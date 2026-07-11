@@ -98,10 +98,19 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for pkg in out/mcp-*/; do
+          # ./ prefix is load-bearing: npm parses a bare owner/name argument
+          # as a GitHub repo spec, not a directory. The pre-publish view check
+          # makes re-runs idempotent — an already-published version is skipped
+          # instead of failing the loop (npm refuses republish over a version).
+          for pkg in ./out/mcp-*/ ./out/mcp/; do
+            name="$(python3 -c "import json,sys; print(json.load(open('$pkg/package.json'))['name'])")"
+            version="$(python3 -c "import json,sys; print(json.load(open('$pkg/package.json'))['version'])")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "skip: $name@$version already published"
+              continue
+            fi
             npm publish "$pkg" --access public --provenance
           done
-          npm publish out/mcp --access public --provenance
 
   github-release:
     name: attach binaries to the GitHub release
