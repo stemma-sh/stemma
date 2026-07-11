@@ -1,0 +1,6 @@
+{
+  "name": "corner-cell-conditional",
+  "spec_ref": "MS-OI29500 \u00a717.4.54(a), \u00a717.4.55(b), \u00a717.7.6(a)",
+  "description": "firstRow blue, firstCol green, nwCell red, seCell yellow.",
+  "expected_behavior": "Cell (0,0): nwCell red. Cell (2,2): seCell yellow."
+}

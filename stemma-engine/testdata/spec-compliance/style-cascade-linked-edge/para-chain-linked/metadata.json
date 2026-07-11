@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6 + \u00a717.7.4.3",
+  "description": "LinkParaP (bold=on, sz=24) linked to LinkCharP (strike=on). MidPara basedOn LinkParaP (italic=on). GrandPara basedOn MidPara (color=FF0000). Tests that linked overlay does NOT leak into child styles via basedOn chain.",
+  "expected": {
+    "para_1": "bold=on, sz=24, strike=on (linked char overlay)",
+    "para_2": "bold=on, sz=24, italic=on. NO strike (link doesn't leak)",
+    "para_3": "bold=on, sz=24, italic=on, color=FF0000. NO strike"
+  }
+}

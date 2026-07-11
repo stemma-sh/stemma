@@ -1,0 +1,6 @@
+{
+  "name": "toggle-reset-in-table-style",
+  "spec_ref": "MS-OI29500 \u00a717.7.6(b)",
+  "description": "BoldPara style + firstRow bold. MS resets (bold stays true).",
+  "expected_behavior": "Cell (0,0): bold. XOR toggle would make it not-bold."
+}

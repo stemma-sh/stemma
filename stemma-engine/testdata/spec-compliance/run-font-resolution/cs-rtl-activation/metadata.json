@@ -1,0 +1,6 @@
+{
+  "name": "cs-rtl-activation",
+  "spec_ref": "ECMA-376 \u00a717.3.2.7/\u00a717.3.2.30",
+  "description": "Run with bCs + i + cs: cs activates bCs (bold) and suppresses i (non-CS italic)",
+  "expected_behavior": "CS run: bold=on (from bCs), italic=off (i is non-CS). Control run: bold=off, italic=on."
+}

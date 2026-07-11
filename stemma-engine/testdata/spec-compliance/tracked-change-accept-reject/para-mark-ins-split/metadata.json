@@ -1,0 +1,5 @@
+{
+  "name": "para-mark-ins-split",
+  "spec_ref": "ECMA-376 \u00a717.13.5.20",
+  "description": "Two paragraphs; first has inserted para mark. Accept keeps split (2 paras), reject merges back (1 para)."
+}

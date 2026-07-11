@@ -1,0 +1,7 @@
+{
+  "name": "direct-para-alignment-overrides-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow conditional (center alignment in pPr). Cell (0,0) paragraph has direct jc=right.",
+  "expected_behavior": "Cell (0,0): right alignment (direct overrides conditional center). Cell (0,1): center alignment (from conditional, no direct). Data rows: default alignment.",
+  "current_status": "GAP-110 \u2014 testing direct pPr > conditional pPr precedence"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "pstyle-reverse-binding",
+  "spec_ref": "ISO 29500-1 \u00a717.9.23",
+  "description": "abstractNum level 0 has pStyle='ListNum'. Paragraphs with style 'ListNum' (and no explicit numPr) should get numbering via the reverse binding.",
+  "expected_behavior": "P0: synthesized '1.' via pStyle binding. P1: synthesized '2.' via pStyle binding. P2: synthesized '3.' via explicit numPr.",
+  "current_status": "TESTING"
+}

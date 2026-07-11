@@ -1,0 +1,6 @@
+{
+  "name": "linked-style-singly",
+  "spec_ref": "MS-OI29500 \u00a717.7.4.6 note b",
+  "description": "Para style links to char style, char style has no link back. Word makes the linking bidirectional.",
+  "expected_behavior": "Para1 (LinkTestPara): bold, size=28. Para2 run (LinkTestChar): italic, color=FF0000."
+}

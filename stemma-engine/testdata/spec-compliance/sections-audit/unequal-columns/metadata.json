@@ -1,0 +1,6 @@
+{
+  "name": "unequal-columns",
+  "spec_ref": "ISO 29500-1 \u00a717.6.4",
+  "description": "Section with 3 unequal columns (2400+480, 4800+480, 2400+0)",
+  "expected_behavior": "SectionProperties.column_defs should have 3 entries with correct widths"
+}

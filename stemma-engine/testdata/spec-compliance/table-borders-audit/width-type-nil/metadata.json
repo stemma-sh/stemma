@@ -1,0 +1,5 @@
+{
+  "name": "width-type-nil",
+  "spec_ref": "ISO 29500-1 SS17.18.90, MS-OI29500 SS17.4.2(a)",
+  "description": "Cell (0,0) has tcW type=nil w=0: per MS-OI29500, this means 'no width specified' and Word ignores the element entirely. Cell (0,1) has tcW type=dxa w=3000."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "conditional-border-override",
+  "spec_ref": "ISO 29500-1 SS17.7.6",
+  "description": "Table style has thin black borders. firstRow conditional has thick red borders (sz=12). First row cells should have red borders."
+}

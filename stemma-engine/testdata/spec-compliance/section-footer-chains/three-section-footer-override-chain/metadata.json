@@ -1,0 +1,5 @@
+{
+  "name": "three-section-footer-override-chain",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "S1: default footer. S2: default footer (overrides S1). S3: nothing \u2014 should inherit S2's default footer (NOT S1's)."
+}

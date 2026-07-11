@@ -1,0 +1,15 @@
+# Tool versions for the stemma workspace. `mise install` fetches everything a
+# contributor needs to build and test the engine + MCP server.
+
+[tools]
+# Pinned exactly, not "stable": clippy grows new lints with every stable
+# release, so a floating toolchain makes `just gate` green locally and red in
+# CI (or vice versa) for the same tree. This line is the single source of
+# truth — CI's lint job installs precisely this version (parsed by ci.yml),
+# and `just lint` refuses to run on anything else. Bump it deliberately and
+# fix what the new clippy flags in the same commit. MSRV floor stays 1.91
+# (crate rust-version fields; enforced by the msrv CI job).
+rust = "1.97.0"
+just = "latest"   # task runner: see Justfile (root) and stemma-engine/Justfile
+python = "3.11"   # only for the optional packaging scripts (mcpb/plugin) + smoke_test.py
+node = "22"       # only for the optional npm packaging (stemma-mcp/npm)

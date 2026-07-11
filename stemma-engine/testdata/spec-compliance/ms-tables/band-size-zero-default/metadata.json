@@ -1,0 +1,6 @@
+{
+  "name": "band-size-zero-default",
+  "spec_ref": "MS-OI29500 \u00a717.7.6.5(b,c), \u00a717.7.6.7(a,b)",
+  "description": "Style with banding but NO tblStyleRowBandSize. Word defaults to 0.",
+  "expected_behavior": "No banding applied. Standard says default is 1."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "inline-image",
+  "spec_ref": "ISO 29500-1 \u00a720.4.2.8",
+  "description": "Paragraph with an inline image (wp:inline inside w:drawing)",
+  "expected_behavior": "OpaqueInline with kind Drawing should be present",
+  "current_status": "SUPPORTED"
+}

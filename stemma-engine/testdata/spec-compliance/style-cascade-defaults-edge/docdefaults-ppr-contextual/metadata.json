@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.5 + \u00a717.3.1.9",
+  "description": "docDefaults pPr sets contextualSpacing=true. Tests that unstyled paragraphs get this value and that a style can override it.",
+  "expected": {
+    "para_1": "contextualSpacing=true (from docDefaults pPr)",
+    "para_2": "contextualSpacing=false (from NoCtxStyle, overrides docDefaults)"
+  }
+}

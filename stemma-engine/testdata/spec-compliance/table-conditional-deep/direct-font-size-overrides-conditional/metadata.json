@@ -1,0 +1,7 @@
+{
+  "name": "direct-font-size-overrides-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow conditional (28pt/56hp font size in rPr). Cell (0,0) run has direct sz=32 (16pt).",
+  "expected_behavior": "Cell (0,0): 16pt/32hp font size (direct overrides conditional 28pt). Cell (0,1): 28pt/56hp font size (from conditional, no direct). Data rows: default font size.",
+  "current_status": "GAP-111 \u2014 testing direct rPr > conditional rPr precedence"
+}

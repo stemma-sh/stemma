@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.23",
+  "description": "Style defines pageBreakBefore. Paragraph referencing that style should inherit page_break_before=true. Direct val=0 should override to false.",
+  "expected": {
+    "para_0": "page_break_before=false (no style)",
+    "para_1": "page_break_before=true (from style)",
+    "para_2": "page_break_before=false (direct val=0 overrides style)"
+  }
+}

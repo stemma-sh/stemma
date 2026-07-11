@@ -1,0 +1,7 @@
+{
+  "name": "flow-control-page-break-before",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.23",
+  "description": "Paragraph with w:pageBreakBefore in pPr",
+  "expected_behavior": "Parser should expose pageBreakBefore flag on ParagraphNode",
+  "current_status": "NOT_PARSED \u2014 pageBreakBefore silently ignored"
+}

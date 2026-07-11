@@ -1,0 +1,5 @@
+{
+  "name": "dotted-dashed-always-weight-1",
+  "spec_ref": "MS-OI29500 \u00a72.1.169",
+  "description": "1x2 table. Cell (0,0) right=dotted sz=24 red (weight=1 per spec). Cell (0,1) left=single sz=4 blue (weight=4). Dotted always gets weight 1 regardless of size, so blue single wins."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "normal-style-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.7.4.17",
+  "description": "Normal style defines left=720 firstLine=360. Tests that direct w:ind left=0 overrides left but firstLine falls through to Normal per per-field merge.",
+  "expected_behavior": "Para 1: left=720, firstLine=360 (Normal). Para 2: left=0 (direct), firstLine=360 (Normal). Para 3: left=0 (direct), firstLine=360 (Normal).",
+  "current_status": "TESTING"
+}

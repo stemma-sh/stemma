@@ -1,0 +1,6 @@
+{
+  "name": "override-table-style-font",
+  "spec_ref": "MS-DOCX \u00a72.3.1",
+  "description": "Table style firstRow: center/14pt. Normal: 11pt/left.",
+  "expected_behavior": "Default: Normal 11pt/left doesn't override table style in tables."
+}

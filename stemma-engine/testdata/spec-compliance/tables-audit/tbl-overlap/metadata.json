@@ -1,0 +1,12 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.55",
+  "description": "Two floating tables, second has tblOverlap=never",
+  "tables": [
+    {
+      "overlap": null
+    },
+    {
+      "overlap": "never"
+    }
+  ]
+}

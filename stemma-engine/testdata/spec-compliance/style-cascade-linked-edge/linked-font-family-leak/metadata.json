@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6 + \u00a717.7.4.3",
+  "description": "FontLinkedPara (font=Arial, sz=28) linked to FontLinkedChar (bold=on, basedOn BaseFontChar(font=Courier New, italic=on)). Tests that char basedOn chain properties (italic) reach runs, while para's explicit font is preserved.",
+  "expected": {
+    "para_1": "font=Arial (para), sz=28 (para), bold=on (char raw), italic=on (char basedOn) \u2014 italic from BaseFontChar should not be lost by raw marks overlay",
+    "para_2": "font=Courier New (char basedOn), italic=on (char basedOn), bold=on (char raw)"
+  }
+}

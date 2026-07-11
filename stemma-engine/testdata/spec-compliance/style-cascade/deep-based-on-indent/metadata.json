@@ -1,0 +1,7 @@
+{
+  "name": "deep-based-on-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.3, \u00a717.3.1.12",
+  "description": "Three-level basedOn chain with each level contributing a different indent field. Tests per-field inheritance within style chain and per-field merge with direct formatting.",
+  "expected_behavior": "Para 1 (StyleC): left=360, right=360, firstLine=240. Para 2 (StyleC+direct): left=720, right=360, firstLine=240. Para 3 (StyleB): left=360, right=360, no firstLine.",
+  "current_status": "TESTING"
+}

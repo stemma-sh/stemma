@@ -1,0 +1,7 @@
+{
+  "name": "numbering-left-only-vs-style-firstline",
+  "spec_ref": "ECMA-376 \u00a717.9.22, \u00a717.3.1.12",
+  "description": "P0: style(left=360,firstLine=360) + numbering(left=720). P1: style only.",
+  "expected_behavior": "P0: left=720, firstLine=None. P1: left=360, firstLine=360.",
+  "current_status": "GAP-103 \u2014 per-field merge leaks style firstLine through numbering"
+}

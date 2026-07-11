@@ -1,0 +1,17 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked style: implicit via para vs explicit char style should match",
+  "expected": {
+    "run_a_implicit": {
+      "bold": true,
+      "color": "0000FF",
+      "font_size": 28
+    },
+    "run_b_explicit": {
+      "bold": true,
+      "color": "0000FF",
+      "font_size": 28,
+      "note": "Should match Run A \u2014 same linked pair"
+    }
+  }
+}

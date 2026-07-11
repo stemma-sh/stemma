@@ -1,0 +1,7 @@
+{
+  "name": "multi-paragraph-bookmark",
+  "spec_ref": "ISO 29500-1 \u00a717.13.6.2/1",
+  "description": "Bookmark range spanning two paragraphs (bookmarkStart in para 1, bookmarkEnd in para 2)",
+  "expected_behavior": "bookmarkStart decoration in paragraph 1, bookmarkEnd decoration in paragraph 2",
+  "current_status": "SUPPORTED \u2014 cross-paragraph bookmarks parsed as decorations in respective paragraphs"
+}

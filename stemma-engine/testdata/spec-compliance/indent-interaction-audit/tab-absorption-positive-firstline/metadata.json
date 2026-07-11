@@ -1,0 +1,7 @@
+{
+  "name": "tab-absorption-positive-firstline",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "P0: w:left=720, w:firstLine=360, text 'A\\tB'. P1: same indent, text 'AB' (control, no tabs).",
+  "expected_behavior": "P0: left=720, first_line=360 (same as P1 \u2014 tab absorption must NOT fire for positive firstLine). GAP-102 bug: condition first_line_twips!=0 incorrectly fires for positive firstLine, absorbing it into left.",
+  "current_status": "GAP-102"
+}

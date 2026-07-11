@@ -1,0 +1,16 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + MS-OI29500 \u00a72.1.258",
+  "description": "Multiple toggle properties with different on/off across levels",
+  "expected": {
+    "para_1_both_styles": {
+      "bold": "OFF (char overrides para per MS-OI29500 \u00a72.1.258)",
+      "italic": "ON (char overrides para)",
+      "caps": "ON (only para sets it, char inherits \u2192 para's value persists)"
+    },
+    "para_2_para_only": {
+      "bold": "ON",
+      "italic": "OFF (explicit val=0)",
+      "caps": "ON"
+    }
+  }
+}

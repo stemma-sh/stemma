@@ -1,0 +1,8 @@
+{
+  "name": "stemma-examples-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests for the stemma Word-frontend example (Playwright).",
+  "scripts": { "test": "./run.sh" },
+  "devDependencies": { "playwright": "^1.40.0" }
+}

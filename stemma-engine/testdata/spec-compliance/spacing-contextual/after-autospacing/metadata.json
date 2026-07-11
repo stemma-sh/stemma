@@ -1,0 +1,6 @@
+{
+  "name": "after-autospacing",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "afterAutospacing overrides after value",
+  "expected_behavior": "P0: after=200 present but afterAutospacing=1 means it should be ignored. P1: after=200 (control, no autospacing)."
+}

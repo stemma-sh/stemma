@@ -1,0 +1,7 @@
+{
+  "name": "tbl-pr-change",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.34/36/37",
+  "description": "Table with tracked property changes on table, row, and cell levels",
+  "expected_behavior": "Parser should expose tblPrChange/trPrChange/tcPrChange with previous values",
+  "current_status": "NOT_PARSED \u2014 table property changes silently ignored"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "chained-continuous-sections",
+  "spec_ref": "ISO 29500-1 section 17.6.17",
+  "description": "S1(nextPage, full margins+pgSz) -> S2(continuous, left=720 only) -> S3(continuous, no pgMar/pgSz). Tests that S3 inherits from S2's enriched state (S1's values flow through S2 to S3)."
+}

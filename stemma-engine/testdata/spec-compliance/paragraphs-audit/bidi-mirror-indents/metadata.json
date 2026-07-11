@@ -1,0 +1,6 @@
+{
+  "name": "bidi-mirror-indents",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.6 + \u00a717.3.1.18",
+  "description": "P0: bidi + mirrorIndents + start=1440, end=720. P1: bidi only + start=1440, end=720. P2: mirrorIndents only + start=1440, end=720.",
+  "expected_behavior": "P0: both bidi and mirrorIndents should be in the model. P1: bidi only. P2: mirrorIndents only."
+}

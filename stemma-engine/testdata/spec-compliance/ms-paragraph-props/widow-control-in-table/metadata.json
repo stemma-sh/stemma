@@ -1,0 +1,7 @@
+{
+  "name": "widow-control-in-table",
+  "spec_ref": "MS-OI29500 2.1.66 \u00a717.3.1.44",
+  "description": "P0: widowControl=false outside table. Table cell P: widowControl=false inside table.",
+  "expected_behavior": "P0: widow_control=Some(false) (honored). Table cell P: widow_control=Some(false) in XML but Word ignores it.",
+  "current_status": "GAP \u2014 we parse widowControl but don't track table context"
+}

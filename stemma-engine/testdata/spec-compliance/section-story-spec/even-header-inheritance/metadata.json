@@ -1,0 +1,5 @@
+{
+  "name": "even-header-inheritance",
+  "spec_ref": "ISO 29500-1 \u00a717.10.5",
+  "description": "evenAndOddHeaders enabled. S1: default + even headers. S2: default only. S2 should inherit even header from S1."
+}

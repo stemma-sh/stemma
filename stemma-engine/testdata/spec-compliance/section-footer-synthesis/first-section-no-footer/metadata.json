@@ -1,0 +1,5 @@
+{
+  "name": "first-section-no-footer",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "First section has no footerReference. Per spec, a blank footer should be synthesized. Second section has an explicit footer."
+}

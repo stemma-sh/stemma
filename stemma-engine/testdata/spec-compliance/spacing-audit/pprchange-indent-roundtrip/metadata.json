@@ -1,0 +1,6 @@
+{
+  "name": "pprchange-indent-roundtrip",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.29 + \u00a717.3.1.12",
+  "description": "pPrChange previous indent must preserve char-unit values",
+  "expected_behavior": "P0 previous_indentation should have left=720, right=360, startChars=200, endChars=100. Roundtrip serialization must emit startChars and endChars."
+}

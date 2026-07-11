@@ -1,0 +1,5 @@
+{
+  "name": "titlepg-selective-first-kinds",
+  "spec_ref": "ISO 29500-1 sections 17.10.6 + 17.10.2",
+  "description": "S1: titlePg + Default header + First header + Default footer + First footer. S2: titlePg + only Default footer (overrides S1's). S2 should inherit Default header, First header, and First footer from S1."
+}

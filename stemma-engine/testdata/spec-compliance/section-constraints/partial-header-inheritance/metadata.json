@@ -1,0 +1,6 @@
+{
+  "name": "partial-header-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.2",
+  "description": "S1 declares default+first headers; S2 declares only first (inherits default from S1); S3 declares nothing (inherits both from S2)",
+  "expected_behavior": "Per-kind inheritance: S2 inherits default from S1, S3 inherits both from S2. S2's first != S1's first (overridden)."
+}

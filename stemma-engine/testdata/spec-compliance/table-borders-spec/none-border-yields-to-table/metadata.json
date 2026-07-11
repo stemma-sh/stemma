@@ -1,0 +1,5 @@
+{
+  "name": "none-border-yields-to-table",
+  "spec_ref": "MS-OI29500 \u00a717.4.66(a)",
+  "description": "2x2 table with red single sz=12 table borders. Cell (0,0) has tcBorders with top=none. Per MS-OI29500: 'none' means 'no cell border' so the opposing (table) border should be displayed."
+}

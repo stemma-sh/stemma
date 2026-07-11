@@ -1,0 +1,6 @@
+{
+  "name": "firstline-chars-supersedes-firstline",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "firstLineChars supersedes firstLine, hangingChars supersedes hanging",
+  "expected_behavior": "P0: firstLineChars=200 supersedes firstLine=360 (both preserved). P1: hangingChars=100 supersedes hanging=720 (both preserved). P2: firstLine=360 only. P3: firstLineChars=200 only."
+}

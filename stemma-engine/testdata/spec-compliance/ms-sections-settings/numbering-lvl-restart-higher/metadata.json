@@ -1,0 +1,7 @@
+{
+  "name": "numbering-lvl-restart-higher",
+  "spec_ref": "MS-OI29500 \u00a717.9.10",
+  "description": "lvlRestart restarts when specified level OR any higher level is used",
+  "expected_behavior": "Level restart should trigger when the configured level or any shallower level is encountered",
+  "current_status": "PASS \u2014 our implementation already handles this correctly"
+}

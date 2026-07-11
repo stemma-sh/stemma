@@ -1,0 +1,7 @@
+{
+  "name": "numbering-from-style",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.14",
+  "description": "Paragraph style with numPr. Paragraphs using this style should auto-number.",
+  "expected_behavior": "Paragraphs should have numbering info: 1. First clause, 2. Second clause, 3. Third clause.",
+  "current_status": "TESTING"
+}

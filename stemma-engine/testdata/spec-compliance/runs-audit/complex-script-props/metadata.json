@@ -1,0 +1,6 @@
+{
+  "name": "complex-script-props",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.2/17/39, MS-OI29500 \u00a717.3.2.26(b)",
+  "description": "Runs with complex script properties (bCs, iCs, szCs) activated by w:cs and w:rtl",
+  "expected_behavior": "cs/rtl causes bCs->bold, iCs->italic, szCs->fontSize"
+}

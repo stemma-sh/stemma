@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 (dstrike as toggle)",
+  "description": "dstrike toggle resolution across hierarchy levels",
+  "expected": {
+    "para_1": "dstrike=ON (both para and char set it)",
+    "para_2": "dstrike=ON (para only)",
+    "para_3": "dstrike=OFF (direct off overrides para on)"
+  }
+}

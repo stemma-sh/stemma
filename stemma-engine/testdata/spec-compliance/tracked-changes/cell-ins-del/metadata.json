@@ -1,0 +1,7 @@
+{
+  "name": "cell-ins-del",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.1/2",
+  "description": "Table with tracked cell insertion (B1) and deletion (B2)",
+  "expected_behavior": "Parser should expose cellIns/cellDel status on affected cells",
+  "current_status": "NOT_PARSED \u2014 cellIns/cellDel silently ignored"
+}

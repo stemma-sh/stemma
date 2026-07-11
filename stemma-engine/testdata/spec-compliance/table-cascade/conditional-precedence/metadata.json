@@ -1,0 +1,7 @@
+{
+  "name": "conditional-precedence",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table with firstRow (blue), lastRow (yellow), firstCol (green), lastCol (red) conditionals. All tblLook flags enabled.",
+  "expected_behavior": "Per \u00a717.7.6 precedence: firstCol/lastCol > firstRow/lastRow. Cell (0,0): green (firstCol > firstRow). Cell (0,2): red (lastCol > firstRow). Cell (3,0): green (firstCol > lastRow). Cell (3,2): red (lastCol > lastRow). Cell (0,1): blue (firstRow only). Cell (3,1): yellow (lastRow only). Cell (1,0): green (firstCol only). Cell (1,2): red (lastCol only).",
+  "current_status": "GAP \u2014 precedence order in apply_conditional_formatting is wrong"
+}

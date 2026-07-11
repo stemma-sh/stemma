@@ -1,0 +1,6 @@
+{
+  "name": "overflow-punct",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.21",
+  "description": "P0: overflowPunct=false (disallow). P1: overflowPunct=true (explicit). P2: no overflowPunct (control).",
+  "expected_behavior": "P0: punctuation may not extend past text extents. P1: punctuation allowed to overflow. P2: default (true per spec)."
+}

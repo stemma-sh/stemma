@@ -1,0 +1,7 @@
+{
+  "name": "lvl-override",
+  "spec_ref": "ISO 29500-1 \u00a717.9.8/9",
+  "description": "Two numbered lists sharing an abstract definition; second list restarts via lvlOverride/startOverride",
+  "expected_behavior": "First list: (a),(b),(c). Second list restarts: (a),(b). The startOverride resets the counter.",
+  "current_status": "NOT_PARSED \u2014 lvlOverride/startOverride silently ignored; second list continues as (d),(e)"
+}

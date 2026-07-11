@@ -1,0 +1,7 @@
+{
+  "name": "indent-partial-direct",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Style defines w:ind left=720 right=360 firstLine=240. Para 2 has direct w:ind left=1440 only. Per spec, absent attributes inherit from style individually.",
+  "expected_behavior": "Para 1: left=720, right=360, firstLine=240 (all from style). Para 2: left=1440 (direct), right=360 (style), firstLine=240 (style). Para 3: left=0, right=0, firstLine=0 (all direct).",
+  "current_status": "TESTING"
+}

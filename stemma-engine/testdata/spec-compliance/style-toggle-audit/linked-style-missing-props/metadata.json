@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked style should use char style rPr but not lose para style properties",
+  "expected": {
+    "para_1": "bold=ON, font_size=32 (from para style; linked char has no sz)",
+    "para_2": "bold=ON (from HeadingChar), font_size from doc defaults/Normal"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "section-types",
+  "spec_ref": "ISO 29500-1 \u00a717.6.17",
+  "description": "Three sections: nextPage, continuous, evenPage break types",
+  "expected_behavior": "Parser should expose section type in SectionProperties",
+  "current_status": "GAP \u2014 section type not yet parsed into SectionProperties"
+}

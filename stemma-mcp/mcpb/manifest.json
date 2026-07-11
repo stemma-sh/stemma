@@ -1,0 +1,60 @@
+{
+  "manifest_version": "0.3",
+  "name": "stemma",
+  "display_name": "Stemma — DOCX tracked changes",
+  "version": "0.1.0",
+  "description": "Structure-aware Microsoft Word (.docx) editing with tracked changes, for agents.",
+  "long_description": "Stemma opens a .docx into a typed intermediate representation, lets an agent read its outline/text/markdown, apply tracked-change edits (insert, delete, replace, formatting, comments, images, table ops), validate the result against OOXML, and save — all as real Word tracked changes that open clean and accept/reject correctly. Malformed input or unsupported edits fail loudly rather than silently corrupting the document.",
+  "author": {
+    "name": "Stemma maintainers",
+    "url": "https://github.com/stemma-sh/stemma"
+  },
+  "homepage": "https://github.com/stemma-sh/stemma",
+  "documentation": "https://github.com/stemma-sh/stemma/blob/main/stemma-mcp/README.md",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["docx", "ooxml", "tracked-changes", "word", "redline", "agent"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/stemma-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/stemma-mcp",
+      "args": [],
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/stemma-mcp.exe" }
+      }
+    }
+  },
+  "tools": [
+    { "name": "open_docx", "description": "Open a .docx from a path into an in-memory document handle." },
+    { "name": "save_docx", "description": "Save the document (with tracked changes) to a .docx path." },
+    { "name": "compare_docx", "description": "Produce a tracked-change redline between two documents." },
+    { "name": "read_outline", "description": "Block-level outline with per-block tracked-change status." },
+    { "name": "read_index", "description": "Stable block index for addressing edits." },
+    { "name": "read_text", "description": "Plain text of the document or a block." },
+    { "name": "read_markdown", "description": "Markdown projection of the document." },
+    { "name": "read_html", "description": "HTML projection of the document." },
+    { "name": "read_block", "description": "Read a single block by id." },
+    { "name": "read_window", "description": "Read a contiguous window of blocks." },
+    { "name": "get_section", "description": "Read a section of the document." },
+    { "name": "read_styles", "description": "Read the document's style table (doc defaults + per-style rows, un-resolved)." },
+    { "name": "find", "description": "Find text occurrences with their block locations." },
+    { "name": "read_redline", "description": "Read the document's tracked-change markup." },
+    { "name": "read_accepted", "description": "Read the document as if all changes were accepted." },
+    { "name": "read_rejected", "description": "Read the document as if all changes were rejected." },
+    { "name": "list_revisions", "description": "List pending tracked changes as structured rows (id, kind, author, text, date)." },
+    { "name": "check_edit", "description": "Dry-run an edit transaction and report what it would do." },
+    { "name": "apply_edit", "description": "Apply a tracked-change edit transaction." },
+    { "name": "apply_batch", "description": "Apply a batch of edit transactions." },
+    { "name": "replace_text", "description": "Tracked replace of one phrase, matched server-side over body text." },
+    { "name": "replace_text_batch", "description": "Apply a list of tracked text replacements with per-item outcomes." },
+    { "name": "replace_all", "description": "Replace all occurrences of text as tracked changes." },
+    { "name": "accept_changes", "description": "Accept tracked changes (all or selected)." },
+    { "name": "reject_changes", "description": "Reject tracked changes (all or selected)." },
+    { "name": "validate_docx", "description": "Validate the serialized document against OOXML, reporting issues." },
+    { "name": "review_session", "description": "Everything this session changed since open_docx: change census, any untracked delta, an untouched-blocks proof, and the validator verdict." },
+    { "name": "audit_docx", "description": "The same change census, untouched-blocks proof, and validator verdict for any two .docx files, computed statelessly." }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}

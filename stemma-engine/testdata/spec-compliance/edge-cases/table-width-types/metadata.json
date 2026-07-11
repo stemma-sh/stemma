@@ -1,0 +1,7 @@
+{
+  "name": "table-width-types",
+  "spec_ref": "ISO 29500-1 \u00a717.4.84",
+  "description": "Four tables with width types: pct (5000=50%), auto (0), dxa (9360 twips), nil (0)",
+  "expected_behavior": "Each table's width measurement should preserve both w and width_type values",
+  "current_status": "SUPPORTED \u2014 testing width type preservation"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "ind-char-unit-override",
+  "spec_ref": "MS-OI29500 2.1.44 \u00a717.3.1.12(b)",
+  "description": "P0: CharOverrideStyle (startChars=200) + direct start=720. P1: direct start=720 only (control).",
+  "expected_behavior": "P0: Word uses startChars=200 from style, ignoring direct start=720. P1: start=720 (no char-unit interference).",
+  "current_status": "GAP \u2014 we don't parse character-unit indent attributes at all"
+}

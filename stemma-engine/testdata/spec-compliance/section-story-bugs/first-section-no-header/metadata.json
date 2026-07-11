@@ -1,0 +1,5 @@
+{
+  "name": "first-section-no-header",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "First section has no headerReference. Per spec, a blank header should be synthesized. Second section has an explicit header."
+}

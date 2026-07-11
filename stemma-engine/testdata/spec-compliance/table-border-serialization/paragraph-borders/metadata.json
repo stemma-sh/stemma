@@ -1,0 +1,5 @@
+{
+  "name": "paragraph-borders",
+  "spec_ref": "ECMA-376 Annex A, CT_PBdr",
+  "description": "Single paragraph with all 6 border edges (top, left, bottom, right, between, bar) each with a distinct color. Used to verify serialization emits children in schema order: top, left, bottom, right, between, bar."
+}

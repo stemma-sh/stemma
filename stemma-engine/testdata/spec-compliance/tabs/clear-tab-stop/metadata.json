@@ -1,0 +1,7 @@
+{
+  "name": "clear-tab-stop",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.38",
+  "description": "Style defines tabs at 1440 and 2880; paragraph clears the stop at 1440",
+  "expected_behavior": "Effective tab stops should only include 2880 (1440 removed by clear)",
+  "current_status": "SUPPORTED \u2014 clear semantics implemented in overlay_tab_stops"
+}

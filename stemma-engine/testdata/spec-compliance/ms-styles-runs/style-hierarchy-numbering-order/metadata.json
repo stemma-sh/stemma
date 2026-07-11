@@ -1,0 +1,6 @@
+{
+  "name": "style-hierarchy-numbering-order",
+  "spec_ref": "MS-OI29500 \u00a717.7.2 note a",
+  "description": "Paragraph with paragraph style indent to test hierarchy order.",
+  "expected_behavior": "Paragraph style applied first, then numbering overrides."
+}

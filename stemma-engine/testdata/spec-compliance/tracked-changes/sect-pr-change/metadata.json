@@ -1,0 +1,7 @@
+{
+  "name": "sect-pr-change",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.32",
+  "description": "Section with tracked page size change via w:sectPrChange",
+  "expected_behavior": "Parser should expose sectPrChange with previous page dimensions",
+  "current_status": "NOT_PARSED \u2014 sectPr is preserved opaquely but changes not tracked"
+}

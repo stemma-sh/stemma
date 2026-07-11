@@ -1,0 +1,7 @@
+{
+  "name": "doc-grid",
+  "spec_ref": "ECMA-376 \u00a717.6.5",
+  "description": "Section with docGrid: type=linesAndChars, linePitch=312, charSpace=4096",
+  "expected_behavior": "Parser should expose docGrid attributes in SectionProperties",
+  "current_status": "GAP \u2014 docGrid not parsed into SectionProperties"
+}

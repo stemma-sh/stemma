@@ -1,0 +1,6 @@
+# No end-of-line conversion anywhere: the test suite compares bytes
+# (fixtures, expected XML, include_str! snapshots), so a CRLF checkout on
+# Windows would break byte-exact assertions. Files are committed with LF
+# and must check out with LF on every platform.
+* -text
+*.docx binary

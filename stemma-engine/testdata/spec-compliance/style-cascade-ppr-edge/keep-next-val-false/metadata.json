@@ -1,0 +1,10 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.15",
+  "description": "Tests that w:keepNext w:val='0' is correctly parsed as false. Also tests that direct val=0 overrides style keepNext=true.",
+  "expected": {
+    "para_0": "keep_next=false (no keepNext element)",
+    "para_1": "keep_next=true (element present, no val = true)",
+    "para_2": "keep_next=false (val=0 means false)",
+    "para_3": "keep_next=false (direct val=0 overrides style's true)"
+  }
+}

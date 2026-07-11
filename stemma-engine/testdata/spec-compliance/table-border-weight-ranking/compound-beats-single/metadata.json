@@ -1,0 +1,5 @@
+{
+  "name": "compound-beats-single",
+  "spec_ref": "MS-OI29500 \u00a72.1.169",
+  "description": "1x3 table. Cell (0,0) right=thinThickSmallGap sz=8 red (rank 7, weight=56). Cell (0,1) left=single sz=8 blue (rank 1, weight=8), right=wave sz=8 green (rank 16, weight=128). Cell (0,2) left=single sz=8 blue (rank 1, weight=8). At edge (0,0)|(0,1): red wins. At edge (0,1)|(0,2): green wins."
+}

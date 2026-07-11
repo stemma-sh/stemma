@@ -1,0 +1,48 @@
+{
+  "name": "Landing Page Showcase",
+  "description": "Software License Agreement with 7 critical but hard-to-spot changes for landing page demo",
+  "changes": [
+    {
+      "section": "2.1 License Fee",
+      "change": "$50,000 → $500,000",
+      "importance": "CRITICAL",
+      "impact": "10x fee increase ($450,000 more annually)"
+    },
+    {
+      "section": "3.2 Termination for Convenience",
+      "change": "90 days → 30 days notice",
+      "importance": "HIGH",
+      "impact": "60 fewer days to transition off the software"
+    },
+    {
+      "section": "4.3 Malicious Code Warranty",
+      "change": "Entire clause removed",
+      "importance": "CRITICAL",
+      "impact": "No protection against malware in delivered software"
+    },
+    {
+      "section": "5.1 Vendor Indemnification",
+      "change": "Carveout exceptions added",
+      "importance": "HIGH",
+      "impact": "Vendor no longer liable for IP infringement in modification/combination scenarios"
+    },
+    {
+      "section": "6.1 Liability Cap",
+      "change": "Entire clause removed",
+      "importance": "CRITICAL",
+      "impact": "Unlimited liability exposure - was capped at 12 months of fees"
+    },
+    {
+      "section": "7.1, 7.2 Support",
+      "change": "\"best efforts\" → \"commercially reasonable efforts\"",
+      "importance": "MEDIUM",
+      "impact": "Weaker support commitment standard"
+    },
+    {
+      "section": "9.1, 9.2 Governing Law & Dispute Resolution",
+      "change": "California/San Francisco → Delaware/Wilmington",
+      "importance": "MEDIUM",
+      "impact": "Less favorable venue for Customer (a California company)"
+    }
+  ]
+}

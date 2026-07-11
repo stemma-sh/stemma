@@ -1,0 +1,5 @@
+{
+  "name": "tbllook-legacy-bitmask",
+  "spec_ref": "MS-OI29500 SS17.4.55(c)",
+  "description": "tblLook with only w:val='04A0' bitmask (no individual attributes). Expected: firstRow=true, lastRow=false, firstCol=true, lastCol=false, noHBand=true, noVBand=true."
+}

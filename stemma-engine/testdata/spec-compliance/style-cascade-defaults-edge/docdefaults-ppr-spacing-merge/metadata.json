@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.5 + \u00a717.7.2",
+  "description": "docDefaults pPr sets spacing before=240 line=276. Style sets only after=120. Tests per-field merge: style after + docDefaults before and line.",
+  "expected": {
+    "para_1": "before=240, line=276 (from docDefaults pPr)",
+    "para_2": "before=240 (docDefaults), after=120 (style), line=276 (docDefaults)"
+  }
+}

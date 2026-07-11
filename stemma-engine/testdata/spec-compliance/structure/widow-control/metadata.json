@@ -1,0 +1,7 @@
+{
+  "name": "widow-control",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.44",
+  "description": "Paragraph with w:widowControl val=0 (disabled)",
+  "expected_behavior": "Parser should expose widowControl=false on ParagraphNode",
+  "current_status": "NOT_PARSED \u2014 widowControl silently ignored"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "hanging-wins-direct",
+  "spec_ref": "ECMA-376 \u00a717.3.1.12",
+  "description": "Direct ind with both hanging=360 and firstLine=720; hanging should win",
+  "expected_behavior": "effective_first_line_twips = -360 (hanging wins)",
+  "current_status": "PASS \u2014 word_ir.rs parser already checks hanging first"
+}

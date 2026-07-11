@@ -1,0 +1,5 @@
+{
+  "name": "opaque-redline-field",
+  "description": "Text changes around a w:fldSimple \u2014 field must not end up inside w:del/w:ins",
+  "pipeline": "BlockModified with OpaqueInline(Field/Simple)"
+}

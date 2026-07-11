@@ -1,0 +1,7 @@
+{
+  "name": "cell-margin-chain",
+  "spec_ref": "ISO 29500-1 \u00a717.4.43",
+  "description": "Table style margins=50tw, table direct margins=100tw, cell (2,0) direct margins=200tw.",
+  "expected_behavior": "Row 0-1 cells: margins from table direct (100tw each). Cell (2,0): direct margins (200tw each). If table direct were absent, style margins (50tw) would apply.",
+  "current_status": "TESTING \u2014 verifying three-level chain"
+}

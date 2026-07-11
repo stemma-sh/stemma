@@ -1,0 +1,22 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.84",
+  "description": "Four tables with different width types: dxa, pct, auto, nil",
+  "tables": [
+    {
+      "width": 5000,
+      "type": "dxa"
+    },
+    {
+      "width": 2500,
+      "type": "pct"
+    },
+    {
+      "width": 0,
+      "type": "auto"
+    },
+    {
+      "width": 0,
+      "type": "nil"
+    }
+  ]
+}

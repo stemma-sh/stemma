@@ -1,0 +1,5 @@
+{
+  "name": "inside-v-interior-cells",
+  "spec_ref": "ISO 29500-1 SS17.4.66, SS17.4.38",
+  "description": "Table with distinct left/right (blue sz=12) vs insideV (green sz=4). Interior cells should use insideV for their vertical edges."
+}

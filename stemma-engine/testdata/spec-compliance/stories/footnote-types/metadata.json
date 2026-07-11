@@ -1,0 +1,5 @@
+{
+  "name": "footnote-types",
+  "spec_ref": "ISO 29500-1 \u00a717.11.20",
+  "description": "Footnotes with type=separator, continuationSeparator, and normal"
+}

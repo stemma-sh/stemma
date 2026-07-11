@@ -1,0 +1,7 @@
+{
+  "name": "tab-absorption-zero-firstline",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=720, no firstLine, text 'A\\tB'. Tests that tab absorption doesn't fire when firstLine is 0.",
+  "expected_behavior": "left=720, first_line=None (passthrough). Tab absorption only applies when first_line_twips!=0.",
+  "current_status": "TESTING \u2014 this branch may already work correctly"
+}

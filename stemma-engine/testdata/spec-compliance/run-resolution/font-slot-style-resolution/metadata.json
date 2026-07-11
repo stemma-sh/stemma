@@ -1,0 +1,7 @@
+{
+  "name": "font-slot-style-resolution",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Font slots cascade independently through style chain: para=eastAsia, char=ascii/hAnsi, direct=cs.",
+  "expected_behavior": "font_family='Courier New' (char), font_east_asia='MS Mincho' (para), font_cs='David' (direct).",
+  "current_status": "TESTING -- font slots cascade independently via resolve_option"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "is-lgl-current-level",
+  "spec_ref": "ISO 29500-1 \u00a717.9.4",
+  "description": "Level 1 uses lowerLetter format but has isLgl set. Both %1 and %2 in lvlText should render as decimal.",
+  "expected_behavior": "Level 0: '1.' Level 1: '1.1', '1.2' \u2014 NOT '1.a', '1.b'."
+}

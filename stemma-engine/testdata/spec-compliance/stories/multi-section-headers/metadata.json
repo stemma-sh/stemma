@@ -1,0 +1,5 @@
+{
+  "name": "multi-section-headers",
+  "spec_ref": "ISO 29500-1 \u00a717.10.5",
+  "description": "Three sections each with a distinct default header"
+}

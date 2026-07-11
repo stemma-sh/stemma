@@ -1,0 +1,7 @@
+{
+  "name": "prefix-hanging-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=720, w:hanging=360, tab at 720, text '1.\\tBody text...'. Tests hanging indent preserved after prefix stripping.",
+  "expected_behavior": "After prefix stripping: left=720 (continuation indent), first_line=0 (=720-720, body starts at same position as continuation). Current bug: left=720, first_line=None (coincidentally correct left, wrong first_line logic).",
+  "current_status": "GAP \u2014 literal_prefix branch uses body_left instead of resolved w:left"
+}

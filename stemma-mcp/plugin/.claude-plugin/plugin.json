@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "stemma",
+  "displayName": "Stemma — DOCX tracked changes",
+  "version": "0.1.0",
+  "description": "Structure-aware Microsoft Word (.docx) editing with tracked changes, for agents. Open a document, read its outline/text, apply tracked-change edits, validate, and save — all as real Word tracked changes.",
+  "author": {
+    "name": "Stemma maintainers",
+    "url": "https://github.com/stemma-sh/stemma"
+  },
+  "homepage": "https://github.com/stemma-sh/stemma",
+  "repository": "https://github.com/stemma-sh/stemma",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["docx", "ooxml", "tracked-changes", "word", "redline", "agent"]
+}

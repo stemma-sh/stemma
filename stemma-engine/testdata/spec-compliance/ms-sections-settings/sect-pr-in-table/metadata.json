@@ -1,0 +1,7 @@
+{
+  "name": "sect-pr-in-table",
+  "spec_ref": "MS-OI29500 \u00a717.6.18",
+  "description": "sectPr inside a table cell paragraph (Word ignores this)",
+  "expected_behavior": "Parser should either ignore sectPr in table cells or warn. Word rejects it.",
+  "current_status": "GAP \u2014 we may parse sectPr from table cells when we shouldn't"
+}

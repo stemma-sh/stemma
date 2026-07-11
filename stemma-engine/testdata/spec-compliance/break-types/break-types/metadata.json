@@ -1,0 +1,7 @@
+{
+  "name": "break-types",
+  "spec_ref": "ISO 29500-1 \u00a717.3.3.1",
+  "description": "Paragraphs with page, column, line, and clear break types",
+  "expected_behavior": "Parser should distinguish page/column breaks from line breaks via HardBreakNode",
+  "current_status": "PARTIAL \u2014 HardBreakNode has no break_type field; all breaks are identical"
+}

@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 (first-value-encountered in basedOn chain)",
+  "description": "3-level char style basedOn chain with toggle overrides",
+  "expected": {
+    "para_1_leaf": "bold=ON (leaf sets it), italic=ON (inherited from root)",
+    "para_2_mid": "bold=OFF (mid explicitly off), italic=ON (inherited from root)",
+    "para_3_root": "bold=ON (root sets it), italic=ON (root sets it)"
+  }
+}

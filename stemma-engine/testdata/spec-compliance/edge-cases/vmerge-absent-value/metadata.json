@@ -1,0 +1,6 @@
+{
+  "name": "vmerge-absent-value",
+  "spec_ref": "ISO 29500-1 \u00a717.4.84",
+  "description": "vMerge with restart, bare (continue), explicit continue, and absent",
+  "expected_behavior": "Row 0: Restart, Row 1: Continue (bare), Row 2: Continue (explicit), Row 3: None"
+}

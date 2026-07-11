@@ -1,0 +1,7 @@
+{
+  "name": "conditional-border-vs-table-border",
+  "spec_ref": "MS-OI29500 \u00a717.4.66(a), ISO 29500-1 \u00a717.7.6",
+  "description": "Table with thin black single borders (sz=4). firstRow conditional has thick red borders (sz=12). Border weight conflict.",
+  "expected_behavior": "Cell (0,0) top border: thick red (sz=12, weight=24) wins over table single black (sz=4, weight=4). Data row cells: table borders only (single black sz=4).",
+  "current_status": "TESTING"
+}

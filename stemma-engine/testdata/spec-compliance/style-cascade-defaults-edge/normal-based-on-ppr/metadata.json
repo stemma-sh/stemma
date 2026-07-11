@@ -1,0 +1,7 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3 + \u00a717.7.4.17",
+  "description": "Normal basedOn SpacingBase. SpacingBase sets after=200, before=100, jc=center. Normal overrides before=0. Tests that paragraph property inheritance through Normal's basedOn chain works correctly.",
+  "expected": {
+    "para_1": "before=0 (Normal), after=200 (SpacingBase), alignment=center (SpacingBase)"
+  }
+}

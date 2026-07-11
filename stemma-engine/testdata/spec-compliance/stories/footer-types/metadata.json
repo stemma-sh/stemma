@@ -1,0 +1,5 @@
+{
+  "name": "footer-types",
+  "spec_ref": "ISO 29500-1 \u00a717.10.3",
+  "description": "Document with three footer types: default, first page, even page"
+}

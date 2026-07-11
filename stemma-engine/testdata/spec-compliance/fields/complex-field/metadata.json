@@ -1,0 +1,7 @@
+{
+  "name": "complex-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.18",
+  "description": "Paragraph with a complex field (DATE) using fldChar begin/separate/end",
+  "expected_behavior": "Parser should produce OpaqueInlines for Begin, Instruction, Separate, End",
+  "current_status": "SUPPORTED \u2014 complex field elements parsed into individual OpaqueInlines"
+}

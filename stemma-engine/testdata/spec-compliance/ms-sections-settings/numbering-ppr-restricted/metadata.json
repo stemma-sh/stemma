@@ -1,0 +1,7 @@
+{
+  "name": "numbering-ppr-restricted",
+  "spec_ref": "MS-OI29500 \u00a717.9.22",
+  "description": "Word only allows jc, ind, and tabs in numbering level pPr",
+  "expected_behavior": "Only jc, ind, tabs from numbering level pPr should be applied",
+  "current_status": "INFO \u2014 we only parse ind currently, which is within the allowed set"
+}

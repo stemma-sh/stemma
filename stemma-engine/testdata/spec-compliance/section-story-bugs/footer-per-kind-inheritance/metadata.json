@@ -1,0 +1,5 @@
+{
+  "name": "footer-per-kind-inheritance",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "S1: default + first footers. S2: only first footer. S2 should inherit S1's default footer while using its own first footer."
+}

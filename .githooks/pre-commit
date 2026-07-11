@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Pre-commit: fast checks before committing. Full gate is `just gate`.
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+echo "pre-commit: cargo check (workspace)..."
+(cd "$REPO_ROOT" && cargo check --workspace --quiet)
+echo "pre-commit: ok."

@@ -1,0 +1,7 @@
+{
+  "name": "border-conflict-cell-vs-table",
+  "spec_ref": "ISO 29500-1 \u00a717.4.39-44",
+  "description": "Table style provides thick red (sz=18) borders on all edges. Cell (1,0) has explicit thin blue (sz=4) tcBorders.",
+  "expected_behavior": "Cell (1,0): blue sz=4 borders (cell overrides style table borders). Cell (0,0), (0,1), (1,1): no cell-level borders (inherit from style).",
+  "current_status": "GAP \u2014 testing cell vs style-provided table border precedence"
+}

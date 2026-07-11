@@ -1,0 +1,7 @@
+{
+  "name": "section-cols-unequal",
+  "spec_ref": "MS-OI29500 \u00a717.6.3 + \u00a717.6.4",
+  "description": "Section with 3 unequal columns (equalWidth=false), third col has no space attr",
+  "expected_behavior": "Parser should expose column definitions with individual widths. Missing space attr defaults to 0.",
+  "current_status": "GAP \u2014 individual column definitions not parsed, only num/space from cols"
+}

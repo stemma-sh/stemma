@@ -1,0 +1,6 @@
+{
+  "name": "snap-to-grid",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.32",
+  "description": "P0: snapToGrid=false (opt out). P1: snapToGrid=true (explicit). P2: no snapToGrid (control).",
+  "expected_behavior": "P0: paragraph opts out of document grid spacing. P1: paragraph uses document grid. P2: default (true per spec)."
+}

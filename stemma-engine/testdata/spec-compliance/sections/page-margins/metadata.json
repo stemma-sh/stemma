@@ -1,0 +1,7 @@
+{
+  "name": "page-margins",
+  "spec_ref": "ISO 29500-1 \u00a717.6.11",
+  "description": "Section with custom pgMar (top=1440, bottom=1440, left=1800, right=1800, header=720, footer=720, gutter=360)",
+  "expected_behavior": "Parser should expose all margin values in SectionProperties",
+  "current_status": "GAP \u2014 pgMar not yet parsed into SectionProperties"
+}

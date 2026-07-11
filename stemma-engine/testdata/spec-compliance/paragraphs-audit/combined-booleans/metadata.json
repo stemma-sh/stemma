@@ -1,0 +1,6 @@
+{
+  "name": "combined-booleans",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1",
+  "description": "P0: suppressAutoHyphens=true, snapToGrid=false, overflowPunct=false, adjustRightInd=false, wordWrap=false. P1: all defaults (control).",
+  "expected_behavior": "P0: all five boolean properties should be reflected in the model. P1: no special properties."
+}

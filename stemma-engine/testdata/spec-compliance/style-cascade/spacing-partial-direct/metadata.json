@@ -1,0 +1,7 @@
+{
+  "name": "spacing-partial-direct",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Style defines w:spacing before=240 after=120 line=276 lineRule=auto. Para 2 has direct w:spacing before=0 only. Para 3 has direct w:spacing line=480 with no lineRule attribute. Para 4 uses ExactSpacedStyle (lineRule=exact) with direct line=480 and no lineRule attr, exposing GAP-016.",
+  "expected_behavior": "Para 1: before=240, after=120, line=276, lineRule=auto (all style). Para 2: before=0 (direct), after=120 (style), line=276 (style). Para 3: line=480 (direct), lineRule=auto (spec default). Para 4: line=480 (direct), lineRule=auto (spec default, NOT exact from style -- GAP-016).",
+  "current_status": "TESTING -- GAP-016 exposed by para 4"
+}

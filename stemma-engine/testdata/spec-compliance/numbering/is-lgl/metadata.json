@@ -1,0 +1,7 @@
+{
+  "name": "is-lgl",
+  "spec_ref": "ISO 29500-1 \u00a717.9.5",
+  "description": "Multi-level list with isLgl on level 2 \u2014 inherited levels should render as decimal",
+  "expected_behavior": "Level 0: 'I.', Level 1: 'I.a.', Level 2: '1.1.1' (not 'I.a.1')",
+  "current_status": "NOT_PARSED \u2014 isLgl ignored; level 2 renders as 'I.a.1'"
+}

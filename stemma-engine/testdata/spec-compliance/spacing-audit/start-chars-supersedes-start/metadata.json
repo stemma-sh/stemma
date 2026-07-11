@@ -1,0 +1,6 @@
+{
+  "name": "start-chars-supersedes-start",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "startChars supersedes start, endChars supersedes end",
+  "expected_behavior": "P0: start_chars=200 supersedes left=720 (both preserved in model). P1: end_chars=100 supersedes right=720. P2: left=720, no char-unit. P3: start_chars=200, left=None."
+}

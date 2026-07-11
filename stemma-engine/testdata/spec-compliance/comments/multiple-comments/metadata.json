@@ -1,0 +1,7 @@
+{
+  "name": "multiple-comments",
+  "spec_ref": "ISO 29500-1 \u00a717.13.4",
+  "description": "Paragraph with two separate comments on different text ranges (id=1, id=2)",
+  "expected_behavior": "Two CommentStory entries with distinct IDs, authors, and content",
+  "current_status": "SUPPORTED \u2014 multiple comments independently parsed"
+}

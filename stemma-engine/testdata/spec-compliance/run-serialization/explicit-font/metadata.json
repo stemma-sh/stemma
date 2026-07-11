@@ -1,0 +1,7 @@
+{
+  "name": "explicit-font",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Diff pair with explicit ascii/hAnsi='Courier New', text change in second paragraph",
+  "expected_behavior": "Explicit font name should survive roundtrip unchanged",
+  "current_status": "OK \u2014 explicit fonts are preserved correctly"
+}

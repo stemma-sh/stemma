@@ -1,0 +1,6 @@
+{
+  "name": "suff-space",
+  "spec_ref": "ECMA-376 section 17.9.28",
+  "description": "Three numbering definitions with suff='space', suff='nothing', and suff='tab'. The separator in rendered_text must match the suff value, not always be a tab.",
+  "expected_behavior": "Space: '1. Body'. Nothing: '1.Body'. Tab: '1.\\tBody'."
+}

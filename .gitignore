@@ -1,0 +1,26 @@
+# Rust build output — a dir named exactly "target" at any depth. Does NOT match
+# testdata dirs like "numbering-merge-target/".
+target/
+
+# Word lock/temp files
+~$*
+
+# Logs
+*.log
+
+# Packaged distribution bundles (built by stemma-mcp/{mcpb,plugin}/build-*.sh)
+dist/
+
+# Python caches (build scripts + smoke_test.py)
+__pycache__/
+*.pyc
+
+# Local environment overrides
+.env
+
+# Editor / OS noise
+.DS_Store
+
+# Agent session state (worktrees, local settings)
+.claude/
+.worktrees/

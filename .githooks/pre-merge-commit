@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pre-merge-commit: full quality gate when merging into main (not fast-forwards).
+# Runs `just gate` (lint + all daily tests).
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+[[ "$(git branch --show-current)" == "main" ]] || exit 0
+echo "pre-merge-commit: merging into main — running just gate..."
+(cd "$REPO_ROOT" && just gate)
+echo "pre-merge-commit: gate passed."

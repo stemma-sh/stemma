@@ -1,0 +1,7 @@
+{
+  "name": "paragraph-spacing",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Paragraphs with various spacing configurations (before, after, line, lineRule)",
+  "expected_behavior": "Parser should expose spacing.before, spacing.after, spacing.line, spacing.line_rule on ParagraphNode",
+  "current_status": "NOT_PARSED \u2014 w:spacing silently ignored (P0 gap)"
+}

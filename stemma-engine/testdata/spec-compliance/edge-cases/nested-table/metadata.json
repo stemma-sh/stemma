@@ -1,0 +1,7 @@
+{
+  "name": "nested-table",
+  "spec_ref": "ISO 29500-1 \u00a717.4.38",
+  "description": "Outer 2x2 table with cell (0,0) containing a nested 2x1 table",
+  "expected_behavior": "Nested table should appear in cell (0,0).blocks as a BlockNode::Table",
+  "current_status": "SUPPORTED \u2014 testing nested table access"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "cs-forces-cs-font",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26(b)",
+  "description": "Run with ascii=Courier, cs=Arial, w:cs=true on English text",
+  "expected_behavior": "font_family should be 'Arial' (cs font) not 'Courier'"
+}

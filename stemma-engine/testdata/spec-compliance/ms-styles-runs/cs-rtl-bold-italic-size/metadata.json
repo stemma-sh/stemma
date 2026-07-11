@@ -1,0 +1,6 @@
+{
+  "name": "cs-rtl-bold-italic-size",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.1, \u00a717.3.2.16, \u00a717.3.2.38",
+  "description": "Run 1 (cs=true): b=off, bCs=on, i=off, iCs=on, sz=24, szCs=28. Run 2 (no cs): same props.",
+  "expected_behavior": "Run 1: bold=on (bCs), italic=on (iCs), size=28 (szCs). Run 2: bold=off (b val=0), italic=off (i val=0), size=24 (sz)."
+}

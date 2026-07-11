@@ -1,0 +1,7 @@
+{
+  "name": "tbllook-disables-firstrow",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style has firstRow (blue 4472C4) and band1Horz (gray D9D9D9) conditionals. tblLook has w:firstRow='0' \u2014 disabling firstRow conditional.",
+  "expected_behavior": "Row 0: should get band1Horz shading (D9D9D9), NOT firstRow blue. Row 1: band2Horz (no shading \u2014 band2Horz not defined). Row 2: band1Horz shading (D9D9D9).",
+  "current_status": "testing tblLook flag suppression of firstRow"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "nil-border-suppresses-table",
+  "spec_ref": "MS-OI29500 \u00a717.4.66(a)",
+  "description": "2x2 table with red single sz=12 table borders. Cell (0,0) has tcBorders with top=nil. Per MS-OI29500: nil means 'no border shall be displayed'. Cell (0,0) top should be nil/suppressed."
+}

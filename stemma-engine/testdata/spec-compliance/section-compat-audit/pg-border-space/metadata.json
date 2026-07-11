@@ -1,0 +1,7 @@
+{
+  "name": "pg-border-space",
+  "spec_ref": "ECMA-376 \u00a717.6.7",
+  "description": "Section with page borders: each edge has a space attribute (top/bottom=31pt, left/right=24pt)",
+  "expected_behavior": "Parser should expose border space attribute in Border struct",
+  "current_status": "GAP \u2014 space attribute not captured in Border struct"
+}

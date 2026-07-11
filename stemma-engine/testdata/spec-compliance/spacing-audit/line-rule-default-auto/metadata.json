@@ -1,0 +1,6 @@
+{
+  "name": "line-rule-default-auto",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "lineRule defaults to auto when omitted with line present",
+  "expected_behavior": "P0: lineRule=auto (default when line is present but lineRule omitted). P1: lineRule=auto (explicit). P2: lineRule=exact. P3: lineRule=None (no line value)."
+}

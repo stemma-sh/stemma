@@ -1,0 +1,5 @@
+{
+  "name": "ordering-insertion-middle",
+  "description": "Insertion in middle of document - should appear between existing paragraphs",
+  "source": "generated for ordering tests"
+}

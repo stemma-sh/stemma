@@ -1,0 +1,7 @@
+{
+  "name": "indentation-types",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Paragraphs with various indentation types: left, right, firstLine, hanging, combined",
+  "expected_behavior": "Parser should expose all indentation values. Hanging stored as negative first_line.",
+  "current_status": "SUPPORTED \u2014 indentation is fully parsed"
+}

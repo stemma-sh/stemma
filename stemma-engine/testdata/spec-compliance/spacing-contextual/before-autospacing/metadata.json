@@ -1,0 +1,6 @@
+{
+  "name": "before-autospacing",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "beforeAutospacing overrides before value",
+  "expected_behavior": "P0: before=200 present but beforeAutospacing=1 means it should be ignored. P1: before=200 (control, no autospacing)."
+}

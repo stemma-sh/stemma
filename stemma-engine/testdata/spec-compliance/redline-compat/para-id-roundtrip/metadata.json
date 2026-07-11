@@ -1,0 +1,6 @@
+{
+  "name": "para-id-roundtrip",
+  "spec_ref": "MS-DOCX \u00a72.6.2.3/2.6.2.4",
+  "description": "Paragraphs with w14:paraId and w14:textId hex attributes",
+  "expected_behavior": "paraId/textId survive import \u2192 redline \u2192 export roundtrip"
+}

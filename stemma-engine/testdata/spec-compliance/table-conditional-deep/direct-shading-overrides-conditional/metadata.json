@@ -1,0 +1,7 @@
+{
+  "name": "direct-shading-overrides-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow conditional (blue 4472C4 shading). Cell (0,0) has direct green (00B050) shading in tcPr.",
+  "expected_behavior": "Cell (0,0): green (00B050) from direct, NOT blue from conditional. Cell (0,1): blue (4472C4) from conditional (no direct shading). Cell (1,0), (1,1): no shading (not in first row).",
+  "current_status": "testing direct > conditional precedence"
+}

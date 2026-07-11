@@ -1,0 +1,7 @@
+{
+  "name": "compat-enable-opentype",
+  "spec_ref": "MS-DOCX \u00a72.3.3",
+  "description": "Document with enableOpenTypeFeatures=1 compat setting",
+  "expected_behavior": "Parser should expose enableOpenTypeFeatures in CompatSettings",
+  "current_status": "GAP \u2014 enableOpenTypeFeatures not parsed"
+}

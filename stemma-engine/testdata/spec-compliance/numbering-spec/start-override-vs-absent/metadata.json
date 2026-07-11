@@ -1,0 +1,7 @@
+{
+  "name": "start-override-vs-absent",
+  "spec_ref": "ISO 29500-1 \u00a717.9.26",
+  "description": "Three num instances sharing an abstractNum. numId=1 (no override), numId=2 (startOverride=1), numId=3 (no override). Tests that startOverride correctly resets, and separate num instances have independent counters.",
+  "expected_behavior": "numId=1: 1., 2., 3. numId=2: 1., 2. (restarted by startOverride). numId=3: 1., 2. (fresh counter for different numId).",
+  "current_status": "TESTING"
+}

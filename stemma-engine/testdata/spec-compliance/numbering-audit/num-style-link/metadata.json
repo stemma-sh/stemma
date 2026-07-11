@@ -1,0 +1,6 @@
+{
+  "name": "num-style-link",
+  "spec_ref": "ISO 29500-1 \u00a717.9.21, \u00a717.9.27",
+  "description": "abstractNum 0 has numStyleLink='OutlineNumbering'. Style 'OutlineNumbering' (type=numbering) has numPr -> numId=2. abstractNum 1 has styleLink='OutlineNumbering' with actual levels. Paragraphs using numId=1 should follow the chain.",
+  "expected_behavior": "Paragraphs using numId=1: '1.', '2.', 'a)'. The numStyleLink chain is followed to get actual level definitions."
+}

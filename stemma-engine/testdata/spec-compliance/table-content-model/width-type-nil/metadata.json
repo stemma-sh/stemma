@@ -1,0 +1,21 @@
+{
+  "spec": "MS-OI29500 \u00a72.1.166",
+  "description": "Table w=0/type=pct and cell w=0/type=dxa \u2014 spec says treat as auto",
+  "table_width": {
+    "w": 0,
+    "type": "pct",
+    "expected_coercion": "auto"
+  },
+  "cell_widths": [
+    {
+      "w": 5000,
+      "type": "pct",
+      "expected_coercion": null
+    },
+    {
+      "w": 0,
+      "type": "dxa",
+      "expected_coercion": "auto"
+    }
+  ]
+}

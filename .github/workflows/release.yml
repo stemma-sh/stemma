@@ -1,0 +1,141 @@
+name: release
+
+# Pushing a version tag (v0.1.0) builds the stemma-mcp binary matrix, publishes
+# the npm packages (@stemma-sh/mcp + per-platform binaries), and attaches the
+# raw binaries to a GitHub release. See RELEASING.md for the full checklist,
+# including the one-time setup (npm org, NPM_TOKEN secret) this depends on.
+
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege by default; each job that needs more declares it itself.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-guard:
+    # A tag that does not match the crate version would publish npm packages
+    # whose version disagrees with --version. Refuse, don't reconcile.
+    name: tag matches stemma-mcp crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag to Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' stemma-mcp/Cargo.toml | head -1)"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Tag v$tag does not match stemma-mcp version $crate."
+            exit 1
+          fi
+          echo "Releasing stemma-mcp $crate"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version-guard
+    strategy:
+      # A release is all five platforms or nothing — a partial matrix must not
+      # publish, so let one failure cancel the rest.
+      matrix:
+        include:
+          # ubuntu-22.04 pins the glibc floor (2.35) for the linux binaries.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, bin: stemma-mcp }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, bin: stemma-mcp }
+          # GitHub retired its Intel macOS runner pool (macos-13) in late
+          # 2025; the Intel binary cross-compiles on an arm64 Mac — the macOS
+          # toolchain targets both architectures natively.
+          - { target: x86_64-apple-darwin, os: macos-14, bin: stemma-mcp }
+          - { target: aarch64-apple-darwin, os: macos-14, bin: stemma-mcp }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, bin: stemma-mcp.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build -p stemma-mcp --release --target ${{ matrix.target }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.target }}/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  npm-publish:
+    # Deliberately minimal: downloads prebuilt artifacts and publishes — no
+    # dependency installs, no test runs. This job holds publish rights; code
+    # execution belongs in ci.yml and the build job.
+    name: publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance attestations (and trusted publishing later)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Assemble packages (strict — all five platforms)
+        run: bash stemma-mcp/npm/build-npm-packages.sh binaries out
+      - name: Publish platform packages, then the wrapper
+        # The wrapper goes last: from the moment @stemma-sh/mcp resolves at a
+        # version, every binary it pins must already exist.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in out/mcp-*/; do
+            npm publish "$pkg" --access public --provenance
+          done
+          npm publish out/mcp --access public --provenance
+
+  github-release:
+    name: attach binaries to the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+      - name: Package archives + checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          for dir in binaries/*/; do
+            target="$(basename "$dir")"
+            case "$target" in
+              *windows*)
+                (cd "$dir" && zip -q "$GITHUB_WORKSPACE/release/stemma-mcp-$version-$target.zip" *)
+                ;;
+              *)
+                chmod 0755 "$dir"/stemma-mcp
+                tar -C "$dir" -czf "release/stemma-mcp-$version-$target.tar.gz" .
+                ;;
+            esac
+          done
+          (cd release && sha256sum * > sha256sums.txt)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed." \
+            release/*

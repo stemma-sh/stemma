@@ -1,0 +1,5 @@
+{
+  "name": "none-allows-opposing",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with table-level borders (single sz=8 black). Cell (0,0) has tcBorders right=none. Cell (0,1) has tcBorders left=single sz=12 red. Per MS-OI29500 SS2.1.169, none means 'I have no border' so the opposing red border should display."
+}

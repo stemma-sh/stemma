@@ -1,0 +1,5 @@
+{
+  "name": "ordering-deletion-consecutive",
+  "description": "Multiple consecutive deletions in middle - all should appear at original position",
+  "source": "generated for ordering tests"
+}

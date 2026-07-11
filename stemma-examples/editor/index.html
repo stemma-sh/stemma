@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>stemma · editor</title>
+    <link rel="stylesheet" href="../shared/styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "prosemirror-model": "https://esm.sh/prosemirror-model@1.23.0",
+          "prosemirror-transform": "https://esm.sh/prosemirror-transform@1.10.2?external=prosemirror-model",
+          "prosemirror-state": "https://esm.sh/prosemirror-state@1.4.3?external=prosemirror-model,prosemirror-transform",
+          "prosemirror-view": "https://esm.sh/prosemirror-view@1.34.3?external=prosemirror-model,prosemirror-state,prosemirror-transform",
+          "prosemirror-keymap": "https://esm.sh/prosemirror-keymap@1.2.2?external=prosemirror-state",
+          "prosemirror-commands": "https://esm.sh/prosemirror-commands@1.6.0?external=prosemirror-model,prosemirror-state,prosemirror-transform",
+          "prosemirror-history": "https://esm.sh/prosemirror-history@1.4.1?external=prosemirror-state,prosemirror-transform"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <header>
+      <p class="crumb"><a href="../">stemma-examples</a> / Word editor</p>
+      <h1>Word editor</h1>
+      <p class="tagline">
+        Open a <code>.docx</code> and edit it with its real formatting — fonts,
+        sizes, colors, highlights, alignment, inline images — rendered from
+        stemma's <code>/rich</code> projection. In <strong>Suggesting</strong>
+        mode edits land as <ins>tracked</ins> <del>changes</del>; in
+        <strong>Editing</strong> mode, directly. Commits are optimistic, so a
+        far server's round-trip stays invisible.
+      </p>
+    </header>
+
+    <section class="toolbar">
+      <label class="file-button">
+        Open .docx
+        <input id="file" type="file" accept=".docx" hidden />
+      </label>
+      <span class="samples" id="samples"></span>
+
+      <span class="divider"></span>
+
+      <div class="segmented" role="group" aria-label="Edit mode">
+        <button id="mode-suggesting" aria-pressed="true">Suggesting</button>
+        <button id="mode-editing" aria-pressed="false">Editing</button>
+      </div>
+
+      <div class="fmt" role="group" aria-label="Formatting">
+        <button id="fmt-bold" class="fmt-btn" title="Bold (Ctrl/Cmd+B)" aria-pressed="false" disabled><b>B</b></button>
+        <button id="fmt-italic" class="fmt-btn" title="Italic (Ctrl/Cmd+I)" aria-pressed="false" disabled><i>I</i></button>
+        <button id="fmt-underline" class="fmt-btn" title="Underline (Ctrl/Cmd+U)" aria-pressed="false" disabled><span style="text-decoration:underline">U</span></button>
+        <button id="fmt-strike" class="fmt-btn" title="Strikethrough" aria-pressed="false" disabled><s>S</s></button>
+      </div>
+
+      <div class="fmt" role="group" aria-label="Run formatting">
+        <select id="fmt-font" class="fmt-select" title="Font family" disabled>
+          <option value="">Font</option>
+          <option>Times New Roman</option>
+          <option>Arial</option>
+          <option>Calibri</option>
+          <option>Georgia</option>
+          <option>Courier New</option>
+          <option>Verdana</option>
+        </select>
+        <select id="fmt-size" class="fmt-select" title="Font size (pt)" disabled>
+          <option value="">Size</option>
+          <option>8</option><option>9</option><option>10</option><option>11</option>
+          <option>12</option><option>14</option><option>16</option><option>18</option>
+          <option>20</option><option>24</option><option>28</option><option>36</option>
+        </select>
+        <label class="fmt-color" title="Text color"><span>A</span><input type="color" id="fmt-color" value="#000000" disabled /></label>
+        <select id="fmt-highlight" class="fmt-select" title="Highlight" disabled>
+          <option value="">Highlight</option>
+          <option value="yellow">Yellow</option>
+          <option value="green">Green</option>
+          <option value="cyan">Cyan</option>
+          <option value="magenta">Magenta</option>
+          <option value="red">Red</option>
+          <option value="lightGray">Gray</option>
+          <option value="none">None</option>
+        </select>
+        <button id="fmt-link" class="fmt-btn" title="Insert/remove link" disabled>🔗</button>
+        <button id="fmt-image" class="fmt-btn" title="Insert image" disabled>🖼</button>
+        <button id="fmt-comment" class="fmt-btn" title="Comment on selection" disabled>💬</button>
+        <input id="image-file" type="file" accept="image/*" hidden />
+      </div>
+
+      <div class="fmt" role="group" aria-label="Paragraph">
+        <button id="fmt-align-left" class="fmt-btn" title="Align left" disabled>L</button>
+        <button id="fmt-align-center" class="fmt-btn" title="Center" disabled>C</button>
+        <button id="fmt-align-right" class="fmt-btn" title="Align right" disabled>R</button>
+        <button id="fmt-align-justify" class="fmt-btn" title="Justify" disabled>J</button>
+        <button id="fmt-bullet" class="fmt-btn" title="Bullet list (toggle)" disabled>•</button>
+        <button id="fmt-outdent" class="fmt-btn" title="Decrease indent / promote list item" disabled>&lt;</button>
+        <button id="fmt-indent" class="fmt-btn" title="Increase indent / demote list item" disabled>&gt;</button>
+      </div>
+
+      <label class="author" id="author-wrap">
+        Author
+        <input id="author" type="text" value="ProseMirror demo" />
+      </label>
+
+      <button id="commit" disabled>Commit 0 changes</button>
+
+      <span class="spacer"></span>
+
+      <button id="export" class="ghost" disabled>Export</button>
+    </section>
+
+    <p id="status" class="status">Open a <code>.docx</code> — or click a sample — to begin.</p>
+
+    <!-- Inline popover for link URL / comment body (replaces window.prompt). -->
+    <div id="inline-popover" class="inline-popover hidden" role="dialog">
+      <label id="popover-label" for="popover-input">Link URL</label>
+      <input id="popover-input" type="text" />
+      <textarea id="popover-textarea" rows="3" class="hidden"></textarea>
+      <div class="popover-actions">
+        <button id="popover-cancel" class="ghost" type="button">Cancel</button>
+        <button id="popover-ok" type="button">OK</button>
+      </div>
+    </div>
+
+    <div id="image-bar" class="image-bar hidden" role="group" aria-label="Resize image">
+      <button id="image-smaller" type="button" title="Smaller">−</button>
+      <input id="image-width" type="number" min="16" step="1" title="Image width (px)" aria-label="Image width in pixels" />
+      <span class="unit">px</span>
+      <button id="image-bigger" type="button" title="Bigger">+</button>
+    </div>
+
+    <main class="split">
+      <div>
+        <div id="editor" class="editor page"></div>
+
+      <aside class="empty-state" id="empty-state">
+        <h2>How this example works</h2>
+        <ol>
+          <li><strong>Open</strong> a <code>.docx</code> — it renders with its full character/paragraph formatting from stemma's rich projection.</li>
+          <li>Pick a mode. <strong>Suggesting</strong> writes edits as tracked changes; <strong>Editing</strong> bakes them in directly.</li>
+          <li><strong>Format</strong> a selection with <strong>B / I / U / S</strong> (or ⌘/Ctrl+B/I/U) — the marks ride along when you commit, round-tripping through stemma's typed <code>replace</code>.</li>
+          <li><strong>Edit</strong> text, then <strong>Commit</strong> — each changed block becomes one guard-pinned op. The redline shows instantly and syncs in the background.</li>
+          <li><strong>Export</strong> the document exactly as you see it.</li>
+        </ol>
+        <p class="note">Tables render as real tables, images inline, equations via MathJax, headers/footers and page borders from the section. The toolbar authors bold/italic/underline/strike plus <strong>font, size, color, highlight</strong> (via the engine's <code>set_format</code> op — color/highlight as a tracked <code>rPrChange</code>) and <strong>alignment/indent</strong> (via <code>set_para_format</code>).</p>
+      </aside>
+      </div>
+
+      <aside class="comments" id="comments">
+        <section id="suggestions" class="rail-section hidden">
+          <h2>Suggestions</h2>
+          <div id="suggestions-list"></div>
+        </section>
+        <section class="rail-section">
+          <h2>Comments</h2>
+          <div id="comments-list"><p class="empty">No comments yet. Select text and click 💬 to add one.</p></div>
+        </section>
+      </aside>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

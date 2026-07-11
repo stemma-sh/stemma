@@ -1,0 +1,7 @@
+{
+  "name": "direct-zero-overrides",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22, \u00a717.3.1.12",
+  "description": "Direct w:ind w:left='0' on a numbered paragraph should zero out the numbering indent.",
+  "expected_behavior": "P0: left=0, firstLine=0 (direct replaces). P1: left=720, firstLine=-360 (numbering only).",
+  "current_status": "GAP-025 \u2014 per-field merge lets firstLine leak from numbering"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "compat-differentiate-multirow",
+  "spec_ref": "MS-DOCX \u00a72.3.4",
+  "description": "Document with differentiateMultirowTableHeaders=1 compat setting",
+  "expected_behavior": "Parser should expose differentiateMultirowTableHeaders in CompatSettings",
+  "current_status": "GAP \u2014 differentiateMultirowTableHeaders not parsed"
+}

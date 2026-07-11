@@ -1,0 +1,7 @@
+{
+  "name": "empty-table-cells",
+  "spec_ref": "ISO 29500-1 \u00a717.4.66",
+  "description": "Table with cells: normal content, default empty, explicit empty <w:p/>, no paragraph at all",
+  "expected_behavior": "Every cell should have at least one (possibly empty) paragraph in the domain model",
+  "current_status": "SUPPORTED \u2014 testing empty cell paragraph invariant"
+}

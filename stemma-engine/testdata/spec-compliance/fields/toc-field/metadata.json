@@ -1,0 +1,7 @@
+{
+  "name": "toc-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.36",
+  "description": "Paragraph with a fldSimple TOC field with \\o switch",
+  "expected_behavior": "Parser should produce OpaqueInline with FieldKind::Simple and instruction containing 'TOC'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed regardless of instruction type"
+}

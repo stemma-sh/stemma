@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.38",
+  "description": "Three-level style chain with tab stop adds and clears. Tests overlay_tab_stops through basedOn chain.",
+  "expected": {
+    "para_0_grandparent": "tabs: 720(left), 1440(center), 2880(right/dot)",
+    "para_1_parent": "tabs: 720(left), 2880(right/dot), 4320(left) [1440 cleared]",
+    "para_2_child": "tabs: 2880(right/dot), 4320(left), 5760(decimal) [720 cleared]"
+  }
+}

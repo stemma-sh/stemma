@@ -1,0 +1,6 @@
+{
+  "name": "preexisting-insertions",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.18",
+  "description": "Pre-existing w:ins with author/date around 'wonderful '",
+  "expected_behavior": "import_docx().canonical should show TrackedSegment with Inserted status and RevisionInfo"
+}

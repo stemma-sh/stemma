@@ -1,0 +1,7 @@
+{
+  "name": "start-omitted-default-zero",
+  "spec_ref": "ISO 29500-1 \u00a717.9.25",
+  "description": "Level with no w:start element. Per spec, default is 0. numId=1 (start omitted): should be 0., 1., 2. numId=2 (start=1, control): should be 1., 2., 3.",
+  "expected_behavior": "numId=1: '0.', '1.', '2.' (start defaults to 0). numId=2: '1.', '2.', '3.' (explicit start=1).",
+  "current_status": "TESTING"
+}

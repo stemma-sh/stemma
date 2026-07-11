@@ -1,0 +1,7 @@
+{
+  "name": "inline-math",
+  "spec_ref": "ISO 29500-1 \u00a722",
+  "description": "Paragraph with an inline math equation (m:oMath)",
+  "expected_behavior": "OpaqueInline with kind Omml should be present",
+  "current_status": "SUPPORTED"
+}

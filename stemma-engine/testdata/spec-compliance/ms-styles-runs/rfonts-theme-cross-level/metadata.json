@@ -1,0 +1,6 @@
+{
+  "name": "rfonts-theme-cross-level",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26 note e",
+  "description": "Parent style: asciiTheme=majorHAnsi. Child style (basedOn parent): ascii='Courier New'. Child's ascii should override parent's asciiTheme.",
+  "expected_behavior": "font_family='Courier New'"
+}

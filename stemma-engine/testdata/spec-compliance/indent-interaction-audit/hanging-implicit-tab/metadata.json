@@ -1,0 +1,7 @@
+{
+  "name": "hanging-implicit-tab",
+  "spec_ref": "ECMA-376 \u00a717.3.1.38",
+  "description": "P0: left=1440, hanging=360, no explicit tabs. P1: same + explicit tab at 1080.",
+  "expected_behavior": "P0 and P1 should have identical tab stop behavior. Implicit tab at 1080.",
+  "current_status": "GAP-100 \u2014 synthesize_default_tab_stops ignores hanging implicit tab"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "opaque-roundtrip",
+  "description": "Opaque element roundtrip safety net: SDTs, fldSimple fields, hyperlinks, bookmarks, and inline images with text changes around them",
+  "opaque_elements": [
+    "w:sdt (block-level content control)",
+    "w:fldSimple (inline field)",
+    "w:hyperlink (inline hyperlink)",
+    "w:bookmarkStart/End (bookmark pair)",
+    "w:drawing (inline image)",
+    "w:sdt in table cell"
+  ],
+  "changes": [
+    "Text around fldSimple field changed",
+    "Text around hyperlink changed",
+    "Text around bookmark changed",
+    "Text around inline image changed",
+    "Plain paragraph text changed",
+    "Table cell text changed (adjacent to SDT cell)",
+    "Block-level SDT unchanged"
+  ]
+}

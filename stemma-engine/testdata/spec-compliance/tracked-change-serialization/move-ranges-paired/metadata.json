@@ -1,0 +1,5 @@
+{
+  "name": "move-ranges-paired",
+  "spec_ref": "ECMA-376 \u00a717.13.5.23-28",
+  "description": "Paragraph move to verify moveFrom/moveTo range pairing"
+}

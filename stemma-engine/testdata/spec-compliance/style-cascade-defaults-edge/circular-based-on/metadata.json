@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3",
+  "description": "CycleA basedOn CycleB, CycleB basedOn CycleA. Tests cycle detection: code should not infinite loop and should resolve properties from each style's own definitions.",
+  "expected": {
+    "para_1": "font_size=24, bold=on (CycleA), color=0000FF (CycleB, before cycle stops)",
+    "para_2": "color=0000FF (CycleB), font_size=24, bold=on (CycleA, before cycle stops)"
+  }
+}

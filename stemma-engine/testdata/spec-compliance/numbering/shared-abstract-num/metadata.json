@@ -1,0 +1,7 @@
+{
+  "name": "shared-abstract-num",
+  "spec_ref": "ISO 29500-1 \u00a717.9.8",
+  "description": "Two lists sharing abstractNumId=0; numId=2 has startOverride=10",
+  "expected_behavior": "First list: 1., 2. Second list: 10., 11.",
+  "current_status": "SUPPORTED"
+}

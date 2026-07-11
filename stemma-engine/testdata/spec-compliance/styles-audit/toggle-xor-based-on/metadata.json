@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + \u00a717.7.4.3",
+  "description": "Toggle XOR through basedOn chain (bold on/on, on/off)",
+  "expected": {
+    "para_1": "bold ON (single level)",
+    "para_2": "bold OFF (on XOR on = off)",
+    "para_3": "bold ON (on XOR off = on)"
+  }
+}

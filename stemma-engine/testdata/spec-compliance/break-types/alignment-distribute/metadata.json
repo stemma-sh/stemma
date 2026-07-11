@@ -1,0 +1,7 @@
+{
+  "name": "alignment-distribute",
+  "spec_ref": "ISO 29500-1 \u00a717.18.44",
+  "description": "Paragraphs with all ST_Jc alignment values including distribute and thaiDistribute",
+  "expected_behavior": "Parser should preserve distribute/thaiDistribute as distinct Alignment variants",
+  "current_status": "PARTIAL \u2014 Alignment enum lacks Distribute/ThaiDistribute; these silently map to Left"
+}

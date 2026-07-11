@@ -1,0 +1,6 @@
+{
+  "name": "border-conflict-weight",
+  "spec_ref": "MS-OI29500 \u00a717.4.66(a)",
+  "description": "Table single sz=24. Cell (0,0) double sz=4, cell (0,1) double sz=18.",
+  "expected_behavior": "Cell (0,0): table single wins (24>12). Cell (0,1): cell double wins (54>24)."
+}

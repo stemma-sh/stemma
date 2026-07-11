@@ -1,0 +1,6 @@
+{
+  "name": "footnote-props-per-section",
+  "spec_ref": "ISO 29500-1 sections 17.11.3",
+  "description": "S1: footnotePr pos=pageBottom numFmt=lowerRoman. S2: footnotePr pos=beneathText numStart=10.",
+  "expected_behavior": "Each section should have distinct footnote_pr with correct position, format, and start values."
+}

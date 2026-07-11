@@ -1,0 +1,6 @@
+{
+  "name": "spacing-line-rules",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Paragraphs with various line spacing rules: auto (240/360/480), exact (240), atLeast (240)",
+  "expected_behavior": "Domain model should preserve both the line value AND the lineRule correctly"
+}

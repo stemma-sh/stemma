@@ -1,0 +1,6 @@
+{
+  "name": "contextual-spacing",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.9",
+  "description": "contextualSpacing: P1+P2 (same style, spacing suppressed), P3 (different style, spacing kept)",
+  "expected_behavior": "Spacing between P1/P2 logically suppressed. P2/P3 keeps spacing. Domain model may or may not model contextualSpacing directly."
+}

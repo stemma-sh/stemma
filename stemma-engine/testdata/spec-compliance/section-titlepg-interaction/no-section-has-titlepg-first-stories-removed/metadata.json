@@ -1,0 +1,5 @@
+{
+  "name": "no-section-has-titlepg-first-stories-removed",
+  "spec_ref": "ISO 29500-1 section 17.10.6",
+  "description": "S1: no titlePg, declares Default+First headers+footers. S2: no titlePg, no declarations. No section has titlePg, so ALL First-kind stories should be removed entirely."
+}

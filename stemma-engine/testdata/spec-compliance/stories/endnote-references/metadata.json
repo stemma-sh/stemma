@@ -1,0 +1,5 @@
+{
+  "name": "endnote-references",
+  "spec_ref": "ISO 29500-1 \u00a717.11.2",
+  "description": "Body contains endnoteReference linking to EndnoteStory id=1"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "no-endnote",
+  "spec_ref": "ISO 29500-1 \u00a717.6.9",
+  "description": "Section with w:noEndnote (endnotes suppressed)",
+  "expected_behavior": "SectionProperties should expose noEndnote boolean"
+}

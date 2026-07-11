@@ -1,0 +1,5 @@
+{
+  "name": "cell-margin-per-side-cascade",
+  "spec_ref": "ISO 29500-1 SS17.4.68",
+  "description": "Table-level margins: top=100, left=200, bottom=100, right=200. Cell (0,0) overrides only left=400 via tcMar. Per SS17.4.68, tcMar overrides tblCellMar \u2014 but the spec says 'shall override the table cell margins', meaning the entire set is replaced. So cell (0,0) should have left=400 and the other sides fall back to defaults (not from table-level)."
+}

@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3 + \u00a717.7.4.14",
+  "description": "numPr inheritance through 3-level basedOn chain",
+  "expected": {
+    "para_1_numpr": "inherited from NumStyleA via chain",
+    "para_2_numpr": "direct from NumStyleA",
+    "para_3_numpr": "inherited from NumStyleA via NumStyleB"
+  }
+}

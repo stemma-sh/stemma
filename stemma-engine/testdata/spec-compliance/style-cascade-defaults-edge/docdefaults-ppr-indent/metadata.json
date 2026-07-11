@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.5",
+  "description": "docDefaults pPr sets ind left=720 right=360. Tests that unstyled paragraphs get indent from docDefaults, and that direct formatting overrides per-attribute.",
+  "expected": {
+    "para_1": "indent left=720 right=360 (from docDefaults pPr)",
+    "para_2": "indent left=0 (direct) right=360 (from docDefaults pPr)"
+  }
+}

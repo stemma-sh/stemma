@@ -1,0 +1,7 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Two paragraph styles both have w:default='1'. Per spec only one should exist. Tests that the code handles this gracefully and doesn't crash.",
+  "expected": {
+    "para_1": "Properties from whichever default wins (implementation-defined order)"
+  }
+}

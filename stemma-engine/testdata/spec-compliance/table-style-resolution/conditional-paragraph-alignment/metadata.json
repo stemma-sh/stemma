@@ -1,0 +1,7 @@
+{
+  "name": "conditional-paragraph-alignment",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.1",
+  "description": "Table style with firstRow conditional (jc=center in pPr) and lastRow conditional (jc=right in pPr).",
+  "expected_behavior": "First row paragraphs: center alignment from conditional pPr. Last row paragraphs: right alignment from conditional pPr. Middle rows: no alignment (default/left).",
+  "current_status": "GAP-020 \u2014 conditional pPr not propagated to paragraphs"
+}

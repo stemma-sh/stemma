@@ -1,0 +1,7 @@
+{
+  "name": "strikethrough-types",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.37/6",
+  "description": "Paragraph with single strikethrough (w:strike) and double strikethrough (w:dstrike)",
+  "expected_behavior": "Both runs should carry Mark::Strike; double-strike should be distinguishable from single",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 both map to Mark::Strike, type detail lost"
+}

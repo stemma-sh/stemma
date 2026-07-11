@@ -1,0 +1,6 @@
+{
+  "name": "tblind-non-left-justification",
+  "spec_ref": "MS-OI29500 \u00a717.4.50(a)",
+  "description": "Table 1 center+indent=720. Table 2 right+indent=720.",
+  "expected_behavior": "Both: indent 720tw honored regardless of justification."
+}

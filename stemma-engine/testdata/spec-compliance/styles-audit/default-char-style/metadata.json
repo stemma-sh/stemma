@@ -1,0 +1,14 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Default character style applies to unstyled runs",
+  "expected": {
+    "para_1_run": {
+      "font_size": 28,
+      "color": "FF0000"
+    },
+    "para_2_run": {
+      "color": "0000FF",
+      "font_size": 28
+    }
+  }
+}

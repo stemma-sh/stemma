@@ -1,0 +1,7 @@
+{
+  "name": "border-conflict",
+  "spec_ref": "ISO 29500-1 \u00a717.4.38",
+  "description": "Table with thick red table-level borders; cell (0,0) overrides with thin blue borders",
+  "expected_behavior": "Cell (0,0) should have blue/sz=4 borders; cell (0,1) should have red/sz=24 borders from table-level",
+  "current_status": "SUPPORTED \u2014 testing conflict resolution priority"
+}

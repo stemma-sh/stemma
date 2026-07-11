@@ -1,0 +1,5 @@
+{
+  "name": "no-revisions-in-comments",
+  "spec_ref": "MS-OI29500 \u00a72.1.313",
+  "description": "Comment with text changes around it \u2014 comments must not contain tracked changes"
+}

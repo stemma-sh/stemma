@@ -1,0 +1,7 @@
+{
+  "name": "char-unit-prefix-stripping",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, MS-OI29500 2.1.44",
+  "description": "P0: w:left=720, w:startChars=200, w:endChars=100, tab at 1440, text '(a)\\tBody text...'. P1: same indent, no prefix (control).",
+  "expected_behavior": "P0 after prefix stripping: start_chars=200, end_chars=100 must survive. GAP-101 bug: prefix stripping branch hardcodes start_chars=None, end_chars=None.",
+  "current_status": "GAP-101"
+}

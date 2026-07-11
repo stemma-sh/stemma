@@ -1,0 +1,7 @@
+{
+  "name": "section-type-val-required",
+  "spec_ref": "MS-OI29500 \u00a717.6.22",
+  "description": "Section type with explicit val=nextPage (Word requires val attribute)",
+  "expected_behavior": "Parser should parse section type. If val is absent, Word behavior differs from spec.",
+  "current_status": "PASS \u2014 section type val is parsed correctly"
+}

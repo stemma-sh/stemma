@@ -1,0 +1,7 @@
+{
+  "name": "nested-bookmarks",
+  "spec_ref": "ISO 29500-1 \u00a717.13.6.2/1",
+  "description": "Two overlapping bookmark ranges: A wraps text1+text2, B wraps text2+text3",
+  "expected_behavior": "Four Decoration nodes (two starts, two ends) with correct pairing by id",
+  "current_status": "SUPPORTED \u2014 overlapping bookmarks parsed as independent decorations"
+}

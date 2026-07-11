@@ -1,0 +1,5 @@
+{
+  "name": "adjacent-conflict",
+  "spec_ref": "ISO 29500-1 SS17.4.66 rule 3",
+  "description": "1x3 table with conflicting borders between adjacent cells. Cell (0,0) right=single sz=24 red (weight=24). Cell (0,1) left=single sz=4 blue (weight=4), right=double sz=12 green (weight=36). Cell (0,2) left=single sz=8 black (weight=8). Per SS17.4.66 rule 3, higher weight wins at each shared edge."
+}

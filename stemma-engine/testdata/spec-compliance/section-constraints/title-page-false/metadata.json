@@ -1,0 +1,6 @@
+{
+  "name": "title-page-false",
+  "spec_ref": "ISO 29500-1 \u00a717.10.6",
+  "description": "Section with default + first-page headers and titlePg val='false'. First-page header should be filtered out.",
+  "expected_behavior": "First-kind header refs and stories should be filtered from the model since titlePg is explicitly false."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "number-format-types",
+  "spec_ref": "ISO 29500-1 \u00a717.9.17",
+  "description": "Lists with bullet, lowerRoman, upperRoman, and upperLetter formats",
+  "expected_behavior": "bullet=bullet, lowerRoman=i./ii./iii., upperRoman=I./II., upperLetter=A./B.",
+  "current_status": "SUPPORTED"
+}

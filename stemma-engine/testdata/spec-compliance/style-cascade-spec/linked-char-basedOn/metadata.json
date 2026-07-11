@@ -1,0 +1,22 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6 + \u00a717.7.4.3",
+  "description": "Linked char style with basedOn chain: inherited props must reach para style runs",
+  "expected": {
+    "para_1_linkedpara": {
+      "bold": true,
+      "italic": true,
+      "color": "FF0000",
+      "font_size": 32
+    },
+    "para_2_linkedchar_direct": {
+      "bold": true,
+      "italic": true,
+      "color": "FF0000"
+    },
+    "para_3_charbase_only": {
+      "bold": false,
+      "italic": true,
+      "color": "FF0000"
+    }
+  }
+}

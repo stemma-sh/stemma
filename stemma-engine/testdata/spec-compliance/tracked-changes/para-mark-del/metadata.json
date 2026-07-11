@@ -1,0 +1,6 @@
+{
+  "name": "para-mark-del",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.28",
+  "description": "Paragraph with deleted paragraph mark (w:del in w:pPr/w:rPr)",
+  "expected_behavior": "ParagraphNode.para_mark_status should be Deleted with author/date"
+}

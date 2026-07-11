@@ -1,0 +1,5 @@
+{
+  "name": "gutter-and-distances",
+  "spec_ref": "ISO 29500-1 section 17.6.17",
+  "description": "S1(nextPage, gutter=720, header=720, footer=720) -> S2(continuous, margins declared but NO gutter/header/footer attributes). S2 should inherit gutter=720, header_distance=720, footer_distance=720."
+}

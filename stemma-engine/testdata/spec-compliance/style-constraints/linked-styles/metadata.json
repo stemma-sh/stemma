@@ -1,0 +1,7 @@
+{
+  "name": "linked-styles",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked paragraph style 'HeadingLinked' (bold only) with w:link to 'HeadingLinkedChar' (italic + red + 14pt). Para style and char style have DIVERGENT rPr to prove the linked char style wins.",
+  "expected_behavior": "Para 1: italic=on, color=FF0000, size=28 from linked character style. bold=off (para style's rPr is NOT used). Para 2: normal formatting.",
+  "current_status": "IMPLEMENTED \u2014 w:link parsed, linked char style rPr used for paragraph runs"
+}

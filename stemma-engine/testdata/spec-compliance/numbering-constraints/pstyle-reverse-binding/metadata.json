@@ -1,0 +1,7 @@
+{
+  "name": "pstyle-reverse-binding",
+  "spec_ref": "ISO 29500-1 \u00a717.9.23",
+  "description": "pStyle reverse binding: abstractNum level 0 has <w:pStyle w:val='ListBullet'/>. Style 'ListBullet' has no numPr. P1 with style 'ListBullet' should get numbering from the level.",
+  "expected_behavior": "P1: has bullet numbering (from abstract level's pStyle binding). P2: no numbering.",
+  "current_status": "TESTING \u2014 pStyle reverse binding likely unimplemented"
+}

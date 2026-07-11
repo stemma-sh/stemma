@@ -1,0 +1,7 @@
+{
+  "name": "field-balance",
+  "spec_ref": "ISO 29500-1 \u00a717.16.2",
+  "description": "Paragraph with balanced complex field (begin/instrText/separate/result/end) and a plain paragraph",
+  "expected_behavior": "Field opaques in order: Begin, Instruction, Separate, End",
+  "current_status": "SUPPORTED \u2014 complex field elements parsed as individual OpaqueInlines"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "compat-mode-15",
+  "spec_ref": "MS-DOCX \u00a72.3.5",
+  "description": "Document with compatibilityMode=15 in settings.xml",
+  "expected_behavior": "Parser should expose compatibilityMode=15 from w:compat/w:compatSetting",
+  "current_status": "GAP \u2014 compatSetting elements not parsed at all"
+}

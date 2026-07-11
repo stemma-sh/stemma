@@ -1,0 +1,5 @@
+{
+  "name": "opaque-redline-hyperlink",
+  "description": "Text changes around a w:hyperlink \u2014 hyperlink must not end up inside w:del/w:ins",
+  "pipeline": "BlockModified with OpaqueInline(Hyperlink)"
+}

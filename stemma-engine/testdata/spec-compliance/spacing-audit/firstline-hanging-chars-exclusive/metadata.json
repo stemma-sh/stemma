@@ -1,0 +1,6 @@
+{
+  "name": "firstline-hanging-chars-exclusive",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "firstLineChars/hangingChars and firstLine/hanging mutual exclusivity",
+  "expected_behavior": "P0: firstLineChars is IGNORED, hangingChars=100 wins. P1: firstLineChars=200 (control). P2: hangingChars=100 (control). P3: firstLine is IGNORED, hanging=720 wins -> effective_first_line=-720."
+}

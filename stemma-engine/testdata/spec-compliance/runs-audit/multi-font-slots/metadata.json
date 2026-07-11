@@ -1,0 +1,6 @@
+{
+  "name": "multi-font-slots",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Run with all four rFonts slots set to different fonts",
+  "expected_behavior": "Each font slot should be independently captured"
+}

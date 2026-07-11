@@ -1,0 +1,6 @@
+{
+  "name": "toggle-para-style-reset",
+  "spec_ref": "MS-OI29500 \u00a717.7.8",
+  "description": "Doc defaults: bold=on. Paragraph style: bold=on. Per spec: XOR -> bold=off. Per Word: reset -> bold=on.",
+  "expected_behavior": "Word behavior: bold=on (paragraph style resets rather than XORs). This is a known divergence between spec and Word."
+}

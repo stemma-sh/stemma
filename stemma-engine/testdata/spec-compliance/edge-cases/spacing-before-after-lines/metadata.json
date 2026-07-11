@@ -1,0 +1,6 @@
+{
+  "name": "spacing-before-after-lines",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "beforeLines/afterLines precedence over before/after",
+  "expected_behavior": "If beforeLines is present alongside before, beforeLines takes precedence per spec. We may not implement beforeLines at all."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "vanish",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.41",
+  "description": "Paragraph with a hidden text run (w:vanish)",
+  "expected_behavior": "Parser should flag the hidden run or exclude it from visible text projection",
+  "current_status": "NOT_PARSED \u2014 w:vanish silently ignored; hidden text appears as normal text"
+}

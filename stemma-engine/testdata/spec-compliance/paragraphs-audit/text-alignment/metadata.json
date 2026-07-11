@@ -1,0 +1,6 @@
+{
+  "name": "text-alignment",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.39",
+  "description": "P0-P4: textAlignment with values top/center/baseline/bottom/auto. P5: no textAlignment (control).",
+  "expected_behavior": "Each paragraph should preserve its textAlignment value in the model. P5 should have no textAlignment."
+}

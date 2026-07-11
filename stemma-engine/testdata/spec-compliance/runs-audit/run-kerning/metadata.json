@@ -1,0 +1,6 @@
+{
+  "name": "run-kerning",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.19(a)",
+  "description": "Run with kerning threshold (w:kern)",
+  "expected_behavior": "Kerning threshold should be preserved in the model"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "spacing-before-after-basic",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "Basic before/after spacing values parsed correctly",
+  "expected_behavior": "P0: before=240, after=200."
+}

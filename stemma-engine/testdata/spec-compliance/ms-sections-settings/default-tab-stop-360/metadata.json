@@ -1,0 +1,7 @@
+{
+  "name": "default-tab-stop-360",
+  "spec_ref": "MS-OI29500 \u00a717.15.1.25",
+  "description": "Document with defaultTabStop=360. Word restricts to short (0..32767).",
+  "expected_behavior": "Parser should read defaultTabStop=360 from settings.xml",
+  "current_status": "PASS \u2014 defaultTabStop is already parsed"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "flow-control-keep-next",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.14/15",
+  "description": "Paragraph with w:keepNext and w:keepLines in pPr",
+  "expected_behavior": "Parser should expose keepNext and keepLines flags on ParagraphNode",
+  "current_status": "NOT_PARSED \u2014 keepNext/keepLines silently ignored"
+}

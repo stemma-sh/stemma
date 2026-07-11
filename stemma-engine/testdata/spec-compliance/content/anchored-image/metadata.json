@@ -1,0 +1,7 @@
+{
+  "name": "anchored-image",
+  "spec_ref": "ISO 29500-1 \u00a720.4.2.3",
+  "description": "Paragraph with an image (verifies Drawing opaque kind)",
+  "expected_behavior": "OpaqueInline with kind Drawing should be present",
+  "current_status": "SUPPORTED"
+}

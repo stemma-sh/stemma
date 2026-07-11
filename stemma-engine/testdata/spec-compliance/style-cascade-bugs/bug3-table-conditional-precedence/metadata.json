@@ -1,0 +1,13 @@
+{
+  "spec": "MS-OI29500 \u00a717.4.54a + \u00a717.7.6(c)",
+  "bug": "Table conditional formatting precedence",
+  "description": "Table style with firstRow, firstCol, lastRow, nwCell, seCell. Tests that corner cells get highest precedence and that per-property fill-from-lower-precedence works correctly.",
+  "expected": {
+    "cell_0_0": "shading=FFC000 (nwCell > firstRow > firstCol), bold from firstRow",
+    "cell_0_2": "shading=4472C4 (firstRow), bold=true, font_size=28",
+    "cell_2_0": "shading=70AD47 (firstCol, no swCell defined)",
+    "cell_2_2": "shading=FF0000 (seCell > lastRow)",
+    "cell_1_0": "shading=70AD47 (firstCol)",
+    "cell_1_1": "no conditional shading"
+  }
+}

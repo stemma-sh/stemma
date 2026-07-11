@@ -1,0 +1,7 @@
+{
+  "name": "rpr-full-ordering",
+  "spec_ref": "ECMA-376 Annex A CT_RPr",
+  "description": "Diff pair with many rPr properties on surviving run, text change in third paragraph",
+  "expected_behavior": "All rPr child elements in ECMA-376 Annex A order after re-serialization",
+  "current_status": "BUG \u2014 bdr misordered (emitted after cs instead of position 28)"
+}

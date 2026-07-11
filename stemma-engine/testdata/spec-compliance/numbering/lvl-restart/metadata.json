@@ -1,0 +1,7 @@
+{
+  "name": "lvl-restart",
+  "spec_ref": "ISO 29500-1 \u00a717.9.10",
+  "description": "Two-level list where level 1 has lvlRestart=0 (never restart)",
+  "expected_behavior": "Level 1 counter continues across level 0 items: a), b), then c), d) \u2014 NOT restarting to a), b)",
+  "current_status": "NOT_PARSED \u2014 lvlRestart ignored; counter incorrectly resets to a), b) after each level 0 item"
+}

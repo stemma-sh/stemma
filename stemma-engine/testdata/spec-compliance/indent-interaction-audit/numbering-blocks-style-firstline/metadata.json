@@ -1,0 +1,7 @@
+{
+  "name": "numbering-blocks-style-firstline",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22, \u00a717.3.1.12",
+  "description": "Style 'FirstLineStyle': w:ind left=360, firstLine=240. Numbering level 0: w:ind left=720 (no firstLine). P0: style + numbering. P1: style only (control).",
+  "expected_behavior": "P0: left=720, firstLine=None (numbering w:ind replaces style w:ind entirely). P1: left=360, firstLine=240. GAP-103 bug: per-field merge leaks style firstLine=240 into P0.",
+  "current_status": "GAP-103"
+}

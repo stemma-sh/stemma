@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.24",
+  "description": "Tests paragraph border inheritance through basedOn chain. pBdr is whole-element replacement: child with pBdr replaces parent. Child without pBdr inherits parent borders.",
+  "expected": {
+    "para_0_parent": "borders: top=FF0000, bottom=0000FF",
+    "para_1_child": "borders: left=00FF00 only (top+bottom NOT inherited)",
+    "para_2_inherit": "borders: top=FF0000, bottom=0000FF (inherited)"
+  }
+}

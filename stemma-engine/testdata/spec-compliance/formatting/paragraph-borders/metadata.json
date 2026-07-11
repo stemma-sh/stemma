@@ -1,0 +1,7 @@
+{
+  "name": "paragraph-borders",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.24",
+  "description": "Paragraphs with bottom border and box border",
+  "expected_behavior": "Parser should expose paragraph borders (at minimum, presence of border on each side)",
+  "current_status": "NOT_PARSED \u2014 w:pBdr silently ignored (P0 gap)"
+}

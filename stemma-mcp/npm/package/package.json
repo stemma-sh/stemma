@@ -1,0 +1,37 @@
+{
+  "name": "@stemma-sh/mcp",
+  "version": "0.0.0-dev",
+  "description": "MCP server for tracked-changes DOCX editing, powered by the stemma engine. Prebuilt binaries — no Rust toolchain required.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "docx",
+    "tracked-changes",
+    "ooxml",
+    "redline",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stemma-sh/stemma.git",
+    "directory": "stemma-mcp/npm/package"
+  },
+  "homepage": "https://github.com/stemma-sh/stemma/tree/main/stemma-mcp#readme",
+  "license": "(MIT OR Apache-2.0)",
+  "bin": {
+    "stemma-mcp": "bin/stemma-mcp.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@stemma-sh/mcp-linux-x64": "0.0.0-dev",
+    "@stemma-sh/mcp-linux-arm64": "0.0.0-dev",
+    "@stemma-sh/mcp-darwin-x64": "0.0.0-dev",
+    "@stemma-sh/mcp-darwin-arm64": "0.0.0-dev",
+    "@stemma-sh/mcp-win32-x64": "0.0.0-dev"
+  }
+}

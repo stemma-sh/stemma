@@ -1,0 +1,7 @@
+{
+  "name": "ref-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.16",
+  "description": "Document with a bookmark and a REF field referencing it",
+  "expected_behavior": "Parser should produce OpaqueInline with FieldKind::Simple and instruction containing 'REF my_bookmark'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed; bookmark presence verifiable separately"
+}

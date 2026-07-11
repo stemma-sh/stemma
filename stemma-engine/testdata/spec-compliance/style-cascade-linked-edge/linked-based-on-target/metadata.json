@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6 + \u00a717.7.4.3",
+  "description": "LinkedParaT (bold=on, sz=28) linked to LinkedCharT (italic=on, basedOn BaseCharT(underline=on)). ChildPara basedOn LinkedParaT (color=00FF00). Tests whether linked overlay leaks into child styles via basedOn.",
+  "expected": {
+    "para_1": "bold=on (para), sz=28 (para), italic=on (linked char raw), underline=on (linked char basedOn via BaseCharT)",
+    "para_2": "bold=on (from LinkedParaT via basedOn), sz=28 (LinkedParaT), color=00FF00 (ChildPara). NO italic, NO underline \u2014 linked overlay from LinkedParaT should not leak into ChildPara."
+  }
+}

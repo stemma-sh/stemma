@@ -1,0 +1,5 @@
+{
+  "name": "mixed-footnote-settings",
+  "spec_ref": "ECMA-376 \u00a717.11.3 / \u00a717.11.2",
+  "description": "S1(nextPage, footnote decimal/continuous) -> S2(continuous, footnote lowerRoman/eachSect) -> S3(continuous, footnote upperLetter/eachPage). Continuous sections have independent footnote/endnote settings. Tests that each section's note properties are preserved per-section."
+}

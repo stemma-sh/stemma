@@ -1,0 +1,6 @@
+{
+  "name": "num-style-link-chain",
+  "spec_ref": "ECMA-376 section 17.9.21, section 17.9.27",
+  "description": "abstractNum 0 has numStyleLink='OutlineList' (no levels). abstractNum 1 has styleLink='OutlineList' with actual levels. Paragraphs using numId=1 (-> abstractNum 0) should follow the chain to get levels from abstractNum 1.",
+  "expected_behavior": "Paragraphs produce '1.', '2.', 'a)' via the numStyleLink chain."
+}

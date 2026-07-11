@@ -1,0 +1,7 @@
+{
+  "name": "linerule-default-style",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "Style defines spacing line=276 with no lineRule; should default to Auto",
+  "expected_behavior": "line_rule = Some(LineSpacingRule::Auto)",
+  "current_status": "BUG \u2014 style-only path does not apply lineRule default"
+}

@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.23 + \u00a717.7.4.3",
+  "description": "Three-level basedOn chain for pageBreakBefore. Root=true, child inherits true, grandchild explicitly sets false.",
+  "expected": {
+    "para_0": "page_break_before=true (from root style)",
+    "para_1": "page_break_before=true (inherited from root through child)",
+    "para_2": "page_break_before=false (grandchild explicitly overrides to false)"
+  }
+}

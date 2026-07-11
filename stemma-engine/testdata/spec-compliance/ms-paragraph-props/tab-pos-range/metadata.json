@@ -1,0 +1,7 @@
+{
+  "name": "tab-pos-range",
+  "spec_ref": "MS-OI29500 2.1.61 \u00a717.3.1.37",
+  "description": "Tab stops at: 1440 (normal), 31680 (max), 32000 (beyond max). Text has 2 tab characters.",
+  "expected_behavior": "Tab at 1440: normal. Tab at 31680: at max boundary. Tab at 32000: Word restricts to [-31680, 31680], should be clamped.",
+  "current_status": "GAP \u2014 we don't validate tab stop position range"
+}

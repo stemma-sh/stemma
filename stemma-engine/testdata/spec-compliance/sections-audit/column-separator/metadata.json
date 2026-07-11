@@ -1,0 +1,6 @@
+{
+  "name": "column-separator",
+  "spec_ref": "ISO 29500-1 \u00a717.6.4",
+  "description": "Section with 2 columns and w:sep=1 (separator line between columns)",
+  "expected_behavior": "SectionProperties should expose column separator boolean"
+}

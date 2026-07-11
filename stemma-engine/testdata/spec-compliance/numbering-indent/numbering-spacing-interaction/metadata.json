@@ -1,0 +1,7 @@
+{
+  "name": "numbering-spacing-interaction",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22, \u00a717.3.1.33",
+  "description": "Numbering doesn't define spacing; style spacing applies. Direct spacing overrides style.",
+  "expected_behavior": "P0: spacing before=120, after=120 (from style). P1: spacing before=0, after=120 (direct before overrides).",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "based-on-chain",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.3",
+  "description": "Three-level basedOn chain: C->B->A. Each level adds/overrides run properties.",
+  "expected_behavior": "StyleC paragraph: font=Arial, size=28, bold=on, italic=on. StyleA paragraph: font=Times New Roman, size=24.",
+  "current_status": "TESTING"
+}

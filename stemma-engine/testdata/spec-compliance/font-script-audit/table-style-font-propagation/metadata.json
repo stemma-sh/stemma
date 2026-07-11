@@ -1,0 +1,7 @@
+{
+  "name": "table-style-font-propagation",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6, \u00a717.3.2.26",
+  "description": "Table style: rPr ascii/hAnsi='Palatino Linotype', sz=20. Cell (0,0): no direct font. Cell (0,1): direct ascii='Impact'.",
+  "expected_behavior": "Cell (0,0): font_family='Palatino Linotype' from table style. Cell (0,1): font_family='Impact' from direct.",
+  "current_status": "GAP-135 \u2014 table style rPr font propagation"
+}

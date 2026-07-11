@@ -1,0 +1,7 @@
+{
+  "name": "jc-default-left",
+  "spec_ref": "MS-OI29500 2.1.45 \u00a717.3.1.13",
+  "description": "P0: no style, no direct jc \u2014 Word defaults to left. P1: CenterStyle has jc=center. P2: Normal style, no jc \u2014 Word defaults to left.",
+  "expected_behavior": "P0: alignment=Left (Word default). P1: alignment=Center (from style). P2: alignment=Left (Word default).",
+  "current_status": "GAP \u2014 our code returns None when no alignment specified"
+}

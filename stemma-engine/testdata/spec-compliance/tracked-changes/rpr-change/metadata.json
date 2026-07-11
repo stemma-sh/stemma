@@ -1,0 +1,6 @@
+{
+  "name": "rpr-change",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.30",
+  "description": "Run with tracked formatting change (not bold \u2192 bold) via w:rPrChange",
+  "expected_behavior": "TextNode.formatting_change should have author, date, and empty previous_marks"
+}

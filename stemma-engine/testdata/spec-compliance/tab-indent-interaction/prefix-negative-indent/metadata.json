@@ -1,0 +1,7 @@
+{
+  "name": "prefix-negative-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=-720, w:right=-360, tab at 360, text '(a)\\tEquity Financing...'. Tests that continuation lines use w:left, not the tab stop position.",
+  "expected_behavior": "After prefix stripping: left=-720 (continuation indent), first_line=1080 (=360-(-720), offset from continuation to first-line edge). Current bug: left=360, first_line=None.",
+  "current_status": "GAP \u2014 literal_prefix branch forces left=body_left, drops first_line"
+}

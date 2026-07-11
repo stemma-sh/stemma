@@ -1,0 +1,6 @@
+{
+  "name": "lvltext-forward-ref",
+  "spec_ref": "MS-OI29500 \u00a717.9.11c",
+  "description": "Level 0 has lvlText='%1.%3' where %3 references level 2 (higher than current level 0). Per MS-OI29500, the entire lvlText is ignored.",
+  "expected_behavior": "Level 0: empty synthesized text (forward reference invalidates). Level 1: '1.1' (normal)."
+}

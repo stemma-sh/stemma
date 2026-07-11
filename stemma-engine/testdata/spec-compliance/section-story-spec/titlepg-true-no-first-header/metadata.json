@@ -1,0 +1,5 @@
+{
+  "name": "titlepg-true-no-first-header",
+  "spec_ref": "ISO 29500-1 \u00a717.10.5",
+  "description": "titlePg=true + default header only (no first-page header ref). Per spec, a blank first-page header shall be created for the first section."
+}

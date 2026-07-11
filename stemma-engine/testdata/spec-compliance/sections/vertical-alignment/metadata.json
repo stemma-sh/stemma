@@ -1,0 +1,7 @@
+{
+  "name": "vertical-alignment",
+  "spec_ref": "ISO 29500-1 \u00a717.6.20",
+  "description": "Section with vAlign=center (text centered vertically on page)",
+  "expected_behavior": "Parser should expose vAlign in SectionProperties",
+  "current_status": "GAP \u2014 vAlign not yet parsed into SectionProperties"
+}

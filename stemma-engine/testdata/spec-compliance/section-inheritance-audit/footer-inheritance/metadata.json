@@ -1,0 +1,6 @@
+{
+  "name": "footer-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.2",
+  "description": "S1 defines default footer 'Section 1 Footer'; S2 has no footer reference (should inherit from S1)",
+  "expected_behavior": "S2 should inherit the footer from S1. footer_refs on body section should include the inherited ref."
+}

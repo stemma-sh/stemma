@@ -1,0 +1,16 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.52/\u00a717.4.53",
+  "description": "Two tables: tblLayout fixed vs autofit",
+  "tables": [
+    {
+      "layout": "fixed",
+      "rows": 2,
+      "cols": 2
+    },
+    {
+      "layout": "autofit",
+      "rows": 2,
+      "cols": 2
+    }
+  ]
+}

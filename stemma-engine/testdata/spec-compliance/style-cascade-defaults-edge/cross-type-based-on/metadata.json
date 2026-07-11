@@ -1,0 +1,7 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3",
+  "description": "Paragraph style CrossTypePara has basedOn pointing to character style CharParent. Per \u00a717.7.4.3, this cross-type reference should be ignored. The paragraph style should only use its own properties.",
+  "expected": {
+    "para_1": "bold=on (CrossTypePara's own rPr), color=None (CharParent NOT inherited)"
+  }
+}

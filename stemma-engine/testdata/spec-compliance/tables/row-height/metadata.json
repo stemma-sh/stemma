@@ -1,0 +1,7 @@
+{
+  "name": "row-height",
+  "spec_ref": "ISO 29500-1 \u00a717.4.81",
+  "description": "Table with auto, exact, and atLeast row heights",
+  "expected_behavior": "Parser should expose trHeight value and hRule on rows",
+  "current_status": "NOT_PARSED \u2014 trHeight silently ignored"
+}

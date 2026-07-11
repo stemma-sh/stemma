@@ -1,0 +1,7 @@
+{
+  "name": "line-num-distance",
+  "spec_ref": "ECMA-376 \u00a717.6.8",
+  "description": "Section with lnNumType: countBy=1, start=0, restart=newPage, distance=720",
+  "expected_behavior": "Parser should expose lnNumType distance attribute in LineNumbering",
+  "current_status": "GAP \u2014 distance attribute not parsed from lnNumType"
+}

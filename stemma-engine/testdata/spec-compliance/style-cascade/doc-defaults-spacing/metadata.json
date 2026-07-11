@@ -1,0 +1,7 @@
+{
+  "name": "doc-defaults-spacing",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.17, \u00a717.3.1.33",
+  "description": "docDefaults sets spacing after=200 line=276. Style sets only before=120. Tests three-level fallback: direct > style > docDefaults.",
+  "expected_behavior": "Para 1: after=200, line=276 (docDefaults). Para 2: before=120 (style), after=200 (docDefaults), line=276 (docDefaults). Para 3: before=0 (direct), after=200 (docDefaults), line=276 (docDefaults).",
+  "current_status": "TESTING"
+}

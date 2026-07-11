@@ -1,0 +1,7 @@
+{
+  "name": "numbering-overrides-style",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22",
+  "description": "Numbering level indent (left=720, hanging=360) should override style indent (left=360).",
+  "expected_behavior": "P0: left=720, firstLine=-360 (numbering wins). P1: left=360 (style only).",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "single-section-no-footer",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "Single-section document with a default header but no footerReference. Per spec, a blank default footer should be synthesized."
+}

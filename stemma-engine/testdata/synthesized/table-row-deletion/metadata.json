@@ -1,0 +1,5 @@
+{
+  "name": "table-row-deletion",
+  "description": "Delete a row from a table (middle row removed)",
+  "pipeline": "TableStructureChanged -> DeleteTableRow"
+}

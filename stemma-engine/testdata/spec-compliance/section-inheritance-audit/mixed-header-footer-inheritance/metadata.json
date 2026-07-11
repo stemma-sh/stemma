@@ -1,0 +1,6 @@
+{
+  "name": "mixed-header-footer-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.2, 17.10.5",
+  "description": "S1: default header + default footer. S2: only first header. S2 should inherit default header + default footer from S1.",
+  "expected_behavior": "S2 header_refs: [first(own), default(inherited)]. S2 footer_refs: [default(inherited)]."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "toggle-xor",
+  "spec_ref": "ISO 29500-1 \u00a717.7.3",
+  "description": "Paragraph style bold=true + character style bold=true. XOR spec says bold=false.",
+  "expected_behavior": "First paragraph's run should resolve to bold=false (XOR of two trues). Second paragraph's run should be bold=true.",
+  "current_status": "NON_COMPLIANT \u2014 toggle properties use override (last-wins), not XOR. First paragraph resolves to bold=true (incorrect per spec)."
+}

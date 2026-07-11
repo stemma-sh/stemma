@@ -1,0 +1,7 @@
+{
+  "name": "multi-paragraph-comment",
+  "spec_ref": "ISO 29500-1 \u00a717.13.4.2/3",
+  "description": "Comment range spanning three paragraphs \u2014 commentRangeStart in p1, commentRangeEnd in p3",
+  "expected_behavior": "CommentRangeStart in first paragraph, CommentRangeEnd in third paragraph",
+  "current_status": "SUPPORTED \u2014 cross-block comment ranges parsed"
+}

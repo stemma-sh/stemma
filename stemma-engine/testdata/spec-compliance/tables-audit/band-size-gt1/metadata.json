@@ -1,0 +1,10 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.6.5/\u00a717.7.6.7 (tblStyleRowBandSize)",
+  "description": "Table style with rowBandSize=2. Rows 0-1=band1(blue BDD7EE), rows 2-3=band2(orange F8CBAD), rows 4-5=band1(blue BDD7EE)",
+  "row_band_size": 2,
+  "expected_bands": {
+    "rows_0_1": "BDD7EE",
+    "rows_2_3": "F8CBAD",
+    "rows_4_5": "BDD7EE"
+  }
+}

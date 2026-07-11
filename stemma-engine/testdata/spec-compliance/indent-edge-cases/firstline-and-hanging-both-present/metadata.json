@@ -1,0 +1,7 @@
+{
+  "name": "firstline-and-hanging-both-present",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "w:ind with both w:firstLine and w:hanging attributes. Per spec, these are mutually exclusive.",
+  "expected_behavior": "P0: Undefined \u2014 test documents actual parser behavior. P1: left=1440, first_line=360 (firstLine only). P2: left=1440, first_line=-720 (hanging only).",
+  "current_status": "TESTING \u2014 spec-invalid input"
+}

@@ -1,0 +1,12 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.33",
+  "bug": "lineRule default when direct spacing omits it",
+  "description": "Style has lineRule=exact. Direct w:spacing sets line but omits lineRule. The lineRule should default to auto per \u00a717.3.1.33, not inherit from the style.",
+  "expected": {
+    "para_1": "line=480, lineRule=auto (default, NOT exact from style)",
+    "para_2": "line=480, lineRule=auto (default, NOT atLeast from style)",
+    "para_3": "line=360, lineRule=exact (from style, no direct override)",
+    "para_4": "line=480, lineRule=auto (default, no style)",
+    "para_5": "line=480, lineRule=exact (explicitly set in direct)"
+  }
+}

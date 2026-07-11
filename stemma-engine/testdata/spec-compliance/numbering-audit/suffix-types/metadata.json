@@ -1,0 +1,6 @@
+{
+  "name": "suffix-types",
+  "spec_ref": "ISO 29500-1 \u00a717.9.28",
+  "description": "Three numbering definitions with different suff values: tab, space, nothing. Tests that the suffix between number text and paragraph body is correct.",
+  "expected_behavior": "Tab: '1.\\tBody'. Space: '1. Body'. Nothing: '1.Body'. Default when suff omitted is tab."
+}

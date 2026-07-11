@@ -1,0 +1,5 @@
+{
+  "name": "page-size-inheritance",
+  "spec_ref": "ISO 29500-1 section 17.6.17",
+  "description": "S1(nextPage, pgSz 12240x15840, margins 1440) -> S2(continuous, margins 720, NO pgSz element). S2 should inherit page_width=12240 and page_height=15840 from S1."
+}

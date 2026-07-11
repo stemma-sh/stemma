@@ -1,0 +1,7 @@
+{
+  "name": "line-numbering",
+  "spec_ref": "ISO 29500-1 \u00a717.6.8",
+  "description": "Section with line numbering: countBy=5, start=1, restart=newPage",
+  "expected_behavior": "Parser should expose lnNumType attributes in SectionProperties",
+  "current_status": "GAP \u2014 lnNumType not yet parsed into SectionProperties"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "numfmt-default-decimal",
+  "spec_ref": "ISO 29500-1 \u00a717.9.17",
+  "description": "Level 0 has no w:numFmt element. Per \u00a717.9.17, the default is decimal.",
+  "expected_behavior": "Level 0: '1.', '2.' (decimal). Level 1: 'a)' (explicit lowerLetter)."
+}

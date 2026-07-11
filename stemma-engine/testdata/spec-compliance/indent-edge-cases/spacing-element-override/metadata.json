@@ -1,0 +1,7 @@
+{
+  "name": "spacing-element-override",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Style defines spacing before=240, after=120, line=276. Paragraph has direct w:spacing with only before=0. Tests element-level override vs per-field merge.",
+  "expected_behavior": "If element-level override: P1 has before=0, after=None, line=None. If per-field merge: P1 has before=0, after=120, line=276. This test asserts element-level override for consistency with w:ind.",
+  "current_status": "TESTING \u2014 open question per GAP-027"
+}

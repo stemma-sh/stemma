@@ -1,0 +1,5 @@
+{
+  "name": "chained-continuous-page-spill",
+  "spec_ref": "ECMA-376 \u00a717.6.22",
+  "description": "S1(nextPage, left=1440) -> S2(continuous, left=720) -> S3(continuous, left=360) -> S4(continuous, left=180). Tests that each section carries distinct left margins through chained inheritance. Page spill layout is a rendering concern."
+}

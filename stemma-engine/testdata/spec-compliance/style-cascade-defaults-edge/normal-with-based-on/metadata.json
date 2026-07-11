@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3 + \u00a717.7.4.17",
+  "description": "Normal style (default paragraph style) has basedOn=CustomBase. CustomBase sets sz=24, color=FF0000. Normal overrides sz=28. Tests that Normal's basedOn chain is resolved correctly.",
+  "expected": {
+    "para_1": "font_size=28 (Normal), color=FF0000 (CustomBase via basedOn), spacing_after=120 (CustomBase)",
+    "para_2": "same as para_1"
+  }
+}

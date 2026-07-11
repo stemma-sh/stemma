@@ -1,0 +1,5 @@
+{
+  "name": "nil-suppresses-opposing",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with table-level borders (single sz=8 black). Cell (0,0) has tcBorders right=nil. Cell (0,1) has no tcBorders. Per MS-OI29500 SS2.1.169, nil means 'no border shall be displayed', so the shared edge should have NO visible border."
+}

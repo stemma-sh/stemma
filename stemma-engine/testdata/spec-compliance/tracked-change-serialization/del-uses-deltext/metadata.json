@@ -1,0 +1,5 @@
+{
+  "name": "del-uses-deltext",
+  "spec_ref": "ECMA-376 \u00a717.3.3.7",
+  "description": "Delete ' World' from 'Hello World' \u2014 verifies w:delText in w:del"
+}

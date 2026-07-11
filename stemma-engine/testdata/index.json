@@ -1,0 +1,164 @@
+{
+  "testCases": [
+    {
+      "dir": "showcase-landing-page",
+      "name": "Software License Agreement",
+      "description": "7 critical contract changes: $450K fee increase, liability cap removed, warranty deleted"
+    },
+    {
+      "dir": "simple-text",
+      "name": "Simple Text",
+      "description": "Basic text changes between paragraphs"
+    },
+    {
+      "dir": "paragraphs",
+      "name": "Paragraphs",
+      "description": "Three paragraph text modifications"
+    },
+    {
+      "dir": "twenty-paragraphs",
+      "name": "Twenty Paragraphs",
+      "description": "Multiple paragraph insertions and deletions"
+    },
+    {
+      "dir": "table-changes",
+      "name": "Table Cell Changes",
+      "description": "Table cell content modifications"
+    },
+    {
+      "dir": "table-modifications",
+      "name": "Table Modifications",
+      "description": "Table structure and content modifications"
+    },
+    {
+      "dir": "table-row-deletion",
+      "name": "Table Row Deletion",
+      "description": "Table row deletion with embedded images"
+    },
+    {
+      "dir": "long-table",
+      "name": "Long Table",
+      "description": "Long table content changes"
+    },
+    {
+      "dir": "images",
+      "name": "Images",
+      "description": "Embedded image changes"
+    },
+    {
+      "dir": "math-equations",
+      "name": "Math Equations",
+      "description": "Mathematical equation modifications"
+    },
+    {
+      "dir": "math-wc021",
+      "name": "Math (WC021)",
+      "description": "Math equation modifications (original test case)"
+    },
+    {
+      "dir": "image-math-combined",
+      "name": "Image + Math + Para",
+      "description": "Combined image, math equation, and paragraph changes"
+    },
+    {
+      "dir": "image-math-wc030",
+      "name": "Image + Math (WC030)",
+      "description": "Image and math equation combined changes"
+    },
+    {
+      "dir": "footnotes",
+      "name": "Footnotes",
+      "description": "Footnote content changes"
+    },
+    {
+      "dir": "footnotes-wc020",
+      "name": "Footnotes (WC020)",
+      "description": "Footnote content changes (original test case)"
+    },
+    {
+      "dir": "safe-valcap-vs-discount",
+      "name": "SAFE: ValCap vs Discount",
+      "description": "Y Combinator SAFE comparing Valuation Cap vs Discount terms"
+    },
+    {
+      "dir": "safe-valcap-vs-mfn",
+      "name": "SAFE: ValCap vs MFN",
+      "description": "Y Combinator SAFE comparing Valuation Cap vs MFN terms"
+    },
+    {
+      "dir": "safe-us-vs-canada",
+      "name": "SAFE: US vs Canada",
+      "description": "Y Combinator SAFE jurisdiction comparison: US vs Canada"
+    },
+    {
+      "dir": "safe-us-vs-cayman",
+      "name": "SAFE: US vs Cayman",
+      "description": "Y Combinator SAFE jurisdiction comparison: US vs Cayman Islands"
+    },
+    {
+      "dir": "safe-us-vs-singapore",
+      "name": "SAFE: US vs Singapore",
+      "description": "Y Combinator SAFE jurisdiction comparison: US vs Singapore"
+    },
+    {
+      "dir": "humira-epar",
+      "name": "Humira EPAR",
+      "description": "EMA European Public Assessment Report for Humira (adalimumab) — large real-world regulatory document"
+    },
+    {
+      "dir": "opdivo-epar",
+      "name": "Opdivo EPAR",
+      "description": "EMA European Public Assessment Report for Opdivo (nivolumab) — large real-world regulatory document"
+    },
+    {
+      "dir": "stelara-epar",
+      "name": "Stelara EPAR",
+      "description": "EMA European Public Assessment Report for Stelara (ustekinumab) — large real-world regulatory document"
+    },
+    {
+      "dir": "tecentriq-epar",
+      "name": "Tecentriq EPAR",
+      "description": "EMA European Public Assessment Report for Tecentriq (atezolizumab) — large real-world regulatory document"
+    },
+    {
+      "dir": "imbruvica-epar",
+      "name": "Imbruvica EPAR",
+      "description": "EMA European Public Assessment Report for Imbruvica (ibrutinib) — large real-world regulatory document"
+    },
+    {
+      "dir": "eliquis-epar",
+      "name": "Eliquis EPAR",
+      "description": "EMA European Public Assessment Report for Eliquis (apixaban) — large real-world regulatory document"
+    },
+    {
+      "dir": "byooviz-epar",
+      "name": "Byooviz EPAR",
+      "description": "EMA European Public Assessment Report for Byooviz (ranibizumab) — large real-world regulatory document"
+    },
+    {
+      "dir": "jakavi-epar",
+      "name": "Jakavi EPAR",
+      "description": "EMA European Public Assessment Report for Jakavi (ruxolitinib) — large real-world regulatory document"
+    },
+    {
+      "dir": "olumiant-epar",
+      "name": "Olumiant EPAR",
+      "description": "EMA European Public Assessment Report for Olumiant (baricitinib) — large real-world regulatory document"
+    },
+    {
+      "dir": "revlimid-epar",
+      "name": "Revlimid EPAR",
+      "description": "EMA European Public Assessment Report for Revlimid (lenalidomide) — large real-world regulatory document"
+    },
+    {
+      "dir": "annex-ii-instructions",
+      "name": "Annex II Instructions",
+      "description": "EMA Annex II manufacturing/conditions document — large structured regulatory annex"
+    },
+    {
+      "dir": "annex-it-solutions",
+      "name": "Annex IT Solutions",
+      "description": "EMA Annex IT solutions document — large structured regulatory annex"
+    }
+  ]
+}

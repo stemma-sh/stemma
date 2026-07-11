@@ -1,0 +1,7 @@
+{
+  "name": "indent-firstline-cascade",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Normal style has firstLine=720. P0: no direct w:ind (pure style inheritance). P1: direct w:ind left=-720, right=-360, no firstLine (the SAFE scenario). P2: direct w:ind left=-720, right=-360, firstLine=0 (explicit zero). P3: direct w:ind left=-720, right=-360, firstLine=720 (explicit 720).",
+  "expected_behavior": "P0: left=0, firstLine=720 (inherited from Normal). P1: QUESTION \u2014 does firstLine inherit from Normal (720) or default to 0? P2: left=-720, firstLine=0 (explicit, no first-line offset). P3: left=-720, firstLine=720 (explicit, first line at 0).",
+  "open_in_word": "Open this DOCX in Word. Compare P1 vs P2 and P1 vs P3. If P1 looks like P2 (no first-line offset), Word treats absent firstLine as 0. If P1 looks like P3 (first line indented), Word cascades firstLine from Normal."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "caps-smallcaps",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.5/30",
+  "description": "Runs with w:caps and w:smallCaps",
+  "expected_behavior": "First run should have Mark::Caps, second should have Mark::SmallCaps",
+  "current_status": "SUPPORTED \u2014 caps and smallCaps parsed into marks"
+}

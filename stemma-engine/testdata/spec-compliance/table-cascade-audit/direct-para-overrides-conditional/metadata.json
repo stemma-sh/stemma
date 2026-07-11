@@ -1,0 +1,7 @@
+{
+  "name": "direct-para-overrides-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.1",
+  "description": "Table with firstRow conditional pPr jc=center. Cell (0,0) has direct paragraph alignment=right.",
+  "expected_behavior": "Cell (0,0) paragraph: direct right overrides conditional center -> Right. Cell (0,1) paragraph: no direct, gets conditional -> Center. Data rows: no conditional alignment.",
+  "current_status": "GAP \u2014 code unconditionally sets para.align from conditional"
+}

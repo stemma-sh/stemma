@@ -1,0 +1,7 @@
+{
+  "name": "prefix-positive-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=720, tab at 1440, text '(a)\\tBody text...'. Same bug class as negative indent but with positive values.",
+  "expected_behavior": "After prefix stripping: left=720 (continuation indent), first_line=720 (=1440-720). Current bug: left=1440, first_line=None.",
+  "current_status": "GAP \u2014 literal_prefix branch forces left=body_left"
+}

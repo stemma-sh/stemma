@@ -1,0 +1,6 @@
+{
+  "name": "comments-basic",
+  "description": "Document with comment range markers and comments.xml; should be preserved",
+  "comment_ranges": 1,
+  "expected_after_normalize": "Comment ranges and comments.xml preserved unchanged"
+}

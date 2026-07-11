@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 (direct formatting always wins)",
+  "description": "Direct bold overrides style toggles without XOR",
+  "expected": {
+    "para_1": "bold=OFF (direct off wins over all styles)",
+    "para_2": "bold=ON (direct on wins)",
+    "para_3": "bold=OFF (direct off wins over para style)"
+  }
+}

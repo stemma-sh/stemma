@@ -1,0 +1,5 @@
+{
+  "name": "cell-override-lower-weight",
+  "spec_ref": "ISO 29500-1 \u00a717.4.38, \u00a717.4.66",
+  "description": "2x2 table with heavy double blue sz=48 table borders. Cell (0,0) has thin single green sz=4 cell borders. Cell border wins over table border regardless of weight."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "direct-font-size-overrides-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.2",
+  "description": "Table with firstRow conditional rPr sz=28 (14pt) and bold. Cell (0,0) run has direct sz=20 (10pt).",
+  "expected_behavior": "Cell (0,0) text: font_size=20 (direct wins over conditional 28). Cell (0,1) text: font_size=28 (conditional applies). Both first-row cells get bold from conditional.",
+  "current_status": "GAP \u2014 code unconditionally overwrites font_size from conditional"
+}

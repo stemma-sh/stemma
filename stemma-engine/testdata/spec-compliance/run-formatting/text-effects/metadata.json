@@ -1,0 +1,7 @@
+{
+  "name": "text-effects",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.8/12/21/31",
+  "description": "Runs with emboss, imprint, outline, and shadow text effects",
+  "expected_behavior": "Each effect should be exposed as a mark or property on the text node",
+  "current_status": "NOT_PARSED \u2014 text effects silently ignored"
+}

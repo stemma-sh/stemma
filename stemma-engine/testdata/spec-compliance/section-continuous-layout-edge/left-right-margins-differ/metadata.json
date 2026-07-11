@@ -1,0 +1,5 @@
+{
+  "name": "left-right-margins-differ",
+  "spec_ref": "ECMA-376 \u00a717.6.22 / \u00a717.6.11",
+  "description": "S1(nextPage, left=1800 right=1800) -> S2(continuous, left=720 right=720). Same page size. Left/right margins can change mid-page on a continuous break. Tests that S2's own left/right margins are preserved."
+}

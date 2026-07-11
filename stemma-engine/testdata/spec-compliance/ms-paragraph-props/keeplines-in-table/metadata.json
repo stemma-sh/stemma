@@ -1,0 +1,7 @@
+{
+  "name": "keeplines-in-table",
+  "spec_ref": "MS-OI29500 2.1.46 \u00a717.3.1.14",
+  "description": "P0: keepLines outside table. Table cell P: keepLines inside table. P2: keepLines outside table (control).",
+  "expected_behavior": "P0: keep_lines=true (honored). Table cell P: keep_lines=true in XML but Word ignores it in rendering. P2: keep_lines=true (honored).",
+  "current_status": "GAP \u2014 we parse keepLines but don't track table context"
+}

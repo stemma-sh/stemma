@@ -1,0 +1,6 @@
+{
+  "name": "interleaved-lists",
+  "spec_ref": "ISO 29500-1 \u00a717.9.11",
+  "description": "Two lists (numId=1 decimal, numId=2 lowerLetter) interleaved. Counter for numId=1 should survive the switch to numId=2 and back.",
+  "expected_behavior": "Sequence: '1.', '2.', 'a)', 'b)', '3.', '4.'. numId=1 continues at 3 after returning from numId=2."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "banding-last-row-exclusion",
+  "spec_ref": "ISO 29500-1 SS17.7.6",
+  "description": "4-row table with firstRow+lastRow+banding. Row 0: firstRow (red). Row 3: lastRow (blue). Rows 1-2: data rows with band1/band2 alternation. Tests that data_row_idx is correctly offset for firstRow."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "mirror-indents-in-table",
+  "spec_ref": "MS-OI29500 2.1.49 \u00a717.3.1.18(b)",
+  "description": "P0: mirrorIndents + start=1440, end=720 outside table. Table cell P: same mirrorIndents inside table.",
+  "expected_behavior": "P0: mirrorIndents honored (swaps start/end on even pages). Table cell P: Word ignores mirrorIndents.",
+  "current_status": "GAP \u2014 we don't parse mirrorIndents at all"
+}

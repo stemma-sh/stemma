@@ -1,0 +1,6 @@
+{
+  "name": "nested-tracked",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.14/30",
+  "description": "Paragraph with w:ins containing a run with w:rPrChange (nested tracked changes)",
+  "expected_behavior": "Text is within ins wrapper; rPrChange is captured on TextNode.formatting_change"
+}

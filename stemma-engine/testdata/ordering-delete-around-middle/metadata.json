@@ -1,0 +1,5 @@
+{
+  "name": "ordering-delete-around-middle",
+  "description": "Delete paragraphs around middle - only middle paragraph survives",
+  "source": "generated for ordering tests"
+}

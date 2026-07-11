@@ -1,0 +1,5 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.44",
+  "description": "Table with tblCellSpacing=100 twips between cells",
+  "cell_spacing_twips": 100
+}

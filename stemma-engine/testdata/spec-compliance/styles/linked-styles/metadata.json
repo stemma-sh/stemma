@@ -1,0 +1,7 @@
+{
+  "name": "linked-styles",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked paragraph+character style pair. Tests both full-paragraph and run-level application.",
+  "expected_behavior": "Para1: bold=on, size=32, color=2E74B5, align=center. Para2 run2: bold=on, size=32, color=2E74B5 (char style).",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.2 + \u00a717.7.4.6",
+  "description": "SimplePara (sz=28, color=FF0000) linked to SimpleChar (bold=on, sz=24). Tests that direct formatting on runs overrides linked char properties.",
+  "expected": {
+    "para_1": "sz=40 (direct), bold=on (linked char), color=FF0000 (para)",
+    "para_2": "bold=off (direct), sz=24 (linked char), color=FF0000 (para)",
+    "para_3": "color=00FF00 (direct), bold=on (linked char), sz=24 (linked char)"
+  }
+}

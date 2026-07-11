@@ -1,0 +1,7 @@
+{
+  "name": "highlight-colors",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.13",
+  "description": "Runs with different highlight colors: yellow, green, cyan, magenta",
+  "expected_behavior": "style_props.highlight should capture the named color for each run",
+  "current_status": "SUPPORTED \u2014 highlight colors parsed into StyleProps.highlight"
+}

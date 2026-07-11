@@ -1,0 +1,6 @@
+{
+  "name": "east-asian-tnr-bypass",
+  "spec_ref": "MS-OI29500 \u00a72.1.88(d)",
+  "description": "Run with ascii=hAnsi=Calibri, eastAsia=Times New Roman",
+  "expected_behavior": "font_family=Calibri, font_east_asia=Calibri (TNR bypass: eastAsia replaced with ascii font)"
+}

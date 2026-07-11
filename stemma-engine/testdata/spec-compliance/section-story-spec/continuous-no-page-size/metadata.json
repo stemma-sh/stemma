@@ -1,0 +1,5 @@
+{
+  "name": "continuous-no-page-size",
+  "spec_ref": "ISO 29500-1 \u00a717.6.22",
+  "description": "Section 1: pgSz w=12240 h=15840 (letter). Section 2: continuous, NO pgSz element. Section 2 should inherit page dimensions from Section 1."
+}

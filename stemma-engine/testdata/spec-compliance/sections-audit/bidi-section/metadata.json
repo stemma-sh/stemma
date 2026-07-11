@@ -1,0 +1,6 @@
+{
+  "name": "bidi-section",
+  "spec_ref": "ISO 29500-1 \u00a717.6.1",
+  "description": "Section with w:bidi element (right-to-left layout)",
+  "expected_behavior": "SectionProperties should expose bidi boolean"
+}

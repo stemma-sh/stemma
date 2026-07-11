@@ -1,0 +1,7 @@
+{
+  "name": "style-table-props",
+  "spec_ref": "ISO 29500-1 \u00a717.4.63",
+  "description": "Table style sets jc=center and tblInd=720. Table has no direct alignment.",
+  "expected_behavior": "Table should inherit center alignment and 720tw indent from style. Currently TableStyleProps does not carry alignment or indent.",
+  "current_status": "GAP \u2014 TableStyleProps missing alignment and indent fields"
+}

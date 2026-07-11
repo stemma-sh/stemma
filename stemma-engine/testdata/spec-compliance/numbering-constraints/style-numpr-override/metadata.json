@@ -1,0 +1,7 @@
+{
+  "name": "style-numpr-override",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.14",
+  "description": "Direct numPr overrides style numPr. Style 'NumberedStyle' has numPr (numId=1, bullets). P1 uses style only (bullets). P2 uses style + direct numPr (numId=2, decimal).",
+  "expected_behavior": "P1: bullet numbering (from style numId=1). P2: decimal numbering '1.' (from direct numId=2, overrides style).",
+  "current_status": "TESTING"
+}

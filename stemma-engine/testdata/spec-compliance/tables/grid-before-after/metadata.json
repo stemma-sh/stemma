@@ -1,0 +1,7 @@
+{
+  "name": "grid-before-after",
+  "spec_ref": "ISO 29500-1 \u00a717.4.14/3",
+  "description": "Table with staggered rows using gridBefore and gridAfter",
+  "expected_behavior": "Canonical table should correctly position cells with grid offsets",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 gridBefore/gridAfter parsed but positioning may be incorrect"
+}

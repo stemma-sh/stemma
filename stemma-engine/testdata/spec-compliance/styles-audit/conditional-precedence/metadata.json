@@ -1,0 +1,10 @@
+{
+  "spec": "MS-OI29500 \u00a717.7.6(c)",
+  "description": "firstRow vs firstCol precedence at intersection cell",
+  "expected": {
+    "cell_0_0": "FF0000 (firstRow wins over firstCol)",
+    "cell_0_1": "FF0000 (firstRow)",
+    "cell_1_0": "0000FF (firstCol)",
+    "cell_1_1": "no conditional shading"
+  }
+}

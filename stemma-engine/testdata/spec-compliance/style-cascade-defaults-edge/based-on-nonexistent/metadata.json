@@ -1,0 +1,7 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.3",
+  "description": "Paragraph style has basedOn pointing to a non-existent styleId. Tests that the code doesn't crash and the style's own properties are still available.",
+  "expected": {
+    "para_1": "font_size=28, color=00FF00 (OrphanStyle's own props, basedOn ignored)"
+  }
+}

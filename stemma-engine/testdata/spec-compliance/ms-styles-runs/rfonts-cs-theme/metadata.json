@@ -1,0 +1,6 @@
+{
+  "name": "rfonts-cs-theme",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26",
+  "description": "Run with cstheme=minorBidi + cs=true.",
+  "expected_behavior": "font_cs should be resolved from theme's minorFont cs typeface."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "ordering-mixed-complex",
+  "description": "Complex mixed changes: delete at start, modify in middle, insert at end",
+  "source": "generated for ordering tests"
+}

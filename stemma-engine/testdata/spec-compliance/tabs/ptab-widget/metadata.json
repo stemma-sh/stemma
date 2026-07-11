@@ -1,0 +1,7 @@
+{
+  "name": "ptab-widget",
+  "spec_ref": "ISO 29500-1 \u00a717.3.3.22",
+  "description": "Paragraph containing a w:ptab element (positioned tab)",
+  "expected_behavior": "w:ptab should produce an OpaqueInline widget in the paragraph segments",
+  "current_status": "SUPPORTED \u2014 ptab handled as opaque widget"
+}

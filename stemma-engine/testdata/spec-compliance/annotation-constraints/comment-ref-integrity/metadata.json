@@ -1,0 +1,7 @@
+{
+  "name": "comment-ref-integrity",
+  "spec_ref": "ISO 29500-1 \u00a717.13.4",
+  "description": "Paragraph with commentRangeStart/End/Reference id=1 and matching comment in comments.xml",
+  "expected_behavior": "CommentRangeStart, CommentRangeEnd, CommentReference(id=1) in body; CommentStory(id=1) in CanonDoc.comments",
+  "current_status": "SUPPORTED \u2014 happy path comment cross-reference"
+}

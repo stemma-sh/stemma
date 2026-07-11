@@ -1,0 +1,5 @@
+{
+  "name": "next-column-roundtrip",
+  "spec_ref": "ECMA-376 \u00a717.6.22 (ST_SectionMark)",
+  "description": "Two-column layout with nextColumn section break. The section_type must survive import -> re-export roundtrip."
+}

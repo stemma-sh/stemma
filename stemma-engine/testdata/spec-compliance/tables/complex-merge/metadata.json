@@ -1,0 +1,7 @@
+{
+  "name": "complex-merge",
+  "spec_ref": "ISO 29500-1 \u00a717.4.17/84",
+  "description": "3x3 table with 2x2 merged cell (gridSpan + vMerge) in top-left",
+  "expected_behavior": "Canonical table should show correct owner_grid with A owning [0,0],[0,1],[1,0],[1,1]",
+  "current_status": "SUPPORTED \u2014 basic vMerge/gridSpan canonicalization works; testing complex pattern"
+}

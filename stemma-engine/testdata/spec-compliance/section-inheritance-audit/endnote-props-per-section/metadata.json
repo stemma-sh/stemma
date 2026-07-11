@@ -1,0 +1,6 @@
+{
+  "name": "endnote-props-per-section",
+  "spec_ref": "ISO 29500-1 sections 17.11.2",
+  "description": "S1: endnotePr pos=sectEnd numFmt=upperRoman. S2: endnotePr pos=docEnd.",
+  "expected_behavior": "Each section should have distinct endnote_pr with correct position and format."
+}

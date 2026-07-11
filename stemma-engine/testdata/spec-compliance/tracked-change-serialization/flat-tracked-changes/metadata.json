@@ -1,0 +1,5 @@
+{
+  "name": "flat-tracked-changes",
+  "spec_ref": "Cross-cutting tracked change flat structure rule",
+  "description": "Multiple edits across document \u2014 no nested ins/del of same type"
+}

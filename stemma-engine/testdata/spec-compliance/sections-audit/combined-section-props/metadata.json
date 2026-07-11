@@ -1,0 +1,6 @@
+{
+  "name": "combined-section-props",
+  "spec_ref": "ISO 29500-1 \u00a717.6",
+  "description": "Section combining landscape A4, margins, continuous type, 2 columns, vAlign=center, pgNumType, docGrid",
+  "expected_behavior": "All properties should be independently accessible in SectionProperties"
+}

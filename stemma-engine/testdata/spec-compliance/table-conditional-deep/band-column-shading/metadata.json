@@ -1,0 +1,7 @@
+{
+  "name": "band-column-shading",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table with band1Vert (green C6EFCE) and band2Vert (orange FBE5D6). 4 columns, vertical banding enabled (noVBand=0), no row/col conditionals.",
+  "expected_behavior": "Col 0: green (C6EFCE, band1Vert). Col 1: orange (FBE5D6, band2Vert). Col 2: green. Col 3: orange. Same pattern across all rows.",
+  "current_status": "testing vertical banding shading"
+}

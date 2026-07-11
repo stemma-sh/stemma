@@ -1,0 +1,7 @@
+{
+  "name": "footnote-ref-integrity",
+  "spec_ref": "ISO 29500-1 \u00a717.11.2, \u00a717.3.3.9",
+  "description": "Body paragraph with footnoteReference id=1, matching footnote in footnotes.xml",
+  "expected_behavior": "FootnoteReference(id=1) in body, FootnoteStory(id=1) in CanonDoc.footnotes",
+  "current_status": "SUPPORTED \u2014 happy path footnote cross-reference"
+}

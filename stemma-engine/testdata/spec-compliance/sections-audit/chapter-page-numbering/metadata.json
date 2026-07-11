@@ -1,0 +1,6 @@
+{
+  "name": "chapter-page-numbering",
+  "spec_ref": "ISO 29500-1 \u00a717.6.12",
+  "description": "Section with pgNumType chapStyle=1, chapSep=hyphen (chapter-relative page numbering)",
+  "expected_behavior": "PageNumberType should expose chapStyle and chapSep"
+}

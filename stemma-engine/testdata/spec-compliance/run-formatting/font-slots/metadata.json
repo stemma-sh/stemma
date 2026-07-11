@@ -1,0 +1,7 @@
+{
+  "name": "font-slots",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Run with all four rFonts slots: ascii=Arial, hAnsi=Arial, eastAsia=MS Mincho, cs=Arial",
+  "expected_behavior": "All four font slots should be accessible; font_family should capture at least ascii/hAnsi",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 font_family captures ascii/hAnsi; eastAsia and cs slots not exposed"
+}

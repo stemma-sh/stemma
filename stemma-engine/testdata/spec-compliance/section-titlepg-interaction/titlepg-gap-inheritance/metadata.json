@@ -1,0 +1,5 @@
+{
+  "name": "titlepg-gap-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.6 + 17.10.2",
+  "description": "S1: titlePg=true with Default+First headers+footers. S2: no titlePg, no declarations. S3: titlePg=true, no declarations. Tests First-kind inheritance through a non-titlePg gap section."
+}

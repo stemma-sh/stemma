@@ -1,0 +1,7 @@
+{
+  "name": "rpr-bdr-ordering",
+  "spec_ref": "ECMA-376 Annex A CT_RPr",
+  "description": "Diff pair with bold/sz/underline/bdr/vertAlign run, text change in second paragraph",
+  "expected_behavior": "bdr should appear at position 28 (after u, before vertAlign) in re-serialized rPr",
+  "current_status": "BUG \u2014 bdr emitted after cs (position 33) instead of position 28"
+}

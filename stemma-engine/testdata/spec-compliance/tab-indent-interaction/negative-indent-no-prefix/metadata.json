@@ -1,0 +1,7 @@
+{
+  "name": "negative-indent-no-prefix",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=-360, tab at 720, text '\\tBody text...' (tab but no prefix). Tests tab absorption without prefix stripping.",
+  "expected_behavior": "left=-360, first_line=None (no firstLine set, tab absorption should not fire). The tab positions the text but doesn't change the indent model.",
+  "current_status": "TESTING \u2014 tab absorption branch gated on first_line_twips!=0"
+}

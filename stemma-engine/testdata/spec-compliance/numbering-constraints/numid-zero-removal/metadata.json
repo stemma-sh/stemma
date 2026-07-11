@@ -1,0 +1,7 @@
+{
+  "name": "numid-zero-removal",
+  "spec_ref": "ISO 29500-1 \u00a717.9.18",
+  "description": "numId=0 removes inherited numbering. Style 'NumberedStyle' has numPr (numId=1). P1 and P3 use the style (get numbering). P2 uses the style + direct numId=0 (numbering removed).",
+  "expected_behavior": "P1: has numbering (bullet). P2: no numbering (numId=0 removes it). P3: has numbering (bullet). The removal on P2 is local.",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,21 @@
+{
+  "spec": "ISO 29500-1 \u00a722.9.2.7 (ST_OnOff) + \u00a717.7.3",
+  "description": "Toggle value variants: true/1/absent=on, false/off/0=off",
+  "expected": {
+    "para_1_root": {
+      "bold": true,
+      "italic": true,
+      "caps": true
+    },
+    "para_2_mid": {
+      "bold": false,
+      "italic": false,
+      "caps": true
+    },
+    "para_3_leaf": {
+      "bold": false,
+      "italic": false,
+      "caps": true
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "color-tiebreaker-darker-on-right",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table. Cell (0,0) right = light green (brightness=766). Cell (0,1) left = dark blue (brightness=128). Same weight. Per SS2.1.169, darker (dark blue) should win. BUG: resolve_border_conflict() picks first arg (light green)."
+}

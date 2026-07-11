@@ -1,0 +1,6 @@
+{
+  "name": "row-height-hrule-default",
+  "spec_ref": "MS-OI29500 \u00a717.4.80(a)",
+  "description": "Row 0: trHeight val=720, no hRule. Row 1: hRule=exact.",
+  "expected_behavior": "Row 0 hRule defaults to 'atLeast' (MS), not 'auto' (standard)."
+}

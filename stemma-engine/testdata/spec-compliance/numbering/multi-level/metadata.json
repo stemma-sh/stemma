@@ -1,0 +1,7 @@
+{
+  "name": "multi-level",
+  "spec_ref": "ISO 29500-1 \u00a717.9.11",
+  "description": "Three-level outline numbering with cross-level references in lvlText",
+  "expected_behavior": "I. / I.1 / I.1.a) / I.1.b) / I.2 / I.2.a) / II. / II.1",
+  "current_status": "SUPPORTED \u2014 basic multi-level numbering works"
+}

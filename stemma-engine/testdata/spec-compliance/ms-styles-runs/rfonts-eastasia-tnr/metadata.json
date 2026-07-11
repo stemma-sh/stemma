@@ -1,0 +1,6 @@
+{
+  "name": "rfonts-eastasia-tnr",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26 notes b,d",
+  "description": "Run 1: eastAsia='Times New Roman', ascii=hAnsi='Calibri'. Run 2: eastAsia='MS Mincho', ascii=hAnsi='Calibri'.",
+  "expected_behavior": "Run 1: For CJK chars, ascii font (Calibri) used because eastAsia=TNR rule. Run 2: For CJK chars, MS Mincho used normally."
+}

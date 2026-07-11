@@ -1,0 +1,18 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 (first-value-encountered in 4-level chain)",
+  "description": "4-level basedOn chain with toggle inherit gap",
+  "expected": {
+    "para_1_leaf": {
+      "bold": true,
+      "caps": true
+    },
+    "para_2_B": {
+      "bold": false,
+      "caps": true
+    },
+    "para_3_A": {
+      "bold": false,
+      "caps": true
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Unstyled paragraphs should apply the default paragraph style (Normal)",
+  "expected": {
+    "para_1_implicit": {
+      "color": "008000",
+      "font_size": 28
+    },
+    "para_2_explicit": {
+      "color": "008000",
+      "font_size": 28
+    },
+    "para_3_custom": {
+      "color": "0000FF",
+      "font_size": null
+    }
+  }
+}

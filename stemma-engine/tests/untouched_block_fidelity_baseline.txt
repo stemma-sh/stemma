@@ -1,0 +1,57 @@
+# Untouched-block fidelity ratchet baseline.
+#
+# One line per KNOWN_OPEN class in untouched_block_fidelity.rs:
+#   <class><TAB><distinct fixture-blocks affected>
+#
+# The ratchet: single_tracked_edit_leaves_untouched_blocks_identical fails if
+# a class's measured count exceeds the number pinned here. Regenerate with:
+#   UPDATE_FIDELITY_BASELINE=1 cargo test -p stemma --test untouched_block_fidelity
+# then review and commit the diff — regeneration itself fails the test run
+# (it can never silently pass CI). Every KNOWN_OPEN entry must have exactly
+# one line here; a line naming a class no longer in KNOWN_OPEN is stale and
+# fails too.
+w:adjustRightInd	0
+w:bottom	14
+w:br	2
+w:col	2
+w:cr	1
+w:end	1
+w:formProt	1
+w:gridSpan	3
+w:ilvl	0
+w:ind	30
+w:jc	2
+w:left	23
+w:noBreakHyphen	1
+w:numId	0
+w:numPr	0
+w:overflowPunct	0
+w:pPr	119
+w:pPr/w:spacing	8
+w:pageBreakBefore	0
+w:pgBorders	3
+w:pgMar	4
+w:pgSz	5
+w:r	453
+w:rFonts	31
+w:rPr	499
+w:rStyle	13
+w:right	17
+w:sectPr	1
+w:shd	1
+w:snapToGrid	0
+w:start	1
+w:suppressAutoHyphens	0
+w:sz	320
+w:t	120
+w:tblLook	5
+w:tblW	1
+w:tblpPr	3
+w:tcBorders	2
+w:tcMar	2
+w:tcW	1
+w:top	12
+w:trHeight	1
+w:type	1
+w:vMerge	3
+w:wordWrap	0

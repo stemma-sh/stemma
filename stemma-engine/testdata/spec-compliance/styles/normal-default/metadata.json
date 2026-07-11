@@ -1,0 +1,7 @@
+{
+  "name": "normal-default",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Normal style defines Calibri 11pt with justify alignment. Unstyled paragraphs should inherit.",
+  "expected_behavior": "Both paragraphs: font=Calibri, size=22, alignment=justify (both).",
+  "current_status": "TESTING"
+}

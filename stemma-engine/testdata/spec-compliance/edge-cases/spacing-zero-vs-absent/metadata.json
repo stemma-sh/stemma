@@ -1,0 +1,6 @@
+{
+  "name": "spacing-zero-vs-absent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Spacing before/after: explicit 0 vs absent (inherit from style)",
+  "expected_behavior": "before=0 overrides style's before=240. Absent before inherits style value."
+}

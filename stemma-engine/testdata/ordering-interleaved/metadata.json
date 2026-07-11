@@ -1,0 +1,5 @@
+{
+  "name": "ordering-interleaved",
+  "description": "Interleaved deletion and insertion - replacement pattern should preserve position",
+  "source": "generated for ordering tests"
+}

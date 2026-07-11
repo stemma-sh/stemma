@@ -1,0 +1,6 @@
+{
+  "name": "tracked-moves",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.22/25",
+  "description": "Paragraph with tracked move (moveFrom + moveTo with range markers)",
+  "expected_behavior": "Move range markers preserved as decorations; moved text visible in atoms"
+}

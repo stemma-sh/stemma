@@ -1,0 +1,6 @@
+{
+  "name": "style-position-cascade",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.19",
+  "description": "Character style with position=24 applied to a run",
+  "expected_behavior": "Run position should be Some(24) from style cascade. KNOWN GAP: parse_rpr_marks does not parse w:position."
+}

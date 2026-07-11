@@ -1,0 +1,7 @@
+{
+  "name": "override-table-style-font-jc",
+  "spec_ref": "MS-DOCX 2.3.1 overrideTableStyleFontSizeAndJustification",
+  "description": "FancyTableStyle has jc=center, sz=28 (14pt). Normal style has default jc=left, sz=22 (11pt). No overrideTableStyleFontSizeAndJustification compat setting.",
+  "expected_behavior": "Default behavior (compat setting false/absent): Normal's 11pt font and left jc do NOT override table style. Table cells should render center-aligned at 14pt.",
+  "current_status": "GAP \u2014 we don't parse or respect compat settings"
+}

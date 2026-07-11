@@ -1,0 +1,5 @@
+{
+  "name": "color-tiebreaker-secondary-reversed",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table. Cell (0,0) right = blue (primary=255, secondary=255). Cell (0,1) left = red (primary=255, secondary=0). Same weight + primary brightness. Per SS2.1.169, red (secondary=0) wins. BUG: resolve_border_conflict() picks first arg (blue)."
+}

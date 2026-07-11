@@ -1,0 +1,21 @@
+{
+  "name": "st-onoff-boolean-forms",
+  "spec_ref": "ISO 29500-1 \u00a722.9.2.7",
+  "description": "All valid ST_OnOff representations for bold/italic/strike",
+  "expected_behavior": "bare element=ON, val=1/true/on=ON, val=0/false/off=OFF, absent element=inherit (no mark)",
+  "paragraphs": [
+    "Bold bare element (ON)",
+    "Bold val=1 (ON)",
+    "Bold val=true (ON)",
+    "Bold val=on (ON)",
+    "Bold val=0 (OFF)",
+    "Bold val=false (OFF)",
+    "Bold val=off (OFF)",
+    "Bold absent (inherit)",
+    "Italic bare (ON)",
+    "Italic val=0 (OFF)",
+    "Italic val=off (OFF)",
+    "Strike bare (ON)",
+    "Strike val=off (OFF)"
+  ]
+}

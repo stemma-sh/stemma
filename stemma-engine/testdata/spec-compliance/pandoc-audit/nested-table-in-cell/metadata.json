@@ -1,0 +1,5 @@
+{
+  "description": "Table cell whose last block-level element is a nested w:tbl, not w:p",
+  "spec_ref": "ECMA-376 \u00a717.4.65 (CT_Tc content model)",
+  "violation": "Last child of w:tc must be w:p; nested w:tbl as final child is invalid"
+}

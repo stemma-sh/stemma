@@ -1,0 +1,7 @@
+{
+  "name": "named-bookmark",
+  "spec_ref": "ISO 29500-1 \u00a717.13.6.2",
+  "description": "Bookmark with semantically meaningful name 'clause_1_start' for hyperlink anchor targets",
+  "expected_behavior": "Bookmark decorations should be present; name should be preserved for cross-reference resolution",
+  "current_status": "SUPPORTED \u2014 bookmark name is preserved in the opaque element XML"
+}

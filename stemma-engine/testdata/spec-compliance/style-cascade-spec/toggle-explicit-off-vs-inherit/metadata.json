@@ -1,0 +1,18 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + \u00a717.7.4.3",
+  "description": "bold=off (explicit) vs bold absent (inherit) in basedOn chain",
+  "expected": {
+    "para_1_explicit_off": {
+      "bold": false,
+      "italic": true
+    },
+    "para_2_inherit": {
+      "bold": true,
+      "italic": true
+    },
+    "para_3_root": {
+      "bold": true,
+      "italic": true
+    }
+  }
+}

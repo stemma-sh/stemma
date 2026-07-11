@@ -1,0 +1,22 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + MS-OI29500 \u00a72.1.230a",
+  "description": "docDefaults caps/strike ON + deep basedOn chain turning them OFF",
+  "expected": {
+    "para_1_leaf": {
+      "caps": false,
+      "strike": false
+    },
+    "para_2_mid": {
+      "caps": false,
+      "strike": true
+    },
+    "para_3_base": {
+      "caps": true,
+      "strike": true
+    },
+    "para_4_unstyled": {
+      "caps": true,
+      "strike": true
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "page-size-mismatch",
+  "spec_ref": "ECMA-376 \u00a717.6.22 / \u00a717.6.14",
+  "description": "S1(nextPage, Letter 12240x15840) -> S2(continuous, Legal 12240x20160). Word promotes S2 to nextPage when page height differs. Tests that S2 retains its own page dimensions."
+}

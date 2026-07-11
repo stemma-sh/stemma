@@ -1,0 +1,6 @@
+{
+  "name": "paper-size-code",
+  "spec_ref": "ISO 29500-1 \u00a717.6.14",
+  "description": "Section with pgSz code=9 (A4 paper size)",
+  "expected_behavior": "SectionProperties should expose paper size code"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "styleref-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.36",
+  "description": "STYLEREF fldSimple referencing Heading 1 style",
+  "expected_behavior": "FieldKind::Simple with instruction containing 'STYLEREF'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed for any instruction type"
+}

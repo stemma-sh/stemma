@@ -1,0 +1,6 @@
+{
+  "name": "multi-style",
+  "spec_ref": "ISO 29500-1 section 17.3.2.40 / section 17.18.99 ST_Underline",
+  "description": "Paragraph with runs using 9 different underline styles",
+  "expected_behavior": "Each run's style_props.underline_style must match the w:val used. All runs must carry Mark::Underline."
+}

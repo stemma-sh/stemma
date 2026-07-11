@@ -1,0 +1,6 @@
+{
+  "name": "cell-margin-type-nil",
+  "spec_ref": "MS-OI29500 \u00a717.4.77(a)",
+  "description": "Cell (0,0) margin type=nil. Cell (0,1) type=dxa w=0.",
+  "expected_behavior": "Cell (0,0): nil ignored, uses table default 150tw. Cell (0,1): 0tw."
+}

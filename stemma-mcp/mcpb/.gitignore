@@ -1,0 +1,3 @@
+# Built bundles and staged binaries are artifacts, not source.
+dist/
+*.mcpb

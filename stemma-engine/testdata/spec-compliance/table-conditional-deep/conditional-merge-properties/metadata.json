@@ -1,0 +1,7 @@
+{
+  "name": "conditional-merge-properties",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "firstRow conditional sets thick red borders (no shading). firstCol conditional sets green shading (no borders). Cell (0,0) matches both.",
+  "expected_behavior": "Cell (0,0): thick red borders FROM firstRow + green shading FROM firstCol. Cell (0,1): thick red borders from firstRow, no shading. Cell (1,0): green shading from firstCol, no cell borders. Cell (1,1): no conditional formatting (interior cell).",
+  "current_status": "testing non-overlapping property merge across conditionals"
+}

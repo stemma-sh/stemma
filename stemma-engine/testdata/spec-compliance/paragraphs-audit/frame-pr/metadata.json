@@ -1,0 +1,6 @@
+{
+  "name": "frame-pr",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.11",
+  "description": "P0: framePr with w=2191, h=811, hRule=exact, hSpace=180, wrap=around, vAnchor=text, hAnchor=page, x=1921. P1: normal paragraph (control).",
+  "expected_behavior": "P0: paragraph is part of a text frame with all attributes preserved. P1: no frame properties."
+}

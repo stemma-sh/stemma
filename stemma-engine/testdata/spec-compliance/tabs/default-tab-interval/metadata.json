@@ -1,0 +1,7 @@
+{
+  "name": "default-tab-interval",
+  "spec_ref": "ISO 29500-1 \u00a717.15.1.25",
+  "description": "Document with w:defaultTabStop set to 360 twips (0.25 inch) in settings.xml",
+  "expected_behavior": "Tab stops should be synthesized at 360-twip intervals instead of default 720",
+  "current_status": "SUPPORTED \u2014 defaultTabStop parsed from settings.xml"
+}

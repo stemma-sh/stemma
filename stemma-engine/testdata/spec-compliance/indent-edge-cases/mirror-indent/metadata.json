@@ -1,0 +1,7 @@
+{
+  "name": "mirror-indent",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Paragraph using w:start/w:end (logical direction) instead of w:left/w:right. For LTR text, start=left and end=right.",
+  "expected_behavior": "P0: left=720, right=360 (from w:start/w:end). P1: left=720, right=360 (from w:left/w:right \u2014 same result).",
+  "current_status": "TESTING"
+}

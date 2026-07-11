@@ -1,0 +1,7 @@
+{
+  "name": "suff-nothing",
+  "spec_ref": "ISO 29500-1 \u00a717.9.28",
+  "description": "Numbering level with suff='nothing' \u2014 no separator between number and text",
+  "expected_behavior": "numId=1 (suff=nothing): rendered_text = '1.No separator after number' (no tab/space). numId=2 (default tab): rendered_text = '1.\\tTab separator (default)'.",
+  "current_status": "TESTING"
+}

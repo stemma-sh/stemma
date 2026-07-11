@@ -1,0 +1,6 @@
+{
+  "name": "style-kern-cascade",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.19(a)",
+  "description": "Character style with kern=28 applied to a run",
+  "expected_behavior": "Run kern should be Some(28) from style cascade. KNOWN GAP: parse_rpr_marks does not parse w:kern."
+}

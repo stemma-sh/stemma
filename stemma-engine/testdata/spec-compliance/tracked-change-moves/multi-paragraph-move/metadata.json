@@ -1,0 +1,6 @@
+{
+  "name": "multi-paragraph-move",
+  "spec_ref": "ECMA-376 \u00a717.13.5.22-28",
+  "description": "Multiple paragraphs moved as a group; each paragraph exceeds 20-char threshold",
+  "expected_behavior": "All moved paragraphs should have matching moveFrom/moveTo range markers linked by name"
+}

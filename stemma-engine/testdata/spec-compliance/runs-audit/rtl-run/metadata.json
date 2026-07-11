@@ -1,0 +1,6 @@
+{
+  "name": "rtl-run",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26(b)",
+  "description": "RTL run should force cs font slot",
+  "expected_behavior": "rtl=true run uses cs font ('David') as font_family"
+}

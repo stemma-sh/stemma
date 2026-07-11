@@ -1,0 +1,5 @@
+{
+  "name": "tbllook-default-omitted",
+  "spec_ref": "MS-OI29500 SS17.4.55(a)",
+  "description": "Table with style that has firstCol conditional (yellow shading) and band1Horz conditional (gray). tblLook is OMITTED. Default 0x04A0 means firstColumn=true, noHBand=false, so firstCol shading should apply to column 0, and banding should apply to data rows."
+}

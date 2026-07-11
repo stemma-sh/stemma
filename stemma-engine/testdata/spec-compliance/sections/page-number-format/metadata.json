@@ -1,0 +1,7 @@
+{
+  "name": "page-number-format",
+  "spec_ref": "ISO 29500-1 \u00a717.6.12",
+  "description": "Section with pgNumType: fmt=lowerRoman, start=3",
+  "expected_behavior": "Parser should expose pgNumType attributes in SectionProperties",
+  "current_status": "GAP \u2014 pgNumType not yet parsed into SectionProperties"
+}

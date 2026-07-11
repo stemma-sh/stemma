@@ -1,0 +1,6 @@
+{
+  "name": "tbllook-omitted-default",
+  "spec_ref": "MS-OI29500 \u00a717.4.55(a)",
+  "description": "No tblLook element. Word defaults to 0x04A0.",
+  "expected_behavior": "firstRow=1, noHBand=1. Row 0 blue, no banding on data rows."
+}

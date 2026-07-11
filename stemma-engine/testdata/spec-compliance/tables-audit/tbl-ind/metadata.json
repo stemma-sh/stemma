@@ -1,0 +1,5 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.51",
+  "description": "Table with tblInd=720tw indent from leading margin",
+  "indent_twips": 720
+}

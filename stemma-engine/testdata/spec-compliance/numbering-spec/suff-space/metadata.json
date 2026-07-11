@@ -1,0 +1,7 @@
+{
+  "name": "suff-space",
+  "spec_ref": "ISO 29500-1 \u00a717.9.28",
+  "description": "Numbering level with suff='space' \u2014 space separator between number and text",
+  "expected_behavior": "rendered_text = '1. Space after number' (single space, not tab).",
+  "current_status": "TESTING"
+}

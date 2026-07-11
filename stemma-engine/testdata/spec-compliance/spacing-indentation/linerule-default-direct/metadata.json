@@ -1,0 +1,7 @@
+{
+  "name": "linerule-default-direct",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "Direct spacing line=276 with no lineRule; should default to Auto",
+  "expected_behavior": "line_rule = Some(LineSpacingRule::Auto)",
+  "current_status": "PASS \u2014 word_ir.rs parser defaults lineRule to auto when line is present"
+}

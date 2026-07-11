@@ -1,0 +1,6 @@
+{
+  "name": "contextual-same-style",
+  "spec_ref": "ECMA-376 \u00a717.3.1.9",
+  "description": "contextualSpacing suppresses space between same-style paragraphs",
+  "expected_behavior": "P0 and P1 both have contextual_spacing=true (from CtxSameStyle). Space between them should be suppressed when rendered."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "table-row-addition",
+  "description": "Add a row to a table (structure change, skipped in transaction)",
+  "pipeline": "TableStructureChanged (skipped in tx, should not crash)"
+}

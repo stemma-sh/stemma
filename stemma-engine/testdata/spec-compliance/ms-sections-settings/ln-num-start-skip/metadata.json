@@ -1,0 +1,7 @@
+{
+  "name": "ln-num-start-skip",
+  "spec_ref": "MS-OI29500 \u00a717.6.8",
+  "description": "Line numbering with start=3 \u2014 Word interprets as skip count (starts at 4)",
+  "expected_behavior": "If following MS behavior, start=3 means first visible number is 4. Spec says start=3 means first number is 3.",
+  "current_status": "GAP \u2014 line numbering semantics not verified against MS behavior"
+}

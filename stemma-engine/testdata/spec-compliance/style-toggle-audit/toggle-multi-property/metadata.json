@@ -1,0 +1,10 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3",
+  "description": "Different toggle properties behave independently across levels",
+  "expected": {
+    "para_1": {
+      "bold": "OFF per ECMA (XOR on^on=off), ON per Word (reset)",
+      "italic": "ON (only para style sets it, no XOR needed)"
+    }
+  }
+}

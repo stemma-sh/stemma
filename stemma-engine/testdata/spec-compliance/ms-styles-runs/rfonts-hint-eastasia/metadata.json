@@ -1,0 +1,6 @@
+{
+  "name": "rfonts-hint-eastasia",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26 note b (hint)",
+  "description": "Run 1: hint=eastAsia, char U+00B7 -> should use eastAsia font (MS Gothic). Run 2: no hint, same char -> should use hAnsi font (Arial).",
+  "expected_behavior": "The hint attribute influences font selection for characters in ambiguous ranges."
+}

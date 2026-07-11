@@ -1,0 +1,7 @@
+{
+  "name": "table-width-types",
+  "spec_ref": "ISO 29500-1 \u00a717.4.63",
+  "description": "Three tables: (1) width=5000 type=dxa, (2) width=2500 type=pct (50%), (3) width=0 type=auto.",
+  "expected_behavior": "Table 1: TableMeasurement { w: 5000, width_type: 'dxa' }. Table 2: TableMeasurement { w: 2500, width_type: 'pct' }. Table 3: TableMeasurement { w: 0, width_type: 'auto' }.",
+  "current_status": "TESTING"
+}

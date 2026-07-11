@@ -1,0 +1,6 @@
+{
+  "name": "default-font-tnr",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26 note c",
+  "description": "Run in a style with no rFonts anywhere.",
+  "expected_behavior": "All font slots should default to Times New Roman per MS note."
+}

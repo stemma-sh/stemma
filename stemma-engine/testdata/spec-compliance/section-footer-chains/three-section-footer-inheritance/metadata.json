@@ -1,0 +1,5 @@
+{
+  "name": "three-section-footer-inheritance",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "S1: default + first footers (titlePg=true). S2: only first footer (titlePg=true) \u2014 inherits default from S1. S3: nothing (titlePg=true) \u2014 inherits both from S2."
+}

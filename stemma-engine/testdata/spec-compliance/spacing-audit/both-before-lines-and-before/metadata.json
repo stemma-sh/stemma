@@ -1,0 +1,6 @@
+{
+  "name": "both-before-lines-and-before",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "beforeLines/afterLines precedence over before/after with roundtrip",
+  "expected_behavior": "All values preserved for roundtrip. P0: before=480, beforeLines=100. P1: after=480, afterLines=200. P2: before=480. P3: beforeLines=100. P4: before=0, beforeLines=100."
+}

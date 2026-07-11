@@ -1,0 +1,6 @@
+{
+  "name": "del-text-variants",
+  "spec_ref": "ISO 29500-1 \u00a717.3.3.7",
+  "description": "Deleted text using w:delText (correct) and w:t (Word quirk)",
+  "expected_behavior": "Both w:delText and w:t inside w:del should produce visible text in the deleted segment. w:ins with w:t is the normal insertion form."
+}

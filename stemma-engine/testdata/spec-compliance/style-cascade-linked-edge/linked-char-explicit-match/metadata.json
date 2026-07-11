@@ -1,0 +1,7 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "MatchPara (bold=on, sz=28, italic=on) linked to MatchChar (bold=on, sz=28, color=0000FF). Tests that when char explicitly sets same values as para, no information loss occurs. Char's additional color property should apply. Para's italic should be preserved.",
+  "expected": {
+    "para_1": "bold=on, sz=28, italic=on (para), color=0000FF (char)"
+  }
+}

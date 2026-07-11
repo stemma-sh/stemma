@@ -1,0 +1,525 @@
+:root {
+  /* Google-Docs-like light palette: a soft gray canvas, white toolbar + page. */
+  --bg: #f9fbfd;
+  --canvas: #f0f3f7;
+  --panel: #ffffff;
+  --panel-2: #f1f3f4;
+  --ink: #202124;
+  --muted: #5f6368;
+  --line: #dadce0;
+  --accent: #1a73e8;
+  --accent-2: #7b1fa2;
+  --ins: #188038;
+  --ins-bg: rgba(24, 128, 56, 0.12);
+  --del: #d93025;
+  --del-bg: rgba(217, 48, 37, 0.10);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+a { color: var(--accent); }
+
+header {
+  padding: 10px 24px 8px;
+  background: var(--panel);
+}
+header .crumb { color: var(--muted); font-size: 12px; margin: 0; }
+header h1 { margin: 0; font-size: 17px; font-weight: 500; letter-spacing: 0; color: var(--ink); }
+header h1 .x { color: var(--muted); font-weight: 400; }
+/* The verbose tagline isn't part of the Google-Docs-style chrome — hide it. */
+.tagline { display: none; }
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.toolbar .spacer { flex: 1; }
+.toolbar .divider { width: 1px; height: 26px; background: var(--line); margin: 0 4px; }
+
+.samples { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.samples-label { color: var(--muted); font-size: 12.5px; margin: 0 2px 0 4px; }
+button.sample { padding: 5px 10px; font-size: 13px; }
+
+button, .file-button {
+  font: inherit;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 7px 13px;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.ghost, .file-button {
+  background: var(--panel-2);
+  border-color: var(--line);
+  color: var(--ink);
+}
+.file-button { color: var(--accent); font-weight: 550; }
+button:not(:disabled):hover, .file-button:hover { border-color: var(--accent); }
+button.accept { background: transparent; color: var(--ins); border-color: rgba(63,185,80,0.4); }
+button.decline { background: transparent; color: var(--del); border-color: rgba(248,81,73,0.4); }
+button.accept:hover { border-color: var(--ins); }
+button.decline:hover { border-color: var(--del); }
+
+.author, .field {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.author input, .field input {
+  font: inherit;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  width: 150px;
+}
+
+/* Formatting toolbar (B / I / U / S). */
+.fmt { display: inline-flex; gap: 2px; }
+/* Toolbar buttons: borderless, hover-gray, light-blue when active (Docs style). */
+.fmt-btn { width: 30px; padding: 6px 0; text-align: center; background: transparent; border: 1px solid transparent; color: var(--ink); border-radius: 4px; }
+.fmt-btn:not(:disabled):hover { background: var(--panel-2); border-color: transparent; }
+.fmt-btn[aria-pressed="true"] { background: #e8f0fe; color: var(--accent); border-color: transparent; }
+
+/* The "Saving… / All changes saved" indicator — subtle muted text, not a button
+   (Google-Docs style). Still clickable as "save now". */
+#commit {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 400;
+  padding: 6px 8px;
+  cursor: default;
+}
+#commit:hover { background: var(--panel-2); }
+#commit.saved::before { content: "✓ "; color: var(--ins); }
+.fmt-btn:disabled { opacity: 0.4; }
+.fmt-select { font: inherit; font-size: 13px; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 6px 6px; max-width: 120px; }
+.fmt-select:disabled { opacity: 0.4; }
+.fmt-color { display: inline-flex; align-items: center; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 5px; cursor: pointer; }
+.fmt-color span { font-size: 13px; line-height: 1; }
+.fmt-color input[type="color"] { width: 18px; height: 18px; padding: 0; border: none; background: none; cursor: pointer; }
+.fmt-color input:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Segmented mode toggle (Suggesting / Editing). */
+.segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.segmented button {
+  background: var(--panel-2);
+  border: none;
+  border-radius: 0;
+  color: var(--muted);
+  padding: 7px 14px;
+}
+.segmented button[aria-pressed="true"] { background: var(--accent); color: #0b0e13; font-weight: 600; }
+.segmented button + button { border-left: 1px solid var(--line); }
+
+.status {
+  margin: 0;
+  padding: 6px 24px;
+  color: var(--muted);
+  font-size: 12.5px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  min-height: 0;
+}
+.status:empty { display: none; }
+.status.error { color: var(--del); }
+.status.ok { color: var(--ins); }
+.status code { color: var(--ink); }
+
+/* ── Document / editor ───────────────────────────────────────────────────── */
+.editor {
+  background: #fff;
+  color: #202124;
+  border-radius: 2px;
+  padding: 36px 44px;
+  min-height: 320px;
+  /* The Google-Docs page: a white sheet floating on the gray canvas. */
+  box-shadow: 0 1px 3px rgba(60, 64, 67, 0.15), 0 4px 12px rgba(60, 64, 67, 0.08);
+}
+.editor:empty { display: none; }
+
+.ProseMirror { outline: none; }
+.ProseMirror:focus { outline: none; }
+/* No hardcoded paragraph/heading margins: vertical spacing is Word's RESOLVED
+   spacing cascade, emitted per-block as inline margin-top/bottom by
+   blockLayoutStyle(). A CSS margin here would override that (e.g. force 12px
+   where Word says 0). The `margin: 0` reset only neutralizes the UA default for
+   blocks whose projection carries no spacing; `line-height` is a fallback that
+   inline `line-height` (from w:spacing line/lineRule) overrides when present. */
+.ProseMirror p { margin: 0; }
+.ProseMirror h1, .ProseMirror h2, .ProseMirror h3,
+.ProseMirror h4, .ProseMirror h5, .ProseMirror h6 { margin: 0; line-height: 1.25; }
+
+.editor.page { font-family: "Times New Roman", Georgia, serif; }
+/* Preserve + render tabs (entry tabs, inter-text tabs) while still wrapping.
+   Word's default tab stop is 0.5in. */
+.editor .ProseMirror { white-space: pre-wrap; tab-size: 0.5in; -moz-tab-size: 0.5in; }
+.ProseMirror .pm-img { max-width: 100%; height: auto; vertical-align: bottom; cursor: pointer; }
+/* A selected image atom (NodeSelection) — show it's the resize target. */
+.ProseMirror img.pm-img.ProseMirror-selectednode { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* A tracked-deleted / -inserted drawing: line-through can't show on an <img>, so
+   fade + outline it in the redline colour (the image is wrapped in <del>/<ins>). */
+.ProseMirror del img.pm-img { opacity: 0.5; outline: 2px solid var(--del); outline-offset: 1px; }
+.ProseMirror ins img.pm-img { outline: 2px solid var(--ins); outline-offset: 1px; }
+
+/* Floating image-resize bar, anchored over the selected <img> (positioned in JS). */
+.image-bar {
+  position: absolute; z-index: 30; display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 7px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 7px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.image-bar.hidden { display: none; }
+
+/* Inline popover (link URL / comment body) — replaces the native window.prompt. */
+.inline-popover {
+  position: absolute; z-index: 40; display: flex; flex-direction: column; gap: 7px;
+  min-width: 260px; padding: 12px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 9px; box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45);
+}
+.inline-popover.hidden { display: none; }
+.inline-popover input.hidden, .inline-popover textarea.hidden { display: none; }
+.inline-popover label { color: var(--muted); font-size: 12px; }
+.inline-popover input, .inline-popover textarea {
+  font: inherit; font-size: 13px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%; resize: vertical;
+}
+.inline-popover input:focus, .inline-popover textarea:focus { outline: none; border-color: var(--accent); }
+.inline-popover .popover-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.inline-popover .popover-actions button { padding: 5px 12px; font-size: 13px; }
+.image-bar button { width: 26px; height: 26px; padding: 0; font-size: 16px; line-height: 1; background: var(--panel); border: 1px solid var(--line); color: var(--ink); border-radius: 5px; cursor: pointer; }
+.image-bar input { width: 60px; padding: 4px 6px; background: var(--panel); border: 1px solid var(--line); color: var(--ink); border-radius: 5px; }
+.image-bar .unit { color: var(--ink); opacity: 0.7; font-size: 12px; }
+.ProseMirror .pm-run { /* inline style carries font/size/color/highlight */ }
+/* Numbering marker: a non-editable inline atom. text-indent positions it at the
+   resolved first-line origin; a following tab node (sized by the tab-layout
+   plugin) bridges marker → body text on the paragraph's real tab stops. */
+.ProseMirror .pm-num { white-space: pre; user-select: none; }
+.ProseMirror a.pm-link { color: #0563c1; text-decoration: underline; cursor: pointer; }
+/* A literal tab: an inline-block spacer the tab-layout plugin sizes to the next
+   tab stop. (Body + marker tabs no longer rely on the CSS tab-size grid.) */
+.ProseMirror .pm-tab { display: inline-block; }
+/* Tab leader fills (TOC dots, signature-line dashes/underscores). */
+.ProseMirror .pm-tab.pm-lead-dot { border-bottom: 2px dotted currentColor; }
+.ProseMirror .pm-tab.pm-lead-dash { border-bottom: 1px dashed currentColor; }
+.ProseMirror .pm-tab.pm-lead-line { border-bottom: 1px solid currentColor; }
+
+/* ── Read-only header / footer bands ─────────────────────────────────────────
+   Page furniture projected from the document's header/footer stories (NOT part
+   of the editable body). Rendered muted + smaller, set apart from the body by a
+   hairline. Each line is a flex row; tab boundaries (.hf-tab) become space so
+   the classic left/center/right footer lays out the way Word draws it. */
+.hf-band {
+  font-family: "Times New Roman", Georgia, serif;
+  /* Word renders header/footer text in its real run color (default black), not
+     a de-emphasized gray; explicit run colors still win via .pm-run. */
+  color: var(--ink);
+  cursor: default;
+  user-select: none;
+}
+/* Word draws no divider between a header/footer and the body — only the
+   header/footer distance separates them. Keep spacing, draw no line. */
+.hf-band.hf-header { margin-bottom: 18px; }
+.hf-band.hf-footer { margin-top: 18px; }
+.hf-line { min-height: 1.2em; white-space: pre-wrap; }
+/* A tabbed line spreads its runs with flex; a plain line aligns its text via
+   text-align (set from the paragraph's w:jc) so a centered footer centers. */
+.hf-line.has-tab { display: flex; align-items: baseline; }
+/* A tab boundary: a flex gap that stretches, spreading runs apart (left/center/
+   right). The first such gap also keeps a single trailing-tab line left-aligned. */
+.hf-band .hf-tab { flex: 1 1 auto; min-width: 1ch; }
+.hf-band a.pm-link { color: #0563c1; text-decoration: underline; }
+.hf-band sup { font-size: 0.7em; vertical-align: super; }
+
+/* Real tables + equations, in both the editor and the read-only preview. */
+.pm-table { border-collapse: collapse; margin: 6px 0 14px; font-size: 0.95em; }
+/* Borders come per-cell from the resolved cell.borders (Word's effective edges),
+   not a hardcoded grey — so a borderless table renders borderless. */
+.pm-table td { padding: 4px 9px; vertical-align: top; }
+.pm-table td.pm-cell-edit:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Cell paragraphs render tight (no body margin); multiple paragraphs stack. */
+.pm-table td .pm-cell-p { margin: 0; }
+.pm-table td .pm-cell-p + .pm-cell-p { margin-top: 4px; }
+.pm-eq { display: inline-block; vertical-align: middle; }
+.pm-eq svg { vertical-align: middle; }
+
+.ProseMirror ins {
+  text-decoration: none;
+  color: #1a7f37;
+  background: var(--ins-bg);
+  border-radius: 2px;
+}
+.ProseMirror del {
+  color: #b32018;
+  background: var(--del-bg);
+  text-decoration: line-through;
+  border-radius: 2px;
+}
+/* A tracked run FORMATTING change (rPrChange): the text keeps its (new) formatting
+   and is flagged with a violet dotted underline — distinct from the green/red of
+   ins/del text changes and the yellow of comments. The accept/reject card carries
+   the action. */
+.ProseMirror .pm-fmtchange {
+  border-bottom: 2px dotted #8250df;
+  background: rgba(130, 80, 223, 0.10);
+  border-radius: 2px;
+  cursor: help;
+}
+.pm-pending .pm-fmtchange { opacity: 0.6; }
+
+.pm-placeholder {
+  border: 1px dashed #c4ccd6;
+  background: #eef1f5;
+  color: #55606e;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+.pm-placeholder .kind {
+  display: inline-block;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #8a94a3;
+  margin-right: 8px;
+}
+.pm-anchor {
+  display: inline;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #e6eaf0;
+  color: #55606e;
+  font-size: 0.9em;
+}
+
+/* A commented span: a soft amber highlight tying the text to its sidebar card.
+   `.pm-comment-active` is added when its card is selected, to brighten the link. */
+.ProseMirror .pm-comment { background: rgba(245, 193, 66, 0.28); border-bottom: 1px solid rgba(193, 142, 16, 0.55); border-radius: 2px; cursor: pointer; }
+/* The active highlight is a ProseMirror Decoration, rendered as a NESTED span
+   inside .pm-comment — so it's a descendant, not the same element (a compound
+   .pm-comment.pm-comment-active selector would never match). */
+.ProseMirror .pm-comment-active { background: rgba(245, 193, 66, 0.6); }
+
+/* ── Comments sidebar (redline review) ───────────────────────────────────── */
+.comments {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px; align-self: start; position: sticky; top: 16px;
+  max-height: calc(100vh - 32px); overflow-y: auto;
+}
+.comments h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
+.comments .empty { color: var(--muted); font-size: 13px; font-style: italic; }
+.comment-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0 0 10px;
+  background: var(--panel-2); cursor: pointer; transition: border-color 0.12s, box-shadow 0.12s;
+}
+.comment-card:hover { border-color: var(--accent); }
+.comment-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.comment-card.resolved { opacity: 0.62; }
+.comment-card .meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.comment-card .author { font-weight: 650; font-size: 13px; color: var(--ink); }
+.comment-card .date { font-size: 11px; color: var(--muted); }
+.comment-card .badge { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--ins); border: 1px solid var(--ins); border-radius: 4px; padding: 1px 5px; }
+.comment-card .body { font-size: 14px; color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.comment-card .reply { font-size: 13px; color: var(--muted); border-left: 2px solid var(--line); padding-left: 8px; margin-top: 6px; white-space: pre-wrap; }
+.comment-card .actions { display: flex; gap: 6px; margin-top: 8px; }
+.comment-card .actions button {
+  font: inherit; font-size: 12px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; cursor: pointer;
+}
+.comment-card .actions button:hover { border-color: var(--accent); }
+.comment-card .actions .reply-box { flex: 1; font: inherit; font-size: 12px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; }
+
+/* ── Suggestions (tracked-change review) rail ─────────────────────────────── */
+.rail-section { margin-bottom: 18px; }
+.rail-section:last-child { margin-bottom: 0; }
+.rail-section.hidden { display: none; }
+#comments.hidden { display: none; }
+#suggestions h2, .comments h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
+.suggest-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0 0 10px;
+  background: var(--panel-2);
+}
+.suggest-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.suggest-author { font-weight: 600; font-size: 13px; color: var(--ink); }
+.suggest-kind { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 4px; padding: 1px 6px; }
+.suggest-kind.k-insert { color: var(--ins); border: 1px solid var(--ins); }
+.suggest-kind.k-delete { color: var(--del); border: 1px solid var(--del); }
+.suggest-kind.k-format { color: var(--accent); border: 1px solid var(--accent); }
+.suggest-kind.k-replace { color: var(--accent); border: 1px solid var(--accent); }
+.suggest-body { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+/* A replace shows as "old → new" in one card. */
+.suggest-old { color: var(--del); text-decoration: line-through; }
+.suggest-new { color: var(--ins); }
+.suggest-arrow { color: var(--muted); }
+.suggest-actions { display: flex; gap: 8px; margin-top: 9px; }
+.suggest-actions button { font: inherit; font-size: 12px; border-radius: 6px; padding: 4px 12px; cursor: pointer; flex: 1; }
+.suggest-actions .accept { background: var(--ins); color: #fff; border: 1px solid transparent; }
+.suggest-actions .decline { background: var(--panel); color: var(--del); border: 1px solid var(--line); }
+.suggest-actions .decline:hover { border-color: var(--del); }
+
+/* Change bars are box-shadow ONLY — never padding/margin — so a block keeps the
+   exact same geometry whether it's clean, dirty, or syncing. Otherwise the text
+   shifts horizontally as a block transitions dirty→pending→committed (a "loading"
+   jump). The 3px bar sits in the page's left gutter. */
+.pm-dirty { box-shadow: -3px 0 0 var(--accent); }
+/* A block flashed by a proposal "preview". */
+.pm-focus { box-shadow: -3px 0 0 var(--accent-2); background: rgba(182,146,246,0.08); border-radius: 4px; }
+/* An optimistically-committed block whose server confirmation is still in
+   flight: the redline shows immediately but faded, with a syncing bar, until the
+   authoritative result lands (or it rolls back). */
+.pm-pending { box-shadow: -3px 0 0 var(--accent-2); animation: pm-sync 1.1s ease-in-out infinite; }
+.pm-pending ins, .pm-pending del { opacity: 0.55; }
+@keyframes pm-sync { 0%, 100% { box-shadow: -3px 0 0 var(--accent-2); } 50% { box-shadow: -3px 0 0 rgba(182,146,246,0.35); } }
+
+/* ── Layouts ─────────────────────────────────────────────────────────────── */
+main { padding: 28px 32px 80px; background: var(--canvas); min-height: calc(100vh - 92px); }
+main.single { max-width: 920px; margin: 0 auto; }
+main.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 24px;
+  max-width: 1240px;
+  margin: 0 auto;
+  align-items: start;
+}
+
+/* ── Rich preview (read-only, render-faithful) ───────────────────────────── */
+.preview {
+  background: #fff;
+  color: #14181f;
+  border-radius: 10px;
+  padding: 48px 56px;
+  min-height: 320px;
+  box-shadow: 0 1px 0 var(--line);
+}
+.preview:empty { display: none; }
+.preview p { margin: 0 0 10px; }
+.preview h1, .preview h2, .preview h3, .preview h4, .preview h5, .preview h6 { margin: 18px 0 8px; }
+.preview .numbering { white-space: pre; color: #14181f; }
+.preview ins { text-decoration: none; color: #1a7f37; background: rgba(63,185,80,0.12); }
+.preview del { color: #b32018; background: rgba(248,81,73,0.1); text-decoration: line-through; }
+.preview .pm-img { max-width: 100%; height: auto; display: inline-block; vertical-align: bottom; }
+.preview .eq-chip {
+  display: inline-block; padding: 0 6px; border-radius: 4px; font-style: italic;
+  background: #eef1f5; color: #55606e;
+}
+.preview .opaque-chip {
+  display: inline; padding: 0 4px; border-radius: 4px; background: #e6eaf0; color: #55606e; font-size: 0.9em;
+}
+.rich-placeholder {
+  border: 1px dashed #c4ccd6; background: #f6f8fa; color: #55606e;
+  border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; font-size: 13px; white-space: pre-wrap;
+}
+.rich-placeholder .kind {
+  display: inline-block; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+  color: #8a94a3; margin-right: 8px;
+}
+
+.empty-state {
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 22px 26px;
+}
+.empty-state.hidden { display: none; }
+.empty-state h2 { margin: 0 0 10px; font-size: 16px; color: var(--ink); }
+.empty-state ol { margin: 0; padding-left: 20px; }
+.empty-state li { margin: 7px 0; }
+.empty-state .note { margin: 14px 0 0; font-size: 13px; font-style: italic; }
+.empty-state ins, .empty-state del { padding: 0 2px; border-radius: 3px; }
+
+/* ── Proposals panel ─────────────────────────────────────────────────────── */
+.proposals {
+  position: sticky;
+  top: 16px;
+}
+.proposals h2 { margin: 0 0 4px; font-size: 15px; }
+.proposals .hint { margin: 0 0 14px; color: var(--muted); font-size: 12.5px; }
+
+.agent-actions { display: grid; gap: 8px; margin-bottom: 18px; }
+.agent-actions button {
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+.agent-actions button:hover:not(:disabled) { border-color: var(--accent-2); }
+.agent-actions .desc { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+.proposal-list { display: grid; gap: 10px; }
+.proposal-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-2);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px 13px;
+}
+.proposal-card .title { font-weight: 600; font-size: 13.5px; }
+.proposal-card .meta { color: var(--muted); font-size: 12px; margin: 3px 0 9px; }
+.proposal-card .excerpt {
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 7px 9px;
+  margin: 0 0 10px;
+  max-height: 84px;
+  overflow: auto;
+}
+.proposal-card .excerpt ins { color: var(--ins); background: var(--ins-bg); text-decoration: none; }
+.proposal-card .excerpt del { color: var(--del); background: var(--del-bg); }
+.proposal-card .actions { display: flex; gap: 8px; }
+.proposal-card .actions button { padding: 5px 11px; font-size: 13px; }
+.proposals .empty { color: var(--muted); font-size: 13px; font-style: italic; }
+
+/* ── Landing page ────────────────────────────────────────────────────────── */
+.landing { max-width: 880px; margin: 0 auto; padding: 48px 32px; }
+.landing .lead { color: var(--muted); max-width: 70ch; }
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 28px; }
+.card {
+  display: block;
+  text-decoration: none;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 22px 24px;
+  transition: border-color 0.15s;
+}
+.card:hover { border-color: var(--accent); }
+.card .tag {
+  display: inline-block;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  margin-bottom: 8px;
+}
+.card h2 { margin: 0 0 8px; font-size: 18px; }
+.card p { margin: 0; color: var(--muted); font-size: 13.5px; }
+@media (max-width: 720px) { .cards { grid-template-columns: 1fr; } main.split { grid-template-columns: 1fr; } }

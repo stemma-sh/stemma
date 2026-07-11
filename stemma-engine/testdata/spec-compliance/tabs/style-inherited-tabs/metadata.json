@@ -1,0 +1,7 @@
+{
+  "name": "style-inherited-tabs",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.38, \u00a717.7",
+  "description": "Paragraph style defines tab stops at 720 (left) and 3600 (center); paragraph uses that style",
+  "expected_behavior": "Paragraph should inherit tab stops from its style",
+  "current_status": "SUPPORTED \u2014 style tab inheritance is implemented"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "simple-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.19",
+  "description": "Paragraph with a w:fldSimple field (PAGE) containing result text '1'",
+  "expected_behavior": "Parser should produce OpaqueInline with FieldKind::Simple, instruction_text=' PAGE ', result_text='1'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed into OpaqueKind::Field(FieldData)"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "run-border",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.4",
+  "description": "Run with character-level border (w:bdr)",
+  "expected_behavior": "Run border properties should be preserved in the model"
+}

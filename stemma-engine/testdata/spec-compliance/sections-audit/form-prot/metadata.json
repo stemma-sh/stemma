@@ -1,0 +1,6 @@
+{
+  "name": "form-prot",
+  "spec_ref": "ISO 29500-1 \u00a717.6.6",
+  "description": "Section with w:formProt val=1 (form protection enabled)",
+  "expected_behavior": "SectionProperties should expose formProt boolean"
+}

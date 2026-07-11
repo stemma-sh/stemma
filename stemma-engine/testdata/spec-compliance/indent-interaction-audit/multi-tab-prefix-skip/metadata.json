@@ -1,0 +1,7 @@
+{
+  "name": "multi-tab-prefix-skip",
+  "spec_ref": "ECMA-376 \u00a717.3.1.38",
+  "description": "P0: left=0, tabs at [360, 720], prefix. P1: tab at [720] only.",
+  "expected_behavior": "body_left uses first tab stop the prefix tab lands on (360).",
+  "current_status": "GAP-104 \u2014 tab_stops_abs.first() may not always be correct"
+}

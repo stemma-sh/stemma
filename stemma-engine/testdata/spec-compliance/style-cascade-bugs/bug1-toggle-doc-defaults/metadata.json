@@ -1,0 +1,11 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + MS-OI29500 \u00a72.1.230a",
+  "bug": "Toggle-docDefaults interaction",
+  "description": "docDefaults bold=on,italic=on with styles overriding individual toggles. Tests that styles can turn OFF toggles that docDefaults turned ON.",
+  "expected": {
+    "para_1": "bold=OFF (style overrides), italic=ON (docDefaults)",
+    "para_2": "bold=ON (docDefaults), italic=OFF (char overrides)",
+    "para_3": "bold=ON (char overrides style's off), italic=ON (docDefaults)",
+    "para_4": "bold=ON (docDefaults), italic=ON (docDefaults)"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "name": "empty-table-zero-rows",
+  "description": "Table with tblPr and tblGrid but zero rows. CT_Tbl's row group (EG_ContentRowContent) is minOccurs=\"0\" in the transitional XSD, so this is schema-valid; Word opens it without repair. Must import, roundtrip, and survive redline export with the table intact."
+}

@@ -1,0 +1,6 @@
+{
+  "name": "next-column-section",
+  "spec_ref": "ISO 29500-1 sections 17.6.22",
+  "description": "Section with type='nextColumn' break. One of five valid section break types per spec.",
+  "expected_behavior": "SectionType should parse as NextColumn (or equivalent). Currently the parser rejects unknown types."
+}

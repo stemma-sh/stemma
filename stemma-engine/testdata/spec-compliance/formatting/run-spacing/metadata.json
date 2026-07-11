@@ -1,0 +1,7 @@
+{
+  "name": "run-spacing",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.33",
+  "description": "Runs with expanded and condensed character spacing",
+  "expected_behavior": "Parser should expose character spacing value on TextNode/StyleProps",
+  "current_status": "NOT_PARSED \u2014 character spacing silently ignored"
+}

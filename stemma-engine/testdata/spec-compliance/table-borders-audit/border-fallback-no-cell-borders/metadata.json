@@ -1,0 +1,11 @@
+{
+  "name": "border-fallback-no-cell-borders",
+  "spec_ref": "ISO 29500-1 SS17.4.66",
+  "description": "Table with tblBorders on all 6 edges, NO tcBorders on any cell. Cells should inherit table borders as defaults.",
+  "expected": {
+    "cell_0_0": "top=table.top, bottom=insideH, left=table.left, right=insideV",
+    "cell_0_1": "top=table.top, bottom=insideH, left=insideV, right=table.right",
+    "cell_1_0": "top=insideH, bottom=table.bottom, left=table.left, right=insideV",
+    "cell_1_1": "top=insideH, bottom=table.bottom, left=insideV, right=table.right"
+  }
+}

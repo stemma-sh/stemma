@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.9",
+  "description": "Tests contextualSpacing=false overriding style's true. Ensures val=0 is parsed as explicit false, not ignored.",
+  "expected": {
+    "para_0": "contextual_spacing=None",
+    "para_1": "contextual_spacing=Some(true) (from style)",
+    "para_2": "contextual_spacing=Some(false) (direct val=0 overrides style)"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "conditional-precedence-order",
+  "spec_ref": "MS-OI29500 \u00a717.7.6(c), \u00a717.7.6.6(a)",
+  "description": "firstRow blue, firstCol green, lastRow orange, lastCol purple, band1Horz gray.",
+  "expected_behavior": "Cell (0,0): firstRow blue wins over firstCol. Cell (3,0): lastRow orange wins over firstCol. Cell (1,0): firstCol green. Cell (1,1): band gray."
+}

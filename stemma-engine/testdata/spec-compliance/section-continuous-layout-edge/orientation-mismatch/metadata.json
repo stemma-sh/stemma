@@ -1,0 +1,5 @@
+{
+  "name": "orientation-mismatch",
+  "spec_ref": "ECMA-376 \u00a717.6.22 / \u00a717.6.14",
+  "description": "S1(nextPage, portrait 12240x15840) -> S2(continuous, landscape 15840x12240). Word promotes S2 to nextPage when orientation differs. Tests that S2 retains its own page dimensions (not inherited)."
+}

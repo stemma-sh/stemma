@@ -1,0 +1,7 @@
+{
+  "name": "compat-combined",
+  "spec_ref": "MS-DOCX \u00a72.3",
+  "description": "Document with 6 compat settings: compatibilityMode=15, overrideTableStyleFontSizeAndJustification=1, doNotFlipMirrorIndents=0, enableOpenTypeFeatures=1, differentiateMultirowTableHeaders=1, allowTextAfterFloatingTableBreak=0",
+  "expected_behavior": "Parser should expose ALL compat settings, not just the 3 currently supported",
+  "current_status": "GAP \u2014 only 3 of 6 settings are parsed"
+}

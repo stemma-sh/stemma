@@ -1,0 +1,7 @@
+{
+  "name": "style-run-props",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.2",
+  "description": "Table style with firstRow conditional setting bold in rPr.",
+  "expected_behavior": "Text in first row cells should be bold and white (color=FFFFFF) from the conditional rPr. Data rows should have default formatting.",
+  "current_status": "GAP \u2014 ConditionalCellProps does not carry rPr"
+}

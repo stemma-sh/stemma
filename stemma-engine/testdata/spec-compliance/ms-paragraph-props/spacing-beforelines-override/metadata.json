@@ -1,0 +1,7 @@
+{
+  "name": "spacing-beforelines-override",
+  "spec_ref": "MS-OI29500 2.1.60 \u00a717.3.1.33",
+  "description": "P0: LineSpacedStyle (beforeLines=200, afterLines=100). P1: LineSpacedStyle + direct before=480. P2: direct before=480 only (control).",
+  "expected_behavior": "P0: before_lines=200, after_lines=100. P1: Word overrides direct before=480 with style's beforeLines=200. P2: before=480.",
+  "current_status": "GAP \u2014 we do element-level override for direct spacing, ignoring line-unit precedence"
+}

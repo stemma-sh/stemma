@@ -1,0 +1,7 @@
+{
+  "name": "hyperlink-with-formatting",
+  "spec_ref": "ISO 29500-1 \u00a717.16.22",
+  "description": "Hyperlink with two runs: first bold, second normal",
+  "expected_behavior": "HyperlinkData.text should be 'bold part and normal part' (concatenation of all runs)",
+  "current_status": "SUPPORTED \u2014 text extraction recursively collects from all runs"
+}

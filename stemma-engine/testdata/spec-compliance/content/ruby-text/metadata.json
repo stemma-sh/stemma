@@ -1,0 +1,7 @@
+{
+  "name": "ruby-text",
+  "spec_ref": "ISO 29500-1 \u00a717.3.3.25",
+  "description": "East Asian ruby annotation (w:ruby)",
+  "expected_behavior": "OpaqueInline with kind Ruby should be present",
+  "current_status": "SUPPORTED"
+}

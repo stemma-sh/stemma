@@ -1,0 +1,7 @@
+{
+  "name": "title-page-interaction",
+  "spec_ref": "ISO 29500-1 sections 17.10.6, 17.6.18",
+  "description": "Section with titlePg=true, default header 'Default Header' and first-page header 'First Page Header'",
+  "expected_behavior": "First page shows 'First Page Header', subsequent pages show 'Default Header'. body_section_properties.title_page should be Some(true).",
+  "current_status": "PARTIAL - headers are parsed, titlePg flag is parsed, but renderer does not select headers based on titlePg"
+}

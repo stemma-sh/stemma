@@ -1,0 +1,7 @@
+{
+  "name": "table-style-indent-alignment",
+  "spec_ref": "ISO 29500-1 \u00a717.4.63",
+  "description": "Style defines jc=center and tblInd=360. Table 1 has no direct overrides. Table 2 has direct jc=right override.",
+  "expected_behavior": "Table 1: center alignment and 360tw indent from style. Table 2: right alignment from direct override, 360tw indent from style (only alignment is overridden).",
+  "current_status": "GAP-021 \u2014 table alignment/indent not resolved from style"
+}

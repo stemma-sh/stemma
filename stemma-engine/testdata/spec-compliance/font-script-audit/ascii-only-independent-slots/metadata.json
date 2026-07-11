@@ -1,0 +1,7 @@
+{
+  "name": "ascii-only-independent-slots",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Parent: ascii/hAnsi='Arial', eastAsia='SimSun', cs='Arial Unicode MS'. Child basedOn parent: only ascii/hAnsi='Trebuchet MS'.",
+  "expected_behavior": "font_family='Trebuchet MS', font_east_asia='SimSun', font_cs='Arial Unicode MS'.",
+  "current_status": "GAP-136 \u2014 independent font slot cascade through basedOn"
+}

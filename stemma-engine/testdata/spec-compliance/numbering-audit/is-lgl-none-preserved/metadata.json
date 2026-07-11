@@ -1,0 +1,6 @@
+{
+  "name": "is-lgl-none-preserved",
+  "spec_ref": "ISO 29500-1 \u00a717.9.4, MS-OI29500 \u00a717.9.4b",
+  "description": "Level 0 is numFmt=none. Level 2 has isLgl and lvlText '%1.%2.%3'. isLgl forces decimal on all levels EXCEPT numFmt=none, which is preserved as empty.",
+  "expected_behavior": "Level 2: '.1.1' \u2014 %1 is empty (none preserved), %2 and %3 are decimal."
+}

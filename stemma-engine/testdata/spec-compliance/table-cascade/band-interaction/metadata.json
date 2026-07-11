@@ -1,0 +1,7 @@
+{
+  "name": "band-interaction",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table with band1Horz (gray D9D9D9), band2Horz (white), band1Vert (blue BDD7EE), band2Vert (white). Both horizontal and vertical banding enabled.",
+  "expected_behavior": "Per 17.7.6: banded rows override banded columns. Cell (0,0): band1Horz row + band1Vert col -> gray (D9D9D9) from band row. Cell (0,1): band1Horz row + band2Vert col -> gray (D9D9D9) from band row. Cell (1,0): band2Horz row + band1Vert col -> white from band row. Band rows always win over band columns at intersection.",
+  "current_status": "GAP \u2014 current code applies band columns after band rows (wrong precedence)"
+}

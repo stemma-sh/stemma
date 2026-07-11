@@ -1,0 +1,9 @@
+{
+  "name": "main-moves",
+  "description": "Main body with w:moveFrom and w:moveTo tracked changes",
+  "revision_elements": {
+    "moveFrom": 1,
+    "moveTo": 1
+  },
+  "expected_after_normalize": "Start middle moved text end."
+}

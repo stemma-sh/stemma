@@ -1,0 +1,5 @@
+{
+  "name": "color-tiebreaker-same-style-same-weight",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with no table borders. Cell (0,0) right = single sz=8 color=FF0000 (red, primary=255, secondary=0). Cell (0,1) left = single sz=8 color=0000FF (blue, primary=255, secondary=255). Same style, weight, and primary brightness. Per SS2.1.169, secondary brightness (B+2G) breaks the tie. Red (secondary=0) wins over blue (secondary=255)."
+}

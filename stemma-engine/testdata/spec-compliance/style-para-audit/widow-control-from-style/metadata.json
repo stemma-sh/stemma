@@ -1,0 +1,17 @@
+{
+  "description": "GAP-141: widowControl resolved through style chain",
+  "paragraphs": [
+    {
+      "text": "Default paragraph",
+      "expected_widow_control": null
+    },
+    {
+      "text": "NoWidow style",
+      "expected_widow_control": false
+    },
+    {
+      "text": "Direct override",
+      "expected_widow_control": true
+    }
+  ]
+}

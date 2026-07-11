@@ -1,0 +1,5 @@
+{
+  "name": "non-continuous-breaks-chain",
+  "spec_ref": "ISO 29500-1 section 17.6.17",
+  "description": "S1(nextPage, 1440 margins) -> S2(continuous, no margins) -> S3(nextPage, 2880 margins, landscape) -> S4(continuous, no margins). S4 should inherit from S3, not from S2. Tests that nextPage breaks the inheritance chain."
+}

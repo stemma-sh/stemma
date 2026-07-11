@@ -1,0 +1,7 @@
+{
+  "name": "block-sdt",
+  "spec_ref": "ISO 29500-1 \u00a717.5.2.32",
+  "description": "Block-level SDT wrapping a paragraph",
+  "expected_behavior": "Content within the SDT should be accessible",
+  "current_status": "SUPPORTED"
+}

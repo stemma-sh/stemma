@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + MS-OI29500 \u00a72.1.258",
+  "description": "Para style bold + char style bold: XOR vs reset",
+  "expected": {
+    "para_1": "bold=ON per Word (reset), bold=OFF per ECMA (XOR on^on=off)",
+    "para_2": "bold=ON (para style only, no XOR needed)",
+    "para_3": "bold=ON (char style only, no XOR needed)"
+  }
+}

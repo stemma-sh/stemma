@@ -1,0 +1,7 @@
+{
+  "name": "tbl-header",
+  "spec_ref": "ISO 29500-1 \u00a717.4.50",
+  "description": "Table with first row marked as repeating header",
+  "expected_behavior": "Parser should expose the tblHeader flag on the header row",
+  "current_status": "NOT_PARSED \u2014 tblHeader silently ignored"
+}

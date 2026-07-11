@@ -1,0 +1,7 @@
+{
+  "name": "mirror-indent-with-hanging",
+  "spec_ref": "ECMA-376 \u00a717.3.1.18, \u00a717.3.1.12",
+  "description": "P0: start=1440, hanging=720, mirrorIndents. P1: no mirror control.",
+  "expected_behavior": "P0: mirror_indents=true, left=1440, first_line=-720.",
+  "current_status": "GAP-106 \u2014 verify mirror_indents preserved with hanging"
+}

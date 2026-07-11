@@ -1,0 +1,21 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.1 (per-property override)",
+  "description": "Non-toggle properties: child overrides per-property, inherits rest",
+  "expected": {
+    "para_1_grandchild": {
+      "font_size": 28,
+      "color": "0000FF",
+      "italic": true
+    },
+    "para_2_child": {
+      "font_size": 28,
+      "color": "FF0000",
+      "italic": true
+    },
+    "para_3_base": {
+      "font_size": 24,
+      "color": "FF0000",
+      "italic": true
+    }
+  }
+}

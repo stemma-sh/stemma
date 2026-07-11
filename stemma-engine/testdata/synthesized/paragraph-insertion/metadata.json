@@ -1,0 +1,5 @@
+{
+  "name": "paragraph-insertion",
+  "description": "Insert a new paragraph between existing ones",
+  "pipeline": "BlockInserted -> InsertBlock"
+}

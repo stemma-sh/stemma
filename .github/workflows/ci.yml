@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    # Clippy runs on the exact toolchain pinned in .mise.toml — the same one
+    # `just lint` enforces locally — so lint can never be green on one side
+    # and red on the other. A floating `stable` here would break main and
+    # every open PR the day a new stable drops (new lints + -D warnings), for
+    # reasons unrelated to the change under review. Bumping the pin (and
+    # fixing what the new clippy flags) is a deliberate maintenance commit;
+    # the `test` matrix stays on floating stable so the code itself is still
+    # exercised on the newest compiler.
+    name: lint (clippy, warnings denied)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned toolchain from .mise.toml
+        id: toolchain
+        run: |
+          version="$(sed -n 's/^rust = "\([^"]*\)".*/\1/p' .mise.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse the pinned rust version from .mise.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    # The engine is a ZIP/OOXML library, so the daily suite must stay green on
+    # Windows (CRLF, path separators, zip byte layout) as well as Unix.
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (daily suite, hermetic)
+        run: cargo test --workspace
+
+  msrv:
+    # Enforce the advertised toolchain floor. This is a build, not a test run:
+    # it proves the workspace compiles on the oldest supported rustc. Keep the
+    # version in sync with the `rust-version` field in each crate's Cargo.toml.
+    name: msrv (build on 1.91 floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace on MSRV
+        run: cargo build --workspace
+
+  npm-launcher:
+    # The npm distribution (stemma-mcp/npm) must not rot between releases:
+    # assemble the host-platform packages from a fresh build, install them the
+    # way a consumer would, and drive the full MCP protocol through npm's bin
+    # shim. release.yml reuses the same assembly script for the real matrix.
+    name: npm launcher (assemble + protocol smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build server
+        run: cargo build -p stemma-mcp
+      - name: Assemble, install, smoke
+        run: bash stemma-mcp/npm/smoke-launcher.sh target/debug/stemma-mcp
+
+  contamination:
+    # Guard the public/private split: nothing tracked in this repo may name the
+    # maintainer-only repository, a contributor's absolute home path, or the
+    # held-out oracle-infrastructure *paths*.
+    name: contamination (no held-out-material leakage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail on references to held-out / maintainer-only material
+        run: |
+          # Patterns use [ ] character classes so this workflow's own pattern
+          # text is never matched by its own grep (self-reference is not a
+          # leak); the classes still match the real literals in every other
+          # file. word-oracle is matched only in slash/path form — the approved
+          # public framing mentions the term in prose, never as a path.
+          pattern='stemma[-]private|/home/[a]ndreas|word-oracle[/]'
+          if git grep -n -i -I -E "$pattern" -- .; then
+            echo "::error::Forbidden reference to held-out/maintainer-only material found in the tracked tree."
+            exit 1
+          fi
+          echo "Contamination check passed: no forbidden references in tracked tree."

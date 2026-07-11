@@ -1,0 +1,6 @@
+{
+  "name": "title-page-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.6",
+  "description": "S1 has titlePg=true with default+first headers. S2 has no titlePg and no headers.",
+  "expected_behavior": "S1.title_page=Some(true), S2.title_page=None (not inherited). S2 inherits both header refs from S1."
+}

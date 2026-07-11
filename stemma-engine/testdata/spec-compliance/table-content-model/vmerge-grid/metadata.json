@@ -1,0 +1,25 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.84",
+  "description": "3x3 table: rows 0-1 have matching vMerge gridSpan=2, row 2 has mismatched gridSpan=1 on vMerge continue",
+  "rows": [
+    {
+      "cells": [
+        "R0C0 (gridSpan=2, vMerge=restart)",
+        "R0C2"
+      ]
+    },
+    {
+      "cells": [
+        "R1C0 (gridSpan=2, vMerge=continue)",
+        "R1C2"
+      ]
+    },
+    {
+      "cells": [
+        "R2C0 (gridSpan=1, vMerge=continue MISMATCH)",
+        "R2C1",
+        "R2C2"
+      ]
+    }
+  ]
+}

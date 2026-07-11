@@ -1,0 +1,6 @@
+{
+  "name": "lvl-restart-specific",
+  "spec_ref": "ISO 29500-1 \u00a717.9.10",
+  "description": "Level 2 has lvlRestart=1 (restart only when level 0 is used). Level 1 appearing does NOT reset level 2's counter.",
+  "expected_behavior": "Sequence: 1. / a) / b) / i) / ii) / c) / iii) / iv) / 2. / a) / i). Level 2 continues through iii) and iv) after level 1 'c)' because lvlRestart=1 means only level 0 triggers restart."
+}

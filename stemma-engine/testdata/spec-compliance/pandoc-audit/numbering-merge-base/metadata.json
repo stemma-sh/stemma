@@ -1,0 +1,4 @@
+{
+  "description": "Base document with numbering: abstractNumId=10, numId=100",
+  "spec_ref": "ECMA-376 Annex A, CT_Numbering (xsd:sequence: abstractNum* then num*)"
+}

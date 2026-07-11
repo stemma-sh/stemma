@@ -1,0 +1,5 @@
+{
+  "name": "ordering-multi-insert",
+  "description": "Multiple insertions throughout document at various positions",
+  "source": "generated for ordering tests"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "comment-with-reply",
+  "spec_ref": "ISO 29500-1 \u00a717.13.4",
+  "description": "Parent comment (id=1) and reply comment (id=2) \u2014 tests comment threading",
+  "expected_behavior": "Both comments parsed as separate CommentStory entries",
+  "current_status": "SUPPORTED \u2014 reply comments parsed (threading metadata not modeled)"
+}

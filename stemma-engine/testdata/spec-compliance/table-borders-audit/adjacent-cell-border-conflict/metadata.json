@@ -1,0 +1,5 @@
+{
+  "name": "adjacent-cell-border-conflict",
+  "spec_ref": "ISO 29500-1 SS17.4.66 rule 3",
+  "description": "Cell (0,0) has thick right border (sz=24 red). Cell (0,1) has thin left border (sz=4 blue). Per SS17.4.66 rule 3, the heavier border wins at the shared edge."
+}

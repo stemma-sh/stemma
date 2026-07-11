@@ -1,0 +1,6 @@
+{
+  "name": "body-section-props",
+  "spec_ref": "ISO 29500-1 \u00a717.6",
+  "description": "Document with custom body-level sectPr (margins and vAlign on w:body/w:sectPr)",
+  "expected_behavior": "CanonDoc.body_section_properties should have margins and vAlign='both'"
+}

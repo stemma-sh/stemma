@@ -1,0 +1,5 @@
+{
+  "name": "same-orientation-control",
+  "spec_ref": "ECMA-376 \u00a717.6.22 / \u00a717.6.14",
+  "description": "S1(nextPage, portrait 12240x15840) -> S2(continuous, portrait 12240x15840). Same page size and orientation: S2 remains a true continuous break. Control test \u2014 S2 keeps its own margins."
+}

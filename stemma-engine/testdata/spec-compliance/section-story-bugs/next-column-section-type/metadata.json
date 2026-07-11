@@ -1,0 +1,5 @@
+{
+  "name": "next-column-section-type",
+  "spec_ref": "ECMA-376 section 17.6.22 (ST_SectionMark)",
+  "description": "Section 1 has w:type w:val='nextColumn'. Must parse as SectionType::NextColumn."
+}

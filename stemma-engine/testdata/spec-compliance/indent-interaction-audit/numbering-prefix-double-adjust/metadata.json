@@ -1,0 +1,7 @@
+{
+  "name": "numbering-prefix-double-adjust",
+  "spec_ref": "ECMA-376 \u00a717.9.22, \u00a717.3.1.12",
+  "description": "P0: numbered (left=720, hanging=360). P1: non-numbered control.",
+  "expected_behavior": "P0: left=720, first_line=-360. No double-adjustment.",
+  "current_status": "GAP-105 \u2014 potential double-adjustment from prefix stripping"
+}

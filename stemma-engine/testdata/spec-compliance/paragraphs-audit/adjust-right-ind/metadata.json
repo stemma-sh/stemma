@@ -1,0 +1,6 @@
+{
+  "name": "adjust-right-ind",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.1",
+  "description": "P0: adjustRightInd=false. P1: adjustRightInd=true (explicit). P2: no adjustRightInd (control).",
+  "expected_behavior": "P0: right indent not auto-adjusted for document grid. P1: right indent auto-adjusted. P2: default (true per spec)."
+}

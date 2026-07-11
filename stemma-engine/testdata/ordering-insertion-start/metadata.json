@@ -1,0 +1,5 @@
+{
+  "name": "ordering-insertion-start",
+  "description": "Insertion at document start - should show insertion at beginning",
+  "source": "generated for ordering tests"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "table-shading-cell-spacing",
+  "spec_ref": "MS-OI29500 \u00a717.4.31(a)",
+  "description": "Table red shading + cell spacing=30tw. Cell (0,0) green.",
+  "expected_behavior": "Table shading only fills cell spacing gaps, not cells."
+}

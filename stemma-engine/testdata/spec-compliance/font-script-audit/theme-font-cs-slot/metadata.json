@@ -1,0 +1,7 @@
+{
+  "name": "theme-font-cs-slot",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26, MS-OI29500 \u00a72.1.88",
+  "description": "Paragraph style sets csTheme='minorBidi' (no explicit cs font). Run has w:cs to force cs font slot. The theme's minorBidi font should be resolved and used as font_family.",
+  "expected_behavior": "font_cs should resolve to the theme's minor Bidi font name. Since cs=true, font_family should also be that font.",
+  "current_status": "GAP-130 \u2014 theme cs font resolve end-to-end"
+}

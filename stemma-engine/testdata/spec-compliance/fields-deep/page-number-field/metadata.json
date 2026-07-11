@@ -1,0 +1,7 @@
+{
+  "name": "page-number-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.19",
+  "description": "Paragraph with PAGE and NUMPAGES fldSimple fields",
+  "expected_behavior": "Both fields produce FieldKind::Simple with their respective instructions",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed for any instruction type"
+}

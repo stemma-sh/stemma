@@ -1,0 +1,37 @@
+[package]
+name = "stemma-mcp"
+version = "0.1.0"
+edition = "2024"
+# Uniform workspace toolchain floor (see stemma-engine/Cargo.toml for the full
+# derivation). This crate's rmcp stack alone requires >= 1.88 (darling 0.23);
+# the workspace floor is 1.91. Enforced by the MSRV job in CI.
+rust-version = "1.91"
+description = "Model Context Protocol (MCP) server exposing stemma's tracked-change DOCX editing verbs over stdio."
+repository = "https://github.com/stemma-sh/stemma"
+keywords = ["docx", "mcp", "tracked-changes", "ooxml", "agent"]
+categories = ["text-processing", "command-line-utilities"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false  # binary/server crate; flip to publish if you want it on crates.io
+
+[[bin]]
+name = "stemma-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# version alongside path: local builds use the workspace copy; a crates.io
+# publish resolves the same dependency from the registry.
+stemma = { path = "../stemma-engine", version = "0.1.0" }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+schemars = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+zip = "0.6.6"

@@ -1,0 +1,7 @@
+{
+  "name": "para-mark-rpr",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.29",
+  "description": "Paragraph with pPr/rPr setting paragraph mark to bold+red, distinct from run formatting.",
+  "expected_behavior": "Text run: no bold, no color override. Paragraph mark: bold=on, color=FF0000.",
+  "current_status": "INFORMATIONAL -- para mark formatting not exposed (only tracking status extracted)"
+}

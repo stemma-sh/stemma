@@ -1,0 +1,6 @@
+{
+  "name": "autospacing-override",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "beforeAutospacing/afterAutospacing override before/after/beforeLines/afterLines",
+  "expected_behavior": "P0: before is ignored (beforeAutospacing=1). P1: after is ignored (afterAutospacing=1). P2: control \u2014 before=480, after=480. P3: both before and beforeLines are ignored (beforeAutospacing=1)."
+}

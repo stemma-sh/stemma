@@ -1,0 +1,7 @@
+{
+  "name": "basic-bookmark",
+  "spec_ref": "ISO 29500-1 \u00a717.13.6.2/1",
+  "description": "Paragraph with a bookmark range wrapping text",
+  "expected_behavior": "bookmarkStart and bookmarkEnd should produce Decoration inlines with DecorationType::Bookmark",
+  "current_status": "SUPPORTED \u2014 bookmarks parsed as zero-width Decoration nodes"
+}

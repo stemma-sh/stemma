@@ -1,0 +1,7 @@
+{
+  "name": "hanging-with-tabs",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Paragraph with w:left=1440 w:hanging=720 and body text containing a tab character. Hanging indent should be preserved.",
+  "expected_behavior": "P0: left=1440, first_line=-720 (hanging preserved despite tabs). P1: left=1440, first_line=-720 (control, no tabs).",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "numbering-bullet-literal-lvltext",
+  "spec_ref": "MS-OI29500 \u00a717.9.17",
+  "description": "Bullet format with lvlText containing %x syntax should display literally",
+  "expected_behavior": "When numFmt=bullet, lvlText is used as literal text \u2014 %1 is not replaced",
+  "current_status": "GAP \u2014 our bullet handling returns bullet char, doesn't use lvlText as literal"
+}

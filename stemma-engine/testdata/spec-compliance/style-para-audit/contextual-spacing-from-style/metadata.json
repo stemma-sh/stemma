@@ -1,0 +1,7 @@
+{
+  "name": "contextual-spacing-from-style",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.9",
+  "description": "Style with contextualSpacing=true and before/after=240.",
+  "expected_behavior": "Para 0,1: contextual_spacing=true. Para 2: false.",
+  "current_status": "TESTING"
+}

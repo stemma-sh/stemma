@@ -1,0 +1,7 @@
+{
+  "name": "numpr-deep-basedon",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.3, \u00a717.7.4.14",
+  "description": "numPr inherited through StyleC -> StyleB -> StyleA chain.",
+  "expected_behavior": "All three paragraphs should have numbering: 1., 2., 3. with indent left=720, firstLine=-360.",
+  "current_status": "TESTING"
+}

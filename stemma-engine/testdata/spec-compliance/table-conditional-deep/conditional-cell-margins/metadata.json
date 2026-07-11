@@ -1,0 +1,7 @@
+{
+  "name": "conditional-cell-margins",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow conditional: shading (4472C4) and tblCellMar (150tw all sides) in tcPr.",
+  "expected_behavior": "First row cells: shading 4472C4 AND margins 150tw on all sides. Data row cells: no shading, no conditional margins.",
+  "current_status": "testing conditional cell margin propagation"
+}

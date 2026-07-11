@@ -1,0 +1,6 @@
+{
+  "name": "preexisting-moves",
+  "spec_ref": "ECMA-376 \u00a717.13.5.21-28",
+  "description": "Pre-existing moveFrom/moveTo with range markers linked by name='move_0'",
+  "expected_behavior": "import_docx().canonical should preserve move_id on TrackedBlocks linking source and destination"
+}

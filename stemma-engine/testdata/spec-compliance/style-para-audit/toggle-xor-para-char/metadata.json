@@ -1,0 +1,7 @@
+{
+  "name": "toggle-xor-para-char",
+  "spec_ref": "ISO 29500-1 \u00a717.7.3",
+  "description": "Para style bold+italic, char style bold. Tests XOR semantics.",
+  "expected_behavior": "Para 0: bold=false (XOR), italic=true. Para 1: bold=true, italic=true. Para 2: bold=true (direct overrides).",
+  "current_status": "GAP \u2014 toggle XOR semantics"
+}

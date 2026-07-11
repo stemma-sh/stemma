@@ -1,0 +1,7 @@
+{
+  "name": "tbl-style",
+  "spec_ref": "ISO 29500-1 \u00a717.4.63",
+  "description": "Table referencing a named table style for border formatting",
+  "expected_behavior": "Parser should resolve tblStyle and apply table-level borders from the style",
+  "current_status": "NOT_PARSED \u2014 tblStyle reference ignored; table uses no style-inherited formatting"
+}

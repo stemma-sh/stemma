@@ -1,0 +1,7 @@
+{
+  "name": "direct-tabs",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.38",
+  "description": "Paragraph with explicit tab stops: left@1440, center@4320, right@7200 (dot leader)",
+  "expected_behavior": "Parser should expose tab_stops with correct positions, alignments, and leaders",
+  "current_status": "SUPPORTED \u2014 tab stops parsed into ParagraphNode.tab_stops"
+}

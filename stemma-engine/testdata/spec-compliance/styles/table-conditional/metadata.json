@@ -1,0 +1,7 @@
+{
+  "name": "table-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow (bold+blue) and band1Horz (light gray) conditional formatting.",
+  "expected_behavior": "First row cells: shading fill=4472C4. Band rows: shading fill=D9E2F3. Table borders from style.",
+  "current_status": "TESTING"
+}

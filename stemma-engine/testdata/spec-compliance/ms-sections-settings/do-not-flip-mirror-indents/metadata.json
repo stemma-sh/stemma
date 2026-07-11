@@ -1,0 +1,7 @@
+{
+  "name": "do-not-flip-mirror-indents",
+  "spec_ref": "MS-DOCX \u00a72.3.2",
+  "description": "Paragraph with mirrorIndents and doNotFlipMirrorIndents=1",
+  "expected_behavior": "When doNotFlipMirrorIndents=1, start/end indent values should NOT be swapped even with mirrorIndents present",
+  "current_status": "GAP \u2014 mirrorIndents not implemented, compatSetting not parsed"
+}

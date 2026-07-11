@@ -1,0 +1,5 @@
+{
+  "name": "empty-tbl-borders",
+  "spec_ref": "ISO 29500-1 \u00a717.4.38",
+  "description": "2x2 table with <w:tblBorders/> (present but empty, no child elements). No borders should be defined at the table level. Cells should have no inherited borders."
+}

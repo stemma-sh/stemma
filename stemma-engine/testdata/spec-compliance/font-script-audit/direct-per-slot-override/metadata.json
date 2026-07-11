@@ -1,0 +1,7 @@
+{
+  "name": "direct-per-slot-override",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26, MS-OI29500 \u00a72.1.88(e)",
+  "description": "Paragraph style: all 4 slots (Verdana, MS PGothic, Simplified Arabic). Direct rPr: only ascii/hAnsi='Consolas'.",
+  "expected_behavior": "font_family='Consolas' (direct), font_east_asia='MS PGothic' (style), font_cs='Simplified Arabic' (style).",
+  "current_status": "GAP-134 \u2014 per-slot override via resolve_option"
+}

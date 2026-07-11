@@ -1,0 +1,5 @@
+{
+  "name": "nil-beats-thick-border",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with no table-level borders. Cell (0,0) has tcBorders right=nil. Cell (0,1) has tcBorders left=thick sz=24 red. Per MS-OI29500 SS2.1.169, nil means 'no border shall be displayed' and suppresses the thick border."
+}

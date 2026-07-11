@@ -1,0 +1,8 @@
+{
+  "name": "toggle-xor-3level-chain",
+  "spec_ref": "ISO 29500-1 \u00a717.7.3",
+  "description": "3-level char basedOn chain + paragraph style, testing toggle XOR accumulation.",
+  "expected_behavior": "Run1(CharA3): bold=off (on XOR on). Run2(CharB3): bold=off (on XOR on). Run3(CharC3): bold=off (inherited on XOR on). Run4(no char): bold=on. All runs: italic resolved through XOR as well.",
+  "current_status": "GAP-023 -- overlay_marks flattens chain correctly for this case, but toggle XOR within basedOn levels is not spec-compliant for all scenarios",
+  "gap_id": "GAP-023"
+}

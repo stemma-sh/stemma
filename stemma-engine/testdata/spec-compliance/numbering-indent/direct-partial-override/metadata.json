@@ -1,0 +1,7 @@
+{
+  "name": "direct-partial-override",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.9.22",
+  "description": "Numbering level indent (left=720, hanging=360) with direct w:ind w:left=1440.",
+  "expected_behavior": "P0: left=1440, firstLine=0 (direct w:ind replaces numbering indent). P1: left=720, firstLine=-360 (numbering level only).",
+  "current_status": "GAP-025 \u2014 per-field merge incorrectly mixes direct + numbering fields"
+}

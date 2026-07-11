@@ -1,0 +1,5 @@
+{
+  "name": "3x3-inside-borders",
+  "spec_ref": "ISO 29500-1 \u00a717.4.66, \u00a717.4.38",
+  "description": "3x3 table with distinct outer (double blue sz=24), insideH (single red sz=12), insideV (single green sz=8). No tcBorders on any cell. Tests cascade into all 9 cell positions."
+}

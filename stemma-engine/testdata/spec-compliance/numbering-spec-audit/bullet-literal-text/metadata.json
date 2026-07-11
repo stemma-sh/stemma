@@ -1,0 +1,6 @@
+{
+  "name": "bullet-literal-text",
+  "spec_ref": "ISO 29500-1 \u00a717.9.17",
+  "description": "Bullet format uses literal lvlText. Level 0: '\u2192', Level 1: '\u2013'.",
+  "expected_behavior": "'\u2192', '\u2192', '\u2013' \u2014 literal bullet characters, not %N expanded."
+}

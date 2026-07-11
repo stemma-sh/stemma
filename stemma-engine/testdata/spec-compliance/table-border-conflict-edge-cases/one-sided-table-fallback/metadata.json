@@ -1,0 +1,5 @@
+{
+  "name": "one-sided-table-fallback",
+  "spec_ref": "ISO 29500-1 SS17.4.66",
+  "description": "2x2 table with only insideV border (blue single sz=8). No cell-level borders. Interior vertical edges should get the insideV border. Both cells at shared edge should agree."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "single-section-no-footer-no-header",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "Single-section document with no headerReference and no footerReference. Per spec, both a blank header and a blank footer should be synthesized."
+}

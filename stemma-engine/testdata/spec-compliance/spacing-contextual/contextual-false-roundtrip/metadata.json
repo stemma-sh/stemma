@@ -1,0 +1,6 @@
+{
+  "name": "contextual-false-roundtrip",
+  "spec_ref": "ECMA-376 \u00a717.3.1.9",
+  "description": "Explicit contextualSpacing val='0' must survive diff/redline roundtrip",
+  "expected_behavior": "Before: contextual_spacing=true (from style). After: contextual_spacing=false (direct val='0'). Redline output should emit contextualSpacing val='0' on the paragraph."
+}

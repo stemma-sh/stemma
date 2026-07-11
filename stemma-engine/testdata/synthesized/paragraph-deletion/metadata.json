@@ -1,0 +1,5 @@
+{
+  "name": "paragraph-deletion",
+  "description": "Remove a paragraph entirely",
+  "pipeline": "BlockDeleted -> ReplaceText(empty)"
+}

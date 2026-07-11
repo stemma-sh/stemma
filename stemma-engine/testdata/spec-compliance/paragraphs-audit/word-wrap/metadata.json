@@ -1,0 +1,6 @@
+{
+  "name": "word-wrap",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.45",
+  "description": "P0: wordWrap=false (character-level breaking). P1: wordWrap=true (word-level). P2: no wordWrap (control).",
+  "expected_behavior": "P0: break at character level. P1: break at word level. P2: default (word-level)."
+}

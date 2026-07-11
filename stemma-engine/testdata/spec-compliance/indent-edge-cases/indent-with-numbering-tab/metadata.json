@@ -1,0 +1,7 @@
+{
+  "name": "indent-with-numbering-tab",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22, \u00a717.3.1.21",
+  "description": "Numbering level with indent left=720, hanging=360 and tab stop at pos=720. Tests structural auto-numbering indent behavior.",
+  "expected_behavior": "P0: left=720, first_line=-360 (from numbering level). P1: left=720, first_line=-360 (second auto-numbered item).",
+  "current_status": "TESTING"
+}

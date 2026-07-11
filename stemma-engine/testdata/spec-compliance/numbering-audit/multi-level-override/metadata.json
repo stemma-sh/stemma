@@ -1,0 +1,6 @@
+{
+  "name": "multi-level-override",
+  "spec_ref": "ISO 29500-1 \u00a717.9.8",
+  "description": "A num with lvlOverride on both level 0 (startOverride=5) and level 1 (startOverride=3). Tests that multiple overrides on different levels work correctly.",
+  "expected_behavior": "Control: '1.', 'a)'. Override: '5.', 'c)', 'd)', '6.'."
+}

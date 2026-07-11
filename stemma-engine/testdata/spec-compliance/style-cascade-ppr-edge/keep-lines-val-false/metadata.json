@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.14",
+  "description": "Tests that w:keepLines w:val='0' is correctly parsed as false.",
+  "expected": {
+    "para_0": "keep_lines=false",
+    "para_1": "keep_lines=true",
+    "para_2": "keep_lines=false (val=0)"
+  }
+}

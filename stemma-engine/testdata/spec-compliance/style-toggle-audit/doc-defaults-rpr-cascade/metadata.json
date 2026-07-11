@@ -1,0 +1,14 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.5",
+  "description": "docDefaults rPr provides base; style overrides per-property",
+  "expected": {
+    "para_1": {
+      "font_size": 28,
+      "color": "808080"
+    },
+    "para_2": {
+      "font_size": 20,
+      "color": "808080"
+    }
+  }
+}

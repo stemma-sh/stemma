@@ -1,0 +1,6 @@
+{
+  "name": "title-page",
+  "spec_ref": "ISO 29500-1 \u00a717.6.18",
+  "description": "Section with w:titlePg element (distinct first-page header/footer)",
+  "expected_behavior": "SectionProperties should expose titlePg boolean"
+}

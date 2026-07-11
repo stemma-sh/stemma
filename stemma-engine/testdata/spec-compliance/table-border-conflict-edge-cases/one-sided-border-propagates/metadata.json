@@ -1,0 +1,5 @@
+{
+  "name": "one-sided-border-propagates",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with no table borders. Cell (0,0) has right border = single sz=12 red. Cell (0,1) has NO tcBorders. Per SS2.1.169: none means the opposing border displays. After conflict resolution, cell (0,1) left should be the red border."
+}

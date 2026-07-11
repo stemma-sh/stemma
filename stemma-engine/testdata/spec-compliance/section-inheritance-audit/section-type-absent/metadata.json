@@ -1,0 +1,6 @@
+{
+  "name": "section-type-absent",
+  "spec_ref": "ISO 29500-1 sections 17.6.22",
+  "description": "Section with no explicit w:type element. Per spec, absent type defaults to nextPage.",
+  "expected_behavior": "section_type should be None (raw XML has no type element). The rendering layer should treat None as nextPage."
+}

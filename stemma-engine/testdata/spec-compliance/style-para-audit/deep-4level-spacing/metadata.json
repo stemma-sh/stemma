@@ -1,0 +1,7 @@
+{
+  "name": "deep-4level-spacing",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.3, \u00a717.3.1.33",
+  "description": "4-level basedOn chain for spacing: A(before) B(after) C(line) D(lineRule).",
+  "expected_behavior": "Para 0: before=120, after=120, line=276, lineRule=exact. Para 1: before=120, after=120. Para 2: before=0 (direct), rest None.",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,9 @@
+{
+  "spec": "ECMA-376 \u00a717.3.2.1 + \u00a717.3.2.38",
+  "description": "bold_cs toggle replacement when cs/rtl active",
+  "expected": {
+    "para_1": "bold=OFF (cs=on, bCs absent \u2192 not bold)",
+    "para_2": "bold=ON (cs=on, bCs=on \u2192 bold)",
+    "para_3": "bold=ON (rtl=on, bCs=on \u2192 bold)"
+  }
+}

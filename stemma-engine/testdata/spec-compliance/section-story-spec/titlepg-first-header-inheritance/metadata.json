@@ -1,0 +1,5 @@
+{
+  "name": "titlepg-first-header-inheritance",
+  "spec_ref": "ISO 29500-1 \u00a717.10.5",
+  "description": "S1: titlePg=true, default + first headers. S2: titlePg=true, default header only (no first ref). S2 should inherit first-page header from S1."
+}

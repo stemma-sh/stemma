@@ -1,0 +1,6 @@
+{
+  "name": "continuous-own-margins",
+  "spec_ref": "ISO 29500-1 sections 17.6.17",
+  "description": "S1 has wide margins (2880). S2 is continuous with narrow margins (720). S2 should keep its own margins.",
+  "expected_behavior": "S2 margin_top=720, margin_left=720 (not overwritten by S1's 2880)."
+}

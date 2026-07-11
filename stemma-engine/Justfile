@@ -1,0 +1,113 @@
+# Stemma engine quality gate — engine-scoped mirror of the root `gate`.
+#
+# `just -f stemma-engine/Justfile gate`            — the merge gate other streams target
+#                                              (clippy + daily, corpus-free, no real-Word oracle).
+# `just -f stemma-engine/Justfile gate-confidence` — gate plus host-only `#[ignore]`d suites
+#                                              that SKIP gracefully when corpus env is unset.
+#
+# The engine crate (`stemma`) owns the edit/diff/serialize pipeline. These
+# recipes prove the engine verbs under `cargo test -p stemma` WITHOUT building
+# the transport crates (stemma-mcp / stemma-api). See
+# `stemma-engine/docs/testing_strategy.md`.
+
+# Resolve STEMMA_CORPUS_ROOT for worktrees (DOCX fixtures are gitignored and
+# live only in the main checkout). Mirrors the root Justfile. When unset, the
+# host-only tiers skip gracefully — the daily `gate` never depends on it.
+export STEMMA_CORPUS_ROOT := env("STEMMA_CORPUS_ROOT", `git rev-parse --git-common-dir 2>/dev/null | xargs -I{} realpath {}/../ 2>/dev/null || echo ""`)
+# Optional external bulk corpus for stress tiers. Unset => stress tests skip.
+export STRESS_CORPUS_DIR := env("STRESS_CORPUS_DIR", "")
+# CORPUS_DIR feeds the corpus sweeps (corpus_triage, element_fidelity_corpus).
+# Defaults to STRESS_CORPUS_DIR so setting ONE bulk-corpus var wires every corpus
+# tier; still skips gracefully when both are unset.
+export CORPUS_DIR := env("CORPUS_DIR", STRESS_CORPUS_DIR)
+
+default:
+    @just --list
+
+# Merge gate other streams target: lint + all daily engine tests.
+# Corpus-free, no real-Word oracle — must be green with all env vars unset.
+gate: clippy test
+
+# Static checks. The engine has no optional features; this lints everything.
+clippy:
+    cargo clippy -p stemma --all-targets --all-features -- -D warnings
+
+# Daily engine tests: unit + integration. Corpus-free, no real-Word oracle.
+# The real-Word conformance tier is held out, outside this crate — the engine
+# ships no Word-automation code.
+test:
+    cargo test -p stemma
+
+# Unit tests only (`--lib`).
+unit:
+    cargo test -p stemma --lib
+
+# Per-verb fidelity gate: reversibility / accept==direct / non-shrinking
+# opaque inventory (#20 I1-I9, daily).
+fidelity:
+    cargo test -p stemma --test edit_fidelity_invariants
+
+# Edit-pipeline invariant parity with the diff/redline tiers (#6/#7/#10/#12
+# applied to the edit construction path, daily).
+edit-invariants:
+    cargo test -p stemma --test edit_invariants
+
+# v4 `replace(table)` canonical-space invariants (#20e, daily).
+edit-table-unit:
+    cargo test -p stemma --test redline_table_replace --test spec_edit_table_tracked_changes
+
+# Property/fuzz transaction-fidelity sweep (Word-free, rayon-parallel, nightly).
+# Generates 20k random-but-valid multi-verb transactions over a seed-doc pool and
+# asserts the canonical fidelity invariants (reject==baseline, accept==direct,
+# zero blocking validator findings, non-shrinking opaque inventory, structural
+# round-trip, atomic rollback). The daily `gate` runs a 400-seed deterministic
+# smoke subset (`fuzz_smoke_daily`); this recipe runs the heavy tier in release.
+# Any single invariant violation prints its repro seed.
+fuzz:
+    cargo test -p stemma --release --test fuzz_transactions -- --ignored --nocapture fuzz_sweep_heavy
+
+# Original-vs-output element fidelity over the bulk corpus (state-3 loss sweep,
+# the real edit-path gate). Set CORPUS_DIR or STRESS_CORPUS_DIR to a corpus root;
+# skips gracefully when unset. CORPUS_SAMPLE=N caps the doc count.
+element-fidelity-corpus:
+    RUST_MIN_STACK=67108864 cargo test -p stemma --release --test element_fidelity -- --ignored --nocapture
+
+# Confidence gate: daily gate plus host-only `#[ignore]`d suites (corpus triage,
+# element-fidelity sweep, stress). These tiers SKIP gracefully when CORPUS_DIR /
+# STEMMA_CORPUS_ROOT / STRESS_CORPUS_DIR are unset, so the gate still exits 0
+# without the corpus on disk.
+gate-confidence: gate
+    cargo test -p stemma -- --ignored
+
+# ── Word-oracle tier (nightly, held out) ───────────────────────────────────
+# The real-Word conformance tier is NOT part of this crate: it is held out,
+# drives a real Word instance, and does not run on a public clone. The OSS
+# engine ships no Word-automation code.
+
+# ── Nightly aggregates ────────────────────────────────────────────────────
+# Host-side full nightly (no real-Word oracle): static + daily + host-ignored
+# confidence sweeps + heavy fuzz. Free; safe to run anywhere.
+nightly: gate-confidence fuzz
+
+# ── CI entrypoint ─────────────────────────────────────────────────────────
+# What a pull-request CI job should run: lint + hermetic daily tests, then the
+# instrumented coverage pass that writes target/llvm-cov/lcov.info for a codecov
+# upload step. Corpus-free, no real-Word oracle — fully reproducible by any contributor.
+ci: gate coverage-report
+
+# ── Coverage ──────────────────────────────────────────────────────────────
+# Line/region coverage of the hermetic daily tier — the reproducible suite an
+# external contributor (or CI) can run: `cargo test -p stemma`. Requires the
+# `llvm-tools` rustup component + `cargo-llvm-cov`. Corpus-dependent tests skip
+# when the corpus is absent (e.g. CI), so the CI number reflects exactly what
+# CI gates.
+coverage:
+    cargo llvm-cov --package stemma --summary-only
+
+# One instrumented run, multiple report formats: text summary + lcov (for CI /
+# codecov upload) + browsable HTML under target/llvm-cov/html.
+coverage-report:
+    cargo llvm-cov --no-report --package stemma
+    cargo llvm-cov report --summary-only
+    cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+    cargo llvm-cov report --html

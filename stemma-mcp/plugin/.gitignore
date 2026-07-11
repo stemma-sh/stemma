@@ -1,0 +1,4 @@
+# Built plugin zips + staged binaries are artifacts, not source.
+dist/
+server/
+*.zip

@@ -1,0 +1,7 @@
+{
+  "name": "ppr-change",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.29",
+  "description": "Paragraph with tracked alignment change (left \u2192 center) via w:pPrChange",
+  "expected_behavior": "Parser should expose the pPrChange with previous alignment=left, current=center",
+  "current_status": "NOT_PARSED \u2014 pPrChange is silently ignored"
+}

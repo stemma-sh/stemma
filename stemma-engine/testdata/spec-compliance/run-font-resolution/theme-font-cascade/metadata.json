@@ -1,0 +1,6 @@
+{
+  "name": "theme-font-cascade",
+  "spec_ref": "ECMA-376 \u00a717.3.2.26",
+  "description": "Paragraph style with asciiTheme=minorHAnsi, theme defines minorHAnsi=Calibri",
+  "expected_behavior": "Run font_family should resolve to 'Calibri' from theme"
+}

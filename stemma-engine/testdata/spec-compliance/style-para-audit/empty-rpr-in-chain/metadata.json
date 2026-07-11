@@ -1,0 +1,7 @@
+{
+  "name": "empty-rpr-in-chain",
+  "spec_ref": "ISO 29500-1 \u00a717.7.1",
+  "description": "Parent bold=true. Child empty rPr. Char style bold=off.",
+  "expected_behavior": "Para 0: bold. Para 1: bold (inherited). Para 2: depends on XOR.",
+  "current_status": "TESTING"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "cs-from-char-style",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26(b), \u00a717.3.2.7",
+  "description": "Char style CsChar: cs=true, ascii='Calibri', cs='Arabic Typesetting'. Run 1 uses CsChar. Run 2 has same fonts but no cs.",
+  "expected_behavior": "Run 1: cs from style -> font_family='Arabic Typesetting'. Run 2: no cs -> font_family='Calibri'.",
+  "current_status": "GAP-132 \u2014 cs from style chain forces cs font slot"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "lvl-override-partial",
+  "spec_ref": "ISO 29500-1 \u00a717.9.8, \u00a717.9.26",
+  "description": "lvlOverride with only startOverride=5; format and indent come from abstract level.",
+  "expected_behavior": "P0: prefix='1.', indent left=720, firstLine=-360. P1: prefix='5.', same indent. P2: prefix='6.', same indent.",
+  "current_status": "TESTING"
+}

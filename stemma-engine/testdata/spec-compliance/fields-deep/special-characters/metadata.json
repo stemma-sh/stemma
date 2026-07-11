@@ -1,0 +1,7 @@
+{
+  "name": "special-characters",
+  "spec_ref": "ISO 29500-1 \u00a717.3.3",
+  "description": "Paragraph with w:sym, w:noBreakHyphen, w:softHyphen, w:cr, w:lastRenderedPageBreak",
+  "expected_behavior": "sym -> OpaqueInline (Unknown), noBreakHyphen/softHyphen/lastRenderedPageBreak -> Decoration, cr -> HardBreak",
+  "current_status": "SUPPORTED \u2014 each element classified per word_ir.rs rules"
+}

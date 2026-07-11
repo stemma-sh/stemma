@@ -1,0 +1,61 @@
+{
+  "name": "inside-h-mapping-3x3",
+  "spec_ref": "ISO 29500-1 SS17.4.22, SS17.4.24, SS17.4.38",
+  "description": "3x3 table with distinct table-level borders: top=red, bottom=blue, left=green, right=yellow, insideH=magenta, insideV=cyan. No cell-level borders. Tests insideH/insideV mapping to cell edges.",
+  "expected_borders": {
+    "(0,0)": {
+      "top": "FF0000",
+      "bottom": "FF00FF",
+      "left": "00FF00",
+      "right": "00FFFF"
+    },
+    "(0,1)": {
+      "top": "FF0000",
+      "bottom": "FF00FF",
+      "left": "00FFFF",
+      "right": "00FFFF"
+    },
+    "(0,2)": {
+      "top": "FF0000",
+      "bottom": "FF00FF",
+      "left": "00FFFF",
+      "right": "FFFF00"
+    },
+    "(1,0)": {
+      "top": "FF00FF",
+      "bottom": "FF00FF",
+      "left": "00FF00",
+      "right": "00FFFF"
+    },
+    "(1,1)": {
+      "top": "FF00FF",
+      "bottom": "FF00FF",
+      "left": "00FFFF",
+      "right": "00FFFF"
+    },
+    "(1,2)": {
+      "top": "FF00FF",
+      "bottom": "FF00FF",
+      "left": "00FFFF",
+      "right": "FFFF00"
+    },
+    "(2,0)": {
+      "top": "FF00FF",
+      "bottom": "0000FF",
+      "left": "00FF00",
+      "right": "00FFFF"
+    },
+    "(2,1)": {
+      "top": "FF00FF",
+      "bottom": "0000FF",
+      "left": "00FFFF",
+      "right": "00FFFF"
+    },
+    "(2,2)": {
+      "top": "FF00FF",
+      "bottom": "0000FF",
+      "left": "00FFFF",
+      "right": "FFFF00"
+    }
+  }
+}

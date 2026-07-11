@@ -1,0 +1,7 @@
+{
+  "name": "empty-rfonts",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Paragraph style sets all 4 font slots (Georgia, MS Gothic, Tahoma). Direct rPr has <w:rFonts/> with no attributes.",
+  "expected_behavior": "Empty rFonts should be a no-op; font_family='Georgia' from style, font_east_asia='MS Gothic', font_cs='Tahoma'.",
+  "current_status": "GAP-131 \u2014 empty rFonts may clear inherited values"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "row-ins-del",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.14/17.13.5.3",
+  "description": "Table with tracked row insertion (row 1) and deletion (row 2)",
+  "expected_behavior": "TableRowNode.tracking_status is Inserted/Deleted with author/date"
+}

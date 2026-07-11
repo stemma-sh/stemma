@@ -1,0 +1,7 @@
+{
+  "name": "sect-pr-in-ppr",
+  "spec_ref": "ISO 29500-1 \u00a717.6.18",
+  "description": "Section break via sectPr in pPr \u2014 must survive redline pipeline",
+  "expected_behavior": "section_properties_raw on the paragraph should contain the sectPr XML blob",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 parsed but may be lost during redline (P0 gap)"
+}

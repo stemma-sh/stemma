@@ -1,0 +1,5 @@
+{
+  "name": "mixed-header-footer-three-sections",
+  "spec_ref": "ECMA-376 section 17.10.2",
+  "description": "S1: default header + default footer. S2: default header only \u2014 inherits footer from S1. S3: default footer only \u2014 inherits header from S2."
+}

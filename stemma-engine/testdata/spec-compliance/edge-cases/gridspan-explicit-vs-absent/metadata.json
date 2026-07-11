@@ -1,0 +1,7 @@
+{
+  "name": "gridspan-explicit-vs-absent",
+  "spec_ref": "ISO 29500-1 \u00a717.4.17",
+  "description": "Two identical 2x2 tables: one with no gridSpan, one with explicit gridSpan=1 on all cells",
+  "expected_behavior": "Both tables should produce grid_span=1 on every cell (identical domain model)",
+  "current_status": "SUPPORTED \u2014 testing default equivalence"
+}

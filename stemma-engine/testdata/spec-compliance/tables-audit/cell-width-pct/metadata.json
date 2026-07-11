@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.87",
+  "description": "Table with cell widths in pct (50ths of percent): 25%, 50%, 25%",
+  "cell_widths_pct50ths": [
+    1250,
+    2500,
+    1250
+  ]
+}

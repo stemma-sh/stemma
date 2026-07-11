@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.23",
+  "description": "Tests that w:pageBreakBefore w:val='0' is parsed as false.",
+  "expected": {
+    "para_0": "page_break_before=false",
+    "para_1": "page_break_before=true",
+    "para_2": "page_break_before=false (val=0)"
+  }
+}

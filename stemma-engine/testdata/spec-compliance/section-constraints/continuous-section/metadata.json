@@ -1,0 +1,7 @@
+{
+  "name": "continuous-section",
+  "spec_ref": "ISO 29500-1 sections 17.6.17",
+  "description": "Section 1 has margins (top=1440, bottom=1440, left=1800, right=1800); Section 2 is continuous with no margins specified (should inherit from Section 1)",
+  "expected_behavior": "Section 2 (continuous) should inherit page margins from Section 1. margin_top should be 1440, margin_left should be 1800.",
+  "current_status": "GAP - continuous section property inheritance is not implemented; Section 2 margins will be None"
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stemma": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/server/stemma-mcp",
+      "args": []
+    }
+  }
+}

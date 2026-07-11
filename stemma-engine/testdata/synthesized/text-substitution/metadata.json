@@ -1,0 +1,5 @@
+{
+  "name": "text-substitution",
+  "description": "Word-level text change within a paragraph",
+  "pipeline": "BlockModified -> ReplaceText"
+}

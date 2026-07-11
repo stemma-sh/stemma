@@ -1,0 +1,5 @@
+{
+  "name": "revision-ids-unique",
+  "spec_ref": "ECMA-376 \u00a717.13.5",
+  "description": "Multiple edits to verify all annotation IDs are unique"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "odd-even-page-sections",
+  "spec_ref": "ISO 29500-1 \u00a717.6.17",
+  "description": "Two sections: oddPage and evenPage break types",
+  "expected_behavior": "section_type should be 'oddPage' and 'evenPage' respectively"
+}

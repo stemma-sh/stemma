@@ -1,0 +1,6 @@
+{
+  "name": "pprchange-spacing-roundtrip",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.29 + \u00a717.3.1.33",
+  "description": "pPrChange previous spacing must preserve beforeLines/afterLines",
+  "expected_behavior": "P0 previous_spacing should have before=480, beforeLines=200, after=240, afterLines=100, line=360, lineRule=auto. Roundtrip serialization must emit beforeLines and afterLines."
+}

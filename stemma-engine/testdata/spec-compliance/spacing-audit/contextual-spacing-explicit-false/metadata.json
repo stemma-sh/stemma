@@ -1,0 +1,6 @@
+{
+  "name": "contextual-spacing-explicit-false",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.9",
+  "description": "Explicit contextualSpacing val='0' should override style's true",
+  "expected_behavior": "P0: contextual_spacing=false (direct val='0' overrides style's true). P1: contextual_spacing=true (inherited from CtxStyle). P2: contextual_spacing=true (direct element present = true)."
+}

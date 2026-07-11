@@ -1,0 +1,5 @@
+{
+  "name": "titlepg-only-on-later-section",
+  "spec_ref": "ISO 29500-1 sections 17.10.6 + 17.10.2",
+  "description": "S1: no titlePg, declares Default+First headers+footers. S2: titlePg=true, no declarations, inherits from S1. S2 keeps First refs (titlePg), S1 loses them. First-kind stories preserved in doc because S2 has titlePg."
+}

@@ -1,0 +1,5 @@
+{
+  "name": "cell-border-nil-override",
+  "spec_ref": "ISO 29500-1 SS17.4.66 rule 1-2",
+  "description": "Cell (0,0) has nil top border. Per SS17.4.66, cell borders win over table borders (rule 2). The nil border suppresses the table border."
+}

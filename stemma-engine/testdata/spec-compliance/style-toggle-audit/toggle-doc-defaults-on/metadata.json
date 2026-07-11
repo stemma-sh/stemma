@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 + MS-OI29500 \u00a72.1.230",
+  "description": "docDefaults bold=on: para style bold=off should turn it off",
+  "expected": {
+    "para_1": "bold=OFF (para style explicitly turns off bold; MS behavior)",
+    "para_2": "bold=ON (doc defaults bold applies to unstyled paragraph)"
+  }
+}

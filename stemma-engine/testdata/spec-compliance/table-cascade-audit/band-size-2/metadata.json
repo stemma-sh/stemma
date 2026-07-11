@@ -1,0 +1,7 @@
+{
+  "name": "band-size-2",
+  "spec_ref": "ECMA-376 \u00a717.7.6.7, MS-OI29500 \u00a72.1.253",
+  "description": "Table with tblStyleRowBandSize=2 and band1Horz (light blue BDD7EE), band2Horz (light green C6EFCE). 6 rows, no firstRow/lastRow.",
+  "expected_behavior": "Rows 0-1: band1Horz (BDD7EE), rows 2-3: band2Horz (C6EFCE), rows 4-5: band1Horz (BDD7EE). Band assignment groups by bandSize=2.",
+  "current_status": "TESTING"
+}

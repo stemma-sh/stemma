@@ -1,0 +1,9 @@
+{
+  "name": "main-format-changes",
+  "description": "Main body with w:pPrChange and w:rPrChange formatting tracked changes",
+  "revision_elements": {
+    "pPrChange": 1,
+    "rPrChange": 1
+  },
+  "expected_after_normalize": "pPrChange and rPrChange removed; w:b and w:jc preserved"
+}

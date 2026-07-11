@@ -1,0 +1,6 @@
+{
+  "name": "theme-font-only",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26, \u00a717.8",
+  "description": "Runs with theme font references only (no explicit font names)",
+  "expected_behavior": "asciiTheme/hAnsiTheme should resolve to actual font names from theme1.xml"
+}

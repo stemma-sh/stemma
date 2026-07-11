@@ -1,0 +1,6 @@
+{
+  "name": "multi-author",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.14/18",
+  "description": "Paragraph with tracked changes by two different authors (ins by A, del by B)",
+  "expected_behavior": "redline_extract finds both authors' changes with correct attribution"
+}

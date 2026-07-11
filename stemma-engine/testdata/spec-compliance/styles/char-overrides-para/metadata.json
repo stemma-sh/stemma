@@ -1,0 +1,7 @@
+{
+  "name": "char-overrides-para",
+  "spec_ref": "ISO 29500-1 \u00a717.7.2",
+  "description": "Formatting cascade: direct > char style > para style. Tests all three levels.",
+  "expected_behavior": "Run1: italic=on, color=FF0000. Run2: bold=on (char), color=0000FF (char), italic=on (para via XOR). Run3: color=00FF00 (direct).",
+  "current_status": "TESTING"
+}

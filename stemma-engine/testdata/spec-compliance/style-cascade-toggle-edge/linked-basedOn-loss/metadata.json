@@ -1,0 +1,18 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked char style basedOn chain properties lost in linked overlay",
+  "expected": {
+    "para_1_no_char": {
+      "bold": true,
+      "italic": true,
+      "font_size": 32,
+      "color": "FF0000"
+    },
+    "para_2_explicit_char": {
+      "bold": true,
+      "italic": true,
+      "font_size": 32,
+      "color": "FF0000"
+    }
+  }
+}

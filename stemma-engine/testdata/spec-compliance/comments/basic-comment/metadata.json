@@ -1,0 +1,7 @@
+{
+  "name": "basic-comment",
+  "spec_ref": "ISO 29500-1 \u00a717.13.4.2/3/5",
+  "description": "Paragraph with a comment anchored to a text range via commentRangeStart/End/Reference",
+  "expected_behavior": "CommentStory with id=1, author=Test Author parsed; range markers in body inlines",
+  "current_status": "SUPPORTED \u2014 comments are parsed into CommentStory"
+}

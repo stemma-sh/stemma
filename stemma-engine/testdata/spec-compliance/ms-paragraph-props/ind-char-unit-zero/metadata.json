@@ -1,0 +1,7 @@
+{
+  "name": "ind-char-unit-zero",
+  "spec_ref": "MS-OI29500 2.1.44 \u00a717.3.1.12(a)",
+  "description": "P0: CharIndentStyle (startChars=100, firstLineChars=50). P1: CharIndentStyle + direct startChars=0.",
+  "expected_behavior": "P0: character-unit indent from style. P1: Word ignores zero character unit indent, keeps style's startChars=100.",
+  "current_status": "GAP \u2014 we don't parse character-unit indent attributes at all"
+}

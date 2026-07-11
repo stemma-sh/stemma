@@ -1,0 +1,7 @@
+{
+  "name": "section-columns",
+  "spec_ref": "ISO 29500-1 \u00a717.6.4",
+  "description": "Section with 2-column layout via w:cols in sectPr",
+  "expected_behavior": "Parser should expose column count as structured data",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 sectPr preserved as raw XML, not parsed into structured fields"
+}

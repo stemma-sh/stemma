@@ -1,0 +1,7 @@
+{
+  "name": "zero-indent-explicit",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "Style defines w:left=720. Paragraph with explicit w:left=0 should override to 0. Paragraph with no w:ind inherits from style.",
+  "expected_behavior": "P0: left=720 (from style). P1: left=0 (explicit override). P2: indent=None (no style, no direct).",
+  "current_status": "TESTING"
+}

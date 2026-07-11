@@ -1,0 +1,5 @@
+{
+  "name": "footer-modification",
+  "description": "Change footer text (skipped in transaction generation)",
+  "pipeline": "FooterModified (skipped in tx, should not crash)"
+}

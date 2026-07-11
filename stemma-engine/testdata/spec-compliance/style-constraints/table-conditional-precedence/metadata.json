@@ -1,0 +1,7 @@
+{
+  "name": "table-conditional-precedence",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.6",
+  "description": "Table with wholeTable (black), firstRow (blue+bold), firstCol (green), nwCell (red+not bold). 3x3 table with firstRow and firstColumn enabled.",
+  "expected_behavior": "Cell (0,0): nwCell wins \u2014 color=FF0000, bold=off, fill=FFDDDD. Cell (0,1): firstRow \u2014 color=0000FF, bold=on, fill=DDDDFF. Cell (1,0): firstCol \u2014 color=00FF00, fill=DDFFDD. Cell (1,1): wholeTable \u2014 color=000000.",
+  "current_status": "GAP \u2014 conditional merge order uses HashMap, nwCell may not override correctly"
+}

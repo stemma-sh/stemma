@@ -1,0 +1,7 @@
+{
+  "name": "style-para-props",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.1",
+  "description": "Table style with firstRow conditional setting jc=center in pPr.",
+  "expected_behavior": "Paragraphs in first row cells should have alignment=center from the conditional pPr. Data rows should have no explicit alignment.",
+  "current_status": "GAP \u2014 ConditionalCellProps does not carry pPr or rPr"
+}

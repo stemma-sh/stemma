@@ -1,0 +1,7 @@
+{
+  "name": "conditional-font-formatting",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6.2",
+  "description": "Table style with firstRow conditional: bold + sz=28 (14pt) in rPr, blue shading (2E75B6) in tcPr.",
+  "expected_behavior": "First row cells: text should be bold and 14pt from conditional rPr. Data rows: default font formatting.",
+  "current_status": "GAP-020 \u2014 conditional rPr not propagated to runs"
+}

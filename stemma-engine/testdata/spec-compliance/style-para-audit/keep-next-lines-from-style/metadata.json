@@ -1,0 +1,15 @@
+{
+  "description": "GAP-142: keepNext/keepLines resolved through style chain",
+  "paragraphs": [
+    {
+      "text": "Default",
+      "keep_next": false,
+      "keep_lines": false
+    },
+    {
+      "text": "KeepTogether style",
+      "keep_next": true,
+      "keep_lines": true
+    }
+  ]
+}

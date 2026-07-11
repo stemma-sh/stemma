@@ -1,0 +1,7 @@
+{
+  "name": "numbering-ppr-style-merge",
+  "spec_ref": "ISO 29500-1 \u00a717.7.2",
+  "description": "Style spacing + numbering indent should coexist.",
+  "expected_behavior": "Para 0,1: spacing from style, indent from numbering.",
+  "current_status": "TESTING"
+}

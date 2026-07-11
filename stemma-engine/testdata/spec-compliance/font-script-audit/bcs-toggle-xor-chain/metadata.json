@@ -1,0 +1,7 @@
+{
+  "name": "bcs-toggle-xor-chain",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.2, ISO 29500-1 \u00a717.7.3",
+  "description": "Parent char style: bCs=on, cs=on, cs font=David. Child char style basedOn parent: bCs=on (XOR -> off).",
+  "expected_behavior": "Run 1 (parent): cs+bCs=on -> Mark::Bold. Run 2 (child): bCs XOR(on,on)=off -> no Bold.",
+  "current_status": "GAP-133 \u2014 bCs toggle XOR through basedOn chain"
+}

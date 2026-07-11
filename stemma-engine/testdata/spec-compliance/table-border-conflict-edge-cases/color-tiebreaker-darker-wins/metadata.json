@@ -1,0 +1,5 @@
+{
+  "name": "color-tiebreaker-darker-wins",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with no table borders. Cell (0,0) right = single sz=8 color=000080 (dark blue, brightness=128). Cell (0,1) left = single sz=8 color=80FF80 (light green, brightness=766). Same style and weight. Per SS2.1.169, darker color wins. Dark blue (000080) should win."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "cell-margins",
+  "spec_ref": "ISO 29500-1 \u00a717.4.42/43",
+  "description": "Table with global cell margins and per-cell margin override",
+  "expected_behavior": "Parser should expose table-level and cell-level margin values",
+  "current_status": "NOT_PARSED \u2014 cell margins silently ignored"
+}

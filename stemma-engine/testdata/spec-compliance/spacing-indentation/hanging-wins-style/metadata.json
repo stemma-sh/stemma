@@ -1,0 +1,7 @@
+{
+  "name": "hanging-wins-style",
+  "spec_ref": "ECMA-376 \u00a717.3.1.12",
+  "description": "Style defines ind with both hanging=360 and firstLine=720; hanging should win per spec",
+  "expected_behavior": "effective_first_line_twips = -360 (hanging wins, firstLine ignored)",
+  "current_status": "BUG \u2014 style parser checks firstLine first, so firstLine wins incorrectly"
+}

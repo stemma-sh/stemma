@@ -1,0 +1,7 @@
+{
+  "name": "complex-field-nested",
+  "spec_ref": "ISO 29500-1 \u00a717.16.18",
+  "description": "Nested complex fields: IF field with inner REF field",
+  "expected_behavior": "Outer and inner begin/separate/end should all be captured as field opaques",
+  "current_status": "SUPPORTED \u2014 each fldChar/instrText is independently parsed"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "date-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.6",
+  "description": "Paragraph with a DATE fldSimple field with format switch",
+  "expected_behavior": "FieldKind::Simple with instruction containing 'DATE'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed for any instruction type"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "underline-styles",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.40",
+  "description": "Paragraph with runs using different underline styles: single, double, dotted, dashed, wave",
+  "expected_behavior": "Each run should carry Mark::Underline; style detail (single vs double etc.) should be distinguishable",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 underline presence detected, but style detail collapsed to binary On/Off"
+}

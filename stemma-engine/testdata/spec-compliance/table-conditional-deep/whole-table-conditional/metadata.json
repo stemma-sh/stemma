@@ -1,0 +1,7 @@
+{
+  "name": "whole-table-conditional",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with wholeTable conditional (gray F2F2F2 shading) and firstRow conditional (blue 4472C4 shading). firstRow enabled in tblLook.",
+  "expected_behavior": "Row 0: blue (4472C4) from firstRow (overrides wholeTable). Rows 1-2: gray (F2F2F2) from wholeTable. wholeTable is the lowest-precedence conditional, applied to all cells.",
+  "current_status": "GAP \u2014 TblStylePrType enum does not include WholeTable"
+}

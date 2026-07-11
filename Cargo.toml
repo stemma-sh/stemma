@@ -1,0 +1,9 @@
+[workspace]
+members = ["stemma-engine", "stemma-mcp", "stemma-api", "stemma-cli"]
+resolver = "2"
+
+# Tests run with light optimization: the DOCX import/serialize paths are hot
+# enough that opt-level 0 makes the suite painfully slow, while higher levels
+# slow compilation more than they save.
+[profile.test]
+opt-level = 1

@@ -1,0 +1,5 @@
+{
+  "name": "table-cell-text",
+  "description": "Change text inside a table cell",
+  "pipeline": "BlockModified inside table cell"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "alternate-content",
+  "spec_ref": "ECMA-376 Part 3 (MCE)",
+  "description": "mc:AlternateContent with Choice (drawing) and Fallback (pict)",
+  "expected_behavior": "Should be handled as OpaqueInline with Drawing kind",
+  "current_status": "SUPPORTED"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "no-nested-ins-del",
+  "spec_ref": "MS-OI29500 \u00a72.1.330/\u00a72.1.334",
+  "description": "Multiple edits to verify no nested w:ins/w:del containers"
+}

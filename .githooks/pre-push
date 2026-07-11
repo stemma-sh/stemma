@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Pre-push: full quality gate when pushing main to any remote. Runs `just gate`.
+# Catches fast-forwards / direct commits the pre-merge-commit hook misses.
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PUSHING_MAIN=false
+while read -r _local_ref _local_oid remote_ref _remote_oid; do
+    [[ "$remote_ref" == "refs/heads/main" ]] && { PUSHING_MAIN=true; break; }
+done
+[[ "$PUSHING_MAIN" == "true" ]] || exit 0
+echo "pre-push: pushing to main — running just gate..."
+(cd "$REPO_ROOT" && just gate)
+echo "pre-push: gate passed."

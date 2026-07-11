@@ -1,0 +1,6 @@
+{
+  "name": "cs-rtl-font-selection",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.26 note b",
+  "description": "Run 1: cs=true + Latin text -> cs font (David). Run 2: rtl=true + Latin text -> cs font (David). Run 3: no cs/rtl + Latin text -> ascii font (Arial).",
+  "expected_behavior": "Runs with cs or rtl should use the cs font slot regardless of character content."
+}

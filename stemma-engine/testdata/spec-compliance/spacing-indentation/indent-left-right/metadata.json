@@ -1,0 +1,6 @@
+{
+  "name": "indent-left-right",
+  "spec_ref": "ECMA-376 \u00a717.3.1.12",
+  "description": "Paragraph with ind left=720 right=360",
+  "expected_behavior": "left=720, right=360 on domain Indentation"
+}

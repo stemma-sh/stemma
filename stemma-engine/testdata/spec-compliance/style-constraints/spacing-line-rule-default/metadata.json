@@ -1,0 +1,7 @@
+{
+  "name": "spacing-line-rule-default",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "Style 'ExactSpacing' defines line=480 lineRule=exact. Para 1: style only (inherits exact). Para 2: direct w:spacing w:line=360 with no lineRule attr.",
+  "expected_behavior": "Para 1: line=480, lineRule=exact (from style). Para 2: line=360 (direct), lineRule=auto (spec default when line is present but lineRule is omitted \u2014 NOT exact from style).",
+  "current_status": "GAP-016 \u2014 lineRule per-field merge falls through to style's 'exact'"
+}

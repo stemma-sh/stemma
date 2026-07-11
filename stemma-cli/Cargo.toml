@@ -1,0 +1,30 @@
+[package]
+name = "stemma-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface to the stemma DOCX engine: compare two files into a tracked-changes redline, extract text/JSON, resolve tracked changes, and validate — a zero-integration path to the core verbs for non-Rust adopters."
+repository = "https://github.com/stemma-sh/stemma"
+keywords = ["docx", "cli", "tracked-changes", "ooxml", "redline"]
+categories = ["command-line-utilities", "text-processing"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = true
+
+[[bin]]
+name = "stemma"
+path = "src/main.rs"
+
+[dependencies]
+# version alongside path: local builds use the workspace copy; a crates.io
+# publish resolves the same dependency from the registry.
+stemma = { path = "../stemma-engine", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The integration tests drive the built `stemma` binary and reopen its output
+# with the engine to verify the redline/resolution round-trips by content.
+stemma = { path = "../stemma-engine" }
+serde_json = "1"
+tempfile = "3"

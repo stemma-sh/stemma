@@ -1,0 +1,7 @@
+{
+  "name": "nested-table-independence",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Outer table with OuterStyle (firstRow=blue). Inner 2x2 table nested in cell (1,0) with InnerStyle (firstRow=red).",
+  "expected_behavior": "Outer row 0 cells: blue (4472C4) from outer firstRow. Inner table row 0 cells: red (FF0000) from inner firstRow. Inner table row 1 cells: no conditional shading. Inner table must NOT inherit outer table's conditional formatting.",
+  "current_status": "TESTING"
+}

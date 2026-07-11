@@ -1,0 +1,6 @@
+{
+  "name": "even-headers-setting-on",
+  "spec_ref": "ISO 29500-1 sections 17.10.1",
+  "description": "Section has both default and even-page headers, and evenAndOddHeaders is ON. Both headers should be active.",
+  "expected_behavior": "Both default and even header stories should be imported."
+}

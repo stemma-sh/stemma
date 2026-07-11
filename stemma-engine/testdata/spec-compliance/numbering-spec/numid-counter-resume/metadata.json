@@ -1,0 +1,7 @@
+{
+  "name": "numid-counter-resume",
+  "spec_ref": "ISO 29500-1 \u00a717.9.15",
+  "description": "Two numId interleaved: numId=1 (1.,2.), then numId=2 ((a),(b)), then back to numId=1 which should RESUME at 3., not restart at 1.",
+  "expected_behavior": "numId=1: '1.', '2.', then after interleave '3.', '4.'. numId=2: '(a)', '(b)'.",
+  "current_status": "TESTING"
+}

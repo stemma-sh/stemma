@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6 + \u00a717.7.4.3",
+  "description": "LinkedPara (sz=32, Arial) linked to LinkedChar (bold=on, basedOn BaseChar(underline=on, color=0000FF, highlight=yellow)). Tests that char style's basedOn properties reach runs via linked overlay, without overwriting para style's explicit properties.",
+  "expected": {
+    "para_1": "sz=32 (para), Arial (para), bold=ON (char raw), underline=ON (char basedOn), color=0000FF (char basedOn), highlight=yellow (char basedOn)",
+    "para_2": "explicit LinkedChar on run: bold=ON, underline=ON, color=0000FF, highlight=yellow (all from resolved char chain). sz=32 (para, since char chain doesn't set sz)."
+  }
+}

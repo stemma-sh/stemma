@@ -1,0 +1,17 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.66",
+  "description": "2x2 table with tblCellSpacing=0 and conflicting adjacent borders: cell (0,0) right=red/single/12, cell (0,1) left=blue/double/4",
+  "cell_spacing": 0,
+  "conflicting_borders": {
+    "cell_0_0_right": {
+      "style": "single",
+      "size": 12,
+      "color": "FF0000"
+    },
+    "cell_0_1_left": {
+      "style": "double",
+      "size": 4,
+      "color": "0000FF"
+    }
+  }
+}

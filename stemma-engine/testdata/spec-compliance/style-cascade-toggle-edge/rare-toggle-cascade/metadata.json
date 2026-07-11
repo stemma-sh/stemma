@@ -1,0 +1,19 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.3 (rare toggle properties)",
+  "description": "Vanish, emboss, shadow, outline toggle cascade",
+  "expected": {
+    "para_1": {
+      "vanish": true,
+      "emboss": false,
+      "shadow": true,
+      "outline": true
+    },
+    "para_2": {
+      "vanish": true,
+      "emboss": false
+    },
+    "para_3": {
+      "emboss": true
+    }
+  }
+}

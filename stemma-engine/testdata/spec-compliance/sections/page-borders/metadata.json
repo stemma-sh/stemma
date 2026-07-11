@@ -1,0 +1,7 @@
+{
+  "name": "page-borders",
+  "spec_ref": "ISO 29500-1 \u00a717.6.7",
+  "description": "Section with solid blue page borders on all four edges",
+  "expected_behavior": "Parser should expose pgBorders in SectionProperties",
+  "current_status": "GAP \u2014 pgBorders not yet parsed into SectionProperties"
+}

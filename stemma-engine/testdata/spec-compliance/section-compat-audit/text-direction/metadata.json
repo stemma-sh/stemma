@@ -1,0 +1,7 @@
+{
+  "name": "text-direction",
+  "spec_ref": "ECMA-376 \u00a717.6.19",
+  "description": "Section with textDirection=tbRl (vertical top-to-bottom, right-to-left)",
+  "expected_behavior": "Parser should expose textDirection val in SectionProperties",
+  "current_status": "GAP \u2014 textDirection not parsed into SectionProperties"
+}

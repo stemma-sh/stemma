@@ -1,0 +1,7 @@
+{
+  "name": "grid-before-edge",
+  "spec_ref": "ISO 29500-1 \u00a717.4.14",
+  "description": "Row 0 has 3 cells; row 1 has gridBefore=1 and 2 cells",
+  "expected_behavior": "Row 1 should expose grid_before=1 and have 2 cells",
+  "current_status": "SUPPORTED \u2014 testing gridBefore exposure"
+}

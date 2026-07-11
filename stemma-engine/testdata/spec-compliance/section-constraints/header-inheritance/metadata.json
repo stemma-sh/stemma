@@ -1,0 +1,7 @@
+{
+  "name": "header-inheritance",
+  "spec_ref": "ISO 29500-1 sections 17.10.2, 17.10.5",
+  "description": "Section 1 defines a default header 'Section 1 Header'; Section 2 has no header reference (should inherit from Section 1 per spec)",
+  "expected_behavior": "Section 2 should inherit the header from Section 1. The document should have exactly 1 header part.",
+  "current_status": "PARTIAL - header part is parsed, but cross-section inheritance is not computed in the model"
+}

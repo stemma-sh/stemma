@@ -1,0 +1,5 @@
+{
+  "name": "mixed-paragraph-changes",
+  "description": "Modify + insert + delete paragraphs in one document",
+  "pipeline": "BlockModified + BlockDeleted + BlockInserted"
+}

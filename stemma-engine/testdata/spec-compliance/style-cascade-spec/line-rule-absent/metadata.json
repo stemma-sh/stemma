@@ -1,0 +1,18 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.33",
+  "description": "lineRule defaults to 'auto' when omitted but line is present",
+  "expected": {
+    "para_1": {
+      "line": 360,
+      "lineRule": "auto"
+    },
+    "para_2": {
+      "line": 360,
+      "lineRule": "exact"
+    },
+    "para_3": {
+      "line": 240,
+      "lineRule": "auto (NOT exact from parent \u2014 child's w:spacing resets lineRule)"
+    }
+  }
+}

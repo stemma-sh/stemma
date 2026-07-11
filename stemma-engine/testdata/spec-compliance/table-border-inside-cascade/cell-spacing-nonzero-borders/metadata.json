@@ -1,0 +1,5 @@
+{
+  "name": "cell-spacing-nonzero-borders",
+  "spec_ref": "MS-OI29500 SS2.1.136, SS2.1.138, SS2.1.150",
+  "description": "2x2 table with tblCellSpacing=20 (non-zero). All table borders black single sz=8. Cell (0,0) has explicit right=thick sz=12 red. Tests cell spacing interaction with border conflict resolution."
+}

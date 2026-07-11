@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.6 + \u00a717.7.6.1",
+  "description": "wholeTable tblStylePr applies shading and bold to all cells",
+  "expected": {
+    "all_cells_shading": "AABBCC",
+    "all_cells_bold": true
+  }
+}

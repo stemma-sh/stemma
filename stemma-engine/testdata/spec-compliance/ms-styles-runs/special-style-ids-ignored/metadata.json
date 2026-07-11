@@ -1,0 +1,6 @@
+{
+  "name": "special-style-ids-ignored",
+  "spec_ref": "MS-OI29500 \u00a717.7.4.17 note a",
+  "description": "DefaultParagraphFont has bold + color=FF0000 added. Word should ignore these properties.",
+  "expected_behavior": "Text NOT bold, NOT color FF0000 because Word ignores children of 'DefaultParagraphFont'."
+}

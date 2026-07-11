@@ -1,0 +1,7 @@
+{
+  "name": "linked-style-cross-para",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.6",
+  "description": "Linked char style applied to run inside paragraph with different para style.",
+  "expected_behavior": "Run1: italic=on, color=FF0000 (from OtherPara). Run2: bold=on (char), color=2E74B5 (char), italic from para via XOR.",
+  "current_status": "TESTING -- linked styles are treated as regular char styles (link element is ignored)"
+}

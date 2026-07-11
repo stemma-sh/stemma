@@ -1,0 +1,10 @@
+{
+  "spec": "ISO 29500-1 \u00a717.3.1.31",
+  "description": "Style defines paragraph shading (w:shd fill=FFFF00). Paragraphs should inherit shading from style chain.",
+  "expected": {
+    "para_0": "shading=None (no style)",
+    "para_1": "shading.fill=FFFF00 (from style)",
+    "para_2": "shading.fill=FFFF00 (inherited through basedOn)",
+    "para_3": "shading.fill=00FF00 (direct overrides style)"
+  }
+}

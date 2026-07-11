@@ -1,0 +1,7 @@
+{
+  "name": "start-at-override",
+  "spec_ref": "ISO 29500-1 \u00a717.9.15",
+  "description": "List with w:start val=5",
+  "expected_behavior": "Synthesized text should be 5., 6., 7.",
+  "current_status": "SUPPORTED"
+}

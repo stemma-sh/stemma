@@ -1,0 +1,6 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.17",
+  "description": "Table with tblGrid=3 columns but cell gridSpan=5 (non-conformant)",
+  "grid_columns": 3,
+  "overflowing_grid_span": 5
+}

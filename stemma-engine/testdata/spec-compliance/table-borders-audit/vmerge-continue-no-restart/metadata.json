@@ -1,0 +1,5 @@
+{
+  "name": "vmerge-continue-no-restart",
+  "spec_ref": "ISO 29500-1 SS17.4.84",
+  "description": "Row 1, Cell 0 has vMerge=continue but there is no restart above it. Per spec, the document is non-conformant. Word treats the cell as standalone (no merge). Our code should normalize this to VerticalMerge::None."
+}

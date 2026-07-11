@@ -1,0 +1,6 @@
+{
+  "name": "spacing-line-auto",
+  "spec_ref": "ECMA-376 \u00a717.3.1.33",
+  "description": "line=240 lineRule=auto is single spacing",
+  "expected_behavior": "P0: line=240, lineRule=Auto."
+}

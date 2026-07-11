@@ -1,0 +1,5 @@
+{
+  "name": "conditional-row-beats-column",
+  "spec_ref": "MS-OI29500 \u00a72.1.246",
+  "description": "3x3 table with style that has firstRow conditional (red shading FF0000) and firstCol conditional (blue shading 0000FF). tblLook enables firstRow and firstColumn. Per MS-OI29500 \u00a72.1.246, firstRow is applied AFTER firstCol, so at corner cell (0,0) firstRow shading (red) should win."
+}

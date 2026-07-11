@@ -1,0 +1,21 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.17 + \u00a717.7.2",
+  "description": "Default char style toggle merge with explicit char style",
+  "expected": {
+    "para_1": {
+      "bold": true,
+      "italic": true,
+      "smallCaps": true
+    },
+    "para_2": {
+      "bold": false,
+      "italic": true,
+      "smallCaps": true
+    },
+    "para_3": {
+      "bold": true,
+      "italic": false,
+      "smallCaps": true
+    }
+  }
+}

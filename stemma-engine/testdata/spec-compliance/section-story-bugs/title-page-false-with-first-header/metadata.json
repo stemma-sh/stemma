@@ -1,0 +1,5 @@
+{
+  "name": "title-page-false-with-first-header",
+  "spec_ref": "ECMA-376 section 17.10.6",
+  "description": "titlePg absent + both default and first-page headers present. Per spec, first-page header should not be active."
+}

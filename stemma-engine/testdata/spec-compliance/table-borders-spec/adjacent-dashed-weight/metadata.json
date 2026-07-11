@@ -1,0 +1,5 @@
+{
+  "name": "adjacent-dashed-weight",
+  "spec_ref": "MS-OI29500 \u00a717.4.66(a)",
+  "description": "1x2 table. Cell (0,0) right=dashed sz=48 red. Cell (0,1) left=single sz=4 blue. Per MS-OI29500, dashed styles get weight=1 regardless of size. Single sz=4 (weight=4) should beat dashed sz=48 (weight=1)."
+}

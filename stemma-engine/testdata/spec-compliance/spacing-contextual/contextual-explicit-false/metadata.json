@@ -1,0 +1,6 @@
+{
+  "name": "contextual-explicit-false",
+  "spec_ref": "ECMA-376 \u00a717.3.1.9",
+  "description": "Direct contextualSpacing val='0' overrides style's true",
+  "expected_behavior": "P0: contextual_spacing=false (direct val='0' overrides style). P1: contextual_spacing=true (from style)."
+}

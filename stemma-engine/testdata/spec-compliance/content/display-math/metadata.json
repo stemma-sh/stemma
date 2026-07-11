@@ -1,0 +1,7 @@
+{
+  "name": "display-math",
+  "spec_ref": "ISO 29500-1 \u00a722",
+  "description": "Display math equation using m:oMathPara",
+  "expected_behavior": "Paragraph should contain OpaqueInline with kind Omml",
+  "current_status": "SUPPORTED"
+}

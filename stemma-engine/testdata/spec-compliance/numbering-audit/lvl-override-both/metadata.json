@@ -1,0 +1,6 @@
+{
+  "name": "lvl-override-both",
+  "spec_ref": "ISO 29500-1 \u00a717.9.8, \u00a717.9.26",
+  "description": "lvlOverride with both startOverride=10 and a full level replacement (upperLetter format, lvlText='(%1)'). The format comes from the replacement, start from startOverride.",
+  "expected_behavior": "numId=1: '1.', '2.'. numId=2: '(J)', '(K)' \u2014 upperLetter starting at 10."
+}

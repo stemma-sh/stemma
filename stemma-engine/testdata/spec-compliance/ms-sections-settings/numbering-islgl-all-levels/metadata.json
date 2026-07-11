@@ -1,0 +1,7 @@
+{
+  "name": "numbering-islgl-all-levels",
+  "spec_ref": "MS-OI29500 \u00a717.9.4",
+  "description": "isLgl should affect ALL numbering levels including current (MS behavior)",
+  "expected_behavior": "When isLgl is set, %N references for ALL levels (including current) display as decimal",
+  "current_status": "PARTIAL \u2014 our code forces other levels to decimal but preserves current level format"
+}

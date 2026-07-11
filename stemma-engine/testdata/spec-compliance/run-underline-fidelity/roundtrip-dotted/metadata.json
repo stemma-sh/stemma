@@ -1,0 +1,6 @@
+{
+  "name": "roundtrip-dotted",
+  "spec_ref": "ISO 29500-1 section 17.3.2.40 / section 17.18.99 ST_Underline",
+  "description": "Before/after pair: paragraph with w:u w:val=\"dotted\" is unchanged; second paragraph differs to trigger serialization.",
+  "expected_behavior": "After diff_and_redline + export, the serialized XML must contain w:u w:val=\"dotted\", not \"single\"."
+}

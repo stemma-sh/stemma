@@ -1,0 +1,6 @@
+{
+  "name": "run-position",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.19",
+  "description": "Runs with vertical displacement via w:position",
+  "expected_behavior": "Position offset should be preserved in the model"
+}

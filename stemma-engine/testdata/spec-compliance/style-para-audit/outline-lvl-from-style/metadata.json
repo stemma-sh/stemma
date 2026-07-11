@@ -1,0 +1,13 @@
+{
+  "description": "GAP-143: outlineLvl resolved from custom style chain",
+  "paragraphs": [
+    {
+      "text": "Default",
+      "heading_level": null
+    },
+    {
+      "text": "CustomHeading style",
+      "heading_level": 3
+    }
+  ]
+}

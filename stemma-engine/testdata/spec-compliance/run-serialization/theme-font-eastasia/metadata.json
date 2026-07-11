@@ -1,0 +1,7 @@
+{
+  "name": "theme-font-eastasia",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "Diff pair with eastAsiaTheme='minorEastAsia', text change in second paragraph",
+  "expected_behavior": "eastAsiaTheme attribute should survive roundtrip",
+  "current_status": "BUG \u2014 theme references resolved to font names on import, lost on export"
+}

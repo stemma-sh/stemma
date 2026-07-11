@@ -1,0 +1,5 @@
+{
+  "name": "header-modification",
+  "description": "Change header text (skipped in transaction generation)",
+  "pipeline": "HeaderModified (skipped in tx, should not crash)"
+}

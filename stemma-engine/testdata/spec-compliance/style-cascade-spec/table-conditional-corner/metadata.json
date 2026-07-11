@@ -1,0 +1,17 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.6 + MS-OI29500 \u00a717.4.54(a)",
+  "description": "Corner cell conditional formatting precedence",
+  "expected": {
+    "table_1_with_nw": {
+      "cell_0_0": "green (NwCell > firstRow > firstCol)",
+      "cell_0_1": "blue (firstRow only)",
+      "cell_1_0": "red (firstCol only)",
+      "cell_1_1": "no conditional shading"
+    },
+    "table_2_no_nw": {
+      "cell_0_0": "blue (firstRow > firstCol, no NwCell defined)",
+      "cell_0_1": "blue (firstRow only)",
+      "cell_1_0": "red (firstCol only)"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "continuous-section-partial-margins",
+  "spec_ref": "ECMA-376 section 17.6.17",
+  "description": "Section 1: top=1440 bottom=1440 left=1440 right=1440. Section 2: continuous, only left=720 declared. Section 2 should get left=720 (own) + top/bottom/right inherited from Section 1."
+}

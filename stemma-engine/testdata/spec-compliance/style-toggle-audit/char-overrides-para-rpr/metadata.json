@@ -1,0 +1,14 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.2",
+  "description": "Character style overrides paragraph style rPr per-property",
+  "expected": {
+    "para_1": {
+      "color": "FF0000",
+      "font_size": 32
+    },
+    "para_2": {
+      "color": "FF0000",
+      "font_size": 24
+    }
+  }
+}

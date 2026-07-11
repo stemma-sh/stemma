@@ -1,0 +1,7 @@
+{
+  "name": "based-on-type-mismatch",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.3",
+  "description": "Character style 'CharStyleB' with basedOn='ParaStyleA' (cross-type mismatch). CharStyleB defines italic + green. ParaStyleA defines bold + blue + size=32.",
+  "expected_behavior": "Run: italic=on, color=00FF00 (from CharStyleB only). bold=off, color!=0000FF, size!=32 (basedOn ignored for cross-type).",
+  "current_status": "GAP \u2014 basedOn type checking not implemented, cross-type inheritance may leak"
+}

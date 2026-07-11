@@ -1,0 +1,13 @@
+{
+  "name": "header-tracked-changes",
+  "description": "Header part with w:ins and w:del tracked changes; main body is clean",
+  "revision_elements": {
+    "ins": 1,
+    "del": 1,
+    "delText": 1
+  },
+  "revision_parts": [
+    "word/header1.xml"
+  ],
+  "expected_after_normalize": "Header text becomes 'Header new text'"
+}

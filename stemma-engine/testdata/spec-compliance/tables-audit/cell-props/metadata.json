@@ -1,0 +1,6 @@
+{
+  "name": "cell-props",
+  "spec_ref": "ISO 29500-1 \u00a717.4.30, \u00a717.4.63, \u00a717.4.72",
+  "description": "Table with noWrap, textDirection, tcFitText on cells",
+  "expected_behavior": "All three cell properties parsed and preserved through roundtrip"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "override-table-style-font",
+  "spec_ref": "MS-DOCX \u00a72.3.1",
+  "description": "Table with overrideTableStyleFontSizeAndJustification=1 \u2014 standard hierarchy applies",
+  "expected_behavior": "When true, Normal style font size/justification SHOULD override table style. When false (default), 11pt/12pt and left-align from Normal do NOT override.",
+  "current_status": "GAP \u2014 compatSetting not parsed, table style resolution ignores this flag"
+}

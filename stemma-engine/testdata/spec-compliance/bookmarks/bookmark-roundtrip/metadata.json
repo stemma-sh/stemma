@@ -1,0 +1,7 @@
+{
+  "name": "bookmark-roundtrip",
+  "spec_ref": "ISO 29500-1 \u00a717.13.6.2/1",
+  "description": "Bookmark for roundtrip fidelity testing (import -> redline export -> reimport)",
+  "expected_behavior": "Bookmark decorations must survive the full redline pipeline",
+  "current_status": "SUPPORTED \u2014 bookmarks survive as Decoration nodes through redline"
+}

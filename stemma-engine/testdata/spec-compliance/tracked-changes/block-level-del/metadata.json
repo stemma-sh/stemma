@@ -1,0 +1,6 @@
+{
+  "name": "block-level-del",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.4",
+  "description": "Entire paragraph wrapped in block-level w:del",
+  "expected_behavior": "TrackedBlock.status should be Deleted for the wrapped paragraph"
+}

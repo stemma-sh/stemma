@@ -1,0 +1,6 @@
+{
+  "name": "reordered-paragraphs",
+  "spec_ref": "ECMA-376 \u00a717.13.5.22-28",
+  "description": "Paragraphs B and C swapped; text exceeds 20 char move threshold",
+  "expected_behavior": "diff_and_redline should produce moveFrom/moveTo (not del+ins)"
+}

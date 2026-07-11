@@ -1,0 +1,6 @@
+{
+  "name": "table-props-roundtrip",
+  "spec_ref": "ISO 29500-1 \u00a717.4",
+  "description": "Table with tblPr, tblGrid, tcPr for roundtrip verification",
+  "expected_behavior": "All table/cell properties survive redline export"
+}

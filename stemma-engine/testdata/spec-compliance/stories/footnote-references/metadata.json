@@ -1,0 +1,5 @@
+{
+  "name": "footnote-references",
+  "spec_ref": "ISO 29500-1 \u00a717.11.13",
+  "description": "Body contains footnoteReference linking to FootnoteStory id=1"
+}

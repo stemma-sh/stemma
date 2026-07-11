@@ -1,0 +1,7 @@
+{
+  "name": "multi-section-margins",
+  "spec_ref": "ISO 29500-1 \u00a717.6.11",
+  "description": "Two mid-document sections with different margins (narrow vs wide)",
+  "expected_behavior": "Each section preserves its own margin values independently",
+  "current_status": "GAP \u2014 pgMar not yet parsed into SectionProperties"
+}

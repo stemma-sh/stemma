@@ -1,0 +1,5 @@
+{
+  "name": "ppr-change-reject",
+  "spec_ref": "ECMA-376 \u00a717.13.5.29",
+  "description": "Paragraph alignment changed left->center via pPrChange. Reject should restore left alignment."
+}

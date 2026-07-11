@@ -1,0 +1,6 @@
+{
+  "name": "rpr-change-multi",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.30",
+  "description": "Run with rPrChange tracking multiple property changes (no bold+red \u2192 bold+no color)",
+  "expected_behavior": "FormattingChange captures both previous color and absence of bold"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "default-char-style",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Default character style (w:default='1') sets color=blue. Tests that unstyled runs inherit it.",
+  "expected_behavior": "Run1 (no rStyle): color=0000FF from default char style. Run2 (rStyle=RedChar): color=FF0000.",
+  "current_status": "GAP-024 -- no default_char_style_id; unstyled runs skip char style level entirely",
+  "gap_id": "GAP-024"
+}

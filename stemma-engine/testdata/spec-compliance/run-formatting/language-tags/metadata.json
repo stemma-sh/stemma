@@ -1,0 +1,7 @@
+{
+  "name": "language-tags",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.20",
+  "description": "Runs with different language tags: en-US, fr-FR, ja-JP (eastAsia)",
+  "expected_behavior": "Language tags should be accessible on the text node or style props",
+  "current_status": "NOT_PARSED \u2014 w:lang silently dropped"
+}

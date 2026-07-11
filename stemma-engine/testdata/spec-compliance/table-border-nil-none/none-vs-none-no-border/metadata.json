@@ -1,0 +1,5 @@
+{
+  "name": "none-vs-none-no-border",
+  "spec_ref": "MS-OI29500 SS2.1.169",
+  "description": "1x2 table with no table-level borders. Cell (0,0) has tcBorders right=none. Cell (0,1) has tcBorders left=none. Both sides say 'I have no border' \u2014 no border displays."
+}

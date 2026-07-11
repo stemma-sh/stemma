@@ -1,0 +1,7 @@
+{
+  "name": "nested-table-style-inherit",
+  "spec_ref": "ISO 29500-1 \u00a717.4.38",
+  "description": "Outer table with green style (C6EFCE shading, green borders). Inner table in cell (1,0) with orange style (FBE5D6 shading, orange borders).",
+  "expected_behavior": "Outer table cells: green shading (C6EFCE). Inner table cells: orange shading (FBE5D6), resolved independently. Inner table should NOT inherit outer table's green shading.",
+  "current_status": "GAP-003 \u2014 testing nested table style independence"
+}

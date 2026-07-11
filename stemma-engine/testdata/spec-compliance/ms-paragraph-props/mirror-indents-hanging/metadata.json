@@ -1,0 +1,7 @@
+{
+  "name": "mirror-indents-hanging",
+  "spec_ref": "MS-OI29500 2.1.49 \u00a717.3.1.18(a)",
+  "description": "P0: mirrorIndents + start=1440, hanging=720. P1: mirrorIndents + start=1440, no hanging. P2: start=1440, hanging=720, no mirrorIndents.",
+  "expected_behavior": "P0: Word has known bug \u2014 misaligns hanging indent on odd pages. P1: mirrorIndents swaps start/end on even pages. P2: normal hanging indent behavior.",
+  "current_status": "GAP \u2014 we don't parse mirrorIndents at all"
+}

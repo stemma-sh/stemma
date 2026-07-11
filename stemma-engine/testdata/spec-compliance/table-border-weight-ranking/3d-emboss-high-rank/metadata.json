@@ -1,0 +1,5 @@
+{
+  "name": "3d-emboss-high-rank",
+  "spec_ref": "MS-OI29500 \u00a72.1.169",
+  "description": "1x2 table. Cell (0,0) right=threeDEmboss sz=4 red (rank 20, weight=80). Cell (0,1) left=double sz=4 blue (rank 3, weight=12). threeDEmboss wins. Red."
+}

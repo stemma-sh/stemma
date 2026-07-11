@@ -1,0 +1,7 @@
+{
+  "name": "preexisting-ins-del",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.14/18/31",
+  "description": "Pre-existing tracked changes: w:ins (bold, with rPrChange) + w:del",
+  "expected_behavior": "Import should parse all tracked change markup; export should preserve it",
+  "current_status": "SUPPORTED \u2014 basic ins/del roundtrip works"
+}

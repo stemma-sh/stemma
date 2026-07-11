@@ -1,0 +1,6 @@
+{
+  "name": "start-omitted",
+  "spec_ref": "ECMA-376 section 17.9.25",
+  "description": "Level 0 has no w:start element. Per the spec the starting value defaults to 0.",
+  "expected_behavior": "Items produce '0.', '1.', '2.'."
+}

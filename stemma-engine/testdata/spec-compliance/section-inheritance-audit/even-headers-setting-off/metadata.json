@@ -1,0 +1,6 @@
+{
+  "name": "even-headers-setting-off",
+  "spec_ref": "ISO 29500-1 sections 17.10.1",
+  "description": "Section has both default and even-page headers, but evenAndOddHeaders is absent (off). Even header should be ignored.",
+  "expected_behavior": "Only the default header story should be imported. The even header should be filtered out."
+}

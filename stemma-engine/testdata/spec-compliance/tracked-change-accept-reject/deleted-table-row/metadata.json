@@ -1,0 +1,5 @@
+{
+  "name": "deleted-table-row",
+  "spec_ref": "ECMA-376 \u00a717.13.5.12",
+  "description": "Table with 2 rows; second row is marked as deleted. Accept should remove the row, reject should keep it."
+}

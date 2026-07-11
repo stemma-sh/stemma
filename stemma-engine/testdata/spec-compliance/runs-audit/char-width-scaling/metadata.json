@@ -1,0 +1,6 @@
+{
+  "name": "char-width-scaling",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.43",
+  "description": "Runs with character width scaling (w:w)",
+  "expected_behavior": "Character width percentage should be preserved in the model"
+}

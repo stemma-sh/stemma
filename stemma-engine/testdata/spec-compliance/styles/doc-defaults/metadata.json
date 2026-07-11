@@ -1,0 +1,7 @@
+{
+  "name": "doc-defaults",
+  "spec_ref": "ISO 29500-1 \u00a717.7.4.17",
+  "description": "Document with docDefaults setting Georgia 14pt #333333. Second paragraph overrides font via style.",
+  "expected_behavior": "Para 1 runs: font=Georgia, size=28, color=333333. Para 2 runs: font=Courier New, size=28, color=333333.",
+  "current_status": "TESTING"
+}

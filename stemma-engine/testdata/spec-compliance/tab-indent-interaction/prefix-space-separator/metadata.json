@@ -1,0 +1,7 @@
+{
+  "name": "prefix-space-separator",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12, \u00a717.3.1.38",
+  "description": "Paragraph with w:left=360, tab at 720, text '(a) Body text...' (space separator, not tab). Tests that space-separated prefix doesn't incorrectly use tab stop logic.",
+  "expected_behavior": "left=360 (from resolved indent, unchanged by prefix stripping). Space-separated prefix does not consume a tab stop.",
+  "current_status": "TESTING \u2014 space prefix may or may not trigger the bug"
+}

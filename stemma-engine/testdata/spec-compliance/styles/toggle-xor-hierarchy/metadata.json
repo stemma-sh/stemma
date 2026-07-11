@@ -1,0 +1,7 @@
+{
+  "name": "toggle-xor-hierarchy",
+  "spec_ref": "ISO 29500-1 \u00a717.7.3",
+  "description": "Toggle XOR across hierarchy: para bold + char bold = XOR false; para bold + char unbold = XOR true.",
+  "expected_behavior": "Run1: bold=off (XOR true^true=false). Run2: bold=on. Run3: bold=on (XOR true^false=true).",
+  "current_status": "TESTING"
+}

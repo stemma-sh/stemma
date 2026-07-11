@@ -1,0 +1,6 @@
+{
+  "name": "preexisting-deletions",
+  "spec_ref": "ISO 29500-1 \u00a717.13.5.4",
+  "description": "Pre-existing w:del with w:delText and author/date around 'original '",
+  "expected_behavior": "import_docx().canonical should show TrackedSegment with Deleted status and RevisionInfo"
+}

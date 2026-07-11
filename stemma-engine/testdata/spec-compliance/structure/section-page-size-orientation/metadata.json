@@ -1,0 +1,7 @@
+{
+  "name": "section-page-size-orientation",
+  "spec_ref": "ISO 29500-1 \u00a717.6.14",
+  "description": "Section with A4 page size and landscape orientation via sectPr in pPr",
+  "expected_behavior": "Parser should expose page size and orientation as structured data",
+  "current_status": "PARTIALLY_SUPPORTED \u2014 sectPr preserved as raw XML, not parsed into structured fields"
+}

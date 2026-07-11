@@ -1,0 +1,7 @@
+{
+  "name": "hyperlink-no-text",
+  "spec_ref": "ISO 29500-1 \u00a717.16.22",
+  "description": "Hyperlink element with no nested runs (empty hyperlink)",
+  "expected_behavior": "Should not crash; may produce an OpaqueInline with empty text or be filtered out",
+  "current_status": "SUPPORTED \u2014 parses without crash, produces hyperlink with empty text"
+}

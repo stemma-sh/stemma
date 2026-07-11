@@ -1,0 +1,8 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.17 + \u00a717.7.2",
+  "description": "CustomDefaultChar (default char style, italic=on, sz=28, color=FF0000). Tests that unstyled runs inherit from the default character style, and that explicit char styles merge with the default char style underneath.",
+  "expected": {
+    "para_1": "italic=ON, sz=28, color=FF0000 (from default char style)",
+    "para_2": "bold=ON (from OverrideChar), italic=ON (default char), sz=28 (default char), color=FF0000 (default char)"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "theme-font-references",
+  "spec_ref": "ISO 29500-1 \u00a717.3.2.26",
+  "description": "rFonts with asciiTheme/hAnsiTheme references. Run A has only theme refs, Run B has both explicit and theme.",
+  "expected_behavior": "Run A: font_family should resolve from theme (e.g. 'Calibri Light' for majorHAnsi). Run B: font_family='Courier New' (explicit wins).",
+  "current_status": "GAP -- theme font attributes (asciiTheme, hAnsiTheme) are not read; Run A gets font_family=None",
+  "gap_id": "GAP-022"
+}

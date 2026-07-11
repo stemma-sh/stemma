@@ -1,0 +1,7 @@
+{
+  "name": "inline-sdt",
+  "spec_ref": "ISO 29500-1 \u00a717.5.2.31",
+  "description": "Inline SDT (content control) within a paragraph",
+  "expected_behavior": "OpaqueInline with kind Sdt should be present",
+  "current_status": "SUPPORTED"
+}

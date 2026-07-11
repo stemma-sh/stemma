@@ -1,0 +1,7 @@
+{
+  "name": "seq-field",
+  "spec_ref": "ISO 29500-1 \u00a717.16.30",
+  "description": "Two paragraphs with SEQ Figure fields (cached values 1 and 2)",
+  "expected_behavior": "Each SEQ field produces FieldKind::Simple with instruction containing 'SEQ'",
+  "current_status": "SUPPORTED \u2014 fldSimple parsed for any instruction type"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "internal-anchor",
+  "spec_ref": "ISO 29500-1 \u00a717.16.22",
+  "description": "Paragraph with an internal hyperlink using w:anchor='bookmark_name'",
+  "expected_behavior": "HyperlinkData.anchor should be Some('bookmark_name'), url should be None",
+  "current_status": "SUPPORTED \u2014 anchor attribute is parsed from the element"
+}

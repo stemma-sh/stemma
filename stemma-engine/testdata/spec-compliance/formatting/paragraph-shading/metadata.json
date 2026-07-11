@@ -1,0 +1,7 @@
+{
+  "name": "paragraph-shading",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.31",
+  "description": "Paragraph with yellow background shading",
+  "expected_behavior": "Parser should expose paragraph shading fill color",
+  "current_status": "NOT_PARSED \u2014 w:shd in pPr silently ignored"
+}

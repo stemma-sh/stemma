@@ -1,0 +1,16 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.38",
+  "description": "2x2 outer table with 2x2 nested table in cell (1,0)",
+  "outer": {
+    "rows": 2,
+    "cols": 2
+  },
+  "inner": {
+    "rows": 2,
+    "cols": 2,
+    "in_cell": [
+      1,
+      0
+    ]
+  }
+}

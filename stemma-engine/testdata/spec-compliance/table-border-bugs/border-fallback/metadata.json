@@ -1,0 +1,5 @@
+{
+  "name": "border-fallback",
+  "spec_ref": "ISO 29500-1 SS17.4.66",
+  "description": "2x2 table with tblBorders (red single sz=12) on all 6 edges. NO tcBorders on any cell. Cells should inherit table borders."
+}

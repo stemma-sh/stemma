@@ -1,0 +1,12 @@
+{
+  "spec": "ISO 29500-1 \u00a717.4.57",
+  "description": "Floating table with tblpPr positioning attributes",
+  "positioning": {
+    "leftFromText": 180,
+    "rightFromText": 180,
+    "vertAnchor": "text",
+    "horzAnchor": "margin",
+    "tblpXSpec": "center",
+    "tblpY": 1440
+  }
+}

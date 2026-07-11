@@ -1,0 +1,6 @@
+{
+  "name": "firstline-vs-hanging",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.12",
+  "description": "firstLine vs hanging indent mutual exclusion",
+  "expected_behavior": "When both firstLine and hanging are on the same w:ind, firstLine takes precedence (hanging is ignored). Para 1: first_line=+720, Para 2: first_line=-360, Para 3: first_line=+720 (hanging ignored)."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "widow-control-default",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.44",
+  "description": "widowControl default=true when not specified.",
+  "expected_behavior": "Para 0: None (default true). Para 1: Some(false). Para 2: Some(false) from style.",
+  "current_status": "TESTING"
+}

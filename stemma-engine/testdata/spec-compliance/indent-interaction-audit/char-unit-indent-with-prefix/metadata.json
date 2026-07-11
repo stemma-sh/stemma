@@ -1,0 +1,7 @@
+{
+  "name": "char-unit-indent-with-prefix",
+  "spec_ref": "MS-OI29500 \u00a72.1.44(b), ECMA-376 \u00a717.3.1.12",
+  "description": "P0: left=720, startChars=200, tab at 1440, prefix. P1: no prefix control.",
+  "expected_behavior": "P0 should preserve startChars=200 after prefix stripping.",
+  "current_status": "GAP-101 \u2014 literal_prefix branch clears start_chars/end_chars"
+}

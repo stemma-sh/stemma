@@ -1,0 +1,5 @@
+{
+  "name": "gridspan-overflow",
+  "spec_ref": "ISO 29500-1 SS17.4.17, MS-OI29500 SS17.4.17(a)",
+  "description": "3-column grid. Row 1 cell 1 has gridSpan=5 which exceeds the grid width. MS-OI29500 says gridSpan of 0 is treated as 1. Our code should clamp gridSpan to the grid column count."
+}

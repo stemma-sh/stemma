@@ -1,0 +1,6 @@
+{
+  "name": "tbllook-val-fallback",
+  "spec_ref": "MS-OI29500 \u00a717.4.55(c)",
+  "description": "tblLook has ONLY w:val='0020' (firstRow=1, noHBand=0).",
+  "expected_behavior": "Row 0: firstRow blue. Row 2: band1Horz gray."
+}

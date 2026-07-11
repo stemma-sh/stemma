@@ -1,0 +1,7 @@
+{
+  "name": "vmerge-firstrow-span",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6, \u00a717.4.84",
+  "description": "Table with firstRow conditional (blue). Cell (0,0) has vMerge restart spanning into row 1. Cell (1,0) is vMerge continue.",
+  "expected_behavior": "Cell (0,0): firstRow blue applies (row_idx=0). Cell (0,1): firstRow blue applies (row_idx=0). Cell (1,0): vMerge continue \u2014 row 1 is NOT firstRow, no blue. Cell (2,0): normal row, no shading.",
+  "current_status": "TESTING"
+}

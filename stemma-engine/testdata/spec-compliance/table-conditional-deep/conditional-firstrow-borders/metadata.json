@@ -1,0 +1,7 @@
+{
+  "name": "conditional-firstrow-borders",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table style with firstRow conditional: blue shading (4472C4) and thick red borders (sz=12, FF0000) in tcPr. Base table has thin black borders.",
+  "expected_behavior": "First row cells: blue shading, thick red borders (sz=12, FF0000). Data row cells: no cell-level borders (only table-level thin black).",
+  "current_status": "testing conditional cell border propagation"
+}

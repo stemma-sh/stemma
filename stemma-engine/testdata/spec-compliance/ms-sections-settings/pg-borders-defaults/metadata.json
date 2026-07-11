@@ -1,0 +1,7 @@
+{
+  "name": "pg-borders-defaults",
+  "spec_ref": "MS-OI29500 \u00a717.6.10",
+  "description": "Page borders with omitted zOrder and offsetFrom attributes",
+  "expected_behavior": "Parser should default zOrder to 'front' and offsetFrom to 'text' per MS behavior",
+  "current_status": "GAP \u2014 pgBorders parsed but zOrder/offsetFrom defaults not applied"
+}

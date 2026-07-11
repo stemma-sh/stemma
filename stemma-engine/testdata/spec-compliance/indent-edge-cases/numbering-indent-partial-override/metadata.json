@@ -1,0 +1,7 @@
+{
+  "name": "numbering-indent-partial-override",
+  "spec_ref": "ISO 29500-1 \u00a717.9.22, \u00a717.3.1.12",
+  "description": "Numbering level has left=1440, hanging=360. Paragraph has direct w:ind with only w:left=720. Element-level override means the numbering hanging should NOT leak through.",
+  "expected_behavior": "P0: left=720, first_line=None (element-level override). P1: left=1440, first_line=-360 (numbering only, control).",
+  "current_status": "TESTING"
+}

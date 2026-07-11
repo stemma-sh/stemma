@@ -1,0 +1,7 @@
+{
+  "name": "szcs-from-style-chain",
+  "spec_ref": "MS-OI29500 \u00a717.3.2.39, \u00a717.3.2.26(b)",
+  "description": "Char style SzCsChar: sz=24, szCs=32, ascii='Arial', cs='David'. Run 1: rStyle=SzCsChar + direct cs=true. Run 2: rStyle=SzCsChar, no cs.",
+  "expected_behavior": "Run 1: cs -> font_size=32 (szCs), font_family='David'. Run 2: no cs -> font_size=24 (sz), font_family='Arial'.",
+  "current_status": "GAP-137 \u2014 szCs from style chain with direct cs"
+}

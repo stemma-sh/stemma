@@ -1,0 +1,5 @@
+{
+  "name": "inside-h-only-no-inside-v",
+  "spec_ref": "ISO 29500-1 SS17.4.38",
+  "description": "2x2 table with insideH (green dashed sz=4) but NO insideV. Interior horizontal edges get green dashed. Interior vertical edges should have NO border."
+}

@@ -1,0 +1,7 @@
+{
+  "name": "external-url",
+  "spec_ref": "ISO 29500-1 \u00a717.16.22",
+  "description": "Paragraph with an external hyperlink to https://example.com via r:id relationship",
+  "expected_behavior": "HyperlinkData.url should be Some('https://example.com'), text should be 'Click here'",
+  "current_status": "PARTIAL \u2014 r:id relationship resolution not implemented; url is always None"
+}

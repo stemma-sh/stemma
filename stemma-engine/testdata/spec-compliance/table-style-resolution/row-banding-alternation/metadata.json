@@ -1,0 +1,7 @@
+{
+  "name": "row-banding-alternation",
+  "spec_ref": "ISO 29500-1 \u00a717.7.6",
+  "description": "Table with band1Horz (light blue DAEEF3), band2Horz (light yellow FFFFCC). 6 rows, horizontal banding enabled, no firstRow/lastRow/col conditionals.",
+  "expected_behavior": "Row 0: blue (DAEEF3, band1Horz). Row 1: yellow (FFFFCC, band2Horz). Row 2: blue. Row 3: yellow. Row 4: blue. Row 5: yellow. Banding cycles every 2 rows.",
+  "current_status": "GAP-003 \u2014 testing banding cycle behavior"
+}

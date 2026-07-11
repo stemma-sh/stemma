@@ -1,0 +1,5 @@
+{
+  "name": "inside-v-distinct",
+  "spec_ref": "ISO 29500-1 SS17.4.66, SS17.4.38",
+  "description": "2x3 table with distinct outer borders (double blue sz=12) vs insideV (single green sz=4) and insideH (dashed red sz=8). Interior cell (0,1) should use insideV/insideH, not outer borders."
+}

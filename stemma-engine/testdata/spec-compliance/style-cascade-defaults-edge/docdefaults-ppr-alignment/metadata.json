@@ -1,0 +1,9 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.5",
+  "description": "docDefaults pPr sets jc=center. Tests that unstyled paragraphs get center alignment from docDefaults, and that styles/direct formatting properly override.",
+  "expected": {
+    "para_1": "alignment=center (from docDefaults pPr)",
+    "para_2": "alignment=left (from LeftAlignStyle)",
+    "para_3": "alignment=right (from direct formatting)"
+  }
+}

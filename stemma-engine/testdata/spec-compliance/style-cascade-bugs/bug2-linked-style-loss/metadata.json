@@ -1,0 +1,10 @@
+{
+  "spec": "ISO 29500-1 \u00a717.7.4.6",
+  "bug": "Linked style property loss via basedOn inheritance",
+  "description": "HeadingPara (sz=32) linked to HeadingChar (basedOn BaseChar sz=24, bold=on). Runs in HeadingPara should get sz=32 from para rPr, not sz=24 from char style's basedOn chain. The linked char style's inherited sz=24 should NOT override the para style's explicit sz=32.",
+  "expected": {
+    "para_1": "bold=ON, font_size=32 (para rPr wins over linked char inherited sz=24)",
+    "para_2": "bold=ON, font_size=24 (explicit HeadingChar: resolved chain has sz=24)",
+    "para_3": "bold=ON, font_size=24 (HeadingChar basedOn BaseChar)"
+  }
+}

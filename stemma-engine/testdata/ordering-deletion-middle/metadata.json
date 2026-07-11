@@ -1,0 +1,5 @@
+{
+  "name": "ordering-deletion-middle",
+  "description": "Deletion of middle paragraph - should show deletion in middle, not at end",
+  "source": "generated for ordering tests"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "interleaved-multi-level",
+  "spec_ref": "ISO 29500-1 \u00a717.9.11",
+  "description": "Legal doc pattern: numbered clauses interrupted by bullet list, then clauses continue. Counter must survive the interruption.",
+  "expected_behavior": "Sequence: '1.', '2.', 'a)', bullet, bullet, '3.', '4.'. numId=1 level 0 continues at 3 after bullet interruption."
+}

@@ -1,0 +1,6 @@
+{
+  "name": "pstyle-reverse-binding",
+  "spec_ref": "ECMA-376 section 17.9.23",
+  "description": "Numbering level 0 has pStyle='CustomListNum'. Paragraph style 'CustomListNum' has no numPr. Three paragraphs use the style. They should get numbering from the reverse binding.",
+  "expected_behavior": "Paragraphs produce '1.', '2.', '3.' via pStyle reverse binding."
+}

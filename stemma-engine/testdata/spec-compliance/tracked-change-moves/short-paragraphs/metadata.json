@@ -1,0 +1,6 @@
+{
+  "name": "short-paragraphs",
+  "spec_ref": "Implementation detail: MOVE_MIN_TEXT_LENGTH = 20",
+  "description": "Paragraphs swapped but text is too short for move detection",
+  "expected_behavior": "diff_and_redline should produce del+ins (not moveFrom/moveTo)"
+}

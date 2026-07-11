@@ -1,0 +1,10 @@
+{
+  "name": "main-ins-del",
+  "description": "Main body with w:ins and w:del tracked changes",
+  "revision_elements": {
+    "ins": 1,
+    "del": 1,
+    "delText": 1
+  },
+  "expected_after_normalize": "This is inserted text with content."
+}

@@ -1,0 +1,10 @@
+{
+  "name": "sdt-with-revisions",
+  "description": "Content control (w:sdt) with tracked changes inside sdtContent",
+  "revision_elements": {
+    "ins": 1,
+    "del": 1,
+    "delText": 1
+  },
+  "expected_after_normalize": "Inside control added text. (w:sdt structure preserved)"
+}

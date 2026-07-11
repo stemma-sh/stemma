@@ -1,0 +1,7 @@
+{
+  "name": "multiple-fields",
+  "spec_ref": "ISO 29500-1 \u00a717.16.19",
+  "description": "Paragraph with two fldSimple fields: PAGE and NUMPAGES",
+  "expected_behavior": "Both fields should produce separate OpaqueInline nodes with FieldKind::Simple",
+  "current_status": "SUPPORTED \u2014 each fldSimple parsed independently"
+}

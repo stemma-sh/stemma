@@ -1,0 +1,5 @@
+{
+  "name": "para-mark-del-merge",
+  "spec_ref": "ECMA-376 \u00a717.13.5.15",
+  "description": "Two paragraphs; first has deleted para mark (center), second is left-aligned. Accept should merge into one paragraph with second's properties (left)."
+}

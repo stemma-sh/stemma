@@ -1,0 +1,7 @@
+{
+  "name": "numstylelink-chain",
+  "spec_ref": "ISO 29500-1 \u00a717.9.21 + \u00a717.9.27",
+  "description": "abstractNum 0 has numStyleLink='NumStyle'. abstractNum 1 has styleLink='NumStyle' and actual levels. Paragraphs reference numId=1 (abstractNum 0) \u2014 levels must be resolved via the numStyleLink chain.",
+  "expected_behavior": "P0: 'I.' (upperRoman). P1: 'a)' (lowerLetter). P2: 'II.' (upperRoman, incremented).",
+  "current_status": "TESTING"
+}

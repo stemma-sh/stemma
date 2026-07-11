@@ -1,0 +1,7 @@
+{
+  "name": "all-nine-levels",
+  "spec_ref": "ISO 29500-1 \u00a717.9.6",
+  "description": "Multi-level list exercising all 9 levels (0-8)",
+  "expected_behavior": "Each level synthesizes correct prefix: 1. / 1.1. / ... / 1.1.1.1.1.1.1.1.1.",
+  "current_status": "SUPPORTED"
+}

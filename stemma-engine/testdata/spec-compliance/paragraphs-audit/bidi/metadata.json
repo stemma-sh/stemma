@@ -1,0 +1,6 @@
+{
+  "name": "bidi",
+  "spec_ref": "ISO 29500-1 \u00a717.3.1.6",
+  "description": "P0: bidi=true (RTL paragraph direction). P1: no bidi (LTR, default).",
+  "expected_behavior": "P0: paragraph direction is RTL \u2014 affects ind, jc, tab, textDirection. P1: normal LTR paragraph."
+}
