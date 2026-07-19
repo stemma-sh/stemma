@@ -61,6 +61,9 @@ The [MCP tool surface](../reference/mcp.md) evolves additively within `0.x`:
 
 - A tool's argument schema may gain **optional** parameters in a minor release.
 - New tools may be added.
+- A successful response may gain additive identity or diagnostic fields. Existing
+  response keys keep their meaning; clients should ignore response fields they
+  do not consume.
 - Making a previously-optional parameter required, renaming a tool or a
   parameter, or removing one is a breaking change and gets a
   [CHANGELOG](../../CHANGELOG.md) entry.

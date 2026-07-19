@@ -438,6 +438,7 @@ fn apply_marks(
         MaterializationMode::TrackedChange => {
             node.formatting_change = Some(FormattingChange {
                 revision_id: revision.revision_id,
+                identity: 0,
                 previous_marks: baseline_marks,
                 previous_style_props: baseline_style_props,
                 previous_rpr_authored: baseline_rpr_authored,

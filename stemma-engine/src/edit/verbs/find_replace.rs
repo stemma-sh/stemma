@@ -70,7 +70,9 @@
 //! comment stories but is gated as opt-in and documented as best-tested on the
 //! body path; it walks the same per-paragraph planner over story blocks.
 
-use super::super::{ContentFragment, EditError, EditStep, ParagraphContent};
+use super::super::{
+    ContentFragment, EditError, EditStep, ParagraphContent, block_at, find_paragraph_path,
+};
 use crate::domain::{
     BlockNode, CanonDoc, InlineNode, NodeId, ParagraphNode, TrackedBlock, TrackingStatus,
 };
@@ -437,13 +439,14 @@ fn chars_eq_ignore_case(a: char, b: char) -> bool {
 // and REFUSES paragraphs that already carry tracked changes (its path
 // auto-accepts history before diffing — a silent fold), `plan_replace_text`
 // builds one status-preserving SPLICE (`EditStep::ReplaceSpanText`) over the
-// Normal text region a match lands in, carrying any tracked segments through
-// untouched. This is the headline tracked-native verb: "find this phrase even
+// visible pending region a match lands in. Normal text and pending insertions
+// are editable; deletions and terminal inserted-then-deleted segments remain
+// walls. This is the headline tracked-native verb: "find this phrase even
 // inside a redlined paragraph, replace it as a tracked change."
 //
-// Model: a paragraph is a sequence of "regions" (maximal runs of Normal text)
-// separated by "walls" — opaque anchors, hard breaks, AND non-Normal tracked
-// segments. Matching happens inside a single region. One paragraph yields AT
+// Model: a paragraph is a sequence of editable regions (maximal runs sharing
+// one Normal/Inserted status) separated by walls — opaque anchors, hard breaks,
+// deletions, and terminal stacked segments. Matching happens inside a single region. One paragraph yields AT
 // MOST ONE splice (the single-edit-per-paragraph rule: two splices would
 // collide on the block guard); when a paragraph has matches in more than one
 // region the planner targets the minimal flat-inline range covering them, which
@@ -508,11 +511,13 @@ impl NormalizationClass {
 /// Which blocks `replace_text` searches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplaceTextScope {
-    /// Every top-level body paragraph.
+    /// Every top-level body paragraph (the frozen CLI worklist coverage).
     WholeDoc,
+    /// Every body paragraph, including paragraphs nested in table cells.
+    BodyAndTables,
     /// The inclusive top-level body slice `[from..=to]` in document order.
     Range { from: NodeId, to: NodeId },
-    /// One block.
+    /// One paragraph, either top-level or nested in a table cell.
     SingleBlock(NodeId),
 }
 
@@ -541,15 +546,18 @@ pub struct MatchSite {
     pub excerpt: String,
 }
 
-/// A needle occurrence found in a TABLE CELL — a region the body-paragraph scan
-/// (`scoped_paragraphs`) does NOT reach (engine finding #5). Surfaced so a
-/// receipt can DISCLOSE the unreached match instead of silently under-replacing.
+/// A needle occurrence found in a TABLE CELL. WholeDoc reaches these directly;
+/// restricted top-level ranges surface them as out-of-scope matches. The
+/// paragraph id also makes each occurrence reachable through SingleBlock.
 /// A confident `applied=N` that omits this is the same dishonest-receipt class as
 /// reporting a success the engine cannot substantiate.
 #[derive(Clone, Debug)]
 pub struct UnreachedCellMatch {
     /// The enclosing table block's id.
     pub table_id: NodeId,
+    /// The addressable paragraph id inside the cell. Passing this as an
+    /// explicit SingleBlock scope makes the same tracked splice reachable.
+    pub paragraph_id: NodeId,
     /// Zero-based row index within the table.
     pub row: usize,
     /// Zero-based cell index within the row.
@@ -559,11 +567,10 @@ pub struct UnreachedCellMatch {
 }
 
 /// Scan every table cell for `needle` (the same region/match logic the body scan
-/// uses) and report each occurrence the body-only `replace_text` path cannot
-/// reach. Read-only — it mutates nothing; it exists purely so the receipt is
-/// honest about the table blind spot. Headers/footnotes/textboxes are likewise
-/// out of body scope but are not (yet) walked here; cells are the measured F1/F5
-/// blind spot and the closeable one.
+/// uses) so restricted scopes can disclose occurrences they did not reach.
+/// Read-only — it mutates nothing; it exists so the receipt is honest and gives
+/// the caller the paragraph id for an exact follow-up. Headers/footnotes/
+/// textboxes are likewise out of body scope but are not walked here.
 pub fn unreached_cell_matches(
     doc: &CanonDoc,
     needle: &str,
@@ -588,6 +595,7 @@ pub fn unreached_cell_matches(
                         for span in spans {
                             out.push(UnreachedCellMatch {
                                 table_id: table.id.clone(),
+                                paragraph_id: p.id.clone(),
                                 row: r,
                                 col: c,
                                 excerpt: build_excerpt(&region.text, span),
@@ -669,7 +677,8 @@ impl From<EditError> for ReplaceTextError {
 /// How many chars of context to show on each side of a match excerpt.
 const EXCERPT_RADIUS: usize = 32;
 
-/// A maximal run of Normal text in a paragraph, with its flat-inline range.
+/// A maximal run of text with one editable (`Normal` or `Inserted`) status in a
+/// paragraph, with its flat-inline range.
 ///
 /// `flat_start`/`flat_end` are half-open boundary indices into the SHARED
 /// `flat_inlines(para)` — the exact index space the splice resolver
@@ -686,11 +695,11 @@ struct Region {
     flat_end: usize,
 }
 
-/// Coalesce the paragraph's flat inlines into maximal runs of Normal text
-/// ("regions"), separated by walls. A wall is any non-Normal-text flat inline:
-/// an opaque anchor, a hard break, a tracked (non-Normal) text run, or a
-/// zero-width decoration / comment marker. A region never spans a wall — that
-/// is the splice's structural model.
+/// Coalesce the paragraph's flat inlines into maximal runs of text with the
+/// same editable status ("regions"), separated by walls. Normal and Inserted
+/// segments are editable; Deleted and InsertedThenDeleted remain walls. Opaque
+/// anchors, hard breaks, and zero-width decorations are walls too. A region
+/// never spans a status boundary, keeping attribution explicit.
 ///
 /// The flat index space is the SHARED `flat_inlines_with_status(para)`, which is
 /// `flat_inlines(para)` paired with each inline's segment status. So a region's
@@ -704,12 +713,20 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
     let mut regions = Vec::new();
     let mut i = 0usize;
     while i < flat.len() {
-        // A region starts at a Normal text inline.
-        if let (InlineNode::Text(_), true) = (flat[i].0, flat[i].1) {
+        // A region starts at visible, replaceable text.
+        if matches!(flat[i].0, InlineNode::Text(_))
+            && matches!(
+                flat[i].1,
+                TrackingStatus::Normal | TrackingStatus::Inserted(_)
+            )
+        {
             let flat_start = i;
+            let region_status = flat[i].1;
             let mut text = String::new();
             while i < flat.len() {
-                if let (InlineNode::Text(t), true) = (flat[i].0, flat[i].1) {
+                if let InlineNode::Text(t) = flat[i].0
+                    && flat[i].1 == region_status
+                {
                     text.push_str(&t.text);
                     i += 1;
                 } else {
@@ -722,7 +739,7 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
                 flat_end: i,
             });
         } else {
-            // Wall (anchor, hard break, tracked text, or zero-width inline) —
+            // Wall (anchor, hard break, deletion/stacked text, or zero-width inline) —
             // advance one flat slot without opening a region.
             i += 1;
         }
@@ -868,15 +885,57 @@ fn scoped_paragraphs<'a>(
         .collect();
     match scope {
         ReplaceTextScope::WholeDoc => Ok(body_paras),
+        ReplaceTextScope::BodyAndTables => {
+            fn collect<'a>(block: &'a BlockNode, out: &mut Vec<&'a ParagraphNode>) {
+                match block {
+                    BlockNode::Paragraph(p) => out.push(p.as_ref()),
+                    BlockNode::Table(table) => {
+                        for row in &table.rows {
+                            for cell in &row.cells {
+                                for block in &cell.blocks {
+                                    collect(block, out);
+                                }
+                            }
+                        }
+                    }
+                    BlockNode::OpaqueBlock(_) => {}
+                }
+            }
+
+            let mut paragraphs = Vec::new();
+            for tracked in &doc.blocks {
+                collect(&tracked.block, &mut paragraphs);
+            }
+            Ok(paragraphs)
+        }
         ReplaceTextScope::SingleBlock(id) => {
-            let p = body_paras
-                .iter()
-                .find(|p| &p.id == id)
-                .copied()
-                .ok_or_else(|| EditError::BlockNotFound {
+            let path = find_paragraph_path(doc, id).ok_or_else(|| EditError::BlockNotFound {
+                block_id: id.clone(),
+                step_index: 0,
+            })?;
+            let p = match block_at(doc, &path) {
+                BlockNode::Paragraph(p) => p.as_ref(),
+                BlockNode::Table(_) => {
+                    return Err(EditError::NotAParagraph {
+                        block_id: id.clone(),
+                        actual_kind: "table",
+                        step_index: 0,
+                    });
+                }
+                BlockNode::OpaqueBlock(_) => {
+                    return Err(EditError::NotAParagraph {
+                        block_id: id.clone(),
+                        actual_kind: "opaque_block",
+                        step_index: 0,
+                    });
+                }
+            };
+            if &p.id != id {
+                return Err(EditError::BlockNotFound {
                     block_id: id.clone(),
                     step_index: 0,
-                })?;
+                });
+            }
             Ok(vec![p])
         }
         ReplaceTextScope::Range { from, to } => {
@@ -932,17 +991,17 @@ pub fn plan_replace_text(
 
     for para in &paras {
         // A tracked BLOCK status can't be carried by a splice — refuse up front.
-        if let Some(tb) = doc.blocks.iter().find(|tb| match &tb.block {
-            BlockNode::Paragraph(p) => p.id == para.id,
-            _ => false,
-        }) && tb.status != TrackingStatus::Normal
+        let top_level_status =
+            find_paragraph_path(doc, &para.id).map(|path| &doc.blocks[path.top_block].status);
+        if let Some(status) = top_level_status
+            && *status != TrackingStatus::Normal
         {
             // Only refuse if this paragraph actually contains a match; otherwise
             // a tracked block elsewhere shouldn't block an unrelated replace.
             if paragraph_has_match(para, opts) {
                 return Err(ReplaceTextError::Engine(EditError::BlockHasTrackedStatus {
                     block_id: para.id.clone(),
-                    status: tracked_status_label(&tb.status),
+                    status: tracked_status_label(status),
                     step_index: 0,
                 }));
             }
@@ -967,7 +1026,7 @@ pub fn plan_replace_text(
             }
         }
 
-        // Straddle detection: a needle present across the paragraph's Normal text
+        // Straddle detection: a needle present across the paragraph's editable text
         // but absent from every region crossed a wall.
         if !had_region_match {
             let joined: String = regions.iter().map(|r| r.text.as_str()).collect();
@@ -1034,7 +1093,7 @@ pub fn plan_replace_text(
 /// Build at most one `ReplaceSpanText` for a paragraph: target the minimal
 /// flat-inline range covering all matched regions and pass its whole rewritten
 /// text. Refuses (per barrier policy) when matched regions are separated by a
-/// tracked segment (a single splice cannot span a tracked wall).
+/// deletion or terminal stacked segment.
 fn plan_paragraph_splice(
     para: &ParagraphNode,
     opts: &ReplaceTextOptions,
@@ -1055,11 +1114,11 @@ fn plan_paragraph_splice(
     let cover_start = matched.first().unwrap().0.flat_start;
     let cover_end = matched.last().unwrap().0.flat_end;
 
-    // The covering range must be all-Normal: if a tracked segment sits between
-    // two matched regions, a single splice can't span it. (Anchors inside the
-    // range are fine — they are carried by reference.) Detect a tracked inline
-    // inside [cover_start, cover_end).
-    if range_contains_tracked_inline(para, cover_start, cover_end) {
+    // The covering range may contain Normal text and pending insertions, whose
+    // attribution the splice materializer preserves/stacks. A deletion or
+    // terminal stacked segment remains a wall. Anchors inside the range are
+    // carried by reference.
+    if range_contains_unreplaceable_inline(para, cover_start, cover_end) {
         match opts.on_barrier_match {
             BarrierPolicy::Skip => return Ok(None),
             BarrierPolicy::Fail => {
@@ -1072,9 +1131,9 @@ fn plan_paragraph_splice(
     }
 
     // Build the covering range's replacement content: walk the flat inlines in
-    // [cover_start, cover_end), emitting rewritten Text for Normal text and a
+    // [cover_start, cover_end), emitting rewritten editable Text and a
     // PreservedInlineRef for each anchor (so opaques survive). A region's matches
-    // are applied; non-matched Normal text is copied verbatim.
+    // are applied; non-matched editable text is copied verbatim.
     let content = build_covering_content(para, &matched, cover_start, cover_end, &opts.new);
     let expect = flat_range_visible_text(para, cover_start, cover_end);
     let guard = block_semantic_hash_for_block(&BlockNode::from(para.clone()));
@@ -1091,14 +1150,18 @@ fn plan_paragraph_splice(
     }))
 }
 
-/// Does `[start, end)` of the flat inlines contain any inline from a non-Normal
-/// segment? Indexes the SHARED `flat_inlines_with_status` so its coordinate
-/// space is identical to `partition_regions` and the resolver (no private
-/// segment re-walk).
-fn range_contains_tracked_inline(para: &ParagraphNode, start: usize, end: usize) -> bool {
+/// Does `[start, end)` contain text from a segment the tracked splice cannot
+/// edit? Normal and Inserted are admitted; Deleted and the terminal stacked
+/// state are walls. Indexes the shared flattening used by the resolver.
+fn range_contains_unreplaceable_inline(para: &ParagraphNode, start: usize, end: usize) -> bool {
     crate::edit::flat_inlines_with_status(para)[start..end]
         .iter()
-        .any(|(_, normal)| !normal)
+        .any(|(_, status)| {
+            matches!(
+                status,
+                TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_)
+            )
+        })
 }
 
 /// The visible text of `[start, end)` flat inlines (Text only; anchors contribute
@@ -1117,10 +1180,10 @@ fn flat_range_visible_text(para: &ParagraphNode, start: usize, end: usize) -> St
 /// Build the `ParagraphContent` for the covering range `[start, end)`: walk the
 /// flat inlines in order; when entering a matched region (at its `flat_start`)
 /// emit its rewritten text and skip the rest of the region's inlines; otherwise
-/// emit each Normal text inline verbatim (a non-matched gap between matched
-/// regions) and each anchor as a `PreservedInlineRef` (so opaques survive). The
-/// covering range is all-Normal-plus-anchors by construction (a tracked inline
-/// in range was already refused), so no tracked text appears here.
+/// emit each editable text inline verbatim (a non-matched gap between matched
+/// regions) and each anchor as a `PreservedInlineRef` (so opaques survive).
+/// Pending insertions may appear; deletion and terminal stacked text were
+/// already refused.
 fn build_covering_content(
     para: &ParagraphNode,
     matched: &[(&Region, Vec<(usize, usize)>)],
@@ -1170,7 +1233,7 @@ fn build_covering_content(
             InlineNode::HardBreak(hb) => {
                 fragments.push(ContentFragment::PreservedInlineRef(hb.id.clone()));
             }
-            // A Normal text inline in a non-matched gap between matched
+            // An editable text inline in a non-matched gap between matched
             // regions — copy verbatim.
             InlineNode::Text(t) => fragments.push(ContentFragment::Text(t.text.clone())),
             _ => {}
@@ -1402,8 +1465,9 @@ fn classify_already_applied(paras: &[&ParagraphNode], opts: &ReplaceTextOptions)
 /// agent widens the scope rather than concluding the phrase is absent.
 fn classify_out_of_scope(doc: &CanonDoc, opts: &ReplaceTextOptions) -> Option<String> {
     let scope_label = match &opts.scope {
-        // WholeDoc already covers the whole body — there is no "outside".
-        ReplaceTextScope::WholeDoc => return None,
+        // Both broad scopes cover every region they promise. BodyAndTables is
+        // the MCP scope; WholeDoc is the frozen CLI's top-level body scope.
+        ReplaceTextScope::WholeDoc | ReplaceTextScope::BodyAndTables => return None,
         ReplaceTextScope::SingleBlock(id) => format!("block '{}'", id.0),
         ReplaceTextScope::Range { from, to } => {
             format!("block range '{}'..'{}'", from.0, to.0)
@@ -1627,6 +1691,17 @@ mod tests {
     fn inserted(author: &str) -> TrackingStatus {
         TrackingStatus::Inserted(RevisionInfo {
             revision_id: 1,
+            identity: 0,
+            author: Some(author.to_string()),
+            date: None,
+            apply_op_id: None,
+        })
+    }
+
+    fn deleted(author: &str) -> TrackingStatus {
+        TrackingStatus::Deleted(RevisionInfo {
+            revision_id: 2,
+            identity: 0,
             author: Some(author.to_string()),
             date: None,
             apply_op_id: None,
@@ -1666,26 +1741,28 @@ mod tests {
     }
 
     #[test]
-    fn region_flat_range_indexes_the_same_inlines_it_collected() {
-        // Normal "the cat " | INSERTED "big " | Normal "cat sat" — two Normal
-        // regions split by a tracked wall.
+    fn editable_region_flat_ranges_share_resolver_coordinates_and_deletions_stay_walls() {
+        // Normal | INSERTED | DELETED | Normal. The insertion is its own
+        // editable region; the deletion remains an unreplaceable wall.
         let para = para_with_segments(
             "p_rt",
             vec![
                 (TrackingStatus::Normal, vec![("r0", "the cat ")]),
                 (inserted("Stemma"), vec![("r1", "big ")]),
-                (TrackingStatus::Normal, vec![("r2", "cat sat")]),
+                (deleted("Other"), vec![("r2", "old ")]),
+                (TrackingStatus::Normal, vec![("r3", "cat sat")]),
             ],
         );
 
         let regions = partition_regions(&para);
         assert_eq!(
             regions.len(),
-            2,
-            "two Normal regions split by the tracked wall"
+            3,
+            "Normal, Inserted, and trailing Normal are independently editable"
         );
         assert_eq!(regions[0].text, "the cat ");
-        assert_eq!(regions[1].text, "cat sat");
+        assert_eq!(regions[1].text, "big ");
+        assert_eq!(regions[2].text, "cat sat");
 
         // THE round-trip pin: each region's flat range, sliced into the SHARED
         // flat_inlines, is exactly the inlines whose text the region holds.
@@ -1705,25 +1782,54 @@ mod tests {
             flat_inlines_with_status(&para).len(),
         );
 
-        // The wall sits between the two regions; a range covering both regions
-        // contains a tracked inline, so a single splice would be refused.
+        // The deletion between the inserted and trailing Normal regions makes
+        // a covering splice unreplaceable.
         let cover_start = regions[0].flat_start;
-        let cover_end = regions[1].flat_end;
+        let cover_end = regions[2].flat_end;
         assert!(
-            range_contains_tracked_inline(&para, cover_start, cover_end),
-            "the covering range [{cover_start}, {cover_end}) spans the tracked wall",
+            range_contains_unreplaceable_inline(&para, cover_start, cover_end),
+            "the covering range [{cover_start}, {cover_end}) spans the deleted wall",
         );
-        // Each region's own range is all-Normal.
-        assert!(!range_contains_tracked_inline(
-            &para,
-            regions[0].flat_start,
-            regions[0].flat_end
-        ));
-        assert!(!range_contains_tracked_inline(
-            &para,
-            regions[1].flat_start,
-            regions[1].flat_end
-        ));
+        for region in &regions {
+            assert!(!range_contains_unreplaceable_inline(
+                &para,
+                region.flat_start,
+                region.flat_end
+            ));
+        }
+    }
+
+    #[test]
+    fn paragraph_splice_planner_targets_text_inside_a_pending_insertion() {
+        let para = para_with_segments(
+            "p_inserted",
+            vec![(
+                inserted("Prior Counsel"),
+                vec![("r_inserted", "rate of 8% above base rate")],
+            )],
+        );
+        let options = ReplaceTextOptions {
+            old: "8%".to_string(),
+            new: "2%".to_string(),
+            author: "Reviewing Counsel".to_string(),
+            scope: ReplaceTextScope::SingleBlock(NodeId::from("p_inserted")),
+            expected: ExpectedMatches::Count(1),
+            match_mode: MatchMode::Exact,
+            on_barrier_match: BarrierPolicy::Fail,
+        };
+
+        let regions = partition_regions(&para);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].text, "rate of 8% above base rate");
+        let step = plan_paragraph_splice(&para, &options)
+            .expect("pending insertion is a valid tracked splice target")
+            .expect("the matching insertion produces a step");
+        match step {
+            EditStep::ReplaceSpanText { block_id, .. } => {
+                assert_eq!(block_id, NodeId::from("p_inserted"));
+            }
+            other => panic!("expected ReplaceSpanText, got {other:?}"),
+        }
     }
 
     #[test]

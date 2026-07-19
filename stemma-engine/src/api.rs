@@ -425,6 +425,25 @@ impl Document {
         self.project(Resolution::RejectAll)
     }
 
+    /// Every pending revision in the document — the engine's ONE canonical
+    /// census ([`crate::tracked_model::enumerate_revisions`]): inline and
+    /// block insert/delete, paragraph marks, table structure, hyperlink runs,
+    /// comment stories, atomic moves, opaque-interior records, and every
+    /// `*PrChange` formatting kind. This is the same walk the accept/reject
+    /// selectors lower against, so the returned `revision_id`s feed
+    /// [`Document::project`] with [`Resolution::Selective`] directly (a
+    /// record with `revision_id == 0` is census-only and never selectable).
+    ///
+    /// Consumers must not re-derive a narrower enumeration from
+    /// [`Document::read`]: the segment view carries no formatting-change
+    /// records, so any count built from it silently understates the
+    /// document's pending state (a formatting-only document reads as
+    /// revision-free, and author-scoped resolution misses that author's
+    /// formatting changes).
+    pub fn revisions(&self) -> Vec<crate::tracked_model::RevisionRecord> {
+        crate::tracked_model::enumerate_revisions(&self.snapshot.canonical)
+    }
+
     /// Escape hatch: borrow the internal [`EditSnapshot`].
     ///
     /// The snapshot is engine-version-bound and not semver-stable; this exists
@@ -642,6 +661,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -710,6 +730,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some(author.to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -857,6 +878,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -910,6 +932,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,

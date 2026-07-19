@@ -651,6 +651,14 @@ impl SimpleRuntime {
         }
     }
 
+    /// Return whether this runtime still owns an open document handle.
+    ///
+    /// Transport-side state that is coupled to a document can use this after
+    /// an eviction sweep instead of maintaining a second liveness clock.
+    pub fn contains_handle(&self, handle: &DocHandle) -> bool {
+        self.docs.contains_key(&handle.0)
+    }
+
     /// Set a validator that runs on every `export_docx()` output.
     ///
     /// When set, the validator receives the exported DOCX bytes before they
@@ -1580,6 +1588,9 @@ impl SimpleRuntime {
         let merge_result = merge_diff(&base.canonical, &target.canonical, &diff, &revision)
             .map_err(map_merge_error)?;
         let mut merged = merge_result.doc;
+        // H7: diff is a revision PRODUCER; mint stable identities for the
+        // revisions it discovered so the redline is enumerable/resolvable.
+        crate::import::mint_identities(&mut merged);
         let merge_elapsed = merge_start.elapsed();
 
         let serialize_start = Instant::now();
@@ -1688,6 +1699,9 @@ impl SimpleRuntime {
         )
         .map_err(map_merge_error)?;
         let mut merged = merge_result.doc;
+        // H7: diff is a revision PRODUCER; mint stable identities for the
+        // revisions it discovered so the redline is enumerable/resolvable.
+        crate::import::mint_identities(&mut merged);
         let merge_elapsed = merge_start.elapsed();
 
         // Drop base_view, target_view, and diff — they are no longer needed.
@@ -2313,6 +2327,7 @@ fn revision_info_from_transaction_meta(meta: &TransactionMeta, revision_id: u32)
         .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
     RevisionInfo {
         revision_id,
+        identity: 0,
         author: Some(meta.author.clone()),
         date: Some(date),
         apply_op_id: None,
@@ -7655,6 +7670,18 @@ impl EditSnapshot {
         // exists but its id was not among the ones selected this call — left
         // pending, exactly like an unselected pPrChange.
         let mut body_section_resolution: Option<bool> = None;
+        // Full projections also resolve revisions in the opaque glossary
+        // package part after the modeled IR is serialized. `Some(true)` =
+        // accept, `Some(false)` = reject; Selective cannot address glossary
+        // interiors because they have no engine identity and leaves them
+        // disclosed by preflight.
+        let mut full_resolution: Option<bool> = None;
+        // Selectively resolving an atomic move changes which source/destination
+        // carrier exists in the package. Refresh the body scaffold for that
+        // narrow case so a later projection cannot replay the old move wrapper.
+        // Other projections retain the established scaffold behavior, which
+        // preserves authored SDTs and body-level range decorations.
+        let mut refresh_body_template = false;
         // Preflight (M0.1 fail-loud): the accept/reject descent resolves
         // revisions inside opaque `raw_xml` by reparsing the fragment. If a
         // fragment cannot be parsed yet its bytes carry a revision marker, the
@@ -7679,12 +7706,14 @@ impl EditSnapshot {
         }
         match resolution {
             Resolution::AcceptAll => {
+                full_resolution = Some(true);
                 crate::tracked_model::accept_all(&mut resolved);
                 if self.canonical.body_section_property_change.is_some() {
                     body_section_resolution = Some(true);
                 }
             }
             Resolution::RejectAll => {
+                full_resolution = Some(false);
                 // Rejecting a tracked paragraph-style change restores the prior
                 // style; the runs' style-inherited marks must be re-resolved
                 // against it, which needs the document's style table.
@@ -7706,6 +7735,31 @@ impl EditSnapshot {
                         details: ErrorDetails::default(),
                     });
                 }
+                // A quarantined move mixture blocks selection only when the
+                // selection addresses a modeled half of that move. Unrelated
+                // visible revisions remain safely isolated, and an id that
+                // exists only inside the quarantine still reaches the
+                // completeness check below and fails as InvalidRange.
+                if let Some(opaque_id) = first_conflicting_quarantined_move_mixture(self, &ids) {
+                    return Err(RuntimeError {
+                        code: ErrorCode::UnsupportedEdit,
+                        message: format!(
+                            "selective resolution refused: quarantined block '{opaque_id}' carries \
+                             a move mixed with another revision; resolving only the modeled move \
+                             half could tear the Word move pair. Use full accept-all/reject-all."
+                        ),
+                        details: ErrorDetails {
+                            block_id: Some(opaque_id),
+                            ..ErrorDetails::default()
+                        },
+                    });
+                }
+                refresh_body_template = crate::tracked_model::enumerate_revisions(&self.canonical)
+                    .iter()
+                    .any(|revision| {
+                        ids.contains(&revision.revision_id)
+                            && revision.kind == crate::tracked_model::RevisionKind::Move
+                    });
                 // A quarantined block is a DISCIPLINED ISOLATION BOUNDARY,
                 // not a reason to refuse unrelated work. Selective
                 // resolution is provably disjoint from the quarantine:
@@ -7802,7 +7856,25 @@ impl EditSnapshot {
             Some(body_template),
             &crate::edit::PendingParts::default(),
         )?;
-        rebuild_snapshot(self, resolved, &redline_bytes)
+        let projected_bytes = if let Some(accept) = full_resolution {
+            let archive = DocxArchive::read(&redline_bytes).map_err(map_docx_error)?;
+            let resolved_archive = crate::normalize::resolve_glossary_docx(&archive, accept)
+                .map_err(|error| RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: format!("glossary resolution failed: {error:?}"),
+                    details: ErrorDetails::default(),
+                })?;
+            resolved_archive.write().map_err(map_docx_error)?
+        } else {
+            redline_bytes
+        };
+        let mut rebuilt = rebuild_snapshot(self, resolved, &projected_bytes)?;
+        if refresh_body_template {
+            let archive = DocxArchive::read(&projected_bytes).map_err(map_docx_error)?;
+            rebuilt.scaffold.body_template =
+                body_template_from_archive(&archive, &rebuilt.canonical)?;
+        }
+        Ok(rebuilt)
     }
 
     /// Discover the deltas between this snapshot and `other` and materialize
@@ -7855,6 +7927,7 @@ impl EditSnapshot {
         // `TransactionMeta`) is the path that stamps a timestamp.
         let revision = RevisionInfo {
             revision_id: next_revision_id,
+            identity: 0,
             author,
             date: None,
             apply_op_id: None,
@@ -7862,6 +7935,9 @@ impl EditSnapshot {
         let merge_result = merge_diff(&self.canonical, &other.canonical, &diff, &revision)
             .map_err(map_merge_error)?;
         let mut merged = merge_result.doc;
+        // H7: diff is a revision PRODUCER; mint stable identities for the
+        // revisions it discovered so the redline is enumerable/resolvable.
+        crate::import::mint_identities(&mut merged);
         // Re-zips of the two unmodified input scaffolds as merge inputs —
         // internal intermediates, not output (output is gated at `serialize`).
         let self_bytes = serialize_snapshot(self, &ExportOptions::unchecked())?;
@@ -7875,6 +7951,57 @@ impl EditSnapshot {
         )?;
         rebuild_snapshot(self, merged, &redline_bytes)
     }
+}
+
+fn first_conflicting_quarantined_move_mixture(
+    snapshot: &EditSnapshot,
+    selected_ids: &HashSet<u32>,
+) -> Option<NodeId> {
+    let selected_authors: HashSet<String> =
+        crate::tracked_model::enumerate_revisions(&snapshot.canonical)
+            .into_iter()
+            .filter(|revision| selected_ids.contains(&revision.revision_id))
+            .filter_map(|revision| revision.author)
+            .collect();
+    if selected_authors.is_empty() {
+        return None;
+    }
+
+    fn contains_conflicting_move(node: &XMLNode, selected_authors: &HashSet<String>) -> bool {
+        let XMLNode::Element(element) = node else {
+            return false;
+        };
+        if is_w_tag(element, "moveFrom") || is_w_tag(element, "moveTo") {
+            return attr_get(element, "author")
+                .is_none_or(|author| selected_authors.contains(author.as_str()));
+        }
+        element
+            .children
+            .iter()
+            .any(|child| contains_conflicting_move(child, selected_authors))
+    }
+
+    snapshot.canonical.blocks.iter().find_map(|tracked| {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            return None;
+        };
+        if opaque.kind != OpaqueKind::QuarantinedNestedTracking {
+            return None;
+        }
+        let index = opaque
+            .proof_ref
+            .docx_anchor
+            .strip_prefix("body_index:")?
+            .parse::<usize>()
+            .ok()?;
+        snapshot
+            .scaffold
+            .body_template
+            .opaque_children
+            .get(&index)
+            .is_some_and(|node| contains_conflicting_move(node, &selected_authors))
+            .then(|| opaque.id.clone())
+    })
 }
 
 /// Build an [`EditSnapshot`] from DOCX bytes without touching any handle store.
@@ -8151,7 +8278,7 @@ fn import_and_anchor(
     let document_xml = archive
         .get(&main_part)
         .ok_or_else(|| invalid_docx(&format!("main document part {main_part} is missing")))?;
-    let mut root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
+    let root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
 
     // Guarantee every recognized WordprocessingML part carries its canonical
     // content-type Override before we anchor (OPC §10.1.2 / ECMA-376 Part 1
@@ -8330,44 +8457,58 @@ fn import_and_anchor(
 
     // Extract cached body nodes for later use by serialize_canonical_docx,
     // avoiding a redundant full xmltree re-parse of document.xml.
-    let cached = {
-        let body = body_element_mut(&mut root).map_err(map_word_xml_error)?;
-        let body_children_len = body.children.len();
-
-        // Extract opaque body children referenced by the canonical model.
-        let mut opaque_children: HashMap<usize, XMLNode> = HashMap::new();
-        for tracked in &canonical.blocks {
-            if let BlockNode::OpaqueBlock(opaque) = &tracked.block
-                && let Some(index_str) = opaque.proof_ref.docx_anchor.strip_prefix("body_index:")
-                && let Ok(idx) = index_str.parse::<usize>()
-                && let Some(child) = body.children.get(idx)
-            {
-                opaque_children.entry(idx).or_insert_with(|| child.clone());
-            }
-        }
-
-        // Extract sectPr nodes from the body.
-        let mut sect_pr_nodes: Vec<XMLNode> = Vec::new();
-        for child in &body.children {
-            if let XMLNode::Element(el) = child
-                && is_w_tag(el, "sectPr")
-            {
-                sect_pr_nodes.push(child.clone());
-            }
-        }
-
-        // Drain body children to keep the root shell lightweight.
-        body.children.clear();
-
-        BodyTemplate {
-            root_shell: root,
-            opaque_children,
-            sect_pr_nodes,
-            body_children_len,
-        }
-    };
+    let cached = extract_body_template(root, &canonical)?;
 
     Ok((updated_bytes, canonical, diagnostics, has_revisions, cached))
+}
+
+fn extract_body_template(
+    mut root: Element,
+    canonical: &CanonDoc,
+) -> Result<BodyTemplate, RuntimeError> {
+    let body = body_element_mut(&mut root).map_err(map_word_xml_error)?;
+    let body_children_len = body.children.len();
+
+    let mut opaque_children: HashMap<usize, XMLNode> = HashMap::new();
+    for tracked in &canonical.blocks {
+        if let BlockNode::OpaqueBlock(opaque) = &tracked.block
+            && let Some(index_str) = opaque.proof_ref.docx_anchor.strip_prefix("body_index:")
+            && let Ok(idx) = index_str.parse::<usize>()
+            && let Some(child) = body.children.get(idx)
+        {
+            opaque_children.entry(idx).or_insert_with(|| child.clone());
+        }
+    }
+
+    let mut sect_pr_nodes: Vec<XMLNode> = Vec::new();
+    for child in &body.children {
+        if let XMLNode::Element(el) = child
+            && is_w_tag(el, "sectPr")
+        {
+            sect_pr_nodes.push(child.clone());
+        }
+    }
+
+    body.children.clear();
+    Ok(BodyTemplate {
+        root_shell: root,
+        opaque_children,
+        sect_pr_nodes,
+        body_children_len,
+    })
+}
+
+fn body_template_from_archive(
+    archive: &DocxArchive,
+    canonical: &CanonDoc,
+) -> Result<BodyTemplate, RuntimeError> {
+    let main_part = crate::docx_package::resolve_main_document_part(archive)
+        .map_err(crate::import::map_package_error)?;
+    let document_xml = archive
+        .get(&main_part)
+        .ok_or_else(|| invalid_docx(&format!("main document part {main_part} is missing")))?;
+    let root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
+    extract_body_template(root, canonical)
 }
 
 /// Build a `w:sdt` element wrapping the given content children,
@@ -8436,6 +8577,19 @@ fn resolve_story_part_to_rid(
 ) -> String {
     if rel_type == HYPERLINK_REL_TYPE {
         return base_pkg.document_rels.add_external(rel_type, part_path);
+    }
+
+    // `sectPrChange` snapshots survive across rebuilds. On their first write,
+    // the snapshot's part-path placeholder is resolved to an rId; a later
+    // rebuild therefore presents that already-resolved rId here again. Treat
+    // a matching registered relationship as the fixed point. Without this
+    // check, an input such as `rId9` is mistaken for a part path and a bogus
+    // relationship with Target="rId9" is minted.
+    if let Some(existing) = base_pkg.document_rels.find_by_id(part_path)
+        && existing.rel_type == rel_type
+        && existing.target_mode.is_none()
+    {
+        return existing.id.clone();
     }
 
     // Already in the output rels?
@@ -9331,6 +9485,29 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    #[test]
+    fn story_part_relationship_resolution_is_idempotent_for_registered_rid() {
+        let bytes = build_docx(&wrap_body("<w:p/>"));
+        let archive = DocxArchive::read(&bytes).expect("test package");
+        let mut base_pkg = DocxPackage::from_archive(&archive).expect("base package");
+        let target_pkg = base_pkg.clone();
+        let rid = base_pkg.document_rels.add(HEADER_REL_TYPE, "header1.xml");
+        let relationship_count = base_pkg.document_rels.entries.len();
+
+        let resolved = resolve_story_part_to_rid(&rid, HEADER_REL_TYPE, &mut base_pkg, &target_pkg);
+
+        assert_eq!(resolved, rid);
+        assert_eq!(base_pkg.document_rels.entries.len(), relationship_count);
+        assert!(
+            base_pkg
+                .document_rels
+                .entries
+                .iter()
+                .all(|relationship| relationship.target != resolved),
+            "an already-resolved rId must never be minted as a relationship target"
+        );
+    }
+
     fn decode_snapshot_blob(blob: &[u8]) -> PersistedEditSnapshot {
         let decoded = zstd::stream::decode_all(Cursor::new(blob)).expect("decode snapshot blob");
         bincode::deserialize(&decoded).expect("deserialize snapshot blob")
@@ -9365,6 +9542,7 @@ mod tests {
             materialization_mode: crate::edit::MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -9435,6 +9613,7 @@ mod tests {
             materialization_mode: crate::edit::MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 2,
+                identity: 0,
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T01:00:00Z".to_string()),
                 apply_op_id: None,
@@ -9604,6 +9783,7 @@ mod tests {
             materialization_mode: crate::edit::MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -9664,6 +9844,7 @@ mod tests {
             materialization_mode: crate::edit::MaterializationMode::Direct,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -9829,6 +10010,7 @@ mod tests {
             materialization_mode: crate::edit::MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 7,
+                identity: 0,
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -10314,6 +10496,7 @@ mod tests {
             previous_style_props: StyleProps::default(),
             previous_rpr_authored: crate::domain::RunRprAuthored::default(),
             revision_id: 77,
+            identity: 0,
             author: "TestAuthor".to_string(),
             date: Some("2024-01-01T00:00:00Z".to_string()),
         };
@@ -10417,6 +10600,7 @@ mod tests {
                     previous_style_props: StyleProps::default(),
                     previous_rpr_authored: crate::domain::RunRprAuthored::default(),
                     revision_id: 78,
+                    identity: 0,
                     author: "Author1".to_string(),
                     date: Some("2024-06-01T00:00:00Z".to_string()),
                 }),
@@ -10426,6 +10610,7 @@ mod tests {
         // Serialize as a block-level deletion (entire paragraph deleted).
         let block_status = TrackingStatus::Deleted(RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some("Deleter".to_string()),
             date: Some("2024-06-02T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -11400,6 +11585,7 @@ mod tests {
             let seg = TrackedSegment {
                 status: TrackingStatus::Inserted(RevisionInfo {
                     revision_id: 1,
+                    identity: 0,
                     author: None,
                     date: None,
                     apply_op_id: None,

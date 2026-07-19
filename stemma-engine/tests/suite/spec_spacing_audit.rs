@@ -534,3 +534,78 @@ fn sa08_both_before_lines_and_before_preserved() {
 // the standard import path because normalization strips pPrChange.
 // They would manifest when a consumer receives a redline-exported DOCX
 // and opens it in Word — the tracked change diff would be incorrect.
+
+// SA-02: an explicit autospacing OVERRIDE ("0") survives serialization.
+//
+// §17.3.1.33 is tri-state: absent (inherit), "1" (auto spacing on), "0"
+// (explicitly OFF — overriding an inherited "1", e.g. from NormalWeb).
+// Collapsing Some(false) to absent flips the paragraph back to the
+// inherited auto spacing — a Word-visible layout change on an untouched
+// paragraph. Witnessed in the wild: a one-word tracked edit rebuilt a
+// NormalWeb document and dropped every explicit `w:beforeAutospacing="0"`/
+// `w:afterAutospacing="0"`, which the delivery verifier then correctly
+// flagged as untouched-block modifications.
+
+/// The explicit "0" override must be re-emitted by the rebuild path.
+#[test]
+fn sa02_explicit_autospacing_off_survives_rebuild() {
+    use std::io::Write;
+    use stemma::ExportOptions;
+    use stemma::api::Document;
+    use stemma::edit_v4::parse_transaction;
+
+    let document_xml = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
+        r#"<w:p><w:pPr><w:spacing w:before="0" w:beforeAutospacing="0" w:after="0" w:afterAutospacing="0"/></w:pPr>"#,
+        r#"<w:r><w:t>Spaced paragraph.</w:t></w:r></w:p>"#,
+        r#"<w:sectPr/></w:body></w:document>"#,
+    );
+    let mut bytes = Vec::new();
+    {
+        use zip::write::FileOptions;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let opts: FileOptions = FileOptions::default();
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#).unwrap();
+        zip.start_file("word/_rels/document.xml.rels", opts)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#).unwrap();
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    let doc = Document::parse(&bytes).expect("parse");
+    let block = &doc.read().blocks[0];
+    let txn_json = format!(
+        r#"{{ "ops": [ {{ "op": "replace", "target": "{}", "guard": "{}",
+               "content": {{ "type": "paragraph",
+                             "content": [ {{ "type": "text", "text": "Rewritten paragraph." }} ] }} }} ],
+             "revision": {{ "author": "Spec Test" }} }}"#,
+        block.id, block.guard
+    );
+    let txn = parse_transaction(&txn_json)
+        .unwrap()
+        .into_edit_transaction()
+        .unwrap();
+    let edited = doc.apply(&txn).expect("tracked edit applies");
+    let out = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(out)).expect("zip");
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("word/document.xml").unwrap(), &mut xml)
+        .unwrap();
+    assert!(
+        xml.contains(r#"w:beforeAutospacing="0""#),
+        "the explicit beforeAutospacing override must survive: {xml}"
+    );
+    assert!(
+        xml.contains(r#"w:afterAutospacing="0""#),
+        "the explicit afterAutospacing override must survive: {xml}"
+    );
+}

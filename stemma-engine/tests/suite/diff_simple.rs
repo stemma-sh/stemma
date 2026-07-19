@@ -516,6 +516,7 @@ fn merge_accept_all_preserves_multi_insert_ordering() {
         &diff,
         &stemma::RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("test".to_string()),
             date: Some("2026-01-01T00:00:00Z".to_string()),
             apply_op_id: None,

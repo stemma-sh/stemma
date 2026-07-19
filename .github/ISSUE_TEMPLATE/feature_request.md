@@ -10,7 +10,8 @@ assignees: ''
 <!-- The task, not the mechanism. What document outcome are you after? -->
 
 **Which surface**
-<!-- Rust api::Document, an MCP tool, or the HTTP/editor demo. -->
+<!-- The approved-worklist CLI, Rust api::Document, an MCP tool, or the
+     HTTP/editor demo. -->
 
 **What you tried and how it fell short**
 <!-- The current verb/API you reached for and where it stopped. -->

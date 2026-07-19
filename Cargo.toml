@@ -1,5 +1,11 @@
 [workspace]
-members = ["stemma-engine", "stemma-mcp", "stemma-api", "stemma-cli"]
+members = [
+    "stemma-engine",
+    "stemma-artifacts",
+    "stemma-mcp",
+    "stemma-api",
+    "stemma-cli",
+]
 resolver = "2"
 
 # Tests run with light optimization: the DOCX import/serialize paths are hot

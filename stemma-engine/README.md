@@ -113,7 +113,7 @@ bytes back. New consumers should depend on `api` and nothing else.
 The crate exposes more than the facade, in deliberate tiers (declared and
 documented at the top of [`src/lib.rs`](src/lib.rs)):
 
-1. **Facade** — `api`. The stable, documented v0.1.0 surface.
+1. **Facade** — `api`. The stable, documented v0.2.0 surface.
 2. **Typed IR / domain model** — `domain`, `diff`, `table`, `table_diff`,
    `tracked_model`, `vocabulary`, `semantic_hash`, `redline_extract`,
    `roundtrip_compare`. The typed `CanonDoc` and its diff/redline views. These
@@ -131,7 +131,7 @@ documented at the top of [`src/lib.rs`](src/lib.rs)):
 
 Everything else — the OOXML (de)serializer plumbing, the validator's
 xref/namespace/ordering sub-checks, the styles/settings/word_ir part builders,
-the OPC package writer — is sealed to `pub(crate)`. This keeps the v0.1.0
+the OPC package writer — is sealed to `pub(crate)`. This keeps the v0.2.0
 semver surface to the tiers above rather than freezing every internal helper.
 
 ### Why `stemma-mcp` reaches the engine API directly

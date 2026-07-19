@@ -1,0 +1,67 @@
+name: Approved-worklist design partner
+description: Volunteer for the bounded Candidate A evaluation workflow
+title: "[design partner] "
+labels:
+  - design-partner
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This intake is for the experimental approved-worklist workflow, not general Word automation. Do not include a customer, party, matter, agreement, filename, path, clause, worklist, receipt, or document hash.
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow category
+      options:
+        - Contract lifecycle management
+        - Legal operations
+        - Procurement operations
+        - Contract automation development
+        - Other existing-agreement workflow
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Can you run an x86_64 GNU/Linux executable?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: dropdown
+    id: word
+    attributes:
+      label: Can an independent reviewer adjudicate the result in desktop Microsoft Word?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: dropdown
+    id: worklist
+    attributes:
+      label: Do you have a local existing-agreement workflow with 3-10 already-approved exact text replacements?
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Content-safe outcome you need
+      description: Describe the workflow class and desired redline/receipt outcome without quoting or identifying any document.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Boundary confirmation
+      options:
+        - label: I understand v0 searches top-level body paragraphs; tables and other stories are outside the admitted evaluation boundary.
+          required: true
+        - label: I will keep the real document, worklist, receipt, paths, hashes, and excerpts local.
+          required: true
+        - label: I understand a safe refusal is not a correct completion.
+          required: true

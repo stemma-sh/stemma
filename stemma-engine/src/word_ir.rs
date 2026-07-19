@@ -1432,6 +1432,37 @@ impl ParagraphView {
                 continue;
             }
 
+            // Wild-input tolerance (Word-verified, wave campaign): Microsoft
+            // Outlook emits a bare `w:rPr` as a direct `w:p` child — CT_P has
+            // no such member, yet Word opens the package valid and unrepaired.
+            // The stray styles no run and is NOT the paragraph-mark rPr (that
+            // lives inside pPr); guessing a meaning would invent semantics and
+            // dropping it would be a silent loss. Preserve it verbatim as a
+            // zero-width marker, the same treatment as the foreign-namespace
+            // arm above.
+            if local_element_name(element) == "rPr" {
+                tracing::debug!(
+                    "preserving schema-invalid bare paragraph-level w:rPr verbatim \
+                     (Microsoft Outlook emission)"
+                );
+                atoms.push(Atom {
+                    kind: AtomKind::Decoration {
+                        name: element.name.clone(),
+                        raw_xml: serialize_element(element),
+                    },
+                    utf16_len: 0,
+                    style_key: None,
+                    origin: AtomOrigin {
+                        run_index: None,
+                        child_index: None,
+                        paragraph_child_index: Some(index),
+                    },
+                    marks: TextMarks::default(),
+                    tracking: None,
+                });
+                continue;
+            }
+
             // Unknown paragraph-level element - fail fast
             return Err(WordIrError::UnknownParagraphElement(element.name.clone()));
         }
@@ -1768,6 +1799,33 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
         // selected branch's content above (see `resolve_run_alternate_content`),
         // so the loop only ever sees the resolved content, never the wrapper.
 
+        // Wild-input tolerance (Word-verified, wave campaign): LibreOffice
+        // 24.2 emits a stray childless COPY of the run's own rPr/rPrChange as
+        // a direct run child when round-tripping a formatting revision.
+        // Schema-invalid (CT_R has no rPrChange member), but Word opens the
+        // package valid and unrepaired and the revision is fully carried by
+        // the in-rPr element. Drop ONLY an exact duplicate (same id, author,
+        // date as the change already parsed into `marks`) — observable via
+        // the debug diagnostic. Anything else keeps the fail-loud arm below:
+        // a non-duplicate would carry a revision this run does not otherwise
+        // hold, and dropping it would be a silent revision loss.
+        if local_name == "rPrChange"
+            && let Some(rc) = marks.rpr_change.as_deref()
+        {
+            let dup_id = attr_value(element, "id")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            let dup_author = attr_value(element, "author").cloned().unwrap_or_default();
+            let dup_date = attr_value(element, "date").cloned();
+            if rc.revision_id == dup_id && rc.author == dup_author && rc.date == dup_date {
+                tracing::debug!(
+                    "dropping stray duplicate run-level w:rPrChange (LibreOffice emission; \
+                     revision carried by the run's rPr)"
+                );
+                continue;
+            }
+        }
+
         // Unknown run-level element - fail fast
         return Err(WordIrError::UnknownRunElement(element.name.clone()));
     }
@@ -2014,12 +2072,18 @@ fn tracked_change_atoms(
             atoms.extend(run_atoms(element, container_index)?);
             continue;
         }
-        // A tracked container nested inside this one: parse the ONE supported
-        // shape — the stacked state (an `ins`/`del` pair in either markup
-        // order) — and fail loud on
-        // everything else (same-type nesting is invalid OOXML per I-TC-003;
-        // move-container mixes and deeper nesting are not modeled). Silently
-        // skipping (the earlier behavior) lost the inner revision.
+        // A tracked container nested inside this one: parse one of the three
+        // modeled one-level states:
+        //
+        // - ins/del (either wire order): an inserted-then-deleted segment;
+        // - moveTo/del: a later deletion in the move destination;
+        // - moveFrom/ins: the insertion from which a later move originated.
+        //
+        // The two move shapes are emitted by Word itself. Their inner carrier
+        // remains an ordinary independent status; the enclosing move context
+        // is supplied by the linked TrackedBlock move pair. Everything else
+        // still fails loud (same-type nesting is invalid OOXML per I-TC-003,
+        // and no deeper nesting is modeled).
         if tracking.is_some()
             && (is_w_tag(element, "ins")
                 || is_w_tag(element, "del")
@@ -2030,14 +2094,23 @@ fn tracked_change_atoms(
             let outer_is_del = is_w_tag(container, "del");
             let inner_is_ins = is_w_tag(element, "ins");
             let inner_is_del = is_w_tag(element, "del");
-            let supported_pair = (outer_is_ins && inner_is_del) || (outer_is_del && inner_is_ins);
-            if !supported_pair {
+            let stacked_pair = (outer_is_ins && inner_is_del) || (outer_is_del && inner_is_ins);
+            let move_destination_deletion = is_w_tag(container, "moveTo") && inner_is_del;
+            let inserted_move_source = is_w_tag(container, "moveFrom") && inner_is_ins;
+            if !stacked_pair && !move_destination_deletion && !inserted_move_source {
                 return Err(WordIrError::NestedTrackedChange {
                     outer: container.name.clone(),
                     inner: element.name.clone(),
                 });
             }
-            atoms.extend(stacked_atoms(container, element, container_index)?);
+            if stacked_pair {
+                atoms.extend(stacked_atoms(container, element, container_index)?);
+            } else {
+                // Parse the inner revision normally. The final tagging loop
+                // deliberately does not overwrite its context with the outer
+                // move context.
+                atoms.extend(tracked_change_atoms(element, container_index)?);
+            }
             continue;
         }
         let local_name = local_element_name(element);
@@ -2710,15 +2783,22 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
                 let revision_id = attr_value(el, "id")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                if let Some(inner_rpr) = find_w_child(el, "rPr") {
-                    let previous = parse_rpr_element(inner_rpr);
-                    marks.rpr_change = Some(Box::new(RprChange {
-                        previous_marks: previous,
-                        revision_id,
-                        author,
-                        date,
-                    }));
-                }
+                // Word always writes the previous-state child, even when empty
+                // (`<w:rPr/>`); LibreOffice omits it entirely when the prior
+                // run had no direct formatting. Same meaning — an absent child
+                // is an EMPTY previous state, never a reason to drop the
+                // tracked change (mirrors parse_tbl_pr_change's missing-inner
+                // handling).
+                let previous = match find_w_child(el, "rPr") {
+                    Some(inner_rpr) => parse_rpr_element(inner_rpr),
+                    None => TextMarks::default(),
+                };
+                marks.rpr_change = Some(Box::new(RprChange {
+                    previous_marks: previous,
+                    revision_id,
+                    author,
+                    date,
+                }));
             }
 
             // --- Toggle rPr children (CT_OnOff) ---
@@ -3722,14 +3802,23 @@ fn extract_border_edge(container: &Element, edge_name: &str) -> Option<BorderEdg
 fn extract_section_property_change(p_pr: &Element) -> Option<SectionPropertyChange> {
     let sect_pr = find_w_child(p_pr, "sectPr")?;
     let change_el = find_w_child(sect_pr, "sectPrChange")?;
-    let revision_id = attr_value(change_el, "id")?.parse().ok()?;
+    // A missing or unparseable w:id takes 0 and gets a minted identity from
+    // the wire-zero pass (mint_wire_zero_revision_ids) — the same handling as
+    // the rPr/pPr parsers; silently dropping the record here would hide a
+    // pending revision. Likewise an absent previous-sectPr child is an EMPTY
+    // previous state (LibreOffice omits it; Word writes `<w:sectPr/>`).
+    let revision_id = attr_value(change_el, "id")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let author = attr_value(change_el, "author").cloned();
     let date = attr_value(change_el, "date").cloned();
-    let prev_sect_pr = find_w_child(change_el, "sectPr")?;
+    let empty_previous = Element::new("sectPr");
+    let prev_sect_pr = find_w_child(change_el, "sectPr").unwrap_or(&empty_previous);
     let previous_properties_raw = serialize_element(prev_sect_pr);
     Some(SectionPropertyChange {
         revision: RevisionInfo {
             revision_id,
+            identity: 0,
             author,
             date,
             apply_op_id: None,
@@ -3746,7 +3835,12 @@ fn extract_ppr_change(p_pr: &Element) -> Option<PprChange> {
         .cloned()
         .unwrap_or_default();
     let date = attr_value(ppr_change_el, "date").cloned();
-    let inner_ppr = find_w_child(ppr_change_el, "pPr")?;
+    // Word always writes the previous-state child, even when empty
+    // (`<w:pPr/>`); LibreOffice omits it when the prior paragraph had no
+    // direct properties. An absent child is an EMPTY previous state, never a
+    // reason to drop the tracked change (same rule as the rPrChange parse).
+    let empty_previous = Element::new("pPr");
+    let inner_ppr = find_w_child(ppr_change_el, "pPr").unwrap_or(&empty_previous);
     let revision_id = attr_value(ppr_change_el, "id")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -3841,6 +3935,7 @@ fn extract_para_mark_status(p_pr: &Element) -> Option<TrackingStatus> {
             let revision_id = attr_value(el, "id")?.parse().ok()?;
             mark_del = Some(RevisionInfo {
                 revision_id,
+                identity: 0,
                 author: attr_value(el, "author").cloned(),
                 date: attr_value(el, "date").cloned(),
                 apply_op_id: None,
@@ -3850,6 +3945,7 @@ fn extract_para_mark_status(p_pr: &Element) -> Option<TrackingStatus> {
             let revision_id = attr_value(el, "id")?.parse().ok()?;
             mark_ins = Some(RevisionInfo {
                 revision_id,
+                identity: 0,
                 author: attr_value(el, "author").cloned(),
                 date: attr_value(el, "date").cloned(),
                 apply_op_id: None,
@@ -4474,6 +4570,7 @@ fn parse_hyperlink_revision_status(el: &Element, inserted: bool) -> Option<Track
     let date = attr_value(el, "date").cloned();
     let info = RevisionInfo {
         revision_id,
+        identity: 0,
         author,
         date,
         apply_op_id: None,

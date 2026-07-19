@@ -664,6 +664,7 @@ mod tests {
     fn rev() -> RevisionInfo {
         RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some("Ada".to_string()),
             date: Some("2024-01-01T00:00:00Z".to_string()),
             apply_op_id: None,

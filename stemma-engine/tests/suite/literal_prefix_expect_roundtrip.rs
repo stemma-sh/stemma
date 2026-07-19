@@ -91,6 +91,7 @@ fn paragraph_with_literal_prefix() -> Vec<u8> {
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("ReaderDocs".to_string()),
         date: Some("2026-06-12T00:00:00Z".to_string()),
         apply_op_id: None,

@@ -425,6 +425,9 @@ pub fn convert_manual_markup(
             &mut report,
         );
     }
+    // H7: this is a revision PRODUCER (manual color/strike markup → real
+    // tracked changes); mint stable identities for what it created.
+    crate::import::mint_identities(doc);
     // H2: one unified body-state validator after the direct manual-markup
     // materialization producer.
     crate::tracked_model::debug_assert_body_invariants(doc, "convert_manual_markup");
@@ -643,12 +646,14 @@ fn flush_group(
         GroupKind::Normal => TrackingStatus::Normal,
         GroupKind::Inserted => TrackingStatus::Inserted(RevisionInfo {
             revision_id,
+            identity: 0,
             author: Some(author.to_string()),
             date: Some(date.to_string()),
             apply_op_id: apply_op_id.map(|s| s.to_string()),
         }),
         GroupKind::Deleted => TrackingStatus::Deleted(RevisionInfo {
             revision_id,
+            identity: 0,
             author: Some(author.to_string()),
             date: Some(date.to_string()),
             apply_op_id: apply_op_id.map(|s| s.to_string()),
@@ -910,6 +915,7 @@ mod tests {
         let tracked_seg = TrackedSegment {
             status: TrackingStatus::Deleted(RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Native".to_string()),
                 date: None,
                 apply_op_id: None,

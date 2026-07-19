@@ -62,6 +62,7 @@ fn txn(step: EditStep, mode: MaterializationMode) -> EditTransaction {
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Gate".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -381,6 +382,7 @@ fn duplicate_block_fill_in_one_transaction_refuses() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Gate".to_string()),
             date: None,
             apply_op_id: None,

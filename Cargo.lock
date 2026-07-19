@@ -1181,6 +1181,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1372,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "stemma"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1393,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "serde",
@@ -1406,19 +1415,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "stemma-artifacts"
+version = "0.2.0"
+dependencies = [
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "stemma-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "stemma",
+ "stemma-artifacts",
  "tempfile",
+ "xmltree-ns",
+ "zip",
 ]
 
 [[package]]
 name = "stemma-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1426,7 +1451,10 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "stemma",
+ "stemma-artifacts",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1779,6 +1807,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23939e44bb9a5d7576fa2b563dc2e136628f1224e88a8deed09e04858b77871f"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

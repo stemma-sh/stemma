@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # build-plugin.sh — package stemma-mcp as a Claude plugin zip.
 #
-# The bundle is a self-contained Claude plugin: the stemma-mcp server binary,
-# the .mcp.json that wires it up, and the cold-start skill. A plugin connector
+# The bundle is a self-contained Claude plugin: the stemma-mcp server binary
+# and the .mcp.json that wires it up. Canonical agent guidance is served by the
+# MCP server through initialize instructions and tool descriptions. A plugin connector
 # runs ON THE HOST machine and shares its filesystem with the agent, so (unlike
 # a remote-style .mcpb desktop extension) the agent's own file paths work with
 # open_docx. The bundled binary must match the host you run on.
@@ -66,12 +67,6 @@ cp "$HERE/.mcp.json"                   "$STAGE/.mcp.json"
 cp "$BUILT"                            "$STAGE/server/$BIN"
 chmod +x "$STAGE/server/$BIN"
 cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$STAGE/"
-
-# Model-invoked skills: the host auto-discovers skills/<name>/SKILL.md from the
-# plugin root, so the directory must be staged verbatim. Required — the SKILL is
-# how a cold agent learns the golden path instead of discovering it via errors.
-[[ -d "$HERE/skills" ]] || { echo "ERROR: $HERE/skills not found" >&2; exit 1; }
-cp -R "$HERE/skills" "$STAGE/skills"
 
 python3 - "$STAGE/.claude-plugin/plugin.json" "$STAMPED" <<'PY'
 import json, sys

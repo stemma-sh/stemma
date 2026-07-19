@@ -178,24 +178,46 @@ fn mixed_wire_zero_and_real_id_revisions_coexist_uniquely() {
     let doc = Document::parse(&make_docx(&body)).expect("parse");
     let ids = enumerated_ids(&doc);
 
+    // H7: enumerate reports engine-minted IDENTITIES (a space above every wire
+    // id), not the wire `w:id`s. All five carriers — the real-id insert and the
+    // four wire-0 ones — must mint a distinct, nonzero, resolvable identity.
     assert_eq!(
         ids.len(),
         5,
         "real-id insertion + four wire-0 carriers; got {ids:?}"
     );
     assert!(
-        ids.contains(&5),
-        "the real wire id 5 must be preserved, not renumbered; got {ids:?}"
-    );
-    assert!(
-        ids.iter().filter(|&&id| id != 5).all(|&id| id != 0),
-        "the wire-0 carriers must be minted to nonzero ids; got {ids:?}"
+        ids.iter().all(|&id| id != 0),
+        "every carrier (real-id and wire-0) must mint a nonzero identity; got {ids:?}"
     );
     let unique: HashSet<u32> = ids.iter().copied().collect();
     assert_eq!(
         unique.len(),
         ids.len(),
-        "all five ids distinct; got {ids:?}"
+        "all five identities distinct; got {ids:?}"
+    );
+    // The real wire id 5 must survive import's wire-0 minting (not be renumbered)
+    // at the WIRE level — the identity space is separate, so check the canonical
+    // carrier's preserved wire id directly.
+    let snap = doc.snapshot();
+    let wire_ids: HashSet<u32> = {
+        let mut out = HashSet::new();
+        for b in &snap.canonical.blocks {
+            if let stemma::BlockNode::Paragraph(p) = &b.block {
+                for seg in &p.segments {
+                    if let stemma::TrackingStatus::Inserted(r)
+                    | stemma::TrackingStatus::Deleted(r) = &seg.status
+                    {
+                        out.insert(r.revision_id);
+                    }
+                }
+            }
+        }
+        out
+    };
+    assert!(
+        wire_ids.contains(&5),
+        "the real wire id 5 must be preserved on the imported carrier, not renumbered; got wire ids {wire_ids:?}"
     );
 
     for id in ids {

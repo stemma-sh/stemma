@@ -49,6 +49,12 @@ const ENDNOTES_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes";
 const COMMENTS_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+/// The glossary (building-blocks / AutoText) document part, referenced from the
+/// document relationships (ECMA-376 Part 1 §17.12). It remains outside the
+/// editable IR, but full accept/reject resolves it through the shared byte
+/// kernel in both archive and model projection paths.
+const GLOSSARY_DOCUMENT_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/glossaryDocument";
 
 // =============================================================================
 // Preflight Report types
@@ -92,6 +98,11 @@ pub struct PreflightTotals {
 pub struct PreflightReport {
     pub parts: Vec<PartReport>,
     pub totals: PreflightTotals,
+    /// Revision counts for glossary story parts (ECMA-376 §17.12), reported
+    /// separately so callers can distinguish building-block revisions from the
+    /// ordinary document stories. Accept/reject resolves these through the
+    /// shared byte kernel; the glossary remains outside the editable IR.
+    pub glossary: Vec<PartReport>,
     pub warnings: Vec<String>,
 }
 
@@ -104,6 +115,10 @@ pub struct NormalizationResult {
     pub parts_normalized: Vec<String>,
     pub revisions_resolved: u32,
     pub opaque_nodes_resolved_revisions_count: u32,
+    /// Compatibility field retained after glossary resolution support landed.
+    /// Full accept/reject now resolves glossary revisions in both paths, so a
+    /// successful operation returns zero.
+    pub unresolved_glossary_revisions: u32,
 }
 
 // =============================================================================
@@ -166,11 +181,8 @@ fn main_part_and_rels(archive: &DocxArchive) -> Result<(String, String), Normali
 /// not fixed at word/document.xml); a package without a discoverable main part
 /// is malformed and the error propagates rather than defaulting.
 ///
-/// Not included: the glossary document part (`word/glossary/document.xml`).
-/// The import/model path does not parse glossary content into tracked blocks,
-/// so the model resolution path leaves glossary revisions untouched; the byte
-/// path stays consistent with it. Resolving glossary revisions in both paths is
-/// a separate, deliberate extension, not something to add silently here.
+/// Glossary parts are collected separately by [`collect_glossary_part_paths`]
+/// because they remain opaque package content rather than modeled stories.
 fn collect_normalizable_part_paths(archive: &DocxArchive) -> Result<Vec<String>, NormalizeError> {
     let (main_part, rels_path) = main_part_and_rels(archive)?;
     let mut paths = vec![main_part];
@@ -219,6 +231,121 @@ fn collect_normalizable_part_paths(archive: &DocxArchive) -> Result<Vec<String>,
     }
 
     Ok(paths)
+}
+
+/// Collect the glossary story part path(s) from the document relationships — the
+/// parts that carry building blocks / AutoText (ECMA-376 §17.12) and can legally
+/// hold tracked revisions inside their doc-part bodies (`CT_Body`).
+///
+/// This is the SINGLE glossary collector both the preflight scan and the
+/// resolution paths use. Keeping it one function is the same discipline that
+/// governs the normalizable set: preflight and mutation cannot drift.
+///
+/// Scope: the glossary main document part, discovered by the `glossaryDocument`
+/// relationship (robust to a non-conventional target name), plus its own
+/// header/footer/footnote/endnote/comment sub-stories discovered through the
+/// glossary relationship part.
+fn collect_glossary_part_paths(archive: &DocxArchive) -> Result<Vec<String>, NormalizeError> {
+    let (main_part, rels_path) = main_part_and_rels(archive)?;
+    let main_dir = main_part
+        .rsplit_once('/')
+        .map(|(dir, _)| format!("{dir}/"))
+        .unwrap_or_default();
+
+    let mut paths = Vec::new();
+    let Some(rels_xml) = archive.get(&rels_path) else {
+        return Ok(paths);
+    };
+    let Ok(root) = parse_xml(rels_xml) else {
+        return Ok(paths);
+    };
+
+    for child in &root.children {
+        let XMLNode::Element(el) = child else {
+            continue;
+        };
+        if local_element_name(el) != "Relationship" {
+            continue;
+        }
+        let Some(rel_type) = get_attr(el, "Type") else {
+            continue;
+        };
+        if rel_type != GLOSSARY_DOCUMENT_REL_TYPE {
+            continue;
+        }
+        let Some(target) = get_attr(el, "Target") else {
+            continue;
+        };
+        let part_path = crate::import::resolve_relationship_target(target, &main_dir);
+        if !paths.iter().any(|p| p == &part_path) {
+            paths.push(part_path);
+        }
+    }
+
+    let glossary_mains = paths.clone();
+    for glossary_main in glossary_mains {
+        let rels_path = crate::docx_package::rels_part_path(&glossary_main);
+        let Some(rels_xml) = archive.get(&rels_path) else {
+            continue;
+        };
+        let root = parse_xml(rels_xml)?;
+        let base_dir = glossary_main
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/"))
+            .unwrap_or_default();
+        for child in &root.children {
+            let XMLNode::Element(el) = child else {
+                continue;
+            };
+            if local_element_name(el) != "Relationship" {
+                continue;
+            }
+            let Some(rel_type) = get_attr(el, "Type") else {
+                continue;
+            };
+            if !matches!(
+                rel_type,
+                HEADER_REL_TYPE
+                    | FOOTER_REL_TYPE
+                    | FOOTNOTES_REL_TYPE
+                    | ENDNOTES_REL_TYPE
+                    | COMMENTS_REL_TYPE
+            ) {
+                continue;
+            }
+            let Some(target) = get_attr(el, "Target") else {
+                continue;
+            };
+            let part_path = crate::import::resolve_relationship_target(target, &base_dir);
+            if !paths.iter().any(|path| path == &part_path) {
+                paths.push(part_path);
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Scan the glossary story part(s) and return a [`PartReport`] per part that
+/// carries revisions. Reused by [`preflight_scan`] to disclose them in
+/// [`PreflightReport::glossary`]. Resolution enumerates through the same
+/// collector, so discovery and mutation cannot drift.
+fn scan_glossary_parts(archive: &DocxArchive) -> Result<Vec<PartReport>, NormalizeError> {
+    let mut reports = Vec::new();
+    for part_path in collect_glossary_part_paths(archive)? {
+        let Some(xml_bytes) = archive.get(&part_path) else {
+            continue;
+        };
+        let (revisions, comments) = scan_part_streaming(xml_bytes)?;
+        if revisions.total() > 0 {
+            reports.push(PartReport {
+                part: part_path,
+                revisions,
+                comments,
+            });
+        }
+    }
+    Ok(reports)
 }
 
 // =============================================================================
@@ -462,9 +589,15 @@ pub fn preflight_scan(archive: &DocxArchive) -> Result<PreflightReport, Normaliz
         });
     }
 
+    // Glossary parts are reported separately so callers can distinguish
+    // building-block revisions from ordinary document stories. Full
+    // accept/reject resolves them through the same byte kernel.
+    let glossary = scan_glossary_parts(archive)?;
+
     Ok(PreflightReport {
         parts,
         totals,
+        glossary,
         warnings,
     })
 }
@@ -718,7 +851,8 @@ pub fn normalize_docx(
     let mut output = archive.clone();
     let mut result = NormalizationResult::default();
 
-    let part_paths = collect_normalizable_part_paths(archive)?;
+    let mut part_paths = collect_normalizable_part_paths(archive)?;
+    part_paths.extend(collect_glossary_part_paths(archive)?);
 
     for part_path in &part_paths {
         let Some(xml_bytes) = output.get(part_path) else {
@@ -743,6 +877,8 @@ pub fn normalize_docx(
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
     }
 
+    result.unresolved_glossary_revisions = 0;
+
     Ok((output, result))
 }
 
@@ -764,7 +900,8 @@ pub fn reject_all_docx(
     let mut output = archive.clone();
     let mut result = NormalizationResult::default();
 
-    let part_paths = collect_normalizable_part_paths(archive)?;
+    let mut part_paths = collect_normalizable_part_paths(archive)?;
+    part_paths.extend(collect_glossary_part_paths(archive)?);
 
     for part_path in &part_paths {
         let Some(xml_bytes) = output.get(part_path) else {
@@ -788,7 +925,38 @@ pub fn reject_all_docx(
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
     }
 
+    result.unresolved_glossary_revisions = 0;
+
     Ok((output, result))
+}
+
+/// Resolve only the opaque glossary story set.
+///
+/// The model projection has already resolved every modeled document story
+/// before calling this helper. Restricting the byte-kernel pass to glossary
+/// parts preserves the established document scaffold byte-for-byte while
+/// closing the otherwise-unmodeled glossary coverage gap.
+pub(crate) fn resolve_glossary_docx(
+    archive: &DocxArchive,
+    accept: bool,
+) -> Result<DocxArchive, NormalizeError> {
+    let mut output = archive.clone();
+    for part_path in collect_glossary_part_paths(archive)? {
+        let Some(xml_bytes) = output.get(&part_path) else {
+            continue;
+        };
+        let mut root = parse_xml(xml_bytes)?;
+        let mut stats = NormalizeStats::default();
+        let range_markers_before = capture_tree_range_markers(&root);
+        if accept {
+            normalize_children(&mut root, &mut stats, false);
+        } else {
+            reject_children(&mut root, &mut stats, false);
+        }
+        collapse_torn_range_markers_in_tree(&mut root, &range_markers_before);
+        output.upsert(&part_path, write_xml(&root)?);
+    }
+    Ok(output)
 }
 
 /// Outcome of [`resolve_opaque_fragment_revisions`].
@@ -969,6 +1137,7 @@ fn resolve_selected_in(
 /// - *PrChange → restore previous properties from the record
 /// - Everything else → recurse
 fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaque: bool) {
+    settle_inserted_mark_restored_with_move(parent, stats, inside_opaque);
     // Join paragraphs whose mark insertion this reject un-proposes (must
     // precede the revision pass, which drops the markers).
     join_mark_resolved_paragraphs(parent, /*keep_inserted=*/ false, stats);
@@ -1001,6 +1170,14 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
                 }
                 // Convert w:delText → w:t inside these children before promoting
                 convert_del_text_to_t(&mut el, stats, inside_opaque);
+                if is_w_tag(&el, "moveFrom") {
+                    // Word's reachable "insert paragraph, then move it" shape
+                    // serializes the earlier insertion inside moveFrom at the
+                    // source. Rejecting the move restores that source content
+                    // and settles the nested insertion as normal content; a
+                    // generic recursive reject would wrongly delete it.
+                    unwrap_insertions_restored_with_move_from(&mut el, stats, inside_opaque);
+                }
                 // Recursively reject children before promoting them
                 reject_children(&mut el, stats, inside_opaque);
                 // Promote all children of the revision wrapper
@@ -1070,6 +1247,80 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
     }
 
     parent.children = new_children;
+}
+
+fn settle_inserted_mark_restored_with_move(
+    parent: &mut Element,
+    stats: &mut NormalizeStats,
+    inside_opaque: bool,
+) {
+    fn has_nested_insert_in_move_from(element: &Element, inside_move_from: bool) -> bool {
+        let inside_move_from = inside_move_from || is_w_tag(element, "moveFrom");
+        if inside_move_from && is_w_tag(element, "ins") {
+            return true;
+        }
+        element.children.iter().any(|child| {
+            matches!(child, XMLNode::Element(child)
+                if has_nested_insert_in_move_from(child, inside_move_from))
+        })
+    }
+
+    for child in &mut parent.children {
+        let XMLNode::Element(paragraph) = child else {
+            continue;
+        };
+        if !is_w_tag(paragraph, "p") || !has_nested_insert_in_move_from(paragraph, false) {
+            continue;
+        }
+        let Some(ppr) = paragraph.children.iter_mut().find_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, "pPr") => Some(element),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(rpr) = ppr.children.iter_mut().find_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, "rPr") => Some(element),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let before = rpr.children.len();
+        rpr.children.retain(
+            |child| !matches!(child, XMLNode::Element(element) if is_w_tag(element, "ins")),
+        );
+        let removed = (before - rpr.children.len()) as u32;
+        if inside_opaque {
+            stats.opaque_resolved += removed;
+        } else {
+            stats.revisions_resolved += removed;
+        }
+    }
+}
+
+fn unwrap_insertions_restored_with_move_from(
+    parent: &mut Element,
+    stats: &mut NormalizeStats,
+    inside_opaque: bool,
+) {
+    let mut children = Vec::with_capacity(parent.children.len());
+    for child in parent.children.drain(..) {
+        match child {
+            XMLNode::Element(mut insertion) if is_w_tag(&insertion, "ins") => {
+                if inside_opaque {
+                    stats.opaque_resolved += 1;
+                } else {
+                    stats.revisions_resolved += 1;
+                }
+                children.append(&mut insertion.children);
+            }
+            XMLNode::Element(mut element) => {
+                unwrap_insertions_restored_with_move_from(&mut element, stats, inside_opaque);
+                children.push(XMLNode::Element(element));
+            }
+            other => children.push(other),
+        }
+    }
+    parent.children = children;
 }
 
 /// Convert `w:delText` → `w:t` and `w:delInstrText` → `w:instrText`
@@ -1379,7 +1630,18 @@ fn memchr_find(haystack: &[u8], needle: &[u8]) -> bool {
 /// Clean documents pass through unchanged.
 pub fn normalize_if_needed(archive: &DocxArchive) -> Result<DocxArchive, NormalizeError> {
     if has_revision_markup_fast(archive) {
-        let (normalized, _) = normalize_docx(archive)?;
+        // Serialization needs the accepted image of modeled document stories
+        // as its base, but the caller's requested projection decides the
+        // glossary direction later. Preserve glossary bytes here so a RejectAll
+        // projection is not irreversibly pre-accepted before its final pass.
+        let glossary_parts: Vec<(String, Vec<u8>)> = collect_glossary_part_paths(archive)?
+            .into_iter()
+            .filter_map(|path| archive.get(&path).map(|bytes| (path, bytes.to_vec())))
+            .collect();
+        let (mut normalized, _) = normalize_docx(archive)?;
+        for (path, bytes) in glossary_parts {
+            normalized.upsert(&path, bytes);
+        }
         Ok(normalized)
     } else {
         Ok(archive.clone())
@@ -1445,33 +1707,15 @@ fn para_mark_markers(p: &Element) -> (bool, bool) {
 /// (bookmarks, comment/permission/move/customXml range delimiters, proof
 /// errors). These occupy no space in the flow, so removing a paragraph
 /// break joins ACROSS them — but never across content (a table, an sdt, …).
-/// The model path's `merge_marked_paragraphs_*` (tracked_model.rs) applies
-/// the same rule to zero-width marker OpaqueBlocks; the two lists must
-/// describe the same elements or the paths diverge on which joins happen.
+/// The element kinds are the shared `resolution_rules::ZERO_WIDTH_BODY_MARKER_NAMES`
+/// enumeration; the model path's `is_zero_width_marker_block` (tracked_model.rs)
+/// consults the same list over its OpaqueBlocks, so the two cannot diverge on
+/// which joins happen. Extraction stays byte-local: `is_w_tag` matches each
+/// name in the `w:` namespace over the raw XML sibling.
 fn is_zero_width_body_marker(element: &Element) -> bool {
-    [
-        "bookmarkStart",
-        "bookmarkEnd",
-        "commentRangeStart",
-        "commentRangeEnd",
-        "proofErr",
-        "permStart",
-        "permEnd",
-        "moveFromRangeStart",
-        "moveFromRangeEnd",
-        "moveToRangeStart",
-        "moveToRangeEnd",
-        "customXmlInsRangeStart",
-        "customXmlInsRangeEnd",
-        "customXmlDelRangeStart",
-        "customXmlDelRangeEnd",
-        "customXmlMoveFromRangeStart",
-        "customXmlMoveFromRangeEnd",
-        "customXmlMoveToRangeStart",
-        "customXmlMoveToRangeEnd",
-    ]
-    .iter()
-    .any(|tag| is_w_tag(element, tag))
+    crate::resolution_rules::ZERO_WIDTH_BODY_MARKER_NAMES
+        .iter()
+        .any(|tag| is_w_tag(element, tag))
 }
 
 /// A table this resolution empties COMPLETELY: it has rows and every one
@@ -1480,26 +1724,19 @@ fn is_zero_width_body_marker(element: &Element) -> bool {
 /// both full resolutions). The revision pass then removes the rowless shell
 /// (§17.4.37), so a paragraph-mark join must treat the table as absent.
 /// Byte-level counterpart of the model path's `table_emptied_by_accept_reject`
-/// (tracked_model.rs). Per-row survival goes through the shared
-/// `resolution_rules::tracked_class_survives` (a row's `(has_ins, has_del)`
-/// come from its `w:trPr/w:ins` / `w:trPr/w:del` markers), the same rule the
-/// model's `row_survives_accept_reject` consults — so the two cannot diverge
-/// on which joins step over a vanishing table.
+/// (tracked_model.rs): both extract each row's `(has_ins, has_del)` from their
+/// own representation (here the `w:trPr/w:ins` / `w:trPr/w:del` markers) and
+/// hand them to the shared `resolution_rules::table_emptied_by_resolution`, so
+/// the "had rows and none survive" composition and its per-row survival cannot
+/// diverge on which joins step over a vanishing table.
 fn table_emptied_by_resolution(tbl: &Element, keep_inserted: bool) -> bool {
-    let mut saw_row = false;
-    for c in &tbl.children {
-        if let XMLNode::Element(el) = c
-            && is_w_tag(el, "tr")
-        {
-            saw_row = true;
-            let has_ins = has_row_tracking(el, "ins");
-            let has_del = has_row_tracking(el, "del");
-            if crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted) {
-                return false;
-            }
+    let rows = tbl.children.iter().filter_map(|c| match c {
+        XMLNode::Element(el) if is_w_tag(el, "tr") => {
+            Some((has_row_tracking(el, "ins"), has_row_tracking(el, "del")))
         }
-    }
-    saw_row
+        _ => None,
+    });
+    crate::resolution_rules::table_emptied_by_resolution(rows, keep_inserted)
 }
 
 /// Whether this resolution EMPTIES the paragraph: it HAS content children and
@@ -2934,6 +3171,26 @@ mod tests {
         assert!(!result_xml.contains("moveTo"));
 
         assert!(stats.revisions_resolved >= 2);
+    }
+
+    #[test]
+    fn reject_move_restores_an_insertion_nested_at_the_source() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p>
+    <w:moveFrom w:id="2" w:author="Mover">
+      <w:ins w:id="1" w:author="Earlier"><w:r><w:t>inserted then moved</w:t></w:r></w:ins>
+    </w:moveFrom>
+    <w:moveTo w:id="3" w:author="Mover"><w:r><w:t>inserted then moved</w:t></w:r></w:moveTo>
+  </w:p></w:body>
+</w:document>"#;
+
+        let archive = archive_with_document_xml(xml);
+        let (rejected, _) = reject_all_docx(&archive).expect("reject nested move source");
+        let xml = std::str::from_utf8(rejected.get("word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("inserted then moved"));
+        assert!(!xml.contains("<w:ins") && !xml.contains("<w:moveFrom"));
+        assert_eq!(xml.matches("inserted then moved").count(), 1);
     }
 
     #[test]

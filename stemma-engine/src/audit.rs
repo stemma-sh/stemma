@@ -57,7 +57,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diff::diff_documents;
 use crate::domain::{
-    BlockNode, CanonDoc, DiffChange, HeaderFooterKind, NodeId, StoryScope, TrackedBlock,
+    BlockNode, CanonDoc, DiffChange, HeaderFooterKind, InlineNode, NodeId, OpaqueKind, StoryScope,
+    TrackedBlock,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, RuntimeError, ValidationReport, first_quarantined_block,
@@ -257,6 +258,7 @@ pub fn audit_documents(
     let committed_diff =
         diff_documents(&before_committed, &after_committed).map_err(map_diff_error)?;
     let mut direct_changes = direct_rows(&committed_diff.changes);
+    append_hyperlink_metadata_rows(&before_committed, &after_committed, &mut direct_changes);
     if before_committed.body_section_properties != after_committed.body_section_properties {
         direct_changes.push(DirectChange {
             story: StoryScope::Body,
@@ -278,6 +280,7 @@ pub fn audit_documents(
         before,
         after,
         &raw_diff.changes,
+        &direct_changes,
         &new_revisions,
         &preexisting_revisions,
     );
@@ -319,21 +322,27 @@ fn refuse_unauditable(doc: &CanonDoc, side: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// The identity of a revision record across two enumerations. Deliberately
-/// excludes `block_id` (importer-assigned and positional — unstable between
-/// two INDEPENDENT parses of related documents) and `date`; content
-/// (`excerpt`) is compared separately to classify Untouched vs Modified.
+/// The identity of a revision record across two enumerations. `revision_id` is
+/// engine-minted from the canonical revision record and is the semantic key;
+/// raw OOXML `w:id` is diagnostic only and never enters correspondence.
 type CensusKey = (StoryScope, u32, RevisionKind, Option<String>);
 
 fn census_key(r: &RevisionRecord) -> CensusKey {
-    (r.location.clone(), r.revision_id, r.kind, r.author.clone())
+    (
+        r.location.clone(),
+        r.revision_id,
+        r.kind,
+        r.author
+            .as_ref()
+            .filter(|author| !author.is_empty())
+            .cloned(),
+    )
 }
 
-/// Match `before`'s records against `after`'s by identity, in document
-/// order. Duplicate identities (Word may reuse `w:id` values) pair off as a
-/// multiset: exact-content matches first, then leftovers in order — a
-/// deterministic pairing, never a guess about which duplicate "really"
-/// survived.
+/// Match `before`'s records against `after`'s by semantic identity, in document
+/// order. One user intention can have several census rows under the same
+/// identity (for example content and paragraph-mark carriers), so rows pair as
+/// a multiset: exact-content matches first, then modified leftovers.
 fn match_census(
     before: Vec<RevisionRecord>,
     after: Vec<RevisionRecord>,
@@ -640,6 +649,87 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
     }
 }
 
+/// Hyperlink relationship retargeting changes committed metadata while leaving
+/// display text unchanged. The semantic text diff deliberately treats that
+/// paragraph as matched, so add the missing audit row explicitly from the typed
+/// hyperlink model instead of letting the untouched proof report a blind spot.
+fn append_hyperlink_metadata_rows(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    rows: &mut Vec<DirectChange>,
+) {
+    let after_by_id: HashMap<NodeId, &TrackedBlock> = after
+        .blocks
+        .iter()
+        .map(|block| (block_node_id(&block.block), block))
+        .collect();
+    for before_block in &before.blocks {
+        let block_id = block_node_id(&before_block.block);
+        let Some(after_block) = after_by_id.get(&block_id) else {
+            continue;
+        };
+        if hyperlink_targets(&before_block.block) == hyperlink_targets(&after_block.block) {
+            continue;
+        }
+        if rows
+            .iter()
+            .any(|row| row.story == StoryScope::Body && row.block_id.as_ref() == Some(&block_id))
+        {
+            continue;
+        }
+        rows.push(DirectChange {
+            story: StoryScope::Body,
+            kind: DirectChangeKind::BlockModified,
+            block_id: Some(block_id),
+            old_excerpt: Some(extract_block_text_for_hash(&before_block.block)),
+            new_excerpt: Some(extract_block_text_for_hash(&after_block.block)),
+            coincides_with_resolution: Vec::new(),
+        });
+    }
+}
+
+/// A block's hyperlink identities in document order: TARGET (url + anchor)
+/// per hyperlink. Deliberately NOT the inline `NodeId` — that id is minted
+/// from a document-global counter and renumbers whenever any earlier inline
+/// content shifts, so comparing it flags untouched hyperlink paragraphs
+/// after a legitimate tracked edit elsewhere. Document order plus the
+/// per-block pairing the caller already does carries the positional
+/// identity.
+fn hyperlink_targets(block: &BlockNode) -> Vec<(Option<String>, Option<String>)> {
+    let mut targets = Vec::new();
+    collect_hyperlink_targets(block, &mut targets);
+    targets
+}
+
+fn collect_hyperlink_targets(
+    block: &BlockNode,
+    targets: &mut Vec<(Option<String>, Option<String>)>,
+) {
+    match block {
+        BlockNode::Paragraph(paragraph) => {
+            for segment in &paragraph.segments {
+                for inline in &segment.inlines {
+                    if let InlineNode::OpaqueInline(opaque) = inline
+                        && let OpaqueKind::Hyperlink(link) = &opaque.kind
+                    {
+                        targets.push((link.url.clone(), link.anchor.clone()));
+                    }
+                }
+            }
+        }
+        BlockNode::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for nested in &cell.blocks {
+                        collect_hyperlink_targets(nested, targets);
+                    }
+                }
+            }
+        }
+        BlockNode::OpaqueBlock(_) => {}
+    }
+}
+
 /// Annotate each direct row with the pre-existing revisions (Resolved or
 /// Modified) at its location: resolving a pending revision changes the
 /// committed content, so the row may be that resolution's effect. Matching
@@ -680,6 +770,7 @@ fn untouched_proof(
     before: &CanonDoc,
     after: &CanonDoc,
     raw_changes: &[DiffChange],
+    direct_changes: &[DirectChange],
     new_revisions: &[RevisionRecord],
     preexisting: &[PreexistingRevision],
 ) -> UntouchedProof {
@@ -697,6 +788,29 @@ fn untouched_proof(
     for p in preexisting {
         if !matches!(p.disposition, RevisionDisposition::Untouched) {
             note_implication(&mut implicated_before, &mut implicated_stories, &p.record);
+        }
+    }
+    for change in direct_changes {
+        if let Some(block_id) = &change.block_id {
+            implicated_before.insert((change.story.clone(), block_id.clone()));
+            implicated_after.insert((change.story.clone(), block_id.clone()));
+        }
+    }
+
+    // Comment stories and their body anchors are one annotation. The raw diff
+    // reports the story insertion/deletion, but the zero-width range markers
+    // added to or removed from the body paragraph are not a separate block
+    // change. Account for those markers here so the untouched proof does not
+    // misreport the correctly anchored paragraph as an unexplained mutation.
+    for change in raw_changes {
+        match change {
+            DiffChange::CommentInserted { id, .. } => {
+                implicate_comment_anchor_blocks(after, id, &mut implicated_after);
+            }
+            DiffChange::CommentDeleted { id, .. } => {
+                implicate_comment_anchor_blocks(before, id, &mut implicated_before);
+            }
+            _ => {}
         }
     }
 
@@ -992,6 +1106,38 @@ fn untouched_proof(
         verified_blocks: verified,
         parts,
         violations,
+    }
+}
+
+fn implicate_comment_anchor_blocks(doc: &CanonDoc, comment_id: &str, out: &mut Implicated) {
+    for block in &doc.blocks {
+        if block_contains_comment_anchor(&block.block, comment_id) {
+            out.insert((StoryScope::Body, block_node_id(&block.block)));
+        }
+    }
+}
+
+fn block_contains_comment_anchor(block: &BlockNode, comment_id: &str) -> bool {
+    match block {
+        BlockNode::Paragraph(paragraph) => paragraph.segments.iter().any(|segment| {
+            segment.inlines.iter().any(|inline| {
+                matches!(
+                    inline,
+                    InlineNode::CommentRangeStart { id }
+                        | InlineNode::CommentRangeEnd { id }
+                        | InlineNode::CommentReference { id }
+                        if id == comment_id
+                )
+            })
+        }),
+        BlockNode::Table(table) => table.rows.iter().any(|row| {
+            row.cells.iter().any(|cell| {
+                cell.blocks
+                    .iter()
+                    .any(|nested| block_contains_comment_anchor(nested, comment_id))
+            })
+        }),
+        BlockNode::OpaqueBlock(_) => false,
     }
 }
 

@@ -1,0 +1,72 @@
+name: Candidate evaluation report
+description: Report a content-safe result or setup blocker for an exact evaluation artifact
+title: "[evaluation] "
+labels:
+  - evaluation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include a real agreement, worklist, receipt, path, document hash, clause excerpt, or party/customer name. Use only content-safe identities and counts.
+  - type: input
+    id: candidate
+    attributes:
+      label: Candidate and source SHA
+      placeholder: Candidate A / 58a73e7e...
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target and build stamp
+      placeholder: linux-x86_64-gnu / 0.1.0+g58a73e7.candidate-a
+    validations:
+      required: true
+  - type: input
+    id: executable
+    attributes:
+      label: Executable byte size and SHA-256
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Furthest stage reached
+      options:
+        - Artifact setup
+        - Terminal CLI result
+        - Word adjudication
+    validations:
+      required: true
+  - type: input
+    id: tuple
+    attributes:
+      label: Process exit and output/receipt presence
+      placeholder: exit 0; output present; receipt present
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Content-safe outcome
+      options:
+        - Correct completion
+        - Safe refusal
+        - Incorrect output
+        - Did not finish
+    validations:
+      required: true
+  - type: textarea
+    id: detail
+    attributes:
+      label: Content-safe observation
+      description: Describe the setup blocker, refusal code, tuple disagreement, or minimized synthetic reproduction without document content.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I confirmed this report contains no real document, worklist, receipt, path, document hash, clause excerpt, or identifying matter data.
+          required: true

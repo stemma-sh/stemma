@@ -832,6 +832,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Fuzz".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,

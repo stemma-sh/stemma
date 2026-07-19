@@ -1092,6 +1092,7 @@ mod tests {
         let reference = synthesize_reference_inline(&NodeId::from("p_1"), "1", NoteKind::Footnote);
         let rev = RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: None,
             date: None,
             apply_op_id: None,

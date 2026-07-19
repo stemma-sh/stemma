@@ -20,7 +20,12 @@ fn help_prints_usage_and_exits_zero() {
         "usage explains it speaks MCP over stdio: {stdout}"
     );
     assert!(
-        stdout.contains("STEMMA_MCP_DOC_TTL_SECS") && stdout.contains("STEMMA_MCP_MAX_DOC_BYTES"),
+        stdout.contains("STEMMA_MCP_PROFILE")
+            && stdout.contains("STEMMA_MCP_DOC_TTL_SECS")
+            && stdout.contains("STEMMA_MCP_MAX_DOC_BYTES")
+            && stdout.contains("STEMMA_MCP_MAX_IMAGE_BYTES")
+            && stdout.contains("STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES")
+            && stdout.contains("STEMMA_MCP_WORKSPACE_ROOT"),
         "usage documents the lifecycle env vars: {stdout}"
     );
     assert!(

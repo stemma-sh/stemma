@@ -138,6 +138,7 @@ fn unrelated_edit_txn(target_block: stemma::domain::NodeId) -> EditTransaction {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -359,11 +360,17 @@ fn the_preserved_bearing_ppr_change_is_enumerable() {
     let records = enumerate_revisions(&doc.snapshot().canonical);
     let fmt: Vec<_> = records
         .iter()
-        .filter(|r| r.kind == RevisionKind::FormatParagraph && r.revision_id == 99)
+        .filter(|r| r.kind == RevisionKind::FormatParagraph)
         .collect();
     assert_eq!(
         fmt.len(),
         1,
         "the pPrChange must enumerate as exactly one formatting revision: {records:?}"
+    );
+    // H7: it carries a real minted identity (the resolvable handle), never the
+    // legacy 0 sentinel — the wire id 99 from the fixture is not the handle.
+    assert_ne!(
+        fmt[0].revision_id, 0,
+        "an imported tracked change is enumerable with a real identity: {records:?}"
     );
 }

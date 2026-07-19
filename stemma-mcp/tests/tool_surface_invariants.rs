@@ -85,6 +85,7 @@ fn replace_txn(
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id,
+            identity: 0,
             author: Some(author.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,

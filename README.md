@@ -1,199 +1,205 @@
 # stemma
 
-A typed-IR DOCX compiler with first-class tracked-change semantics — and an
-MCP server that puts it in front of agents.
+**Safe tracked changes for Word automation.**
 
+Give Stemma an existing `.docx` and a short approved worklist. It creates a new,
+Word-native redline while preserving the original document and any revisions it
+already contains. Every requested item is reported as applied or explicitly
+refused; ambiguity is never silently guessed.
+
+```text
+existing DOCX + approved old-to-new changes
+    -> tracked-native execution
+    -> scope and preservation audit
+    -> new redline DOCX + machine-readable receipt
 ```
-DOCX bytes -> import -> CanonDoc -> edit / diff -> apply -> serialize -> DOCX bytes
+
+The v0.2.0 product focus is this workflow. The typed Rust engine remains the
+correctness kernel, the CLI is the canonical process contract, and MCP is the
+agent adapter. The HTTP/editor demo and broad low-level verb surface remain
+available, but are not where current product development is focused.
+
+## Compact agent workflow
+
+The default product shape is three semantic stages:
+
+```text
+inspect -> execute -> verify
 ```
 
-Programmatic DOCX editing usually forces a bad trade. Converters (pandoc,
-markdown pipelines) flatten the file and cannot write tracked changes back.
-XML-splicing libraries (python-docx and kin) edit in place but have no
-tracked-change model — insertions, deletions, moves, and their accept/reject
-semantics are yours to hand-roll against raw XML. stemma treats the problem
-as compilation instead: parse the whole document into a typed intermediate
-representation (the IR — one canonical tree, `CanonDoc`), apply edits as
-typed transformations with tracked-change semantics built in, and serialize
-back to a file Word opens clean.
+`inspect` emits compact, revision-aware extended Markdown rather than exposing
+the typed IR. `execute` compiles an exact-input-bound plan through the typed
+engine. `verify` independently certifies any before/after pair and returns
+accepted/rejected projection identities. Markdown is the agent language, never
+the source of truth.
 
-## Highlights
+## Try the workflow
 
-- **Tracked changes as a type system, not markup.** Insertions, deletions,
-  moves, formatting changes, comments, and their accept/reject semantics are
-  parsed into a canonical typed IR and serialized back to files that open
-  clean in Word — including documents already carrying someone else's
-  redline (visible tracked-changes markup).
-- **Agent-ready.** The [MCP server](stemma-mcp/) exposes read/edit/review
-  verbs over stdio: every write returns a receipt naming exactly what
-  changed, every refusal names an escape hatch, and originals are never
-  touched.
-- **Verified before bytes leave.** A post-serialization OOXML linker — it
-  reference-checks the emitted package the way a code linker checks symbols —
-  gates every output; ~1,060 ECMA-376/ISO-29500 conformance tests; a
-  real-Word oracle tier behind that.
-- **Benchmarked, with receipts.** Across three model sweeps: **95%** task
-  success vs 76–85% for the same agent on Claude's stock DOCX skill on
-  frontier model tiers, at 2–3× lower latency and roughly half the token
-  traffic — tier-by-tier results, losses, and corrections disclosed inline.
-  The two arms fail differently in kind: stemma's observed failures are loud
-  refusals with the document untouched; the hand-editing failures were
-  silent content loss (a dropped table row's text, emptied footnotes).
-  [The report](docs/benchmarks.md) ·
-  [per-cell data](docs/benchmark-data-model-sweeps-2026-07.json).
-- **A cost structure, not just a pass rate.** The document stays server-side,
-  so an agent's token traffic is flat in document size: the same 43-change
-  task moved no more tokens in a ~150-page agreement than in a ~50-page one,
-  while the raw-XML arm grew 33% and finished one turn from its ceiling. And
-  the guardrails keep a budget model functional — 76% vs 20% on Haiku 4.5,
-  at ~$0.10–0.25 per document on the resolution family — so high-volume
-  pipelines can execute decomposed edits on a cheap tier instead of a
-  frontier model hand-editing XML.
-- **An honest fidelity contract.** Render fidelity and content completeness
-  are guaranteed and gated; byte identity is explicitly out of contract —
-  [read this](docs/guide/fidelity.md) before pointing a checksum at stemma output.
-
-**Where it stands:** the engine is the hardened part — spec-tested,
-corpus-hardened, and the component every guarantee above is about. The MCP
-server and HTTP API are deliberately thin transports, proof-of-concept grade:
-complete enough to drive real reviews end to end, and explicit about their
-limits ([MCP status](stemma-mcp/README.md) ·
-[HTTP scope](docs/reference/http.md)). And all of it is **pre-1.0**: under
-`0.x` semver a minor release may break API contracts — deliberately, with
-changelog notice, and along documented tier boundaries
-([the stability policy](docs/guide/stability.md) says exactly what you can
-depend on today).
-
-## Quickstart
+From a clone:
 
 ```bash
-mise install                          # rust toolchain + just (or: rustc >= 1.91)
-cargo run -p stemma --example my_first_edit   # fastest first run: parse → edit → validated bytes
-just gate                             # lint + full test suite (optional; ~8 min)
+demo_dir="$(mktemp -d)"
+cargo run -p stemma-cli -- inspect \
+  stemma-engine/testdata/simple-text/before.docx
+cargo run -p stemma-cli -- execute \
+  stemma-engine/testdata/simple-text/before.docx \
+  --plan stemma-cli/examples/approved-worklist.json \
+  -o "$demo_dir/redline.docx" \
+  --receipt "$demo_dir/receipt.json"
+cargo run -p stemma-cli -- verify \
+  stemma-engine/testdata/simple-text/before.docx \
+  "$demo_dir/redline.docx"
 ```
 
-The test suite is hermetic — no network, no external services: clone,
-`just gate`, green. It is thorough, so it takes **~8 minutes** and has some
-long stretches with no output — that is the suite running, not a hang. You do
-**not** need to run it before trying the examples below; the quickest way to
-see the engine work end to end is
-`cargo run -p stemma --example my_first_edit`. Then pick your surface —
-building an agent? MCP. An app or service? HTTP. Shell scripts or CI? The
-CLI. Rust? Embed the engine crate directly:
+The example worklist is deliberately concrete:
 
-**Agents (MCP)** — point your MCP client at the server. Released versions run
-straight from npm, no Rust toolchain; from this checkout, build it
-([wiring for both](stemma-mcp/README.md)):
+```json
+{
+  "schema": "stemma.worklist.v0",
+  "input": {
+    "sha256": "2cdfb8ecd1a27ef7132ebbaa1f718d6705ea6532bf3b155c09bfd7e87d410667",
+    "bytes": 11431
+  },
+  "author": "Approved Reviewer",
+  "changes": [
+    {
+      "id": "change-1",
+      "old": "foo bar",
+      "new": "review-ready language",
+      "expected_matches": 1
+    }
+  ]
+}
+```
+
+`redline.docx` opens in Word with a native tracked replacement. Rejecting the
+new revisions restores the input text; accepting them shows the approved new
+text. `receipt.json` contains exact input, worklist, and output SHA-256
+identities, complete per-item outcomes, new revision counts, preservation of
+pre-existing revisions, untouched-scope findings, and package validation.
+
+The worklist's required input hash and byte count bind approval to one exact
+document. `stemma validate INPUT` prints both values. An all-applied worklist
+creates the redline and exits `0`. If any item is refused, Stemma persists the
+receipt, creates no DOCX, and exits `3`. `--emit-partial` is an explicit escape
+hatch that creates a non-deliverable partial redline and still exits `3`.
+
+The durable receipt defaults to `<out>.receipt.json`; `--receipt FILE` overrides
+it. Receipt and DOCX paths are create-new. The receipt is committed first, so a
+failed DOCX commit can leave a diagnostic receipt without a DOCX, but never a
+DOCX without its receipt. Delivery therefore requires the documented process
+exit plus output presence and receipt hash/size agreement; the receipt makes
+those checks explicit. JSON is also mirrored to stdout for pipelines; a closed
+stdout does not invalidate the durable result.
+
+Receipts contain paths, hashes, match excerpts, and diagnoses. Treat them as
+document-sensitive metadata rather than publishing them by default.
+
+The experimental `stemma.worklist.v0` scope is intentionally narrow: guarded
+old-to-new changes in top-level body paragraphs. Exact match count defaults to
+one; optional block/range scope and `normalize_ws` matching handle deliberate
+disambiguation. Matches crossing tracked/opaque barriers are refused. Matches
+in top-level table cells are detected and refused for default-scope items.
+Nested table cells, headers, footers, notes, comments, and textboxes are
+named as unsearched receipt limitations.
+
+Full command and receipt contract: [CLI reference](docs/reference/cli.md).
+For the historical pre-release Candidate A identity and its synthetic
+walkthrough, see [Evaluate the approved-worklist workflow](docs/evaluation.md).
+
+## Agent adapter
+
+The released MCP server runs from npm without a Rust toolchain. Its default
+`core` profile exposes 5 tools over the complete typed edit transaction; set
+`STEMMA_MCP_PROFILE=advanced` to opt into the full 31-tool expert surface:
 
 ```bash
-npx -y @stemma-sh/mcp                 # released versions (prebuilt binaries)
-cargo build -p stemma-mcp --release   # this checkout; binary at target/release/stemma-mcp
+npx -y @stemma-sh/mcp
 ```
 
-```jsonc
-// agent calls:
-replace_text { "doc_id": "doc_1", "old": "twelve (12) months",
-               "new": "twenty-four (24) months", "author": "J. Osei" }
-// stemma answers with a receipt, not a shrug:
-{ "applied": true, "changed_block_ids": ["p_41"], "revision_ids": [17],
-  "matches": [{ "block_id": "p_41", "excerpt": "…liability shall not exceed
-  «twelve (12) months» of fees…" }] }
+The compact agent path is:
+
+```text
+open_docx -> inspect_docx -> execute_plan -> verify_docx -> save_docx
 ```
 
-Full tool surface, refusal vocabulary, and recipes:
-[the MCP reference](docs/reference/mcp.md) — self-contained, written to be
-pasted into an agent's context.
+`inspect_docx` defaults to the first page of a compact current index and selects bounded find or
+window reads, a paged document projection with exact prose and bounded table
+summaries, block detail, revisions, styles, editable notes, historical
+accepted/rejected/redline projections, or the complete parser-derived edit
+operation catalog.
+Table block detail is a bounded page of cell locators; every cell paragraph id
+remains available for exact follow-up inspection.
+`execute_plan` previews or applies the existing atomic v4 transaction, executes
+an explicitly non-atomic server-side literal-replacement worklist with per-item
+outcomes, handles an accept/reject selection, or produces a tracked redline
+from a two-file comparison through the typed engine.
+Worklist preview uses a throwaway snapshot, and the default whole-body scope
+includes table-cell paragraphs with the same formatting-preserving tracked
+splice as top-level body text.
+Receipts omit whole-table content. `verify_docx` audits either the open session
+or any producer's before/after pair; each audit section is explicitly paged
+with totals and continuation metadata. Treat any
+plan error, direct change, unexpected prior-revision change, untouched-scope
+violation, or validator issue as incomplete. Save only to a new path. The MCP
+workspace boundary confines agent-controlled reads and writes to
+`STEMMA_MCP_WORKSPACE_ROOT`. See the
+[MCP golden path](stemma-mcp/README.md) and
+[filesystem contract](docs/reference/mcp.md#filesystem-and-artifact-boundary).
 
-**Apps & services (HTTP)** — the core verbs over JSON, and the fastest way
-to *see* stemma work:
+## Why Stemma
 
-```bash
-cargo run -p stemma-api               # open http://127.0.0.1:3000
-```
+- **Layered Word revisions.** New tracked changes are authored beside existing
+  reviewers' revisions rather than flattening the document through Markdown.
+- **Bounded execution.** Match counts, optional scopes, author separation, and
+  tracked/opaque barriers turn ambiguity into a named refusal.
+- **Evidence before delivery.** Blocking OOXML validation, preservation audit,
+  exact artifact identity, and create-new output semantics run before success.
+- **A typed safety kernel.** DOCX bytes are parsed into one canonical typed IR;
+  tracked insert/delete/format semantics and accept/reject projections are not
+  hand-written XML splices at the adapter edge.
 
-`stemma-api` is a demo-grade, single-process server: in-memory documents, no
-auth, no TLS, no persistence, loopback-only. It exists to exercise the engine
-over HTTP and to serve the editor, not as a production deployment. See its
-[scope and endpoints](docs/reference/http.md).
+The engine and historical agent evaluations remain documented in the
+[benchmark report](docs/benchmarks.md) and
+[per-cell data](docs/benchmark-data-model-sweeps-2026-07.json). The CLI worklist
+remains the narrow approved-replacement contract; the MCP core exposes the same
+typed transaction and assurance kernels as the advanced profile through a
+smaller semantic surface.
 
-That one command serves a browser Word-style review editor on the API —
-upload a `.docx`, edit in Suggesting/Editing mode, accept/reject tracked
-changes, export redline/accepted/rejected copies. Note the editor's first
-load fetches ProseMirror (from esm.sh) and MathJax (from jsdelivr) over the
-public internet, so this surface — unlike the hermetic test suite — needs a
-network connection the first time you open it.
-
-**Command line** — no integration at all; redlines and extraction from any
-shell, script, or CI job:
-
-```bash
-cargo install --path stemma-cli       # installs `stemma` into ~/.cargo/bin
-stemma compare base.docx target.docx --author "J. Osei" -o redline.docx
-stemma extract redline.docx --format json   # blocks + pending tracked changes
-stemma resolve redline.docx --accept-author "J. Osei" -o resolved.docx
-stemma validate resolved.docx
-```
-
-Any two versions of a real Word file work as `base`/`target`. For a
-no-files-needed demo of the same flow,
-`cargo run -p stemma --example redline_from_two_files` runs on bundled
-fixtures. [The CLI reference](docs/reference/cli.md).
-
-**Rust (embed the engine)** — `stemma-engine` directly; every verb on one
-facade:
-
-```rust
-let doc = Document::parse(&docx).expect("parse DOCX bytes");
-// Author one tracked edit as a typed, guard-pinned transaction (see the example).
-let txn = parse_transaction(&txn_json)
-    .expect("transaction JSON is schema-valid")
-    .into_edit_transaction()
-    .expect("v4 transaction translates to an EditTransaction");
-let edited = doc.apply(&txn).expect("apply the tracked edit");
-let out = edited
-    .serialize(&ExportOptions::default())
-    .expect("serialize to validated DOCX");
-```
-
-Runnable end-to-end (parse → tracked edit → receipt → validated bytes):
-`cargo run -p stemma --example my_first_edit`. More:
-[`walk_the_document`](stemma-engine/examples/walk_the_document.rs),
-[`resolve_a_redline`](stemma-engine/examples/resolve_a_redline.rs),
-[`redline_from_two_files`](stemma-engine/examples/redline_from_two_files.rs),
-[`review_before_save`](stemma-engine/examples/review_before_save.rs).
+The project is **pre-1.0**. A `0.x` minor release may change the experimental
+worklist or receipt contract with changelog notice. See the
+[stability policy](docs/guide/stability.md).
 
 ## When stemma is the wrong tool
 
-- **Generating documents from templates, no tracked changes involved** —
+- **Generating documents from templates, no tracked changes involved**:
   python-docx or plain OOXML templating is simpler.
-- **One-shot format conversion** (DOCX → Markdown/HTML and done) — use
-  pandoc; stemma's projections exist to serve editing loops, not conversion
-  pipelines.
-- **Byte-identical round-trips** — out of contract by design; render
-  fidelity and content completeness are the guarantees
-  ([the fidelity contract](docs/guide/fidelity.md)).
-
-stemma earns its keep where documents stop being flat text: redlines on top
-of redlines, comments, footnotes, tables, headers — anything that must
-survive a round-trip through Word's review machinery.
+- **One-shot format conversion** (DOCX to Markdown/HTML and done): use pandoc;
+  Stemma's projections exist to serve editing loops, not conversion pipelines.
+- **Byte-identical round-trips**: out of contract by design; render fidelity and
+  content completeness are the guarantees in the
+  [fidelity contract](docs/guide/fidelity.md).
+- **Broad interactive Word editing**: Stemma deliberately uses Word as the
+  review surface rather than building another general-purpose editor.
 
 ## Workspace
 
-| Component | |
+| Component | Role |
 |---|---|
-| [`stemma-engine/`](stemma-engine/) | Crate — the compiler: import, typed IR, diff/merge, edit transactions, serialization, validation. |
-| [`stemma-mcp/`](stemma-mcp/) | Crate — the engine's verbs over MCP/stdio, for agents. |
-| [`stemma-api/`](stemma-api/) | Crate — the same verbs over HTTP/JSON. |
-| [`stemma-cli/`](stemma-cli/) | Crate — the `stemma` command-line tool: compare, extract, resolve, validate. |
-| [`stemma-examples/`](stemma-examples/) | Static browser assets (no Cargo crate) — a review editor (Suggesting/Editing) served by `stemma-api`. |
+| [`stemma-engine/`](stemma-engine/) | Correctness kernel: import, typed IR, tracked edit semantics, serialization, and validation. |
+| [`stemma-artifacts/`](stemma-artifacts/) | Shared host boundary: path authority, exact identity, protected sources, and create-new commits. |
+| [`stemma-cli/`](stemma-cli/) | Canonical process contract: approved worklist apply, compare, extract, resolve, and validate. |
+| [`stemma-mcp/`](stemma-mcp/) | Agent adapter over stdio. |
+| [`stemma-api/`](stemma-api/) | Maintenance-only HTTP demonstration surface; not a production service. |
+| [`stemma-examples/`](stemma-examples/) | Maintenance-only browser demonstration assets served by `stemma-api`. |
 
 ## Documentation
 
-The [docs](docs/README.md) carry the full story:
-[guide](docs/guide/concepts.md) (concepts → revisions → editing → fidelity) ·
-[MCP reference](docs/reference/mcp.md) (verbs, refusals, recipes —
-self-contained; paste it into your agent) ·
-[benchmarks](docs/benchmarks.md).
+The [docs](docs/README.md) include the
+[CLI contract](docs/reference/cli.md),
+[MCP reference](docs/reference/mcp.md),
+[engine guide](docs/guide/concepts.md), and
+[benchmark history](docs/benchmarks.md).
 
 ## How this was built
 
@@ -203,9 +209,9 @@ direction, taste, and ideas.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and expectations, and
-[SECURITY.md](SECURITY.md) for how to report vulnerabilities. AI-assisted
-contributions are welcome and held to the same bar as everything else:
-`just gate` green, tests justified from the domain, honest PR descriptions.
+[SECURITY.md](SECURITY.md) for vulnerability reports. AI-assisted contributions
+are welcome and held to the same bar: `just gate` green, tests justified from
+the domain, and honest PR descriptions.
 
 ## License
 

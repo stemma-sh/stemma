@@ -104,6 +104,7 @@ fn tracked_delete_block(doc: &Document, block: &NodeId, expect: &str) -> Documen
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Reviewer".to_string()),
             date: Some("2026-07-10T00:00:00Z".to_string()),
             apply_op_id: None,

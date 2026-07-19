@@ -58,8 +58,11 @@ loudly instead of changing the wrong thing.
 
 Serialization runs a post-serialization OOXML linker — a structural
 validation pass over the emitted package — before bytes are written;
-`save_docx` refuses to persist a structurally corrupt file. Saving
-always writes to a new path — the input file is never touched.
+`save_docx` refuses to persist a structurally corrupt file. Transport output
+commits are create-new: inputs and every existing destination are refused.
+Bytes are staged beside the destination, committed without clobbering, and
+verified by length and SHA-256 before success. This is collision-safe
+visibility, not a power-loss durability claim.
 
 Next: [Revisions](revisions.md) — the tracked-change type system these
 concepts exist to serve.

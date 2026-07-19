@@ -72,6 +72,19 @@ let out = doc.serialize(&ExportOptions::default()).expect("serialize validated D
 
 Runnable: `cargo run -p stemma --example review_before_save`.
 
-Saving always targets a new path. The input file is never modified.
+Saving always targets a new, unused path. Inputs and every existing destination
+are refused; there is no overwrite option. MCP paths must also stay inside its
+configured workspace root. Successful transport commits report the exact byte
+length and SHA-256 of the create-new artifact.
+
+For MCP image edits backed by a server-side `path`, source identity joins the
+receipt and session only after the mutation applies; edits rejected before
+mutation and previews register nothing. The session deduplicates repeated exact
+sources and couples registration with save/review export. Source identity state
+has no independent TTL and is removed only after the runtime confirms the
+document was evicted; missing state for a live document fails closed. Image path
+reads are bounded before base64 expansion; see the [MCP
+reference](../reference/mcp.md#filesystem-and-artifact-boundary) for the defaults
+and configuration variables.
 
 Next: [Fidelity](fidelity.md) — what the output does and doesn't promise.

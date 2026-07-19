@@ -139,6 +139,7 @@ fn make_doc(blocks: Vec<TrackedBlock>) -> CanonDoc {
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("Test Author".to_string()),
         date: Some("2026-07-02T00:00:00Z".to_string()),
         apply_op_id: None,

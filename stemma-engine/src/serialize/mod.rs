@@ -565,18 +565,17 @@ fn build_text_run_with_leading_tabs(
             if let Some(ref date) = fc.date {
                 attr_set(&mut rpr_change, "w:date", date.clone());
             }
-            // The previous-props snapshot is a run rPr too: apply the same
-            // direct-ness projection so the "before" state is recorded with the
-            // same inherited-vs-direct semantics as the current props.
-            // Previous-state snapshot: same directness PROJECTION as the live
-            // rPr, but NO toggle synthesis — bold_off/missing-ON describe the
-            // CURRENT run's authored state, not the pre-change state, and
-            // synthesizing them here would fabricate history (a phantom
-            // <w:b/> in the rPrChange baseline).
-            let prev_rpr = build_rpr(
-                &direct_marks(&fc.previous_marks, directness),
-                &direct_run_style_props(&fc.previous_style_props, directness),
+            // The previous-props snapshot has its OWN direct-formatting
+            // provenance. Filtering it through the live run's provenance
+            // destroys history whenever the change removed a property (for
+            // example, current plain text with a previously-authored <w:b/>).
+            // Project and synthesize OFF toggles from the previous state only.
+            let previous_directness = fc.previous_rpr_authored;
+            let mut prev_rpr = build_rpr(
+                &direct_marks(&fc.previous_marks, previous_directness),
+                &direct_run_style_props(&fc.previous_style_props, previous_directness),
             );
+            append_authored_off_toggles(&mut prev_rpr, &fc.previous_marks, previous_directness);
             rpr_change.children.push(XMLNode::Element(prev_rpr));
             rpr.children.push(XMLNode::Element(rpr_change));
         }
@@ -750,6 +749,7 @@ fn append_single_inline(
                         &opaque.wrapper_marks,
                         &opaque.wrapper_style_props,
                         &opaque.kind,
+                        /*inject_default_note_style=*/ false,
                     ) {
                         run.children.push(XMLNode::Element(rpr));
                     }
@@ -807,6 +807,7 @@ fn append_single_inline(
                     &opaque.wrapper_marks,
                     &opaque.wrapper_style_props,
                     &opaque.kind,
+                    /*inject_default_note_style=*/ true,
                 ) {
                     run.children.push(XMLNode::Element(rpr));
                 }
@@ -845,6 +846,15 @@ fn append_single_inline(
                     == DecorationEmit::Skip
                 {
                     return Ok(());
+                }
+                // Carry the wrapper's close polarity to the re-nesting pass
+                // as a transient attribute — the pass consumes (and the
+                // defensive sweep strips) it, so it never reaches output.
+                // Without polarity, nested same-name wrappers pair
+                // open-with-open and flatten (see
+                // DecorationType::CustomXmlWrapperEnd).
+                if deco.kind == crate::domain::DecorationType::CustomXmlWrapperEnd {
+                    attr_set(&mut element, WRAPPER_CLOSE_MARKER_ATTR, "1");
                 }
                 if decoration_requires_run_wrapper(&element) {
                     let mut run = w_el("r");
@@ -1892,12 +1902,21 @@ fn renest_inline_bidi_wrappers(p: &mut Element) {
 /// folds the intervening siblings back INTO the open marker and drops the
 /// close marker, reconstructing `<w:customXml>…content…</w:customXml>` verbatim.
 ///
-/// Like `w:bdo`/`w:dir` (and unlike id-paired `moveFrom`/`moveTo`), these
-/// wrappers carry no `w:id`, so open/close pairs are matched by STACK ORDER
-/// over empty markers of the same local name — handling adjacent and nested
-/// (`customXml … smartTag … /smartTag … /customXml`) shapes. The `customXmlPr`
-/// / `smartTagPr` child is part of the (childless-content) template, so a
+/// Open/close pairing: close markers carry a transient polarity attribute
+/// ([`WRAPPER_CLOSE_MARKER_ATTR`], stamped from
+/// `DecorationType::CustomXmlWrapperEnd` at emission and never reaching
+/// output). With polarity, a close folds with the nearest unmatched open of
+/// the same local name — correct for adjacent AND nested SAME-name wrappers
+/// (`smartTag` inside `smartTag`, Word's `place` > `PlaceName` emission),
+/// which name-order pairing cannot distinguish (it folds open-with-open and
+/// flattens the nesting). Snapshots serialized before polarity existed
+/// decode both markers as plain `CustomXmlWrapper`; for those (no polarity
+/// attribute anywhere in the paragraph) the original STACK-ORDER pairing
+/// over same-name markers remains the fallback. The `customXmlPr` /
+/// `smartTagPr` child is part of the (childless-content) template, so a
 /// marker carrying ONLY a property child still counts as an empty bracket.
+const WRAPPER_CLOSE_MARKER_ATTR: &str = "stemmaWrapperClose";
+
 fn renest_inline_custom_xml_wrappers(p: &mut Element) {
     fn empty_wrapper_marker_name(node: &XMLNode) -> Option<String> {
         let XMLNode::Element(el) = node else {
@@ -1925,6 +1944,17 @@ fn renest_inline_custom_xml_wrappers(p: &mut Element) {
         Some(local.to_string())
     }
 
+    fn is_close_marker(node: &XMLNode) -> bool {
+        let XMLNode::Element(el) = node else {
+            return false;
+        };
+        crate::xml_attrs::attr_get(el, WRAPPER_CLOSE_MARKER_ATTR).is_some()
+    }
+
+    // Polarity is per-document: a serialization either stamped every close
+    // marker (current model) or none (a pre-polarity snapshot).
+    let have_polarity = p.children.iter().any(is_close_marker);
+
     // Iterate to a fixed point: each pass folds the INNERMOST balanced pair
     // (an open immediately followed, at this level, by its close once any inner
     // wrappers have already been folded). Folding changes indices, so restart.
@@ -1935,17 +1965,27 @@ fn renest_inline_custom_xml_wrappers(p: &mut Element) {
             let Some(name) = empty_wrapper_marker_name(&p.children[i]) else {
                 continue;
             };
-            if let Some((top_name, open_idx)) = stack.last().cloned()
-                && top_name == name
-            {
-                // This marker closes the open one on top of the stack, and
-                // since it is the top, nothing unmatched lies between them:
-                // the innermost pair. Fold it.
-                stack.pop();
+            let closes_top = if have_polarity {
+                // A stamped close marker folds with the nearest unmatched
+                // open of the same name; an open marker only ever pushes.
+                is_close_marker(&p.children[i])
+                    && stack.last().is_some_and(|(top_name, _)| *top_name == name)
+            } else {
+                // Pre-polarity fallback: second same-name marker closes the
+                // first (correct for adjacent wrappers; nested same-name
+                // shapes are indistinguishable without polarity).
+                stack.last().is_some_and(|(top_name, _)| *top_name == name)
+            };
+            if closes_top {
+                // Since it matches the stack top, nothing unmatched lies
+                // between them: the innermost pair. Fold it.
+                let (_, open_idx) = stack.pop().expect("checked non-empty");
                 fold = Some((open_idx, i));
                 break;
             }
-            stack.push((name, i));
+            if !(have_polarity && is_close_marker(&p.children[i])) {
+                stack.push((name, i));
+            }
         }
         let Some((open_idx, close_idx)) = fold else {
             break;
@@ -1959,6 +1999,28 @@ fn renest_inline_custom_xml_wrappers(p: &mut Element) {
             open_el.children.extend(between);
         }
     }
+
+    // Defensive sweep: the polarity attribute is transient and must never
+    // reach output — an unbalanced document (open without close or vice
+    // versa) leaves markers unfolded (possibly drained into a folded
+    // wrapper), so strip it recursively from whatever remains.
+    fn strip_close_markers(el: &mut Element) {
+        let keys: Vec<_> = el
+            .attributes
+            .keys()
+            .filter(|k| k.local_name == WRAPPER_CLOSE_MARKER_ATTR)
+            .cloned()
+            .collect();
+        for key in keys {
+            el.attributes.shift_remove(&key);
+        }
+        for child in &mut el.children {
+            if let XMLNode::Element(e) = child {
+                strip_close_markers(e);
+            }
+        }
+    }
+    strip_close_markers(p);
 }
 
 #[allow(clippy::type_complexity)]
@@ -2252,8 +2314,12 @@ pub(crate) fn build_paragraph_properties(
         if let Some(before_lines) = spacing.before_lines {
             attr_set(&mut sp, "w:beforeLines", before_lines.to_string());
         }
-        if let Some(true) = spacing.before_autospacing {
-            attr_set(&mut sp, "w:beforeAutospacing", "1");
+        // §17.3.1.33 is tri-state: absent inherits, "1" turns auto spacing
+        // on, "0" explicitly overrides an inherited "1" (e.g. NormalWeb).
+        // Some(false) must re-emit "0" — dropping it flips the paragraph
+        // back to the inherited auto spacing, a visible layout change.
+        if let Some(auto) = spacing.before_autospacing {
+            attr_set(&mut sp, "w:beforeAutospacing", if auto { "1" } else { "0" });
         }
         if let Some(after) = spacing.after {
             attr_set(&mut sp, "w:after", after.to_string());
@@ -2261,8 +2327,8 @@ pub(crate) fn build_paragraph_properties(
         if let Some(after_lines) = spacing.after_lines {
             attr_set(&mut sp, "w:afterLines", after_lines.to_string());
         }
-        if let Some(true) = spacing.after_autospacing {
-            attr_set(&mut sp, "w:afterAutospacing", "1");
+        if let Some(auto) = spacing.after_autospacing {
+            attr_set(&mut sp, "w:afterAutospacing", if auto { "1" } else { "0" });
         }
         if let Some(line) = spacing.line {
             attr_set(&mut sp, "w:line", line.to_string());
@@ -2599,8 +2665,8 @@ pub(crate) fn build_paragraph_properties(
             if let Some(before_lines) = spacing.before_lines {
                 attr_set(&mut sp, "w:beforeLines", before_lines.to_string());
             }
-            if let Some(true) = spacing.before_autospacing {
-                attr_set(&mut sp, "w:beforeAutospacing", "1");
+            if let Some(auto) = spacing.before_autospacing {
+                attr_set(&mut sp, "w:beforeAutospacing", if auto { "1" } else { "0" });
             }
             if let Some(after) = spacing.after {
                 attr_set(&mut sp, "w:after", after.to_string());
@@ -2608,8 +2674,8 @@ pub(crate) fn build_paragraph_properties(
             if let Some(after_lines) = spacing.after_lines {
                 attr_set(&mut sp, "w:afterLines", after_lines.to_string());
             }
-            if let Some(true) = spacing.after_autospacing {
-                attr_set(&mut sp, "w:afterAutospacing", "1");
+            if let Some(auto) = spacing.after_autospacing {
+                attr_set(&mut sp, "w:afterAutospacing", if auto { "1" } else { "0" });
             }
             if let Some(line) = spacing.line {
                 attr_set(&mut sp, "w:line", line.to_string());
@@ -2936,6 +3002,7 @@ fn append_tracked_hyperlink_paragraph_opaque(
 ) {
     let rev = RevisionInfo {
         revision_id: next_annotation_id(next_id),
+        identity: 0,
         author: Some(author.to_string()),
         date: Some(date.to_string()),
         apply_op_id: None,
@@ -2996,7 +3063,9 @@ fn append_tracked_inserted_complex_field(
     date: &str,
     next_id: &mut u32,
 ) {
-    let rpr = build_wrapper_rpr(wrapper_marks, wrapper_style_props, kind);
+    // Engine-authored emission (tracked field insert); the note-style
+    // default is moot for fields but the provenance is authored.
+    let rpr = build_wrapper_rpr(wrapper_marks, wrapper_style_props, kind, true);
     let field_run = |child: Element, rpr: &Option<Element>| -> Element {
         let mut run = w_el("r");
         if let Some(rpr) = rpr {
@@ -4235,6 +4304,7 @@ fn build_wrapper_rpr(
     marks: &[Mark],
     style_props: &StyleProps,
     kind: &OpaqueKind,
+    inject_default_note_style: bool,
 ) -> Option<Element> {
     let mut rpr = if !marks.is_empty() || !style_props.is_empty() {
         build_rpr(marks, style_props)
@@ -4242,7 +4312,14 @@ fn build_wrapper_rpr(
         w_el("rPr")
     };
 
-    if let Some(style_val) = note_reference_style_name(kind)
+    // The default note-reference style belongs to ENGINE-AUTHORED references
+    // only (raw_xml: None — the engine synthesized the whole run and Word
+    // expects the style there, §17.11.3/§17.11.7). An IMPORTED reference's
+    // captured rPr is the truth: many documents name the style differently
+    // (or format the run directly), and inventing the English style id both
+    // changes untouched content and dangles when no such style exists.
+    if inject_default_note_style
+        && let Some(style_val) = note_reference_style_name(kind)
         && style_props.char_style_id.is_none()
     {
         let mut rstyle = w_el("rStyle");
@@ -4583,6 +4660,18 @@ pub(crate) fn build_rpr(marks: &[Mark], style_props: &StyleProps) -> Element {
             .map(|s| s.to_xml_str())
             .unwrap_or("single");
         attr_set(&mut u, "w:val", val);
+        rpr.children.push(XMLNode::Element(u));
+    } else if style_props.underline_style == Some(crate::domain::UnderlineStyle::None) {
+        // §17.3.2.40 is tri-state: absent inherits, a style value turns
+        // underline on, and an explicit `w:val="none"` OVERRIDES an
+        // inherited underline (the Hyperlink character style underlines by
+        // default; wild documents suppress it exactly this way). The
+        // underline MARK is off for this run, but the explicit override is
+        // authored content and must be re-emitted — dropping it flips the
+        // run back to the inherited underline (same tri-state family as
+        // beforeAutospacing/afterAutospacing).
+        let mut u = w_el("u");
+        attr_set(&mut u, "w:val", "none");
         rpr.children.push(XMLNode::Element(u));
     }
 
@@ -7095,6 +7184,7 @@ mod tests {
         let inserted_block = TrackedBlock {
             status: TrackingStatus::Inserted(RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("test".to_string()),
                 date: Some("2026-01-01T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -7129,6 +7219,7 @@ mod tests {
                 segments: vec![TrackedSegment {
                     status: TrackingStatus::Inserted(RevisionInfo {
                         revision_id: 1,
+                        identity: 0,
                         author: Some("test".to_string()),
                         date: Some("2026-01-01T00:00:00Z".to_string()),
                         apply_op_id: None,
@@ -7536,6 +7627,7 @@ mod tests {
         use crate::domain::RevisionInfo;
         let rev = RevisionInfo {
             revision_id: 42,
+            identity: 0,
             author: Some("Test".to_string()),
             date: Some("2026-05-19T10:00:00Z".to_string()),
             apply_op_id: None,

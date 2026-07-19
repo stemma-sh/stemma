@@ -71,6 +71,7 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 50,
+        identity: 0,
         author: Some("quarantine-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -232,9 +233,17 @@ fn selective_resolution_of_visible_ids_works_alongside_a_quarantined_block() {
     let bytes = make_docx_with_body(&format!("{MOVE_MIX_P}{tracked_plain}"));
     let doc = Document::parse(&bytes).expect("parse");
 
+    // The enumerate-visible insertion (AuthorC's "visible") addressed by its
+    // MINTED IDENTITY — provably disjoint from the quarantined interior, which
+    // enumerate reports census-only (revision_id 0).
+    let visible_id = stemma::tracked_model::enumerate_revisions(&doc.snapshot().canonical)
+        .into_iter()
+        .find(|r| r.author.as_deref() == Some("C") && r.revision_id != 0)
+        .expect("AuthorC's insertion is enumerable and resolvable")
+        .revision_id;
     let projected = doc
         .project(Resolution::Selective {
-            ids: std::collections::HashSet::from([7u32]),
+            ids: std::collections::HashSet::from([visible_id]),
             action: ResolveSelectionAction::Accept,
         })
         .expect("selective resolution of a visible id must work despite the quarantine");

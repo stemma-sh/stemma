@@ -594,6 +594,7 @@ fn structural_op_on_table_with_pending_cell_change_refuses() {
         previous_text_direction: None,
         previous_tc_fit_text: None,
         revision_id: 1,
+        identity: 0,
         author: "Prior".to_string(),
         date: None,
     });
@@ -797,6 +798,7 @@ fn structural_op_on_table_with_tracked_row_refuses() {
     let mut base = formatted_grid(2, 2);
     base.rows[1].tracking_status = Some(TrackingStatus::Inserted(RevisionInfo {
         revision_id: 7,
+        identity: 0,
         author: Some("Prior".to_string()),
         date: None,
         apply_op_id: None,

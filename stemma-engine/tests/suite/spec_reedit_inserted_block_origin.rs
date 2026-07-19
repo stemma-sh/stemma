@@ -82,6 +82,7 @@ fn txn(steps: Vec<EditStep>, author: &str, revision_id: u32) -> EditTransaction 
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id,
+            identity: 0,
             author: Some(author.to_string()),
             date: Some("2026-07-10T00:00:00Z".to_string()),
             apply_op_id: None,

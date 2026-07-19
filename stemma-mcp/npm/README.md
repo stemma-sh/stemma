@@ -10,10 +10,11 @@ containing nothing but the compiled binary — npm downloads only the one whose
 |---|---|
 | `package/` | The `@stemma-sh/mcp` wrapper, checked in: launcher (`bin/stemma-mcp.js`), manifest, npm README. Its `version` and pinned platform versions are placeholders (`0.0.0-dev`) — stamped at assembly time. |
 | `build-npm-packages.sh` | Assembles publish-ready package dirs from built binaries. Version comes from `stemma-mcp/Cargo.toml`; strict by default (all five platforms), `--only <triple>` for one. |
-| `smoke-launcher.sh` | End-to-end check: assemble for the host, install like a consumer (packed tarballs), run `--version` and the full `smoke_test.py` protocol pass through npm's bin shim. CI runs this on every push (`npm-launcher` job). |
+| `smoke-launcher.sh` | End-to-end check: assemble for the host, install like a consumer (packed tarballs), then run `--version`, the protocol smoke, and safe-artifact conformance through npm's bin shim. CI runs this on every push (`npm-launcher` job). |
 
-Publishing happens only from the tag-triggered release workflow
-(`.github/workflows/release.yml`); see [RELEASING.md](../../RELEASING.md).
+Publishing happens only from the manually started, protected release workflow
+after exact-artifact qualification approval (`.github/workflows/release.yml`);
+see [RELEASING.md](../../RELEASING.md).
 The platform map lives in two places that must stay in sync — the launcher's
 `PLATFORM_PACKAGES` and the script's `platforms` table; both say so.
 

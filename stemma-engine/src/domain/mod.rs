@@ -3579,6 +3579,13 @@ pub struct ParagraphFormattingChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Tracked table formatting change: the "before" state from w:tblPrChange (§17.13.5.34).
@@ -3602,6 +3609,13 @@ pub struct TableFormattingChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Tracked row formatting change: the "before" state from w:trPrChange (§17.13.5.36).
@@ -3623,6 +3637,13 @@ pub struct RowFormattingChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Tracked cell formatting change: the "before" state from w:tcPrChange (§17.13.5.37).
@@ -3656,6 +3677,13 @@ pub struct CellFormattingChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Tracked formatting change: the "before" state from w:rPrChange.
@@ -3689,6 +3717,13 @@ pub struct FormattingChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Per-slot provenance for a text run's `<w:rPr>`: was each property AUTHORED
@@ -4143,6 +4178,20 @@ pub enum DecorationType {
     /// NOTE: appended LAST so serialized snapshots that encode the enum by
     /// variant index stay readable.
     ForeignElement,
+    /// The CLOSE marker of a [`DecorationType::CustomXmlWrapper`] pair. The
+    /// open/close polarity is known at import (the atoms are
+    /// `CustomXmlWrapperStart`/`End`) and MUST be carried in the model:
+    /// nested SAME-name wrappers (`smartTag` inside `smartTag` — Word's own
+    /// `place` > `PlaceName` emission) are indistinguishable by name alone,
+    /// and the serializer's re-nesting pass would otherwise pair an outer
+    /// open with an inner open, flattening the structure and stranding the
+    /// outer close as an empty element. Pre-polarity snapshots decode both
+    /// markers as `CustomXmlWrapper`; the re-nesting pass keeps its
+    /// name-stack pairing as the fallback for exactly that case.
+    ///
+    /// NOTE: appended LAST so serialized snapshots that encode the enum by
+    /// variant index stay readable.
+    CustomXmlWrapperEnd,
 }
 
 /// A formatting mark (kept for backwards compatibility).
@@ -5384,6 +5433,13 @@ pub struct TransactionMeta {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RevisionInfo {
+    /// The original wire `w:id` this revision imported with (or the id minted
+    /// for a wire-`w:id="0"` carrier / an authoring transaction). This is a
+    /// per-element OOXML annotation, NOT a document-wide address: Word reuses
+    /// `w:id` across unrelated elements, so it is NOT unique. It survives ONLY
+    /// as the round-trip/serialization pairing key and as the seed floor for
+    /// `runtime::max_revision_id` → the annotation counter. NEVER address a
+    /// revision by this value; use [`RevisionInfo::identity`].
     pub revision_id: u32,
     pub author: Option<String>,
     pub date: Option<String>,
@@ -5398,6 +5454,27 @@ pub struct RevisionInfo {
     /// the writer. The field must always be present in the binary form.
     #[serde(default)]
     pub apply_op_id: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). Unique within a
+    /// `Document` instance and STABLE across projections within that instance's
+    /// lineage: a still-pending revision keeps this value through partial
+    /// resolution and re-projection, because it rides forward structurally on
+    /// the cloned `RevisionInfo` rather than being re-derived. Imported
+    /// identities are deterministically derived from the canonical revision
+    /// record, so an unchanged revision also keeps this value across save and
+    /// reopen even when serialization replaces its raw `w:id`. This — NOT
+    /// `revision_id` — is the address `Resolution::Selective`, `enumerate_
+    /// revisions`, `resolvable_revision_ids`, and the cascade set use. All the
+    /// carriers of one user intention share ONE identity: a MOVE's source
+    /// content + source pilcrow + destination clone(s) carry the move group's
+    /// identity, so selecting it resolves the whole move atomically and the
+    /// group enumerates as one record.
+    ///
+    /// `0` is the pre-identity sentinel: a snapshot serialized before H7, or a
+    /// carrier not yet passed through the import mint walk, decodes as `0` and
+    /// is not individually addressable until (re-)minted. Appended LAST for the
+    /// bincode-positional reason above.
+    #[serde(default)]
+    pub identity: u32,
 }
 
 /// Tracked change for section properties (w:sectPrChange).

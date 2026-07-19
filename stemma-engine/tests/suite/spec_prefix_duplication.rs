@@ -74,6 +74,7 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 1,
+        identity: 0,
         author: Some("prefix-test".to_string()),
         date: Some("2026-01-01T00:00:00Z".to_string()),
         apply_op_id: None,

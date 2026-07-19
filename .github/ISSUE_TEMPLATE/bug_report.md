@@ -13,16 +13,19 @@ assignees: ''
 <!-- The smallest input that triggers it. Attach the `.docx` (or a minimal
      fixture that reproduces), and the exact tool/transaction/API call. If the
      document is sensitive, a stripped-down version that still reproduces is
-     ideal. -->
+     ideal. Never attach a real agreement, worklist, or receipt: receipts can
+     contain paths, hashes, excerpts, and diagnoses. -->
 
 **Does Word open the output clean?**
 <!-- If this is a serialize/export bug: does the produced `.docx` open in Word
      without a repair dialog? Does Word's accept/reject of the tracked changes
      match what stemma produced? "N/A" if not an output bug. -->
 
-**Surface**
-<!-- Which one: engine (Rust api::Document / lower tier), stemma-mcp,
-     stemma-api/editor. Include the commit SHA (pre-1.0: fixes land on main). -->
+**Surface and identity**
+<!-- Which one: stemma apply CLI, engine (Rust api::Document / lower tier),
+     stemma-mcp, or stemma-api/editor. Include the source commit or build stamp.
+     For an evaluation artifact, include only its public target ID, byte size,
+     and SHA-256. -->
 
 **Spec reference (if a conformance claim)**
 <!-- If you're asserting what OOXML/Word requires, cite the section:

@@ -211,6 +211,7 @@ fn merge_redline_canonical() -> stemma::CanonDoc {
         &diff,
         &RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Stemma".to_string()),
             date: Some("2026-03-27T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -2571,6 +2572,7 @@ fn fixpoint_diff_merge_accept_rediff_is_empty() {
 
     let revision = RevisionInfo {
         revision_id: 1,
+        identity: 0,
         author: Some("fixpoint-test".to_string()),
         date: Some("2025-06-01T00:00:00Z".to_string()),
         apply_op_id: None,

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/stemma-sh/stemma/security/advisories/new
+    about: Report parsing, artifact-boundary, or other security issues privately.
+  - name: Approved-worklist evaluation guide
+    url: https://github.com/stemma-sh/stemma/blob/main/docs/evaluation.md
+    about: Read the experimental scope, identity checks, and privacy rules before opening an evaluation report.

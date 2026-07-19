@@ -139,6 +139,7 @@ fn preserved_ppr_children_survive_an_unrelated_edit_and_validate_full() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -223,6 +224,7 @@ fn preserved_ppr_children_survive_reimport_after_unrelated_edit() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -315,6 +317,7 @@ fn preserved_ppr_survives_a_tracked_text_edit_and_both_resolutions() {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,

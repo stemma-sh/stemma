@@ -500,25 +500,41 @@ fn compare_tracking_status(
     match (a, b) {
         (TrackingStatus::Normal, TrackingStatus::Normal) => {}
         (TrackingStatus::Inserted(ra), TrackingStatus::Inserted(rb)) => {
-            compare_opt(
-                diffs,
-                &format!("{path}.inserted.author"),
-                &ra.author,
-                &rb.author,
-            );
-            compare_opt(diffs, &format!("{path}.inserted.date"), &ra.date, &rb.date);
+            compare_tracking_revision_info(diffs, &format!("{path}.inserted"), ra, rb);
         }
         (TrackingStatus::Deleted(ra), TrackingStatus::Deleted(rb)) => {
-            compare_opt(
+            compare_tracking_revision_info(diffs, &format!("{path}.deleted"), ra, rb);
+        }
+        (TrackingStatus::InsertedThenDeleted(ra), TrackingStatus::InsertedThenDeleted(rb)) => {
+            compare_tracking_revision_info(
                 diffs,
-                &format!("{path}.deleted.author"),
-                &ra.author,
-                &rb.author,
+                &format!("{path}.inserted_then_deleted.inserted"),
+                &ra.inserted,
+                &rb.inserted,
             );
-            compare_opt(diffs, &format!("{path}.deleted.date"), &ra.date, &rb.date);
+            compare_tracking_revision_info(
+                diffs,
+                &format!("{path}.inserted_then_deleted.deleted"),
+                &ra.deleted,
+                &rb.deleted,
+            );
         }
         _ => diff(diffs, path, a, b),
     }
+}
+
+fn compare_tracking_revision_info(
+    diffs: &mut Vec<Difference>,
+    path: &str,
+    a: &RevisionInfo,
+    b: &RevisionInfo,
+) {
+    // The engine identity is the semantic key and is stable across
+    // save/reopen. Raw wire ids and apply-operation ids are boundary-local and
+    // deliberately ignored.
+    compare_val(diffs, &format!("{path}.identity"), &a.identity, &b.identity);
+    compare_opt(diffs, &format!("{path}.author"), &a.author, &b.author);
+    compare_opt(diffs, &format!("{path}.date"), &a.date, &b.date);
 }
 
 // ---------------------------------------------------------------------------
@@ -844,12 +860,18 @@ fn compare_paragraphs(
         heading_level,
         b_heading_level,
     );
-    compare_opt(
-        diffs,
-        &format!("{path}.para_mark_status"),
-        para_mark_status,
-        b_para_mark_status,
-    );
+    match (para_mark_status, b_para_mark_status) {
+        (None, None) => {}
+        (Some(a), Some(b)) => {
+            compare_tracking_status(diffs, &format!("{path}.para_mark_status"), a, b)
+        }
+        _ => diff(
+            diffs,
+            &format!("{path}.para_mark_status"),
+            para_mark_status,
+            b_para_mark_status,
+        ),
+    }
     compare_val(
         diffs,
         &format!("{path}.paragraph_mark_marks"),
@@ -1070,37 +1092,57 @@ fn compare_tracked_segments(
     a: &[TrackedSegment],
     b: &[TrackedSegment],
 ) {
-    if a.len() != b.len() {
-        diff(diffs, &format!("{path}.len"), a.len(), b.len());
+    // Coalesce consecutive EQUAL-status segments before comparing: segments
+    // exist to partition inlines by tracking status, so a boundary between
+    // same-status neighbors carries no document meaning — the importer
+    // legitimately opens a fresh segment for a structurally-anchored marker
+    // (a between-blocks bookmarkEnd, see `structural_range_decoration`) that
+    // a rebuild folds back into its neighbor. Same status, same inline
+    // sequence ⇒ same content. Statuses compare by full value, so segments
+    // of DIFFERENT revisions (or different kinds) never merge.
+    fn coalesce(segs: &[TrackedSegment]) -> Vec<(&TrackingStatus, Vec<&InlineNode>)> {
+        let mut out: Vec<(&TrackingStatus, Vec<&InlineNode>)> = Vec::new();
+        for seg in segs {
+            // Exhaustive destructure: a new TrackedSegment field must be handled.
+            let TrackedSegment { status, inlines } = seg;
+            if let Some((last_status, last_inlines)) = out.last_mut()
+                && *last_status == status
+            {
+                last_inlines.extend(inlines.iter());
+                continue;
+            }
+            out.push((status, inlines.iter().collect()));
+        }
+        out
+    }
+    let ca = coalesce(a);
+    let cb = coalesce(b);
+
+    if ca.len() != cb.len() {
+        diff(diffs, &format!("{path}.len"), ca.len(), cb.len());
         return;
     }
-    for (i, (sa, sb)) in a.iter().zip(b.iter()).enumerate() {
+    for (i, ((status, inlines), (b_status, b_inlines))) in ca.iter().zip(cb.iter()).enumerate() {
         let p = format!("{path}[{i}]");
-        // Exhaustive destructure: a new TrackedSegment field must be handled.
-        let TrackedSegment { status, inlines } = sa;
-        let TrackedSegment {
-            status: b_status,
-            inlines: b_inlines,
-        } = sb;
         compare_tracking_status(diffs, &format!("{p}.status"), status, b_status);
-        compare_inlines(diffs, &format!("{p}.inlines"), inlines, b_inlines);
+        if inlines.len() != b_inlines.len() {
+            diff(
+                diffs,
+                &format!("{p}.inlines.len"),
+                inlines.len(),
+                b_inlines.len(),
+            );
+            continue;
+        }
+        for (j, (ia, ib)) in inlines.iter().zip(b_inlines.iter()).enumerate() {
+            compare_inline_node(diffs, &format!("{p}.inlines[{j}]"), ia, ib);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Inline nodes
 // ---------------------------------------------------------------------------
-
-fn compare_inlines(diffs: &mut Vec<Difference>, path: &str, a: &[InlineNode], b: &[InlineNode]) {
-    if a.len() != b.len() {
-        diff(diffs, &format!("{path}.len"), a.len(), b.len());
-        return;
-    }
-    for (i, (ia, ib)) in a.iter().zip(b.iter()).enumerate() {
-        let p = format!("{path}[{i}]");
-        compare_inline_node(diffs, &p, ia, ib);
-    }
-}
 
 fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, b: &InlineNode) {
     match (a, b) {
@@ -1278,6 +1320,18 @@ fn compare_opaque_inlines(
     );
 }
 
+/// The load-bearing identity inside a decoration's verbatim bytes: the
+/// `w:name` attribute value (bookmarks §17.13.6.2, move ranges
+/// §17.13.5.24/.26). None for name-less decorations (proofErr,
+/// lastRenderedPageBreak, note refs, …) — for those, `kind` plus the
+/// wrapper fields are the whole comparable identity.
+fn decoration_name(raw_xml: &Option<Vec<u8>>) -> Option<String> {
+    let raw = String::from_utf8_lossy(raw_xml.as_deref()?);
+    let start = raw.find("w:name=\"")? + "w:name=\"".len();
+    let rest = &raw[start..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
 fn compare_decorations(
     diffs: &mut Vec<Difference>,
     path: &str,
@@ -1288,17 +1342,26 @@ fn compare_decorations(
     let DecorationNode {
         id: _, // ephemeral NodeId
         kind,
-        opaque_ref,   // carries bookmark/comment identity — real fidelity
+        // opaque_ref is an internal store reference minted from the global
+        // inline counter (`paragraph:<id>:deco:<n>`); it renumbers whenever
+        // ANY earlier inline content shifts, so comparing it indicts
+        // untouched blocks after a legitimate edit elsewhere (same class as
+        // OpaqueInlineNode's skipped opaque_ref). The decoration's real
+        // identity is the `w:name` inside its verbatim bytes — compared
+        // below via `decoration_name`.
+        opaque_ref: _,
         proof_ref: _, // ephemeral proof bookkeeping
         // wrapper rPr of the host run for run-level decorations (footnoteRef/
         // endnoteRef/separator/…) — real fidelity: the note-reference style,
         // fonts and size the auto-number renders in.
         wrapper_marks,
         wrapper_style_props,
-        // raw_xml is the verbatim element bytes; `kind` + `opaque_ref` capture
-        // the semantic identity. The bytes can legitimately re-serialize with
-        // cosmetic differences, so we compare semantics, not bytes.
-        raw_xml: _,
+        // raw_xml is the verbatim element bytes. The load-bearing identity
+        // inside them is the `w:name` attribute (bookmarks §17.13.6.2, move
+        // ranges §17.13.5.24/.26) — compared below. The numeric `w:id` is a
+        // disposable pairing key the serializer remints, and the remaining
+        // bytes can legitimately re-serialize with cosmetic differences.
+        raw_xml,
         // origin is a serializer-side bookmark-id policy hint, not document
         // content; it steers id assignment at write time and is recomputed.
         origin: _,
@@ -1306,19 +1369,19 @@ fn compare_decorations(
     let DecorationNode {
         id: _,
         kind: b_kind,
-        opaque_ref: b_opaque_ref,
+        opaque_ref: _,
         proof_ref: _,
         wrapper_marks: b_wrapper_marks,
         wrapper_style_props: b_wrapper_style_props,
-        raw_xml: _,
+        raw_xml: b_raw_xml,
         origin: _,
     } = b;
     compare_val(diffs, &format!("{path}.decoration.kind"), kind, b_kind);
-    compare_val(
+    compare_opt(
         diffs,
-        &format!("{path}.decoration.opaque_ref"),
-        opaque_ref,
-        b_opaque_ref,
+        &format!("{path}.decoration.name"),
+        &decoration_name(raw_xml),
+        &decoration_name(b_raw_xml),
     );
     compare_val(
         diffs,
@@ -1753,6 +1816,52 @@ fn compare_opaque_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn revision_info(wire_id: u32, identity: u32, author: &str, date: &str) -> RevisionInfo {
+        RevisionInfo {
+            revision_id: wire_id,
+            author: Some(author.to_string()),
+            date: Some(date.to_string()),
+            apply_op_id: Some(format!("apply-{wire_id}")),
+            identity,
+        }
+    }
+
+    #[test]
+    fn stacked_revision_comparison_keys_identity_not_wire_id() {
+        let left = TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+            inserted: revision_info(10, 1000, "Alice", "2026-01-01T00:00:00Z"),
+            deleted: revision_info(11, 1001, "Bob", "2026-01-02T00:00:00Z"),
+        }));
+        let right = TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+            inserted: revision_info(110, 1000, "Alice", "2026-01-01T00:00:00Z"),
+            deleted: revision_info(111, 1001, "Bob", "2026-01-02T00:00:00Z"),
+        }));
+        let mut diffs = Vec::new();
+        compare_tracking_status(&mut diffs, "status", &left, &right);
+        assert!(
+            diffs.is_empty(),
+            "wire-id reminting is diagnostic only: {diffs:?}"
+        );
+
+        let changed = TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+            inserted: revision_info(210, 2000, "Mallory", "2026-01-01T00:00:00Z"),
+            deleted: revision_info(211, 1001, "Bob", "2026-01-02T00:00:00Z"),
+        }));
+        compare_tracking_status(&mut diffs, "status", &left, &changed);
+        assert!(
+            diffs
+                .iter()
+                .any(|difference| difference.path.ends_with("inserted.author")),
+            "authored metadata remains fidelity: {diffs:?}"
+        );
+        assert!(
+            diffs
+                .iter()
+                .any(|difference| difference.path.ends_with("inserted.identity")),
+            "engine identity remains semantic fidelity: {diffs:?}"
+        );
+    }
 
     fn empty_canon_doc() -> CanonDoc {
         CanonDoc {
@@ -2193,5 +2302,100 @@ mod tests {
             diffs.is_empty(),
             "synthesized_text should be ignored, got: {diffs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_coalescing_tests {
+    use super::*;
+    use crate::domain::{
+        DecorationNode, DecorationType, DocPart, NodeId, ParagraphNode, ProofRef, StyleProps,
+        TextNode, TrackedSegment, TrackingStatus,
+    };
+
+    fn text(t: &str) -> InlineNode {
+        InlineNode::from(TextNode {
+            id: NodeId::from("t"),
+            text_role: None,
+            text: t.to_string(),
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: Default::default(),
+            formatting_change: None,
+        })
+    }
+
+    fn bookmark_end() -> InlineNode {
+        InlineNode::from(DecorationNode {
+            id: NodeId::from("d"),
+            kind: DecorationType::Bookmark,
+            opaque_ref: "p:deco:1".to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("d"),
+                docx_anchor: String::new(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            raw_xml: Some(br#"<w:bookmarkEnd w:id="2"/>"#.to_vec()),
+            origin: None,
+        })
+    }
+
+    fn para(segments: Vec<TrackedSegment>) -> ParagraphNode {
+        let mut p = ParagraphNode::new_story_body("p", "", None);
+        p.segments = segments;
+        p
+    }
+
+    fn seg(status: TrackingStatus, inlines: Vec<InlineNode>) -> TrackedSegment {
+        TrackedSegment { status, inlines }
+    }
+
+    /// Segment boundaries between EQUAL-status neighbors are parse
+    /// artifacts: segments exist to partition inlines by tracking status,
+    /// and the importer legitimately opens a fresh segment for a
+    /// structurally-anchored marker (e.g. a between-blocks bookmarkEnd)
+    /// that a rebuild folds back into its neighbor. Same status, same
+    /// inline sequence ⇒ same content.
+    #[test]
+    fn adjacent_equal_status_segments_compare_equal_to_their_merge() {
+        let split = para(vec![
+            seg(TrackingStatus::Normal, vec![text("GOVERNMENT NOTICES")]),
+            seg(TrackingStatus::Normal, vec![bookmark_end()]),
+        ]);
+        let merged = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("GOVERNMENT NOTICES"), bookmark_end()],
+        )]);
+        let mut diffs = Vec::new();
+        compare_paragraphs(&mut diffs, "block[0].paragraph", &split, &merged);
+        assert!(diffs.is_empty(), "{diffs:?}");
+    }
+
+    /// The guard in the other direction: DIFFERENT statuses never coalesce —
+    /// a deleted run folded into a normal segment is a real content change.
+    #[test]
+    fn different_status_segments_still_differ_from_a_merge() {
+        let split = para(vec![
+            seg(TrackingStatus::Normal, vec![text("Keep")]),
+            seg(
+                TrackingStatus::Deleted(crate::domain::RevisionInfo {
+                    revision_id: 5,
+                    identity: 5,
+                    author: Some("A".to_string()),
+                    date: None,
+                    apply_op_id: None,
+                }),
+                vec![text("Gone")],
+            ),
+        ]);
+        let merged = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("Keep"), text("Gone")],
+        )]);
+        let mut diffs = Vec::new();
+        compare_paragraphs(&mut diffs, "block[0].paragraph", &split, &merged);
+        assert!(!diffs.is_empty(), "a status change is real content");
     }
 }

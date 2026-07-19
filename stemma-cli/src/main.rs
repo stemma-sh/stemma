@@ -1,14 +1,17 @@
 //! `stemma` — a thin command-line interface to the DOCX engine.
 //!
-//! A zero-integration path to the engine's core verbs for adopters who are not
-//! writing Rust: compare two files into a tracked-changes redline, extract the
-//! body as text or JSON, resolve tracked changes, and validate a package.
+//! The focused path applies an approved worklist to an existing DOCX as native
+//! tracked changes. Maintenance verbs compare, extract, resolve, and validate.
 //!
 //! Design contract (CLAUDE.md): parse at the edges, no silent fallbacks. Every
 //! failure exits nonzero with a one-line actionable message on stderr naming
 //! what failed and which file/id; user input never panics. stdout carries data,
-//! stderr carries diagnostics. The CLI drives ONLY the stable
-//! [`stemma::api::Document`] facade.
+//! stderr carries diagnostics. General verbs drive the stable
+//! [`stemma::api::Document`] facade. The experimental worklist command also uses
+//! the tracked-native replacement planner until field evidence justifies a
+//! shared application facade.
+
+mod apply;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -17,8 +20,15 @@ use std::process::ExitCode;
 
 use clap::{ArgGroup, Parser, Subcommand};
 use serde::Serialize;
-use stemma::api::{BlockRole, Document, DocumentView, SegmentView, TrackStatus, validate};
+use serde_json::json;
+use stemma::api::{BlockRole, Document, validate};
+use stemma::audit::RevisionDisposition;
+use stemma::tracked_model::RevisionKind;
 use stemma::{ExportOptions, Resolution, ResolveSelectionAction};
+use stemma_artifacts::{
+    ArtifactDisposition, ArtifactIdentity, CollisionPolicy, DigestAlgorithm, OutputArtifact,
+    PathAuthority,
+};
 
 /// `compare --author NAME` attributes every discovered revision to NAME
 /// (`diff_as`); omitting it leaves the redline anonymous (`diff`). See the
@@ -27,10 +37,10 @@ use stemma::{ExportOptions, Resolution, ResolveSelectionAction};
 #[command(
     name = "stemma",
     version,
-    about = "Tracked-change DOCX operations from the command line.",
-    long_about = "Compare two DOCX files into a tracked-changes redline, extract the \
-                  body as text/JSON, resolve tracked changes, and validate a package. \
-                  Drives the stemma engine's stable Document facade."
+    about = "Compact inspect, execute, and verify workflows for tracked-change DOCX.",
+    long_about = "Inspect a DOCX through compact revision-aware Markdown, execute an \
+                  exact-input-bound plan as native tracked changes, independently verify \
+                  any before/after pair, and access maintenance compare/extract/resolve verbs."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,6 +49,47 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Apply an explicit approved worklist and create a native Word redline.
+    #[command(visible_alias = "execute")]
+    Apply {
+        /// The existing document to change. It is never modified.
+        input: PathBuf,
+        /// A stemma.worklist.v0 JSON file.
+        #[arg(long, visible_alias = "plan", value_name = "FILE")]
+        worklist: PathBuf,
+        /// Where to create the redline DOCX. Refuses any existing path or input.
+        #[arg(short = 'o', long = "out")]
+        out: PathBuf,
+        /// Durable JSON receipt path (default: <out>.receipt.json).
+        #[arg(long, value_name = "FILE")]
+        receipt: Option<PathBuf>,
+        /// Create a non-deliverable partial redline when any item is refused.
+        #[arg(long)]
+        emit_partial: bool,
+    },
+
+    /// Inspect a DOCX through the compact, revision-aware agent projection.
+    Inspect {
+        /// The document to inspect.
+        file: PathBuf,
+        /// Output format. Markdown is the compact default; JSON wraps the same
+        /// projection with its exact input identity and summary.
+        #[arg(long, value_enum, default_value_t = InspectFormat::Markdown)]
+        format: InspectFormat,
+    },
+
+    /// Verify a before/after pair under the tracked-delivery policy.
+    Verify {
+        /// The protected baseline document.
+        before: PathBuf,
+        /// The result to verify. It may have been produced by any tool.
+        after: PathBuf,
+        /// Verification policy. v0 requires valid tracked-only change,
+        /// preservation of pending revisions, and a clean untouched proof.
+        #[arg(long, value_enum, default_value_t = VerifyPolicy::TrackedDeliveryV0)]
+        policy: VerifyPolicy,
+    },
+
     /// Diff two files into a tracked-changes redline (reject-all == base,
     /// accept-all == target).
     Compare {
@@ -46,8 +97,7 @@ enum Command {
         base: PathBuf,
         /// The revised document (the "after").
         target: PathBuf,
-        /// Where to write the redline DOCX. Overwrites an existing file; refuses
-        /// to overwrite either input.
+        /// Where to create the redline DOCX. Refuses any existing path or input.
         #[arg(short = 'o', long = "out")]
         out: PathBuf,
         /// Attribute every discovered revision to NAME (`w:author`). Omit for an
@@ -72,8 +122,7 @@ enum Command {
     Resolve {
         /// The document whose tracked changes to resolve.
         file: PathBuf,
-        /// Where to write the resolved DOCX. Overwrites an existing file;
-        /// refuses to overwrite the input.
+        /// Where to create the resolved DOCX. Refuses any existing path or input.
         #[arg(short = 'o', long = "out")]
         out: PathBuf,
 
@@ -110,11 +159,22 @@ enum ExtractFormat {
     Json,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum InspectFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum VerifyPolicy {
+    TrackedDeliveryV0,
+}
+
 fn main() -> ExitCode {
     // clap handles --help/--version and usage errors itself (exit code 2).
     let cli = Cli::parse();
     match run(cli.command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
@@ -122,15 +182,40 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(command: Command) -> Result<(), String> {
-    match command {
+fn run(command: Command) -> Result<ExitCode, String> {
+    let artifacts = PathAuthority::explicit()
+        .map_err(|e| format!("cannot establish filesystem authority: {e}"))?;
+    let result = match command {
+        Command::Apply {
+            input,
+            worklist,
+            out,
+            receipt,
+            emit_partial,
+        } => {
+            return apply::apply_worklist(
+                &artifacts,
+                &input,
+                &worklist,
+                &out,
+                receipt.as_deref(),
+                emit_partial,
+            )
+            .map(apply::ApplyStatus::exit_code);
+        }
+        Command::Inspect { file, format } => inspect(&artifacts, &file, format),
+        Command::Verify {
+            before,
+            after,
+            policy,
+        } => return verify(&artifacts, &before, &after, policy),
         Command::Compare {
             base,
             target,
             out,
             author,
-        } => compare(&base, &target, &out, author.as_deref()),
-        Command::Extract { file, format } => extract(&file, format),
+        } => compare(&artifacts, &base, &target, &out, author.as_deref()),
+        Command::Extract { file, format } => extract(&artifacts, &file, format),
         Command::Resolve {
             file,
             out,
@@ -141,6 +226,7 @@ fn run(command: Command) -> Result<(), String> {
             accept_ids,
             reject_ids,
         } => resolve(
+            &artifacts,
             &file,
             &out,
             Disposition::from_flags(
@@ -152,20 +238,208 @@ fn run(command: Command) -> Result<(), String> {
                 reject_ids,
             )?,
         ),
-        Command::Validate { file } => validate_cmd(&file),
+        Command::Validate { file } => validate_cmd(&artifacts, &file),
+    };
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// compact inspect / verify
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct InspectJson {
+    schema: &'static str,
+    input: CompactIdentity,
+    blocks: usize,
+    pending_revisions: usize,
+    projection: String,
+}
+
+#[derive(Serialize)]
+struct CompactIdentity {
+    bytes: u64,
+    sha256: String,
+}
+
+impl From<&ArtifactIdentity> for CompactIdentity {
+    fn from(identity: &ArtifactIdentity) -> Self {
+        Self {
+            bytes: identity.bytes,
+            sha256: identity.digest.hex.clone(),
+        }
     }
+}
+
+fn inspect(artifacts: &PathAuthority, file: &Path, format: InspectFormat) -> Result<(), String> {
+    let (doc, input) = parse_doc(artifacts, file, "input_docx")?;
+    let view = doc.read();
+    let blocks = view.blocks.len();
+    let revisions = pending_revisions(&doc).len();
+    let projection = doc.to_markdown();
+    match format {
+        InspectFormat::Markdown => {
+            let header = format!(
+                "@stemma inspect.v0 sha256={} bytes={} blocks={} pending_revisions={}",
+                input.digest.hex, input.bytes, blocks, revisions
+            );
+            if projection.is_empty() {
+                print_line(&header)
+            } else {
+                print_line(&format!("{header}\n\n{projection}"))
+            }
+        }
+        InspectFormat::Json => {
+            let payload = InspectJson {
+                schema: "stemma.inspect.v0",
+                input: CompactIdentity::from(&input),
+                blocks,
+                pending_revisions: revisions,
+                projection,
+            };
+            let encoded = serde_json::to_string_pretty(&payload)
+                .map_err(|e| format!("cannot encode inspection for {}: {e}", file.display()))?;
+            print_line(&encoded)
+        }
+    }
+}
+
+fn verify(
+    artifacts: &PathAuthority,
+    before_path: &Path,
+    after_path: &Path,
+    policy: VerifyPolicy,
+) -> Result<ExitCode, String> {
+    let before = artifacts
+        .read_source(before_path, "before_docx", None)
+        .map_err(|e| e.to_string())?;
+    let after = artifacts
+        .read_source(after_path, "after_docx", None)
+        .map_err(|e| e.to_string())?;
+    let report = stemma::api::audit(before.bytes(), after.bytes()).map_err(|e| {
+        format!(
+            "cannot audit {} against {}: {e}",
+            after_path.display(),
+            before_path.display()
+        )
+    })?;
+
+    let modified_preexisting = report
+        .preexisting_revisions
+        .iter()
+        .filter(|row| !matches!(row.disposition, RevisionDisposition::Untouched))
+        .count();
+    let policy_pass = match policy {
+        VerifyPolicy::TrackedDeliveryV0 => {
+            report.validator.ok
+                && report.direct_changes.is_empty()
+                && report.untouched.violations.is_empty()
+                && modified_preexisting == 0
+        }
+    };
+
+    let after_doc = Document::parse(after.bytes())
+        .map_err(|e| format!("{}: not a valid DOCX ({e})", after_path.display()))?;
+    let accepted = after_doc
+        .project(Resolution::AcceptAll)
+        .and_then(|doc| doc.serialize(&ExportOptions::default()))
+        .map_err(|e| format!("cannot produce accepted verification projection: {e}"))?;
+    let rejected = after_doc
+        .project(Resolution::RejectAll)
+        .and_then(|doc| doc.serialize(&ExportOptions::default()))
+        .map_err(|e| format!("cannot produce rejected verification projection: {e}"))?;
+
+    let direct: Vec<_> = report
+        .direct_changes
+        .iter()
+        .map(|change| {
+            json!({
+                "story": format!("{:?}", change.story),
+                "kind": change.kind.as_str(),
+                "block_id": change.block_id.as_ref().map(ToString::to_string),
+                "old_excerpt": change.old_excerpt,
+                "new_excerpt": change.new_excerpt,
+                "coincides_with_resolution": change.coincides_with_resolution,
+            })
+        })
+        .collect();
+    let validator_issues: Vec<_> = report
+        .validator
+        .issues
+        .iter()
+        .map(|issue| {
+            json!({
+                "code": format!("{:?}", issue.code),
+                "message": issue.message,
+                "context": issue.context,
+            })
+        })
+        .collect();
+    let payload = json!({
+        "schema": "stemma.verify.v0",
+        "policy": "tracked-delivery-v0",
+        "status": if policy_pass { "pass" } else { "fail" },
+        "before": CompactIdentity::from(before.identity()),
+        "after": CompactIdentity::from(after.identity()),
+        "summary": {
+            "new_revisions": report.new_revisions.len(),
+            "preexisting_revisions": report.preexisting_revisions.len(),
+            "modified_or_resolved_preexisting": modified_preexisting,
+            "direct_changes": report.direct_changes.len(),
+            "untouched_violations": report.untouched.violations.len(),
+            "validator_ok": report.validator.ok,
+        },
+        "projections": {
+            "accepted": digest_payload(&accepted),
+            "rejected": digest_payload(&rejected),
+        },
+        "direct_changes": direct,
+        "untouched": {
+            "verified_blocks": report.untouched.verified_blocks,
+            "parts": report.untouched.parts,
+            "violations": report.untouched.violations.iter().map(|v| json!({
+                "story": format!("{:?}", v.story),
+                "kind": format!("{:?}", v.kind),
+                "detail": v.detail,
+            })).collect::<Vec<_>>(),
+        },
+        "validator": {
+            "ok": report.validator.ok,
+            "issues": validator_issues,
+        },
+    });
+    let encoded = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("cannot encode verification result: {e}"))?;
+    print_line(&encoded)?;
+    Ok(if policy_pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    })
+}
+
+fn digest_payload(bytes: &[u8]) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    json!({
+        "bytes": bytes.len(),
+        "sha256": format!("{digest:x}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // compare
 // ---------------------------------------------------------------------------
 
-fn compare(base: &Path, target: &Path, out: &Path, author: Option<&str>) -> Result<(), String> {
-    let base_doc = parse_doc(base)?;
-    let target_doc = parse_doc(target)?;
-
-    refuse_output_over_input(base, out)?;
-    refuse_output_over_input(target, out)?;
+fn compare(
+    artifacts: &PathAuthority,
+    base: &Path,
+    target: &Path,
+    out: &Path,
+    author: Option<&str>,
+) -> Result<(), String> {
+    let (base_doc, base_artifact) = parse_doc(artifacts, base, "base_docx")?;
+    let (target_doc, target_artifact) = parse_doc(artifacts, target, "target_docx")?;
 
     // `--author NAME` attributes the discovered revisions (`diff_as`); omitting
     // it leaves the redline anonymous (`diff`). Same round-trip either way.
@@ -182,13 +456,20 @@ fn compare(base: &Path, target: &Path, out: &Path, author: Option<&str>) -> Resu
     })?;
 
     let bytes = serialize(&redline, out)?;
-    write_output(out, &bytes)?;
+    let output = write_output(
+        artifacts,
+        out,
+        "output_redline",
+        &bytes,
+        &[base_artifact, target_artifact],
+    )?;
 
-    let count = pending_revisions(&redline.read()).len();
+    let count = pending_revisions(&redline).len();
     eprintln!(
-        "wrote redline to {} ({count} tracked revision{})",
+        "wrote redline to {} ({count} tracked revision{}); {}",
         out.display(),
-        if count == 1 { "" } else { "s" }
+        if count == 1 { "" } else { "s" },
+        output_summary(&output),
     );
     Ok(())
 }
@@ -197,15 +478,15 @@ fn compare(base: &Path, target: &Path, out: &Path, author: Option<&str>) -> Resu
 // extract
 // ---------------------------------------------------------------------------
 
-fn extract(file: &Path, format: ExtractFormat) -> Result<(), String> {
-    let doc = parse_doc(file)?;
+fn extract(artifacts: &PathAuthority, file: &Path, format: ExtractFormat) -> Result<(), String> {
+    let (doc, _input) = parse_doc(artifacts, file, "input_docx")?;
     match format {
         ExtractFormat::Text => print_line(&doc.to_text()),
         ExtractFormat::Json => {
             let view = doc.read();
             let payload = ExtractJson {
                 blocks: view.blocks.iter().map(BlockJson::from_view).collect(),
-                revisions: pending_revisions(&view)
+                revisions: pending_revisions(&doc)
                     .into_iter()
                     .map(RevisionJson::from)
                     .collect(),
@@ -264,7 +545,7 @@ impl From<PendingRevision> for RevisionJson {
     fn from(r: PendingRevision) -> RevisionJson {
         RevisionJson {
             revision_id: r.id,
-            kind: r.kind.label(),
+            kind: r.kind.as_str(),
             author: r.author,
             block_id: r.block_id,
             excerpt: r.excerpt,
@@ -331,11 +612,15 @@ impl Disposition {
     }
 }
 
-fn resolve(file: &Path, out: &Path, disposition: Disposition) -> Result<(), String> {
-    let doc = parse_doc(file)?;
-    refuse_output_over_input(file, out)?;
+fn resolve(
+    artifacts: &PathAuthority,
+    file: &Path,
+    out: &Path,
+    disposition: Disposition,
+) -> Result<(), String> {
+    let (doc, input_artifact) = parse_doc(artifacts, file, "input_docx")?;
 
-    let pending = pending_revisions(&doc.read());
+    let pending = pending_revisions(&doc);
     let resolution = plan_resolution(&disposition, &pending, file)?;
 
     let resolved = doc
@@ -343,9 +628,19 @@ fn resolve(file: &Path, out: &Path, disposition: Disposition) -> Result<(), Stri
         .map_err(|e| format!("cannot resolve tracked changes in {}: {e}", file.display()))?;
 
     let bytes = serialize(&resolved, out)?;
-    write_output(out, &bytes)?;
+    let output = write_output(
+        artifacts,
+        out,
+        "output_resolved_docx",
+        &bytes,
+        &[input_artifact],
+    )?;
 
-    eprintln!("wrote resolved document to {}", out.display());
+    eprintln!(
+        "wrote resolved document to {}; {}",
+        out.display(),
+        output_summary(&output)
+    );
     Ok(())
 }
 
@@ -357,7 +652,9 @@ fn plan_resolution(
     pending: &[PendingRevision],
     file: &Path,
 ) -> Result<Resolution, String> {
-    let known: HashSet<u32> = pending.iter().map(|r| r.id).collect();
+    // id 0 is the census-only sentinel (reported, never selectable) — it must
+    // not satisfy the non-empty check nor be offered to the selective resolver.
+    let known: HashSet<u32> = pending.iter().map(|r| r.id).filter(|id| *id != 0).collect();
 
     match disposition {
         Disposition::AcceptAll => {
@@ -406,6 +703,7 @@ fn ids_by_author(
         .iter()
         .filter(|r| r.author.as_deref() == Some(author))
         .map(|r| r.id)
+        .filter(|id| *id != 0)
         .collect();
     if ids.is_empty() {
         return Err(format!(
@@ -472,12 +770,14 @@ fn check_ids(requested: &[u32], known: &HashSet<u32>, file: &Path) -> Result<Has
 // validate
 // ---------------------------------------------------------------------------
 
-fn validate_cmd(file: &Path) -> Result<(), String> {
-    let bytes = read_bytes(file)?;
-    let doc = Document::parse(&bytes)
+fn validate_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
+    let input = artifacts
+        .read_source(file, "input_docx", None)
+        .map_err(|e| e.to_string())?;
+    let doc = Document::parse(input.bytes())
         .map_err(|e| format!("{}: not a valid DOCX ({e})", file.display()))?;
 
-    let report = validate(&bytes);
+    let report = validate(input.bytes());
     if !report.ok {
         let details = report
             .issues
@@ -493,12 +793,14 @@ fn validate_cmd(file: &Path) -> Result<(), String> {
 
     let view = doc.read();
     let blocks = view.blocks.len();
-    let revisions = pending_revisions(&view).len();
+    let revisions = pending_revisions(&doc).len();
     print_line(&format!(
-        "OK: {} — {blocks} block{}, {revisions} pending revision{}",
+        "OK: {} — {blocks} block{}, {revisions} pending revision{}; bytes={} sha256={}",
         file.display(),
         if blocks == 1 { "" } else { "s" },
         if revisions == 1 { "" } else { "s" },
+        input.identity().bytes,
+        input.identity().digest.hex,
     ))
 }
 
@@ -506,81 +808,43 @@ fn validate_cmd(file: &Path) -> Result<(), String> {
 // revision enumeration (shared by extract / resolve / validate)
 // ---------------------------------------------------------------------------
 
-/// One pending tracked change, enumerated from the read projection in document
-/// order. Revision ids are session handles read from the live view (never reused
-/// from raw XML), matching how the engine's own examples enumerate revisions.
+/// One pending tracked change, enumerated from the engine's canonical census
+/// ([`Document::revisions`]) in document order. Revision ids are the
+/// engine-minted identities the selective resolver addresses (never raw wire
+/// ids); `id == 0` marks a census-only record that is reported but not
+/// individually selectable.
 struct PendingRevision {
     id: u32,
     author: Option<String>,
-    kind: RevKind,
+    kind: RevisionKind,
     block_id: String,
     excerpt: String,
 }
 
-#[derive(Clone, Copy)]
-enum RevKind {
-    Insert,
-    Delete,
-}
-
-impl RevKind {
-    fn label(self) -> &'static str {
-        match self {
-            RevKind::Insert => "insert",
-            RevKind::Delete => "delete",
-        }
-    }
-}
-
-/// Every pending revision, once, in first-seen document order. A revision id can
-/// surface across several spans; we keep the first occurrence's block and
-/// excerpt as its representative, exactly as a reviewer reads it.
-fn pending_revisions(view: &DocumentView) -> Vec<PendingRevision> {
+/// Every pending revision, once, in first-seen document order — the engine's
+/// canonical census, NOT a re-derivation from the segment view (the view
+/// carries no formatting-change records, so a view-derived count silently
+/// understates the pending state). A revision id can surface across several
+/// carriers; we keep the first occurrence's block and excerpt as its
+/// representative, exactly as a reviewer reads it.
+fn pending_revisions(doc: &Document) -> Vec<PendingRevision> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-
-    for block in &view.blocks {
-        let block_id = block.id.to_string();
-        let mut record = |status: &TrackStatus, text: &str| {
-            for (rev, kind) in status_entries(status) {
-                if seen.insert(rev.revision_id) {
-                    out.push(PendingRevision {
-                        id: rev.revision_id,
-                        author: rev.author.clone(),
-                        kind,
-                        block_id: block_id.clone(),
-                        excerpt: excerpt(text),
-                    });
-                }
-            }
-        };
-
-        record(&block.block_status, &block.text);
-        record(&block.paragraph_mark_status, &block.text);
-        for segment in &block.segments {
-            match segment {
-                SegmentView::Text { status, text, .. } => record(status, text),
-                SegmentView::Opaque { status, text, .. } => {
-                    record(status, text.as_deref().unwrap_or(""))
-                }
-            }
+    for r in doc.revisions() {
+        // Census-only records share id 0; each is its own row, so only real
+        // identities deduplicate.
+        if r.revision_id != 0 && !seen.insert(r.revision_id) {
+            continue;
         }
+        out.push(PendingRevision {
+            id: r.revision_id,
+            author: r.author,
+            kind: r.kind,
+            block_id: r.block_id.to_string(),
+            excerpt: excerpt(&r.excerpt),
+        });
     }
     out
-}
-
-/// The `(revision, kind)` pairs a single tracked status carries. A stacked
-/// insert-then-delete surfaces both its revisions (D5), each keyed by its own id.
-fn status_entries(status: &TrackStatus) -> Vec<(stemma::api::RevisionView, RevKind)> {
-    match status {
-        TrackStatus::Normal => vec![],
-        TrackStatus::Inserted(r) => vec![(r.clone(), RevKind::Insert)],
-        TrackStatus::Deleted(r) => vec![(r.clone(), RevKind::Delete)],
-        TrackStatus::InsertedThenDeleted { inserted, deleted } => vec![
-            (inserted.clone(), RevKind::Insert),
-            (deleted.clone(), RevKind::Delete),
-        ],
-    }
 }
 
 /// A short, single-line excerpt: whitespace-collapsed and capped, so a JSON
@@ -619,13 +883,17 @@ fn print_line(text: &str) -> Result<(), String> {
     }
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
-}
-
-fn parse_doc(path: &Path) -> Result<Document, String> {
-    let bytes = read_bytes(path)?;
-    Document::parse(&bytes).map_err(|e| format!("{}: not a valid DOCX ({e})", path.display()))
+fn parse_doc(
+    artifacts: &PathAuthority,
+    path: &Path,
+    role: &str,
+) -> Result<(Document, ArtifactIdentity), String> {
+    let input = artifacts
+        .read_source(path, role, None)
+        .map_err(|e| e.to_string())?;
+    let doc = Document::parse(input.bytes())
+        .map_err(|e| format!("{}: not a valid DOCX ({e})", path.display()))?;
+    Ok((doc, input.identity().clone()))
 }
 
 fn serialize(doc: &Document, out: &Path) -> Result<Vec<u8>, String> {
@@ -633,42 +901,33 @@ fn serialize(doc: &Document, out: &Path) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("cannot serialize output for {}: {e}", out.display()))
 }
 
-fn write_output(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+fn write_output(
+    artifacts: &PathAuthority,
+    path: &Path,
+    role: &str,
+    bytes: &[u8],
+    protected_sources: &[ArtifactIdentity],
+) -> Result<OutputArtifact, String> {
+    artifacts
+        .commit_new(path, role, bytes, protected_sources)
+        .map_err(|e| e.to_string())
 }
 
-/// Refuse to write output over one of the inputs (same canonical path).
-/// Overwriting an unrelated existing file is allowed (standard tool behavior);
-/// clobbering the input in place is not.
-fn refuse_output_over_input(input: &Path, output: &Path) -> Result<(), String> {
-    let input_canon = input
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve {}: {e}", input.display()))?;
-    let output_canon = canonical_output(output)?;
-    if input_canon == output_canon {
-        return Err(format!(
-            "refusing to overwrite the input file {}: choose a different --out path",
-            input.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Canonicalize an output path that may not exist yet: resolve its parent
-/// directory (which must exist) and rejoin the file name.
-fn canonical_output(output: &Path) -> Result<PathBuf, String> {
-    if let Ok(existing) = output.canonicalize() {
-        return Ok(existing);
-    }
-    let parent = match output.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
+fn output_summary(output: &OutputArtifact) -> String {
+    let collision_policy = match output.collision_policy {
+        CollisionPolicy::CreateNew => "create_new",
+        _ => "unknown",
     };
-    let file_name = output
-        .file_name()
-        .ok_or_else(|| format!("output path {} has no file name", output.display()))?;
-    let parent_canon = parent
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve output directory {}: {e}", parent.display()))?;
-    Ok(parent_canon.join(file_name))
+    let disposition = match output.disposition {
+        ArtifactDisposition::Created => "created",
+        _ => "unknown",
+    };
+    let digest_algorithm = match output.identity.digest.algorithm {
+        DigestAlgorithm::Sha256 => "sha256",
+        _ => "unknown_digest",
+    };
+    format!(
+        "bytes={} {digest_algorithm}={} collision_policy={collision_policy} disposition={disposition}",
+        output.identity.bytes, output.identity.digest.hex,
+    )
 }

@@ -352,6 +352,7 @@ fn apply_to_paragraph(
         MaterializationMode::TrackedChange => {
             para.formatting_change = Some(ParagraphFormattingChange {
                 revision_id: revision.revision_id,
+                identity: 0,
                 previous_alignment: para.align.clone(),
                 // Snapshot AUTHORED-direct indent/spacing (the previous DIRECT
                 // pPr), not the resolved effective value — see
@@ -737,6 +738,7 @@ mod tests {
     fn rev() -> RevisionInfo {
         RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Test".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,

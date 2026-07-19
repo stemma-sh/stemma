@@ -162,6 +162,7 @@ fn footnote_pending_ids(doc: &Document) -> Vec<u32> {
 fn revision(id: u32, author: &str) -> RevisionInfo {
     RevisionInfo {
         revision_id: id,
+        identity: 0,
         author: Some(author.to_string()),
         date: Some("2026-06-12T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -190,9 +191,13 @@ fn accepting_a_footnote_del_and_ins_by_id_materializes_the_correction_in_footnot
         "pending: BOTH old (struck) and new (inserted) text are present"
     );
 
+    // Address the footnote revisions by their minted identities (discovered
+    // from the footnote story), not the raw wire ids 101/102.
+    let footnote_ids: HashSet<u32> = footnote_pending_ids(&doc).into_iter().collect();
+    assert_eq!(footnote_ids.len(), 2, "the del+ins pair: {footnote_ids:?}");
     let resolved = doc
         .project(Resolution::Selective {
-            ids: HashSet::from([101, 102]),
+            ids: footnote_ids,
             action: ResolveSelectionAction::Accept,
         })
         .expect("selective accept of the footnote pair");
@@ -243,9 +248,11 @@ fn rejecting_a_footnote_del_and_ins_by_id_restores_the_original_text() {
         &footnote_part_xml("L. Marsh", "2026-06-05T10:00:00Z"),
     );
     let doc = Document::parse(&bytes).expect("parse");
+    let footnote_ids: HashSet<u32> = footnote_pending_ids(&doc).into_iter().collect();
+    assert_eq!(footnote_ids.len(), 2, "the del+ins pair: {footnote_ids:?}");
     let resolved = doc
         .project(Resolution::Selective {
-            ids: HashSet::from([101, 102]),
+            ids: footnote_ids,
             action: ResolveSelectionAction::Reject,
         })
         .expect("selective reject of the footnote pair");
@@ -267,6 +274,11 @@ fn an_unselected_footnote_revision_stays_pending() {
         &footnote_part_xml("L. Marsh", "2026-06-05T10:00:00Z"),
     );
     let doc = Document::parse(&bytes).expect("parse");
+    // The footnote revisions' minted identities, captured before any
+    // resolution — the domain rule is they survive an UNRELATED resolve
+    // unchanged.
+    let footnote_ids_before = footnote_pending_ids(&doc);
+    assert_eq!(footnote_ids_before.len(), 2, "del+ins pending");
     let view = doc.read();
     let target = view
         .blocks
@@ -314,7 +326,7 @@ fn an_unselected_footnote_revision_stays_pending() {
     );
     assert_eq!(
         footnote_pending_ids(&resolved),
-        vec![101, 102],
+        footnote_ids_before,
         "footnote revision ids survive intact, still pending"
     );
 }

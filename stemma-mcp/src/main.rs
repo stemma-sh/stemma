@@ -16,8 +16,8 @@
 //! - Tool results are structured JSON so the model gets machine-readable
 //!   feedback (block ids, semantic hashes, error codes) to drive its next step.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rmcp::{
@@ -29,6 +29,8 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use stemma_artifacts::{ArtifactError, ArtifactIdentity, PathAuthority, ReadArtifact};
 
 use stemma::edit_v4::parse_transaction;
 use stemma::extended_markdown::to_extended_markdown_blocks;
@@ -47,7 +49,8 @@ use stemma::{
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OpenArgs {
-    /// Absolute path to a .docx file on the local filesystem.
+    /// Path to a .docx under the MCP workspace root. Relative paths resolve
+    /// from that root.
     path: String,
 }
 
@@ -56,6 +59,106 @@ struct OpenArgs {
 struct ReadArgs {
     /// The doc_id returned by open_docx.
     doc_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum InspectQuery {
+    /// Compact current structural index. The safe default for navigation.
+    #[default]
+    Index,
+    /// Paged id-bearing extended Markdown for document comprehension.
+    /// Tables are explicit bounded summaries with exact follow-up ids.
+    Document,
+    /// Exact guarded planning detail for one block, with formatting on request.
+    Block,
+    /// Structured inventory of every pending tracked revision.
+    Revisions,
+    /// Bounded rollup of the pending revisions: exact counts by author and
+    /// kind, no rows. The dense-document entry point — combine with `filter`
+    /// and drill down with `revisions` only where the counts say to look.
+    RevisionsSummary,
+    /// Authored style table and document defaults.
+    Styles,
+    /// Case-insensitive text or opaque-metadata search.
+    Find,
+    /// Inclusive bounded block range.
+    Window,
+    /// One heading and its section, through the next peer/higher heading.
+    Section,
+    /// Plain current document text.
+    Text,
+    /// Current document HTML.
+    Html,
+    /// Full extended-markdown redline with inline insertions/deletions.
+    Redline,
+    /// Document projected as if every pending revision were accepted.
+    Accepted,
+    /// Document projected as if every pending revision were rejected.
+    Rejected,
+    /// Footnote/endnote inventory with note ids, kinds, and editable body text.
+    Notes,
+    /// Complete transaction-operation vocabulary; optionally filter by name.
+    Operations,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// Compact guarded planning detail, or the complete run-formatting projection.
+enum InspectBlockDetail {
+    #[default]
+    Compact,
+    Formatting,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InspectDocxArgs {
+    /// The doc_id returned by open_docx.
+    doc_id: String,
+    /// Projection to return. Omit for the first compact index page.
+    #[serde(default)]
+    query: InspectQuery,
+    /// Required for query="block" or query="section"; use an id from
+    /// open_docx or the document projection.
+    #[serde(default)]
+    block_id: Option<String>,
+    /// Valid only for query="block": "compact" (default) or "formatting".
+    /// Compact retains exact editable identity and opaque anchors; formatting
+    /// adds complete run-level marks, style properties, and metadata.
+    #[serde(default)]
+    detail: Option<InspectBlockDetail>,
+    /// Required for query="find". For query="operations", optionally pass one
+    /// exact operation name to retrieve only that entry.
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Valid only for query="revisions": AND-combined author, kind, and block
+    /// range filters matching the revision inventory contract.
+    #[serde(default)]
+    filter: Option<RevisionFilter>,
+    /// Required only for query="window".
+    #[serde(default)]
+    from_block_id: Option<String>,
+    /// Required only for query="window".
+    #[serde(default)]
+    to_block_id: Option<String>,
+    /// Required only for query="window": "text", "markdown", or "html".
+    #[serde(default)]
+    format: Option<String>,
+    /// First result to return; valid for query="index", "document", or "find".
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Page size; valid for query="index", "document", or "find".
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Offset within a table's cells for query="block", or within each matched
+    /// table's matching cells for query="find". Defaults to 0.
+    #[serde(default)]
+    cell_offset: Option<usize>,
+    /// Cells returned for a table query="block" (default 8), or matching cells
+    /// per table for query="find" (default 4). May not exceed 64.
+    #[serde(default)]
+    cell_limit: Option<usize>,
 }
 
 /// The v4 edit-transaction argument as it crosses the MCP wire.
@@ -74,6 +177,12 @@ struct ReadArgs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(transparent)]
 struct TransactionArg(Value);
+
+impl TransactionArg {
+    fn operation_count(&self) -> Option<usize> {
+        self.0.get("ops").and_then(Value::as_array).map(Vec::len)
+    }
+}
 
 impl schemars::JsonSchema for TransactionArg {
     /// Inline the object schema directly into the parent (like a primitive)
@@ -249,8 +358,286 @@ fn v4_op_shapes(op: &str) -> &'static [&'static str] {
         ],
         // Delete a note and its body-side reference run, by `note_id`.
         "delete_note" => &[r#"{"op":"delete_note","note_id":"<note_id>","note_kind":"footnote"}"#],
+        "set_format" => &[
+            r#"{"op":"set_format","target":"<block_id>","expect":"<exact text>","marks":[{"type":"bold"}]}"#,
+        ],
+        "set_para_format" => &[
+            r#"{"op":"set_para_format","target":"<block_id>","align":"center","spacing":{"after":120}}"#,
+        ],
+        "set_cell_format" => &[
+            r#"{"op":"set_cell_format","target":"<table_id>","row_index":0,"col_index":0,"shading":{"fill":"D9EAF7"}}"#,
+        ],
+        "set_row_format" => &[
+            r#"{"op":"set_row_format","target":"<table_id>","row_index":0,"height":360,"height_rule":"exact"}"#,
+        ],
+        "set_table_format" => &[
+            r#"{"op":"set_table_format","target":"<table_id>","width":{"w":5000,"width_type":"pct"}}"#,
+        ],
+        "apply_style" => &[r#"{"op":"apply_style","target":"<block_id>","style_id":"Heading1"}"#],
+        "create_style" => &[
+            r#"{"op":"create_style","style_id":"Heading1","style_type":"para","name":"Heading 1","run_props":{"font_family":"Georgia","font_size_half_points":32,"bold":true},"para_props":{"spacing_before":240,"spacing_after":120}}"#,
+        ],
+        "modify_style" => &[
+            r#"{"op":"modify_style","style_id":"Normal","style_type":"para","name":"Normal","run_props":{"font_family":"Georgia","font_size_half_points":24},"para_props":{}}"#,
+        ],
+        "set_doc_defaults" => {
+            &[r#"{"op":"set_doc_defaults","font_family":"Georgia","font_size_half_points":24}"#]
+        }
+        "set_page_setup" => &[
+            r#"{"op":"set_page_setup","target":{"section":"body"},"margins":{"top":1440,"bottom":1440,"left":1440,"right":1440,"header":720,"footer":720}}"#,
+        ],
+        "set_numbering" => &[
+            r#"{"op":"set_numbering","target":"<block_id>","change":{"kind":"remove"}}"#,
+            r#"{"op":"set_numbering","target":"<block_id>","change":{"kind":"split"}}"#,
+        ],
+        "insert_bookmark" => &[
+            r#"{"op":"insert_bookmark","target":"<block_id>","expect":"<anchor text>","name":"bookmark_name"}"#,
+        ],
+        "insert_cross_ref" => &[
+            r#"{"op":"insert_cross_ref","target":"<block_id>","expect":"<anchor text>","bookmark":"bookmark_name","ref_kind":"ref","as_hyperlink":true}"#,
+        ],
+        "comment_create" => &[
+            r#"{"op":"comment_create","target":"<block_id>","expect":"<anchor text>","body":"<comment text>","author":"Reviewer"}"#,
+        ],
+        "comment_reply" => &[
+            r#"{"op":"comment_reply","parent_comment_id":"<comment_id>","body":"<reply text>","author":"Reviewer"}"#,
+        ],
+        "comment_resolve" => {
+            &[r#"{"op":"comment_resolve","comment_id":"<comment_id>","done":true}"#]
+        }
+        "comment_delete" => &[r#"{"op":"comment_delete","comment_id":"<comment_id>"}"#],
+        "insert_image" => &[
+            r#"{"op":"insert_image","target":"<block_id>","bytes_base64":"AAAA","format":"png","alt_text":"<description>"}"#,
+        ],
+        "replace_image" => &[
+            r#"{"op":"replace_image","target":"<block_id>","drawing_id":"<drawing_id>","bytes_base64":"AAAA","format":"png"}"#,
+        ],
+        "blocks_to_table" => &[
+            r#"{"op":"blocks_to_table","from":"<block_id>","to":"<block_id>","delimiter":" — ","header":["Feature","Notes"]}"#,
+        ],
         _ => &[],
     }
+}
+
+fn operation_group(op: &str) -> &'static str {
+    match op {
+        "replace" | "insert" | "delete" | "move" | "blocks_to_table" => "content",
+        "set_attr" | "set_format" | "set_para_format" | "apply_style" | "create_style"
+        | "modify_style" | "set_doc_defaults" => "formatting_and_styles",
+        "set_cell_format" | "set_row_format" | "set_table_format" | "table_op" => "tables",
+        "insert_cross_ref" | "insert_bookmark" | "rename_bookmark" | "remove_bookmark" => {
+            "references"
+        }
+        "set_numbering" => "numbering",
+        "set_image_attrs" | "delete_image" | "insert_image" | "replace_image"
+        | "set_image_layout" => "images",
+        "comment_create" | "comment_reply" | "comment_resolve" | "comment_delete" => "comments",
+        "insert_note" | "edit_note" | "delete_note" => "notes",
+        "set_page_setup" | "set_section_type" | "insert_section_break" => "sections",
+        "edit_header"
+        | "edit_footer"
+        | "create_header"
+        | "create_footer"
+        | "set_header_footer_mode" => "headers_and_footers",
+        "insert_equation" => "equations",
+        "wrap_content_control"
+        | "wrap_blocks_content_control"
+        | "set_content_control_value"
+        | "sdt_text_fill" => "content_controls",
+        "set_form_field_value" => "form_fields",
+        "set_textbox_text" | "opaque_text_edit" => "textboxes_and_opaque_content",
+        _ => "other",
+    }
+}
+
+fn operation_cue(op: &str) -> &'static str {
+    match op {
+        "replace" => "Tracked whole-paragraph or guarded span replacement.",
+        "insert" => "Insert paragraphs, tables, or a native table of contents at an anchor.",
+        "delete" => "Track deletion of one block.",
+        "move" => "Track relocation of one block or one contiguous range in a single op.",
+        "table_op" => "Structural table edits; insert_row carries cell text in the same op.",
+        "insert_note" => "Insert a footnote/endnote reference and its story body.",
+        "edit_note" => "Edit one note body by note_id from inspect_docx query=notes.",
+        "delete_note" => "Delete one note and its body-side reference by note_id.",
+        "comment_create" => "Create an anchored comment; comments are annotations, not revisions.",
+        "set_image_attrs" => {
+            "Resize an existing drawing or change alt text; this is a direct property edit."
+        }
+        "insert_image" => {
+            "Insert image bytes/path at a paragraph; dimensions may use intrinsic size."
+        }
+        "replace_image" => "Replace an existing drawing's media by drawing_id.",
+        "create_style" | "modify_style" => "Create or modify one named Word style.",
+        "set_doc_defaults" => "Change inherited document-default font settings once.",
+        "set_page_setup" => "Change page geometry for the body or a paragraph's section.",
+        "blocks_to_table" => "Convert a contiguous paragraph range into a tracked table.",
+        "opaque_text_edit" => "Tracked find/replace inside a textbox or inline content control.",
+        _ => "Typed transaction operation; use the advertised fields and preview before apply.",
+    }
+}
+
+/// Fields accepted by the MCP edge before the transaction reaches the engine
+/// parser. Keep these separate from `operation_vocabulary()` so the catalog is
+/// honest about both contracts: `path` is a real compact-surface input, while
+/// the engine itself sees only the resolved `bytes_base64` field.
+fn operation_edge_fields(op: &str) -> &'static [&'static str] {
+    match op {
+        "insert_image" | "replace_image" => &["path"],
+        _ => &[],
+    }
+}
+
+fn operation_edge_examples(op: &str) -> &'static [&'static str] {
+    match op {
+        "insert_image" => &[
+            r#"{"op":"insert_image","target":"<block_id>","path":"/workspace/logo.png","format":"png","alt_text":"<description>"}"#,
+        ],
+        "replace_image" => &[
+            r#"{"op":"replace_image","target":"<block_id>","drawing_id":"<drawing_id>","path":"/workspace/replacement.png","format":"png"}"#,
+        ],
+        _ => &[],
+    }
+}
+
+/// Route map from the 26-tool surface used by the historical benchmark to the
+/// five-tool core. This is both documentation and a drift guard: callers can
+/// ask for the operation catalog and see the exact replacement route instead
+/// of inferring that a removed tool name means a removed capability.
+const LEGACY_TOOL_EQUIVALENTS: &[(&str, &str)] = &[
+    ("open_docx", "open_docx"),
+    ("read_outline", "inspect_docx query='index'"),
+    ("read_markdown", "inspect_docx query='document'"),
+    ("read_block", "inspect_docx query='block'"),
+    ("find", "inspect_docx query='find'"),
+    ("get_section", "inspect_docx query='section'"),
+    ("read_text", "inspect_docx query='text'"),
+    ("read_html", "inspect_docx query='html'"),
+    ("read_redline", "inspect_docx query='redline'"),
+    ("read_accepted", "inspect_docx query='accepted'"),
+    ("read_rejected", "inspect_docx query='rejected'"),
+    ("read_index", "inspect_docx query='index' or query='notes'"),
+    ("read_styles", "inspect_docx query='styles'"),
+    ("read_window", "inspect_docx query='window'"),
+    ("list_revisions", "inspect_docx query='revisions'"),
+    ("apply_edit", "execute_plan transaction, preview=false"),
+    (
+        "apply_batch",
+        "execute_plan transaction, preview=true|false",
+    ),
+    ("check_edit", "execute_plan transaction, preview=true"),
+    ("accept_changes", "execute_plan resolution action='accept'"),
+    ("reject_changes", "execute_plan resolution action='reject'"),
+    (
+        "replace_text",
+        "execute_plan replacement_worklist with one item",
+    ),
+    ("replace_text_batch", "execute_plan replacement_worklist"),
+    (
+        "replace_all",
+        "execute_plan replacement_worklist item replace_all=true",
+    ),
+    ("compare_docx", "execute_plan comparison"),
+    ("validate_docx", "verify_docx doc_id mode"),
+    ("save_docx", "save_docx"),
+];
+
+/// Complete transaction vocabulary for the compact surface. Operation names
+/// and parser fields come from edit_v4's actual fail-loud parser table; fields
+/// consumed by the MCP edge before parsing are identified separately. Curated
+/// examples are additive teaching material.
+/// Intent hints for the op names cold agents actually guess (observed in
+/// transcripts): capabilities that exist but are not ops of that name. The
+/// unknown-op refusal quotes the matching hint so the error names the
+/// agent's next move instead of only dumping the catalog.
+const OP_INTENT_HINTS: &[(&str, &str)] = &[
+    (
+        "toc",
+        "a table of contents is not an op — use `insert` with a {\"type\":\"toc\"} content block",
+    ),
+    (
+        "image",
+        "images are `insert_image`, `replace_image`, `set_image_attrs`, `set_image_layout`, or `delete_image`",
+    ),
+    (
+        "field",
+        "fields are not a free-form op — cross-references via `insert_cross_ref`, form fields via `set_form_field_value`",
+    ),
+];
+
+fn operation_catalog(operation: Option<&str>) -> Result<Value, String> {
+    let vocabulary = stemma::edit_v4::operation_vocabulary();
+    if let Some(name) = operation
+        && !vocabulary.iter().any(|(candidate, _)| *candidate == name)
+    {
+        // Actionability: name the closest real op(s) (substring match both
+        // ways) and any intent hint before the full catalog dump.
+        let lowered = name.to_ascii_lowercase();
+        let mut hints: Vec<String> = Vec::new();
+        if !lowered.is_empty() {
+            let close: Vec<&str> = vocabulary
+                .iter()
+                .map(|(candidate, _)| *candidate)
+                .filter(|candidate| {
+                    candidate.contains(lowered.as_str()) || lowered.contains(*candidate)
+                })
+                .collect();
+            if !close.is_empty() {
+                hints.push(format!("closest matches: {}", close.join(", ")));
+            }
+            for (intent, hint) in OP_INTENT_HINTS {
+                if lowered.contains(intent) {
+                    hints.push((*hint).to_string());
+                }
+            }
+        }
+        let hint_text = if hints.is_empty() {
+            String::new()
+        } else {
+            format!(" {};", hints.join("; "))
+        };
+        return Err(format!(
+            "unknown transaction operation '{name}';{hint_text} known operations: {}",
+            vocabulary
+                .iter()
+                .map(|(candidate, _)| *candidate)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let operations: Vec<Value> = vocabulary
+        .iter()
+        .filter(|(name, _)| operation.is_none_or(|wanted| wanted == *name))
+        .map(|(name, fields)| {
+            let mut accepted_fields = fields.to_vec();
+            accepted_fields.extend_from_slice(operation_edge_fields(name));
+            json!({
+                "name": name,
+                "group": operation_group(name),
+                "accepted_fields": accepted_fields,
+                "parser_fields": fields,
+                "mcp_edge_fields": operation_edge_fields(name),
+                "cue": operation_cue(name),
+                "examples": v4_op_shapes(name),
+                "mcp_edge_examples": operation_edge_examples(name),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "transaction_envelope": {
+            "ops": "non-empty ordered operation array",
+            "revision": {"author": "required tracked-change author", "date": "optional ISO-8601"},
+            "summary": "optional",
+        },
+        "operation_count": vocabulary.len(),
+        "filtered": operation.is_some(),
+        "operations": operations,
+        "legacy_surface_routes": LEGACY_TOOL_EQUIVALENTS.iter().map(|(old, route)| {
+            json!({"historical_tool": old, "core_route": route})
+        }).collect::<Vec<_>>(),
+        "workflow": "inspect targets and guards; execute_plan preview=true; apply the identical plan with preview=false when apply_ready=true",
+        "server_version": SERVER_VERSION,
+    }))
 }
 
 /// Append the canonical op shape(s) to a v4 schema error so the model fixes the
@@ -513,7 +900,7 @@ struct ApplyEditArgs {
     /// of the range first (its content would be lost in a text-only cell).
     ///
     /// `insert_image` / `replace_image` supply the image bytes by EITHER `path`
-    /// (an absolute path to the file on disk, read server-side — preferred; no
+    /// (a path under the MCP workspace root, read server-side — preferred; no
     /// hand-encoding) OR `bytes_base64` (the base64 bytes). Exactly one is
     /// required; both or neither is refused. `format` is `"png"|"jpeg"|"gif"`.
     /// `cx`/`cy` (the display box, in EMUs) are OPTIONAL: omit BOTH to use the
@@ -568,6 +955,20 @@ struct FindArgs {
     doc_id: String,
     /// Text to search for (case-insensitive substring) across block text.
     pattern: String,
+    /// Zero-based result offset. Defaults to 0.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Maximum top-level matches returned. Defaults to 16 and may not exceed 64.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Zero-based offset within each matched table's matching cells. Defaults
+    /// to 0. Use the per-table `matching_cells_next_offset` to continue.
+    #[serde(default)]
+    cell_offset: Option<usize>,
+    /// Maximum matching cells returned per matched table. Defaults to 4 and
+    /// may not exceed 64. Every table reports its true count and continuation.
+    #[serde(default)]
+    cell_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -585,7 +986,8 @@ struct SectionArgs {
 struct SaveArgs {
     /// The doc_id returned by open_docx.
     doc_id: String,
-    /// Absolute path to write the resulting .docx to.
+    /// New path under the MCP workspace root. Relative paths resolve from the
+    /// root; an existing destination is refused.
     path: String,
 }
 
@@ -643,9 +1045,10 @@ struct ReplaceTextArgs {
     new: String,
     /// Author stamped on the resulting tracked change.
     author: String,
-    /// Where to search. Omit for the whole body. To restrict: an inclusive block
-    /// range `{ "from_block_id": "p_3", "to_block_id": "p_9" }` or a single
-    /// block `{ "block_id": "p_7" }`.
+    /// Where to search. Omit for top-level and table-cell body paragraphs. To
+    /// restrict: an inclusive top-level block range
+    /// `{ "from_block_id": "p_3", "to_block_id": "p_9" }` or a single block
+    /// `{ "block_id": "p_7" }` (including a table-cell paragraph id).
     #[serde(default)]
     scope: Option<ReplaceTextScopeArg>,
     /// How many occurrences must match. A number (default 1) requires EXACTLY
@@ -717,6 +1120,11 @@ struct ReplaceTextBatchArgs {
     /// The find/replace instructions, applied in order against live state (so a
     /// later item sees earlier items' edits).
     replacements: Vec<ReplaceItem>,
+    /// Run the complete ordered worklist against a throwaway snapshot. Per-item
+    /// outcomes are exact, successful items feed later planning, and no state
+    /// is persisted.
+    #[serde(default)]
+    preview: bool,
     /// Author-impersonation override (see replace_text). Default false.
     #[serde(default)]
     allow_existing_author: bool,
@@ -725,7 +1133,8 @@ struct ReplaceTextBatchArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplaceTextScopeArg {
-    /// Restrict to a single block.
+    /// Restrict to one paragraph id, including a paragraph nested in a table
+    /// cell. Matching-cell ids come from inspect_docx find/block results.
     #[serde(default)]
     block_id: Option<String>,
     /// Restrict to an inclusive block-id range (document order).
@@ -742,11 +1151,11 @@ fn default_match_mode() -> String {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CompareArgs {
-    /// Absolute path to the base ("original") .docx.
+    /// Path to the base ("original") .docx under the MCP workspace root.
     base_path: String,
-    /// Absolute path to the target ("modified") .docx.
+    /// Path to the target ("modified") .docx under the MCP workspace root.
     target_path: String,
-    /// Absolute path to write the redline .docx to.
+    /// New redline path under the MCP workspace root.
     out_path: String,
     /// Author name stamped on the redline's tracked changes. Defaults to "stemma".
     #[serde(default)]
@@ -754,6 +1163,188 @@ struct CompareArgs {
 }
 
 // ─── Result helpers ──────────────────────────────────────────────────────────
+
+/// A potentially large evidence collection. Only evidence may use this type:
+/// submitted worklist items and transaction operations are decision-plane data
+/// and use [`CompleteDecisionOutcomes`] below instead.
+#[derive(Debug)]
+struct CappedEvidenceSet {
+    rows: Vec<Value>,
+    total: usize,
+    set_sha256: String,
+}
+
+impl CappedEvidenceSet {
+    /// Commit to the complete, deterministically ordered set before retaining
+    /// only the inline prefix. The commitment is SHA-256 over a compact JSON
+    /// array whose object keys are sorted recursively and whose array order is
+    /// preserved.
+    fn new(complete: Vec<Value>, cap: usize) -> Self {
+        let total = complete.len();
+        let set_sha256 = canonical_set_sha256(&complete);
+        let rows = complete.into_iter().take(cap).collect();
+        Self {
+            rows,
+            total,
+            set_sha256,
+        }
+    }
+
+    fn returned(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn omitted(&self) -> usize {
+        self.total - self.returned()
+    }
+
+    fn metadata(&self) -> Value {
+        json!({
+            "total": self.total,
+            "returned": self.returned(),
+            "omitted": self.omitted(),
+            "set_sha256": self.set_sha256,
+        })
+    }
+}
+
+/// Decision-plane outcomes are complete by construction. There is deliberately
+/// no cap or paging method on this type: shortening the rows would violate the
+/// submitted-count invariant and panic at this internal programmer boundary.
+#[derive(Debug)]
+struct CompleteDecisionOutcomes {
+    rows: Vec<Value>,
+}
+
+impl CompleteDecisionOutcomes {
+    fn new(species: &str, submitted: usize, rows: Vec<Value>) -> Self {
+        assert_eq!(
+            rows.len(),
+            submitted,
+            "{species} outcome count must equal submitted count"
+        );
+        Self { rows }
+    }
+
+    fn uniform(species: &str, submitted: usize, status: &str) -> Self {
+        let rows = (0..submitted)
+            .map(|index| json!({"index": index, "status": status}))
+            .collect();
+        Self::new(species, submitted, rows)
+    }
+
+    fn into_rows(self) -> Vec<Value> {
+        self.rows
+    }
+}
+
+fn attach_transaction_outcomes(
+    result: CallToolResult,
+    operation_count: usize,
+    preview: bool,
+) -> CallToolResult {
+    let is_error = result.is_error == Some(true);
+    let operation_status = if is_error {
+        "not_applied"
+    } else if preview {
+        "would_apply"
+    } else {
+        "applied"
+    };
+    let atomicity_status = if is_error {
+        "refused"
+    } else if preview {
+        "would_apply"
+    } else {
+        "committed"
+    };
+    let outcomes =
+        CompleteDecisionOutcomes::uniform("transaction", operation_count, operation_status);
+    let Some(Value::Object(mut payload)) = result.structured_content.clone() else {
+        return result;
+    };
+    payload.insert("operation_count".into(), json!(operation_count));
+    payload.insert(
+        "operation_outcomes".into(),
+        Value::Array(outcomes.into_rows()),
+    );
+    payload.insert(
+        "atomicity".into(),
+        json!({"mode": "all", "status": atomicity_status}),
+    );
+    let value = Value::Object(payload);
+    let rebuilt = if is_error {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    };
+    rebuilt.with_meta(result.meta)
+}
+
+fn attach_known_transaction_outcomes(
+    result: CallToolResult,
+    operation_count: Option<usize>,
+    preview: bool,
+) -> CallToolResult {
+    match operation_count {
+        Some(operation_count) => attach_transaction_outcomes(result, operation_count, preview),
+        None => result,
+    }
+}
+
+fn canonical_set_sha256(rows: &[Value]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"[");
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            digest.update(b",");
+        }
+        let mut encoded = Vec::new();
+        write_canonical_json(row, &mut encoded);
+        digest.update(encoded);
+    }
+    digest.update(b"]");
+    format!("{:x}", digest.finalize())
+}
+
+fn write_canonical_json(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(value) => out.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::Number(value) => out.extend_from_slice(value.to_string().as_bytes()),
+        Value::String(value) => {
+            out.extend_from_slice(
+                &serde_json::to_vec(value).expect("serializing a JSON string cannot fail"),
+            );
+        }
+        Value::Array(values) => {
+            out.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical_json(value, out);
+            }
+            out.push(b']');
+        }
+        Value::Object(values) => {
+            out.push(b'{');
+            let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(
+                    &serde_json::to_vec(key).expect("serializing a JSON key cannot fail"),
+                );
+                out.push(b':');
+                write_canonical_json(&values[key], out);
+            }
+            out.push(b'}');
+        }
+    }
+}
 
 /// The build identity reported in-band: in every error payload (see
 /// `fail_json`) and in the `open_docx` response. The pack scripts inject the
@@ -767,12 +1358,177 @@ const SERVER_VERSION: &str = match option_env!("STEMMA_MCP_BUILD_STAMP") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// The full editing playbook, served as MCP `instructions` on initialize.
+///
+/// This is the CANONICAL guidance for driving stemma — golden path, sharp
+/// edges, tracked-table/style/note recipes, and the layer-vs-resolve policy.
+/// It ships in the server so every MCP client that surfaces `instructions`
+/// gets it out of the box (npx, mcpb, any non-Claude host) — agents must not
+/// need a client-specific skill file to drive the engine well. Packaging must
+/// not fork this guidance into a separate skill.
+const INSTRUCTIONS: &str = include_str!("instructions.md");
+const CORE_INSTRUCTIONS: &str = "Stemma core profile: open_docx -> inspect_docx -> \
+execute_plan -> verify_docx -> save_docx. Inspect before editing. execute_plan previews or \
+applies one explicit v4 transaction or revision-resolution selection through the typed engine; for several literal \
+substitutions use its explicit replacement_worklist path instead of one read/edit round trip per phrase. Never invent block \
+ids, span handles, guards, revision authors, or unsupported operations. Inspect query=operations before an unfamiliar \
+transaction and query=notes before editing a footnote/endnote. The operations catalog is parser-derived and also maps every \
+historical tool to its five-tool route. Use execute_plan comparison (without doc_id) to produce a redline from two files. Treat any plan error, \
+unexplained direct_delta row, unexpected changed pre-existing revision, untouched violation, or NEW validator issue as \
+incomplete. Comment-story rows are requested annotations, and property_change rows are direct \
+OOXML property edits such as image resizing or hyperlink retargeting; reconcile them with the \
+user's requested operations and disclose them rather than rejecting a valid output. Rows carrying \
+coincides_with_resolution are the committed effect of an explicit revision resolution and must \
+be reconciled with the requested selector. Validator findings unchanged from baseline are \
+pre-existing evidence, not a regression; \
+disclose them, but do not withhold an otherwise valid requested output. Ordinary edits must remain pending tracked changes: resolution is not a finalize \
+step, and must be used only when the user explicitly asks to accept, reject, or clean up \
+revisions. Save only after verification passes, and always to a new path. Set \
+STEMMA_MCP_PROFILE=advanced only for expert escape-hatch tools, not broader semantics.";
+
 // ─── Runtime configuration (parsed at the edge) ──────────────────────────────
 
 /// Env var: idle seconds before an open document is evicted from memory.
 const ENV_DOC_TTL_SECS: &str = "STEMMA_MCP_DOC_TTL_SECS";
 /// Env var: the largest `.docx` `open_docx` will read, in bytes.
 const ENV_MAX_DOC_BYTES: &str = "STEMMA_MCP_MAX_DOC_BYTES";
+/// Env var: maximum bytes read from one image path in an edit transaction.
+const ENV_MAX_IMAGE_BYTES: &str = "STEMMA_MCP_MAX_IMAGE_BYTES";
+/// Env var: maximum aggregate image bytes read by one edit transaction.
+const ENV_MAX_IMAGE_TOTAL_BYTES: &str = "STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES";
+/// Env var: the only filesystem tree agent-controlled MCP paths may access.
+const ENV_WORKSPACE_ROOT: &str = "STEMMA_MCP_WORKSPACE_ROOT";
+/// Env var selecting the compact default surface or the full expert surface.
+const ENV_PROFILE: &str = "STEMMA_MCP_PROFILE";
+
+/// The product-facing MCP surface. File lifecycle remains explicit because
+/// opening and committing artifacts are safety boundaries, while the semantic
+/// work is the compact read -> execute -> verify sequence in the middle.
+const CORE_TOOLS: &[&str] = &[
+    "open_docx",
+    "inspect_docx",
+    "execute_plan",
+    "verify_docx",
+    "save_docx",
+];
+const DEFAULT_CORE_INDEX_LIMIT: usize = 16;
+const MAX_CORE_INDEX_LIMIT: usize = 256;
+const DEFAULT_CORE_DOCUMENT_LIMIT: usize = 16;
+const CORE_DOCUMENT_TABLE_CELL_PREVIEWS: usize = 4;
+const CORE_DOCUMENT_CELL_EXCERPT_CHARS: usize = 120;
+const DEFAULT_FIND_LIMIT: usize = 16;
+const MAX_FIND_LIMIT: usize = 64;
+const DEFAULT_FIND_CELL_LIMIT: usize = 4;
+const MAX_FIND_CELL_LIMIT: usize = 64;
+const FIND_CELL_EXCERPT_CHARS: usize = 120;
+const FIND_TEXT_EXCERPT_CHARS: usize = 240;
+const DEFAULT_BLOCK_CELL_LIMIT: usize = 8;
+const MAX_BLOCK_CELL_LIMIT: usize = 64;
+const BLOCK_CELL_EXCERPT_CHARS: usize = 120;
+
+/// Normalize an advertised tool schema for strict function-calling clients.
+/// Gemini rejects `$defs`/`$ref`, and common Gemini bridges mishandle the JSON
+/// Schema `anyOf: [T, null]` encoding used for optional fields. Optionality is
+/// already represented by absence from `required`, so advertising `T` alone
+/// loses no model-call shape. The Rust argument structs remain the authoritative
+/// validation boundary; this only makes their wire schema self-contained.
+fn inline_local_schema_refs(schema: Value) -> Result<Value, String> {
+    fn expand(
+        value: Value,
+        defs: &serde_json::Map<String, Value>,
+        active: &mut HashSet<String>,
+    ) -> Result<Value, String> {
+        match value {
+            Value::Array(items) => items
+                .into_iter()
+                .map(|item| expand(item, defs, active))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            Value::Object(mut object) => {
+                if let Some(reference) = object.remove("$ref") {
+                    let reference = reference
+                        .as_str()
+                        .ok_or_else(|| "JSON Schema $ref must be a string".to_string())?;
+                    let name = reference.strip_prefix("#/$defs/").ok_or_else(|| {
+                        format!("unsupported non-local JSON Schema reference: {reference}")
+                    })?;
+                    if !active.insert(name.to_string()) {
+                        return Err(format!("recursive JSON Schema definition: {name}"));
+                    }
+                    let target = defs.get(name).cloned().ok_or_else(|| {
+                        format!("JSON Schema reference has no matching definition: {reference}")
+                    })?;
+                    let mut expanded = expand(target, defs, active)?;
+                    active.remove(name);
+
+                    // JSON Schema permits annotations beside `$ref`. Preserve
+                    // them explicitly instead of silently discarding metadata.
+                    if !object.is_empty() {
+                        let expanded_object = expanded.as_object_mut().ok_or_else(|| {
+                            format!("referenced JSON Schema definition is not an object: {name}")
+                        })?;
+                        for (key, sibling) in object {
+                            expanded_object.insert(key, expand(sibling, defs, active)?);
+                        }
+                    }
+                    Ok(expanded)
+                } else {
+                    object.remove("$defs");
+                    let mut object = object
+                        .into_iter()
+                        .map(|(key, child)| Ok((key, expand(child, defs, active)?)))
+                        .collect::<Result<serde_json::Map<_, _>, String>>()?;
+
+                    if let Some(Value::Array(branches)) = object.get("anyOf") {
+                        let non_null: Vec<&Value> = branches
+                            .iter()
+                            .filter(|branch| {
+                                branch.get("type") != Some(&Value::String("null".into()))
+                            })
+                            .collect();
+                        let null_count = branches.len() - non_null.len();
+                        if branches.len() == 2 && null_count == 1 && non_null.len() == 1 {
+                            let mut replacement = non_null[0]
+                                .as_object()
+                                .ok_or_else(|| {
+                                    "optional JSON Schema branch is not an object".to_string()
+                                })?
+                                .clone();
+                            object.remove("anyOf");
+                            for (key, value) in object {
+                                replacement.insert(key, value);
+                            }
+                            return Ok(Value::Object(replacement));
+                        }
+                    }
+                    // Schemars represents Option<primitive> as
+                    // `type:["integer","null"]` rather than anyOf. Gemini's
+                    // dialect rejects type arrays just as it rejects nullable
+                    // anyOf; field absence already carries optionality.
+                    if let Some(Value::Array(types)) = object.get("type") {
+                        let non_null: Vec<&Value> = types
+                            .iter()
+                            .filter(|kind| kind.as_str() != Some("null"))
+                            .collect();
+                        let null_count = types.len() - non_null.len();
+                        if types.len() == 2 && null_count == 1 && non_null.len() == 1 {
+                            object.insert("type".to_string(), non_null[0].clone());
+                        }
+                    }
+                    Ok(Value::Object(object))
+                }
+            }
+            scalar => Ok(scalar),
+        }
+    }
+
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    expand(schema, &defs, &mut HashSet::new())
+}
 
 /// Default idle TTL: 24 hours. Deliberately generous — an interactive editing
 /// session can sit idle (agent thinking, user away) far longer than minutes, so
@@ -784,16 +1540,32 @@ const DEFAULT_DOC_TTL_SECS: u64 = 86_400;
 /// sit well under this; the cap exists to refuse an accidental or pathological
 /// huge read before it is pulled into memory. `0` disables the cap.
 const DEFAULT_MAX_DOC_BYTES: u64 = 50 * 1024 * 1024;
+/// Default per-image cap: 20 MiB before base64 expansion.
+const DEFAULT_MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Default aggregate image cap per transaction: 50 MiB before base64 expansion.
+const DEFAULT_MAX_IMAGE_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Server configuration parsed once at startup from the environment. Parsing is
 /// fail-loud: a malformed value is a startup error, never a silent fallback. An
 /// absent value takes the documented default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolProfile {
+    Core,
+    Advanced,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Config {
+    /// Compact product surface by default; the full engine surface is opt-in.
+    profile: ToolProfile,
     /// Idle seconds before an open document is evicted; `0` disables eviction.
     doc_ttl_secs: u64,
     /// Largest `.docx` (in bytes) `open_docx` will read; `0` disables the cap.
     max_doc_bytes: u64,
+    /// Largest image source read by an edit; `0` disables the per-file cap.
+    max_image_bytes: u64,
+    /// Aggregate image source bytes in one edit; `0` disables the total cap.
+    max_image_total_bytes: u64,
 }
 
 impl Config {
@@ -801,8 +1573,14 @@ impl Config {
     /// human-readable message describing which variable is malformed.
     fn from_env() -> Result<Self, String> {
         Ok(Self {
+            profile: env_profile(ENV_PROFILE)?,
             doc_ttl_secs: env_u64(ENV_DOC_TTL_SECS, DEFAULT_DOC_TTL_SECS)?,
             max_doc_bytes: env_u64(ENV_MAX_DOC_BYTES, DEFAULT_MAX_DOC_BYTES)?,
+            max_image_bytes: env_u64(ENV_MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_BYTES)?,
+            max_image_total_bytes: env_u64(
+                ENV_MAX_IMAGE_TOTAL_BYTES,
+                DEFAULT_MAX_IMAGE_TOTAL_BYTES,
+            )?,
         })
     }
 
@@ -812,9 +1590,30 @@ impl Config {
     #[cfg(test)]
     fn defaults() -> Self {
         Self {
+            profile: ToolProfile::Core,
             doc_ttl_secs: DEFAULT_DOC_TTL_SECS,
             max_doc_bytes: DEFAULT_MAX_DOC_BYTES,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            max_image_total_bytes: DEFAULT_MAX_IMAGE_TOTAL_BYTES,
         }
+    }
+}
+
+fn parse_profile_setting(name: &str, raw: Option<&str>) -> Result<ToolProfile, String> {
+    match raw {
+        None | Some("core") => Ok(ToolProfile::Core),
+        Some("advanced") => Ok(ToolProfile::Advanced),
+        Some(value) => Err(format!(
+            "{name}={value:?} is invalid; expected 'core' or 'advanced'"
+        )),
+    }
+}
+
+fn env_profile(name: &str) -> Result<ToolProfile, String> {
+    match std::env::var(name) {
+        Ok(raw) => parse_profile_setting(name, Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_profile_setting(name, None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
     }
 }
 
@@ -837,6 +1636,47 @@ fn env_u64(name: &str, default: u64) -> Result<u64, String> {
         Ok(raw) => parse_u64_setting(name, Some(&raw), default),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
+/// Resolve one workspace-root setting against an explicit startup directory.
+/// Keeping environment access outside this helper makes every path case
+/// deterministic and parallel-testable.
+fn artifact_authority_from_setting(
+    configured_root: Option<&std::ffi::OsStr>,
+    startup_dir: &Path,
+) -> Result<PathAuthority, String> {
+    let supplied_root = match configured_root {
+        Some(value) if value.is_empty() => {
+            return Err(format!(
+                "{ENV_WORKSPACE_ROOT} is empty; set it to an existing directory or unset it to use the startup directory"
+            ));
+        }
+        Some(value) => PathBuf::from(value),
+        None => startup_dir.to_path_buf(),
+    };
+    let root = if supplied_root.is_absolute() {
+        supplied_root
+    } else {
+        startup_dir.join(supplied_root)
+    };
+    PathAuthority::rooted(&root)
+        .map_err(|e| format!("cannot use {} as {ENV_WORKSPACE_ROOT}: {e}", root.display()))
+}
+
+fn artifact_authority_from_env() -> Result<PathAuthority, String> {
+    let configured_root = std::env::var_os(ENV_WORKSPACE_ROOT);
+    match configured_root.as_deref() {
+        // Absolute and explicitly empty settings do not depend on cwd. Preserve
+        // that property even if the process's startup directory was removed.
+        Some(value) if value.is_empty() || Path::new(value).is_absolute() => {
+            artifact_authority_from_setting(Some(value), Path::new("."))
+        }
+        configured_root => {
+            let startup_dir = std::env::current_dir()
+                .map_err(|e| format!("cannot determine the default MCP workspace root: {e}"))?;
+            artifact_authority_from_setting(configured_root, &startup_dir)
+        }
     }
 }
 
@@ -891,17 +1731,33 @@ fn usage() -> String {
          stemma-mcp [--help | --version]\n\
          \n\
          ENVIRONMENT:\n    \
+         {ENV_PROFILE}        Tool surface: core (default, 5 tools) or advanced\n                              \
+         (full expert surface).\n    \
          {ENV_DOC_TTL_SECS}   Idle seconds before an open document is evicted from\n                              \
          memory (default {DEFAULT_DOC_TTL_SECS} = 24h; set 0 to disable).\n    \
          {ENV_MAX_DOC_BYTES}  Largest .docx open_docx will read, in bytes\n                              \
          (default {DEFAULT_MAX_DOC_BYTES} = 50 MiB; set 0 to disable).\n    \
+         {ENV_MAX_IMAGE_BYTES} Largest single image path an edit will read\n                              \
+         (default {DEFAULT_MAX_IMAGE_BYTES} = 20 MiB; set 0 to disable).\n    \
+         {ENV_MAX_IMAGE_TOTAL_BYTES} Aggregate image path bytes per edit\n                              \
+         (default {DEFAULT_MAX_IMAGE_TOTAL_BYTES} = 50 MiB; set 0 to disable).\n    \
+         {ENV_WORKSPACE_ROOT} Only filesystem tree MCP tools may read or write\n                              \
+         (default: the canonical server startup directory).\n    \
          RUST_LOG                  Log filter (default stemma_mcp=info); logs go to stderr.\n\
          \n\
          See stemma-mcp/README.md for the full tool surface and lifecycle notes.\n"
     )
 }
 
-fn ok(value: Value) -> CallToolResult {
+/// Every successful object payload names the build that produced it. Keeping
+/// this at the response boundary prevents a newly added tool from emitting an
+/// artifact or decision receipt without provenance.
+fn ok(mut value: Value) -> CallToolResult {
+    if let Value::Object(payload) = &mut value {
+        payload
+            .entry("server_version")
+            .or_insert_with(|| json!(SERVER_VERSION));
+    }
     CallToolResult::structured(value)
 }
 
@@ -917,6 +1773,50 @@ fn fail_json(mut payload: Value) -> CallToolResult {
 /// its next step (e.g. re-read the outline after a stale-edit failure).
 fn fail(code: &str, message: impl Into<String>) -> CallToolResult {
     fail_json(json!({ "code": code, "error": message.into() }))
+}
+
+fn artifact_error_code(error: &ArtifactError) -> &'static str {
+    match error {
+        ArtifactError::PathOutsideAuthority { .. } => "artifact_outside_workspace",
+        ArtifactError::OutputExists { .. } => "artifact_output_exists",
+        ArtifactError::ProtectedSource { .. } => "artifact_protected_source",
+        ArtifactError::SourceTooLarge { .. } => "artifact_source_too_large",
+        ArtifactError::PathResolution { kind: "source", .. }
+        | ArtifactError::IdentityPathNotUtf8 {
+            operation: "source",
+            ..
+        }
+        | ArtifactError::WindowsAlternateDataStream {
+            operation: "source",
+            ..
+        }
+        | ArtifactError::SourceNotFile { .. }
+        | ArtifactError::ReadOpen { .. }
+        | ArtifactError::ReadMetadata { .. }
+        | ArtifactError::Read { .. } => "artifact_read_failed",
+        _ => "artifact_commit_failed",
+    }
+}
+
+fn artifact_fail(error: ArtifactError) -> CallToolResult {
+    fail(artifact_error_code(&error), error.to_string())
+}
+
+fn attach_input_artifacts(
+    result: CallToolResult,
+    sources: Vec<ArtifactIdentity>,
+) -> CallToolResult {
+    let Some(Value::Object(mut payload)) = result.structured_content.clone() else {
+        return result;
+    };
+    payload.insert("input_artifacts".to_string(), json!(sources));
+    let value = Value::Object(payload);
+    let rebuilt = if result.is_error == Some(true) {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    };
+    rebuilt.with_meta(result.meta)
 }
 
 /// Render one block of the current document as a read-view row. Built from the
@@ -954,6 +1854,32 @@ fn block_row(view: &BlockView, tracked: &TrackedBlock) -> Value {
         "status": status_label,
         "text": view.text,
         "semantic_hash": block_semantic_hash_for_block(&tracked.block),
+    })
+}
+
+/// Mutation receipts never serialize an entire table merely because one cell
+/// paragraph changed. The table id and semantic hash prove which top-level
+/// block changed; callers can explicitly inspect it when full content is
+/// genuinely needed. Non-table rows retain the normal compact outline shape.
+fn receipt_block_row(view: &BlockView, tracked: &TrackedBlock) -> Value {
+    if !matches!(view.role, BlockRole::Table) {
+        return block_row(view, tracked);
+    }
+    let status = match &tracked.status {
+        TrackingStatus::Normal => "normal",
+        TrackingStatus::Inserted(_) => "inserted",
+        TrackingStatus::Deleted(_) => "deleted",
+        TrackingStatus::InsertedThenDeleted(_) => "inserted_then_deleted",
+    };
+    json!({
+        "id": view.id.to_string(),
+        "kind": "table",
+        "status": status,
+        "semantic_hash": block_semantic_hash_for_block(&tracked.block),
+        "cell_count": view.cells.len(),
+        "text_chars": view.text.chars().count(),
+        "content_omitted": true,
+        "inspect": "inspect_docx query=block with this id for full table content",
     })
 }
 
@@ -1051,6 +1977,26 @@ fn cap_excerpt(s: &str) -> String {
     }
 }
 
+/// A bounded excerpt centered on the case-insensitive match when possible.
+/// Find is a locator, so its excerpt must show the wording that caused the hit
+/// even when that wording occurs near the end of a long clause. Exact text is
+/// retrieved by inspecting the returned block id.
+fn match_excerpt(text: &str, needle_lower: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let lowered = text.to_lowercase();
+    let match_start = lowered
+        .find(needle_lower)
+        .map(|byte| lowered[..byte].chars().count())
+        .unwrap_or(0);
+    let needle_chars = needle_lower.chars().count().min(limit);
+    let flank = (limit - needle_chars) / 2;
+    let start = match_start.saturating_sub(flank).min(total - limit);
+    text.chars().skip(start).take(limit).collect()
+}
+
 /// Apply the [`MAX_REVISION_ROWS`] cap, returning the rows to emit and — ONLY
 /// when the cap bites — an explicit truncation report. The report is the whole
 /// point of the cap being non-silent (CLAUDE.md): it names the limit, the true
@@ -1064,6 +2010,9 @@ fn cap_revision_rows(rows: &[RevisionRow]) -> (&[RevisionRow], Option<Value>) {
         "limit": MAX_REVISION_ROWS,
         "total": rows.len(),
         "omitted": rows.len() - MAX_REVISION_ROWS,
+        "set_sha256": canonical_set_sha256(
+            &rows.iter().map(revision_row_json).collect::<Vec<_>>()
+        ),
         "advice": "narrow the result with filter.by_block_range or filter.by_author to see the omitted rows",
     });
     (&rows[..MAX_REVISION_ROWS], Some(report))
@@ -1275,6 +2224,7 @@ fn block_detail_json(block: &BlockView) -> Value {
         _ => None,
     };
     json!({
+        "detail": "formatting",
         "id": block.id.to_string(),
         "role": role_label(&block.role),
         "level": level,
@@ -1304,6 +2254,236 @@ fn block_detail_json(block: &BlockView) -> Value {
         "block_status": track_status_json(&block.block_status),
         "spans": spans,
     })
+}
+
+/// The default block-planning projection. It preserves every value needed to
+/// identify and guard an edit, including durable opaque ids that a structural
+/// paragraph replacement must carry forward. Repeated text-span formatting is
+/// intentionally absent and explicitly recoverable with `detail=formatting`.
+fn compact_block_detail_json(block: &BlockView) -> Value {
+    let anchors: Vec<Value> = block
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let SegmentView::Opaque {
+                id,
+                kind,
+                status,
+                text,
+                handle,
+                ..
+            } = segment
+            else {
+                return None;
+            };
+            Some(json!({
+                "id": id.to_string(),
+                "handle": handle.as_ref().map(|h| h.0.clone()),
+                "anchor_kind": anchor_kind_str(kind),
+                "status": track_status_json(status),
+                "text": text,
+            }))
+        })
+        .collect();
+    let level = match &block.role {
+        BlockRole::Heading { level } => Some(*level),
+        _ => None,
+    };
+    json!({
+        "detail": "compact",
+        "formatting_available": true,
+        "id": block.id.to_string(),
+        "role": role_label(&block.role),
+        "level": level,
+        "opaque_label": block.opaque_label,
+        "style": block.style_id,
+        "role_token": block.role_token,
+        "list": list_json(block.list.as_ref()),
+        "cells": cells_json(block),
+        "text": block.text,
+        "literal_prefix": block.literal_prefix,
+        "guard": block.guard,
+        "block_status": track_status_json(&block.block_status),
+        "anchors": anchors,
+    })
+}
+
+/// The bounded core projection of one top-level block. Paragraphs retain the
+/// normal compact/formatting shape. Tables replace their aggregate text and
+/// unbounded full-cell bodies with a page of addressable cell locators. Every
+/// paragraph id in a cell is returned, so exact text, anchors, and formatting
+/// remain one explicit block inspection away; the advanced `read_block`
+/// surface deliberately continues to return the complete table in one call.
+fn core_block_detail_json(
+    block: &BlockView,
+    detail: InspectBlockDetail,
+    cell_offset: Option<usize>,
+    cell_limit: Option<usize>,
+) -> Result<Value, String> {
+    let is_table = matches!(block.role, BlockRole::Table);
+    if !is_table {
+        if cell_offset.is_some() || cell_limit.is_some() {
+            return Err(format!(
+                "cell_offset/cell_limit require a table block; '{}' is a {}",
+                block.id,
+                role_label(&block.role)
+            ));
+        }
+        return Ok(match detail {
+            InspectBlockDetail::Compact => compact_block_detail_json(block),
+            InspectBlockDetail::Formatting => block_detail_json(block),
+        });
+    }
+
+    let offset = cell_offset.unwrap_or(0);
+    let limit = cell_limit.unwrap_or(DEFAULT_BLOCK_CELL_LIMIT);
+    if limit == 0 || limit > MAX_BLOCK_CELL_LIMIT {
+        return Err(format!(
+            "block cell_limit must be between 1 and {MAX_BLOCK_CELL_LIMIT}, got {limit}"
+        ));
+    }
+    let total = block.cells.len();
+    if offset > total {
+        return Err(format!(
+            "block cell_offset {offset} is beyond cell_count {total} for table '{}'",
+            block.id
+        ));
+    }
+
+    let cells: Vec<Value> = block
+        .cells
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|cell| {
+            let text_chars = cell.text.chars().count();
+            let text_excerpt: String = cell.text.chars().take(BLOCK_CELL_EXCERPT_CHARS).collect();
+            let block_ids: Vec<&str> = cell
+                .paragraphs
+                .iter()
+                .map(|paragraph| paragraph.block_id.as_str())
+                .collect();
+            json!({
+                "row": cell.row,
+                "col": cell.col,
+                "block_id": block_ids.first().copied(),
+                "block_ids": block_ids,
+                "text_excerpt": text_excerpt,
+                "text_chars": text_chars,
+                "text_truncated": text_chars > BLOCK_CELL_EXCERPT_CHARS,
+            })
+        })
+        .collect();
+    let returned = cells.len();
+    let next = offset + returned;
+    let mut result = match detail {
+        InspectBlockDetail::Compact => compact_block_detail_json(block),
+        InspectBlockDetail::Formatting => block_detail_json(block),
+    };
+    result["text"] = Value::Null;
+    result["table_text_chars"] = json!(block.text.chars().count());
+    result["table_text_omitted"] = json!(true);
+    result["cells"] = json!(cells);
+    result["cell_count"] = json!(total);
+    result["cells_offset"] = json!(offset);
+    result["cells_limit"] = json!(limit);
+    result["cells_returned"] = json!(returned);
+    result["cells_has_more"] = json!(next < total);
+    result["cells_next_offset"] = json!((next < total).then_some(next));
+    Ok(result)
+}
+
+/// Detail projection for a paragraph nested inside a table cell. The engine's
+/// top-level `DocumentView.blocks` deliberately keeps a table as one block, but
+/// edit targeting recurses into its cell paragraphs. Surface those same ids at
+/// the read edge so every advertised edit target is inspectable before use.
+fn cell_paragraph_detail_json(
+    view: &stemma::view::DocumentView,
+    target: &str,
+    detail: InspectBlockDetail,
+) -> Option<Value> {
+    for table in &view.blocks {
+        if !matches!(table.role, BlockRole::Table) {
+            continue;
+        }
+        for cell in &table.cells {
+            for paragraph in &cell.paragraphs {
+                if paragraph.block_id != target {
+                    continue;
+                }
+                let mut text = String::new();
+                for segment in &paragraph.segments {
+                    match segment {
+                        stemma::InlineChange::Unchanged { text: part, .. }
+                        | stemma::InlineChange::Inserted { text: part, .. } => text.push_str(part),
+                        stemma::InlineChange::Deleted { .. } => {}
+                        stemma::InlineChange::Opaque { text: part, .. } => {
+                            if let Some(part) = part {
+                                text.push_str(part);
+                            }
+                        }
+                    }
+                }
+                let nested_in = json!({
+                    "table_id": table.id.to_string(),
+                    "row": cell.row,
+                    "col": cell.col,
+                });
+                return Some(match detail {
+                    InspectBlockDetail::Formatting => json!({
+                        "detail": "formatting",
+                        "id": paragraph.block_id,
+                        "role": "paragraph",
+                        "nested_in": nested_in,
+                        "guard": paragraph.guard,
+                        "text": text,
+                        "segments": paragraph.segments,
+                        "server_version": SERVER_VERSION,
+                    }),
+                    InspectBlockDetail::Compact => {
+                        let anchors: Vec<Value> = paragraph
+                            .segments
+                            .iter()
+                            .filter_map(|segment| {
+                                let stemma::InlineChange::Opaque {
+                                    segment_type,
+                                    kind,
+                                    opaque_id,
+                                    text,
+                                    reference_id,
+                                    content_hash,
+                                    ..
+                                } = segment
+                                else {
+                                    return None;
+                                };
+                                Some(json!({
+                                    "id": opaque_id,
+                                    "segment_type": segment_type,
+                                    "anchor_kind": kind,
+                                    "text": text,
+                                    "reference_id": reference_id,
+                                    "content_hash": content_hash,
+                                }))
+                            })
+                            .collect();
+                        json!({
+                            "detail": "compact",
+                            "formatting_available": true,
+                            "id": paragraph.block_id,
+                            "role": "paragraph",
+                            "nested_in": nested_in,
+                            "guard": paragraph.guard,
+                            "text": text,
+                            "anchors": anchors,
+                            "server_version": SERVER_VERSION,
+                        })
+                    }
+                });
+            }
+        }
+    }
+    None
 }
 
 /// The list/numbering membership as JSON, or `null` when absent. Surfaces
@@ -1343,6 +2523,90 @@ fn cells_json(block: &BlockView) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Extended Markdown for the bounded core document projection. Prose blocks
+/// remain exact. A table is one top-level block but can contain an entire
+/// contract, so rendering its flattened aggregate would defeat block paging.
+/// Instead surface an explicit summary plus a few addressable cell previews;
+/// `query="block"` pages every cell and each returned paragraph id provides
+/// exact content. The advanced Markdown reads retain the complete projection.
+fn core_document_markdown(blocks: &[BlockView]) -> String {
+    let mut out = String::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            out.push_str("\n\n");
+        }
+        if !matches!(block.role, BlockRole::Table) {
+            out.push_str(&to_extended_markdown_blocks(std::slice::from_ref(block)));
+            continue;
+        }
+
+        // Emit the same table header contract without first materializing and
+        // discarding the engine renderer's unbounded flattened table body.
+        out.push_str(&core_table_markdown_header(block));
+        out.push('\n');
+        out.push_str(&format!(
+            "<obj id={} kind=table cells={} chars={} content=bounded/>",
+            block.id,
+            block.cells.len(),
+            block.text.chars().count()
+        ));
+        for cell in block.cells.iter().take(CORE_DOCUMENT_TABLE_CELL_PREVIEWS) {
+            let block_ids = cell
+                .paragraphs
+                .iter()
+                .map(|paragraph| paragraph.block_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let text_chars = cell.text.chars().count();
+            let excerpt: String = cell
+                .text
+                .chars()
+                .take(CORE_DOCUMENT_CELL_EXCERPT_CHARS)
+                .map(|character| match character {
+                    '\n' | '\r' => ' ',
+                    other => other,
+                })
+                .collect();
+            out.push_str(&format!(
+                "\ncell[{},{}] blocks={} chars={}: {}",
+                cell.row, cell.col, block_ids, text_chars, excerpt
+            ));
+        }
+        let omitted = block
+            .cells
+            .len()
+            .saturating_sub(CORE_DOCUMENT_TABLE_CELL_PREVIEWS);
+        if omitted > 0 {
+            out.push_str(&format!(
+                "\n<more cells={} next_offset={} inspect_block={}/>",
+                omitted, CORE_DOCUMENT_TABLE_CELL_PREVIEWS, block.id
+            ));
+        }
+    }
+    out
+}
+
+/// Header parity for a table summarized by [`core_document_markdown`]. Kept
+/// concrete instead of introducing a second generic Markdown renderer: this is
+/// the one role whose body must be bounded at the core edge.
+fn core_table_markdown_header(block: &BlockView) -> String {
+    debug_assert!(matches!(block.role, BlockRole::Table));
+    let mut header = format!("#{} role=table", block.id);
+    if let Some(style) = &block.style_id
+        && !style.is_empty()
+    {
+        header.push_str(" style=");
+        header.push_str(style);
+    }
+    match &block.block_status {
+        TrackStatus::Inserted(_) => header.push_str(" status=inserted"),
+        TrackStatus::Deleted(_) => header.push_str(" status=deleted"),
+        TrackStatus::InsertedThenDeleted { .. } => header.push_str(" status=inserted_then_deleted"),
+        TrackStatus::Normal => {}
+    }
+    header
 }
 
 // ─── Write receipts (the lean response contract) ───────────────────────────────
@@ -1673,7 +2937,7 @@ impl StemmaServer {
                     .iter()
                     .zip(snap.canonical.blocks.iter())
                     .filter(|(bv, _)| want.contains(bv.id.to_string().as_str()))
-                    .map(|(bv, tb)| block_row(bv, tb))
+                    .map(|(bv, tb)| receipt_block_row(bv, tb))
                     .collect();
                 (rows, snap.canonical.blocks.len())
             })
@@ -1688,11 +2952,30 @@ impl StemmaServer {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug)]
+struct SessionSources {
+    artifacts: Vec<ArtifactIdentity>,
+}
+
+impl SessionSources {
+    fn new(artifacts: Vec<ArtifactIdentity>) -> Self {
+        Self { artifacts }
+    }
+}
+
 #[derive(Clone)]
 struct StemmaServer {
     runtime: Arc<SimpleRuntime>,
     /// Startup configuration (TTL, size cap). Immutable for the process.
     config: Config,
+    /// Agent-controlled filesystem authority and create-new commit boundary.
+    artifacts: PathAuthority,
+    /// Exact source identities incorporated into each open document. The open
+    /// DOCX is always first; successfully applied image sources are appended.
+    source_artifacts: Arc<Mutex<HashMap<String, SessionSources>>>,
+    /// Couples image-backed runtime mutation with source registration and with
+    /// session export, preventing a save from observing only half that state.
+    artifact_session_gate: Arc<Mutex<()>>,
     /// Every `doc_id` this server has handed out from `open_docx`. The engine
     /// reports a missing handle the same way whether it was never opened or was
     /// evicted after its TTL; membership here disambiguates the two so an
@@ -1714,20 +2997,183 @@ impl StemmaServer {
         Self::with_config(Config::defaults())
     }
 
+    #[cfg(test)]
     fn with_config(config: Config) -> Self {
+        let artifacts = PathAuthority::explicit()
+            .expect("test/embedded process must have a readable current directory");
+        Self::with_config_and_authority(config, artifacts)
+    }
+
+    fn with_config_and_authority(config: Config, artifacts: PathAuthority) -> Self {
+        let tool_router = Self::router_for_profile(config.profile);
         Self {
             runtime: Arc::new(SimpleRuntime::new()),
             config,
+            artifacts,
+            source_artifacts: Arc::new(Mutex::new(HashMap::new())),
+            artifact_session_gate: Arc::new(Mutex::new(())),
             issued_doc_ids: Arc::new(Mutex::new(HashSet::new())),
             // Routers are composed with `+`. Each parallel stream contributes
             // its own named router; the base `tool_router()` carries the core
             // open/read/edit/save tools, `read_projections_router()` the
             // read-surface projections.
-            tool_router: Self::tool_router()
-                + Self::read_projections_router()
-                + Self::read_index_router()
-                + Self::agentic_router(),
+            tool_router,
         }
+    }
+
+    fn router_for_profile(profile: ToolProfile) -> ToolRouter<Self> {
+        let mut router = Self::tool_router()
+            + Self::read_projections_router()
+            + Self::read_index_router()
+            + Self::agentic_router();
+        if profile == ToolProfile::Core {
+            let names: Vec<String> = router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect();
+            for name in names {
+                if !CORE_TOOLS.contains(&name.as_str()) {
+                    router.disable_route(name);
+                }
+            }
+        }
+        for name in CORE_TOOLS {
+            let route = router
+                .map
+                .get_mut(*name)
+                .unwrap_or_else(|| panic!("core tool route is missing: {name}"));
+            let schema = Value::Object(route.attr.input_schema.as_ref().clone());
+            let schema = inline_local_schema_refs(schema)
+                .unwrap_or_else(|error| panic!("invalid schema for core tool {name}: {error}"));
+            let schema = schema
+                .as_object()
+                .unwrap_or_else(|| panic!("core tool schema is not an object: {name}"))
+                .clone();
+            route.attr.input_schema = Arc::new(schema);
+        }
+        router
+    }
+
+    fn max_doc_bytes(&self) -> Option<u64> {
+        (self.config.max_doc_bytes > 0).then_some(self.config.max_doc_bytes)
+    }
+
+    fn max_image_bytes(&self) -> Option<u64> {
+        (self.config.max_image_bytes > 0).then_some(self.config.max_image_bytes)
+    }
+
+    fn max_image_total_bytes(&self) -> Option<u64> {
+        (self.config.max_image_total_bytes > 0).then_some(self.config.max_image_total_bytes)
+    }
+
+    fn read_source(
+        &self,
+        path: &str,
+        role: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<ReadArtifact, CallToolResult> {
+        self.artifacts
+            .read_source(path, role, max_bytes)
+            .map_err(artifact_fail)
+    }
+
+    fn missing_source_state(doc_id: &str) -> CallToolResult {
+        fail_json(json!({
+            "code": "artifact_session_state_missing",
+            "error": format!(
+                "doc_id '{doc_id}' is open but its protected source identity state is missing. \
+                 Refusing persistence; re-open the document with open_docx."
+            ),
+            "doc_id": doc_id,
+        }))
+    }
+
+    fn protected_sources(&self, doc_id: &str) -> Result<Vec<ArtifactIdentity>, CallToolResult> {
+        let artifacts = self
+            .source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned")
+            .get(doc_id)
+            .map(|session| session.artifacts.clone());
+        match artifacts {
+            Some(artifacts) if !artifacts.is_empty() => Ok(artifacts),
+            _ => Err(Self::missing_source_state(doc_id)),
+        }
+    }
+
+    fn record_sources(
+        &self,
+        doc_id: &str,
+        sources: Vec<ArtifactIdentity>,
+    ) -> Result<(), CallToolResult> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let mut sessions = self
+            .source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned");
+        let Some(session) = sessions.get_mut(doc_id) else {
+            return Err(Self::missing_source_state(doc_id));
+        };
+        if session.artifacts.is_empty() {
+            return Err(Self::missing_source_state(doc_id));
+        }
+        for source in sources {
+            let duplicate = session.artifacts.iter().any(|existing| {
+                existing.resolved_path == source.resolved_path
+                    && existing.bytes == source.bytes
+                    && existing.digest == source.digest
+            });
+            if !duplicate {
+                session.artifacts.push(source);
+            }
+        }
+        Ok(())
+    }
+
+    fn evict_expired_sessions(&self, ttl_secs: u64) {
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        self.runtime.evict_expired(ttl_secs);
+        self.source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned")
+            .retain(|doc_id, _| self.runtime.contains_handle(&DocHandle(doc_id.clone())));
+    }
+
+    fn apply_edit_with_sources(
+        &self,
+        handle: &DocHandle,
+        txn: &stemma::edit::EditTransaction,
+        allow_existing_author: bool,
+        sources: Vec<ArtifactIdentity>,
+    ) -> CallToolResult {
+        if sources.is_empty() {
+            return self.apply_edit_receipt(handle, txn, allow_existing_author);
+        }
+
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        if !self.runtime.contains_handle(handle) {
+            return self.apply_edit_receipt(handle, txn, allow_existing_author);
+        }
+        if let Err(failure) = self.protected_sources(&handle.0) {
+            return failure;
+        }
+        let (result, applied) = self.apply_edit_receipt_outcome(handle, txn, allow_existing_author);
+        if applied {
+            if let Err(failure) = self.record_sources(&handle.0, sources.clone()) {
+                return failure;
+            }
+            return attach_input_artifacts(result, sources);
+        }
+        result
     }
 
     /// Upgrade an ambiguous "doc handle not found" tool error into an
@@ -1759,6 +3205,14 @@ impl StemmaServer {
         let Some(doc_id) = referenced_doc_id else {
             return result;
         };
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        self.source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned")
+            .remove(doc_id);
         let issued = self
             .issued_doc_ids
             .lock()
@@ -1814,50 +3268,159 @@ impl StemmaServer {
                 )
             })
     }
+
+    /// A bounded page of the structural index used by the compact core. The
+    /// page contract is explicit (`returned`, `has_more`, `next_offset`), so a
+    /// large document never turns an omitted query into a silent truncation or
+    /// a multi-hundred-kilobyte history entry.
+    fn core_index_page(
+        &self,
+        doc_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, CallToolResult> {
+        if limit == 0 || limit > MAX_CORE_INDEX_LIMIT {
+            return Err(fail(
+                "invalid_argument",
+                format!("index limit must be between 1 and {MAX_CORE_INDEX_LIMIT}, got {limit}"),
+            ));
+        }
+        let handle = DocHandle(doc_id.to_string());
+        let outline = self
+            .runtime
+            .with(&handle, |snap| {
+                let view = build_document_view(snap);
+                stemma::view::build_outline(&view)
+            })
+            .map_err(|e| {
+                fail(
+                    &format!("{:?}", e.code),
+                    format!("doc not open: {}", e.message),
+                )
+            })?;
+        if offset > outline.total_blocks {
+            return Err(fail(
+                "InvalidRange",
+                format!(
+                    "index offset {offset} is beyond total_blocks {} in doc '{doc_id}'",
+                    outline.total_blocks
+                ),
+            ));
+        }
+        let end = offset.saturating_add(limit).min(outline.total_blocks);
+        let entries: Vec<Value> = outline.entries[offset..end]
+            .iter()
+            .map(outline_entry_json)
+            .collect();
+        let has_more = end < outline.total_blocks;
+        Ok(json!({
+            "doc_id": doc_id,
+            "total_blocks": outline.total_blocks,
+            "total_chars": outline.total_chars,
+            "offset": offset,
+            "limit": limit,
+            "returned": entries.len(),
+            "has_more": has_more,
+            "next_offset": has_more.then_some(end),
+            "entries": entries,
+            "server_version": SERVER_VERSION,
+        }))
+    }
+
+    /// A bounded page of id-bearing extended Markdown. Paging is by top-level
+    /// block, matching the index's stable document order. The complete
+    /// projection remains retrievable without injecting the entire document
+    /// into every later model turn.
+    fn core_document_page(
+        &self,
+        doc_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, CallToolResult> {
+        if limit == 0 || limit > MAX_CORE_INDEX_LIMIT {
+            return Err(fail(
+                "invalid_argument",
+                format!("document limit must be between 1 and {MAX_CORE_INDEX_LIMIT}, got {limit}"),
+            ));
+        }
+        let handle = DocHandle(doc_id.to_string());
+        self.runtime
+            .with(&handle, |snap| {
+                let view = build_document_view(snap);
+                let total = view.blocks.len();
+                if offset > total {
+                    return Err(fail(
+                        "InvalidRange",
+                        format!(
+                            "document offset {offset} is beyond total_blocks {total} in doc '{doc_id}'"
+                        ),
+                    ));
+                }
+                let end = offset.saturating_add(limit).min(total);
+                let has_more = end < total;
+                Ok(json!({
+                    "doc_id": doc_id,
+                    "content": core_document_markdown(&view.blocks[offset..end]),
+                    "tables_bounded": true,
+                    "table_cell_preview_limit": CORE_DOCUMENT_TABLE_CELL_PREVIEWS,
+                    "total_blocks": total,
+                    "offset": offset,
+                    "limit": limit,
+                    "returned": end - offset,
+                    "has_more": has_more,
+                    "next_offset": has_more.then_some(end),
+                    "server_version": SERVER_VERSION,
+                }))
+            })
+            .map_err(|e| {
+                fail(
+                    &format!("{:?}", e.code),
+                    format!("doc not open: {}", e.message),
+                )
+            })?
+    }
 }
 
 #[tool_router]
 impl StemmaServer {
     #[tool(
         description = "Open a .docx file into the engine. Returns a doc_id, block_count, \
-                       total_chars, server_version, and a COMPACT structural index: one \
-                       lightweight row per block (id, index, role, heading depth, a 120-char \
+                       total_chars, server_version, and the first 16 rows of a PAGED compact \
+                       structural index (id, index, role, heading depth, a 120-char \
                        text preview, char/byte length, tracked status, role_token, list \
-                       membership). This is the navigation tier — scan it for the block ids to \
-                       edit, then read_block / read_outline for full text + semantic_hash, or \
-                       read_markdown to understand the document. open_docx deliberately does \
-                       NOT echo full block text (that would overflow tool-result limits on a \
-                       large document)."
+                       membership), plus returned/has_more/next_offset. Prefer inspect_docx \
+                       query='find' for known wording or query='index' with offset/limit for \
+                       another page; do not request every page as a substitute for find/window. \
+                       open_docx deliberately does not echo an unbounded document projection."
     )]
     async fn open_docx(&self, Parameters(args): Parameters<OpenArgs>) -> CallToolResult {
-        // Enforce the size cap on the file's metadata BEFORE reading it into
-        // memory, so an oversized file is refused without ever being buffered.
-        if self.config.max_doc_bytes > 0 {
-            match std::fs::metadata(&args.path) {
-                Ok(meta) if meta.len() > self.config.max_doc_bytes => {
+        // The artifact boundary checks the metadata cap before buffering and
+        // checks it again while reading, so growth during the read also refuses.
+        let source =
+            match self
+                .artifacts
+                .read_source(&args.path, "input_docx", self.max_doc_bytes())
+            {
+                Ok(source) => source,
+                Err(ArtifactError::SourceTooLarge { size, limit, .. }) => {
                     return fail_json(json!({
                         "code": "doc_too_large",
                         "error": format!(
                             "'{}' is {} bytes, over the {}-byte open limit. Raise \
                              {ENV_MAX_DOC_BYTES} to open larger files (or set it to 0 to \
                              disable the cap).",
-                            args.path, meta.len(), self.config.max_doc_bytes,
+                            args.path, size, limit,
                         ),
                         "path": args.path,
-                        "size_bytes": meta.len(),
-                        "limit_bytes": self.config.max_doc_bytes,
+                        "size_bytes": size,
+                        "limit_bytes": limit,
                         "env_var": ENV_MAX_DOC_BYTES,
                     }));
                 }
-                Ok(_) => {}
-                Err(e) => return fail("io_error", format!("cannot stat {}: {e}", args.path)),
-            }
-        }
-        let bytes = match std::fs::read(&args.path) {
-            Ok(b) => b,
-            Err(e) => return fail("io_error", format!("cannot read {}: {e}", args.path)),
-        };
-        let import = match self.runtime.import_docx(&bytes) {
+                Err(error) => return artifact_fail(error),
+            };
+        let input_artifact = source.identity().clone();
+        let import = match self.runtime.import_docx(source.bytes()) {
             Ok(r) => r,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
@@ -1868,23 +3431,17 @@ impl StemmaServer {
             .lock()
             .expect("issued_doc_ids mutex poisoned")
             .insert(doc_id.clone());
-        // Return the COMPACT structural index (the navigation tier), not the
-        // heavy per-block outline (id + role + 120-char preview + length per
-        // row, vs the full row with text + semantic_hash + cells). On the
-        // 102-block document the heavy outline was ~50KB and tripped the host's
-        // truncation limit, spilling to a temp file the agent then had to grep
-        // for its own doc_id. The
-        // compact index keeps open_docx inside tool-result limits; read_outline /
-        // read_block pull the heavy rows on demand.
-        let handle = DocHandle(doc_id.clone());
-        let outline = match self.runtime.with(&handle, |snap| {
-            let view = build_document_view(snap);
-            stemma::view::build_outline(&view)
-        }) {
-            Ok(o) => o,
-            Err(e) => return fail(&format!("{:?}", e.code), e.message),
+        self.source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned")
+            .insert(
+                doc_id.clone(),
+                SessionSources::new(vec![input_artifact.clone()]),
+            );
+        let page = match self.core_index_page(&doc_id, 0, DEFAULT_CORE_INDEX_LIMIT) {
+            Ok(page) => page,
+            Err(failure) => return failure,
         };
-        let index: Vec<Value> = outline.entries.iter().map(outline_entry_json).collect();
         // The document's origin authors (the existing redline's authors, off
         // limits to the impersonation guard) are captured by the engine
         // itself at import time — see `EditSnapshot::guard_author` /
@@ -1892,10 +3449,16 @@ impl StemmaServer {
         // needed here.
         ok(json!({
             "doc_id": doc_id,
-            "block_count": outline.total_blocks,
-            "total_chars": outline.total_chars,
+            "block_count": page["total_blocks"],
+            "total_chars": page["total_chars"],
             "server_version": SERVER_VERSION,
-            "index": index,
+            "input_artifact": input_artifact,
+            "index": page["entries"],
+            "index_offset": page["offset"],
+            "index_limit": page["limit"],
+            "index_returned": page["returned"],
+            "index_has_more": page["has_more"],
+            "index_next_offset": page["next_offset"],
         }))
     }
 
@@ -1960,6 +3523,9 @@ impl StemmaServer {
                 .iter()
                 .find(|b| b.id.to_string() == target)
                 .map(block_detail_json)
+                .or_else(|| {
+                    cell_paragraph_detail_json(&view, &target, InspectBlockDetail::Formatting)
+                })
         });
         match result {
             Ok(Some(detail)) => ok(detail),
@@ -1976,33 +3542,112 @@ impl StemmaServer {
 
     #[tool(
         description = "Find blocks whose visible text contains `pattern` (case-insensitive). \
-                       Returns matching block ids with role, text, role_token, list membership, \
-                       and (for table matches) the table's cells ([{row, col, text}]) so a \
-                       phrase inside a table resolves to a cell address for set_cell_text. Use \
-                       this when you know the wording but not the block id."
+                       Returns matching block ids with role, a match-centered text excerpt of at \
+                       most 240 characters, exact text length, role_token, list membership, \
+                       and (for table matches) a PAGED matching_cells locator list as \
+                       [{row,col,block_id,text_excerpt,text_chars,text_truncated}]. Each table \
+                       returns at most 4 cells by default plus its true matching_cell_count, \
+                       returned/has_more/next_offset; pass cell_offset/cell_limit (maximum 64) \
+                       to retrieve the rest. Inspect a returned cell block_id for exact text, \
+                       anchors, or formatting. Use \
+                       this when you know the wording but not the block id; inspect a returned \
+                       block id for exact full text."
     )]
     async fn find(&self, Parameters(args): Parameters<FindArgs>) -> CallToolResult {
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(DEFAULT_FIND_LIMIT);
+        let cell_offset = args.cell_offset.unwrap_or(0);
+        let cell_limit = args.cell_limit.unwrap_or(DEFAULT_FIND_CELL_LIMIT);
+        if limit == 0 || limit > MAX_FIND_LIMIT {
+            return fail(
+                "invalid_argument",
+                format!("find limit must be between 1 and {MAX_FIND_LIMIT}, got {limit}"),
+            );
+        }
+        if cell_limit == 0 || cell_limit > MAX_FIND_CELL_LIMIT {
+            return fail(
+                "invalid_argument",
+                format!(
+                    "find cell_limit must be between 1 and {MAX_FIND_CELL_LIMIT}, got {cell_limit}"
+                ),
+            );
+        }
         let handle = DocHandle(args.doc_id.clone());
         let needle = args.pattern.to_lowercase();
         let result = self.runtime.with(&handle, move |snap| {
             let view = build_document_view(snap);
             let mut matches = Vec::new();
             for b in &view.blocks {
+                let is_table = matches!(b.role, BlockRole::Table);
+                let all_matching_cells: Vec<_> = if is_table {
+                    b.cells
+                        .iter()
+                        .filter(|cell| cell.text.to_lowercase().contains(&needle))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let matching_cell_count = all_matching_cells.len();
+                let matching_cells: Vec<Value> = all_matching_cells
+                    .into_iter()
+                    .skip(cell_offset)
+                    .take(cell_limit)
+                    .map(|cell| {
+                        let text_chars = cell.text.chars().count();
+                        let text_excerpt =
+                            match_excerpt(&cell.text, &needle, FIND_CELL_EXCERPT_CHARS);
+                        json!({
+                            "row": cell.row,
+                            "col": cell.col,
+                            "block_id": cell.paragraphs.first().map(|p| p.block_id.as_str()),
+                            "text_excerpt": text_excerpt,
+                            "text_chars": text_chars,
+                                "text_truncated": text_chars > FIND_CELL_EXCERPT_CHARS,
+                        })
+                    })
+                    .collect();
+                let matching_cells_returned = matching_cells.len();
+                let matching_cells_next = cell_offset + matching_cells_returned;
+                let text_chars = b.text.chars().count();
                 // Common block fields, shared by a text match and any anchor
                 // match in this block.
                 let base = |matched_in: &str| {
-                    json!({
+                    let mut row = json!({
                         "id": b.id.to_string(),
                         "role": role_label(&b.role),
-                        "text": b.text,
                         // So a phrase found inside a table resolves to a cell
                         // address, and a phrase in a list paragraph carries its
                         // list membership.
                         "role_token": b.role_token,
                         "list": list_json(b.list.as_ref()),
-                        "cells": cells_json(b),
                         "matched_in": matched_in,
-                    })
+                    });
+                    // Keep each role's locator honest and minimal: tables need
+                    // cell continuation, paragraphs need a match-centered
+                    // excerpt. Neither carries irrelevant empty fields from
+                    // the other shape.
+                    row["text"] = Value::Null;
+                    if is_table {
+                        row["table_text_omitted"] = json!(true);
+                        row["matching_cells"] = json!(matching_cells);
+                        row["matching_cell_count"] = json!(matching_cell_count);
+                        row["matching_cells_offset"] = json!(cell_offset);
+                        row["matching_cells_limit"] = json!(cell_limit);
+                        row["matching_cells_returned"] = json!(matching_cells_returned);
+                        row["matching_cells_has_more"] =
+                            json!(matching_cells_next < matching_cell_count);
+                        row["matching_cells_next_offset"] = json!(
+                            (matching_cells_next < matching_cell_count)
+                                .then_some(matching_cells_next)
+                        );
+                    } else {
+                        row["text_excerpt"] =
+                            json!(match_excerpt(&b.text, &needle, FIND_TEXT_EXCERPT_CHARS));
+                        row["text_chars"] = json!(text_chars);
+                        row["text_truncated"] = json!(text_chars > FIND_TEXT_EXCERPT_CHARS);
+                        row["text_omitted"] = json!(true);
+                    }
+                    row
                 };
                 // Existing behavior, unchanged except for the additive
                 // `matched_in: "text"` tag.
@@ -2022,9 +3667,30 @@ impl StemmaServer {
             matches
         });
         match result {
-            Ok(matches) => ok(json!({
-                "pattern": args.pattern, "count": matches.len(), "matches": matches,
-            })),
+            Ok(matches) => {
+                let total = matches.len();
+                if offset > total {
+                    return fail(
+                        "invalid_argument",
+                        format!("find offset {offset} exceeds total match count {total}"),
+                    );
+                }
+                let page: Vec<Value> = matches.into_iter().skip(offset).take(limit).collect();
+                let returned = page.len();
+                let next = offset + returned;
+                ok(json!({
+                    "pattern": args.pattern,
+                    "count": total,
+                    "matches": page,
+                    "offset": offset,
+                    "limit": limit,
+                    "returned": returned,
+                    "has_more": next < total,
+                    "next_offset": if next < total { Some(next) } else { None },
+                    "cell_offset": cell_offset,
+                    "cell_limit": cell_limit,
+                }))
+            }
             Err(e) => fail(
                 &format!("{:?}", e.code),
                 format!("doc not open: {}", e.message),
@@ -2099,26 +3765,45 @@ impl StemmaServer {
                        actionable: re-read the outline and retry."
     )]
     async fn apply_edit(&self, Parameters(args): Parameters<ApplyEditArgs>) -> CallToolResult {
+        let submitted_operations = args.transaction.operation_count();
         let txn_json = args.transaction.to_json_string();
         // Resolve any image `path` alternative to `bytes_base64` before parsing.
-        let txn_json = match resolve_image_paths(&txn_json) {
-            Ok(s) => s,
-            Err(f) => return f,
+        let (txn_json, image_sources) = match resolve_image_paths(
+            &self.artifacts,
+            &txn_json,
+            self.max_image_bytes(),
+            self.max_image_total_bytes(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(f) => {
+                return attach_known_transaction_outcomes(f, submitted_operations, false);
+            }
         };
 
         // Parse + schema-validate at the edge (parse_transaction does both).
         let v4 = match parse_transaction(&txn_json) {
             Ok(v) => v,
             Err(e) => {
-                return fail(
-                    "schema_error",
-                    augment_schema_error(&txn_json, &e.to_string()),
+                return attach_known_transaction_outcomes(
+                    fail(
+                        "schema_error",
+                        augment_schema_error(&txn_json, &e.to_string()),
+                    ),
+                    submitted_operations,
+                    false,
                 );
             }
         };
+        let operation_count = v4.ops.len();
         let mut txn = match v4.into_edit_transaction() {
             Ok(t) => t,
-            Err(e) => return fail("adapter_error", e.to_string()),
+            Err(e) => {
+                return attach_transaction_outcomes(
+                    fail("adapter_error", e.to_string()),
+                    operation_count,
+                    false,
+                );
+            }
         };
 
         // Per-call mode override, parsed at the edge with no silent fallback.
@@ -2127,11 +3812,19 @@ impl StemmaServer {
         match parse_materialization_mode(&args.mode) {
             Ok(Some(m)) => txn.materialization_mode = m,
             Ok(None) => {}
-            Err(msg) => return fail("invalid_argument", msg),
+            Err(msg) => {
+                return attach_transaction_outcomes(
+                    fail("invalid_argument", msg),
+                    operation_count,
+                    false,
+                );
+            }
         }
 
         let handle = DocHandle(args.doc_id.clone());
-        self.apply_edit_receipt(&handle, &txn, args.allow_existing_author)
+        let result =
+            self.apply_edit_with_sources(&handle, &txn, args.allow_existing_author, image_sources);
+        attach_transaction_outcomes(result, operation_count, false)
     }
 
     /// Apply a transaction and build the lean write receipt: status, the
@@ -2149,6 +3842,18 @@ impl StemmaServer {
         txn: &stemma::edit::EditTransaction,
         allow_existing_author: bool,
     ) -> CallToolResult {
+        self.apply_edit_receipt_outcome(handle, txn, allow_existing_author)
+            .0
+    }
+
+    /// As `apply_edit_receipt`, plus whether the runtime mutation committed.
+    /// The boolean remains true if only post-apply receipt construction fails.
+    fn apply_edit_receipt_outcome(
+        &self,
+        handle: &DocHandle,
+        txn: &stemma::edit::EditTransaction,
+        allow_existing_author: bool,
+    ) -> (CallToolResult, bool) {
         // Capture the pre-edit canonical so the receipt can name exactly which
         // blocks changed (honest before/after structural diff) and which
         // revision ids are newly created.
@@ -2158,13 +3863,22 @@ impl StemmaServer {
         {
             Ok(c) => c,
             Err(e) => {
-                return fail(
-                    &format!("{:?}", e.code),
-                    format!("doc not open: {}", e.message),
+                return (
+                    fail(
+                        &format!("{:?}", e.code),
+                        format!("doc not open: {}", e.message),
+                    ),
+                    false,
                 );
             }
         };
-        let max_before = stemma::max_revision_id(&before);
+        // Semantic identities are deterministic record keys, not counters.
+        // Capture the exact pre-edit set so the receipt can report the
+        // after-minus-before set without assuming numeric ordering.
+        let before_revision_ids: HashSet<u32> = revision_rows(&before)
+            .iter()
+            .map(|r| r.revision_id)
+            .collect();
 
         match self
             .runtime
@@ -2172,14 +3886,10 @@ impl StemmaServer {
         {
             Ok(result) => {
                 let changed = changed_block_ids(&before, &result.canonical);
-                // The transaction stamps new revisions sequentially from
-                // max_before+1 — but not every stamped id SURVIVES: the
-                // whole-paragraph diff/normalize can drop a stamped segment,
-                // leaving a gap in the range (a multi-op transaction exposed a
-                // phantom id this way; the raw-range form over-reported it).
-                // So enumerate the AFTER-doc's actually-present revisions with
-                // the SAME walk list_revisions uses and keep the ids above
-                // max_before: receipt == read surface by construction.
+                // Enumerate the AFTER-doc's actually-present revisions with the
+                // SAME walk list_revisions uses and subtract the captured set:
+                // receipt == read surface by construction, with no counter or
+                // watermark assumption.
                 let revision_ids = match self
                     .runtime
                     .with(&handle.clone(), |snap| revision_rows(&snap.canonical))
@@ -2188,58 +3898,97 @@ impl StemmaServer {
                         let mut ids: Vec<u32> = rows
                             .iter()
                             .map(|r| r.revision_id)
-                            .filter(|id| *id > max_before)
+                            .filter(|id| !before_revision_ids.contains(id))
                             .collect();
                         ids.sort_unstable();
                         ids.dedup();
                         ids
                     }
                     Err(e) => {
-                        return fail(
-                            &format!("{:?}", e.code),
-                            format!("doc not open after edit: {}", e.message),
+                        return (
+                            fail(
+                                &format!("{:?}", e.code),
+                                format!("doc not open after edit: {}", e.message),
+                            ),
+                            result.applied,
                         );
                     }
                 };
                 let (changed_blocks, block_count) =
                     match self.changed_block_rows(&handle.0, &changed) {
                         Ok(v) => v,
-                        Err(r) => return r,
+                        Err(r) => return (r, result.applied),
                     };
                 let moves = move_receipts(&before, &result.canonical);
                 let table_rows_changed = table_receipts(&before, &result.canonical);
-                ok(json!({
-                    "applied": result.applied,
-                    "doc_id": handle.0,
-                    "revision_ids": revision_ids,
-                    "changed_block_ids": changed,
-                    "changed_blocks": changed_blocks,
-                    "block_count": block_count,
-                    // Neighborhood receipt for any move(s) this transaction
-                    // performed — empty when none did. See `move_receipts`.
-                    "moves": moves,
-                    // Fresh row inserts/deletes any table_op made this
-                    // transaction — empty when none did. See `table_receipts`.
-                    "table_receipts": table_rows_changed,
-                    "server_version": SERVER_VERSION,
-                }))
+                (
+                    ok(Self::bounded_transaction_receipt(json!({
+                        "applied": result.applied,
+                        "doc_id": handle.0,
+                        "revision_ids": revision_ids,
+                        "changed_block_ids": changed,
+                        "changed_blocks": changed_blocks,
+                        "block_count": block_count,
+                        // Neighborhood receipt for any move(s) this transaction
+                        // performed — empty when none did. See `move_receipts`.
+                        "moves": moves,
+                        // Fresh row inserts/deletes any table_op made this
+                        // transaction — empty when none did. See `table_receipts`.
+                        "table_receipts": table_rows_changed,
+                        "server_version": SERVER_VERSION,
+                    }))),
+                    result.applied,
+                )
             }
             // The engine's RuntimeError carries an actionable message and a code
             // (e.g. StaleEdit, OpaqueDestroyed, AnchorNotFound, NoOpEdit).
-            Err(e) => fail_json(json!({
-                "code": format!("{:?}", e.code),
-                "error": e.message,
-                "details": format!("{:?}", e.details),
-            })),
+            Err(e) => (
+                fail_json(json!({
+                    "code": format!("{:?}", e.code),
+                    "error": e.message,
+                    "details": format!("{:?}", e.details),
+                })),
+                false,
+            ),
         }
     }
 
     #[tool(
         description = "Export an open document to a .docx file at the given path, \
-                       including any tracked changes applied. Returns bytes written."
+                       including any tracked changes applied. Runs a fresh session audit and the \
+                       blocking serialization gate before commit. Returns exact input/output \
+                       identities, an audit decision commitment, validation result, and final \
+                       deliverability verdict."
     )]
     async fn save_docx(&self, Parameters(args): Parameters<SaveArgs>) -> CallToolResult {
         let handle = DocHandle(args.doc_id.clone());
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        // Bind the save to a fresh audit of this exact in-memory generation.
+        // Audit detail stays out of the save receipt; its exact decision counts,
+        // verdict, and commitment remain inline below.
+        let audit_report = match self.runtime.review_session(&handle) {
+            Ok(report) => report,
+            Err(error) => return fail(&format!("{:?}", error.code), error.message),
+        };
+        let baseline_bytes = match self.runtime.session_source_bytes(&handle) {
+            Ok(bytes) => bytes,
+            Err(error) => return fail(&format!("{:?}", error.code), error.message),
+        };
+        let mut audit = audit_report_json(&audit_report, None, None, None)
+            .expect("default audit page coordinates are valid");
+        attach_baseline_validation(
+            &mut audit,
+            &stemma::api::validate(&baseline_bytes),
+            &audit_report.validator,
+        );
+        let audit_decision = json!({
+            "counts": audit["counts"],
+            "verdict": audit["verdict"],
+        });
+        let audit_set_sha256 = canonical_set_sha256(std::slice::from_ref(&audit_decision));
         let bytes = match self.runtime.export_docx(&handle, ExportMode::Redline) {
             Ok(b) => b,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
@@ -2250,10 +3999,41 @@ impl StemmaServer {
         if let Err(e) = stemma::gate_serialized_bytes(&bytes, stemma::ValidatorLevel::Blocking) {
             return fail(&format!("{:?}", e.code), e.message);
         }
-        if let Err(e) = std::fs::write(&args.path, &bytes) {
-            return fail("io_error", format!("cannot write {}: {e}", args.path));
-        }
-        ok(json!({ "path": args.path, "bytes_written": bytes.len() }))
+        let input_artifacts = match self.protected_sources(&args.doc_id) {
+            Ok(artifacts) => artifacts,
+            Err(failure) => return failure,
+        };
+        let output_artifact =
+            match self
+                .artifacts
+                .commit_new(&args.path, "output_docx", &bytes, &input_artifacts)
+            {
+                Ok(output) => output,
+                Err(error) => return artifact_fail(error),
+            };
+        let audit_deliverable = audit["verdict"]["deliverable"] == true;
+        let final_status = if audit_deliverable {
+            "pass"
+        } else {
+            "review_required"
+        };
+        ok(json!({
+            "path": args.path,
+            "bytes_written": bytes.len(),
+            "input_artifacts": input_artifacts,
+            "output_artifact": output_artifact,
+            "audit_binding": {
+                "doc_id": args.doc_id,
+                "scope": "open_session_to_saved_output",
+                "output_sha256": output_artifact.identity.digest.hex.clone(),
+                "set_sha256": audit_set_sha256,
+                "counts": audit_decision["counts"],
+                "verdict": audit_decision["verdict"],
+            },
+            "validation": {"level": "blocking", "ok": true},
+            "verdict": {"status": final_status, "deliverable": audit_deliverable},
+            "server_version": SERVER_VERSION,
+        }))
     }
 
     #[tool(
@@ -2262,18 +4042,20 @@ impl StemmaServer {
                        number of detected changes."
     )]
     async fn compare_docx(&self, Parameters(args): Parameters<CompareArgs>) -> CallToolResult {
-        let base = match read_or_fail(&args.base_path) {
-            Ok(b) => b,
-            Err(r) => return r,
+        let base = match self.read_source(&args.base_path, "base_docx", self.max_doc_bytes()) {
+            Ok(source) => source,
+            Err(failure) => return failure,
         };
-        let target = match read_or_fail(&args.target_path) {
-            Ok(b) => b,
-            Err(r) => return r,
+        let target = match self.read_source(&args.target_path, "target_docx", self.max_doc_bytes())
+        {
+            Ok(source) => source,
+            Err(failure) => return failure,
         };
-        let (base_import, target_import) = match self.runtime.import_docx_pair(&base, &target) {
-            Ok(pair) => pair,
-            Err(e) => return fail(&format!("{:?}", e.code), e.message),
-        };
+        let (base_import, target_import) =
+            match self.runtime.import_docx_pair(base.bytes(), target.bytes()) {
+                Ok(pair) => pair,
+                Err(e) => return fail(&format!("{:?}", e.code), e.message),
+            };
         let meta = TransactionMeta {
             author: args.author.unwrap_or_else(|| "stemma".to_string()),
             reason: None,
@@ -2293,13 +4075,23 @@ impl StemmaServer {
         {
             return fail(&format!("{:?}", e.code), e.message);
         }
-        if let Err(e) = std::fs::write(&args.out_path, &result.redline_bytes) {
-            return fail("io_error", format!("cannot write {}: {e}", args.out_path));
-        }
+        let input_artifacts = vec![base.identity().clone(), target.identity().clone()];
+        let output_artifact = match self.artifacts.commit_new(
+            &args.out_path,
+            "output_redline",
+            &result.redline_bytes,
+            &input_artifacts,
+        ) {
+            Ok(output) => output,
+            Err(error) => return artifact_fail(error),
+        };
         ok(json!({
             "out_path": args.out_path,
             "change_count": result.diff.changes.len(),
             "bytes_written": result.redline_bytes.len(),
+            "input_artifacts": input_artifacts,
+            "output_artifact": output_artifact,
+            "server_version": SERVER_VERSION,
         }))
     }
 
@@ -2408,6 +4200,7 @@ impl StemmaServer {
             materialization_mode: stemma::edit::MaterializationMode::TrackedChange,
             revision: stemma::RevisionInfo {
                 revision_id: 0,
+                identity: 0,
                 author: Some("stemma".to_string()),
                 date: None,
                 apply_op_id: None,
@@ -2521,8 +4314,10 @@ impl StemmaServer {
                 // falling back to read_block/apply_edit ceremony. A genuinely
                 // absent needle yields an empty diagnosis (no speculative advice).
                 let base = format!(
-                    "expected {} match(es) but found {actual}; pass expected_matches to \
-                     confirm, narrow scope, or use \"all\"",
+                    "expected {} match(es) but found {actual}; if one site is intended, \
+                     narrow the target (longer old text, or scope:{{block_id}} from the \
+                     listed matches) — raise expected_matches or use \"all\" only after \
+                     verifying every listed match is intended",
                     expected_matches_label(&expected)
                 );
                 let error = if diagnosis.is_empty() {
@@ -2574,13 +4369,15 @@ impl StemmaServer {
             materialization_mode: stemma::edit::MaterializationMode::TrackedChange,
             revision: stemma::RevisionInfo {
                 revision_id: 0,
+                identity: 0,
                 author: Some(options.author.clone()),
                 date: None,
                 apply_op_id: None,
             },
         };
 
-        let unreached = unreached_cells_json(&canonical, &options.old, options.match_mode);
+        let unreached =
+            unreached_cells_json(&canonical, &options.old, options.match_mode, &options.scope);
         let mut receipt =
             self.apply_edit_receipt(&handle, &transaction, args.allow_existing_author);
         attach_field(&mut receipt, "match_count", json!(match_count));
@@ -2605,7 +4402,9 @@ impl StemmaServer {
                        still apply. Returns {applied, failed, items:[{index, old, status, \
                        match_count, changed_blocks | error, ...}]}. Use this instead of N \
                        replace_text round trips whenever you have more than one phrase to \
-                       change.")]
+                       change. preview=true runs the same ordered, non-atomic semantics on a \
+                       throwaway snapshot: successful items feed later planning but nothing \
+                       persists.")]
     async fn replace_text_batch(
         &self,
         Parameters(args): Parameters<ReplaceTextBatchArgs>,
@@ -2617,10 +4416,24 @@ impl StemmaServer {
             return fail("invalid_argument", "replacements must be a non-empty list");
         }
 
+        let submitted = args.replacements.len();
         let handle = DocHandle(args.doc_id.clone());
         let mut items: Vec<Value> = Vec::with_capacity(args.replacements.len());
         let mut applied = 0usize;
         let mut failed = 0usize;
+        let mut preview_snapshot = if args.preview {
+            match self.runtime.with(&handle, Clone::clone) {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    return fail(
+                        &format!("{:?}", e.code),
+                        format!("doc not open: {}", e.message),
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         for (index, item) in args.replacements.into_iter().enumerate() {
             // Parse this item's options at the edge — a bad item fails only itself.
@@ -2675,13 +4488,20 @@ impl StemmaServer {
 
             // Re-fetch the canonical each iteration so item N plans against the
             // state left by items 1..N (sequential, live).
-            let canonical = match self.runtime.with(&handle, |snap| snap.canonical.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    return fail(
-                        &format!("{:?}", e.code),
-                        format!("doc not open: {}", e.message),
-                    );
+            let canonical = if let Some(snapshot) = &preview_snapshot {
+                Arc::clone(&snapshot.canonical)
+            } else {
+                match self
+                    .runtime
+                    .with(&handle, |snap| Arc::clone(&snap.canonical))
+                {
+                    Ok(canonical) => canonical,
+                    Err(e) => {
+                        return fail(
+                            &format!("{:?}", e.code),
+                            format!("doc not open: {}", e.message),
+                        );
+                    }
                 }
             };
 
@@ -2707,42 +4527,51 @@ impl StemmaServer {
                         .map(|c| c.as_str())
                         .collect();
                     let skipped = straddles_json(&plan.skipped_straddles);
-                    let before = match self.runtime.with(&handle, |s| Arc::clone(&s.canonical)) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return fail(
-                                &format!("{:?}", e.code),
-                                format!("doc not open: {}", e.message),
-                            );
-                        }
-                    };
+                    let before = Arc::clone(&canonical);
                     let transaction = stemma::edit::EditTransaction {
                         steps: plan.steps,
                         summary: Some("replace_text_batch".to_string()),
                         materialization_mode: stemma::edit::MaterializationMode::TrackedChange,
                         revision: stemma::RevisionInfo {
                             revision_id: 0,
+                            identity: 0,
                             author: Some(args.author.clone()),
                             date: None,
                             apply_op_id: None,
                         },
                     };
-                    match self.runtime.apply_edit_authored(
-                        &handle,
-                        &transaction,
-                        args.allow_existing_author,
-                    ) {
-                        Ok(result) => {
-                            let changed = changed_block_ids(&before, &result.canonical);
-                            let unreached = unreached_cells_json(&before, &item.old, match_mode);
-                            items.push(
-                                json!({"index": index, "old": item.old, "status": "applied",
+                    let outcome = if let Some(snapshot) = &preview_snapshot {
+                        snapshot
+                            .apply_authored(&transaction, args.allow_existing_author)
+                            .map(|next| (Arc::clone(&next.canonical), Some(next)))
+                    } else {
+                        self.runtime
+                            .apply_edit_authored(&handle, &transaction, args.allow_existing_author)
+                            .map(|result| (result.canonical, None))
+                    };
+                    match outcome {
+                        Ok((after, next_preview)) => {
+                            let changed = changed_block_ids(&before, &after);
+                            let unreached = unreached_cells_json(
+                                &before,
+                                &item.old,
+                                match_mode,
+                                &options.scope,
+                            );
+                            let status = if args.preview {
+                                "would_apply"
+                            } else {
+                                "applied"
+                            };
+                            items.push(json!({"index": index, "old": item.old, "status": status,
                                 "match_count": match_count, "matches": matched,
                                 "changed_blocks": changed,
                                 "normalization_applied": normalization,
                                 "skipped_straddles": skipped,
-                                "unreached_matches": unreached}),
-                            );
+                                "unreached_matches": unreached}));
+                            if let Some(next_preview) = next_preview {
+                                preview_snapshot = Some(next_preview);
+                            }
                             applied += 1;
                         }
                         Err(e) => {
@@ -2777,12 +4606,16 @@ impl StemmaServer {
             }
         }
 
+        let outcomes = CompleteDecisionOutcomes::new("replacement worklist", submitted, items);
         ok(json!({
             "doc_id": args.doc_id,
             "author": args.author,
-            "applied": applied,
+            "submitted": submitted,
+            "preview": args.preview,
+            "applied": if args.preview { 0 } else { applied },
+            "would_apply": if args.preview { Some(applied) } else { None },
             "failed": failed,
-            "items": items,
+            "items": outcomes.into_rows(),
         }))
     }
 }
@@ -2795,24 +4628,27 @@ fn expected_matches_label(e: &stemma::edit::ExpectedMatches) -> String {
     }
 }
 
-/// Table-cell occurrences of `needle` that the body-only replace_text scan did
-/// NOT reach (engine finding #5), as JSON for the receipt's honesty disclosure.
-/// A non-empty list means "applied N" is incomplete: the needle also lives in a
-/// table cell that this verb cannot splice — fix it with set_cell_text. Returning
-/// this (instead of a silent under-replace) is the receipt-honesty contract: a
-/// region that was not searched is disclosed, never folded into a green result.
+/// Table-cell occurrences of `needle` that WholeDoc's legacy top-level scan did
+/// not reach, as JSON for the receipt's honesty disclosure. Explicit MCP scopes
+/// describe the complete intended search boundary, so matches outside one are
+/// deliberately out of scope rather than "unreached".
 fn unreached_cells_json(
     doc: &stemma::CanonDoc,
     needle: &str,
     mode: stemma::edit::MatchMode,
+    scope: &stemma::edit::ReplaceTextScope,
 ) -> Value {
+    if !matches!(scope, stemma::edit::ReplaceTextScope::WholeDoc) {
+        return json!([]);
+    }
     let cells = stemma::edit::unreached_cell_matches(doc, needle, mode);
     json!(
         cells
             .iter()
             .map(|m| json!({
                 "region": "table_cell",
-                "block_id": m.table_id.to_string(),
+                "block_id": m.paragraph_id.to_string(),
+                "table_id": m.table_id.to_string(),
                 "row": m.row,
                 "col": m.col,
                 "excerpt": m.excerpt,
@@ -2832,16 +4668,17 @@ fn straddles_json(skipped: &[stemma::edit::SkippedStraddle]) -> Value {
 }
 
 /// Parse the optional structured scope arg into the engine type. Empty/None =>
-/// whole doc. A single `block_id`, OR both `from_block_id`+`to_block_id`. Mixing
+/// body and table-cell paragraphs. A single `block_id`, OR both
+/// `from_block_id`+`to_block_id`. Mixing
 /// the two forms, or supplying only one range endpoint, is rejected.
 fn parse_replace_text_scope(
     arg: &Option<ReplaceTextScopeArg>,
 ) -> Result<stemma::edit::ReplaceTextScope, String> {
     let Some(s) = arg else {
-        return Ok(stemma::edit::ReplaceTextScope::WholeDoc);
+        return Ok(stemma::edit::ReplaceTextScope::BodyAndTables);
     };
     match (&s.block_id, &s.from_block_id, &s.to_block_id) {
-        (None, None, None) => Ok(stemma::edit::ReplaceTextScope::WholeDoc),
+        (None, None, None) => Ok(stemma::edit::ReplaceTextScope::BodyAndTables),
         (Some(id), None, None) => Ok(stemma::edit::ReplaceTextScope::SingleBlock(
             stemma::NodeId::from(id.as_str()),
         )),
@@ -2882,11 +4719,45 @@ fn attach_field(result: &mut CallToolResult, key: &str, value: Value) {
     if result.is_error == Some(true) {
         return;
     }
-    if let Some(structured) = result.structured_content.as_mut()
-        && let Some(obj) = structured.as_object_mut()
-    {
-        obj.insert(key.to_string(), value);
+    let Some(Value::Object(mut payload)) = result.structured_content.clone() else {
+        return;
+    };
+    payload.insert(key.to_string(), value);
+    *result = CallToolResult::structured(Value::Object(payload)).with_meta(result.meta.clone());
+}
+
+/// Mark a successful, complete preview with the exact state transition it has
+/// unlocked. This is deliberately response-local rather than more repeated
+/// tool-description prose: one small cue at the decision point can avoid an
+/// entire read/reformulate/preview loop. Partial worklists (one or more failed
+/// items) never receive the cue.
+fn attach_preview_apply_cue(result: &mut CallToolResult) {
+    if result.is_error == Some(true) {
+        return;
     }
+    let Some(Value::Object(payload)) = result.structured_content.as_ref() else {
+        return;
+    };
+    let would_apply = match payload.get("would_apply") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_u64().is_some_and(|count| count > 0),
+        _ => false,
+    };
+    let has_failures = payload
+        .get("failed")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0);
+    if !would_apply || has_failures {
+        return;
+    }
+    attach_field(result, "apply_ready", json!(true));
+    attach_field(
+        result,
+        "next_action",
+        json!(
+            "When this preview covers all intended changes, call execute_plan with the identical plan and preview=false. No re-inspection is needed unless document state changes."
+        ),
+    );
 }
 
 // ─── Read-surface projections (comprehension / roadmap A) ──────────────────────
@@ -2947,6 +4818,41 @@ struct RevisionFilter {
 struct BlockRange {
     from_block_id: String,
     to_block_id: String,
+}
+
+/// Parsed `by_kind` filter: an exact revision kind, or "format" as the group
+/// alias for all *PrChange kinds (the common "show me formatting changes"
+/// query, without naming each carrier). ONE vocabulary, ONE parser — shared
+/// by the revision-inventory filter and the resolution `by_filter` selector
+/// so the two surfaces can never drift apart.
+enum KindFilter {
+    Exact(RevisionKind),
+    AnyFormat,
+}
+
+impl KindFilter {
+    fn matches(&self, kind: RevisionKind) -> bool {
+        match self {
+            KindFilter::Exact(k) => *k == kind,
+            KindFilter::AnyFormat => kind.is_format(),
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        if raw == "format" {
+            return Ok(Self::AnyFormat);
+        }
+        match RevisionKind::parse(raw) {
+            Some(kind) => Ok(Self::Exact(kind)),
+            None => Err(format!(
+                "by_kind must be \"insert\", \"delete\", \"format\" (any formatting \
+                 change), \"format_run\", \"format_paragraph\", \"format_table\", \
+                 \"format_row\", \"format_cell\", \"format_section\", or \
+                 \"opaque_interior\" (tracked changes inside embedded content — \
+                 visible but not individually resolvable); got {raw:?}"
+            )),
+        }
+    }
 }
 
 #[tool_router(router = read_projections_router)]
@@ -3038,126 +4944,12 @@ impl StemmaServer {
         &self,
         Parameters(args): Parameters<ListRevisionsArgs>,
     ) -> CallToolResult {
-        // Parse the optional kind filter at the edge — no silent fallback.
-        // Accepts every RevisionKind wire name, plus "format" as the group
-        // alias for all *PrChange kinds (the common "show me formatting
-        // changes" query, without naming each carrier).
-        enum KindFilter {
-            Exact(RevisionKind),
-            AnyFormat,
-        }
-        impl KindFilter {
-            fn matches(&self, kind: RevisionKind) -> bool {
-                match self {
-                    KindFilter::Exact(k) => *k == kind,
-                    KindFilter::AnyFormat => kind.is_format(),
-                }
-            }
-        }
-        let kind_filter = match args.filter.as_ref().and_then(|f| f.by_kind.as_deref()) {
-            None => None,
-            Some("format") => Some(KindFilter::AnyFormat),
-            Some(other) => match RevisionKind::parse(other) {
-                Some(kind) => Some(KindFilter::Exact(kind)),
-                None => {
-                    return fail(
-                        "invalid_argument",
-                        format!(
-                            "by_kind must be \"insert\", \"delete\", \"format\" (any formatting \
-                             change), \"format_run\", \"format_paragraph\", \"format_table\", \
-                             \"format_row\", \"format_cell\", \"format_section\", or \
-                             \"opaque_interior\" (tracked changes inside embedded content — \
-                             visible but not individually resolvable); got {other:?}"
-                        ),
-                    );
-                }
-            },
-        };
-
-        let handle = DocHandle(args.doc_id.clone());
-        let view = match self.runtime.with(&handle, build_document_view) {
-            Ok(v) => v,
-            Err(e) => {
-                return fail(
-                    &format!("{:?}", e.code),
-                    format!("doc not open: {}", e.message),
-                );
-            }
-        };
-
-        // The block-range filter is the only one that can fail loudly: an unknown
-        // or out-of-order endpoint is a caller error, not an empty result. Lower
-        // it to the inclusive set of block ids in range (same contract as the
-        // accept/reject ByRange selector).
-        let block_range = args.filter.as_ref().and_then(|f| f.by_block_range.as_ref());
-        let in_range: Option<std::collections::HashSet<String>> = match block_range {
-            None => None,
-            Some(BlockRange {
-                from_block_id,
-                to_block_id,
-            }) => {
-                let pos = |bid: &str| view.blocks.iter().position(|b| b.id.to_string() == bid);
-                let Some(from) = pos(from_block_id) else {
-                    return fail(
-                        "AnchorNotFound",
-                        format!(
-                            "range start block '{from_block_id}' not found in doc '{}'",
-                            args.doc_id
-                        ),
-                    );
-                };
-                let Some(to) = pos(to_block_id) else {
-                    return fail(
-                        "AnchorNotFound",
-                        format!(
-                            "range end block '{to_block_id}' not found in doc '{}'",
-                            args.doc_id
-                        ),
-                    );
-                };
-                if from > to {
-                    return fail(
-                        "InvalidRange",
-                        format!(
-                            "range endpoints out of document order: '{from_block_id}' (#{from}) comes after '{to_block_id}' (#{to})"
-                        ),
-                    );
-                }
-                Some(
-                    view.blocks[from..=to]
-                        .iter()
-                        .map(|b| b.id.to_string())
-                        .collect(),
-                )
-            }
-        };
-
-        let author_filter = args.filter.as_ref().and_then(|f| f.by_author.as_deref());
-
-        // One walk, then the AND-combined filters. revision_rows is the shared
-        // enumeration; the filters here mirror the accept/reject selectors.
-        let rows: Vec<RevisionRow> = match self
-            .runtime
-            .with(&handle, |snap| revision_rows(&snap.canonical))
-        {
+        // Filter parsing + application is shared with the revisions_summary
+        // projection (one code path — see filtered_revision_rows).
+        let rows = match self.filtered_revision_rows(&args.doc_id, args.filter.as_ref()) {
             Ok(rows) => rows,
-            Err(e) => {
-                return fail(
-                    &format!("{:?}", e.code),
-                    format!("doc not open: {}", e.message),
-                );
-            }
+            Err(result) => return result,
         };
-        let rows: Vec<RevisionRow> = rows
-            .into_iter()
-            .filter(|r| {
-                in_range
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&r.block_id))
-            })
-            .filter(|r| author_filter.is_none_or(|a| r.author.as_deref() == Some(a)))
-            .filter(|r| kind_filter.as_ref().is_none_or(|k| k.matches(r.kind)))
-            .collect();
 
         let total = rows.len();
         let (emitted, truncation) = cap_revision_rows(&rows);
@@ -3209,10 +5001,6 @@ impl StemmaServer {
     }
 }
 
-fn read_or_fail(path: &str) -> Result<Vec<u8>, CallToolResult> {
-    std::fs::read(Path::new(path)).map_err(|e| fail("io_error", format!("cannot read {path}: {e}")))
-}
-
 /// Resolve the `path` alternative to `bytes_base64` on `insert_image` /
 /// `replace_image` ops at the MCP edge, so an agent can point at a file on disk
 /// instead of hand-encoding base64 (which stalls MCP-only agents that have no
@@ -3227,14 +5015,21 @@ fn read_or_fail(path: &str) -> Result<Vec<u8>, CallToolResult> {
 /// Best-effort on shape: input that is not a transaction object with an `ops`
 /// array is returned unchanged for `parse_transaction` to reject with its own
 /// detailed error.
-fn resolve_image_paths(txn_json: &str) -> Result<String, CallToolResult> {
+fn resolve_image_paths(
+    authority: &PathAuthority,
+    txn_json: &str,
+    max_image_bytes: Option<u64>,
+    max_total_bytes: Option<u64>,
+) -> Result<(String, Vec<ArtifactIdentity>), CallToolResult> {
     use base64::Engine as _;
     let Ok(mut value) = serde_json::from_str::<Value>(txn_json) else {
-        return Ok(txn_json.to_string());
+        return Ok((txn_json.to_string(), Vec::new()));
     };
     let Some(ops) = value.get_mut("ops").and_then(Value::as_array_mut) else {
-        return Ok(txn_json.to_string());
+        return Ok((txn_json.to_string(), Vec::new()));
     };
+    let mut sources = Vec::new();
+    let mut total_bytes = 0_u64;
     for (i, op) in ops.iter_mut().enumerate() {
         let Some(obj) = op.as_object_mut() else {
             continue;
@@ -3263,24 +5058,61 @@ fn resolve_image_paths(txn_json: &str) -> Result<String, CallToolResult> {
                 return Err(fail(
                     "invalid_argument",
                     format!(
-                        "ops[{i}]: an image op needs its bytes — supply `path` (an absolute \
-                         path to the image file, read server-side) or `bytes_base64` (the \
+                        "ops[{i}]: an image op needs its bytes — supply `path` (inside the \
+                         MCP workspace root, read server-side) or `bytes_base64` (the \
                          base64-encoded bytes)"
                     ),
                 ));
             }
             (false, Some(path)) => {
-                let bytes = read_or_fail(&path)?;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let source = match authority.read_source(
+                    &path,
+                    format!("input_image_{i}"),
+                    max_image_bytes,
+                ) {
+                    Ok(source) => source,
+                    Err(ArtifactError::SourceTooLarge { size, limit, .. }) => {
+                        return Err(fail_json(json!({
+                            "code": "artifact_source_too_large",
+                            "error": format!(
+                                "image path {path:?} is {size} bytes, over the {limit}-byte \
+                                 per-image limit; reduce the image or raise {ENV_MAX_IMAGE_BYTES}"
+                            ),
+                            "path": path,
+                            "size_bytes": size,
+                            "limit_bytes": limit,
+                            "env_var": ENV_MAX_IMAGE_BYTES,
+                        })));
+                    }
+                    Err(error) => return Err(artifact_fail(error)),
+                };
+                total_bytes = total_bytes.saturating_add(source.identity().bytes);
+                if let Some(limit) = max_total_bytes
+                    && total_bytes > limit
+                {
+                    return Err(fail_json(json!({
+                        "code": "artifact_source_too_large",
+                        "error": format!(
+                            "image paths in this edit total {total_bytes} bytes, over the \
+                             {limit}-byte aggregate limit; reduce the transaction or raise \
+                             {ENV_MAX_IMAGE_TOTAL_BYTES}"
+                        ),
+                        "size_bytes": total_bytes,
+                        "limit_bytes": limit,
+                        "env_var": ENV_MAX_IMAGE_TOTAL_BYTES,
+                    })));
+                }
+                let encoded = base64::engine::general_purpose::STANDARD.encode(source.bytes());
                 obj.remove("path");
                 obj.insert("bytes_base64".to_string(), Value::String(encoded));
+                sources.push(source.identity().clone());
             }
             (true, None) => {
                 // Already carries bytes; nothing to resolve.
             }
         }
     }
-    Ok(value.to_string())
+    Ok((value.to_string(), sources))
 }
 
 // ─── Read-surface scale (roadmap A): structural index + id-range windowing + HTML ───
@@ -3576,9 +5408,206 @@ enum ChangeSelector {
         from_block_id: String,
         to_block_id: String,
     },
+    /// AND-combined filter over the same axes and vocabulary as the revision
+    /// inventory filter: author ∧ kind ∧ block-range. At least one axis is
+    /// required — an all-empty filter would be `all` in disguise and fails
+    /// loudly instead of resolving everything by accident. This is the
+    /// selector for prompts shaped like "reject author X's changes in
+    /// Section Y": one call, no id enumeration.
+    ByFilter {
+        /// Same contract as the inventory filter's `by_author` (exact match;
+        /// an anonymized revision never matches).
+        #[serde(default)]
+        by_author: Option<String>,
+        /// Same vocabulary as the inventory filter's `by_kind` ("insert",
+        /// "delete", "format", or an exact formatting-change kind).
+        #[serde(default)]
+        by_kind: Option<String>,
+        /// Same contract as the inventory filter's `by_block_range`
+        /// (inclusive, document order; unknown endpoint => AnchorNotFound).
+        #[serde(default)]
+        by_block_range: Option<BlockRange>,
+    },
     /// Every tracked change in the document (collected from the read view, one
     /// code path with the other selectors — not `Resolution::AcceptAll`).
     All,
+}
+
+fn change_selector_json(selector: &ChangeSelector) -> Value {
+    match selector {
+        ChangeSelector::ByIds { revision_ids } => {
+            json!({"by": "by_ids", "revision_ids": revision_ids})
+        }
+        ChangeSelector::ByAuthor { author } => json!({"by": "by_author", "author": author}),
+        ChangeSelector::ByRange {
+            from_block_id,
+            to_block_id,
+        } => json!({
+            "by": "by_range",
+            "from_block_id": from_block_id,
+            "to_block_id": to_block_id,
+        }),
+        ChangeSelector::ByFilter {
+            by_author,
+            by_kind,
+            by_block_range,
+        } => json!({
+            "by": "by_filter",
+            "by_author": by_author,
+            "by_kind": by_kind,
+            "by_block_range": by_block_range.as_ref().map(|range| json!({
+                "from_block_id": range.from_block_id,
+                "to_block_id": range.to_block_id,
+            })),
+        }),
+        ChangeSelector::All => json!({"by": "all"}),
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ResolutionActionArg {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolutionPlanArg {
+    /// Whether the selected pending revisions are accepted or rejected.
+    action: ResolutionActionArg,
+    /// Explicit revision selection. Prefer the bulk selectors (by_author,
+    /// by_range, by_filter for author ∧ kind ∧ block-range conjunctions, all)
+    /// over enumerating ids — one selector call replaces the whole
+    /// inventory-then-id-list round trip. Obtain authors, kinds, and block
+    /// ids from inspect_docx.
+    selector: ChangeSelector,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReplacementWorklistArg {
+    /// Author stamped on every tracked replacement in the worklist.
+    author: String,
+    /// Literal replacements compiled and applied server-side in order. Each
+    /// item has the same exact-count and barrier contract as replace_text.
+    replacements: Vec<CoreReplacementItem>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum CoreReplacementMatchMode {
+    Exact,
+    NormalizeWs,
+}
+
+impl CoreReplacementMatchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::NormalizeWs => "normalize_ws",
+        }
+    }
+}
+
+fn default_core_replacement_match_mode() -> CoreReplacementMatchMode {
+    CoreReplacementMatchMode::Exact
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum CoreBarrierPolicy {
+    Skip,
+    Fail,
+}
+
+impl CoreBarrierPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+fn default_core_barrier_policy() -> CoreBarrierPolicy {
+    CoreBarrierPolicy::Skip
+}
+
+/// Gemini's function schema cannot faithfully represent the advanced
+/// `number | "all"` union: its schema cleaner collapses that union to string
+/// and causes numeric counts to arrive as `"2"`. The compact edge models the
+/// two domain states explicitly instead of accepting or guessing stringified
+/// numbers.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CoreReplacementItem {
+    old: String,
+    new: String,
+    #[serde(default)]
+    scope: Option<ReplaceTextScopeArg>,
+    /// Exact number of occurrences required. Defaults to 1 when omitted and
+    /// replace_all is false.
+    #[serde(default)]
+    expected_matches: Option<usize>,
+    /// Require and replace every occurrence. Mutually exclusive with
+    /// expected_matches.
+    #[serde(default)]
+    replace_all: bool,
+    /// Literal matching (default) or whitespace/typographic-quote folding.
+    #[serde(default = "default_core_replacement_match_mode")]
+    match_mode: CoreReplacementMatchMode,
+    /// Skip a match that crosses an opaque/revision wall (default), or fail
+    /// this worklist item explicitly.
+    #[serde(default = "default_core_barrier_policy")]
+    on_barrier_match: CoreBarrierPolicy,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExecutePlanArgs {
+    /// The doc_id returned by open_docx. Required for transaction, resolution,
+    /// and replacement_worklist; omit only for a comparison producer plan.
+    #[serde(default)]
+    doc_id: Option<String>,
+    /// One atomic v4 edit transaction. Mutually exclusive with resolution.
+    #[serde(default)]
+    transaction: Option<TransactionArg>,
+    /// One explicit accept/reject selection. Mutually exclusive with transaction.
+    #[serde(default)]
+    resolution: Option<ResolutionPlanArg>,
+    /// Server-side literal replacement worklist. Mutually exclusive with
+    /// transaction and resolution. This is the compact bulk-authoring path:
+    /// use replace_all=true only when every occurrence is intended.
+    #[serde(default)]
+    replacement_worklist: Option<ReplacementWorklistArg>,
+    /// Producer path equivalent to the advanced compare_docx capability:
+    /// compare base_path to target_path and write a tracked redline to out_path.
+    /// Mutually exclusive with every doc_id-backed plan.
+    #[serde(default)]
+    comparison: Option<ComparisonPlanArg>,
+    /// Validate and report the exact outcome without mutation when true.
+    preview: bool,
+    /// "tracked" (default) or "direct" for transaction plans only.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Author-impersonation override for transaction plans only.
+    #[serde(default)]
+    allow_existing_author: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ComparisonPlanArg {
+    /// Path to the base/original DOCX under the workspace root.
+    base_path: String,
+    /// Path to the target/modified DOCX under the workspace root.
+    target_path: String,
+    /// New redline path under the workspace root.
+    out_path: String,
+    /// Author stamped on the generated tracked changes. Defaults to "stemma".
+    #[serde(default)]
+    author: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3618,8 +5647,30 @@ struct ValidateArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RenderSpec {
-    /// Absolute output path for the rendered redline .docx.
+    /// New output path for the rendered redline under the MCP workspace root.
     path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum AuditDetail {
+    Census,
+    DirectDelta,
+    Preexisting,
+    Violations,
+    ValidatorIssues,
+}
+
+impl AuditDetail {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Census => "census",
+            Self::DirectDelta => "direct_delta",
+            Self::Preexisting => "preexisting",
+            Self::Violations => "violations",
+            Self::ValidatorIssues => "validator_issues",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3631,19 +5682,67 @@ struct ReviewSessionArgs {
     /// as a tracked-changes .docx at `render.path`.
     #[serde(default)]
     render: Option<RenderSpec>,
+    /// Return a particular audit section page. Omit for the bounded first page
+    /// of every section.
+    #[serde(default)]
+    detail: Option<AuditDetail>,
+    /// Zero-based row offset for detail. Valid only when detail is set.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Detail page size, 1..=64. Valid only when detail is set.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AuditDocxArgs {
-    /// Absolute path of the baseline .docx.
+    /// Path of the baseline .docx under the MCP workspace root.
     before_path: String,
-    /// Absolute path of the .docx to certify.
+    /// Path of the .docx to certify under the MCP workspace root.
     after_path: String,
     /// When set, additionally materialize the before → after delta as a
     /// tracked-changes .docx at `render.path`.
     #[serde(default)]
     render: Option<RenderSpec>,
+    /// Return a particular audit section page. Omit for the bounded first page
+    /// of every section.
+    #[serde(default)]
+    detail: Option<AuditDetail>,
+    /// Zero-based row offset for detail. Valid only when detail is set.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Detail page size, 1..=64. Valid only when detail is set.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct VerifyDocxArgs {
+    /// Verify changes made since open_docx. Mutually exclusive with the path pair.
+    #[serde(default)]
+    doc_id: Option<String>,
+    /// Baseline for producer-neutral verification. Requires after_path and no doc_id.
+    #[serde(default)]
+    before_path: Option<String>,
+    /// Changed file for producer-neutral verification. Requires before_path and no doc_id.
+    #[serde(default)]
+    after_path: Option<String>,
+    /// Optionally materialize the verified delta as a create-new redline.
+    #[serde(default)]
+    render: Option<RenderSpec>,
+    /// Return a particular audit section page: census, direct_delta,
+    /// preexisting, violations, or validator_issues. Omit for a bounded first
+    /// page of every section.
+    #[serde(default)]
+    detail: Option<AuditDetail>,
+    /// Zero-based row offset for detail. Valid only when detail is set.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Detail page size, 1..=64. Valid only when detail is set.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3678,6 +5777,167 @@ fn edit_error_code(e: &stemma::edit::EditError) -> stemma::ErrorCode {
 }
 
 impl StemmaServer {
+    /// Cap only transaction EVIDENCE. `operation_outcomes` is attached later
+    /// through `CompleteDecisionOutcomes` and can never enter this function.
+    fn bounded_transaction_receipt(mut receipt: Value) -> Value {
+        let object = receipt
+            .as_object_mut()
+            .expect("transaction receipt is always a JSON object");
+        let mut truncated = serde_json::Map::new();
+        for (field, count_field, cap) in [
+            ("revision_ids", "revision_count", Self::RECEIPT_ID_CAP),
+            (
+                "changed_block_ids",
+                "changed_block_count",
+                Self::RECEIPT_ID_CAP,
+            ),
+            (
+                "changed_blocks",
+                "changed_block_rows_count",
+                Self::RECEIPT_BLOCK_ROW_CAP,
+            ),
+            ("moves", "move_count", Self::RECEIPT_BLOCK_ROW_CAP),
+            (
+                "table_receipts",
+                "table_receipt_count",
+                Self::RECEIPT_BLOCK_ROW_CAP,
+            ),
+        ] {
+            let complete = object
+                .remove(field)
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let Value::Array(complete) = complete else {
+                panic!("transaction receipt field {field} must be an array");
+            };
+            let evidence = CappedEvidenceSet::new(complete, cap);
+            object.insert(count_field.into(), json!(evidence.total));
+            object.insert(field.into(), Value::Array(evidence.rows.clone()));
+            object.insert(format!("{field}_evidence"), evidence.metadata());
+            if evidence.omitted() > 0 {
+                truncated.insert(format!("{field}_omitted"), json!(evidence.omitted()));
+            }
+        }
+        if !truncated.is_empty() {
+            truncated.insert(
+                "advice".into(),
+                json!(
+                    "decision outcomes and exact counts are complete; inspect_docx and verify_docx expose omitted evidence"
+                ),
+            );
+            object.insert("truncated".into(), Value::Object(truncated));
+        }
+        receipt
+    }
+
+    /// Lower an inclusive block-id range to the set of block ids it covers,
+    /// in canonical document order. Shared by the `ByRange` and `ByFilter`
+    /// selectors so the range contract (unknown endpoint => AnchorNotFound,
+    /// out-of-order endpoints => InvalidRange) cannot drift between them.
+    fn block_ids_in_range(
+        &self,
+        doc_id: &str,
+        from_block_id: &str,
+        to_block_id: &str,
+    ) -> Result<std::collections::HashSet<String>, CallToolResult> {
+        let handle = DocHandle(doc_id.to_string());
+        // Block order comes from the canonical document order.
+        let order: Vec<String> = self
+            .runtime
+            .with(&handle, |snap| {
+                snap.canonical
+                    .blocks
+                    .iter()
+                    .map(|tb| match &tb.block {
+                        stemma::BlockNode::Paragraph(p) => p.id.to_string(),
+                        stemma::BlockNode::Table(t) => t.id.to_string(),
+                        stemma::BlockNode::OpaqueBlock(o) => o.id.to_string(),
+                    })
+                    .collect()
+            })
+            .map_err(|e| {
+                fail(
+                    &format!("{:?}", e.code),
+                    format!("doc not open: {}", e.message),
+                )
+            })?;
+        let pos = |bid: &str| order.iter().position(|b| b == bid);
+        let Some(from) = pos(from_block_id) else {
+            return Err(fail(
+                "AnchorNotFound",
+                format!("range start block '{from_block_id}' not found in doc '{doc_id}'"),
+            ));
+        };
+        let Some(to) = pos(to_block_id) else {
+            return Err(fail(
+                "AnchorNotFound",
+                format!("range end block '{to_block_id}' not found in doc '{doc_id}'"),
+            ));
+        };
+        if from > to {
+            return Err(fail(
+                "InvalidRange",
+                format!(
+                    "range endpoints out of document order: '{from_block_id}' (#{from}) comes after '{to_block_id}' (#{to})"
+                ),
+            ));
+        }
+        Ok(order[from..=to].iter().cloned().collect())
+    }
+
+    /// Enumerate pending revisions with the optional AND-combined filter
+    /// applied — the SHARED front half of `list_revisions` and the
+    /// `revisions_summary` projection, so the filter semantics are one code
+    /// path and cannot drift.
+    fn filtered_revision_rows(
+        &self,
+        doc_id: &str,
+        filter: Option<&RevisionFilter>,
+    ) -> Result<Vec<RevisionRow>, CallToolResult> {
+        // Parse the optional kind filter at the edge — no silent fallback.
+        let kind_filter = match filter.and_then(|f| f.by_kind.as_deref()) {
+            None => None,
+            Some(raw) => match KindFilter::parse(raw) {
+                Ok(parsed) => Some(parsed),
+                Err(message) => return Err(fail("invalid_argument", message)),
+            },
+        };
+        // The block-range filter is the only one that can fail loudly: an
+        // unknown or out-of-order endpoint is a caller error, not an empty
+        // result. Same contract as the accept/reject range selectors.
+        let in_range: Option<std::collections::HashSet<String>> =
+            match filter.and_then(|f| f.by_block_range.as_ref()) {
+                None => None,
+                Some(BlockRange {
+                    from_block_id,
+                    to_block_id,
+                }) => Some(self.block_ids_in_range(doc_id, from_block_id, to_block_id)?),
+            };
+        let author_filter = filter.and_then(|f| f.by_author.as_deref());
+
+        // One walk, then the AND-combined filters. revision_rows is the shared
+        // enumeration; the filters here mirror the accept/reject selectors.
+        let handle = DocHandle(doc_id.to_string());
+        let rows: Vec<RevisionRow> = self
+            .runtime
+            .with(&handle, |snap| revision_rows(&snap.canonical))
+            .map_err(|e| {
+                fail(
+                    &format!("{:?}", e.code),
+                    format!("doc not open: {}", e.message),
+                )
+            })?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| {
+                in_range
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&r.block_id))
+            })
+            .filter(|r| author_filter.is_none_or(|a| r.author.as_deref() == Some(a)))
+            .filter(|r| kind_filter.as_ref().is_none_or(|k| k.matches(r.kind)))
+            .collect())
+    }
+
     /// Lower a [`ChangeSelector`] to the concrete set of revision ids it names,
     /// by walking the read view of the open document. This is the ONLY place
     /// author/range selectors become id-sets; the engine's `Resolution` is left
@@ -3689,7 +5949,9 @@ impl StemmaServer {
     /// - `ByAuthor` against an anonymized (author = None) revision counts as
     ///   unmatched-because-anonymous — the author is never invented;
     /// - `ByRange` with an unknown endpoint => `AnchorNotFound`; out-of-order
-    ///   endpoints => `InvalidRange`.
+    ///   endpoints => `InvalidRange`;
+    /// - `ByFilter` AND-combines its axes with the same per-axis contracts;
+    ///   an all-empty filter => `invalid_argument` (never an implicit `All`).
     fn resolve_revision_ids(
         &self,
         doc_id: &str,
@@ -3754,52 +6016,55 @@ impl StemmaServer {
                 from_block_id,
                 to_block_id,
             } => {
-                // Block order comes from the canonical document order.
-                let order: Vec<String> = self
-                    .runtime
-                    .with(&handle, |snap| {
-                        snap.canonical
-                            .blocks
-                            .iter()
-                            .map(|tb| match &tb.block {
-                                stemma::BlockNode::Paragraph(p) => p.id.to_string(),
-                                stemma::BlockNode::Table(t) => t.id.to_string(),
-                                stemma::BlockNode::OpaqueBlock(o) => o.id.to_string(),
-                            })
-                            .collect()
-                    })
-                    .map_err(|e| {
-                        fail(
-                            &format!("{:?}", e.code),
-                            format!("doc not open: {}", e.message),
-                        )
-                    })?;
-                let pos = |bid: &str| order.iter().position(|b| b == bid);
-                let Some(from) = pos(&from_block_id) else {
-                    return Err(fail(
-                        "AnchorNotFound",
-                        format!("range start block '{from_block_id}' not found in doc '{doc_id}'"),
-                    ));
-                };
-                let Some(to) = pos(&to_block_id) else {
-                    return Err(fail(
-                        "AnchorNotFound",
-                        format!("range end block '{to_block_id}' not found in doc '{doc_id}'"),
-                    ));
-                };
-                if from > to {
-                    return Err(fail(
-                        "InvalidRange",
-                        format!(
-                            "range endpoints out of document order: '{from_block_id}' (#{from}) comes after '{to_block_id}' (#{to})"
-                        ),
-                    ));
-                }
-                let allowed: std::collections::HashSet<&str> =
-                    order[from..=to].iter().map(String::as_str).collect();
+                let allowed = self.block_ids_in_range(doc_id, &from_block_id, &to_block_id)?;
                 records
                     .iter()
                     .filter(|r| allowed.contains(r.block_id.to_string().as_str()))
+                    .map(|r| r.revision_id)
+                    .collect()
+            }
+            ChangeSelector::ByFilter {
+                by_author,
+                by_kind,
+                by_block_range,
+            } => {
+                if by_author.is_none() && by_kind.is_none() && by_block_range.is_none() {
+                    return Err(fail(
+                        "invalid_argument",
+                        "by_filter requires at least one of by_author, by_kind, or \
+                         by_block_range — to resolve every tracked change, use the \
+                         explicit {\"by\": \"all\"} selector instead",
+                    ));
+                }
+                let kind_filter = match by_kind.as_deref() {
+                    None => None,
+                    Some(raw) => match KindFilter::parse(raw) {
+                        Ok(filter) => Some(filter),
+                        Err(message) => return Err(fail("invalid_argument", message)),
+                    },
+                };
+                let allowed = match by_block_range {
+                    None => None,
+                    Some(BlockRange {
+                        from_block_id,
+                        to_block_id,
+                    }) => Some(self.block_ids_in_range(doc_id, &from_block_id, &to_block_id)?),
+                };
+                records
+                    .iter()
+                    // Same author contract as ByAuthor: an anonymized revision
+                    // (author == None) never matches a filter author.
+                    .filter(|r| {
+                        by_author
+                            .as_deref()
+                            .is_none_or(|a| r.author.as_deref() == Some(a))
+                    })
+                    .filter(|r| kind_filter.as_ref().is_none_or(|k| k.matches(r.kind)))
+                    .filter(|r| {
+                        allowed
+                            .as_ref()
+                            .is_none_or(|s| s.contains(r.block_id.to_string().as_str()))
+                    })
                     .map(|r| r.revision_id)
                     .collect()
             }
@@ -3819,14 +6084,805 @@ impl StemmaServer {
 #[tool_router(router = agentic_router)]
 impl StemmaServer {
     #[tool(
-        description = "Accept tracked changes selected by id, author, block range, or all. \
+        description = "Inspect an open DOCX through one bounded semantic surface. Omit query (or \
+                       use 'index') for the first 16 rows of the compact current structural \
+                       index; use offset/limit (maximum 256) only to page it. Use the explicit \
+                       query='document' for a PAGED id-bearing extended-Markdown projection (default \
+                       16 blocks; use offset/limit, maximum 256). Its prose is exact; tables are \
+                       bounded summaries with four cell previews and route to query='block' for all \
+                       cells. Prefer query='find' plus pattern to \
+                       locate wording or opaque metadata, \
+                       then query='block' plus block_id for compact exact text, guards, durable opaque \
+                       anchors, nested table-cell paragraphs, and list identity. Table blocks return \
+                       8 bounded cell locators by default; page them with cell_offset/cell_limit \
+                       (maximum 64), then inspect a locator's block_ids for exact cell paragraphs. Pass \
+                       detail='formatting' only when complete run marks/style properties are needed. \
+                       Use query='window' plus \
+                       from_block_id, to_block_id, and format ('text'|'markdown'|'html') for an \
+                       inclusive bounded range. query='section' plus block_id returns one heading \
+                       and its section. query='revisions_summary' returns exact pending-revision \
+                       counts by author and kind with NO rows — START HERE on a dense document, \
+                       then drill down. query='revisions' returns the pending-revision inventory; \
+                       both take the optional filter={by_author?,by_kind?,by_block_range?: \
+                       {from_block_id,to_block_id}}, AND-combined. To resolve a whole \
+                       selection, pass the same axes to execute_plan's resolution \
+                       selector (by='by_filter') instead of enumerating ids. \
+                       query='styles' returns authored styles and document defaults; query='notes' \
+                       returns footnote/endnote ids, kinds, and editable body text. The legacy \
+                       comprehension projections remain explicit as query='text', query='html', \
+                       query='redline', query='accepted', or query='rejected'. query='operations' \
+                       returns every transaction op from \
+                       the authoritative parser with its accepted fields, cues, and exact examples; \
+                       pass pattern='<op_name>' to retrieve one operation. \
+                       This tool is read-only; re-inspect a block after editing it because span \
+                       handles and guards become stale."
+    )]
+    async fn inspect_docx(&self, Parameters(args): Parameters<InspectDocxArgs>) -> CallToolResult {
+        let has_query_args = args.block_id.is_some()
+            || args.detail.is_some()
+            || args.pattern.is_some()
+            || args.filter.is_some()
+            || args.from_block_id.is_some()
+            || args.to_block_id.is_some()
+            || args.format.is_some()
+            || args.offset.is_some()
+            || args.limit.is_some()
+            || args.cell_offset.is_some()
+            || args.cell_limit.is_some();
+        let has_non_index_args = args.block_id.is_some()
+            || args.detail.is_some()
+            || args.pattern.is_some()
+            || args.filter.is_some()
+            || args.from_block_id.is_some()
+            || args.to_block_id.is_some()
+            || args.format.is_some()
+            || args.cell_offset.is_some()
+            || args.cell_limit.is_some();
+        match args.query {
+            InspectQuery::Index => {
+                if has_non_index_args {
+                    return fail(
+                        "invalid_argument",
+                        "query 'index' accepts only doc_id, offset, and limit",
+                    );
+                }
+                match self.core_index_page(
+                    &args.doc_id,
+                    args.offset.unwrap_or(0),
+                    args.limit.unwrap_or(DEFAULT_CORE_INDEX_LIMIT),
+                ) {
+                    Ok(page) => ok(page),
+                    Err(failure) => failure,
+                }
+            }
+            InspectQuery::Document => {
+                if has_non_index_args {
+                    return fail(
+                        "invalid_argument",
+                        "query 'document' accepts only doc_id, offset, and limit",
+                    );
+                }
+                match self.core_document_page(
+                    &args.doc_id,
+                    args.offset.unwrap_or(0),
+                    args.limit.unwrap_or(DEFAULT_CORE_DOCUMENT_LIMIT),
+                ) {
+                    Ok(page) => ok(page),
+                    Err(failure) => failure,
+                }
+            }
+            InspectQuery::Block => {
+                if args.pattern.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'block' accepts only doc_id, block_id, detail, cell_offset, and cell_limit",
+                    );
+                }
+                let Some(block_id) = args.block_id else {
+                    return fail(
+                        "invalid_argument",
+                        "query 'block' requires a non-empty block_id",
+                    );
+                };
+                if block_id.trim().is_empty() {
+                    return fail(
+                        "invalid_argument",
+                        "query 'block' requires a non-empty block_id",
+                    );
+                }
+                let detail = args.detail.unwrap_or_default();
+                let cell_offset = args.cell_offset;
+                let cell_limit = args.cell_limit;
+                let handle = DocHandle(args.doc_id.clone());
+                let target = block_id.clone();
+                let result = self.runtime.with(&handle, move |snapshot| {
+                    let view = build_document_view(snapshot);
+                    if let Some(block) = view
+                        .blocks
+                        .iter()
+                        .find(|block| block.id.to_string() == target)
+                    {
+                        return core_block_detail_json(block, detail, cell_offset, cell_limit)
+                            .map(Some);
+                    }
+                    if cell_offset.is_some() || cell_limit.is_some() {
+                        return Err(format!(
+                            "cell_offset/cell_limit require a top-level table block; '{target}' is not one"
+                        ));
+                    }
+                    Ok(cell_paragraph_detail_json(&view, &target, detail))
+                });
+                match result {
+                    Ok(Ok(Some(payload))) => ok(payload),
+                    Ok(Ok(None)) => fail("AnchorNotFound", format!("block '{block_id}' not found")),
+                    Ok(Err(message)) => fail("invalid_argument", message),
+                    Err(error) => fail(
+                        &format!("{:?}", error.code),
+                        format!("doc not open: {}", error.message),
+                    ),
+                }
+            }
+            InspectQuery::Revisions => {
+                if args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.pattern.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'revisions' accepts only doc_id and optional filter",
+                    );
+                }
+                self.list_revisions(Parameters(ListRevisionsArgs {
+                    doc_id: args.doc_id,
+                    filter: args.filter,
+                }))
+                .await
+            }
+            InspectQuery::RevisionsSummary => {
+                if args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.pattern.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'revisions_summary' accepts only doc_id and optional filter",
+                    );
+                }
+                let rows = match self.filtered_revision_rows(&args.doc_id, args.filter.as_ref()) {
+                    Ok(rows) => rows,
+                    Err(result) => return result,
+                };
+                // Exact counts by author × kind. An anonymized revision is
+                // grouped under `author: null` — reported, never invented.
+                let mut by_author: Vec<(
+                    Option<String>,
+                    std::collections::BTreeMap<String, usize>,
+                )> = Vec::new();
+                for row in &rows {
+                    let entry = match by_author.iter_mut().find(|(a, _)| *a == row.author) {
+                        Some((_, kinds)) => kinds,
+                        None => {
+                            by_author.push((row.author.clone(), Default::default()));
+                            &mut by_author.last_mut().expect("just pushed").1
+                        }
+                    };
+                    *entry.entry(row.kind.as_str().to_string()).or_default() += 1;
+                }
+                let authors: Vec<Value> = by_author
+                    .into_iter()
+                    .map(|(author, kinds)| {
+                        let author_total: usize = kinds.values().sum();
+                        json!({
+                            "author": author,
+                            "kinds": kinds,
+                            "total": author_total,
+                        })
+                    })
+                    .collect();
+                ok(json!({
+                    "doc_id": args.doc_id,
+                    "total": rows.len(),
+                    "by_author": authors,
+                    "server_version": SERVER_VERSION,
+                }))
+            }
+            InspectQuery::Styles => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'styles' accepts only doc_id");
+                }
+                self.read_styles(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Find => {
+                if args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'find' accepts only doc_id, pattern, offset, limit, cell_offset, and cell_limit",
+                    );
+                }
+                let Some(pattern) = args.pattern else {
+                    return fail("invalid_argument", "query 'find' requires pattern");
+                };
+                if pattern.trim().is_empty() {
+                    return fail(
+                        "invalid_argument",
+                        "query 'find' requires non-empty pattern",
+                    );
+                }
+                self.find(Parameters(FindArgs {
+                    doc_id: args.doc_id,
+                    pattern,
+                    offset: args.offset,
+                    limit: args.limit,
+                    cell_offset: args.cell_offset,
+                    cell_limit: args.cell_limit,
+                }))
+                .await
+            }
+            InspectQuery::Window => {
+                if args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.pattern.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'window' accepts only doc_id, from_block_id, to_block_id, and format",
+                    );
+                }
+                let (Some(from_block_id), Some(to_block_id), Some(format)) =
+                    (args.from_block_id, args.to_block_id, args.format)
+                else {
+                    return fail(
+                        "invalid_argument",
+                        "query 'window' requires from_block_id, to_block_id, and format",
+                    );
+                };
+                self.read_window(Parameters(WindowArgs {
+                    doc_id: args.doc_id,
+                    from_block_id,
+                    to_block_id,
+                    format,
+                }))
+                .await
+            }
+            InspectQuery::Section => {
+                if args.detail.is_some()
+                    || args.pattern.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'section' accepts only doc_id and block_id",
+                    );
+                }
+                let Some(heading_id) = args.block_id.filter(|id| !id.trim().is_empty()) else {
+                    return fail(
+                        "invalid_argument",
+                        "query 'section' requires a non-empty heading block_id",
+                    );
+                };
+                self.get_section(Parameters(SectionArgs {
+                    doc_id: args.doc_id,
+                    heading_id,
+                }))
+                .await
+            }
+            InspectQuery::Text => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'text' accepts only doc_id");
+                }
+                self.read_text(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Html => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'html' accepts only doc_id");
+                }
+                self.read_html(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Redline => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'redline' accepts only doc_id");
+                }
+                self.read_redline(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Accepted => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'accepted' accepts only doc_id");
+                }
+                self.read_accepted(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Rejected => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'rejected' accepts only doc_id");
+                }
+                self.read_rejected(Parameters(ReadArgs {
+                    doc_id: args.doc_id,
+                }))
+                .await
+            }
+            InspectQuery::Notes => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'notes' accepts only doc_id");
+                }
+                let handle = DocHandle(args.doc_id.clone());
+                match self
+                    .runtime
+                    .with(&handle, |snapshot| notes_json(snapshot.canonical.as_ref()))
+                {
+                    Ok(notes) => ok(json!({
+                        "doc_id": args.doc_id,
+                        "note_count": notes.len(),
+                        "notes": notes,
+                        "server_version": SERVER_VERSION,
+                    })),
+                    Err(error) => fail(
+                        &format!("{:?}", error.code),
+                        format!("doc not open: {}", error.message),
+                    ),
+                }
+            }
+            InspectQuery::Operations => {
+                if args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.offset.is_some()
+                    || args.limit.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'operations' accepts only doc_id and optional pattern",
+                    );
+                }
+                let operation = args.pattern.as_deref();
+                if operation.is_some_and(|name| name.trim().is_empty()) {
+                    return fail(
+                        "invalid_argument",
+                        "query 'operations' pattern must be a non-empty exact operation name",
+                    );
+                }
+                let handle = DocHandle(args.doc_id.clone());
+                if let Err(error) = self.runtime.with(&handle, |_| ()) {
+                    return fail(
+                        &format!("{:?}", error.code),
+                        format!("doc not open: {}", error.message),
+                    );
+                }
+                match operation_catalog(operation) {
+                    Ok(catalog) => ok(catalog),
+                    Err(message) => fail("invalid_argument", message),
+                }
+            }
+        }
+    }
+
+    #[tool(
+        description = "Preview or execute one explicit TransformPlan through Stemma's typed \
+                       engine. Supply exactly one of transaction, resolution, \
+                       replacement_worklist, or comparison. A transaction is \
+                       the existing atomic v4 contract: {ops:[...], revision:{author}, summary?}; \
+                       preview=true validates it on a throwaway snapshot and preview=false applies \
+                       all ops or none; both return touched-block-only receipts. A resolution is \
+                       {action:'accept'|'reject', selector:{by:...}} \
+                       and uses revision ids/authors obtained from inspect_docx; preview reports the \
+                       exact ids without resolving them. Before an unfamiliar structural plan, \
+                       call inspect_docx query='operations' (optionally pattern='<op>') for the \
+                       complete parser-derived operation vocabulary, parser fields, MCP-edge \
+                       fields, exact \
+                       examples, and cues. High-value transaction ops include \
+                       replace/insert/delete/move, \
+                       comment_create/comment_reply/comment_resolve, table_op and table/cell/row \
+                       formatting, run/paragraph formatting, notes, images, styles, numbering, \
+                       bookmarks, content controls, equations, cross-references, and headers or \
+                       footers. Common exact op shapes: paragraph edit \
+                       {op:'replace',target:'p_3',expect:'old text',content:{type:'paragraph', \
+                       content:[{type:'text',text:'new text'}]}}; table cell edit \
+                       {op:'table_op',target:'tbl_1',table_op:{kind:'set_cell_text',row_index:0, \
+                       col_index:1,text:'new text'}}; anchored comment \
+                       {op:'comment_create',target:'p_3',expect:'anchor text',body:'comment', \
+                       author:'Reviewer'}; reply to that comment with \
+                       {op:'comment_reply',parent_comment_id:'1',body:'reply',author:'Reviewer'}. \
+                       Notes are first-class: inspect_docx query='notes' returns note_id/kind/body; \
+                       then use insert_note/edit_note/delete_note. parent_comment_id is the string comment id returned by inspection, never \
+                       a block id or opaque-anchor id. When replacing a paragraph that contains an opaque \
+                       anchor, preserve it in content.content as \
+                       {type:'opaque_ref',attrs:{id:'<opaque id from inspect block anchors>'}}. \
+                       For bulk literal changes use replacement_worklist:{author,replacements:[ \
+                       {old,new,expected_matches?:2,replace_all?:false,scope?,match_mode?, \
+                       on_barrier_match?}]}; use replace_all:true instead of expected_matches \
+                       only when every occurrence is intended. Omitted scope searches top-level \
+                       and table-cell paragraphs; use scope only to restrict or disambiguate. It \
+                       supports an exact throwaway preview or apply, reports every item independently, and avoids \
+                       one search/read/edit round trip per phrase. It is explicitly non-atomic: \
+                       failed items are returned alongside applied items for exact re-issue. \
+                       Resolution is NOT a finalize step: for ordinary fill/edit tasks leave both \
+                       existing and newly authored revisions pending; accept/reject only when the \
+                       user explicitly asks to resolve or clean revisions. \
+                       Obtain targets, cell coordinates, spans, and guards from \
+                       inspect_docx; unknown or stale plan state fails loudly. comparison is the \
+                       producer path {base_path,target_path,out_path,author?}; omit doc_id and use \
+                       preview=false to generate a tracked redline from two files."
+    )]
+    async fn execute_plan(&self, Parameters(args): Parameters<ExecutePlanArgs>) -> CallToolResult {
+        let ExecutePlanArgs {
+            doc_id,
+            transaction,
+            resolution,
+            replacement_worklist,
+            comparison,
+            preview,
+            mode,
+            allow_existing_author,
+        } = args;
+        let plan_count = usize::from(transaction.is_some())
+            + usize::from(resolution.is_some())
+            + usize::from(replacement_worklist.is_some())
+            + usize::from(comparison.is_some());
+        if plan_count != 1 {
+            return fail(
+                "invalid_argument",
+                "execute_plan requires exactly one of transaction, resolution, replacement_worklist, or comparison",
+            );
+        }
+        if let Some(comparison) = comparison {
+            if doc_id.is_some() || mode.is_some() || allow_existing_author || preview {
+                return fail(
+                    "invalid_argument",
+                    "comparison requires doc_id omitted, preview=false, mode omitted, and allow_existing_author=false",
+                );
+            }
+            return self
+                .compare_docx(Parameters(CompareArgs {
+                    base_path: comparison.base_path,
+                    target_path: comparison.target_path,
+                    out_path: comparison.out_path,
+                    author: comparison.author,
+                }))
+                .await;
+        }
+        let Some(doc_id) = doc_id.filter(|value| !value.trim().is_empty()) else {
+            return fail(
+                "invalid_argument",
+                "transaction, resolution, and replacement_worklist require a non-empty doc_id",
+            );
+        };
+        match (transaction, resolution, replacement_worklist) {
+            (Some(transaction), None, None) => {
+                let mut result = self
+                    .apply_batch(Parameters(BatchArgs {
+                        doc_id,
+                        transaction,
+                        preview,
+                        mode,
+                        allow_existing_author,
+                    }))
+                    .await;
+                if preview {
+                    attach_preview_apply_cue(&mut result);
+                }
+                result
+            }
+            (None, Some(resolution), None) => {
+                if mode.is_some() || allow_existing_author {
+                    return fail(
+                        "invalid_argument",
+                        "mode and allow_existing_author are valid only for transaction plans",
+                    );
+                }
+                if preview {
+                    let selector = change_selector_json(&resolution.selector);
+                    let ids = match self.resolve_revision_ids(&doc_id, resolution.selector) {
+                        Ok(ids) => ids,
+                        Err(result) => return result,
+                    };
+                    let mut revision_ids: Vec<u32> = ids.into_iter().collect();
+                    revision_ids.sort_unstable();
+                    let action = match resolution.action {
+                        ResolutionActionArg::Accept => "accept",
+                        ResolutionActionArg::Reject => "reject",
+                    };
+                    let evidence = CappedEvidenceSet::new(
+                        revision_ids.into_iter().map(Value::from).collect(),
+                        Self::RECEIPT_ID_CAP,
+                    );
+                    let selected = evidence.total;
+                    let evidence_metadata = evidence.metadata();
+                    let revision_ids = evidence.rows;
+                    let mut result = ok(json!({
+                        "doc_id": doc_id,
+                        "applied": false,
+                        "would_apply": true,
+                        "resolution": {
+                            "action": action,
+                            "selector": selector,
+                            "selected": selected,
+                            "revision_ids": revision_ids,
+                            "revision_ids_evidence": evidence_metadata,
+                            "deliverable": true,
+                        },
+                    }));
+                    attach_preview_apply_cue(&mut result);
+                    return result;
+                }
+                match resolution.action {
+                    ResolutionActionArg::Accept => {
+                        self.accept_changes(Parameters(AcceptArgs {
+                            doc_id,
+                            selector: resolution.selector,
+                        }))
+                        .await
+                    }
+                    ResolutionActionArg::Reject => {
+                        self.reject_changes(Parameters(RejectArgs {
+                            doc_id,
+                            selector: resolution.selector,
+                        }))
+                        .await
+                    }
+                }
+            }
+            (None, None, Some(worklist)) => {
+                if mode.is_some() {
+                    return fail(
+                        "invalid_argument",
+                        "mode is valid only for transaction plans; replacement_worklist always authors tracked changes",
+                    );
+                }
+                let mut replacements = Vec::with_capacity(worklist.replacements.len());
+                for (index, item) in worklist.replacements.into_iter().enumerate() {
+                    if item.replace_all && item.expected_matches.is_some() {
+                        return fail(
+                            "invalid_argument",
+                            format!(
+                                "replacement_worklist item {index} must use exactly one of expected_matches or replace_all=true"
+                            ),
+                        );
+                    }
+                    replacements.push(ReplaceItem {
+                        old: item.old,
+                        new: item.new,
+                        scope: item.scope,
+                        expected_matches: if item.replace_all {
+                            Some(ExpectedMatchesArg::Keyword("all".to_string()))
+                        } else {
+                            item.expected_matches.map(ExpectedMatchesArg::Count)
+                        },
+                        match_mode: item.match_mode.as_str().to_string(),
+                        on_barrier_match: item.on_barrier_match.as_str().to_string(),
+                    });
+                }
+                let mut result = self
+                    .replace_text_batch(Parameters(ReplaceTextBatchArgs {
+                        doc_id,
+                        author: worklist.author,
+                        replacements,
+                        preview,
+                        allow_existing_author,
+                    }))
+                    .await;
+                if preview {
+                    attach_preview_apply_cue(&mut result);
+                }
+                result
+            }
+            _ => unreachable!("plan_count and comparison branch enforce one doc-backed plan"),
+        }
+    }
+
+    #[tool(
+        description = "Verify intended versus actual DOCX changes using the engine-derived audit. \
+                       For an open session pass only doc_id; this verifies changes since open_docx. \
+                       For producer-neutral verification pass before_path and after_path with no \
+                       doc_id. Exactly one mode is required. Do not call both modes for one edit: \
+                       doc_id is the authoritative session audit before save, while a saved-path \
+                       pair redundantly recomputes the same engine evidence. \
+                       Returns new tracked changes, direct \
+                       untracked delta, dispositions of pre-existing revisions, untouched-scope \
+                       proof, validation, and exact input identities. A direct_delta row is \
+                       unexplained unless explanation identifies a comment_annotation, \
+                       property_change, or revision_resolution; reconcile those explained rows \
+                       with the requested comment, direct OOXML property operation, or selector, \
+                       and treat every other row as incomplete. Every list is explicitly \
+                       paged (16 rows by default, 64 maximum); use detail with offset/limit to \
+                       retrieve every finding without flooding conversation history. Optional render.path commits \
+                       a create-new audit redline. baseline_validator describes the input before \
+                       editing; validator.new_issue_count reports regressions introduced by the \
+                       current document. Findings unchanged from baseline must be disclosed but \
+                       do not block an otherwise valid output. Any unexpectedly changed/resolved \
+                       prior revision, untouched violation, NEW validator issue, or unexplained \
+                       direct_delta row is incomplete."
+    )]
+    async fn verify_docx(&self, Parameters(args): Parameters<VerifyDocxArgs>) -> CallToolResult {
+        match (args.doc_id, args.before_path, args.after_path) {
+            (Some(doc_id), None, None) if !doc_id.trim().is_empty() => {
+                self.review_session(Parameters(ReviewSessionArgs {
+                    doc_id,
+                    render: args.render,
+                    detail: args.detail,
+                    offset: args.offset,
+                    limit: args.limit,
+                }))
+                .await
+            }
+            (None, Some(before_path), Some(after_path))
+                if !before_path.trim().is_empty() && !after_path.trim().is_empty() =>
+            {
+                self.audit_docx(Parameters(AuditDocxArgs {
+                    before_path,
+                    after_path,
+                    render: args.render,
+                    detail: args.detail,
+                    offset: args.offset,
+                    limit: args.limit,
+                }))
+                .await
+            }
+            _ => fail(
+                "invalid_argument",
+                "verify_docx requires exactly one mode: non-empty doc_id, or non-empty \
+                 before_path plus after_path",
+            ),
+        }
+    }
+
+    /// Caps for resolution receipts. A bulk resolution can touch hundreds of
+    /// revisions and blocks; a receipt that inlines every id and block row
+    /// stops being a receipt and becomes a projection — it outgrows the
+    /// client's context and forces file-offload post-processing. Counts are
+    /// always exact; lists are bounded with an explicit `truncated` report —
+    /// the cap is never silent (same contract as the revision-inventory row
+    /// cap).
+    const RECEIPT_ID_CAP: usize = 64;
+    const RECEIPT_BLOCK_ROW_CAP: usize = 16;
+
+    /// Assemble the accept/reject receipt: exact counts always, bounded
+    /// evidence with immutable complete-set commitments, and an explicit
+    /// `truncated` report when any list was capped. ONE builder for both
+    /// actions so the receipt shapes cannot drift.
+    fn resolution_receipt(
+        doc_id: &str,
+        action: &str, // "accepted" | "rejected" — also keys "<action>_revision_ids"
+        resolved_ids: &[u32],
+        cascaded_ids: &[u32],
+        changed_block_ids: &[String],
+        changed_blocks: Vec<Value>,
+        block_count: usize,
+    ) -> Value {
+        let action_count_key = action;
+        let action_ids_key = format!("{action}_revision_ids");
+        let action_ids_omitted_key = format!("{action_ids_key}_omitted");
+        let action_ids = CappedEvidenceSet::new(
+            resolved_ids.iter().copied().map(Value::from).collect(),
+            Self::RECEIPT_ID_CAP,
+        );
+        let cascaded = CappedEvidenceSet::new(
+            cascaded_ids.iter().copied().map(Value::from).collect(),
+            Self::RECEIPT_ID_CAP,
+        );
+        let block_ids = CappedEvidenceSet::new(
+            changed_block_ids.iter().cloned().map(Value::from).collect(),
+            Self::RECEIPT_ID_CAP,
+        );
+        let block_rows = CappedEvidenceSet::new(changed_blocks, Self::RECEIPT_BLOCK_ROW_CAP);
+        let ids_omitted = action_ids.omitted();
+        let cascaded_omitted = cascaded.omitted();
+        let block_ids_omitted = block_ids.omitted();
+        let rows_omitted = block_rows.omitted();
+        let mut receipt = serde_json::Map::new();
+        receipt.insert("doc_id".into(), json!(doc_id));
+        receipt.insert(action_count_key.into(), json!(resolved_ids.len()));
+        receipt.insert(
+            action_ids_key.clone(),
+            Value::Array(action_ids.rows.clone()),
+        );
+        receipt.insert(format!("{action_ids_key}_evidence"), action_ids.metadata());
+        receipt.insert("cascaded".into(), json!(cascaded_ids.len()));
+        receipt.insert(
+            "cascaded_revision_ids".into(),
+            Value::Array(cascaded.rows.clone()),
+        );
+        receipt.insert("cascaded_revision_ids_evidence".into(), cascaded.metadata());
+        receipt.insert("changed_block_count".into(), json!(changed_block_ids.len()));
+        receipt.insert(
+            "changed_block_ids".into(),
+            Value::Array(block_ids.rows.clone()),
+        );
+        receipt.insert("changed_block_ids_evidence".into(), block_ids.metadata());
+        receipt.insert(
+            "changed_blocks".into(),
+            Value::Array(block_rows.rows.clone()),
+        );
+        receipt.insert("changed_blocks_evidence".into(), block_rows.metadata());
+        receipt.insert("block_count".into(), json!(block_count));
+        receipt.insert("server_version".into(), json!(SERVER_VERSION));
+        if ids_omitted + cascaded_omitted + block_ids_omitted + rows_omitted > 0 {
+            let mut truncated = serde_json::Map::new();
+            truncated.insert(action_ids_omitted_key, json!(ids_omitted));
+            truncated.insert(
+                "cascaded_revision_ids_omitted".into(),
+                json!(cascaded_omitted),
+            );
+            truncated.insert("changed_block_ids_omitted".into(), json!(block_ids_omitted));
+            truncated.insert("changed_blocks_rows_omitted".into(), json!(rows_omitted));
+            truncated.insert(
+                "advice".into(),
+                json!(
+                    "counts are exact; the omitted entries are not lost — inspect_docx \
+                     {query: \"revisions\"} lists what remains pending, and verify_docx \
+                     checks the saved result independently of this receipt"
+                ),
+            );
+            receipt.insert("truncated".into(), Value::Object(truncated));
+        }
+        Value::Object(receipt)
+    }
+
+    #[tool(
+        description = "Accept tracked changes selected by id, author, block range, an \
+                       AND-combined filter (by_filter: author ∧ kind ∧ block range — the \
+                       one-call form of \"author X's changes in section Y\"), or all. \
                        The selector is lowered to a concrete revision-id set against the \
                        current read view; an empty/unmatched selection fails loudly \
                        (InvalidRange) rather than silently doing nothing. Accepting only \
                        some changes leaves the rest tracked. Returns a lean receipt: \
-                       accepted_revision_ids, cascaded_revision_ids, changed_block_ids, \
-                       changed_blocks (rows for the changed blocks only), block_count, \
-                       server_version — NOT the whole outline. \
+                       exact counts (accepted, cascaded, changed_block_count) plus \
+                       BOUNDED lists (accepted_revision_ids, cascaded_revision_ids, \
+                       changed_block_ids, changed_blocks rows) — a bulk resolution \
+                       reports an explicit `truncated` breakdown instead of an \
+                       unbounded id dump; counts are always exact and every capped \
+                       list carries omitted + set_sha256 metadata for its complete set. \
                        Policy: by default, LAYER your tracked changes beside other authors' \
                        pending changes; only resolve (accept/reject) another author's pending \
                        change when the user's instruction calls for it (a cleanup/tighten-class \
@@ -3863,19 +6919,18 @@ impl StemmaServer {
                         Ok(v) => v,
                         Err(r) => return r,
                     };
-                ok(json!({
-                    "doc_id": args.doc_id,
-                    "accepted_revision_ids": accepted,
-                    // Revisions resolved as a CASCADE of this acceptance
-                    // (e.g. accepting a deletion stacked over an insertion
-                    // settles the insertion's claim on that range). Never
-                    // silent — track these too.
-                    "cascaded_revision_ids": result.cascaded_revision_ids,
-                    "changed_block_ids": changed,
-                    "changed_blocks": changed_blocks,
-                    "block_count": block_count,
-                    "server_version": SERVER_VERSION,
-                }))
+                // Cascaded revisions (e.g. accepting a deletion stacked over
+                // an insertion settles the insertion's claim on that range)
+                // are never silent — counted exactly, listed bounded.
+                ok(Self::resolution_receipt(
+                    &args.doc_id,
+                    "accepted",
+                    &accepted,
+                    &result.cascaded_revision_ids,
+                    &changed,
+                    changed_blocks,
+                    block_count,
+                ))
             }
             Err(e) => fail_json(json!({
                 "code": format!("{:?}", e.code),
@@ -3885,12 +6940,14 @@ impl StemmaServer {
     }
 
     #[tool(
-        description = "Reject tracked changes selected by id, author, block range, or all. \
+        description = "Reject tracked changes selected by id, author, block range, an \
+                       AND-combined filter (by_filter: author ∧ kind ∧ block range), or all. \
                        Same selector lowering and fail-loud contract as accept_changes; \
                        rejecting only some changes leaves the rest tracked. Returns a lean \
-                       receipt: rejected_revision_ids, cascaded_revision_ids, \
-                       changed_block_ids, changed_blocks (rows for the changed blocks only), \
-                       block_count, server_version — NOT the whole outline. \
+                       receipt: exact counts (rejected, cascaded, changed_block_count) plus \
+                       BOUNDED lists with an explicit `truncated` breakdown and complete-set \
+                       commitment metadata on bulk resolutions — counts are always exact, \
+                       never an unbounded id dump. \
                        Policy: by default, LAYER your tracked changes beside other authors' \
                        pending changes; only resolve (accept/reject) another author's pending \
                        change when the user's instruction calls for it (a cleanup/tighten-class \
@@ -3927,15 +6984,15 @@ impl StemmaServer {
                         Ok(v) => v,
                         Err(r) => return r,
                     };
-                ok(json!({
-                    "doc_id": args.doc_id,
-                    "rejected_revision_ids": rejected,
-                    "cascaded_revision_ids": result.cascaded_revision_ids,
-                    "changed_block_ids": changed,
-                    "changed_blocks": changed_blocks,
-                    "block_count": block_count,
-                    "server_version": SERVER_VERSION,
-                }))
+                ok(Self::resolution_receipt(
+                    &args.doc_id,
+                    "rejected",
+                    &rejected,
+                    &result.cascaded_revision_ids,
+                    &changed,
+                    changed_blocks,
+                    block_count,
+                ))
             }
             Err(e) => fail_json(json!({
                 "code": format!("{:?}", e.code),
@@ -3953,44 +7010,63 @@ impl StemmaServer {
                        is stale or unsupported. Use this to validate an edit before committing."
     )]
     async fn check_edit(&self, Parameters(args): Parameters<CheckArgs>) -> CallToolResult {
+        let submitted_operations = args.transaction.operation_count();
         let txn_json = args.transaction.to_json_string();
-        let txn_json = match resolve_image_paths(&txn_json) {
-            Ok(s) => s,
-            Err(f) => return f,
+        let (txn_json, _image_sources) = match resolve_image_paths(
+            &self.artifacts,
+            &txn_json,
+            self.max_image_bytes(),
+            self.max_image_total_bytes(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(f) => return attach_known_transaction_outcomes(f, submitted_operations, true),
         };
         let v4 = match parse_transaction(&txn_json) {
             Ok(v) => v,
             Err(e) => {
-                return fail(
-                    "schema_error",
-                    augment_schema_error(&txn_json, &e.to_string()),
+                return attach_known_transaction_outcomes(
+                    fail(
+                        "schema_error",
+                        augment_schema_error(&txn_json, &e.to_string()),
+                    ),
+                    submitted_operations,
+                    true,
                 );
             }
         };
+        let operation_count = v4.ops.len();
         let txn = match v4.into_edit_transaction() {
             Ok(t) => t,
-            Err(e) => return fail("adapter_error", e.to_string()),
+            Err(e) => {
+                return attach_transaction_outcomes(
+                    fail("adapter_error", e.to_string()),
+                    operation_count,
+                    true,
+                );
+            }
         };
 
         let handle = DocHandle(args.doc_id.clone());
-        // Run the verb core on a clone of the canonical IR and DISCARD it. The
-        // `with` closure returns the dry-run Result; the cloned canonical is
-        // dropped at the end of the closure, so nothing is persisted.
-        let outcome = self.runtime.with(&handle, |snap| {
-            stemma::edit::apply_transaction(&snap.canonical.clone(), &txn).map(|_| ())
-        });
-        match outcome {
+        // Run the same package-aware, author-protected apply used by commit and
+        // discard the derived snapshot. Pure apply_transaction cannot check
+        // package-level style/media constraints or origin-author impersonation.
+        let outcome = self
+            .runtime
+            .with(&handle, |snap| snap.apply_authored(&txn, false).map(|_| ()));
+        let result = match outcome {
             Ok(Ok(())) => ok(json!({ "doc_id": args.doc_id, "would_apply": true })),
-            Ok(Err(edit_err)) => fail_json(json!({
-                "code": format!("{:?}", edit_error_code(&edit_err)),
-                "error": edit_err.to_string(),
+            Ok(Err(error)) => fail_json(json!({
+                "code": format!("{:?}", error.code),
+                "error": error.message,
+                "details": format!("{:?}", error.details),
                 "would_apply": false,
             })),
             Err(e) => fail(
                 &format!("{:?}", e.code),
                 format!("doc not open: {}", e.message),
             ),
-        }
+        };
+        attach_transaction_outcomes(result, operation_count, true)
     }
 
     #[tool(
@@ -4033,7 +7109,9 @@ impl StemmaServer {
                        effects are annotated on direct rows via coincides_with_resolution), \
                        untouched ({verified_blocks, parts, violations} — every block outside \
                        the reported changes verified structurally identical to the baseline), \
-                       and validator (the package verdict on the would-be save bytes). Run it \
+                       and validator (the package verdict on the would-be save bytes). The \
+                       response separates baseline_validator findings already present at open \
+                       from validator.new_issue_count regressions introduced since open. Run it \
                        BEFORE save_docx: review, then save iff it matches intent. Saving does \
                        not reset the baseline; re-opening does. Optional render.path \
                        additionally materializes the baseline→now delta as a tracked-changes \
@@ -4045,18 +7123,32 @@ impl StemmaServer {
         Parameters(args): Parameters<ReviewSessionArgs>,
     ) -> CallToolResult {
         let handle = DocHandle(args.doc_id.clone());
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
         let report = match self.runtime.review_session(&handle) {
             Ok(r) => r,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
-        let mut payload = audit_report_json(&report);
+        let mut payload = match audit_report_json(&report, args.detail, args.offset, args.limit) {
+            Ok(payload) => payload,
+            Err(message) => return fail("invalid_argument", message),
+        };
+        let source = match self.runtime.session_source_bytes(&handle) {
+            Ok(bytes) => bytes,
+            Err(error) => return fail(&format!("{:?}", error.code), error.message),
+        };
+        let baseline_validation = stemma::api::validate(&source);
+        attach_baseline_validation(&mut payload, &baseline_validation, &report.validator);
         payload["doc_id"] = json!(args.doc_id);
         payload["server_version"] = json!(SERVER_VERSION);
+        let input_artifacts = match self.protected_sources(&args.doc_id) {
+            Ok(artifacts) => artifacts,
+            Err(failure) => return failure,
+        };
+        payload["input_artifacts"] = json!(input_artifacts);
         if let Some(render) = &args.render {
-            let source = match self.runtime.session_source_bytes(&handle) {
-                Ok(b) => b,
-                Err(e) => return fail(&format!("{:?}", e.code), e.message),
-            };
             // The current document as bytes, via the same gated export the
             // save path uses — an unsaveable document cannot render either,
             // and the failure names the gate finding.
@@ -4064,7 +7156,13 @@ impl StemmaServer {
                 Ok(b) => b,
                 Err(e) => return fail(&format!("{:?}", e.code), e.message),
             };
-            match self.render_redline_between(&source, &current, &render.path) {
+            match self.render_redline_between(
+                &source,
+                &current,
+                &render.path,
+                "session_redline",
+                &input_artifacts,
+            ) {
                 Ok(render_json) => payload["render"] = render_json,
                 Err(failure) => return failure,
             }
@@ -4082,29 +7180,47 @@ impl StemmaServer {
                        preexisting (before's pending revisions with disposition \
                        untouched|modified|resolved), untouched (structural proof over \
                        everything else, all stories), validator (package verdict on \
-                       after's bytes). compare_docx answers 'produce a redline'; audit_docx \
+                       after's bytes), and baseline_validator (the before file's verdict); \
+                       validator.new_issue_count isolates regressions. compare_docx answers \
+                       'produce a redline'; audit_docx \
                        answers 'certify what happened' — optional render.path also writes \
-                       the redline, subsuming compare_docx when set."
+                       the redline, subsuming compare_docx when set. Audit lists are explicitly \
+                       paged: omit detail for the first 16 rows of every section, or select one \
+                       detail with offset/limit (maximum 64) to retrieve all findings."
     )]
     async fn audit_docx(&self, Parameters(args): Parameters<AuditDocxArgs>) -> CallToolResult {
-        let before = match read_or_fail(&args.before_path) {
-            Ok(b) => b,
-            Err(r) => return r,
+        let before = match self.read_source(&args.before_path, "before_docx", self.max_doc_bytes())
+        {
+            Ok(source) => source,
+            Err(failure) => return failure,
         };
-        let after = match read_or_fail(&args.after_path) {
-            Ok(b) => b,
-            Err(r) => return r,
+        let after = match self.read_source(&args.after_path, "after_docx", self.max_doc_bytes()) {
+            Ok(source) => source,
+            Err(failure) => return failure,
         };
-        let report = match stemma::audit(&before, &after) {
+        let report = match stemma::audit(before.bytes(), after.bytes()) {
             Ok(r) => r,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
-        let mut payload = audit_report_json(&report);
+        let input_artifacts = vec![before.identity().clone(), after.identity().clone()];
+        let mut payload = match audit_report_json(&report, args.detail, args.offset, args.limit) {
+            Ok(payload) => payload,
+            Err(message) => return fail("invalid_argument", message),
+        };
+        let baseline_validation = stemma::api::validate(before.bytes());
+        attach_baseline_validation(&mut payload, &baseline_validation, &report.validator);
         payload["before_path"] = json!(args.before_path);
         payload["after_path"] = json!(args.after_path);
         payload["server_version"] = json!(SERVER_VERSION);
+        payload["input_artifacts"] = json!(input_artifacts);
         if let Some(render) = &args.render {
-            match self.render_redline_between(&before, &after, &render.path) {
+            match self.render_redline_between(
+                before.bytes(),
+                after.bytes(),
+                &render.path,
+                "audit_redline",
+                &input_artifacts,
+            ) {
                 Ok(render_json) => payload["render"] = render_json,
                 Err(failure) => return failure,
             }
@@ -4116,67 +7232,115 @@ impl StemmaServer {
         description = "Apply a v4 edit transaction with a preview switch. A v4 transaction is \
                        already atomic (all ops apply or none), so a 'batch' is just one \
                        transaction plus preview. preview=true runs the dry-run path and \
-                       returns {applied:false, would_apply:true, preview_outline} built from \
-                       the discarded canonical (nothing persisted); preview=false applies it \
-                       as tracked changes and returns the lean write receipt (applied, \
-                       revision_ids, changed_block_ids, changed_blocks, block_count, \
-                       server_version) — the changed blocks only, not the whole document."
+                       returns the same lean, touched-block-only receipt as apply while \
+                       discarding the derived snapshot (nothing persists); preview=false \
+                       applies it as tracked changes. Every submitted operation has an uncapped \
+                       inline outcome plus the atomicity result; potentially large revision and \
+                       changed-block evidence is capped with exact counts, omission counts, and \
+                       complete-set SHA-256 commitments."
     )]
     async fn apply_batch(&self, Parameters(args): Parameters<BatchArgs>) -> CallToolResult {
+        let submitted_operations = args.transaction.operation_count();
         let txn_json = args.transaction.to_json_string();
-        let txn_json = match resolve_image_paths(&txn_json) {
-            Ok(s) => s,
-            Err(f) => return f,
+        let (txn_json, image_sources) = match resolve_image_paths(
+            &self.artifacts,
+            &txn_json,
+            self.max_image_bytes(),
+            self.max_image_total_bytes(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(f) => {
+                return attach_known_transaction_outcomes(f, submitted_operations, args.preview);
+            }
         };
         let v4 = match parse_transaction(&txn_json) {
             Ok(v) => v,
             Err(e) => {
-                return fail(
-                    "schema_error",
-                    augment_schema_error(&txn_json, &e.to_string()),
+                return attach_known_transaction_outcomes(
+                    fail(
+                        "schema_error",
+                        augment_schema_error(&txn_json, &e.to_string()),
+                    ),
+                    submitted_operations,
+                    args.preview,
                 );
             }
         };
+        let operation_count = v4.ops.len();
         let mut txn = match v4.into_edit_transaction() {
             Ok(t) => t,
-            Err(e) => return fail("adapter_error", e.to_string()),
+            Err(e) => {
+                return attach_transaction_outcomes(
+                    fail("adapter_error", e.to_string()),
+                    operation_count,
+                    args.preview,
+                );
+            }
         };
         match parse_materialization_mode(&args.mode) {
             Ok(Some(m)) => txn.materialization_mode = m,
             Ok(None) => {}
-            Err(msg) => return fail("invalid_argument", msg),
+            Err(msg) => {
+                return attach_transaction_outcomes(
+                    fail("invalid_argument", msg),
+                    operation_count,
+                    args.preview,
+                );
+            }
         }
         let handle = DocHandle(args.doc_id.clone());
 
-        // The author-impersonation guard runs inside `apply_edit_receipt`
-        // below, on the PERSISTING path only — a preview (dry run) returns
-        // before reaching it and persists nothing, so it stays free to model
-        // any author.
         if args.preview {
-            // Dry-run: apply the verb core to a clone, build the outline from
-            // that discarded canonical, and persist nothing.
+            // Dry-run the exact package-aware, authored path and build the same
+            // touched-block-only receipt as commit from the discarded derived
+            // snapshot. Returning the whole outline here used to dominate
+            // agent history (100KB+ per preview on benchmark documents).
             let outcome = self.runtime.with(&handle, |snap| {
-                stemma::edit::apply_transaction(&snap.canonical.clone(), &txn).map(
-                    |(canon, _pending)| {
-                        let view = stemma::view::build_document_view_from_canon(&canon);
-                        view.blocks
+                let before = Arc::clone(&snap.canonical);
+                let before_revision_ids: HashSet<u32> = revision_rows(&before)
+                    .iter()
+                    .map(|row| row.revision_id)
+                    .collect();
+                snap.apply_authored(&txn, args.allow_existing_author)
+                    .map(|preview| {
+                        let after = preview.canonical;
+                        let changed = changed_block_ids(&before, &after);
+                        let want: HashSet<&str> = changed.iter().map(String::as_str).collect();
+                        let view = build_document_view_from_canon(&after);
+                        let changed_blocks = view
+                            .blocks
                             .iter()
-                            .zip(canon.blocks.iter())
-                            .map(|(bv, tb)| block_row(bv, tb))
-                            .collect::<Vec<_>>()
-                    },
-                )
+                            .zip(after.blocks.iter())
+                            .filter(|(block, _)| want.contains(block.id.to_string().as_str()))
+                            .map(|(bv, tb)| receipt_block_row(bv, tb))
+                            .collect::<Vec<_>>();
+                        let mut revision_ids: Vec<u32> = revision_rows(&after)
+                            .iter()
+                            .map(|row| row.revision_id)
+                            .filter(|id| !before_revision_ids.contains(id))
+                            .collect();
+                        revision_ids.sort_unstable();
+                        revision_ids.dedup();
+                        Self::bounded_transaction_receipt(json!({
+                            "doc_id": args.doc_id,
+                            "applied": false,
+                            "would_apply": true,
+                            "revision_ids": revision_ids,
+                            "changed_block_ids": changed,
+                            "changed_blocks": changed_blocks,
+                            "block_count": after.blocks.len(),
+                            "moves": move_receipts(&before, &after),
+                            "table_receipts": table_receipts(&before, &after),
+                            "server_version": SERVER_VERSION,
+                        }))
+                    })
             });
-            return match outcome {
-                Ok(Ok(preview_outline)) => ok(json!({
-                    "doc_id": args.doc_id,
-                    "applied": false,
-                    "would_apply": true,
-                    "preview_outline": preview_outline,
-                })),
-                Ok(Err(edit_err)) => fail_json(json!({
-                    "code": format!("{:?}", edit_error_code(&edit_err)),
-                    "error": edit_err.to_string(),
+            let result = match outcome {
+                Ok(Ok(receipt)) => ok(receipt),
+                Ok(Err(error)) => fail_json(json!({
+                    "code": format!("{:?}", error.code),
+                    "error": error.message,
+                    "details": format!("{:?}", error.details),
                     "would_apply": false,
                 })),
                 Err(e) => fail(
@@ -4184,9 +7348,12 @@ impl StemmaServer {
                     format!("doc not open: {}", e.message),
                 ),
             };
+            return attach_transaction_outcomes(result, operation_count, true);
         }
 
-        self.apply_edit_receipt(&handle, &txn, args.allow_existing_author)
+        let result =
+            self.apply_edit_with_sources(&handle, &txn, args.allow_existing_author, image_sources);
+        attach_transaction_outcomes(result, operation_count, false)
     }
 }
 
@@ -4203,23 +7370,74 @@ fn validation_issue_code_str(code: &stemma::ValidationIssueCode) -> &'static str
 
 // ─── Audit report wire shape (review_session / audit_docx, RFC 0001) ─────────
 
-/// Serialize a row list under the report's shared cap: `{rows, total}` plus
-/// an explicit `truncated` report ONLY when the cap bites — same non-silent
-/// policy as `cap_revision_rows`.
-fn capped_rows_json(rows: Vec<Value>, narrow_advice: &str) -> Value {
-    let total = rows.len();
-    if total <= MAX_REVISION_ROWS {
-        return json!({ "rows": rows, "total": total });
+const DEFAULT_AUDIT_PAGE_ROWS: usize = 16;
+const MAX_AUDIT_PAGE_ROWS: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct AuditPageRequest {
+    detail: AuditDetail,
+    offset: usize,
+    limit: usize,
+}
+
+fn parse_audit_page_request(
+    detail: Option<AuditDetail>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Option<AuditPageRequest>, String> {
+    let Some(detail) = detail else {
+        if offset.is_some() || limit.is_some() {
+            return Err("offset and limit require detail".to_string());
+        }
+        return Ok(None);
+    };
+    let limit = limit.unwrap_or(DEFAULT_AUDIT_PAGE_ROWS);
+    if !(1..=MAX_AUDIT_PAGE_ROWS).contains(&limit) {
+        return Err(format!(
+            "audit detail limit must be between 1 and {MAX_AUDIT_PAGE_ROWS}, got {limit}"
+        ));
     }
-    json!({
-        "rows": rows[..MAX_REVISION_ROWS],
+    Ok(Some(AuditPageRequest {
+        detail,
+        offset: offset.unwrap_or(0),
+        limit,
+    }))
+}
+
+fn audit_rows_page(rows: &[Value], offset: usize, limit: usize) -> Result<Value, String> {
+    let total = rows.len();
+    if offset > total {
+        return Err(format!(
+            "audit detail offset {offset} exceeds section total {total}"
+        ));
+    }
+    let end = offset.saturating_add(limit).min(total);
+    let returned = end - offset;
+    let has_more = end < total;
+    let omitted = total - returned;
+    let mut page = json!({
+        "rows": &rows[offset..end],
         "total": total,
-        "truncated": {
-            "limit": MAX_REVISION_ROWS,
-            "omitted": total - MAX_REVISION_ROWS,
-            "advice": narrow_advice,
-        },
-    })
+        "offset": offset,
+        "returned": returned,
+        "omitted": omitted,
+        "set_sha256": canonical_set_sha256(rows),
+        "has_more": has_more,
+    });
+    if has_more {
+        page["next_offset"] = json!(end);
+    }
+    Ok(page)
+}
+
+fn audit_array_and_page(page: Value) -> (Value, Value) {
+    let rows = page["rows"].clone();
+    let mut metadata = page;
+    metadata
+        .as_object_mut()
+        .expect("audit page is always an object")
+        .remove("rows");
+    (rows, metadata)
 }
 
 fn audit_census_row_json(r: &stemma::tracked_model::RevisionRecord) -> Value {
@@ -4234,6 +7452,27 @@ fn audit_census_row_json(r: &stemma::tracked_model::RevisionRecord) -> Value {
     })
 }
 
+fn validation_issue_json(issue: &stemma::runtime::ValidationIssue) -> Value {
+    json!({
+        "code": validation_issue_code_str(&issue.code),
+        "message": issue.message,
+        "context": issue.context,
+    })
+}
+
+fn audit_direct_change_explanation(c: &stemma::audit::DirectChange) -> Option<&'static str> {
+    match &c.story {
+        StoryScope::Comment { .. } => Some("comment_annotation"),
+        _ if !c.coincides_with_resolution.is_empty() => Some("revision_resolution"),
+        _ if c.kind == stemma::audit::DirectChangeKind::BlockModified
+            && c.old_excerpt == c.new_excerpt =>
+        {
+            Some("property_change")
+        }
+        _ => None,
+    }
+}
+
 fn audit_direct_row_json(c: &stemma::audit::DirectChange) -> Value {
     json!({
         "story": c.story,
@@ -4242,14 +7481,33 @@ fn audit_direct_row_json(c: &stemma::audit::DirectChange) -> Value {
         "old_excerpt": c.old_excerpt.as_deref().map(cap_excerpt),
         "new_excerpt": c.new_excerpt.as_deref().map(cap_excerpt),
         "coincides_with_resolution": c.coincides_with_resolution,
+        "explanation": audit_direct_change_explanation(c),
     })
 }
 
-/// The full `AuditReport` wire shape shared by `review_session` and
-/// `audit_docx` (RFC 0001): sections 1–4, every claim engine-derived. The
-/// caller adds its identity fields (`doc_id` / paths) and optional `render`.
-fn audit_report_json(report: &stemma::audit::AuditReport) -> Value {
+/// Bounded `AuditReport` wire shape shared by `review_session` and
+/// `audit_docx` (RFC 0001): sections 1–4, every claim engine-derived and every
+/// list explicitly paged. A selected detail page changes only that section;
+/// the other sections remain on their bounded first page. The caller adds its
+/// identity fields (`doc_id` / paths) and optional `render`.
+fn audit_report_json(
+    report: &stemma::audit::AuditReport,
+    detail: Option<AuditDetail>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
     use stemma::audit::{RevisionDisposition, UntouchedViolationKind};
+
+    let unexplained_direct_changes = report
+        .direct_changes
+        .iter()
+        .filter(|change| audit_direct_change_explanation(change).is_none())
+        .count();
+    let changed_prior_revisions = report
+        .preexisting_revisions
+        .iter()
+        .filter(|prior| !matches!(&prior.disposition, RevisionDisposition::Untouched))
+        .count();
 
     let census: Vec<Value> = report
         .new_revisions
@@ -4313,30 +7571,117 @@ fn audit_report_json(report: &stemma::audit::AuditReport) -> Value {
         .validator
         .issues
         .iter()
-        .map(|i| {
-            json!({
-                "code": validation_issue_code_str(&i.code),
-                "message": i.message,
-                "context": i.context,
-            })
-        })
+        .map(validation_issue_json)
         .collect();
 
-    json!({
-        "session": {
-            "census": capped_rows_json(census, "resolve or save in stages, or read list_revisions with filters for the full census"),
-            "direct_delta": capped_rows_json(direct, "compare_docx renders the full delta as a redline"),
+    let request = parse_audit_page_request(detail, offset, limit)?;
+    let coordinates = |section: AuditDetail| match request {
+        Some(request) if request.detail == section => (request.offset, request.limit),
+        _ => (0, DEFAULT_AUDIT_PAGE_ROWS),
+    };
+    let (census_offset, census_limit) = coordinates(AuditDetail::Census);
+    let census = audit_rows_page(&census, census_offset, census_limit)?;
+    let (direct_offset, direct_limit) = coordinates(AuditDetail::DirectDelta);
+    let direct = audit_rows_page(&direct, direct_offset, direct_limit)?;
+    let (preexisting_offset, preexisting_limit) = coordinates(AuditDetail::Preexisting);
+    let preexisting = audit_rows_page(&preexisting, preexisting_offset, preexisting_limit)?;
+    let (violations_offset, violations_limit) = coordinates(AuditDetail::Violations);
+    let (violations, violations_page) = audit_array_and_page(audit_rows_page(
+        &violations,
+        violations_offset,
+        violations_limit,
+    )?);
+    let (issues_offset, issues_limit) = coordinates(AuditDetail::ValidatorIssues);
+    let (validator_issues, validator_issues_page) = audit_array_and_page(audit_rows_page(
+        &validator_issues,
+        issues_offset,
+        issues_limit,
+    )?);
+
+    let mut payload = json!({
+        "counts": {
+            "new_revisions": report.new_revisions.len(),
+            "direct_changes": report.direct_changes.len(),
+            "unexplained_direct_changes": unexplained_direct_changes,
+            "preexisting_revisions": report.preexisting_revisions.len(),
+            "changed_prior_revisions": changed_prior_revisions,
+            "untouched_violations": report.untouched.violations.len(),
+            "validator_issues": report.validator.issues.len(),
+            "new_validator_issues": Value::Null,
         },
-        "preexisting": capped_rows_json(preexisting, "read list_revisions with filters for the full pending set"),
+        "session": {
+            "census": census,
+            "direct_delta": direct,
+        },
+        "preexisting": preexisting,
         "untouched": {
             "verified_blocks": report.untouched.verified_blocks,
             "parts": report.untouched.parts,
-            // Violations are findings, never capped: hiding one would be the
-            // exact silent under-report the audit exists to kill.
             "violations": violations,
+            "violations_page": violations_page,
         },
-        "validator": { "ok": report.validator.ok, "issues": validator_issues },
-    })
+        "validator": {
+            "ok": report.validator.ok,
+            "issues": validator_issues,
+            "issues_page": validator_issues_page,
+        },
+    });
+    if let Some(request) = request {
+        payload["requested_detail"] = json!({
+            "section": request.detail.as_str(),
+            "offset": request.offset,
+            "limit": request.limit,
+        });
+    }
+    Ok(payload)
+}
+
+fn attach_baseline_validation(
+    payload: &mut Value,
+    baseline: &stemma::runtime::ValidationReport,
+    current: &stemma::runtime::ValidationReport,
+) {
+    let baseline_issues: Vec<Value> = baseline.issues.iter().map(validation_issue_json).collect();
+    let baseline_page = audit_rows_page(&baseline_issues, 0, DEFAULT_AUDIT_PAGE_ROWS)
+        .expect("zero-offset default audit page is valid");
+    let (baseline_rows, baseline_page) = audit_array_and_page(baseline_page);
+    payload["baseline_validator"] = json!({
+        "ok": baseline.ok,
+        "issues": baseline_rows,
+        "issues_page": baseline_page,
+    });
+
+    let new_issue_count = current
+        .issues
+        .iter()
+        .filter(|issue| !baseline.issues.contains(issue))
+        .count();
+    let resolved_baseline_issue_count = baseline
+        .issues
+        .iter()
+        .filter(|issue| !current.issues.contains(issue))
+        .count();
+    payload["validator"]["baseline_issue_count"] = json!(baseline.issues.len());
+    payload["validator"]["new_issue_count"] = json!(new_issue_count);
+    payload["validator"]["resolved_baseline_issue_count"] = json!(resolved_baseline_issue_count);
+    payload["validator"]["unchanged_from_baseline"] =
+        json!(new_issue_count == 0 && resolved_baseline_issue_count == 0);
+    payload["counts"]["new_validator_issues"] = json!(new_issue_count);
+    let blocking_finding_count = payload["counts"]["unexplained_direct_changes"]
+        .as_u64()
+        .expect("audit count is an integer")
+        + payload["counts"]["changed_prior_revisions"]
+            .as_u64()
+            .expect("audit count is an integer")
+        + payload["counts"]["untouched_violations"]
+            .as_u64()
+            .expect("audit count is an integer")
+        + u64::try_from(new_issue_count).expect("usize fits u64 on supported targets");
+    payload["verdict"] = json!({
+        "status": if blocking_finding_count == 0 { "pass" } else { "fail" },
+        "deliverable": blocking_finding_count == 0,
+        "blocking_finding_count": blocking_finding_count,
+    });
 }
 
 impl StemmaServer {
@@ -4348,6 +7693,8 @@ impl StemmaServer {
         base: &[u8],
         target: &[u8],
         out_path: &str,
+        output_role: &str,
+        protected_sources: &[ArtifactIdentity],
     ) -> Result<Value, CallToolResult> {
         let (base_import, target_import) = self
             .runtime
@@ -4365,12 +7712,21 @@ impl StemmaServer {
         // Gate the redline before persisting it, same as save_docx/compare_docx.
         stemma::gate_serialized_bytes(&result.redline_bytes, stemma::ValidatorLevel::Blocking)
             .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
-        std::fs::write(out_path, &result.redline_bytes)
-            .map_err(|e| fail("io_error", format!("cannot write {out_path}: {e}")))?;
+        let output_artifact = self
+            .artifacts
+            .commit_new(
+                out_path,
+                output_role,
+                &result.redline_bytes,
+                protected_sources,
+            )
+            .map_err(artifact_fail)?;
         Ok(json!({
             "path": out_path,
             "change_count": result.diff.changes.len(),
             "bytes_written": result.redline_bytes.len(),
+            "output_artifact": output_artifact,
+            "server_version": SERVER_VERSION,
         }))
     }
 }
@@ -4382,9 +7738,9 @@ impl StemmaServer {
 // ever see the base open/read/edit/save tools. See `StemmaServer::new`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for StemmaServer {
-    /// Every tool call funnels through here. We (1) sweep expired documents so a
-    /// long-lived host cannot grow without bound, (2) note the `doc_id` the call
-    /// referenced, dispatch to the router, and (3) upgrade an ambiguous missing-
+    /// Every tool call funnels through here. We (1) sweep expired documents and
+    /// their coupled artifact state so a long-lived host cannot grow without
+    /// bound, (2) dispatch to the router, and (3) upgrade an ambiguous missing-
     /// handle error into an actionable "re-open" / "unknown id" one. The
     /// `#[tool_handler]` macro fills in `list_tools`/`get_tool`; only `call_tool`
     /// is overridden (the macro skips a method we define ourselves).
@@ -4393,15 +7749,15 @@ impl ServerHandler for StemmaServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if self.config.doc_ttl_secs > 0 {
-            self.runtime.evict_expired(self.config.doc_ttl_secs);
-        }
         let referenced_doc_id = request
             .arguments
             .as_ref()
             .and_then(|a| a.get("doc_id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if self.config.doc_ttl_secs > 0 {
+            self.evict_expired_sessions(self.config.doc_ttl_secs);
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = self.tool_router.call(tcc).await?;
         Ok(self.attribute_missing_doc(result, referenced_doc_id.as_deref()))
@@ -4413,15 +7769,18 @@ impl ServerHandler for StemmaServer {
         // server it has wired up. Version tracks SERVER_VERSION (the same
         // build-stamp identity carried on every tool payload) so the handshake
         // and the responses report one version.
+        //
+        // The full editing playbook ships IN the server: `instructions.md` is
+        // the canonical guidance (golden path, sharp edges, layering policy),
+        // and every MCP client that surfaces server `instructions` gets it at
+        // connect time — no client-specific skill file required. Packaging
+        // must not fork the in-band guidance.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("stemma-mcp", SERVER_VERSION))
-            .with_instructions(
-                "stemma DOCX engine. Workflow: open_docx(path) -> read block ids/text/hashes; \
-             apply_edit(doc_id, v4 transaction) to make tracked changes (anchor each op to a \
-             block id and pin it with `expect`); save_docx(doc_id, path) to write the result. \
-             compare_docx(base, target, out) produces a redline. Edits are atomic and fail \
-             loudly on stale preconditions; on a stale error, re-read the outline and retry.",
-            )
+            .with_instructions(match self.config.profile {
+                ToolProfile::Core => CORE_INSTRUCTIONS,
+                ToolProfile::Advanced => INSTRUCTIONS,
+            })
     }
 }
 
@@ -4460,6 +7819,13 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+    let artifacts = match artifact_authority_from_env() {
+        Ok(authority) => authority,
+        Err(message) => {
+            eprintln!("stemma-mcp: invalid configuration: {message}");
+            std::process::exit(2);
+        }
+    };
 
     // Log to stderr so stdout stays a clean JSON-RPC channel.
     tracing_subscriber::fmt()
@@ -4472,10 +7838,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         doc_ttl_secs = config.doc_ttl_secs,
+        profile = ?config.profile,
         max_doc_bytes = config.max_doc_bytes,
+        max_image_bytes = config.max_image_bytes,
+        max_image_total_bytes = config.max_image_total_bytes,
+        workspace_root = %artifacts.root().expect("production MCP authority is rooted").display(),
         "stemma-mcp starting on stdio"
     );
-    let service = StemmaServer::with_config(config).serve(stdio()).await?;
+    let service = StemmaServer::with_config_and_authority(config, artifacts)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -4490,6 +7862,33 @@ mod tests {
 
     use super::*;
     use stemma::api::Document;
+
+    /// The server-shipped instructions ARE the editing playbook — a cold agent
+    /// on any MCP client must receive the golden path, the sharp edges, and
+    /// the layering policy at connect time. Pins the load-bearing sections so
+    /// a refactor cannot silently ship a stub (the pre-2026-07 state was a
+    /// 395-char summary — 2% of the guidance — and every non-Claude client
+    /// ran the engine blind).
+    #[test]
+    fn instructions_carry_the_full_playbook() {
+        for marker in [
+            "## Golden path",
+            "## Sharp edges",
+            "AuthorImpersonation",
+            "replace_text",
+            "## Policy: layer beside, don't resolve, unless asked",
+        ] {
+            assert!(
+                INSTRUCTIONS.contains(marker),
+                "server instructions lost required section/marker: {marker}"
+            );
+        }
+        assert!(
+            INSTRUCTIONS.len() > 8_000,
+            "server instructions suspiciously short ({} bytes) — stub shipped?",
+            INSTRUCTIONS.len()
+        );
+    }
 
     /// A minimal DOCX (no styles part → Normal-styled paragraphs) whose body is
     /// `body_inner`, optionally with a numbering.xml carrying numId=1 (decimal)
@@ -4596,6 +7995,145 @@ mod tests {
     }
 
     #[test]
+    fn core_table_detail_is_bounded_paged_and_exactly_retrievable() {
+        let cells: String = (0..12)
+            .map(|col| {
+                let text = format!("CELL-{col:02}-{}", "x".repeat(200));
+                format!(r#"<w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#)
+            })
+            .collect();
+        let body = format!(
+            r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tr>{cells}</w:tr></w:tbl>"#
+        );
+        let doc = Document::parse(&make_docx(&body, false)).expect("parse table");
+        let view = doc.read();
+        let table = view
+            .blocks
+            .iter()
+            .find(|block| matches!(block.role, BlockRole::Table))
+            .expect("table block");
+
+        let full = block_detail_json(table);
+        assert_eq!(full["cells"].as_array().expect("full cells").len(), 12);
+        assert!(
+            full["cells"][0]["text"]
+                .as_str()
+                .expect("full cell text")
+                .chars()
+                .count()
+                > BLOCK_CELL_EXCERPT_CHARS,
+            "advanced full-read surface keeps exact unbounded cell text"
+        );
+
+        let first = core_block_detail_json(table, InspectBlockDetail::Compact, None, None)
+            .expect("default core table page");
+        assert_eq!(first["text"], Value::Null);
+        assert_eq!(first["table_text_omitted"], true);
+        assert_eq!(first["cell_count"], 12);
+        assert_eq!(first["cells_returned"], DEFAULT_BLOCK_CELL_LIMIT);
+        assert_eq!(first["cells_has_more"], true);
+        assert_eq!(first["cells_next_offset"], DEFAULT_BLOCK_CELL_LIMIT);
+        let first_cell = &first["cells"][0];
+        assert_eq!(first_cell["text_truncated"], true);
+        assert_eq!(
+            first_cell["text_excerpt"]
+                .as_str()
+                .expect("excerpt")
+                .chars()
+                .count(),
+            BLOCK_CELL_EXCERPT_CHARS
+        );
+        let paragraph_id = first_cell["block_ids"][0]
+            .as_str()
+            .expect("cell paragraph id");
+        let exact = cell_paragraph_detail_json(&view, paragraph_id, InspectBlockDetail::Compact)
+            .expect("returned cell paragraph is inspectable");
+        assert_eq!(exact["text"], full["cells"][0]["text"]);
+
+        let second = core_block_detail_json(
+            table,
+            InspectBlockDetail::Formatting,
+            Some(DEFAULT_BLOCK_CELL_LIMIT),
+            Some(8),
+        )
+        .expect("continuation page");
+        assert_eq!(second["cells_returned"], 4);
+        assert_eq!(second["cells_has_more"], false);
+        assert_eq!(second["cells_next_offset"], Value::Null);
+        assert_eq!(second["cells"][0]["col"], DEFAULT_BLOCK_CELL_LIMIT);
+    }
+
+    #[test]
+    fn core_paragraph_detail_rejects_table_cell_paging_arguments() {
+        let doc = Document::parse(&make_docx(
+            r#"<w:p><w:r><w:t>Body paragraph.</w:t></w:r></w:p>"#,
+            false,
+        ))
+        .expect("parse");
+        let error = core_block_detail_json(
+            &doc.read().blocks[0],
+            InspectBlockDetail::Compact,
+            Some(0),
+            None,
+        )
+        .expect_err("cell paging on a paragraph must fail loud");
+        assert!(error.contains("require a table block"), "{error}");
+    }
+
+    #[test]
+    fn core_document_markdown_bounds_tables_without_hiding_the_read_path() {
+        let cells: String = (0..12)
+            .map(|col| {
+                let text = format!("CELL-{col:02}-{}-TAIL-CELL-{col:02}", "x".repeat(300));
+                format!(r#"<w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#)
+            })
+            .collect();
+        let body = format!(
+            r#"<w:p><w:r><w:t>Exact prose remains complete.</w:t></w:r></w:p><w:tbl><w:tblPr/><w:tr>{cells}</w:tr></w:tbl>"#
+        );
+        let doc = Document::parse(&make_docx(&body, false)).expect("parse table document");
+        let view = doc.read();
+        let core = core_document_markdown(&view.blocks);
+        let advanced = to_extended_markdown_blocks(&view.blocks);
+        let table = view
+            .blocks
+            .iter()
+            .find(|block| matches!(block.role, BlockRole::Table))
+            .expect("table block");
+        assert_eq!(
+            core_table_markdown_header(table),
+            to_extended_markdown_blocks(std::slice::from_ref(table))
+                .lines()
+                .next()
+                .expect("advanced table header"),
+            "the bounded core summary retains the authoritative table header"
+        );
+
+        assert!(core.contains("Exact prose remains complete."));
+        assert!(core.contains("kind=table cells=12"));
+        assert_eq!(core.matches("\ncell[").count(), 4);
+        assert!(core.contains("<more cells=8 next_offset=4 inspect_block=tbl_1/>"));
+        assert!(
+            core.contains("blocks=p_2"),
+            "first cell is addressable: {core}"
+        );
+        assert!(
+            !core.contains("TAIL-CELL-11"),
+            "an unrequested late cell body must not leak into the bounded page"
+        );
+        assert!(
+            advanced.contains("TAIL-CELL-11"),
+            "advanced exact Markdown remains complete"
+        );
+        assert!(
+            core.len() * 3 < advanced.len(),
+            "bounded table projection should be materially smaller: core={} advanced={}",
+            core.len(),
+            advanced.len()
+        );
+    }
+
+    #[test]
     fn block_detail_json_carries_list_membership_for_a_numbered_paragraph() {
         // The read_block JSON of a list paragraph must carry num_id/ilvl/ordered.
         let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Item one</w:t></w:r></w:p>"#;
@@ -4607,6 +8145,38 @@ mod tests {
         assert_eq!(list["num_id"], 1);
         assert_eq!(list["ilvl"], 0);
         assert_eq!(list["ordered"], true, "decimal list is ordered");
+    }
+
+    #[test]
+    fn compact_block_detail_preserves_every_opaque_anchor_id() {
+        let body = r#"<w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText>PAGE</w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>1</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+        </w:p>"#;
+        let doc = Document::parse(&make_docx(body, false)).expect("parse field paragraph");
+        let view = doc.read();
+        let full = block_detail_json(&view.blocks[0]);
+        let compact = compact_block_detail_json(&view.blocks[0]);
+        let full_ids: Vec<&str> = full["spans"]
+            .as_array()
+            .expect("formatting spans")
+            .iter()
+            .filter(|span| span["kind"] == "anchor")
+            .filter_map(|span| span["id"].as_str())
+            .collect();
+        let compact_ids: Vec<&str> = compact["anchors"]
+            .as_array()
+            .expect("compact anchors")
+            .iter()
+            .filter_map(|anchor| anchor["id"].as_str())
+            .collect();
+        assert!(!full_ids.is_empty(), "fixture must contain opaque anchors");
+        assert_eq!(compact_ids, full_ids, "compact detail loses no anchor ids");
+        assert_eq!(compact["formatting_available"], true);
+        assert!(compact.get("spans").is_none());
     }
 
     #[test]
@@ -4672,6 +8242,65 @@ mod tests {
         }
     }
 
+    /// Gemini's function-calling dialect rejects JSON Schema references. The
+    /// compact default profile must therefore advertise self-contained schemas;
+    /// downstream clients may still normalize nullable/union syntax for their
+    /// own dialect, but they must not need an out-of-band definition resolver.
+    #[test]
+    fn core_tool_schemas_are_self_contained() {
+        let router = StemmaServer::router_for_profile(ToolProfile::Core);
+        for tool in router.list_all() {
+            let name = tool.name;
+            let value = Value::Object(tool.input_schema.as_ref().clone());
+            let encoded = value.to_string();
+            assert!(
+                !encoded.contains("\"$defs\"") && !encoded.contains("\"$ref\""),
+                "{name} must not advertise JSON Schema references: {value}"
+            );
+            assert!(
+                !encoded.contains("\"type\":\"null\""),
+                "{name} must express optionality through `required`, not a null union: {value}"
+            );
+            assert!(
+                !encoded.contains("\"type\":["),
+                "{name} must advertise one Gemini-compatible type per field: {value}"
+            );
+        }
+
+        let execute = router.get("execute_plan").expect("execute schema");
+        let execute = Value::Object(execute.input_schema.as_ref().clone());
+        let replacement = &execute["properties"]["replacement_worklist"]["properties"]["replacements"]
+            ["items"]["properties"];
+        assert_eq!(
+            replacement["match_mode"]["enum"],
+            json!(["exact", "normalize_ws"])
+        );
+        assert_eq!(
+            replacement["on_barrier_match"]["enum"],
+            json!(["skip", "fail"])
+        );
+
+        let inspect = router.get("inspect_docx").expect("inspect schema");
+        let inspect = Value::Object(inspect.input_schema.as_ref().clone());
+        assert_eq!(
+            inspect["properties"]["detail"]["enum"],
+            json!(["compact", "formatting"])
+        );
+
+        let verify = router.get("verify_docx").expect("verify schema");
+        let verify = Value::Object(verify.input_schema.as_ref().clone());
+        assert_eq!(
+            verify["properties"]["detail"]["enum"],
+            json!([
+                "census",
+                "direct_delta",
+                "preexisting",
+                "violations",
+                "validator_issues"
+            ])
+        );
+    }
+
     /// A transaction that arrives double-encoded (the object as a JSON string —
     /// what a stringifying MCP host sends) is unwrapped and parses identically
     /// to the object form. A top-level string is never a valid transaction, so
@@ -4717,6 +8346,69 @@ mod tests {
         assert_eq!(payload["code"], "test_code");
     }
 
+    #[test]
+    fn successful_payloads_carry_the_server_version() {
+        let result = ok(json!({ "ok": true }));
+        let payload = result
+            .structured_content
+            .expect("ok() produces a structured payload");
+        assert_eq!(payload["server_version"], SERVER_VERSION);
+        assert_eq!(payload["ok"], true);
+    }
+
+    #[test]
+    fn augmented_receipts_keep_text_and_structured_content_equal() {
+        let mut result = ok(json!({ "applied": true }));
+        attach_field(&mut result, "match_count", json!(2));
+        let structured = result.structured_content.as_ref().unwrap();
+        let text: Value =
+            serde_json::from_str(&result.content[0].as_text().expect("text fallback").text)
+                .unwrap();
+        assert_eq!(&text, structured);
+    }
+
+    #[test]
+    fn preview_apply_cue_marks_only_complete_successful_previews() {
+        let mut transaction = ok(json!({"would_apply": true}));
+        let before_bytes = serde_json::to_vec(transaction.structured_content.as_ref().unwrap())
+            .expect("serialize base preview")
+            .len();
+        attach_preview_apply_cue(&mut transaction);
+        let after_bytes = serde_json::to_vec(transaction.structured_content.as_ref().unwrap())
+            .expect("serialize guided preview")
+            .len();
+        assert!(
+            after_bytes - before_bytes < 256,
+            "decision-point cue must stay tiny: before={before_bytes} after={after_bytes}"
+        );
+        let transaction = transaction.structured_content.expect("transaction payload");
+        assert_eq!(transaction["apply_ready"], true);
+        assert!(
+            transaction["next_action"]
+                .as_str()
+                .is_some_and(|text| text.contains("identical plan"))
+        );
+
+        let mut complete_worklist = ok(json!({"would_apply": 3, "failed": 0}));
+        attach_preview_apply_cue(&mut complete_worklist);
+        assert_eq!(
+            complete_worklist.structured_content.as_ref().unwrap()["apply_ready"],
+            true
+        );
+
+        let mut partial_worklist = ok(json!({"would_apply": 2, "failed": 1}));
+        attach_preview_apply_cue(&mut partial_worklist);
+        assert!(
+            partial_worklist
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get("apply_ready")
+                .is_none(),
+            "a partial worklist must be repaired, never invited to apply"
+        );
+    }
+
     /// The unwrap is not a leniency loophole: a string that isn't transaction
     /// JSON still fails loudly in the authoritative parser.
     #[test]
@@ -4745,7 +8437,7 @@ mod tests {
     // A misnamed OPTIONAL field on a tool-argument struct (camelCase habit, a
     // typo) is otherwise dropped by serde with no error, and the field's
     // documented default silently takes over. For `ReplaceTextScopeArg` that
-    // default is `ReplaceTextScope::WholeDoc` — the caller's blast-radius
+    // default is the broad BodyAndTables scope — the caller's blast-radius
     // limiter vanishes and a scoped replace becomes a document-wide one. Every
     // tool-argument struct must instead refuse the call, naming the field that
     // didn't match, exactly like `parse_transaction`'s schema refusals do.
@@ -4932,6 +8624,553 @@ mod tests {
         );
     }
 
+    // ─── ChangeSelector::ByFilter: AND-combined bulk resolution ───────────────
+    //
+    // Domain rule under test: "resolve author X's changes in <range>" is ONE
+    // selector call — the conjunction the single-axis selectors cannot express.
+    // Fixture: AuthorA inserts in p_1, AuthorB deletes in p_1, AuthorB inserts
+    // in p_3; p_2 is clean (a range boundary that must exclude p_1).
+
+    /// p_1: "Keep " + <ins AuthorA "alpha "> + <del AuthorB "beta "> + "tail."
+    /// p_2: clean boundary paragraph.
+    /// p_3: "End " + <ins AuthorB "gamma "> + "stop."
+    fn filter_selector_docx() -> Vec<u8> {
+        let body = concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r>"#,
+            r#"<w:ins w:id="10" w:author="AuthorA" w:date="2026-01-01T00:00:00Z"><w:r><w:t xml:space="preserve">alpha </w:t></w:r></w:ins>"#,
+            r#"<w:del w:id="11" w:author="AuthorB" w:date="2026-02-01T00:00:00Z"><w:r><w:delText xml:space="preserve">beta </w:delText></w:r></w:del>"#,
+            r#"<w:r><w:t>tail.</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>Clean boundary.</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t xml:space="preserve">End </w:t></w:r>"#,
+            r#"<w:ins w:id="12" w:author="AuthorB" w:date="2026-02-01T00:00:00Z"><w:r><w:t xml:space="preserve">gamma </w:t></w:r></w:ins>"#,
+            r#"<w:r><w:t>stop.</w:t></w:r></w:p>"#,
+        );
+        make_docx(body, false)
+    }
+
+    /// Author ∧ range: rejecting AuthorB inside p_3..p_3 must remove exactly
+    /// the gamma insertion — AuthorB's p_1 deletion and AuthorA's insertion
+    /// stay pending. This is the "reject author X's changes in section Y
+    /// only" review instruction as a one-call selector.
+    #[tokio::test]
+    async fn by_filter_resolves_author_within_range_only() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let rejected = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByFilter {
+                    by_author: Some("AuthorB".to_string()),
+                    by_kind: None,
+                    by_block_range: Some(BlockRange {
+                        from_block_id: "p_3".to_string(),
+                        to_block_id: "p_3".to_string(),
+                    }),
+                },
+            }))
+            .await;
+        let payload = structured(&rejected);
+        assert_eq!(rejected.is_error, Some(false), "{payload}");
+        assert_eq!(
+            payload["rejected_revision_ids"].as_array().map(Vec::len),
+            Some(1),
+            "exactly the in-range AuthorB revision is selected: {payload}"
+        );
+
+        let canonical = server
+            .runtime
+            .with(&DocHandle(doc_id), |snapshot| {
+                Arc::clone(&snapshot.canonical)
+            })
+            .unwrap();
+        let remaining: Vec<(String, Option<String>)> = revision_rows(&canonical)
+            .iter()
+            .map(|row| (row.block_id.to_string(), row.author.clone()))
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "AuthorA's insertion and AuthorB's out-of-range deletion stay pending: {remaining:?}"
+        );
+        assert!(
+            remaining.iter().all(|(block, _)| block == "p_1"),
+            "every surviving revision lives outside the filtered range: {remaining:?}"
+        );
+    }
+
+    /// Author ∧ kind: accepting AuthorB's deletions must leave AuthorB's
+    /// insertion pending — the kind axis uses the same vocabulary as the
+    /// revision-inventory filter.
+    #[tokio::test]
+    async fn by_filter_kind_axis_selects_within_author() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let accepted = server
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByFilter {
+                    by_author: Some("AuthorB".to_string()),
+                    by_kind: Some("delete".to_string()),
+                    by_block_range: None,
+                },
+            }))
+            .await;
+        let payload = structured(&accepted);
+        assert_eq!(accepted.is_error, Some(false), "{payload}");
+        assert_eq!(
+            payload["accepted_revision_ids"].as_array().map(Vec::len),
+            Some(1),
+            "exactly AuthorB's deletion is selected: {payload}"
+        );
+        let canonical = server
+            .runtime
+            .with(&DocHandle(doc_id), |snapshot| {
+                Arc::clone(&snapshot.canonical)
+            })
+            .unwrap();
+        let authors_pending: Vec<Option<String>> = revision_rows(&canonical)
+            .iter()
+            .map(|row| row.author.clone())
+            .collect();
+        assert_eq!(
+            authors_pending.len(),
+            2,
+            "AuthorA's insertion and AuthorB's p_3 insertion stay pending: {authors_pending:?}"
+        );
+    }
+
+    /// An all-empty filter is `all` in disguise — it must fail loudly, never
+    /// resolve everything by accident.
+    #[tokio::test]
+    async fn by_filter_requires_at_least_one_axis() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let result = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id,
+                selector: ChangeSelector::ByFilter {
+                    by_author: None,
+                    by_kind: None,
+                    by_block_range: None,
+                },
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let message = format!("{result:?}");
+        assert!(
+            message.contains("at least one"),
+            "the refusal names the missing axes: {message}"
+        );
+    }
+
+    /// Wire shape: the selector parses from its documented JSON form, and an
+    /// unrecognized extra field is refused (same unknown-field contract as the
+    /// other variants).
+    #[test]
+    fn by_filter_wire_shape_parses_and_denies_unknown_fields() {
+        let wire = serde_json::json!({
+            "by": "by_filter",
+            "by_author": "Alice",
+            "by_block_range": {"from_block_id": "p_2", "to_block_id": "p_5"},
+        });
+        let selector: ChangeSelector =
+            serde_json::from_value(wire).expect("documented by_filter wire shape parses");
+        assert!(matches!(
+            selector,
+            ChangeSelector::ByFilter {
+                by_author: Some(_),
+                by_kind: None,
+                by_block_range: Some(_),
+            }
+        ));
+        let extra =
+            serde_json::json!({ "by": "by_filter", "by_author": "Alice", "author": "Alice" });
+        serde_json::from_value::<ChangeSelector>(extra)
+            .expect_err("an unrecognized extra field inside by_filter must be refused");
+    }
+
+    // ─── inspect_docx revisions_summary: counts, not rows ─────────────────────
+
+    /// Domain rule: a review round is triaged by exact author × kind counts
+    /// before any row is read. The rollup carries NO rows and composes with
+    /// the same AND-combined filter as the inventory.
+    #[tokio::test]
+    async fn revisions_summary_counts_by_author_and_kind() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let summary = structured(
+            &server
+                .inspect_docx(Parameters(
+                    serde_json::from_value(json!({
+                        "doc_id": doc_id.clone(),
+                        "query": "revisions_summary",
+                    }))
+                    .expect("documented wire shape parses"),
+                ))
+                .await,
+        );
+        assert_eq!(summary["total"], 3, "{summary}");
+        assert!(
+            summary.get("revisions").is_none(),
+            "the rollup carries counts, not rows: {summary}"
+        );
+        let authors = summary["by_author"].as_array().expect("by_author array");
+        let of = |name: &str| {
+            authors
+                .iter()
+                .find(|a| a["author"] == name)
+                .unwrap_or_else(|| panic!("author {name} missing: {summary}"))
+        };
+        assert_eq!(of("AuthorA")["kinds"]["insert"], 1);
+        assert_eq!(of("AuthorA")["total"], 1);
+        assert_eq!(of("AuthorB")["kinds"]["insert"], 1);
+        assert_eq!(of("AuthorB")["kinds"]["delete"], 1);
+        assert_eq!(of("AuthorB")["total"], 2);
+
+        let filtered = structured(
+            &server
+                .inspect_docx(Parameters(
+                    serde_json::from_value(json!({
+                        "doc_id": doc_id,
+                        "query": "revisions_summary",
+                        "filter": {"by_block_range": {"from_block_id": "p_3", "to_block_id": "p_3"}},
+                    }))
+                    .expect("filtered wire shape parses"),
+                ))
+                .await,
+        );
+        assert_eq!(
+            filtered["total"], 1,
+            "the rollup composes with the shared filter: {filtered}"
+        );
+    }
+
+    // ─── Resolution receipts: exact counts, bounded lists ─────────────────────
+    //
+    // Domain rule: a receipt reports WHAT HAPPENED (exact counts, bounded
+    // evidence), it is not a projection. A bulk resolution must not inline
+    // hundreds of ids and block rows; the cap is disclosed, never silent.
+
+    /// N paragraphs, each carrying exactly one AuthorA insertion — a bulk
+    /// review round bigger than every receipt cap.
+    fn bulk_insertions_docx(paragraphs: usize) -> Vec<u8> {
+        let mut body = String::new();
+        for i in 0..paragraphs {
+            body.push_str(&format!(
+                concat!(
+                    r#"<w:p><w:r><w:t xml:space="preserve">Clause {i} </w:t></w:r>"#,
+                    r#"<w:ins w:id="{id}" w:author="AuthorA" w:date="2026-01-01T00:00:00Z">"#,
+                    r#"<w:r><w:t xml:space="preserve">added {i} </w:t></w:r></w:ins>"#,
+                    r#"<w:r><w:t>end.</w:t></w:r></w:p>"#
+                ),
+                i = i,
+                id = 100 + i,
+            ));
+        }
+        make_docx(&body, false)
+    }
+
+    /// Bulk acceptance: counts exact, every list capped, truncation explicit.
+    #[tokio::test]
+    async fn bulk_resolution_receipt_is_bounded_with_explicit_truncation() {
+        const N: usize = 70; // above RECEIPT_ID_CAP (64) and ROW_CAP (16)
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bulk_insertions_docx(N)).await;
+        let accepted = server
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id,
+                selector: ChangeSelector::ByAuthor {
+                    author: "AuthorA".to_string(),
+                },
+            }))
+            .await;
+        let payload = structured(&accepted);
+        assert_eq!(accepted.is_error, Some(false), "{payload}");
+        assert_eq!(payload["accepted"], N, "exact count survives the cap");
+        assert_eq!(
+            payload["accepted_revision_ids"].as_array().map(Vec::len),
+            Some(StemmaServer::RECEIPT_ID_CAP),
+            "the id list is bounded: {payload}"
+        );
+        assert_eq!(payload["changed_block_count"], N);
+        assert_eq!(
+            payload["changed_blocks"].as_array().map(Vec::len),
+            Some(StemmaServer::RECEIPT_BLOCK_ROW_CAP),
+            "block rows are bounded: {payload}"
+        );
+        let truncated = &payload["truncated"];
+        assert_eq!(
+            truncated["accepted_revision_ids_omitted"],
+            N - StemmaServer::RECEIPT_ID_CAP,
+            "the cap is disclosed, never silent: {payload}"
+        );
+        assert_eq!(
+            truncated["changed_blocks_rows_omitted"],
+            N - StemmaServer::RECEIPT_BLOCK_ROW_CAP
+        );
+        assert!(
+            truncated["advice"]
+                .as_str()
+                .is_some_and(|a| a.contains("inspect_docx")),
+            "the truncation report names the follow-up surface: {payload}"
+        );
+        for (field, total, returned) in [
+            (
+                "accepted_revision_ids_evidence",
+                N,
+                StemmaServer::RECEIPT_ID_CAP,
+            ),
+            (
+                "changed_block_ids_evidence",
+                N,
+                StemmaServer::RECEIPT_ID_CAP,
+            ),
+            (
+                "changed_blocks_evidence",
+                N,
+                StemmaServer::RECEIPT_BLOCK_ROW_CAP,
+            ),
+        ] {
+            let evidence = &payload[field];
+            assert_eq!(evidence["total"], total, "{field}: {payload}");
+            assert_eq!(evidence["returned"], returned, "{field}: {payload}");
+            assert_eq!(evidence["omitted"], total - returned, "{field}: {payload}");
+            assert_eq!(
+                evidence["set_sha256"].as_str().map(str::len),
+                Some(64),
+                "{field} must commit to its complete pre-cap set: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_resolution_preview_echoes_selector_counts_and_set_commitment() {
+        const N: usize = 70;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bulk_insertions_docx(N)).await;
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id),
+                transaction: None,
+                resolution: Some(ResolutionPlanArg {
+                    action: ResolutionActionArg::Accept,
+                    selector: ChangeSelector::All,
+                }),
+                replacement_worklist: None,
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&preview);
+        assert_eq!(preview.is_error, Some(false), "{payload}");
+        assert_eq!(payload["resolution"]["selector"], json!({"by": "all"}));
+        assert_eq!(payload["resolution"]["selected"], N);
+        assert_eq!(
+            payload["resolution"]["revision_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(StemmaServer::RECEIPT_ID_CAP)
+        );
+        assert_eq!(
+            payload["resolution"]["revision_ids_evidence"]["omitted"],
+            N - StemmaServer::RECEIPT_ID_CAP
+        );
+        assert_eq!(
+            payload["resolution"]["revision_ids_evidence"]["set_sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+    }
+
+    /// A small resolution keeps the complete lists and carries NO truncated
+    /// key — the bounded receipt only changes shape when something was capped.
+    #[tokio::test]
+    async fn small_resolution_receipt_is_complete_and_untruncated() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let accepted = server
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id,
+                selector: ChangeSelector::ByAuthor {
+                    author: "AuthorA".to_string(),
+                },
+            }))
+            .await;
+        let payload = structured(&accepted);
+        assert_eq!(accepted.is_error, Some(false), "{payload}");
+        assert_eq!(payload["accepted"], 1);
+        assert_eq!(
+            payload["accepted_revision_ids"].as_array().map(Vec::len),
+            Some(1),
+            "small receipts stay complete: {payload}"
+        );
+        assert!(
+            payload.get("truncated").is_none(),
+            "nothing was capped, so nothing is reported truncated: {payload}"
+        );
+    }
+
+    /// Transaction outcomes are the decision plane: one row per submitted op,
+    /// even when the transaction is larger than every evidence-list cap.
+    #[tokio::test]
+    async fn atomic_transaction_outcomes_are_complete_above_receipt_caps() {
+        const N: usize = 70;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(N)).await;
+        let ops: Vec<Value> = (0..N)
+            .map(|i| {
+                json!({
+                    "op": "replace",
+                    "target": format!("p_{}", i + 1),
+                    "expect": format!("Paragraph {i}"),
+                    "content": {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": format!("Rewritten {i}.")}],
+                    },
+                })
+            })
+            .collect();
+        let result = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": ops,
+                    "revision": {"author": "Decision Plane Test"},
+                })),
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["operation_count"], N);
+        assert_eq!(payload["atomicity"]["mode"], "all");
+        assert_eq!(payload["atomicity"]["status"], "would_apply");
+        assert_eq!(payload["changed_block_count"], N);
+        assert_eq!(
+            payload["changed_block_ids"].as_array().map(Vec::len),
+            Some(StemmaServer::RECEIPT_ID_CAP)
+        );
+        assert_eq!(
+            payload["changed_blocks"].as_array().map(Vec::len),
+            Some(StemmaServer::RECEIPT_BLOCK_ROW_CAP)
+        );
+        for field in [
+            "revision_ids_evidence",
+            "changed_block_ids_evidence",
+            "changed_blocks_evidence",
+        ] {
+            assert_eq!(
+                payload[field]["set_sha256"].as_str().map(str::len),
+                Some(64),
+                "capped transaction evidence commits to the full set: {payload}"
+            );
+        }
+        let outcomes = payload["operation_outcomes"]
+            .as_array()
+            .expect("transaction outcomes");
+        assert_eq!(outcomes.len(), N, "no decision outcome may be capped");
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert_eq!(outcome["index"], index);
+            assert_eq!(outcome["status"], "would_apply");
+        }
+        assert!(
+            payload.get("operation_outcomes_evidence").is_none(),
+            "decision rows are structurally inline, never an evidence set: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_atomic_transaction_still_accounts_for_every_operation() {
+        const N: usize = 70;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(N)).await;
+        let ops: Vec<Value> = (0..N)
+            .map(|i| {
+                json!({
+                    "op": "replace",
+                    "target": format!("p_{}", i + 1),
+                    "expect": format!("Paragraph {i}"),
+                    "content": {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": format!("Rewritten {i}.")}],
+                    },
+                })
+            })
+            .collect();
+        let result = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": ops,
+                    "revision": {"author": "Decision Plane Test"},
+                })),
+                preview: false,
+                mode: Some("not_a_mode".to_string()),
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(true), "{payload}");
+        assert_eq!(payload["operation_count"], N);
+        assert_eq!(payload["atomicity"]["status"], "refused");
+        let outcomes = payload["operation_outcomes"]
+            .as_array()
+            .expect("refused transaction outcomes");
+        assert_eq!(outcomes.len(), N);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome["status"] == "not_applied"),
+            "atomic refusal leaves every operation unapplied: {payload}"
+        );
+    }
+
+    /// Non-atomic worklists have the same completeness rule: every submitted
+    /// item gets an inline outcome, including failures, with no cap metadata.
+    #[tokio::test]
+    async fn replacement_worklist_outcomes_are_complete_above_receipt_caps() {
+        const N: usize = 70;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(1)).await;
+        let replacements = (0..N)
+            .map(|i| ReplaceItem {
+                old: format!("absent phrase {i}"),
+                new: format!("replacement {i}"),
+                scope: None,
+                expected_matches: None,
+                match_mode: "exact".to_string(),
+                on_barrier_match: "skip".to_string(),
+            })
+            .collect();
+        let result = server
+            .replace_text_batch(Parameters(ReplaceTextBatchArgs {
+                doc_id,
+                author: "Decision Plane Test".to_string(),
+                replacements,
+                preview: true,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["submitted"], N);
+        assert_eq!(payload["failed"], N);
+        assert_eq!(
+            payload["items"].as_array().map(Vec::len),
+            Some(N),
+            "every submitted worklist item must have an inline outcome: {payload}"
+        );
+        assert!(
+            payload.get("items_evidence").is_none(),
+            "decision rows are never cappable evidence: {payload}"
+        );
+    }
+
     // ─── list_revisions: compact revision table ────────────────────────────────
     //
     // These assert the SHARED enumeration `revision_rows` (the one the tool body
@@ -4960,41 +9199,54 @@ mod tests {
         let doc = Document::parse(&redline_docx()).expect("parse redline");
         let rows = revision_rows(&doc.snapshot().canonical);
 
-        // Four pending revisions: ins #10, del #11, and the stacked span's ins #1
-        // + del #2 (a stacked span is TWO rows — one per resolvable revision).
+        // Four pending revisions: the plain ins ("added ") and del ("removed "),
+        // and the stacked span's ins + del over "contested " (a stacked span is
+        // TWO rows — one per resolvable revision). H7: rows carry engine-minted
+        // IDENTITIES (not the wire ids 10/11/1/2), so identify each row by its
+        // stable content (kind + excerpt), and assert the identities are simply
+        // four distinct, resolvable (non-zero) handles.
+        assert_eq!(rows.len(), 4, "four rows");
+        let by = |kind: RevisionKind, excerpt: &str| {
+            rows.iter()
+                .find(|r| r.kind == kind && r.excerpt == excerpt)
+                .unwrap_or_else(|| panic!("a {kind:?} row for {excerpt:?}"))
+        };
         let ids: Vec<u32> = rows.iter().map(|r| r.revision_id).collect();
-        assert_eq!(
-            ids,
-            vec![10, 11, 1, 2],
-            "all four revisions, document order: {ids:?}"
+        let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 4, "four distinct identities: {ids:?}");
+        assert!(
+            ids.iter().all(|&id| id != 0),
+            "every id resolvable: {ids:?}"
         );
 
-        let by_id = |id: u32| rows.iter().find(|r| r.revision_id == id).unwrap();
-        let ins = by_id(10);
-        assert_eq!(ins.kind, RevisionKind::Insert);
+        let ins = by(RevisionKind::Insert, "added ");
         assert_eq!(ins.author.as_deref(), Some("AuthorA"));
         assert_eq!(ins.block_id, "p_1");
-        assert_eq!(ins.excerpt, "added ");
         assert_eq!(ins.date.as_deref(), Some("2026-01-01T00:00:00Z"));
 
-        let del = by_id(11);
-        assert_eq!(del.kind, RevisionKind::Delete);
+        let del = by(RevisionKind::Delete, "removed ");
         assert_eq!(del.author.as_deref(), Some("AuthorB"));
-        assert_eq!(del.excerpt, "removed ");
 
         // The stacked span: the insertion (AuthorA) and the deletion (AuthorB)
-        // are independent rows, each resolvable on its own id.
-        assert_eq!(by_id(1).kind, RevisionKind::Insert);
-        assert_eq!(by_id(1).author.as_deref(), Some("AuthorA"));
-        assert_eq!(by_id(2).kind, RevisionKind::Delete);
-        assert_eq!(by_id(2).author.as_deref(), Some("AuthorB"));
+        // are independent rows, each resolvable on its own identity.
+        assert_eq!(
+            by(RevisionKind::Insert, "contested ").author.as_deref(),
+            Some("AuthorA")
+        );
+        assert_eq!(
+            by(RevisionKind::Delete, "contested ").author.as_deref(),
+            Some("AuthorB")
+        );
     }
 
     #[test]
     fn revision_row_location_is_body_for_an_ordinary_body_revision_and_crosses_the_wire() {
         let doc = Document::parse(&redline_docx()).expect("parse redline");
         let rows = revision_rows(&doc.snapshot().canonical);
-        let ins = rows.iter().find(|r| r.revision_id == 10).unwrap();
+        let ins = rows
+            .iter()
+            .find(|r| r.kind == RevisionKind::Insert && r.excerpt == "added ")
+            .unwrap();
         assert_eq!(ins.location, StoryScope::Body);
 
         // The wire JSON must actually carry it — this is the field that lets
@@ -5045,7 +9297,7 @@ mod tests {
         let rows = revision_rows(&doc.snapshot().canonical);
         let ins = rows
             .iter()
-            .find(|r| r.revision_id == 201)
+            .find(|r| r.kind == RevisionKind::Insert && r.author.as_deref() == Some("Reviewer"))
             .expect("footnote insertion is enumerated");
         assert_eq!(
             ins.location,
@@ -5097,35 +9349,220 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compact_notes_query_surfaces_editable_note_identity_and_body() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &footnote_docx()).await;
+        let result = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::Notes,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["note_count"], 1);
+        assert_eq!(
+            payload["notes"],
+            json!([{"note_id": "1", "kind": "footnote", "text": "See Appendix C"}]),
+            "the five-tool surface must expose everything edit_note requires: {payload}"
+        );
+    }
+
+    #[test]
+    fn compact_operation_catalog_is_parser_complete_and_routes_the_old_surface() {
+        let payload = operation_catalog(None).expect("complete catalog");
+        let operations = payload["operations"].as_array().expect("operation rows");
+        let authoritative = stemma::edit_v4::operation_vocabulary();
+        assert_eq!(operations.len(), authoritative.len());
+        for (name, fields) in authoritative {
+            let row = operations
+                .iter()
+                .find(|row| row["name"] == *name)
+                .unwrap_or_else(|| panic!("catalog omitted parser operation {name}"));
+            assert_eq!(row["parser_fields"], json!(fields));
+            let accepted = row["accepted_fields"].as_array().expect("accepted fields");
+            for field in *fields {
+                assert!(
+                    accepted.iter().any(|candidate| candidate == field),
+                    "catalog omitted parser field {name}.{field}"
+                );
+            }
+            assert!(row["group"].as_str().is_some_and(|group| !group.is_empty()));
+            assert!(row["cue"].as_str().is_some_and(|cue| !cue.is_empty()));
+        }
+
+        for image_op in ["insert_image", "replace_image"] {
+            let row = operations
+                .iter()
+                .find(|row| row["name"] == image_op)
+                .expect("image operation row");
+            assert_eq!(row["mcp_edge_fields"], json!(["path"]));
+            assert!(
+                row["accepted_fields"]
+                    .as_array()
+                    .is_some_and(|fields| fields.iter().any(|field| field == "path")),
+                "compact catalog must advertise the server-resolved image path: {row}"
+            );
+            assert!(
+                row["mcp_edge_examples"]
+                    .as_array()
+                    .is_some_and(|examples| !examples.is_empty()),
+                "compact catalog must show the edge-valid image path shape: {row}"
+            );
+        }
+
+        let routes = payload["legacy_surface_routes"]
+            .as_array()
+            .expect("historical route map");
+        assert_eq!(routes.len(), 26, "every historical tool has a core route");
+        for required in [
+            "compare_docx",
+            "read_accepted",
+            "read_rejected",
+            "read_redline",
+            "read_index",
+            "get_section",
+            "apply_edit",
+            "replace_text_batch",
+        ] {
+            assert!(
+                routes.iter().any(|row| row["historical_tool"] == required),
+                "historical capability {required} has no five-tool route"
+            );
+        }
+
+        for operation in [
+            "move",
+            "table_op",
+            "insert_note",
+            "edit_note",
+            "create_style",
+            "set_page_setup",
+            "insert_image",
+        ] {
+            let one = operation_catalog(Some(operation)).expect("known operation");
+            let row = &one["operations"][0];
+            assert_eq!(row["name"], operation);
+            assert!(
+                row["examples"]
+                    .as_array()
+                    .is_some_and(|examples| !examples.is_empty()),
+                "historically taught operation {operation} needs an exact example"
+            );
+        }
+    }
+
+    /// An unknown-op refusal must name the agent's next move, not only dump
+    /// the catalog: near-name guesses get closest matches, and the observed
+    /// guessed intents (toc/image/field — cold agents guessed all three) get
+    /// their capability's real spelling.
+    #[test]
+    fn unknown_operation_refusal_names_the_next_move() {
+        let toc = operation_catalog(Some("toc")).expect_err("toc is not an op");
+        assert!(
+            toc.contains("{\"type\":\"toc\"}"),
+            "the toc guess routes to the insert content block: {toc}"
+        );
+        let image = operation_catalog(Some("image")).expect_err("image is not an op");
+        assert!(
+            image.contains("closest matches") && image.contains("insert_image"),
+            "the image guess names the real image ops: {image}"
+        );
+        let typo = operation_catalog(Some("zzz_no_such_op")).expect_err("unknown");
+        assert!(
+            typo.contains("known operations"),
+            "a no-match guess still gets the full catalog list: {typo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_projection_queries_preserve_historical_read_vocabulary() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &redline_docx()).await;
+        for (query, field) in [
+            (InspectQuery::Text, "text"),
+            (InspectQuery::Html, "html"),
+            (InspectQuery::Redline, "markdown"),
+            (InspectQuery::Accepted, "markdown"),
+            (InspectQuery::Rejected, "markdown"),
+        ] {
+            let result = server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id: doc_id.clone(),
+                    query,
+                    block_id: None,
+                    detail: None,
+                    pattern: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await;
+            let payload = structured(&result);
+            assert_eq!(result.is_error, Some(false), "{payload}");
+            assert!(
+                payload[field]
+                    .as_str()
+                    .is_some_and(|content| !content.is_empty()),
+                "compact projection must carry the historical {field} payload: {payload}"
+            );
+        }
+    }
+
     #[test]
     fn revision_filters_are_and_combined_on_author_and_kind() {
         let doc = Document::parse(&redline_docx()).expect("parse redline");
         let rows = revision_rows(&doc.snapshot().canonical);
 
-        // by_author: AuthorA owns the two insertions (#10, #1).
-        let author_a: Vec<u32> = rows
+        // H7: rows carry minted identities (not wire ids), so assert the filter
+        // COMPOSITION by the structural facts of this fixture, not literal ids.
+        // by_author: AuthorA owns exactly the two insertions.
+        let author_a: Vec<&_> = rows
             .iter()
             .filter(|r| r.author.as_deref() == Some("AuthorA"))
-            .map(|r| r.revision_id)
             .collect();
-        assert_eq!(author_a, vec![10, 1]);
+        assert_eq!(author_a.len(), 2, "AuthorA owns two revisions");
+        assert!(
+            author_a.iter().all(|r| r.kind == RevisionKind::Insert),
+            "both of AuthorA's revisions are insertions"
+        );
 
-        // by_kind: deletions are #11 and the stacked #2.
+        // by_kind: exactly two deletions (the plain del + the stacked del).
         let deletes: Vec<u32> = rows
             .iter()
             .filter(|r| r.kind == RevisionKind::Delete)
             .map(|r| r.revision_id)
             .collect();
-        assert_eq!(deletes, vec![11, 2]);
+        assert_eq!(deletes.len(), 2, "two deletions");
 
-        // AND-combined: AuthorB's deletions are #11 and #2 (AuthorB has no
-        // insertions, so the author+kind intersection is exactly the deletes).
+        // AND-combined: AuthorB has no insertions, so author+kind intersects to
+        // exactly the deletions.
         let author_b_deletes: Vec<u32> = rows
             .iter()
             .filter(|r| r.author.as_deref() == Some("AuthorB") && r.kind == RevisionKind::Delete)
             .map(|r| r.revision_id)
             .collect();
-        assert_eq!(author_b_deletes, vec![11, 2]);
+        assert_eq!(
+            author_b_deletes, deletes,
+            "AuthorB's deletions are exactly all deletions (AuthorB never inserted)"
+        );
     }
 
     #[test]
@@ -5156,6 +9593,17 @@ mod tests {
         let emoji = "🌼".repeat(85);
         let cut = cap_excerpt(&emoji);
         assert_eq!(cut.chars().filter(|c| *c == '🌼').count(), 80);
+    }
+
+    #[test]
+    fn find_excerpt_is_bounded_and_keeps_a_late_match_visible() {
+        let text = format!("{}UniquE Needle{}", "α".repeat(400), "ω".repeat(400));
+        let excerpt = match_excerpt(&text, "unique needle", FIND_TEXT_EXCERPT_CHARS);
+        assert_eq!(excerpt.chars().count(), FIND_TEXT_EXCERPT_CHARS);
+        assert!(
+            excerpt.to_lowercase().contains("unique needle"),
+            "match must remain visible in bounded excerpt: {excerpt}"
+        );
     }
 
     fn synthetic_row(id: u32) -> RevisionRow {
@@ -5223,6 +9671,7 @@ mod tests {
         assert_eq!(report["limit"], MAX_REVISION_ROWS);
         assert_eq!(report["total"], over);
         assert_eq!(report["omitted"], 37);
+        assert_eq!(report["set_sha256"].as_str().map(str::len), Some(64));
         assert!(
             report["advice"]
                 .as_str()
@@ -5522,10 +9971,41 @@ mod tests {
             .expect("doc_id")
             .to_string();
 
+        let transaction = replace_txn_arg("p_50", "Paragraph 49", "Paragraph FIFTY rewritten.");
+        let preview = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id: doc_id.clone(),
+                transaction: transaction.clone(),
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let preview_payload = structured(&preview);
+        let preview_bytes =
+            serde_json::to_vec(&preview_payload).expect("serialize preview receipt");
+        assert!(
+            preview_payload.get("preview_outline").is_none(),
+            "preview must not echo the whole document: {preview_payload}"
+        );
+        assert_eq!(preview_payload["changed_block_ids"], json!(["p_50"]));
+        assert_eq!(
+            preview_payload["changed_blocks"]
+                .as_array()
+                .expect("changed blocks")
+                .len(),
+            1
+        );
+        assert!(
+            preview_bytes.len() < 16 * 1024,
+            "preview receipt must be < 16KB on a 102-block doc, was {} bytes",
+            preview_bytes.len()
+        );
+
         let result = server
             .apply_edit(Parameters(ApplyEditArgs {
                 doc_id: doc_id.clone(),
-                transaction: replace_txn_arg("p_50", "Paragraph 49", "Paragraph FIFTY rewritten."),
+                transaction,
                 mode: None,
                 allow_existing_author: false,
             }))
@@ -5540,15 +10020,17 @@ mod tests {
             bytes.len()
         );
 
-        // open_docx returns the compact index (the requested navigation tier,
-        // inherently O(blocks)). It is not capped at 16KB, but it must be
-        // strictly smaller than the OLD heavy outline that tripped the host's
-        // truncation limit (~49KB), AND it must DROP the two
+        // open_docx returns a bounded first page of the compact index. It must
+        // be strictly smaller than the OLD heavy outline that tripped the
+        // host's truncation limit (~49KB), AND it must DROP the two
         // heaviest per-block fields — full `text` and `semantic_hash` — which
         // are what made the heavy outline blow up. The compact row carries only
         // a bounded text_preview.
         let open_payload = structured(&open);
         let index = open_payload["index"].as_array().expect("index rows");
+        assert_eq!(index.len(), DEFAULT_CORE_INDEX_LIMIT);
+        assert_eq!(open_payload["index_has_more"], true);
+        assert_eq!(open_payload["index_next_offset"], DEFAULT_CORE_INDEX_LIMIT);
         for row in index {
             assert!(
                 row.get("text").is_none(),
@@ -5564,6 +10046,11 @@ mod tests {
             );
         }
         let compact_bytes = serde_json::to_vec(&open_payload).expect("serialize open");
+        assert!(
+            compact_bytes.len() < 32 * 1024,
+            "bounded open receipt must be < 32KB on a 102-block doc, was {} bytes",
+            compact_bytes.len()
+        );
         let heavy_outline = server.outline(&doc_id).expect("heavy outline");
         let heavy_bytes =
             serde_json::to_vec(&json!({ "blocks": heavy_outline })).expect("serialize heavy");
@@ -5573,6 +10060,41 @@ mod tests {
              outline ({} bytes)",
             compact_bytes.len(),
             heavy_bytes.len()
+        );
+
+        let document_page = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: doc_id.clone(),
+                query: InspectQuery::Document,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let document_payload = structured(&document_page);
+        assert_eq!(document_payload["returned"], DEFAULT_CORE_DOCUMENT_LIMIT);
+        assert_eq!(document_payload["total_blocks"], 102);
+        assert_eq!(document_payload["has_more"], true);
+        assert_eq!(document_payload["next_offset"], DEFAULT_CORE_DOCUMENT_LIMIT);
+        assert!(
+            document_payload["content"]
+                .as_str()
+                .expect("paged markdown")
+                .contains("#p_1")
+        );
+        let document_bytes = serde_json::to_vec(&document_payload).expect("serialize page");
+        assert!(
+            document_bytes.len() < 16 * 1024,
+            "default document page must be bounded on a 102-block doc, was {} bytes",
+            document_bytes.len()
         );
     }
 
@@ -5744,6 +10266,26 @@ mod tests {
             "insert_note",
             "edit_note",
             "delete_note",
+            "set_format",
+            "set_para_format",
+            "set_cell_format",
+            "set_row_format",
+            "set_table_format",
+            "apply_style",
+            "create_style",
+            "modify_style",
+            "set_doc_defaults",
+            "set_page_setup",
+            "set_numbering",
+            "insert_bookmark",
+            "insert_cross_ref",
+            "comment_create",
+            "comment_reply",
+            "comment_resolve",
+            "comment_delete",
+            "insert_image",
+            "replace_image",
+            "blocks_to_table",
         ] {
             let shapes = v4_op_shapes(op);
             assert!(!shapes.is_empty(), "a shape for every listed op: {op}");
@@ -5824,6 +10366,95 @@ mod tests {
             "a distinct author must be accepted: {}",
             structured(&ok)
         );
+    }
+
+    #[tokio::test]
+    async fn check_and_batch_preview_enforce_the_commit_author_guard() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &redline_docx()).await;
+        let transaction = || {
+            TransactionArg(json!({
+                "ops": [{
+                    "op": "replace",
+                    "target": "p_2",
+                    "expect": "Second clean paragraph.",
+                    "content": {"type": "paragraph", "content": [
+                        {"type": "text", "text": "Second paragraph, tightened."}
+                    ]}
+                }],
+                "revision": {"author": "AuthorA"}
+            }))
+        };
+
+        let checked = server
+            .check_edit(Parameters(CheckArgs {
+                doc_id: doc_id.clone(),
+                transaction: transaction(),
+            }))
+            .await;
+        assert_eq!(structured(&checked)["code"], "AuthorImpersonation");
+        assert_eq!(structured(&checked)["would_apply"], false);
+
+        let previewed = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id,
+                transaction: transaction(),
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(structured(&previewed)["code"], "AuthorImpersonation");
+        assert_eq!(structured(&previewed)["would_apply"], false);
+    }
+
+    #[tokio::test]
+    async fn check_preview_and_commit_share_package_aware_style_validation() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let transaction = || {
+            TransactionArg(json!({
+                "ops": [{
+                    "op": "apply_style",
+                    "target": "p_1",
+                    "style_id": "DefinitelyMissingStyle"
+                }],
+                "revision": {"author": "Reviewer"}
+            }))
+        };
+
+        let checked = server
+            .check_edit(Parameters(CheckArgs {
+                doc_id: doc_id.clone(),
+                transaction: transaction(),
+            }))
+            .await;
+        let previewed = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id: doc_id.clone(),
+                transaction: transaction(),
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let committed = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: transaction(),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+
+        for result in [&checked, &previewed, &committed] {
+            assert_eq!(
+                structured(result)["code"],
+                "AnchorNotFound",
+                "preview and commit must share the package-aware refusal: {}",
+                structured(result)
+            );
+        }
     }
 
     /// The session's own (novel) author is not impersonation — a second edit by
@@ -5956,13 +10587,11 @@ mod tests {
         );
     }
 
-    /// Receipt-honesty contract: replace_text matches BODY
-    /// paragraphs only, so a needle living in a TABLE CELL is not replaced — but
-    /// the receipt must DISCLOSE it under `unreached_matches`, never report a
-    /// green `applied` as if complete. A batch verb would ship half a redline
-    /// behind a green receipt without this disclosure.
+    /// The MCP default body scope includes table-cell paragraphs. A global
+    /// replacement must therefore edit both occurrences and honestly report no
+    /// unreached cells.
     #[tokio::test]
-    async fn replace_text_discloses_unreached_table_cell_matches() {
+    async fn replace_text_default_scope_reaches_table_cell_matches() {
         let server = StemmaServer::new();
         // One body paragraph with "Acme Corp" and a 1x1 table whose cell ALSO
         // says "Acme Corp" — the signature-table shape in miniature.
@@ -5984,21 +10613,62 @@ mod tests {
             .await;
         assert_ne!(result.is_error, Some(true), "the body replace succeeds");
         let p = structured(&result);
-        assert_eq!(p["match_count"], 1, "only the BODY occurrence is replaced");
+        assert_eq!(p["match_count"], 2, "body and table-cell matches apply");
         let unreached = p["unreached_matches"]
             .as_array()
             .expect("unreached_matches present");
-        assert_eq!(
-            unreached.len(),
-            1,
-            "the table-cell occurrence is disclosed, not silent: {p}"
-        );
-        assert_eq!(unreached[0]["region"], "table_cell");
         assert!(
-            unreached[0]["excerpt"]
-                .as_str()
-                .is_some_and(|e| e.contains("Acme Corp"))
+            unreached.is_empty(),
+            "default scope reached every cell: {p}"
         );
+    }
+
+    /// An explicit scope is the caller's complete search boundary. A matching
+    /// table cell outside a body-paragraph scope is deliberately excluded, not
+    /// reported as an unreached edit that might prompt the agent to widen scope.
+    #[tokio::test]
+    async fn replace_text_explicit_scope_does_not_report_outside_matches() {
+        let server = StemmaServer::new();
+        let body = r#"<w:p><w:r><w:t>Acme Corp is the party.</w:t></w:r></w:p><w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>Acme Corp</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "is the party".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let body_id = found["matches"][0]["id"]
+            .as_str()
+            .expect("body paragraph id")
+            .to_string();
+
+        let result = server
+            .replace_text(Parameters(ReplaceTextArgs {
+                doc_id,
+                old: "Acme Corp".to_string(),
+                new: "Acme Corporation".to_string(),
+                author: "Counsel".to_string(),
+                scope: Some(ReplaceTextScopeArg {
+                    block_id: Some(body_id),
+                    from_block_id: None,
+                    to_block_id: None,
+                }),
+                expected_matches: Some(ExpectedMatchesArg::Count(1)),
+                match_mode: "exact".to_string(),
+                on_barrier_match: "skip".to_string(),
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_ne!(result.is_error, Some(true), "scoped replacement succeeds");
+        assert_eq!(payload["match_count"], 1);
+        assert_eq!(payload["unreached_matches"], json!([]));
     }
 
     /// replace_text_batch applies a whole worklist in ONE call and is
@@ -6023,6 +10693,7 @@ mod tests {
             .replace_text_batch(Parameters(ReplaceTextBatchArgs {
                 doc_id,
                 author: "Counsel".to_string(),
+                preview: false,
                 allow_existing_author: false,
                 replacements: vec![
                     item("Paragraph 0", "Clause 0", None), // unique → applies
@@ -6137,12 +10808,10 @@ mod tests {
 
     // ─── revision_ids invariant ─────────────────────────────────────────────
     //
-    // The receipt reconstructs the new revisions as the contiguous range
-    // (max_before+1 ..= max_after). This is guaranteed by construction:
-    // apply_transaction stamps ids from max_revision_id(before)+1, strictly
-    // monotonic. These tests pin the three load-bearing cases so a future change
-    // to the stamping or the edge reconstruction can't silently break the
-    // receipt's per-op attribution.
+    // The receipt reports the exact after-minus-before semantic identity set.
+    // These tests pin the load-bearing cases so a future edge reconstruction
+    // cannot silently break per-op attribution by treating identities as
+    // counters or wire ids.
 
     fn rev_ids(p: &Value) -> Vec<u64> {
         p["revision_ids"]
@@ -6154,8 +10823,7 @@ mod tests {
     }
 
     /// A TRACKED edit on a clean document: the receipt's revision_ids are exactly
-    /// the revisions the document now carries (the doc had none before), and they
-    /// are a contiguous ascending run.
+    /// the revisions the document now carries (the doc had none before).
     #[tokio::test]
     async fn revision_ids_match_the_new_tracked_revisions() {
         let server = StemmaServer::new();
@@ -6172,10 +10840,12 @@ mod tests {
         let p = structured(&result);
         let ids = rev_ids(&p);
         assert!(!ids.is_empty(), "a tracked edit creates revision ids: {p}");
-        // Contiguous ascending.
-        for w in ids.windows(2) {
-            assert_eq!(w[1], w[0] + 1, "revision_ids are a contiguous run: {ids:?}");
-        }
+        assert!(
+            ids.iter().all(|id| *id != 0),
+            "identities are nonzero: {ids:?}"
+        );
+        let distinct: HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "identities are unique: {ids:?}");
 
         // Cross-check against the source of truth: list_revisions on this
         // (previously clean) doc reports exactly the ids the receipt claimed.
@@ -6203,10 +10873,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compact_revision_query_preserves_author_kind_and_range_filters() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>One </w:t></w:r><w:ins w:id="1" w:author="Prior"><w:r><w:t>alpha</w:t></w:r></w:ins></w:p>"#,
+            r#"<w:p><w:r><w:t>Two </w:t></w:r><w:ins w:id="2" w:author="Other"><w:r><w:t>beta</w:t></w:r></w:ins></w:p>"#,
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let result = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::Revisions,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: Some(RevisionFilter {
+                    by_author: Some("Prior".to_string()),
+                    by_kind: Some("insert".to_string()),
+                    by_block_range: Some(BlockRange {
+                        from_block_id: "p_1".to_string(),
+                        to_block_id: "p_1".to_string(),
+                    }),
+                }),
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["total"], 1, "{payload}");
+        assert_eq!(payload["revisions"][0]["author"], "Prior");
+        assert_eq!(payload["revisions"][0]["block_id"], "p_1");
+    }
+
+    /// A tracked edit on a doc that ALREADY carries pending revisions: the
+    /// receipt names ONLY the newly-minted revisions, never the pre-existing
+    /// ones. RFC-0004 §H7 regression: "new" is identity-set difference, never a
+    /// wire-space or numeric-identity watermark.
+    #[tokio::test]
+    async fn revision_ids_exclude_preexisting_revisions() {
+        // p_1 arrives with a pre-existing tracked insertion (wire id 5); p_2 is
+        // clean and is what we edit.
+        let body = concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Base </w:t></w:r><w:ins w:id="5" w:author="Prior" w:date="2020-01-01T00:00:00Z"><w:r><w:t>added</w:t></w:r></w:ins></w:p>"#,
+            r#"<w:p><w:r><w:t>Second paragraph.</w:t></w:r></w:p>"#,
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+
+        // The doc already has one pending revision before we touch it.
+        let before = structured(
+            &server
+                .list_revisions(Parameters(ListRevisionsArgs {
+                    doc_id: doc_id.clone(),
+                    filter: None,
+                }))
+                .await,
+        );
+        let preexisting: Vec<u64> = before["revisions"]
+            .as_array()
+            .expect("revisions array")
+            .iter()
+            .map(|r| r["revision_id"].as_u64().expect("revision_id"))
+            .collect();
+        assert_eq!(preexisting.len(), 1, "one pre-existing revision: {before}");
+
+        let result = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: replace_txn_arg("p_2", "Second paragraph.", "Second REWRITTEN."),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let p = structured(&result);
+        let ids = rev_ids(&p);
+        assert!(!ids.is_empty(), "the tracked edit created revisions: {p}");
+        assert!(
+            !ids.iter().any(|id| preexisting.contains(id)),
+            "the receipt must NOT report the pre-existing revision {preexisting:?} as new: {ids:?}"
+        );
+    }
+
     /// A DIRECT-mode edit leaves NO tracked revisions (it stamps then resolves),
     /// so the receipt's revision_ids is empty — the honest answer (nothing is
-    /// pending review). The empty `(max_before+1..=max_after)` range falls out
-    /// because max_after <= max_before.
+    /// pending review). The after-minus-before identity set is empty.
     #[tokio::test]
     async fn direct_mode_edit_reports_no_revision_ids() {
         let server = StemmaServer::new();
@@ -6277,6 +11034,105 @@ mod tests {
         }))
     }
 
+    #[tokio::test]
+    async fn compact_transaction_composes_row_insert_and_delete_on_one_table() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_table_docx()).await;
+        let outline = structured(
+            &server
+                .read_outline(Parameters(ReadArgs {
+                    doc_id: doc_id.clone(),
+                }))
+                .await,
+        );
+        let table_id = table_block_id(&outline);
+        let table_detail = structured(
+            &server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id: doc_id.clone(),
+                    query: InspectQuery::Block,
+                    block_id: Some(table_id.clone()),
+                    detail: None,
+                    pattern: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let guard = table_detail["guard"]
+            .as_str()
+            .expect("table detail carries a guard")
+            .to_string();
+        let plan = || {
+            TransactionArg(json!({
+                "ops": [
+                    {
+                        "op": "table_op",
+                        "target": table_id.clone(),
+                        "semantic_hash": guard.clone(),
+                        "table_op": {
+                            "kind": "insert_row",
+                            "ref_row": 1,
+                            "position": "after",
+                            "cells": ["NEW0", "NEW1"]
+                        }
+                    },
+                    {
+                        "op": "table_op",
+                        "target": table_id.clone(),
+                        "semantic_hash": guard.clone(),
+                        "table_op": {"kind": "delete_row", "row_index": 0}
+                    }
+                ],
+                "revision": {"author": "Table Transaction Test"}
+            }))
+        };
+
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: Some(plan()),
+                resolution: None,
+                replacement_worklist: None,
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let preview_payload = structured(&preview);
+        assert_eq!(preview.is_error, Some(false), "{preview_payload}");
+        assert_eq!(preview_payload["apply_ready"], true, "{preview_payload}");
+
+        let applied = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id),
+                transaction: Some(plan()),
+                resolution: None,
+                replacement_worklist: None,
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let applied_payload = structured(&applied);
+        assert_eq!(applied.is_error, Some(false), "{applied_payload}");
+        assert_eq!(applied_payload["applied"], true, "{applied_payload}");
+        assert!(
+            applied_payload["revision_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.len() >= 2),
+            "both structural changes must remain pending: {applied_payload}"
+        );
+    }
+
     /// `read_block`'s `cells` entries carry the cell's own paragraph `block_id`
     /// (not just `{row, col, text}`) — the id-addressed path a foreign pending
     /// change points an agent at instead of the grid address.
@@ -6308,6 +11164,379 @@ mod tests {
                 .expect("cell block_id is a non-null string");
             assert!(!block_id.is_empty(), "cell block_id must be usable: {cell}");
         }
+    }
+
+    /// Every paragraph id surfaced inside a table is a real edit target and
+    /// must therefore be inspectable through the compact core before editing.
+    #[tokio::test]
+    async fn compact_block_inspection_reaches_table_cell_paragraphs() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_table_docx()).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "R0C1".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let cell_id = found["matches"][0]["matching_cells"]
+            .as_array()
+            .expect("matching table cells")
+            .iter()
+            .find(|cell| cell["text_excerpt"] == "R0C1")
+            .and_then(|cell| cell["block_id"].as_str())
+            .expect("matching cell paragraph id")
+            .to_string();
+
+        let detail = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::Block,
+                block_id: Some(cell_id.clone()),
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let payload = structured(&detail);
+        assert_eq!(detail.is_error, Some(false), "nested detail: {payload}");
+        assert_eq!(payload["id"], cell_id);
+        assert_eq!(payload["text"], "R0C1");
+        assert_eq!(payload["nested_in"]["row"], 0);
+        assert_eq!(payload["nested_in"]["col"], 1);
+        assert_eq!(payload["detail"], "compact");
+        assert_eq!(payload["formatting_available"], true);
+        assert!(payload.get("segments").is_none());
+        assert!(
+            payload["guard"]
+                .as_str()
+                .is_some_and(|guard| !guard.is_empty())
+        );
+    }
+
+    /// Run-level style objects are a deliberate on-demand expansion, not part
+    /// of the permanent planning context. The exact text and guard agree across
+    /// both projections, while the compact response stays materially smaller.
+    #[tokio::test]
+    async fn compact_cell_block_detail_omits_repeated_formatting_but_full_is_retrievable() {
+        let runs: String = (0..40)
+            .map(|index| {
+                let color = format!("{:06X}", index + 1);
+                format!(
+                    r#"<w:r><w:rPr><w:b/><w:i/><w:color w:val="{color}"/><w:sz w:val="22"/><w:highlight w:val="yellow"/></w:rPr><w:t>Styled segment {index}. </w:t></w:r>"#
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"<w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/><w:p>{runs}</w:p></w:tc></w:tr></w:tbl>"#
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(&body, false)).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "Styled segment 0".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let cell_id = found["matches"][0]["matching_cells"][0]["block_id"]
+            .as_str()
+            .expect("cell paragraph id")
+            .to_string();
+        let inspect = |detail| InspectDocxArgs {
+            doc_id: doc_id.clone(),
+            query: InspectQuery::Block,
+            block_id: Some(cell_id.clone()),
+            detail,
+            pattern: None,
+            filter: None,
+            from_block_id: None,
+            to_block_id: None,
+            format: None,
+            offset: None,
+            limit: None,
+            cell_offset: None,
+            cell_limit: None,
+        };
+
+        let compact = structured(&server.inspect_docx(Parameters(inspect(None))).await);
+        let formatting = structured(
+            &server
+                .inspect_docx(Parameters(inspect(Some(InspectBlockDetail::Formatting))))
+                .await,
+        );
+        assert_eq!(compact["text"], formatting["text"]);
+        assert_eq!(compact["guard"], formatting["guard"]);
+        assert!(compact.get("segments").is_none());
+        assert_eq!(formatting["segments"].as_array().map(Vec::len), Some(40));
+        let compact_bytes = serde_json::to_vec(&compact)
+            .expect("compact serialization")
+            .len();
+        let formatting_bytes = serde_json::to_vec(&formatting)
+            .expect("formatting serialization")
+            .len();
+        assert!(
+            compact_bytes * 4 < formatting_bytes,
+            "compact detail should be at least 4x smaller: compact={compact_bytes}, formatting={formatting_bytes}"
+        );
+    }
+
+    /// A table is one top-level find match, so top-level pagination alone does
+    /// not bound its cell locators. Nested pagination must keep the default
+    /// response small while making every matching cell exactly retrievable.
+    #[tokio::test]
+    async fn find_pages_matching_table_cells_without_hiding_any() {
+        let rows: String = (0..20)
+            .map(|index| {
+                let padding = "x".repeat(300);
+                format!(
+                    r#"<w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>{padding} [placeholder {index}]</w:t></w:r></w:p></w:tc></w:tr>"#
+                )
+            })
+            .collect();
+        let body = format!(r#"<w:tbl><w:tblPr/>{rows}</w:tbl>"#);
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(&body, false)).await;
+        let find_page = |cell_offset, cell_limit| FindArgs {
+            doc_id: doc_id.clone(),
+            pattern: "[".to_string(),
+            offset: None,
+            limit: None,
+            cell_offset,
+            cell_limit,
+        };
+
+        let first = structured(&server.find(Parameters(find_page(None, None))).await);
+        assert_eq!(first["count"], 1, "the table is one block match");
+        let first_table = &first["matches"][0];
+        assert_eq!(first_table["matching_cell_count"], 20);
+        assert_eq!(first_table["matching_cells_returned"], 4);
+        assert_eq!(first_table["matching_cells_has_more"], true);
+        assert_eq!(first_table["matching_cells_next_offset"], 4);
+        assert!(
+            first_table["matching_cells"]
+                .as_array()
+                .expect("matching cell locators")
+                .iter()
+                .all(|cell| cell["text_excerpt"]
+                    .as_str()
+                    .is_some_and(|excerpt| excerpt.contains("[placeholder"))),
+            "even a late cell match remains visible in each bounded excerpt: {first_table}"
+        );
+        assert!(
+            serde_json::to_vec(&first)
+                .expect("serialize first page")
+                .len()
+                < 4 * 1024,
+            "default broad find page must remain bounded: {first}"
+        );
+
+        let second = structured(&server.find(Parameters(find_page(Some(4), Some(8)))).await);
+        let third = structured(&server.find(Parameters(find_page(Some(12), Some(8)))).await);
+        assert_eq!(second["matches"][0]["matching_cells_returned"], 8);
+        assert_eq!(second["matches"][0]["matching_cells_next_offset"], 12);
+        assert_eq!(third["matches"][0]["matching_cells_returned"], 8);
+        assert_eq!(third["matches"][0]["matching_cells_has_more"], false);
+        assert_eq!(
+            third["matches"][0]["matching_cells_next_offset"],
+            Value::Null
+        );
+
+        let ids: HashSet<&str> = [&first, &second, &third]
+            .into_iter()
+            .flat_map(|page| {
+                page["matches"][0]["matching_cells"]
+                    .as_array()
+                    .expect("matching cells")
+            })
+            .map(|cell| cell["block_id"].as_str().expect("cell paragraph id"))
+            .collect();
+        assert_eq!(ids.len(), 20, "all cell ids are retrievable exactly once");
+    }
+
+    #[tokio::test]
+    async fn find_bounds_long_paragraphs_while_exact_block_text_remains_retrievable() {
+        let exact = format!(
+            "{}UniquE Needle{}",
+            "long prefix ".repeat(80),
+            " long suffix".repeat(80)
+        );
+        let body = format!(r#"<w:p><w:r><w:t>{exact}</w:t></w:r></w:p>"#);
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(&body, false)).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "unique needle".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let hit = &found["matches"][0];
+        assert_eq!(hit["text"], Value::Null);
+        assert_eq!(hit["text_chars"], exact.chars().count());
+        assert_eq!(hit["text_truncated"], true);
+        let excerpt = hit["text_excerpt"].as_str().expect("bounded excerpt");
+        assert!(excerpt.to_lowercase().contains("unique needle"));
+        assert_eq!(excerpt.chars().count(), FIND_TEXT_EXCERPT_CHARS);
+
+        let detail = structured(
+            &server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id,
+                    query: InspectQuery::Block,
+                    block_id: Some(hit["id"].as_str().expect("block id").to_string()),
+                    detail: None,
+                    pattern: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(detail["text"], exact);
+    }
+
+    #[tokio::test]
+    async fn compact_whole_document_worklist_previews_and_edits_a_table_cell_paragraph() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_table_docx()).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "R0C1".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        let cell_id = found["matches"][0]["matching_cells"][0]["block_id"]
+            .as_str()
+            .expect("matching cell paragraph id")
+            .to_string();
+        let worklist = || ReplacementWorklistArg {
+            author: "Cell Worklist Test".to_string(),
+            replacements: vec![CoreReplacementItem {
+                old: "R0C1".to_string(),
+                new: "CELL REPLACED".to_string(),
+                scope: None,
+                expected_matches: Some(1),
+                replace_all: false,
+                match_mode: default_core_replacement_match_mode(),
+                on_barrier_match: default_core_barrier_policy(),
+            }],
+        };
+
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(worklist()),
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let preview_payload = structured(&preview);
+        assert_eq!(preview.is_error, Some(false), "{preview_payload}");
+        assert_eq!(preview_payload["would_apply"], 1);
+        assert_eq!(preview_payload["items"][0]["unreached_matches"], json!([]));
+        assert_eq!(preview_payload["apply_ready"], true);
+        assert!(
+            preview_payload["next_action"]
+                .as_str()
+                .is_some_and(|text| text.contains("preview=false"))
+        );
+
+        let before = structured(
+            &server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id: doc_id.clone(),
+                    query: InspectQuery::Block,
+                    block_id: Some(cell_id.clone()),
+                    detail: None,
+                    pattern: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(before["text"], "R0C1", "preview must not persist: {before}");
+
+        let applied = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(worklist()),
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let applied_payload = structured(&applied);
+        assert_eq!(applied.is_error, Some(false), "{applied_payload}");
+        assert_eq!(applied_payload["applied"], 1);
+        assert!(applied_payload.get("apply_ready").is_none());
+
+        let after = structured(
+            &server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id,
+                    query: InspectQuery::Block,
+                    block_id: Some(cell_id),
+                    detail: None,
+                    pattern: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(after["text"], "CELL REPLACED");
     }
 
     /// `apply_edit` on a table_op that structurally inserts a row reports a
@@ -6444,7 +11673,9 @@ mod tests {
             "revision": { "author": "Imager" }
         })
         .to_string();
-        let resolved = resolve_image_paths(&txn).expect("resolves");
+        let authority = PathAuthority::explicit().expect("explicit test authority");
+        let (resolved, sources) =
+            resolve_image_paths(&authority, &txn, None, None).expect("resolves");
         let value: Value = serde_json::from_str(&resolved).expect("json");
         let op = &value["ops"][0];
         assert!(op.get("path").is_none(), "path removed after resolution");
@@ -6453,6 +11684,8 @@ mod tests {
             .decode(encoded)
             .expect("decodes");
         assert_eq!(decoded, png, "bytes match the file on disk");
+        assert_eq!(sources.len(), 1, "the consumed image is identified");
+        assert_eq!(sources[0].bytes, png.len() as u64);
     }
 
     /// Both `bytes_base64` and `path` → invalid_argument (exactly-one contract).
@@ -6466,7 +11699,9 @@ mod tests {
             "revision": { "author": "Imager" }
         })
         .to_string();
-        let err = resolve_image_paths(&txn).expect_err("both sources must fail");
+        let authority = PathAuthority::explicit().expect("explicit test authority");
+        let err =
+            resolve_image_paths(&authority, &txn, None, None).expect_err("both sources must fail");
         assert_eq!(err.is_error, Some(true));
         let payload = err.structured_content.expect("payload");
         assert_eq!(payload["code"], "invalid_argument");
@@ -6487,7 +11722,9 @@ mod tests {
             "revision": { "author": "Imager" }
         })
         .to_string();
-        let err = resolve_image_paths(&txn).expect_err("neither source must fail");
+        let authority = PathAuthority::explicit().expect("explicit test authority");
+        let err = resolve_image_paths(&authority, &txn, None, None)
+            .expect_err("neither source must fail");
         let payload = err.structured_content.expect("payload");
         assert_eq!(payload["code"], "invalid_argument");
         let msg = payload["error"].as_str().unwrap();
@@ -6509,10 +11746,46 @@ mod tests {
             "revision": { "author": "Imager" }
         })
         .to_string();
-        let resolved = resolve_image_paths(&txn).expect("resolves");
+        let authority = PathAuthority::explicit().expect("explicit test authority");
+        let (resolved, sources) =
+            resolve_image_paths(&authority, &txn, None, None).expect("resolves");
         let value: Value = serde_json::from_str(&resolved).expect("json");
         assert_eq!(value["ops"][0]["op"], "replace");
         assert_eq!(value["ops"][1]["bytes_base64"], "AAAA");
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn resolve_image_paths_enforces_per_file_and_aggregate_caps() {
+        let png = png_100x50();
+        let path = write_temp_png(&png);
+        let one = json!({
+            "ops": [
+                { "op": "insert_image", "target": "p_1", "path": path.clone(), "format": "png" }
+            ],
+            "revision": { "author": "Imager" }
+        })
+        .to_string();
+        let authority = PathAuthority::explicit().expect("explicit test authority");
+        let error = resolve_image_paths(&authority, &one, Some(1), None)
+            .expect_err("per-file cap refuses before encoding");
+        assert_eq!(structured(&error)["code"], "artifact_source_too_large");
+        assert_eq!(structured(&error)["env_var"], ENV_MAX_IMAGE_BYTES);
+
+        let two = json!({
+            "ops": [
+                { "op": "insert_image", "target": "p_1", "path": path.clone(), "format": "png" },
+                { "op": "insert_image", "target": "p_2", "path": path.clone(), "format": "png" }
+            ],
+            "revision": { "author": "Imager" }
+        })
+        .to_string();
+        let error = resolve_image_paths(&authority, &two, None, Some(png.len() as u64 + 1))
+            .expect_err("aggregate cap refuses the transaction");
+        let payload = structured(&error);
+        assert_eq!(payload["code"], "artifact_source_too_large");
+        assert_eq!(payload["env_var"], ENV_MAX_IMAGE_TOTAL_BYTES);
+        std::fs::remove_file(path).ok();
     }
 
     /// End-to-end: an agent inserts an image by `path` with cx/cy OMITTED. The
@@ -6530,13 +11803,14 @@ mod tests {
         let doc_id = structured(&open)["doc_id"].as_str().unwrap().to_string();
 
         let png_path = write_temp_png(&png_100x50());
+        let original_png = std::fs::read(&png_path).expect("read test png");
         let result = server
             .apply_edit(Parameters(ApplyEditArgs {
-                doc_id,
+                doc_id: doc_id.clone(),
                 transaction: TransactionArg(json!({
                     "ops": [
                         { "op": "insert_image", "target": "p_1",
-                          "path": png_path, "format": "png" }
+                          "path": png_path.clone(), "format": "png" }
                     ],
                     "revision": { "author": "Imager" }
                 })),
@@ -6547,24 +11821,163 @@ mod tests {
         assert_eq!(result.is_error, Some(false), "insert by path applies");
         let payload = structured(&result);
         assert_eq!(payload["applied"], true, "applied: {payload}");
+        let text_payload: Value =
+            serde_json::from_str(&result.content[0].as_text().expect("text fallback").text)
+                .expect("text fallback is JSON");
+        assert_eq!(
+            text_payload, payload,
+            "text and structured MCP receipts must agree"
+        );
+        assert_eq!(
+            Path::new(
+                payload["input_artifacts"][0]["resolved_path"]
+                    .as_str()
+                    .expect("resolved path")
+            ),
+            Path::new(&png_path)
+                .canonicalize()
+                .expect("canonical png path"),
+            "the apply receipt identifies the consumed image: {payload}"
+        );
+
+        let second = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: doc_id.clone(),
+                transaction: TransactionArg(json!({
+                    "ops": [
+                        { "op": "insert_image", "target": "p_2",
+                          "path": png_path.clone(), "format": "png" }
+                    ],
+                    "revision": { "author": "Imager Two" }
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(second.is_error, Some(false), "second image insert applies");
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id: doc_id.clone(),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(
+            structured(&review)["input_artifacts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "the open DOCX plus one exact image identity are retained without duplicates"
+        );
+
+        let save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: png_path.clone(),
+            }))
+            .await;
+        assert_eq!(
+            structured(&save)["code"],
+            "artifact_protected_source",
+            "an incorporated image remains protected for the session"
+        );
+        assert_eq!(
+            std::fs::read(&png_path).expect("image survives refusal"),
+            original_png
+        );
+        std::fs::remove_file(png_path).ok();
     }
 
     // ─── review_session / audit_docx (RFC 0001) ─────────────────────────────
 
     #[test]
-    fn capped_rows_json_truncation_is_explicit_never_silent() {
+    fn audit_rows_are_explicitly_paged_never_silently_truncated() {
         let small: Vec<Value> = (0..3).map(|i| json!({ "i": i })).collect();
-        let payload = capped_rows_json(small, "narrow it");
+        let payload = audit_rows_page(&small, 0, DEFAULT_AUDIT_PAGE_ROWS).unwrap();
         assert_eq!(payload["total"], 3);
-        assert!(payload.get("truncated").is_none(), "{payload}");
+        assert_eq!(payload["returned"], 3);
+        assert_eq!(payload["has_more"], false);
+        assert!(payload.get("next_offset").is_none(), "{payload}");
 
-        let big: Vec<Value> = (0..MAX_REVISION_ROWS + 7)
+        let big: Vec<Value> = (0..DEFAULT_AUDIT_PAGE_ROWS + 7)
             .map(|i| json!({ "i": i }))
             .collect();
-        let payload = capped_rows_json(big, "narrow it");
-        assert_eq!(payload["total"], MAX_REVISION_ROWS + 7);
-        assert_eq!(payload["rows"].as_array().unwrap().len(), MAX_REVISION_ROWS);
-        assert_eq!(payload["truncated"]["omitted"], 7, "{payload}");
+        let payload = audit_rows_page(&big, 0, DEFAULT_AUDIT_PAGE_ROWS).unwrap();
+        assert_eq!(payload["total"], DEFAULT_AUDIT_PAGE_ROWS + 7);
+        assert_eq!(
+            payload["rows"].as_array().unwrap().len(),
+            DEFAULT_AUDIT_PAGE_ROWS
+        );
+        assert_eq!(payload["has_more"], true);
+        assert_eq!(payload["next_offset"], DEFAULT_AUDIT_PAGE_ROWS);
+        assert_eq!(payload["omitted"], 7);
+        let complete_set_hash = payload["set_sha256"]
+            .as_str()
+            .expect("audit page commits to the complete set")
+            .to_string();
+        assert_eq!(complete_set_hash.len(), 64);
+
+        let tail = audit_rows_page(&big, DEFAULT_AUDIT_PAGE_ROWS, 7).unwrap();
+        assert_eq!(tail["returned"], 7);
+        assert_eq!(tail["has_more"], false);
+        assert_eq!(tail["omitted"], DEFAULT_AUDIT_PAGE_ROWS);
+        assert_eq!(
+            tail["set_sha256"], complete_set_hash,
+            "every page is bound to the same complete immutable set"
+        );
+        assert!(audit_rows_page(&big, big.len() + 1, 1).is_err());
+        assert!(parse_audit_page_request(None, Some(0), None).is_err());
+        assert!(
+            parse_audit_page_request(
+                Some(AuditDetail::Violations),
+                None,
+                Some(MAX_AUDIT_PAGE_ROWS + 1)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn baseline_validation_is_separated_from_new_regressions() {
+        use stemma::runtime::{ValidationIssue, ValidationIssueCode, ValidationReport};
+
+        let existing = ValidationIssue {
+            code: ValidationIssueCode::WordprocessingInvariant,
+            message: "pre-existing table finding".to_string(),
+            context: Some("table t_1".to_string()),
+        };
+        let introduced = ValidationIssue {
+            code: ValidationIssueCode::SchemaInvariant,
+            message: "new finding".to_string(),
+            context: Some("word/document.xml".to_string()),
+        };
+        let baseline = ValidationReport {
+            ok: false,
+            issues: vec![existing.clone()],
+        };
+        let current = ValidationReport {
+            ok: false,
+            issues: vec![existing, introduced],
+        };
+        let mut payload = json!({
+            "validator": {},
+            "counts": {
+                "unexplained_direct_changes": 0,
+                "changed_prior_revisions": 0,
+                "untouched_violations": 0,
+            },
+        });
+
+        attach_baseline_validation(&mut payload, &baseline, &current);
+
+        assert_eq!(payload["baseline_validator"]["issues_page"]["total"], 1);
+        assert_eq!(payload["validator"]["baseline_issue_count"], 1);
+        assert_eq!(payload["validator"]["new_issue_count"], 1);
+        assert_eq!(payload["validator"]["resolved_baseline_issue_count"], 0);
+        assert_eq!(payload["validator"]["unchanged_from_baseline"], false);
     }
 
     /// End-to-end over the wire surface: open → tracked edit → review_session
@@ -6588,6 +12001,9 @@ mod tests {
             .review_session(Parameters(ReviewSessionArgs {
                 doc_id: doc_id.clone(),
                 render: None,
+                detail: None,
+                offset: None,
+                limit: None,
             }))
             .await;
         assert_eq!(review.is_error, Some(false), "review succeeds");
@@ -6606,6 +12022,15 @@ mod tests {
         );
         assert!(payload["untouched"]["verified_blocks"].as_u64().unwrap() >= 3);
         assert_eq!(payload["validator"]["ok"], true);
+        assert_eq!(payload["baseline_validator"]["ok"], true);
+        assert_eq!(payload["validator"]["new_issue_count"], 0);
+        assert_eq!(payload["validator"]["unchanged_from_baseline"], true);
+        assert_eq!(payload["counts"]["unexplained_direct_changes"], 0);
+        assert_eq!(payload["counts"]["changed_prior_revisions"], 0);
+        assert_eq!(payload["counts"]["untouched_violations"], 0);
+        assert_eq!(payload["counts"]["new_validator_issues"], 0);
+        assert_eq!(payload["verdict"]["status"], "pass");
+        assert_eq!(payload["verdict"]["deliverable"], true);
         assert!(
             payload.get("render").is_none(),
             "no render unless requested"
@@ -6623,6 +12048,9 @@ mod tests {
                 render: Some(RenderSpec {
                     path: out_path.clone(),
                 }),
+                detail: None,
+                offset: None,
+                limit: None,
             }))
             .await;
         assert_eq!(review.is_error, Some(false), "review+render succeeds");
@@ -6634,6 +12062,112 @@ mod tests {
         );
         assert!(std::path::Path::new(&out_path).exists());
         std::fs::remove_file(&out_path).ok();
+    }
+
+    #[tokio::test]
+    async fn review_session_accounts_for_requested_comment_annotation() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let applied = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: doc_id.clone(),
+                transaction: TransactionArg(json!({
+                    "ops": [{
+                        "op": "comment_create",
+                        "target": "p_1",
+                        "expect": "Paragraph 0",
+                        "body": "Confirm approval before proceeding.",
+                        "author": "Reviewer"
+                    }],
+                    "revision": {"author": "Reviewer"}
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(structured(&applied)["applied"], true, "{applied:?}");
+
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        let payload = structured(&review);
+        assert_eq!(review.is_error, Some(false), "{payload}");
+        assert_eq!(payload["session"]["direct_delta"]["total"], 1);
+        assert_eq!(
+            payload["session"]["direct_delta"]["rows"][0]["explanation"], "comment_annotation",
+            "the committed comment story is explicitly classified, not hidden: {payload}"
+        );
+        assert_eq!(
+            payload["untouched"]["violations"].as_array().unwrap().len(),
+            0,
+            "comment range markers are accounted for by the annotation: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_session_pages_every_census_row_without_hiding_the_total() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(12)).await;
+        for paragraph_index in 1..=9 {
+            let result = server
+                .apply_edit(Parameters(ApplyEditArgs {
+                    doc_id: doc_id.clone(),
+                    transaction: replace_txn_arg(
+                        &format!("p_{}", paragraph_index + 1),
+                        &format!("Paragraph {paragraph_index}"),
+                        &format!("Paragraph {paragraph_index} rewritten."),
+                    ),
+                    mode: None,
+                    allow_existing_author: false,
+                }))
+                .await;
+            assert_eq!(structured(&result)["applied"], true, "{paragraph_index}");
+        }
+
+        let first = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id: doc_id.clone(),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        let first = structured(&first);
+        let census = &first["session"]["census"];
+        let total = census["total"].as_u64().unwrap() as usize;
+        assert!(total > DEFAULT_AUDIT_PAGE_ROWS, "{first}");
+        assert_eq!(
+            census["rows"].as_array().unwrap().len(),
+            DEFAULT_AUDIT_PAGE_ROWS
+        );
+        assert_eq!(census["has_more"], true);
+        assert_eq!(census["next_offset"], DEFAULT_AUDIT_PAGE_ROWS);
+
+        let tail = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: None,
+                detail: Some(AuditDetail::Census),
+                offset: Some(DEFAULT_AUDIT_PAGE_ROWS),
+                limit: Some(MAX_AUDIT_PAGE_ROWS),
+            }))
+            .await;
+        let tail = structured(&tail);
+        let census = &tail["session"]["census"];
+        assert_eq!(census["total"], total);
+        assert_eq!(
+            census["returned"],
+            total.saturating_sub(DEFAULT_AUDIT_PAGE_ROWS)
+        );
+        assert_eq!(census["has_more"], false);
+        assert_eq!(tail["requested_detail"]["section"], "census");
     }
 
     /// Stateless certification over two files: the saved session output
@@ -6680,6 +12214,9 @@ mod tests {
                 before_path: before_path.clone(),
                 after_path: after_path.clone(),
                 render: None,
+                detail: None,
+                offset: None,
+                limit: None,
             }))
             .await;
         assert_eq!(audit.is_error, Some(false), "audit succeeds");
@@ -6697,6 +12234,605 @@ mod tests {
         );
         assert_eq!(payload["validator"]["ok"], true);
         std::fs::remove_file(&after_path).ok();
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(source: &Path, destination: &Path) -> bool {
+        std::os::unix::fs::symlink(source, destination).expect("create file symlink");
+        true
+    }
+
+    /// APFS refuses to create names that are not valid UTF-8 (EILSEQ, os
+    /// error 92 on macOS), so scenarios needing an on-disk non-UTF-8 path
+    /// cannot be provisioned there — nor can such a canonical path reach the
+    /// wire on that filesystem. Bounded skip, reported, never absorbed; any
+    /// other error still panics.
+    #[cfg(unix)]
+    fn provision_non_utf8(result: std::io::Result<()>, what: &Path) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+                eprintln!(
+                    "skipping on-disk non-UTF-8 assertions: this filesystem cannot represent {}: {error}",
+                    what.display()
+                );
+                false
+            }
+            Err(error) => panic!("provision non-UTF-8 name {}: {error}", what.display()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(source: &Path, destination: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(source, destination) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping symlink assertion without Windows symlink privilege: {error}");
+                false
+            }
+            Err(error) => panic!("create file symlink: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rooted_mcp_open_refuses_traversal_and_symlink_escape() {
+        let world = tempfile::tempdir().expect("world");
+        let workspace = world.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let input = workspace.join("input.docx");
+        let outside = world.path().join("outside.docx");
+        std::fs::write(&input, make_multi_para_docx(3)).expect("write input");
+        std::fs::write(&outside, make_multi_para_docx(4)).expect("write outside");
+
+        let authority = PathAuthority::rooted(&workspace).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+
+        let traversal = server
+            .open_docx(Parameters(OpenArgs {
+                path: "../outside.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&traversal)["code"], "artifact_outside_workspace");
+
+        let escaped_link = workspace.join("escaped.docx");
+        if create_file_symlink(&outside, &escaped_link) {
+            let escaped = server
+                .open_docx(Parameters(OpenArgs {
+                    path: "escaped.docx".to_string(),
+                }))
+                .await;
+            assert_eq!(structured(&escaped)["code"], "artifact_outside_workspace");
+        }
+
+        let absolute_inside = server
+            .open_docx(Parameters(OpenArgs {
+                path: input.display().to_string(),
+            }))
+            .await;
+        assert_eq!(
+            absolute_inside.is_error,
+            Some(false),
+            "an absolute path inside the configured root is authorized"
+        );
+        assert_eq!(
+            Path::new(
+                structured(&absolute_inside)["input_artifact"]["resolved_path"]
+                    .as_str()
+                    .expect("resolved path")
+            ),
+            input.canonicalize().unwrap()
+        );
+
+        let stream_read = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx:hidden".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&stream_read)["code"], "artifact_read_failed");
+
+        let original = std::fs::read(&input).unwrap();
+        let stream_write = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: structured(&absolute_inside)["doc_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                path: "input.docx:stemma-output".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&stream_write)["code"], "artifact_commit_failed");
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_fails_loudly_before_non_utf8_paths_reach_json_receipts() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let world = tempfile::tempdir().expect("world");
+        let workspace = world.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let non_utf8_docx = workspace.join(OsString::from_vec(b"input-\xff.docx".to_vec()));
+        if !provision_non_utf8(
+            std::fs::write(&non_utf8_docx, make_multi_para_docx(3)),
+            &non_utf8_docx,
+        ) {
+            return;
+        }
+        let alias = workspace.join("input-alias.docx");
+        assert!(create_file_symlink(&non_utf8_docx, &alias));
+
+        let authority = PathAuthority::rooted(&workspace).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let alias_result = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input-alias.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(alias_result.is_error, Some(true));
+        assert_eq!(
+            structured(&alias_result)["code"],
+            "artifact_read_failed",
+            "a non-UTF8 canonical source path is a typed read refusal, not a JSON panic"
+        );
+        assert!(
+            structured(&alias_result)["error"]
+                .as_str()
+                .unwrap()
+                .contains("not valid UTF-8")
+        );
+
+        let non_utf8_workspace = world
+            .path()
+            .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+        std::fs::create_dir(&non_utf8_workspace).expect("non-UTF8 workspace");
+        std::fs::write(
+            non_utf8_workspace.join("input.docx"),
+            make_multi_para_docx(3),
+        )
+        .expect("write rooted input");
+        let startup_error = artifact_authority_from_setting(None, &non_utf8_workspace)
+            .expect_err("a rooted MCP cannot start with a non-UTF8 canonical workspace");
+        assert!(
+            startup_error.contains(ENV_WORKSPACE_ROOT)
+                && startup_error.contains("not valid UTF-8")
+                && startup_error.contains("serialized receipts"),
+            "startup refusal is explicit and actionable: {startup_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_mcp_refuses_outside_compare_audit_and_render_paths() {
+        let world = tempfile::tempdir().expect("world");
+        let workspace = world.path().join("workspace");
+        let outside = world.path().join("outside");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&outside).expect("outside");
+        let input = workspace.join("input.docx");
+        let target = workspace.join("target.docx");
+        let outside_docx = outside.join("outside.docx");
+        std::fs::write(&input, make_multi_para_docx(3)).expect("write input");
+        std::fs::write(&target, make_multi_para_docx(4)).expect("write target");
+        std::fs::write(&outside_docx, make_multi_para_docx(5)).expect("write outside");
+
+        let authority = PathAuthority::rooted(&workspace).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        let outside_path = outside_docx.display().to_string();
+
+        for (base_path, target_path, out_path) in [
+            (
+                outside_path.clone(),
+                "target.docx".to_string(),
+                "compare-outside-base.docx".to_string(),
+            ),
+            (
+                "input.docx".to_string(),
+                outside_path.clone(),
+                "compare-outside-target.docx".to_string(),
+            ),
+        ] {
+            let denied = server
+                .compare_docx(Parameters(CompareArgs {
+                    base_path,
+                    target_path,
+                    out_path: out_path.clone(),
+                    author: None,
+                }))
+                .await;
+            assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+            assert!(!workspace.join(out_path).exists());
+        }
+
+        for (before_path, after_path) in [
+            (outside_path.clone(), "target.docx".to_string()),
+            ("input.docx".to_string(), outside_path.clone()),
+        ] {
+            let denied = server
+                .audit_docx(Parameters(AuditDocxArgs {
+                    before_path,
+                    after_path,
+                    render: None,
+                    detail: None,
+                    offset: None,
+                    limit: None,
+                }))
+                .await;
+            assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+        }
+
+        let audit_output = outside.join("audit.docx");
+        let denied = server
+            .audit_docx(Parameters(AuditDocxArgs {
+                before_path: "input.docx".to_string(),
+                after_path: "target.docx".to_string(),
+                render: Some(RenderSpec {
+                    path: audit_output.display().to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+        assert!(!audit_output.exists());
+
+        let review_output = outside.join("review.docx");
+        let denied = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: Some(RenderSpec {
+                    path: review_output.display().to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+        assert!(!review_output.exists());
+    }
+
+    #[tokio::test]
+    async fn rooted_mcp_refuses_outside_images_before_check_or_commit() {
+        let world = tempfile::tempdir().expect("world");
+        let workspace = world.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("input.docx"), make_multi_para_docx(3)).expect("write input");
+        let outside_image = world.path().join("outside.png");
+        std::fs::write(&outside_image, png_100x50()).expect("write outside image");
+
+        let authority = PathAuthority::rooted(&workspace).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        let image_transaction = || {
+            TransactionArg(json!({
+                "ops": [{
+                    "op": "insert_image",
+                    "target": "p_1",
+                    "path": outside_image.display().to_string(),
+                    "format": "png"
+                }],
+                "revision": { "author": "Imager" }
+            }))
+        };
+
+        let checked = server
+            .check_edit(Parameters(CheckArgs {
+                doc_id: doc_id.clone(),
+                transaction: image_transaction(),
+            }))
+            .await;
+        assert_eq!(structured(&checked)["code"], "artifact_outside_workspace");
+
+        let applied = server
+            .apply_batch(Parameters(BatchArgs {
+                doc_id: doc_id.clone(),
+                transaction: image_transaction(),
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(structured(&applied)["code"], "artifact_outside_workspace");
+
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&review)["session"]["census"]["total"], 0);
+        assert_eq!(
+            structured(&review)["session"]["direct_delta"]["total"],
+            0,
+            "neither rejected media path may mutate the open document"
+        );
+    }
+
+    /// The transport, not caller convention, owns filesystem authority and
+    /// create-new persistence. Exercise the shared policy through every MCP
+    /// writer and verify a refused call leaves the existing bytes untouched.
+    #[tokio::test]
+    async fn artifact_boundary_is_enforced_across_mcp_surfaces() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside workspace");
+        let input = workspace.path().join("input.docx");
+        let target = workspace.path().join("target.docx");
+        std::fs::write(&input, make_multi_para_docx(3)).expect("write input");
+        std::fs::write(&target, make_multi_para_docx(4)).expect("write target");
+
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+
+        let denied = server
+            .open_docx(Parameters(OpenArgs {
+                path: outside.path().join("outside.docx").display().to_string(),
+            }))
+            .await;
+        assert_eq!(
+            structured(&denied)["code"],
+            "artifact_outside_workspace",
+            "a missing path outside the root is a safe refusal"
+        );
+
+        let outside_input = outside.path().join("outside.docx");
+        std::fs::write(&outside_input, make_multi_para_docx(3)).expect("write outside input");
+        let denied = server
+            .open_docx(Parameters(OpenArgs {
+                path: outside_input.display().to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            opened.is_error,
+            Some(false),
+            "relative rooted read succeeds"
+        );
+        let open_payload = structured(&opened);
+        let doc_id = open_payload["doc_id"].as_str().unwrap().to_string();
+        assert_eq!(open_payload["input_artifact"]["role"], "input_docx");
+        assert_eq!(
+            open_payload["input_artifact"]["digest"]["algorithm"],
+            "sha256"
+        );
+
+        let hard_link = workspace.path().join("input-hard-link.docx");
+        std::fs::hard_link(&input, &hard_link).expect("create source hard link");
+        let alias_save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "input-hard-link.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            structured(&alias_save)["code"],
+            "artifact_protected_source",
+            "hard-link aliases of a source are protected at the MCP surface"
+        );
+
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "result.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "fresh output commits");
+        let save_payload = structured(&saved);
+        assert_eq!(save_payload["verdict"]["status"], "pass");
+        assert_eq!(save_payload["verdict"]["deliverable"], true);
+        assert_eq!(save_payload["validation"]["level"], "blocking");
+        assert_eq!(save_payload["validation"]["ok"], true);
+        assert_eq!(save_payload["audit_binding"]["doc_id"], doc_id);
+        assert_eq!(
+            save_payload["audit_binding"]["set_sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert_eq!(save_payload["audit_binding"]["verdict"]["status"], "pass");
+        assert_eq!(
+            save_payload["output_artifact"]["collision_policy"],
+            "create_new"
+        );
+        assert_eq!(save_payload["output_artifact"]["disposition"], "created");
+        let result_path = workspace.path().join("result.docx");
+        let committed = std::fs::read(&result_path).expect("committed output");
+        assert_eq!(
+            save_payload["output_artifact"]["identity"]["bytes"],
+            committed.len() as u64
+        );
+        let reread = server
+            .artifacts
+            .read_source("result.docx", "verification", None)
+            .expect("reread committed bytes");
+        assert_eq!(
+            save_payload["output_artifact"]["identity"]["digest"]["hex"],
+            reread.identity().digest.hex
+        );
+        assert_eq!(
+            save_payload["audit_binding"]["output_sha256"],
+            reread.identity().digest.hex
+        );
+
+        let compared = server
+            .compare_docx(Parameters(CompareArgs {
+                base_path: "input.docx".to_string(),
+                target_path: "target.docx".to_string(),
+                out_path: "compare.docx".to_string(),
+                author: None,
+            }))
+            .await;
+        assert_eq!(compared.is_error, Some(false));
+        let compare_payload = structured(&compared);
+        let compare_reread = server
+            .artifacts
+            .read_source("compare.docx", "verification", None)
+            .unwrap();
+        assert_eq!(
+            compare_payload["output_artifact"]["identity"]["digest"]["hex"],
+            compare_reread.identity().digest.hex
+        );
+        assert_eq!(
+            compare_payload["output_artifact"]["identity"]["role"],
+            "output_redline"
+        );
+
+        let compact_compared = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: None,
+                transaction: None,
+                resolution: None,
+                replacement_worklist: None,
+                comparison: Some(ComparisonPlanArg {
+                    base_path: "input.docx".to_string(),
+                    target_path: "target.docx".to_string(),
+                    out_path: "compare-core.docx".to_string(),
+                    author: Some("Core Comparator".to_string()),
+                }),
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(compact_compared.is_error, Some(false));
+        assert_eq!(
+            structured(&compact_compared)["output_artifact"]["identity"]["role"],
+            "output_redline",
+            "the five-tool producer route preserves compare_docx semantics"
+        );
+
+        let audited = server
+            .audit_docx(Parameters(AuditDocxArgs {
+                before_path: "input.docx".to_string(),
+                after_path: "result.docx".to_string(),
+                render: Some(RenderSpec {
+                    path: "audit.docx".to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(audited.is_error, Some(false));
+        let audit_payload = structured(&audited);
+        let audit_reread = server
+            .artifacts
+            .read_source("audit.docx", "verification", None)
+            .unwrap();
+        assert_eq!(
+            audit_payload["render"]["output_artifact"]["identity"]["digest"]["hex"],
+            audit_reread.identity().digest.hex
+        );
+
+        let reviewed = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id: doc_id.clone(),
+                render: Some(RenderSpec {
+                    path: "review.docx".to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(reviewed.is_error, Some(false));
+        let review_payload = structured(&reviewed);
+        let review_reread = server
+            .artifacts
+            .read_source("review.docx", "verification", None)
+            .unwrap();
+        assert_eq!(
+            review_payload["render"]["output_artifact"]["identity"]["digest"]["hex"],
+            review_reread.identity().digest.hex
+        );
+
+        let save_again = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "result.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&save_again)["code"], "artifact_output_exists");
+        assert_eq!(std::fs::read(&result_path).unwrap(), committed);
+
+        let over_input = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&over_input)["code"], "artifact_protected_source");
+
+        let compare = server
+            .compare_docx(Parameters(CompareArgs {
+                base_path: "input.docx".to_string(),
+                target_path: "target.docx".to_string(),
+                out_path: "result.docx".to_string(),
+                author: None,
+            }))
+            .await;
+        assert_eq!(structured(&compare)["code"], "artifact_output_exists");
+
+        let audit = server
+            .audit_docx(Parameters(AuditDocxArgs {
+                before_path: "input.docx".to_string(),
+                after_path: "result.docx".to_string(),
+                render: Some(RenderSpec {
+                    path: "result.docx".to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&audit)["code"], "artifact_protected_source");
+
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: Some(RenderSpec {
+                    path: "result.docx".to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&review)["code"], "artifact_output_exists");
+        assert_eq!(std::fs::read(&result_path).unwrap(), committed);
+
+        let outside_output = outside.path().join("new.docx");
+        let denied = server
+            .compare_docx(Parameters(CompareArgs {
+                base_path: "input.docx".to_string(),
+                target_path: "target.docx".to_string(),
+                out_path: outside_output.display().to_string(),
+                author: None,
+            }))
+            .await;
+        assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
+        assert!(!outside_output.exists());
     }
 
     // ─── Lifecycle hardening: config, CLI, size cap, eviction attribution ─────
@@ -6738,11 +12874,275 @@ mod tests {
     }
 
     #[test]
+    fn tool_profile_defaults_to_core_and_refuses_unknown_values() {
+        assert_eq!(
+            parse_profile_setting(ENV_PROFILE, None),
+            Ok(ToolProfile::Core)
+        );
+        assert_eq!(
+            parse_profile_setting(ENV_PROFILE, Some("core")),
+            Ok(ToolProfile::Core)
+        );
+        assert_eq!(
+            parse_profile_setting(ENV_PROFILE, Some("advanced")),
+            Ok(ToolProfile::Advanced)
+        );
+        let error = parse_profile_setting(ENV_PROFILE, Some("full"))
+            .expect_err("unknown profiles must fail loud");
+        assert!(
+            error.contains(ENV_PROFILE) && error.contains("core") && error.contains("advanced")
+        );
+    }
+
+    #[test]
+    fn core_guidance_is_materially_smaller_than_the_advanced_playbook() {
+        assert!(CORE_INSTRUCTIONS.contains("open_docx -> inspect_docx"));
+        assert!(CORE_INSTRUCTIONS.contains("verify_docx -> save_docx"));
+        assert!(CORE_INSTRUCTIONS.contains("resolution is not a finalize"));
+        assert!(
+            CORE_INSTRUCTIONS.len() * 10 < INSTRUCTIONS.len(),
+            "core startup guidance should remain at least 10x smaller: core={} advanced={}",
+            CORE_INSTRUCTIONS.len(),
+            INSTRUCTIONS.len()
+        );
+
+        let router = StemmaServer::router_for_profile(ToolProfile::Core);
+        let inspect = router.get("inspect_docx").expect("inspect core tool");
+        let inspect_description = inspect.description.as_deref().unwrap_or_default();
+        for marker in [
+            "query='find'",
+            "query='window'",
+            "query='document'",
+            "query='notes'",
+            "query='operations'",
+            "query='accepted'",
+            "query='rejected'",
+        ] {
+            assert!(
+                inspect_description.contains(marker),
+                "compact inspection description lost bounded-navigation marker: {marker}"
+            );
+        }
+        let execute = router.get("execute_plan").expect("execute core tool");
+        let execute_description = execute.description.as_deref().unwrap_or_default();
+        for marker in [
+            "opaque_ref",
+            "attrs",
+            "touched-block-only",
+            "Resolution is NOT a finalize step",
+            "comparison is the producer path",
+            "insert_note/edit_note/delete_note",
+        ] {
+            assert!(
+                execute_description.contains(marker),
+                "compact execution description lost load-bearing guidance: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_root_setting_is_fail_loud_and_canonical() {
+        let world = tempfile::tempdir().expect("world");
+        let startup = world.path().join("startup");
+        let configured = startup.join("configured");
+        std::fs::create_dir(&startup).expect("startup");
+        std::fs::create_dir(&configured).expect("configured root");
+
+        let default = artifact_authority_from_setting(None, &startup.join("."))
+            .expect("missing setting uses the startup directory");
+        assert_eq!(
+            default.root(),
+            Some(startup.canonicalize().unwrap().as_path()),
+            "the default root is canonical"
+        );
+
+        let relative_setting = PathBuf::from("configured").join("..").join("configured");
+        let relative =
+            artifact_authority_from_setting(Some(relative_setting.as_os_str()), &startup)
+                .expect("a relative setting resolves from the startup directory");
+        assert_eq!(
+            relative.root(),
+            Some(configured.canonicalize().unwrap().as_path()),
+            "relative roots are resolved and canonicalized without changing process cwd"
+        );
+
+        let empty = artifact_authority_from_setting(Some(std::ffi::OsStr::new("")), &startup)
+            .expect_err("an explicitly empty root must fail");
+        assert!(
+            empty.contains(ENV_WORKSPACE_ROOT) && empty.contains("empty"),
+            "empty-root error is actionable: {empty}"
+        );
+
+        let missing =
+            artifact_authority_from_setting(Some(std::ffi::OsStr::new("missing")), &startup)
+                .expect_err("a missing root must fail");
+        assert!(
+            missing.contains(ENV_WORKSPACE_ROOT) && missing.contains("missing"),
+            "missing-root error names the setting and path: {missing}"
+        );
+
+        let file = startup.join("not-a-directory");
+        std::fs::write(&file, b"file").expect("write non-directory root");
+        let not_directory = artifact_authority_from_setting(Some(file.as_os_str()), &startup)
+            .expect_err("a file cannot be the workspace root");
+        assert!(
+            not_directory.contains(ENV_WORKSPACE_ROOT) && not_directory.contains("not a directory"),
+            "non-directory error is actionable: {not_directory}"
+        );
+    }
+
+    #[test]
     fn humanize_secs_renders_whole_units() {
         assert_eq!(humanize_secs(DEFAULT_DOC_TTL_SECS), "24h");
         assert_eq!(humanize_secs(3600), "1h");
         assert_eq!(humanize_secs(1800), "30m");
         assert_eq!(humanize_secs(45), "45s");
+    }
+
+    #[tokio::test]
+    async fn source_artifact_registry_is_removed_only_after_runtime_eviction() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(3)).await;
+        let handle = DocHandle(doc_id.clone());
+
+        server.evict_expired_sessions(u64::MAX);
+        assert!(server.runtime.contains_handle(&handle));
+        assert!(
+            server
+                .source_artifacts
+                .lock()
+                .unwrap()
+                .contains_key(&doc_id)
+        );
+
+        server.evict_expired_sessions(0);
+        assert!(!server.runtime.contains_handle(&handle));
+        assert!(
+            !server
+                .source_artifacts
+                .lock()
+                .unwrap()
+                .contains_key(&doc_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_source_registry_fails_closed_for_save_and_review() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(3))
+            .expect("write input");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        assert!(server.runtime.contains_handle(&DocHandle(doc_id.clone())));
+        server.source_artifacts.lock().unwrap().remove(&doc_id);
+
+        let save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "saved.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(structured(&save)["code"], "artifact_session_state_missing");
+        assert!(!workspace.path().join("saved.docx").exists());
+
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id,
+                render: Some(RenderSpec {
+                    path: "review.docx".to_string(),
+                }),
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(
+            structured(&review)["code"],
+            "artifact_session_state_missing"
+        );
+        assert!(!workspace.path().join("review.docx").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_source_registry_refuses_path_backed_image_before_mutation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(3))
+            .expect("write input");
+        std::fs::write(workspace.path().join("image.png"), png_100x50()).expect("write image");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        let handle = DocHandle(doc_id.clone());
+        let before = server.runtime.view(&handle).unwrap().fingerprint;
+        server.source_artifacts.lock().unwrap().remove(&doc_id);
+
+        let result = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": [{
+                        "op": "insert_image",
+                        "target": "p_1",
+                        "path": "image.png",
+                        "format": "png"
+                    }],
+                    "revision": { "author": "Imager" }
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+
+        assert_eq!(
+            structured(&result)["code"],
+            "artifact_session_state_missing"
+        );
+        assert_eq!(server.runtime.view(&handle).unwrap().fingerprint, before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_never_opens_a_protected_source_replaced_by_a_fifo() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let input = workspace.path().join("input.docx");
+        let existing = workspace.path().join("existing.docx");
+        std::fs::write(&input, make_multi_para_docx(3)).expect("write input");
+        std::fs::write(&existing, b"keep me").expect("write existing output");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        std::fs::remove_file(&input).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed with {status}");
+
+        let result = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "existing.docx".to_string(),
+            }))
+            .await;
+
+        assert_eq!(structured(&result)["code"], "artifact_commit_failed");
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep me");
     }
 
     /// open_docx refuses a file larger than the configured cap, and the error
@@ -6751,8 +13151,11 @@ mod tests {
     #[tokio::test]
     async fn open_docx_rejects_a_file_over_the_size_cap() {
         let server = StemmaServer::with_config(Config {
+            profile: ToolProfile::Core,
             doc_ttl_secs: DEFAULT_DOC_TTL_SECS,
             max_doc_bytes: 100,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            max_image_total_bytes: DEFAULT_MAX_IMAGE_TOTAL_BYTES,
         });
         let docx = make_multi_para_docx(3);
         assert!(docx.len() as u64 > 100, "fixture must exceed the tiny cap");
@@ -6780,8 +13183,11 @@ mod tests {
     #[tokio::test]
     async fn open_docx_size_cap_of_zero_is_disabled() {
         let server = StemmaServer::with_config(Config {
+            profile: ToolProfile::Core,
             doc_ttl_secs: DEFAULT_DOC_TTL_SECS,
             max_doc_bytes: 0,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            max_image_total_bytes: DEFAULT_MAX_IMAGE_TOTAL_BYTES,
         });
         let path = write_temp_docx(&make_multi_para_docx(3));
         let result = server
@@ -6825,6 +13231,448 @@ mod tests {
             Some("doc_issued"),
         );
         assert_eq!(structured(&other)["code"], "StaleEdit");
+    }
+
+    #[tokio::test]
+    async fn compact_surface_inspects_executes_and_verifies_through_shared_kernels() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(3)).await;
+
+        let document = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: doc_id.clone(),
+                query: InspectQuery::Document,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        assert_eq!(document.is_error, Some(false));
+        assert!(
+            structured(&document)["content"]
+                .as_str()
+                .unwrap()
+                .contains("Paragraph 0")
+        );
+
+        let block = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: doc_id.clone(),
+                query: InspectQuery::Block,
+                block_id: Some("p_1".to_string()),
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        assert_eq!(block.is_error, Some(false));
+        assert_eq!(structured(&block)["id"], "p_1");
+
+        let transaction = replace_txn_arg("p_1", "Paragraph 0", "Revised paragraph");
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: Some(transaction.clone()),
+                resolution: None,
+                replacement_worklist: None,
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(preview.is_error, Some(false));
+        assert_eq!(structured(&preview)["applied"], false);
+        assert_eq!(structured(&preview)["would_apply"], true);
+        assert_eq!(structured(&preview)["changed_block_ids"], json!(["p_1"]));
+        assert_eq!(
+            structured(&preview)["changed_blocks"]
+                .as_array()
+                .expect("preview changed blocks")
+                .len(),
+            1
+        );
+        assert!(structured(&preview).get("preview_outline").is_none());
+
+        let applied = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: Some(transaction),
+                resolution: None,
+                replacement_worklist: None,
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(applied.is_error, Some(false));
+        assert_eq!(structured(&applied)["applied"], true);
+        let applied_revision_count = structured(&applied)["revision_ids"]
+            .as_array()
+            .expect("execute receipt revision ids")
+            .len();
+
+        let resolution_preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: Some(ResolutionPlanArg {
+                    action: ResolutionActionArg::Accept,
+                    selector: ChangeSelector::All,
+                }),
+                replacement_worklist: None,
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(resolution_preview.is_error, Some(false));
+        assert_eq!(structured(&resolution_preview)["would_apply"], true);
+        assert_eq!(
+            structured(&resolution_preview)["resolution"]["revision_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(applied_revision_count)
+        );
+
+        let verified = server
+            .verify_docx(Parameters(VerifyDocxArgs {
+                doc_id: Some(doc_id),
+                before_path: None,
+                after_path: None,
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(verified.is_error, Some(false));
+        assert_eq!(structured(&verified)["validator"]["ok"], true);
+        assert!(
+            structured(&verified)["session"]["census"]["total"]
+                .as_u64()
+                .is_some_and(|total| total > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_execute_plan_runs_a_server_side_replacement_worklist() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(3)).await;
+        let item = |old: &str, new: &str| CoreReplacementItem {
+            old: old.to_string(),
+            new: new.to_string(),
+            scope: None,
+            expected_matches: Some(1),
+            replace_all: false,
+            match_mode: default_core_replacement_match_mode(),
+            on_barrier_match: default_core_barrier_policy(),
+        };
+
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(ReplacementWorklistArg {
+                    author: "Worklist Test".to_string(),
+                    replacements: vec![
+                        item("Paragraph 0", "First replacement"),
+                        item("Paragraph 2", "Second replacement"),
+                    ],
+                }),
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let preview_payload = structured(&preview);
+        assert_eq!(preview.is_error, Some(false), "preview: {preview_payload}");
+        assert_eq!(preview_payload["applied"], 0);
+        assert_eq!(preview_payload["would_apply"], 2);
+        assert_eq!(preview_payload["items"][0]["status"], "would_apply");
+        assert_eq!(preview_payload["items"][1]["status"], "would_apply");
+        let absent = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "First replacement".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(absent["count"], 0, "preview must not persist: {absent}");
+
+        let result = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(ReplacementWorklistArg {
+                    author: "Worklist Test".to_string(),
+                    replacements: vec![
+                        item("Paragraph 0", "First replacement"),
+                        item("Paragraph 2", "Second replacement"),
+                    ],
+                }),
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "worklist result: {payload}");
+        assert_eq!(payload["applied"], 2);
+        assert_eq!(payload["failed"], 0);
+
+        let first = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id,
+                    pattern: "First replacement".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(first["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn compact_worklist_layers_over_a_prior_authors_pending_insertion() {
+        let server = StemmaServer::new();
+        let bytes = make_docx(
+            r#"<w:p><w:r><w:t xml:space="preserve">Interest: </w:t></w:r><w:ins w:id="5" w:author="Prior Counsel" w:date="2020-01-01T00:00:00Z"><w:r><w:t>rate of 8% above base rate</w:t></w:r></w:ins></w:p>"#,
+            false,
+        );
+        let doc_id = open_and_id(&server, &bytes).await;
+        let worklist = || ReplacementWorklistArg {
+            author: "Reviewing Counsel".to_string(),
+            replacements: vec![CoreReplacementItem {
+                old: "rate of 8% above base rate".to_string(),
+                new: "rate of 2% above base rate".to_string(),
+                scope: None,
+                expected_matches: Some(1),
+                replace_all: false,
+                match_mode: default_core_replacement_match_mode(),
+                on_barrier_match: CoreBarrierPolicy::Fail,
+            }],
+        };
+
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(worklist()),
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let preview_payload = structured(&preview);
+        assert_eq!(preview.is_error, Some(false), "{preview_payload}");
+        assert_eq!(preview_payload["would_apply"], 1);
+        assert_eq!(preview_payload["items"][0]["match_count"], 1);
+
+        let applied = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(worklist()),
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let applied_payload = structured(&applied);
+        assert_eq!(applied.is_error, Some(false), "{applied_payload}");
+        assert_eq!(applied_payload["applied"], 1);
+
+        let accepted = structured(
+            &server
+                .read_accepted(Parameters(ReadArgs {
+                    doc_id: doc_id.clone(),
+                }))
+                .await,
+        );
+        assert!(
+            accepted["markdown"]
+                .as_str()
+                .is_some_and(|text| text.contains("rate of 2% above base rate")),
+            "accept-all projection contains the layered replacement: {accepted}"
+        );
+
+        let rejected = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByAuthor {
+                    author: "Reviewing Counsel".to_string(),
+                },
+            }))
+            .await;
+        assert_eq!(rejected.is_error, Some(false), "{}", structured(&rejected));
+        let restored = structured(
+            &server
+                .read_accepted(Parameters(ReadArgs {
+                    doc_id: doc_id.clone(),
+                }))
+                .await,
+        );
+        assert!(
+            restored["markdown"]
+                .as_str()
+                .is_some_and(|text| text.contains("rate of 8% above base rate")),
+            "reject restores prior insertion: {restored}"
+        );
+        let canonical = server
+            .runtime
+            .with(&DocHandle(doc_id), |snapshot| {
+                Arc::clone(&snapshot.canonical)
+            })
+            .unwrap();
+        assert!(
+            revision_rows(&canonical)
+                .iter()
+                .any(|revision| revision.author.as_deref() == Some("Prior Counsel")),
+            "rejecting the layered edit preserves the prior author's insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_inspection_defaults_to_index_and_supports_find_and_window() {
+        let default_args: InspectDocxArgs =
+            serde_json::from_value(json!({"doc_id": "doc_1"})).expect("default inspect args");
+        assert!(matches!(default_args.query, InspectQuery::Index));
+
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(4)).await;
+        let index = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: doc_id.clone(),
+                query: InspectQuery::Index,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&index)["total_blocks"], 4);
+        assert!(structured(&index).get("markdown").is_none());
+
+        let found = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: doc_id.clone(),
+                query: InspectQuery::Find,
+                block_id: None,
+                detail: None,
+                pattern: Some("Paragraph 2".to_string()),
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&found)["count"], 1);
+        assert_eq!(structured(&found)["matches"][0]["id"], "p_3");
+
+        let window = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::Window,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: Some("p_2".to_string()),
+                to_block_id: Some("p_3".to_string()),
+                format: Some("markdown".to_string()),
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let window_payload = structured(&window);
+        let content = window_payload["content"].as_str().expect("window content");
+        assert!(content.contains("Paragraph 1"));
+        assert!(content.contains("Paragraph 2"));
+        assert!(!content.contains("Paragraph 0"));
+        assert!(!content.contains("Paragraph 3"));
+    }
+
+    #[tokio::test]
+    async fn compact_surface_refuses_ambiguous_query_and_verify_modes() {
+        let server = StemmaServer::new();
+        let bad_query = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id: "doc_unused".to_string(),
+                query: InspectQuery::Document,
+                block_id: Some("p_1".to_string()),
+                detail: None,
+                pattern: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&bad_query)["code"], "invalid_argument");
+
+        let bad_verify = server
+            .verify_docx(Parameters(VerifyDocxArgs {
+                doc_id: Some("doc_1".to_string()),
+                before_path: Some("before.docx".to_string()),
+                after_path: Some("after.docx".to_string()),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        assert_eq!(structured(&bad_verify)["code"], "invalid_argument");
     }
 }
 
@@ -6877,6 +13725,9 @@ mod doc_drift {
         "review_session",
         "audit_docx",
         "apply_batch",
+        "inspect_docx",
+        "execute_plan",
+        "verify_docx",
     ];
 
     const MCP_MD: &str = include_str!(concat!(
@@ -6918,6 +13769,9 @@ mod doc_drift {
             "review_session" => d!(ReviewSessionArgs),
             "audit_docx" => d!(AuditDocxArgs),
             "apply_batch" => d!(BatchArgs),
+            "inspect_docx" => d!(InspectDocxArgs),
+            "execute_plan" => d!(ExecutePlanArgs),
+            "verify_docx" => d!(VerifyDocxArgs),
             other => Err(format!("no arg-struct mapping for tool '{other}'")),
         }
     }
@@ -7013,24 +13867,30 @@ mod doc_drift {
         out
     }
 
-    /// Parse the `<N> tools` count the README declares.
-    fn declared_tool_count(readme: &str) -> Option<usize> {
-        let words: Vec<&str> = readme.split_whitespace().collect();
-        // The FIRST "<number> tools" phrase (skip prose like "MCP tools").
-        words.windows(2).find_map(|w| {
-            w[1].starts_with("tools")
-                .then(|| w[0].parse::<usize>().ok())
-                .flatten()
-        })
-    }
-
     /// The registered tool surface is exactly `EXPECTED_TOOLS` — no more, no
     /// fewer. This is what forces the canonical list (and thus the docs checks
     /// below) to track reality when a tool is added or renamed.
     #[test]
     fn registered_tool_set_matches_canonical_list() {
-        let server = StemmaServer::new();
-        let actual: BTreeSet<String> = server
+        let core = StemmaServer::new();
+        let core_actual: BTreeSet<String> = core
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let core_expected: BTreeSet<String> =
+            CORE_TOOLS.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            core_actual, core_expected,
+            "default core profile must stay compact"
+        );
+
+        let advanced = StemmaServer::with_config(Config {
+            profile: ToolProfile::Advanced,
+            ..Config::defaults()
+        });
+        let actual: BTreeSet<String> = advanced
             .tool_router
             .list_all()
             .iter()
@@ -7041,7 +13901,7 @@ mod doc_drift {
             actual, expected,
             "registered MCP tools drifted from EXPECTED_TOOLS; update the canonical list AND the docs"
         );
-        assert_eq!(actual.len(), 28, "expected exactly 28 registered tools");
+        assert_eq!(actual.len(), 31, "expected exactly 31 registered tools");
     }
 
     /// Every registered tool is documented in both surfaces, and the README's
@@ -7059,13 +13919,9 @@ mod doc_drift {
                 "tool `{name}` is registered but absent from stemma-mcp/README.md"
             );
         }
-        let declared = declared_tool_count(MCP_README)
-            .expect("stemma-mcp/README.md must state an '<N> tools' count");
-        assert_eq!(
-            declared,
-            EXPECTED_TOOLS.len(),
-            "stemma-mcp/README.md tool count ({declared}) disagrees with the registered surface ({})",
-            EXPECTED_TOOLS.len()
+        assert!(
+            MCP_README.contains("5 tools") && MCP_README.contains("31 tools"),
+            "stemma-mcp/README.md must state both core and advanced tool counts"
         );
     }
 

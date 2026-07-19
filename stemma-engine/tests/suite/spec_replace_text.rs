@@ -78,6 +78,7 @@ fn apply(doc: &Document, options: &ReplaceTextOptions) -> Result<Document, Strin
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some(options.author.clone()),
             date: None,
             apply_op_id: None,

@@ -1,20 +1,23 @@
 # stemma docs
 
-A typed-IR DOCX compiler with first-class tracked-change semantics — and an
-MCP server that puts it in front of agents.
+Safe tracked changes for Word automation. In v0.2.0, apply an approved
+old-to-new worklist to an existing DOCX and receive a native redline plus
+explicit item outcomes. The typed engine is the correctness kernel; CLI and MCP
+are adapters.
 
 **Pick your surface first:**
 
 | You are… | Use | Start here |
 |---|---|---|
-| building an agent | the MCP server | [MCP reference](reference/mcp.md) — verbs, refusals, recipes |
-| building an app/service | the HTTP API | [HTTP API](reference/http.md) — one command also serves a browser Word-style review editor |
+| applying an approved worklist | the `stemma` CLI | [CLI reference](reference/cli.md) — apply contract, receipt, and refusal semantics |
+| building an agent | the MCP server | [MCP reference](reference/mcp.md) — focused worklist path and advanced verbs |
 | embedding in Rust | `stemma-engine` | the crate docs + [architecture](internals/architecture.md); runnable examples: `cargo run -p stemma --example my_first_edit` |
-| scripting from a shell or CI | the `stemma` CLI | [CLI reference](reference/cli.md) — compare, extract, resolve, validate |
+| maintaining the local HTTP/editor demo | the HTTP API | [HTTP API](reference/http.md) — non-production demonstration surface |
 
-The same engine and the same semantics behind every surface — a tracked change
-made over MCP is the tracked change the editor renders and the Rust API
-resolves. Each section below answers one question:
+The same engine owns tracked-change semantics behind every surface. The
+experimental aggregate worklist and receipt contract currently belongs to the
+CLI; MCP exposes the same kernel through a narrower recommended tool sequence,
+not a second receipt standard. Each section below answers one question:
 
 - **[Guide](guide/concepts.md)** — *how do I think about this?* Four short
   chapters for humans: [concepts](guide/concepts.md) →

@@ -9,21 +9,33 @@ is still a valid DOCX the engine can parse.
 Usage: python3 smoke_test.py /path/to/stemma-mcp /path/to/input.docx
 """
 
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+# The MCP wire and the fixture text are UTF-8; without pinning, Python uses
+# the locale codec for pipes (cp1252 on Windows CI), which corrupts both the
+# server's receipts and this script's own progress output.
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 
 class McpClient:
-    def __init__(self, binary):
+    def __init__(self, binary, env=None):
         self.proc = subprocess.Popen(
             [binary],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
             bufsize=1,
+            env=env,
         )
         self._id = 0
 
@@ -104,10 +116,24 @@ def status_name(block_status):
 
 
 def main():
-    binary, docx = sys.argv[1], sys.argv[2]
-    client = McpClient(binary)
+    binary, source_docx = sys.argv[1], sys.argv[2]
+    workspace = tempfile.TemporaryDirectory(prefix="stemma-mcp-smoke-")
+    docx = str(Path(workspace.name) / "input.docx")
+    shutil.copy2(source_docx, docx)
+    env = os.environ.copy()
+    env["STEMMA_MCP_WORKSPACE_ROOT"] = workspace.name
+    profile = env.get("STEMMA_MCP_PROFILE", "core")
+    expected_version = subprocess.check_output(
+        [binary, "--version"], env=env, text=True, encoding="utf-8"
+    ).strip()
+    client = McpClient(binary, env=env)
     try:
         info = client.initialize()
+        if info["serverInfo"]["version"] != expected_version:
+            fail(
+                "initialize build identity disagrees with --version: "
+                f"{info['serverInfo']['version']} != {expected_version}"
+            )
         print(f"initialized: server={info['serverInfo']['name']} "
               f"protocol={info['protocolVersion']}")
 
@@ -120,7 +146,7 @@ def main():
         # `#[tool_handler]` is left pointing at the default `Self::tool_router()`
         # they compile but never register, so list_tools/call_tool only ever see
         # the base tools. This set is the wire-level guard for that regression.
-        expected = {
+        advanced_expected = {
             # base
             "open_docx", "read_outline", "read_markdown", "read_block", "find",
             "get_section", "apply_edit", "save_docx", "compare_docx", "replace_all",
@@ -135,18 +161,56 @@ def main():
             "apply_batch",
             # session review + stateless audit
             "review_session", "audit_docx",
+            # compact semantic front end
+            "inspect_docx", "execute_plan", "verify_docx",
         }
-        missing = expected - set(names)
-        if missing:
-            fail(f"tool surface not fully registered over the wire; missing "
-                 f"{sorted(missing)}; got {names}")
+        core_expected = {
+            "open_docx", "inspect_docx", "execute_plan", "verify_docx", "save_docx",
+        }
+        expected = core_expected if profile == "core" else advanced_expected
+        if set(names) != expected:
+            fail(f"{profile} tool surface drifted; expected {sorted(expected)}; got {names}")
 
         # 1. open
         is_err, opened = client.call("open_docx", {"path": docx})
         if is_err:
             fail(f"open_docx error: {opened}")
+        if opened["input_artifact"]["digest"]["algorithm"] != "sha256":
+            fail(f"open receipt did not report SHA-256 identity: {opened}")
+        if opened["server_version"] != expected_version:
+            fail(f"open receipt build identity mismatch: {opened}")
         index = opened["index"]
         print(f"opened doc_id={opened['doc_id']} block_count={opened['block_count']}")
+
+        # The compact profile must expose the complete typed transaction
+        # vocabulary over the real wire. Exercise both parser-derived fields
+        # and the MCP-only image-path alternative (resolved before parsing).
+        if profile == "core":
+            is_err, catalog = client.call(
+                "inspect_docx",
+                {"doc_id": opened["doc_id"], "query": "operations"},
+            )
+            if is_err:
+                fail(f"operation catalog error: {catalog}")
+            operations = {row["name"]: row for row in catalog["operations"]}
+            if catalog["operation_count"] != len(operations):
+                fail(f"operation catalog count disagrees with rows: {catalog}")
+            required_ops = {
+                "replace", "move", "table_op", "edit_note", "comment_create",
+                "set_image_attrs", "insert_image", "create_style",
+                "set_page_setup", "set_numbering",
+            }
+            missing = required_ops - operations.keys()
+            if missing:
+                fail(f"operation catalog omitted required vocabulary: {sorted(missing)}")
+            image = operations["insert_image"]
+            if "bytes_base64" not in image["parser_fields"]:
+                fail(f"image parser vocabulary is incomplete: {image}")
+            if image["mcp_edge_fields"] != ["path"] or "path" not in image["accepted_fields"]:
+                fail(f"image MCP-edge vocabulary is incomplete: {image}")
+            if len(catalog["legacy_surface_routes"]) != 26:
+                fail(f"historical surface route map is incomplete: {catalog}")
+            print(f"catalogued {len(operations)} transaction operations")
 
         # pick the first normal paragraph with a usable run of text
         target = next(
@@ -177,27 +241,58 @@ def main():
             "revision": {"author": "smoke-test"},
             "summary": "smoke test replace",
         }
-        is_err, applied = client.call("apply_edit", {"doc_id": opened["doc_id"], "transaction": txn})
+        edit_tool = "execute_plan" if profile == "core" else "apply_edit"
+        edit_args = {"doc_id": opened["doc_id"], "transaction": txn}
+        if profile == "core":
+            edit_args["preview"] = False
+        is_err, applied = client.call(edit_tool, edit_args)
         if is_err:
-            fail(f"apply_edit error: {applied}")
+            fail(f"{edit_tool} error: {applied}")
         if not applied.get("applied"):
-            fail(f"apply_edit did not apply: {applied}")
+            fail(f"{edit_tool} did not apply: {applied}")
         print(f"applied edit; doc now has {applied['block_count']} blocks")
 
         # 3. test fail-loud: a stale expect must be rejected
         stale_txn = dict(txn)
         stale_txn["ops"] = [dict(txn["ops"][0], expect="this string is definitely not present zzz")]
-        is_err, stale = client.call("apply_edit", {"doc_id": opened["doc_id"], "transaction": stale_txn})
+        stale_args = {"doc_id": opened["doc_id"], "transaction": stale_txn}
+        if profile == "core":
+            stale_args["preview"] = False
+        is_err, stale = client.call(edit_tool, stale_args)
         if not is_err:
             fail(f"stale edit should have failed but succeeded: {stale}")
         print(f"stale edit correctly rejected: code={stale.get('code')}")
 
+        if profile == "core":
+            is_err, verified = client.call("verify_docx", {"doc_id": opened["doc_id"]})
+            if is_err or not verified.get("validator", {}).get("ok"):
+                fail(f"verify_docx did not certify the open session: {verified}")
+
         # 4. save
-        out = tempfile.mktemp(suffix=".docx")
+        out = str(Path(workspace.name) / "output.docx")
         is_err, saved = client.call("save_docx", {"doc_id": opened["doc_id"], "path": out})
         if is_err:
             fail(f"save_docx error: {saved}")
+        committed = Path(out).read_bytes()
+        actual_hash = hashlib.sha256(committed).hexdigest()
+        artifact = saved["output_artifact"]
+        if artifact["identity"]["digest"]["hex"] != actual_hash:
+            fail(f"save receipt hash does not match committed bytes: {saved}")
+        if artifact["collision_policy"] != "create_new" or artifact["disposition"] != "created":
+            fail(f"save receipt did not report create-new policy: {saved}")
+        if saved["server_version"] != expected_version:
+            fail(f"save receipt build identity mismatch: {saved}")
         print(f"saved {saved['bytes_written']} bytes to {out}")
+
+        # The same destination must refuse, and the first committed artifact
+        # must remain byte-identical after that refusal.
+        is_err, collision = client.call(
+            "save_docx", {"doc_id": opened["doc_id"], "path": out}
+        )
+        if not is_err or collision.get("code") != "artifact_output_exists":
+            fail(f"second save should refuse an existing destination: {collision}")
+        if Path(out).read_bytes() != committed:
+            fail("existing destination changed after a refused second save")
 
         # 5. reopen the saved file -> proves it's a valid DOCX the engine parses,
         #    and that the inserted text is present.
@@ -217,6 +312,7 @@ def main():
         print("\nPASS: full open -> edit -> fail-loud -> save -> reopen round-trip works")
     finally:
         client.close()
+        workspace.cleanup()
 
 
 if __name__ == "__main__":

@@ -81,6 +81,7 @@ fn formatting_txn(block_id: NodeId) -> EditTransaction {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 7,
+            identity: 0,
             author: Some("fid".into()),
             date: Some("2026-07-02T00:00:00Z".into()),
             apply_op_id: None,

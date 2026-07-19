@@ -479,3 +479,78 @@ fn custom_xml_pr_precedes_block_content() {
         );
     }
 }
+
+/// ECMA §17.5.1.9 — smart tags NEST: EG_PContent admits smartTag inside
+/// smartTag, and Word's own emission wraps a whole place name in
+/// `element="place"` with `element="PlaceName"`/`element="PlaceType"`
+/// children spanning several runs. The transparent-wrapper decomposition
+/// must reconstruct the SAME nesting on round-trip. Pairing open/close
+/// markers by element name alone folds open-with-open for nested
+/// same-name wrappers and flattens the structure (wild witness: a school
+/// letterhead paragraph whose place>PlaceName nesting was rebuilt as flat
+/// siblings with the wrong spans).
+#[test]
+fn nested_same_name_smarttags_roundtrip_with_nesting_intact() {
+    let body = concat!(
+        r#"<w:p>"#,
+        r#"<w:smartTag w:uri="urn:schemas-microsoft-com:office:smarttags" w:element="place">"#,
+        r#"<w:smartTag w:uri="urn:schemas-microsoft-com:office:smarttags" w:element="PlaceName">"#,
+        r#"<w:r><w:t>Bolivar-Richburg</w:t></w:r></w:smartTag>"#,
+        r#"<w:r><w:t xml:space="preserve"> </w:t></w:r>"#,
+        r#"<w:smartTag w:uri="urn:schemas-microsoft-com:office:smarttags" w:element="PlaceType">"#,
+        r#"<w:r><w:t>School</w:t></w:r></w:smartTag>"#,
+        r#"</w:smartTag>"#,
+        r#"</w:p><w:sectPr/>"#,
+    );
+    let b = make_docx(body, &[]);
+    let xml = reserialize(&b);
+
+    let root = xmltree::Element::parse(std::io::Cursor::new(xml.as_bytes())).expect("parse xml");
+    let body_el = root.get_child("body").expect("body");
+    let para = body_el.get_child("p").expect("paragraph");
+    let top_tags: Vec<&xmltree::Element> = para
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            xmltree::XMLNode::Element(e) if e.name == "smartTag" => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        top_tags.len(),
+        1,
+        "one OUTER place smartTag, not flattened siblings: {xml}"
+    );
+    let outer = top_tags[0];
+    let attr = |e: &xmltree::Element, name: &str| -> Option<String> {
+        e.attributes
+            .iter()
+            .find(|(k, _)| k.local_name == name)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(attr(outer, "element").as_deref(), Some("place"), "{xml}");
+    let inner: Vec<String> = outer
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            xmltree::XMLNode::Element(e) if e.name == "smartTag" => attr(e, "element"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        inner,
+        vec!["PlaceName".to_string(), "PlaceType".to_string()],
+        "both inner wrappers stay nested inside place, in order: {xml}"
+    );
+
+    // Fixpoint: a second round-trip must not restructure further.
+    let again = reserialize(&{
+        let doc = Document::parse(&b).expect("parse");
+        doc.serialize(&stemma::ExportOptions::default())
+            .expect("serialize")
+    });
+    assert_eq!(xml, again, "wrapper reconstruction must be a fixpoint");
+
+    let (ok, detail) = opens_clean(&b);
+    assert!(ok, "nested smart tags are valid WML: {detail}");
+}

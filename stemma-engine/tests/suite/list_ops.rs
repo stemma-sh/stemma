@@ -84,6 +84,7 @@ fn step(block_id: &str, change: NumberingChange) -> EditTransaction {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Counsel".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,

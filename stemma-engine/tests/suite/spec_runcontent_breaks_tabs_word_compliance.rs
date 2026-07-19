@@ -417,6 +417,7 @@ fn nobreakhyphen_inside_hyperlink_survives_reserialize_as_u2011() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("spec".to_string()),
             date: Some("2026-06-29T00:00:00Z".to_string()),
             apply_op_id: None,

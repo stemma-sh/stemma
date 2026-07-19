@@ -57,6 +57,7 @@ fn merge_redline_canonical(fixture: &str) -> CanonDoc {
         &diff,
         &RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Stemma".to_string()),
             date: Some("2026-03-26T00:00:00Z".to_string()),
             apply_op_id: None,

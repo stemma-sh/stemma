@@ -167,6 +167,7 @@ fn all_text(doc: &CanonDoc) -> String {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 1,
+        identity: 0,
         author: Some("sentinel".to_string()),
         date: Some("2026-06-01T00:00:00Z".to_string()),
         apply_op_id: None,

@@ -90,6 +90,7 @@ fn txn_by(steps: Vec<EditStep>, mode: MaterializationMode, author: &str) -> Edit
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some(author.to_string()),
             date: Some("2026-06-29T00:00:00Z".to_string()),
             apply_op_id: None,

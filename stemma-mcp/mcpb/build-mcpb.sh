@@ -19,6 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # stemma-mcp/mcpb
 ROOT="$(cd "$HERE/../.." && pwd)"                       # workspace root
 BIN="stemma-mcp"
 DIST="$HERE/dist"
+MCPB_CLI="@anthropic-ai/mcpb@2.1.2"
 
 TARGET_INPUT="${1:-}"
 
@@ -83,7 +84,7 @@ PY
 mkdir -p "$DIST"
 OUT="$DIST/stemma-${TRIPLE}.mcpb"
 echo "▸ Packing $OUT"
-npx --yes @anthropic-ai/mcpb pack "$STAGE" "$OUT"
+npx --yes "$MCPB_CLI" pack "$STAGE" "$OUT"
 
 echo
 echo "✅  Built: $OUT  (version $STAMPED)"

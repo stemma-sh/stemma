@@ -1,8 +1,9 @@
 {
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.3.schema.json",
   "manifest_version": "0.3",
   "name": "stemma",
   "display_name": "Stemma — DOCX tracked changes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Structure-aware Microsoft Word (.docx) editing with tracked changes, for agents.",
   "long_description": "Stemma opens a .docx into a typed intermediate representation, lets an agent read its outline/text/markdown, apply tracked-change edits (insert, delete, replace, formatting, comments, images, table ops), validate the result against OOXML, and save — all as real Word tracked changes that open clean and accept/reject correctly. Malformed input or unsupported edits fail loudly rather than silently corrupting the document.",
   "author": {
@@ -19,15 +20,26 @@
     "mcp_config": {
       "command": "${__dirname}/server/stemma-mcp",
       "args": [],
+      "env": {
+        "STEMMA_MCP_WORKSPACE_ROOT": "${user_config.workspace_root}"
+      },
       "platform_overrides": {
         "win32": { "command": "${__dirname}/server/stemma-mcp.exe" }
       }
     }
   },
+  "user_config": {
+    "workspace_root": {
+      "type": "directory",
+      "title": "Document workspace",
+      "description": "Choose the only directory tree Stemma may read from or write to. Output paths must be new; Stemma never replaces an existing file.",
+      "required": true
+    }
+  },
   "tools": [
-    { "name": "open_docx", "description": "Open a .docx from a path into an in-memory document handle." },
-    { "name": "save_docx", "description": "Save the document (with tracked changes) to a .docx path." },
-    { "name": "compare_docx", "description": "Produce a tracked-change redline between two documents." },
+    { "name": "open_docx", "description": "Open a .docx inside the configured document workspace into an in-memory handle." },
+    { "name": "save_docx", "description": "Commit the document with tracked changes to a new path inside the workspace; never replace an existing file." },
+    { "name": "compare_docx", "description": "Commit a tracked-change redline between two workspace documents to a new path." },
     { "name": "read_outline", "description": "Block-level outline with per-block tracked-change status." },
     { "name": "read_index", "description": "Stable block index for addressing edits." },
     { "name": "read_text", "description": "Plain text of the document or a block." },
@@ -52,7 +64,10 @@
     { "name": "reject_changes", "description": "Reject tracked changes (all or selected)." },
     { "name": "validate_docx", "description": "Validate the serialized document against OOXML, reporting issues." },
     { "name": "review_session", "description": "Everything this session changed since open_docx: change census, any untracked delta, an untouched-blocks proof, and the validator verdict." },
-    { "name": "audit_docx", "description": "The same change census, untouched-blocks proof, and validator verdict for any two .docx files, computed statelessly." }
+    { "name": "audit_docx", "description": "The same change census, untouched-blocks proof, and validator verdict for any two workspace .docx files, computed statelessly." },
+    { "name": "inspect_docx", "description": "Query a compact index, bounded find/window reads, explicit document Markdown, exact block details, revisions, or styles." },
+    { "name": "execute_plan", "description": "Run an atomic v4 transaction, server-side literal-replacement worklist, or explicit revision-resolution selection through the typed engine." },
+    { "name": "verify_docx", "description": "Verify an open session or any before/after DOCX pair through the audit kernel." }
   ],
   "compatibility": {
     "platforms": ["darwin", "linux", "win32"]

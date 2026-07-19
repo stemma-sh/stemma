@@ -135,6 +135,7 @@ fn extract_hyperlink_targets_from_rels(docx_bytes: &[u8]) -> Vec<String> {
 fn revision_info() -> RevisionInfo {
     RevisionInfo {
         revision_id: 0,
+        identity: 0,
         author: Some("set_attr_spec".to_string()),
         date: Some("2026-05-21T00:00:00Z".to_string()),
         apply_op_id: None,

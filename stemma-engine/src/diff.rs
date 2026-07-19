@@ -3462,6 +3462,7 @@ fn detect_formatting_change(
                 previous_rpr_authored: RunRprAuthored::default(),
                 // Placeholder: merge_diff fills from RevisionInfo.
                 revision_id: 0,
+                identity: 0,
                 author: String::new(),
                 date: None,
             }),

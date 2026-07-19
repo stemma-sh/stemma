@@ -85,6 +85,7 @@ const TWO_PARAS: &str = r#"<w:p><w:r><w:t>Service levels apply.</w:t></w:r></w:p
 fn revision(id: u32) -> RevisionInfo {
     RevisionInfo {
         revision_id: id,
+        identity: 0,
         author: Some("enum-test".to_string()),
         date: Some("2026-06-12T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -239,16 +240,23 @@ fn every_serialized_revision_is_enumerable_from_the_read_view() {
     let enumerable = view_enumerable_ids(&reparsed);
     let serialized = serialized_revision_ids(&bytes);
 
-    let invisible: Vec<u32> = serialized
-        .iter()
-        .copied()
-        .filter(|id| !enumerable.contains(id))
-        .collect();
+    // RFC-0004 §H7: the enumerate/read surface now reports engine-minted
+    // IDENTITIES, a space DISJOINT from the wire `w:id`s serialized into the
+    // bytes (wire ids are never used as addresses). So "no invisible ink" can no
+    // longer be checked by id-value membership; it is checked by COUNT — every
+    // distinct serialized revision must correspond to exactly one enumerable
+    // resolvable revision, and none may be census-only (identity 0). A dropped
+    // revision would shrink `enumerable`; a phantom would grow it.
     assert!(
-        invisible.is_empty(),
-        "every serialized revision must be enumerable from the read view \
-         (else no selector can resolve it); invisible ids: {invisible:?} \
-         (serialized {serialized:?}, enumerable {enumerable:?})"
+        !enumerable.contains(&0),
+        "no enumerable revision may be census-only (identity 0): {enumerable:?}"
+    );
+    assert_eq!(
+        serialized.len(),
+        enumerable.len(),
+        "every serialized revision must be enumerable from the read view (else no \
+         selector can resolve it); serialized {serialized:?} (wire ids), \
+         enumerable {enumerable:?} (minted identities)"
     );
 }
 
@@ -382,17 +390,19 @@ fn footnote_story_revisions_are_enumerable_with_footnote_location() {
         2,
         "the del+ins pair inside footnote 1 must both be enumerated: {records:?}"
     );
+    // H7: the record carries the engine-minted identity (non-zero, resolvable),
+    // NOT the raw wire `w:id`; identify the carrier by kind/author instead.
     assert!(
         footnote_records
             .iter()
-            .any(|r| r.kind == RevisionKind::Delete && r.revision_id == 101),
-        "the footnote's w:del (id 101) must be enumerated: {footnote_records:?}"
+            .any(|r| r.kind == RevisionKind::Delete && r.revision_id != 0),
+        "the footnote's w:del must be enumerated with a resolvable identity: {footnote_records:?}"
     );
     assert!(
         footnote_records
             .iter()
-            .any(|r| r.kind == RevisionKind::Insert && r.revision_id == 102),
-        "the footnote's w:ins (id 102) must be enumerated: {footnote_records:?}"
+            .any(|r| r.kind == RevisionKind::Insert && r.revision_id != 0),
+        "the footnote's w:ins must be enumerated with a resolvable identity: {footnote_records:?}"
     );
     assert!(
         footnote_records
@@ -568,16 +578,19 @@ fn every_serialized_footnote_and_section_revision_is_enumerable() {
     serialized.sort_unstable();
     serialized.dedup();
 
-    let invisible: Vec<u32> = serialized
-        .iter()
-        .copied()
-        .filter(|id| !enumerable.contains(id))
-        .collect();
+    // RFC-0004 §H7: enumerate reports minted IDENTITIES, disjoint from the wire
+    // `w:id`s in the bytes — so "no invisible ink" is checked by COUNT (see the
+    // read-view test for the rationale), not id-value membership.
     assert!(
-        invisible.is_empty(),
+        !enumerable.contains(&0),
+        "no enumerable revision may be census-only (identity 0): {enumerable:?}"
+    );
+    assert_eq!(
+        serialized.len(),
+        enumerable.len(),
         "every serialized revision (body, footnote, AND sectPrChange) must be \
-         enumerable; invisible ids: {invisible:?} (serialized {serialized:?}, \
-         enumerable {enumerable:?})"
+         enumerable; serialized {serialized:?} (wire ids), enumerable \
+         {enumerable:?} (minted identities)"
     );
 }
 
@@ -651,7 +664,8 @@ fn header_story_revisions_are_enumerable_with_header_location() {
         "the header's w:ins must be enumerated: {records:?}"
     );
     let r = header_records[0];
-    assert_eq!(r.revision_id, 201);
+    // H7: record carries the minted identity (resolvable), not the wire w:id.
+    assert_ne!(r.revision_id, 0);
     assert_eq!(r.kind, RevisionKind::Insert);
     assert_eq!(r.author.as_deref(), Some("H. Reviewer"));
     assert!(
@@ -676,7 +690,8 @@ fn footer_story_revisions_are_enumerable_with_footer_location() {
         "the footer's w:del must be enumerated: {records:?}"
     );
     let r = footer_records[0];
-    assert_eq!(r.revision_id, 211);
+    // H7: record carries the minted identity (resolvable), not the wire w:id.
+    assert_ne!(r.revision_id, 0);
     assert_eq!(r.kind, RevisionKind::Delete);
     assert_eq!(r.author.as_deref(), Some("F. Reviewer"));
 }
@@ -696,7 +711,8 @@ fn comment_interior_revisions_are_enumerable_with_comment_location() {
         "the w:ins inside comment 1's text must be enumerated: {records:?}"
     );
     let r = comment_records[0];
-    assert_eq!(r.revision_id, 221);
+    // H7: record carries the minted identity (resolvable), not the wire w:id.
+    assert_ne!(r.revision_id, 0);
     assert_eq!(r.kind, RevisionKind::Insert);
     assert_eq!(r.author.as_deref(), Some("C. Reviewer"));
 }

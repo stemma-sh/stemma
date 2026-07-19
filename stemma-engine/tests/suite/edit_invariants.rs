@@ -47,6 +47,7 @@ use stemma::{
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 42,
+        identity: 0,
         author: Some("edit-invariants".to_string()),
         date: Some("2026-04-11T00:00:00Z".to_string()),
         apply_op_id: None,

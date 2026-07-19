@@ -74,6 +74,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Gate".to_string()),
             date: Some("2026-06-06T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -298,6 +299,7 @@ fn reject_all_persists_the_reverted_mark_after_a_save() {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Gate".to_string()),
                 date: Some("2026-06-06T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -367,6 +369,7 @@ fn read_rejected_markdown_and_a_persisted_save_agree_on_the_reverted_mark() {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Gate".to_string()),
                 date: Some("2026-06-06T00:00:00Z".to_string()),
                 apply_op_id: None,

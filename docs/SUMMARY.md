@@ -1,6 +1,8 @@
 # Summary
 
 - [Overview](README.md)
+- [Evaluate the approved-worklist workflow](evaluation.md)
+- [60-second approved-worklist demo](demo-approved-worklist.md)
 
 ## Guide
 

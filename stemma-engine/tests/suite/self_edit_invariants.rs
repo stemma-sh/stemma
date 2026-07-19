@@ -25,6 +25,7 @@ use crate::common;
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 1,
+        identity: 0,
         author: Some("self-edit-test".to_string()),
         date: Some("2025-06-01T00:00:00Z".to_string()),
         apply_op_id: None,

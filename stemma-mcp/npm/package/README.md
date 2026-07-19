@@ -24,7 +24,10 @@ Or wire it into an MCP client (stdio transport):
   "mcpServers": {
     "stemma": {
       "command": "npx",
-      "args": ["-y", "@stemma-sh/mcp"]
+      "args": ["-y", "@stemma-sh/mcp"],
+      "env": {
+        "STEMMA_MCP_WORKSPACE_ROOT": "/absolute/path/to/documents"
+      }
     }
   }
 }
@@ -32,8 +35,21 @@ Or wire it into an MCP client (stdio transport):
 
 The server speaks JSON-RPC over stdio and takes no arguments (`--help` /
 `--version` aside). Documents are passed as tool arguments
-(`open_docx { "path": ... }`); every edit is applied as a proper tracked
-change and gated through an OOXML validator before bytes are written.
+(`open_docx { "path": ... }`). `STEMMA_MCP_WORKSPACE_ROOT` confines every
+read and output path; when unset it is the canonical startup current directory.
+Relative paths resolve under it and read symlinks may not escape it.
+
+Image files supplied by `path` default to a 20 MiB per-image cap
+(`STEMMA_MCP_MAX_IMAGE_BYTES`) and a 50 MiB aggregate cap per transaction
+(`STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES`). Both measure bytes before base64 expansion,
+return `artifact_source_too_large` when exceeded, and accept `0` to disable the
+corresponding limit.
+
+Every output is create-new: an existing destination or input alias is refused,
+with no overwrite option. Output is validated, staged in the destination
+directory, committed without clobbering, and verified by byte length and SHA-256
+before success. This protects ordinary mistakes and failed writes; it is not a
+sandbox against a hostile same-user process or a power-loss durability promise.
 
 Full tool reference, recipes, and refusal vocabulary:
 [the stemma MCP reference](https://github.com/stemma-sh/stemma/blob/main/docs/reference/mcp.md).

@@ -73,6 +73,7 @@ fn tracked_ins_body() -> &'static str {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 9,
+        identity: 0,
         author: Some("span-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,

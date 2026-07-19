@@ -1,23 +1,146 @@
----
-name: stemma
-description: Edit Microsoft Word (.docx) documents that carry tracked changes (redlines), as tracked changes, via the stemma MCP tools. Use when the user asks to tighten/revise/redline a .docx, make tracked edits, find-and-replace text, accept or reject changes, read a document's revisions, or conform a document to a house style (named heading/body styles, fonts, margins). Encodes the golden path (lead with replace_text for find/replace) and the sharp edges (marks wire format, span semantics, whitespace exactness, style-op field names, layer-vs-resolve policy) so you do not discover them through errors.
-version: 1.5.0
----
 
 # Editing a tracked-changes .docx with stemma
 
-The dominant task: **edit a document that already carries a redline, adding your edits as tracked changes layered beside the existing ones.** stemma's engine work is milliseconds. Follow the golden path and the sharp edges below.
+The default task path is a compact compiler front end over the complete typed
+engine. Follow it first; the individual advanced tools below are expert escape
+hatches over the same kernels.
 
 ## Golden path
 
-1. **`open_docx(path)`** → `doc_id` + the block outline. Every block has a stable `id` (`p_7`), a `role_token`, and visible `text`. Address all later edits by these ids.
-2. **See what the redline contains.** `list_revisions(doc_id)` returns one row per tracked change `{revision_id, author, kind, block_id, excerpt}` — the structured index for building accept/reject id lists. `read_redline(doc_id)` returns the full prose with `<ins>`/`<del>` inline, and `read_markdown(doc_id)` the whole document as id-bearing tagged prose — the comprehension surfaces for reading what the redline actually says.
-3. **Resolve existing changes only if the task calls for it** (see Policy below). Use `reject_changes` / `accept_changes` with a selector: `{"by":"by_ids","revision_ids":[...]}`, `{"by":"by_author","author":"Opposing Counsel"}`, `{"by":"by_range","from_block_id":"p_4","to_block_id":"p_6"}`, or `{"by":"all"}`. Batch ids in one call. An empty/unmatched selection fails loudly — it never silently no-ops.
-4. **Make your own edits as tracked changes.** For the dominant case — find a phrase and replace it, even inside paragraphs that already carry tracked changes — reach for **`replace_text(doc_id, old, new, author, scope?, expected_matches?, match_mode?)`** FIRST: it matches server-side and splices a tracked change through tracked paragraphs in ONE call, with no `read_block`, span handles, or guards. `expected_matches` defaults to 1 and the call fails (`MatchCountMismatch`) listing each match's `{block_id, excerpt}` if the count differs, so you disambiguate in one follow-up; pass `"all"` to replace everywhere. Use `apply_edit` only for the genuinely surgical or structural cases: a **span replace** to target one specific occurrence among several (see below), or a **whole-paragraph replace** for a formatting/mark change. `apply_edit` defaults to tracked (`w:ins`/`w:del`); pass `mode:"direct"` only to bake a change in untracked.
-5. **`validate_docx(doc_id)`** → `{ok, issues}`. Run it after your edits; expect `ok:true`, zero issues.
-6. **`save_docx(doc_id, path)`** → writes the .docx. Save to a NEW path to leave the original untouched.
+1. **`open_docx(path)`** returns `doc_id`, exact input identity, and the first 16
+   rows of a paged compact block index. Prefer find over walking every page.
+   Paths stay under `STEMMA_MCP_WORKSPACE_ROOT`.
+2. **`inspect_docx(doc_id, ...)`** returns the first compact index page by default.
+   Prefer `query:"find"` plus `pattern`, then inspect one exact block. Block
+   inspection is compact by default: paragraphs keep exact text, guards,
+   list/role identity, and durable opaque anchors. A table block returns eight
+   bounded cell locators by default and omits its aggregate body; page with
+   `cell_offset`/`cell_limit`, then inspect a locator's `block_ids` for exact
+   cell paragraphs. Pass `detail:"formatting"` only when
+   complete run marks and style properties are needed. Use a
+   returned `next_offset` to page beyond the default 16 find matches. Use a
+   returned table's `matching_cells_next_offset` as `cell_offset` when more than
+   the default four matching cells exist; this nested page is separate from
+   the top-level find page. Non-table find results use a match-centered excerpt
+   of at most 240 characters; inspect the returned block id for exact text. Use a
+   bounded `query:"window"` when nearby context is needed. The
+   `query:"document"` projection returns 16 top-level blocks by default and
+   exposes `has_more`/`next_offset` for deliberate paging. Prose is exact;
+   tables are explicit summaries with four cell previews and route back to
+   paged block inspection, so a large table cannot silently defeat the bound. Query
+   revisions or styles when the plan needs them; for review rounds start with
+   `query:"revisions_summary"` (exact counts by author × kind, no rows).
+3. **`execute_plan(..., preview:true)`** validates one explicit atomic v4
+   transaction or accept/reject selection without mutation. Fix every refusal,
+   then execute the same plan with `preview:false`. A complete successful
+   preview reports `apply_ready:true`; apply that identical plan once it covers
+   all intended changes rather than re-reading or reformulating it. Both paths return only the
+   touched blocks, not the full document. For several literal substitutions,
+   preview `replacement_worklist` with `preview:true`, then apply it with
+   `preview:false`; it runs the ordered tracked worklist on a throwaway snapshot
+   or live state and reports each item independently. Give each item an integer
+   `expected_matches`, or `replace_all:true` when every occurrence is intended;
+   do not stringify the count. On a `MatchCountMismatch` refusal, the listed
+   matches are disambiguation data: when one site is intended, narrow the
+   target (longer old text, or the listed match's cell `scope`) — never raise
+   `expected_matches` to absorb ambiguity you have not verified occurrence by
+   occurrence. `match_mode` is exactly `exact` or
+   `normalize_ws`. Omitted scope includes top-level and table-cell paragraphs;
+   pass a matching cell paragraph `block_id` as `scope:{block_id}` only when
+   disambiguation is needed. Do not flatten the cell.
 
-`check_edit(doc_id, transaction)` dry-runs a transaction (`{would_apply:true}` or the actionable error apply_edit would give) without mutating — use it before a risky multi-op edit, not before every edit.
+When replacing a paragraph that contains an opaque span, preserve that anchor
+inside `content.content` as
+`{"type":"opaque_ref","attrs":{"id":"<opaque id from block segments>"}}`.
+Do not flatten, omit, or invent the anchor.
+4. **`verify_docx({doc_id})`** must report zero unexpected direct changes, zero
+   untouched-scope violations, intended pre-existing-revision dispositions, and
+   `validator.ok:true`. It also accepts a producer-neutral before/after path pair.
+   Audit lists return 16 rows by default with totals and continuation metadata;
+   retrieve remaining rows with `detail`, `offset`, and `limit` (maximum 64).
+5. **`save_docx(doc_id, path)`** commits only a complete, verified result to a
+   NEW unused path. Existing destinations and input aliases are refused.
+
+Use the individual read, edit, resolution, and audit tools only when an expert
+workflow needs separate steps or narrower receipts. Never silently broaden an
+approved plan.
+
+`check_edit(doc_id, transaction)` dry-runs the same package-aware,
+author-protected path as `apply_edit` and discards the result. Use it before a
+risky advanced transaction, not before the focused batch.
+
+## Review rounds and dense documents (triage → bulk resolve → save early)
+
+For "accept/reject <author>'s changes" tasks, especially on long documents:
+
+1. **Triage with counts, not rows.** `inspect_docx(query:"revisions_summary")`
+   returns exact pending counts by author × kind and composes with `filter`.
+   Do not page the full inventory just to learn who changed what and how much.
+2. **Resolve with a bulk selector, never a hand-built id list.** The
+   resolution selector takes `{"by":"by_author",...}`, `{"by":"by_range",...}`,
+   `{"by":"by_filter", by_author?, by_kind?, by_block_range?}` (AND-combined —
+   "author X's changes in Section Y" is ONE call), or `{"by":"all"}`.
+   Enumerating the inventory to assemble `{"by":"by_ids"}` wastes turns and
+   context; reserve explicit ids for cherry-picks the axes cannot express.
+   For a section named in the instruction: `query:"find"` the heading, take
+   the section's block range via `query:"section"` on the heading id, and
+   pass those endpoints as `by_block_range`.
+3. **Trust bounded receipts.** Bulk writes and resolutions return exact counts
+   beside capped evidence lists carrying `omitted` and `set_sha256` commitments
+   to the complete set. Submitted worklist items and transaction operations are
+   never capped: each has an inline outcome. Verify with `verify_docx`;
+   do not re-derive counts by re-reading the inventory.
+4. **Persist before polishing.** Once the requested changes are complete and
+   `verify_docx` is clean, `save_docx` IMMEDIATELY — completed-but-unsaved
+   work is worthless if the session ends. Extra spot-checks and summary
+   material come after the artifact exists, never before.
+
+## Filesystem boundary
+
+- Every server-side read and output path stays inside
+  `STEMMA_MCP_WORKSPACE_ROOT`, which defaults to the canonical directory where
+  the server started. Relative tool paths resolve under that root. Do not retry
+  a path that returns `artifact_outside_workspace`; choose a path inside the
+  configured root.
+- A read symlink that resolves outside the root is refused. Image `path` inputs
+  follow the same rule as DOCX inputs.
+- Image `path` inputs default to 20 MiB each
+  (`STEMMA_MCP_MAX_IMAGE_BYTES`) and 50 MiB aggregate per transaction
+  (`STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES`), measured before base64 expansion; `0`
+  disables the corresponding host limit. `artifact_source_too_large` means use
+  a smaller image, split the transaction, or ask the host operator to raise the
+  relevant limit.
+- Outputs are create-new only. Always choose a path that does not exist; do not
+  delete or overwrite another artifact to make a call succeed.
+- Successful save, compare, and render calls preserve their existing receipt
+  fields and add SHA-256-qualified artifact identity. Treat the output as
+  committed only after the tool returns success.
+- An image path becomes a registered session source if the runtime mutation
+  applies; edits rejected before mutation, `check_edit`, and previews register nothing. Mutation,
+  registration, and save/review export are coupled; exact repeated sources
+  deduplicate, and their identities expire with the document session TTL.
+- Stemma stages and verifies output before a no-clobber commit. This guards
+  ordinary caller mistakes and failed writes, not a hostile same-user local
+  process, storage corruption, or power-loss durability.
+
+## Transaction op quick reference
+
+The everyday ops, exact wire shapes — for anything beyond these,
+`inspect_docx(query:"operations", pattern:"<op_name>")` returns the full
+catalog entry; you rarely need the whole catalog:
+
+```json
+{"op":"replace","target":"p_7","expect":"<current text>","content":{"type":"paragraph","content":[{"type":"text","text":"new text"}]}}
+{"op":"insert","target":{"anchor":"p_7","position":"after"},"content":[{"type":"paragraph","content":[{"type":"text","text":"new paragraph"}]}]}
+{"op":"delete","target":"p_7","expect":"<current text>"}
+```
+
+Every transaction carries `"revision":{"author":"<distinct name>"}`. There is
+no `toc` or `field` op — a table of contents is an `insert` with a
+`{"type":"toc"}` content block (see below); images use `insert_image`/
+`replace_image`/`set_image_attrs`. Formatting is `set_format` (run marks),
+`set_para_format`, or `apply_style`; tables are `table_op` (see the table
+section).
 
 ## Span replace (the surgical edit)
 

@@ -179,6 +179,7 @@ fn plain_para(id: &str, text: &str) -> ParagraphNode {
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 7,
+        identity: 0,
         author: Some("find-replace".to_string()),
         date: Some("2026-06-01T00:00:00Z".to_string()),
         apply_op_id: None,

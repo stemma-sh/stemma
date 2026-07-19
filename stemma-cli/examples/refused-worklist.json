@@ -1,0 +1,16 @@
+{
+  "schema": "stemma.worklist.v0",
+  "input": {
+    "sha256": "2cdfb8ecd1a27ef7132ebbaa1f718d6705ea6532bf3b155c09bfd7e87d410667",
+    "bytes": 11431
+  },
+  "author": "Approved Reviewer",
+  "changes": [
+    {
+      "id": "missing-text",
+      "old": "language that is not present",
+      "new": "approved replacement",
+      "expected_matches": 1
+    }
+  ]
+}

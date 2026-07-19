@@ -236,6 +236,7 @@ fn sentinel_edit(anchor: NodeId) -> EditTransaction {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 900_000,
+            identity: 0,
             author: Some("fidelity-gate".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,

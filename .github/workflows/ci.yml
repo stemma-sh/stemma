@@ -84,8 +84,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Validate MCPB manifest
+        run: npx --yes @anthropic-ai/mcpb@2.1.2 validate stemma-mcp/mcpb/manifest.json
+      - name: Test candidate binding and immutable publication tooling
+        run: >-
+          python3 -m unittest discover -s stemma-mcp/tests
+          -p 'test_*.py' -v
       - name: Build server
         run: cargo build -p stemma-mcp
+      - name: Exercise safe artifact boundary over MCP
+        run: python3 stemma-mcp/safe_artifact_conformance.py target/debug/stemma-mcp
       - name: Assemble, install, smoke
         run: bash stemma-mcp/npm/smoke-launcher.sh target/debug/stemma-mcp
 

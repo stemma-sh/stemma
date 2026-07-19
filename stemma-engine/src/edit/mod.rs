@@ -4910,7 +4910,7 @@ fn find_paragraph_in_table(
 }
 
 /// Resolve a `ParagraphPath` to the BlockNode it points at (read-only).
-fn block_at<'a>(doc: &'a CanonDoc, path: &ParagraphPath) -> &'a BlockNode {
+pub(crate) fn block_at<'a>(doc: &'a CanonDoc, path: &ParagraphPath) -> &'a BlockNode {
     let mut block = &doc.blocks[path.top_block].block;
     for step in &path.descent {
         let table = match block {
@@ -5966,22 +5966,21 @@ pub(crate) fn flat_inlines(para: &ParagraphNode) -> Vec<&InlineNode> {
 }
 
 /// The same flat, document-order inline list as [`flat_inlines`], but each
-/// inline paired with whether its owning segment is `Normal`. A planner that
-/// needs the per-inline tracked/Normal classification (to coalesce Normal-only
-/// regions) MUST derive it here rather than re-walking `para.segments` with its
-/// own counter — that second walk is what silently drifts from the resolver's
-/// index space. One flattening, one coordinate system.
+/// inline paired with its owning segment status. A planner that needs
+/// per-inline editability MUST derive it here rather than re-walking
+/// `para.segments` with its own counter — that second walk is what silently
+/// drifts from the resolver's index space. One flattening, one coordinate
+/// system.
 ///
 /// Invariant: `flat_inlines_with_status(para).len() == flat_inlines(para).len()`
 /// and `flat_inlines_with_status(para)[i].0` is the same `&InlineNode` as
 /// `flat_inlines(para)[i]`, for every `i` (same iteration order).
-pub(crate) fn flat_inlines_with_status(para: &ParagraphNode) -> Vec<(&InlineNode, bool)> {
+pub(crate) fn flat_inlines_with_status(
+    para: &ParagraphNode,
+) -> Vec<(&InlineNode, &TrackingStatus)> {
     para.segments
         .iter()
-        .flat_map(|seg| {
-            let normal = seg.status == TrackingStatus::Normal;
-            seg.inlines.iter().map(move |inline| (inline, normal))
-        })
+        .flat_map(|seg| seg.inlines.iter().map(move |inline| (inline, &seg.status)))
         .collect()
 }
 
@@ -7191,6 +7190,7 @@ fn apply_formatting_only_replace(
                             };
                         Some(FormattingChange {
                             revision_id: rev.revision_id,
+                            identity: 0,
                             previous_marks,
                             previous_style_props,
                             previous_rpr_authored,
@@ -8149,6 +8149,7 @@ fn set_mark_surface(marks: &mut Vec<Mark>, style_props: &mut StyleProps, target:
 fn next_revision(base: &RevisionInfo, counter: &mut u32) -> RevisionInfo {
     let rev = RevisionInfo {
         revision_id: *counter,
+        identity: 0,
         author: base.author.clone(),
         date: base.date.clone(),
         apply_op_id: base.apply_op_id.clone(),
@@ -9709,6 +9710,7 @@ fn snapshot_paragraph_formatting(
     let numbering_explicitly_absent = p.numbering.is_none() && p.literal_prefix.is_none();
     ParagraphFormattingChange {
         revision_id: revision.revision_id,
+        identity: 0,
         previous_alignment: p.align.clone(),
         // The pPrChange inner pPr is the previous DIRECT formatting (§17.13.5.29),
         // so snapshot the AUTHORED-direct indent/spacing — not the resolved
@@ -9760,6 +9762,7 @@ fn snapshot_paragraph_formatting(
 fn snapshot_cell_formatting(cell: &TableCellNode, revision: &RevisionInfo) -> CellFormattingChange {
     CellFormattingChange {
         revision_id: revision.revision_id,
+        identity: 0,
         previous_width: cell.formatting.width.clone(),
         previous_borders: cell.formatting.borders.clone(),
         previous_shading: cell.formatting.shading.clone(),
@@ -9785,6 +9788,7 @@ pub(crate) fn snapshot_row_formatting(
 ) -> RowFormattingChange {
     RowFormattingChange {
         revision_id: revision.revision_id,
+        identity: 0,
         previous_height: row.height,
         previous_height_rule: row.height_rule.clone(),
         author: revision.author.clone().unwrap_or_default(),
@@ -9801,6 +9805,7 @@ pub(crate) fn snapshot_row_formatting(
 fn snapshot_table_formatting(table: &TableNode, revision: &RevisionInfo) -> TableFormattingChange {
     TableFormattingChange {
         revision_id: revision.revision_id,
+        identity: 0,
         previous_width: table.formatting.width.clone(),
         previous_borders: table.formatting.borders.clone(),
         previous_default_cell_margins: table.formatting.default_cell_margins.clone(),
@@ -10011,6 +10016,13 @@ pub fn apply_transaction_with_id_floor(
     transaction: &EditTransaction,
     external_max_revision_id: u32,
 ) -> Result<(CanonDoc, PendingParts), EditError> {
+    // Every guard supplied in one atomic transaction describes the snapshot
+    // the caller inspected before submitting that transaction. Keep that
+    // immutable snapshot available while the mutable clone advances through
+    // its ordered steps. A later step targeting the same block must not become
+    // spuriously stale merely because an earlier step in this transaction
+    // changed it.
+    let transaction_base = doc;
     let mut doc = doc.clone();
     // Fixed for the whole call: any revision_id >= this floor was minted by
     // THIS transaction (see `apply_set_cell_text_in_place`'s "own pending
@@ -10651,10 +10663,30 @@ pub fn apply_transaction_with_id_floor(
                 op,
                 rationale: _,
             } => {
+                // Existing tables validate against the immutable transaction
+                // base. A table created by an earlier step has no base entry,
+                // so retain the ordinary current-state guard for that case.
+                let guard_for_current = if let Some(expected) = semantic_hash.as_deref()
+                    && let Some(base_idx) = find_block_index(&transaction_base.blocks, block_id)
+                {
+                    if let Err(actual) =
+                        check_block_guard(&transaction_base.blocks[base_idx].block, expected)
+                    {
+                        return Err(EditError::BlockSemanticHashMismatch {
+                            block_id: block_id.clone(),
+                            expected: expected.to_string(),
+                            actual,
+                            step_index,
+                        });
+                    }
+                    None
+                } else {
+                    semantic_hash.as_deref()
+                };
                 verbs::table_ops::apply(
                     &mut doc,
                     block_id,
-                    semantic_hash.as_deref(),
+                    guard_for_current,
                     op,
                     &transaction.revision,
                     &mut rev_counter,
@@ -11523,6 +11555,10 @@ pub fn apply_transaction_with_id_floor(
         }
     }
 
+    // H7: authoring creates new revisions with identity 0; mint stable
+    // identities for them (existing identities are preserved) before the doc
+    // leaves the producer, so enumerate/Selective can address them.
+    crate::import::mint_identities(&mut doc);
     // H2: one unified body-state validator after this producer's normalizers.
     crate::tracked_model::debug_assert_body_invariants(&doc, "apply_transaction");
     Ok((doc, pending))
@@ -11607,7 +11643,7 @@ fn apply_replace_table(
     // only base state still refused is an UNRESOLVED tracked change (the
     // structural diff can't layer a fresh revision over an in-flight one) — the
     // same narrow guard the granular ops use.
-    validate_table_not_mid_redline(&base_table, step_index)?;
+    validate_table_not_mid_redline(&base_table, step_index, None)?;
 
     // RFC-0003 Item 1: caller-SET formatting on a TRACKED replace can't be a
     // reversible tracked change (table/row `*PrChange` doesn't cover style, and
@@ -11769,17 +11805,23 @@ fn is_table_diff_identity(diff: &crate::domain::TableDiffResult) -> bool {
 /// `validate_base_table_v4_compatible` formatting refusal (which refused every
 /// table carrying formatting the v4 grammar could not express) no longer applies.
 ///
-/// What DOES still have to be refused is a base carrying an UNRESOLVED tracked
-/// change — a row/cell tracked insert or delete, or a pending `tblPrChange`/
+/// What DOES still have to be refused is a base carrying a PRE-EXISTING
+/// unresolved tracked change — a row/cell tracked insert or delete, or a pending `tblPrChange`/
 /// `trPrChange`/`tcPrChange`. The structural diff (`compute_table_diff_result`
 /// → `apply_table_structure_changed`) assumes a clean base; layering a fresh
 /// revision over an in-flight one would interleave two change layers ambiguously
 /// (RFC-0003 keeps row-level tracked-change markup out of the edit schema — it
 /// belongs to the revision model). Fail loud and point at the in-flight change
-/// so the caller accepts/rejects it first.
+/// so the caller accepts/rejects it first. Granular table ops may, however,
+/// compose over row/cell statuses minted earlier in the SAME atomic
+/// transaction; `transaction_floor` identifies those engine-minted ids. This
+/// is how one plan can insert one row and delete another without resolving its
+/// own first step. Whole-table replacement passes no floor and retains the
+/// strict clean-base rule.
 pub(crate) fn validate_table_not_mid_redline(
     base: &TableNode,
     step_index: usize,
+    transaction_floor: Option<u32>,
 ) -> Result<(), EditError> {
     if base.formatting_change.is_some() {
         return Err(EditError::TableMidRedline {
@@ -11789,7 +11831,9 @@ pub(crate) fn validate_table_not_mid_redline(
         });
     }
     for (row_index, row) in base.rows.iter().enumerate() {
-        if row.tracking_status.is_some() {
+        if row.tracking_status.as_ref().is_some_and(|status| {
+            !tracking_status_belongs_to_transaction(status, transaction_floor)
+        }) {
             return Err(EditError::TableMidRedline {
                 table_id: base.id.clone(),
                 location: format!("row[{row_index}] (tracked row ins/del)"),
@@ -11804,7 +11848,9 @@ pub(crate) fn validate_table_not_mid_redline(
             });
         }
         for (cell_index, cell) in row.cells.iter().enumerate() {
-            if cell.tracking_status.is_some() {
+            if cell.tracking_status.as_ref().is_some_and(|status| {
+                !tracking_status_belongs_to_transaction(status, transaction_floor)
+            }) {
                 return Err(EditError::TableMidRedline {
                     table_id: base.id.clone(),
                     location: format!("row[{row_index}].cell[{cell_index}] (tracked cell ins/del)"),
@@ -11821,6 +11867,24 @@ pub(crate) fn validate_table_not_mid_redline(
         }
     }
     Ok(())
+}
+
+fn tracking_status_belongs_to_transaction(
+    status: &TrackingStatus,
+    transaction_floor: Option<u32>,
+) -> bool {
+    let Some(floor) = transaction_floor else {
+        return false;
+    };
+    match status {
+        TrackingStatus::Normal => true,
+        TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision) => {
+            revision.revision_id >= floor
+        }
+        TrackingStatus::InsertedThenDeleted(stacked) => {
+            stacked.inserted.revision_id >= floor && stacked.deleted.revision_id >= floor
+        }
+    }
 }
 
 /// The logical column count of a table's first row (`gridBefore` + Σ gridSpan +
@@ -12330,6 +12394,7 @@ fn stamp_revision(base: &RevisionInfo, rev_counter: &mut u32) -> RevisionInfo {
     *rev_counter += 1;
     RevisionInfo {
         revision_id,
+        identity: 0,
         author: base.author.clone(),
         date: base.date.clone(),
         apply_op_id: base.apply_op_id.clone(),
@@ -12977,6 +13042,7 @@ mod tests {
     fn revision() -> RevisionInfo {
         RevisionInfo {
             revision_id: 7,
+            identity: 0,
             author: Some("unit-test".to_string()),
             date: Some("2026-06-03T00:00:00Z".to_string()),
             apply_op_id: None,

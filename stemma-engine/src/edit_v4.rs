@@ -2541,6 +2541,16 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
     // Mirror a new `Op` variant's field list here. See `edit/AGENTS.md`.
 ];
 
+/// The complete wire vocabulary accepted by [`parse_transaction`].
+///
+/// This is intentionally a read-only view over the same table that enforces
+/// fail-loud unknown-field rejection. MCP and other typed edges use it for
+/// capability discovery, so the advertised operation names and fields cannot
+/// drift from the parser's authoritative vocabulary.
+pub fn operation_vocabulary() -> &'static [(&'static str, &'static [&'static str])] {
+    OP_FIELDS
+}
+
 // ─── Schema validation (parse step) ──────────────────────────────────────────
 //
 // The schema check verifies structural well-formedness of an already-deserialized
@@ -4261,6 +4271,7 @@ impl EditTransactionV4 {
             materialization_mode: self.materialization_mode,
             revision: RevisionInfo {
                 revision_id: 0,
+                identity: 0,
                 author: Some(self.revision.author),
                 date,
                 apply_op_id: self.revision.apply_op_id,

@@ -161,6 +161,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 7,
+            identity: 0,
             author: Some("L2T".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,

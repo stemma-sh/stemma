@@ -101,6 +101,7 @@ fn footnote_ref_run_retains_rpr_after_body_edit() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Editor".to_string()),
             date: Some("2026-07-09T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -148,4 +149,98 @@ fn footnote_ref_run_retains_rpr_after_body_edit() {
             "footnoteRef run lost {needle}\nfootnotes.xml:\n{footnotes_xml}"
         );
     }
+}
+
+/// The BODY-side footnote-reference run (`w:footnoteReference` §17.11.3)
+/// keeps its captured rPr VERBATIM on rebuild — the serializer must not
+/// inject a default `rStyle w:val="FootnoteReference"` into an imported
+/// reference whose original run carried no rStyle. Non-English documents
+/// name their note-reference style differently (or apply the formatting
+/// directly); inventing the English style id changes untouched content and
+/// dangles when no such style exists in the document. The default belongs
+/// to ENGINE-AUTHORED references only (raw_xml: None), where the engine is
+/// the author of the whole run.
+#[test]
+fn imported_body_reference_run_keeps_captured_rpr_without_style_injection() {
+    // Body reference run with direct formatting only — no rStyle.
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">First paragraph.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Nota</w:t></w:r><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="1"/></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let bytes = make_docx_with_parts(document_xml);
+
+    let base = Document::parse(&bytes).expect("parse");
+    let block_id = first_block_id(&base.snapshot().canonical);
+    let txn = EditTransaction {
+        steps: vec![EditStep::SetParagraphFormatting {
+            block_id,
+            semantic_hash: None,
+            patch: ParagraphFormattingPatch {
+                align: Some(Alignment::Center),
+                ..ParagraphFormattingPatch::default()
+            },
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::Direct,
+        revision: RevisionInfo {
+            revision_id: 1,
+            identity: 0,
+            author: Some("Editor".to_string()),
+            date: Some("2026-07-09T00:00:00Z".to_string()),
+            apply_op_id: None,
+        },
+    };
+    let edited = base.apply(&txn).expect("apply body edit");
+    let out = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let archive = DocxArchive::read(&out).expect("read exported docx");
+    let doc_xml = String::from_utf8(
+        archive
+            .get("word/document.xml")
+            .expect("document.xml")
+            .to_vec(),
+    )
+    .unwrap()
+    .replace(" />", "/>");
+
+    assert!(
+        !doc_xml.contains(r#"<w:rStyle w:val="FootnoteReference"/>"#),
+        "no invented default rStyle on an imported reference run: {doc_xml}"
+    );
+    assert!(
+        doc_xml.contains(r#"<w:vertAlign w:val="superscript"/>"#),
+        "the captured direct formatting must survive: {doc_xml}"
+    );
+}
+
+/// Companion helper for the body-reference test: same package skeleton as
+/// `make_docx_with_footnote`, but with a caller-supplied document.xml.
+fn make_docx_with_parts(document_xml: &str) -> Vec<u8> {
+    let footnotes_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> Body of the note.</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFn" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#;
+    use std::io::Write;
+    use zip::write::FileOptions;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: FileOptions = FileOptions::default();
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(content_types.as_bytes()).unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(rels.as_bytes()).unwrap();
+        zip.start_file("word/_rels/document.xml.rels", opts)
+            .unwrap();
+        zip.write_all(doc_rels.as_bytes()).unwrap();
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+        zip.start_file("word/footnotes.xml", opts).unwrap();
+        zip.write_all(footnotes_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    buf
 }

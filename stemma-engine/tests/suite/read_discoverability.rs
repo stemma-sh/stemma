@@ -307,6 +307,7 @@ fn insert_after(anchor: &NodeId, role: &str, text: &str) -> EditTransaction {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Test".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,

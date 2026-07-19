@@ -55,4 +55,7 @@ echo "full protocol smoke through the launcher:"
 python3 "$repo_root/stemma-mcp/smoke_test.py" "$shim" \
   "$repo_root/stemma-examples/samples/safe-agreement.docx"
 
+echo "safe artifact conformance through the launcher:"
+python3 "$repo_root/stemma-mcp/safe_artifact_conformance.py" "$shim"
+
 echo "npm launcher smoke: PASS ($triple)"

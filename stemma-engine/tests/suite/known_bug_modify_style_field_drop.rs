@@ -88,6 +88,7 @@ fn modify_style_preserves_fields_the_definition_does_not_model() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("fid".into()),
             date: Some("2026-07-02T00:00:00Z".into()),
             apply_op_id: None,

@@ -269,6 +269,7 @@ fn make_simple_doc(para_id: &str, text: &str) -> CanonDoc {
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("Test Author".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -2758,6 +2759,7 @@ fn apply_op_id_is_stamped_on_every_tracked_segment_the_apply_produces() {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some("Andreas".to_string()),
             date: Some("2026-04-13T00:00:00Z".to_string()),
             apply_op_id: Some("op_test_xyz".to_string()),
@@ -4253,11 +4255,13 @@ fn resolve_selected_revisions_accepts_hyperlink_edit_by_id() {
     let mut result = apply_transaction(&doc, &tx)
         .expect("hyperlink edit applies")
         .0;
+    // H7: the resolver addresses revisions by their minted identity, not the
+    // wire revision_id.
     let revision_id = get_hyperlink(&result, "h1")
         .runs
         .iter()
         .find_map(|r| match &r.status {
-            TrackingStatus::Inserted(rev) => Some(rev.revision_id),
+            TrackingStatus::Inserted(rev) => Some(rev.identity),
             _ => None,
         })
         .expect("edit records an Inserted run");
@@ -4285,11 +4289,13 @@ fn resolve_selected_revisions_rejects_hyperlink_edit_by_id() {
     let mut result = apply_transaction(&doc, &tx)
         .expect("hyperlink edit applies")
         .0;
+    // H7: the resolver addresses revisions by their minted identity, not the
+    // wire revision_id.
     let revision_id = get_hyperlink(&result, "h1")
         .runs
         .iter()
         .find_map(|r| match &r.status {
-            TrackingStatus::Deleted(rev) => Some(rev.revision_id),
+            TrackingStatus::Deleted(rev) => Some(rev.identity),
             _ => None,
         })
         .expect("edit records a Deleted run");

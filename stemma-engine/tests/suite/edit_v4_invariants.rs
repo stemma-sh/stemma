@@ -941,6 +941,7 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
         block: BlockNode::from(para),
         status: TrackingStatus::Inserted(RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("LLM".to_string()),
             date: None,
             apply_op_id: None,
@@ -1111,6 +1112,7 @@ fn set_attr_hyperlink_no_op_when_neither_field_set_after_adapter() {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some("Counsel".to_string()),
             date: None,
             apply_op_id: None,

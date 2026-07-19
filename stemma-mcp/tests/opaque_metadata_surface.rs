@@ -212,6 +212,7 @@ fn find_locates_content_control_by_alias_then_set_succeeds() {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("tester".to_string()),
             date: Some("2026-06-11T00:00:00Z".to_string()),
             apply_op_id: None,

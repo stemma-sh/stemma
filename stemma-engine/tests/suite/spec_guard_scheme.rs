@@ -66,6 +66,7 @@ fn first_block(doc: &Document) -> BlockNode {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 60,
+        identity: 0,
         author: Some("guard-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,

@@ -37,8 +37,9 @@
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
 
+use stemma::tracked_model::enumerate_revisions;
 use stemma::view::build_document_view_from_canon;
-use stemma::{DocxRuntime, ExportMode, ResolveSelectionAction, SimpleRuntime};
+use stemma::{DocxRuntime, ExportMode, ResolveSelectionAction, RevisionKind, SimpleRuntime};
 use zip::write::FileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -116,9 +117,18 @@ fn import_and_reject_prefix(docx: &[u8]) -> (SimpleRuntime, stemma::DocHandle) {
     let rt = SimpleRuntime::new();
     let import = rt.import_docx(docx).expect("import");
     let handle = import.doc_handle.clone();
-    let ids: HashSet<u32> = [1, 2].into_iter().collect();
+    // Address the two tracked deletions (the "1." and the tab) by their MINTED
+    // IDENTITIES, discovered from the imported document — not the raw wire ids
+    // 1/2. Enumerate the freshly-imported canonical (the read view projects the
+    // pending deletions away, so it cannot surface their ids).
+    let ids: HashSet<u32> = enumerate_revisions(&import.canonical)
+        .into_iter()
+        .filter(|r| r.kind == RevisionKind::Delete)
+        .map(|r| r.revision_id)
+        .collect();
+    assert_eq!(ids.len(), 2, "the two tracked prefix deletions: {ids:?}");
     rt.resolve_tracked_revisions(&handle, &ids, ResolveSelectionAction::Reject)
-        .expect("reject ids 1,2");
+        .expect("reject the two prefix deletions");
     (rt, handle)
 }
 

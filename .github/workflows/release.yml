@@ -1,38 +1,122 @@
 name: release
 
-# Pushing a version tag (v0.1.0) builds the stemma-mcp binary matrix, publishes
-# the npm packages (@stemma-sh/mcp + per-platform binaries), and attaches the
-# raw binaries to a GitHub release. See RELEASING.md for the full checklist,
-# including the one-time setup (npm org, NPM_TOKEN secret) this depends on.
+# A maintainer starts one release-candidate run from the exact release commit.
+# It builds and uploads the native matrix first, then waits at the protected
+# `release` environment. Only after exact-artifact/Word qualification is
+# approved does the same run bind the tag, publish exact npm tarballs, and
+# attach the verified GitHub assets.
+# See RELEASING.md for the required environment protection and full checklist.
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable MAJOR.MINOR.PATCH from stemma-mcp/Cargo.toml, without the v prefix"
+        required: true
+        type: string
+      commit_sha:
+        description: "Full 40-character release commit SHA expected at the selected ref"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
 
 # Least privilege by default; each job that needs more declares it itself.
 permissions:
+  actions: read
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Manual values are data, never workflow-generated shell source. The first
+  # job validates these before any job with write or publish authority runs.
+  REQUESTED_VERSION: ${{ inputs.version }}
+  REQUESTED_COMMIT_SHA: ${{ inputs.commit_sha }}
 
 jobs:
   version-guard:
-    # A tag that does not match the crate version would publish npm packages
+    # An input that does not match the crate version would publish npm packages
     # whose version disagrees with --version. Refuse, don't reconcile.
-    name: tag matches stemma-mcp crate version
+    name: requested version matches stemma-mcp crate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compare tag to Cargo.toml
+        with:
+          fetch-depth: 0
+      - name: Compare requested version to Cargo.toml
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' stemma-mcp/Cargo.toml | head -1)"
-          if [ "$tag" != "$crate" ]; then
-            echo "::error::Tag v$tag does not match stemma-mcp version $crate."
+          requested="$REQUESTED_VERSION"
+          requested_sha="$REQUESTED_COMMIT_SHA"
+          if [[ ! "$requested" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Requested version must be stable MAJOR.MINOR.PATCH SemVer without prerelease or build metadata."
             exit 1
           fi
+          if [[ ! "$requested_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Requested commit must be a full lowercase hexadecimal SHA."
+            exit 1
+          fi
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' stemma-mcp/Cargo.toml | head -1)"
+          if [ "$requested" != "$crate" ]; then
+            echo "::error::Requested version $requested does not match stemma-mcp version $crate."
+            exit 1
+          fi
+          if [ "$requested_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Requested commit $requested_sha does not match selected ref commit $GITHUB_SHA."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release commit $GITHUB_SHA is not reachable from origin/main."
+            exit 1
+          fi
+          tag_sha="$(git ls-remote --tags origin "refs/tags/v$requested" | awk 'NR == 1 { print $1 }')"
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag v$requested already binds a different source: $tag_sha."
+            exit 1
+          fi
+          if [ -n "$tag_sha" ]; then
+            echo "Retrying the source already bound by tag v$requested."
+          fi
           echo "Releasing stemma-mcp $crate"
+      - name: Verify release environment protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/environments/release" > "$RUNNER_TEMP/release-environment.json"
+          python3 - "$RUNNER_TEMP/release-environment.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              environment = json.load(stream)
+          rules = environment.get("protection_rules") or []
+          reviewer_rules = [
+              rule for rule in rules if rule.get("type") == "required_reviewers"
+          ]
+          if len(reviewer_rules) != 1:
+              raise SystemExit(
+                  "release environment must have exactly one required-reviewers rule"
+              )
+          rule = reviewer_rules[0]
+          if not rule.get("prevent_self_review"):
+              raise SystemExit("release environment must prevent self-review")
+          if not rule.get("reviewers"):
+              raise SystemExit("release environment must name at least one reviewer")
+          print("release environment protection is configured")
+          PY
+      - name: Verify release tag mutation protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" \
+            > "$RUNNER_TEMP/tag-rulesets.json"
+          ruleset_id="$(python3 stemma-mcp/verify_release_tag_ruleset.py \
+            select "$RUNNER_TEMP/tag-rulesets.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets/$ruleset_id?includes_parents=true" \
+            > "$RUNNER_TEMP/release-tag-ruleset.json"
+          python3 stemma-mcp/verify_release_tag_ruleset.py \
+            verify "$RUNNER_TEMP/release-tag-ruleset.json" "$ruleset_id"
 
   build:
     name: build (${{ matrix.target }})
@@ -45,11 +129,10 @@ jobs:
           # ubuntu-22.04 pins the glibc floor (2.35) for the linux binaries.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, bin: stemma-mcp }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, bin: stemma-mcp }
-          # GitHub retired its Intel macOS runner pool (macos-13) in late
-          # 2025; the Intel binary cross-compiles on an arm64 Mac — the macOS
-          # toolchain targets both architectures natively.
-          - { target: x86_64-apple-darwin, os: macos-14, bin: stemma-mcp }
-          - { target: aarch64-apple-darwin, os: macos-14, bin: stemma-mcp }
+          # Use native runners for both macOS architectures so the qualification
+          # step executes each exact binary rather than merely cross-compiling.
+          - { target: x86_64-apple-darwin, os: macos-15-intel, bin: stemma-mcp }
+          - { target: aarch64-apple-darwin, os: macos-15, bin: stemma-mcp }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, bin: stemma-mcp.exe }
     runs-on: ${{ matrix.os }}
     steps:
@@ -58,93 +141,429 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Build release binary
-        run: cargo build -p stemma-mcp --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          version="$REQUESTED_VERSION"
+          export STEMMA_MCP_BUILD_STAMP="${version}+g${GITHUB_SHA:0:12}"
+          cargo build -p stemma-mcp --release --target "${{ matrix.target }}"
+      - name: Qualify exact release binary over MCP
+        shell: bash
+        run: |
+          python stemma-mcp/smoke_test.py \
+            "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
+            stemma-examples/samples/safe-agreement.docx
+      - name: Enforce exact-binary artifact conformance
+        shell: bash
+        run: |
+          mkdir -p "qualification/${{ matrix.target }}"
+          python stemma-mcp/safe_artifact_conformance.py \
+            "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
+            | tee "qualification/${{ matrix.target }}/safe-artifact-conformance.json"
       - name: Stage binary
         shell: bash
         run: |
           mkdir -p "dist/${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.target }}/"
+          cp "qualification/${{ matrix.target }}/safe-artifact-conformance.json" \
+            "dist/${{ matrix.target }}/"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/${{ matrix.target }}
           if-no-files-found: error
 
+  candidate-manifest:
+    name: freeze exact five-target candidate manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: candidate-inputs
+      - name: Validate matrix and write create-new manifest
+        run: |
+          python3 stemma-mcp/build_candidate_manifest.py \
+            candidate-inputs \
+            "$REQUESTED_VERSION" \
+            "$GITHUB_SHA" \
+            candidate-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-manifest
+          path: candidate-manifest.json
+          if-no-files-found: error
+
+  release-approval:
+    # Configure this environment with required reviewers and prevent
+    # self-review. Reviewers approve only after downloading this run's build
+    # artifacts and recording the exact-artifact Word qualification result.
+    name: approve exact candidate after Word qualification
+    needs: candidate-manifest
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Record promotion boundary
+        run: |
+          echo "Approved exact candidate from commit $GITHUB_SHA"
+          echo "Pinned request commit: $REQUESTED_COMMIT_SHA"
+          echo "Requested release version: $REQUESTED_VERSION"
+          echo "Approved candidate identity: candidate-manifest workflow artifact"
+
+  release-claim:
+    # Claim the approved version before npm's irreversible publication. This
+    # prevents an ordinary concurrent writer from binding the name elsewhere;
+    # the native package stamp and npm provenance remain the source identity.
+    name: bind approved source to release tag
+    needs: release-approval
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-verify protection and create or confirm the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" \
+            > "$RUNNER_TEMP/tag-rulesets.json"
+          ruleset_id="$(python3 stemma-mcp/verify_release_tag_ruleset.py \
+            select "$RUNNER_TEMP/tag-rulesets.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets/$ruleset_id?includes_parents=true" \
+            > "$RUNNER_TEMP/release-tag-ruleset.json"
+          python3 stemma-mcp/verify_release_tag_ruleset.py \
+            verify "$RUNNER_TEMP/release-tag-ruleset.json" "$ruleset_id"
+
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ -z "$tag_sha" ]; then
+            if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$GITHUB_SHA"; then
+              echo "Tag creation raced another writer; checking the resulting binding."
+            fi
+            tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          fi
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag does not identify approved source $GITHUB_SHA."
+            exit 1
+          fi
+
   npm-publish:
     # Deliberately minimal: downloads prebuilt artifacts and publishes — no
     # dependency installs, no test runs. This job holds publish rights; code
     # execution belongs in ci.yml and the build job.
     name: publish npm packages
-    needs: build
+    needs: release-claim
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
-      id-token: write # provenance attestations (and trusted publishing later)
+      id-token: write # OIDC trusted publishing + provenance attestations
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: binaries
+      - name: Re-verify downloaded candidate against the approved manifest
+        run: |
+          python3 stemma-mcp/verify_candidate_manifest.py \
+            binaries "$REQUESTED_VERSION" "$GITHUB_SHA"
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      - name: Install and verify the npm OIDC runtime
+        # Auth is npm's OIDC trusted-publisher exchange (configured on each
+        # package on npmjs.com) — no registry token exists anywhere. OIDC
+        # requires Node >= 22.14.0 and npm >= 11.5.1.
+        run: |
+          npm install -g npm@11.5.1
+          python3 - "$(node --version)" "$(npm --version)" <<'PY'
+          import re
+          import sys
+
+          def parse_version(value, label):
+              pattern = r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?"
+              match = re.fullmatch(pattern, value)
+              if match is None:
+                  raise SystemExit(
+                      "{} returned an invalid version: {!r}".format(label, value)
+                  )
+              return tuple(int(component) for component in match.groups())
+
+          node = parse_version(sys.argv[1], "node")
+          npm = parse_version(sys.argv[2], "npm")
+          if node < (22, 14, 0):
+              raise SystemExit("npm trusted publishing requires Node >= 22.14.0")
+          if npm < (11, 5, 1):
+              raise SystemExit("npm trusted publishing requires npm >= 11.5.1")
+          print(
+              "verified npm OIDC runtime: Node {} / npm {}".format(
+                  sys.argv[1], sys.argv[2]
+              )
+          )
+          PY
       - name: Assemble packages (strict — all five platforms)
         run: bash stemma-mcp/npm/build-npm-packages.sh binaries out
+      - name: Re-verify public ref state and protection before irreversible publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag no longer identifies approved source $GITHUB_SHA."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" \
+            > "$RUNNER_TEMP/tag-rulesets.json"
+          ruleset_id="$(python3 stemma-mcp/verify_release_tag_ruleset.py \
+            select "$RUNNER_TEMP/tag-rulesets.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets/$ruleset_id?includes_parents=true" \
+            > "$RUNNER_TEMP/release-tag-ruleset.json"
+          python3 stemma-mcp/verify_release_tag_ruleset.py \
+            verify "$RUNNER_TEMP/release-tag-ruleset.json" "$ruleset_id"
       - name: Publish platform packages, then the wrapper
         # The wrapper goes last: from the moment @stemma-sh/mcp resolves at a
         # version, every binary it pins must already exist.
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          # ./ prefix is load-bearing: npm parses a bare owner/name argument
-          # as a GitHub repo spec, not a directory. The pre-publish view check
-          # makes re-runs idempotent — an already-published version is skipped
-          # instead of failing the loop (npm refuses republish over a version).
-          for pkg in ./out/mcp-*/ ./out/mcp/; do
-            name="$(python3 -c "import json,sys; print(json.load(open('$pkg/package.json'))['name'])")"
-            version="$(python3 -c "import json,sys; print(json.load(open('$pkg/package.json'))['version'])")"
-            if npm view "$name@$version" version >/dev/null 2>&1; then
-              echo "skip: $name@$version already published"
-              continue
-            fi
-            npm publish "$pkg" --access public --provenance
-          done
+        run: bash stemma-mcp/npm/publish-npm-packages.sh out
 
   github-release:
     name: attach binaries to the GitHub release
-    needs: build
+    needs: npm-publish
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write # create the release + upload assets
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: binaries
-      - name: Package archives + checksums
+      - name: Re-verify downloaded candidate against the approved manifest
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          python3 stemma-mcp/verify_candidate_manifest.py \
+            binaries "$REQUESTED_VERSION" "$GITHUB_SHA"
+      - name: Package archives, conformance reports, and checksums
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
           mkdir -p release
+          cp binaries/candidate-manifest/candidate-manifest.json release/
           for dir in binaries/*/; do
             target="$(basename "$dir")"
+            if [ "$target" = "candidate-manifest" ]; then
+              continue
+            fi
             case "$target" in
               *windows*)
-                (cd "$dir" && zip -q "$GITHUB_WORKSPACE/release/stemma-mcp-$version-$target.zip" *)
+                python3 - "$dir" "release/stemma-mcp-$version-$target.zip" <<'PY'
+                import pathlib
+                import sys
+                import zipfile
+
+                source = pathlib.Path(sys.argv[1])
+                output = pathlib.Path(sys.argv[2])
+                with zipfile.ZipFile(output, "x", zipfile.ZIP_DEFLATED) as archive:
+                    for path in sorted(source.iterdir(), key=lambda item: item.name):
+                        info = zipfile.ZipInfo(path.name, (1980, 1, 1, 0, 0, 0))
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        info.external_attr = 0o644 << 16
+                        archive.writestr(info, path.read_bytes())
+                PY
                 ;;
               *)
                 chmod 0755 "$dir"/stemma-mcp
-                tar -C "$dir" -czf "release/stemma-mcp-$version-$target.tar.gz" .
+                tar --sort=name --mtime='UTC 1980-01-01' \
+                  --owner=0 --group=0 --numeric-owner --format=ustar \
+                  -C "$dir" -cf - . \
+                  | gzip -n > "release/stemma-mcp-$version-$target.tar.gz"
                 ;;
             esac
           done
           (cd release && sha256sum * > sha256sums.txt)
-      - name: Create release
+      - name: Create or complete the exact draft, then publish it
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed." \
-            release/*
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag no longer identifies approved source $GITHUB_SHA."
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/release.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > "$release_json" 2>/dev/null; then
+            notes="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed."
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="$tag" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="$tag" \
+              -f body="$notes" \
+              -F draft=true > "$release_json"
+          fi
+
+          release_metadata="$(python3 - "$release_json" "$tag" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              release = json.load(stream)
+          if release.get("tag_name") != sys.argv[2]:
+              raise SystemExit("release tag does not match the approved tag")
+          release_id = release.get("id")
+          if type(release_id) is not int:
+              raise SystemExit("release response has no numeric id")
+          draft = release.get("draft")
+          if type(draft) is not bool:
+              raise SystemExit("release response has no boolean draft state")
+          if release.get("prerelease") is not False:
+              raise SystemExit("release must not be marked as a prerelease")
+          print(f"{release_id}\t{str(draft).lower()}")
+          PY
+          )"
+          IFS=$'\t' read -r release_id release_is_draft <<< "$release_metadata"
+
+          assets_json="$RUNNER_TEMP/release-assets.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" > "$assets_json"
+          python3 - release "$assets_json" "$release_is_draft" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          local = {path.name for path in pathlib.Path(sys.argv[1]).iterdir() if path.is_file()}
+          with open(sys.argv[2], encoding="utf-8") as stream:
+              assets = json.load(stream)
+          remote = [asset.get("name") for asset in assets]
+          if len(remote) != len(set(remote)):
+              raise SystemExit("release contains duplicate asset names")
+          extras = sorted(set(remote) - local)
+          if extras:
+              raise SystemExit("release contains unexpected assets: " + ", ".join(extras))
+          if sys.argv[3] != "true":
+              if set(remote) != local:
+                  raise SystemExit("published release is missing approved assets")
+              if any(asset.get("state") != "uploaded" for asset in assets):
+                  raise SystemExit("published release contains an incomplete asset")
+          PY
+
+          for asset in release/*; do
+            name="$(basename "$asset")"
+            asset_record="$(python3 - "$assets_json" "$name" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              assets = json.load(stream)
+          matches = [asset for asset in assets if asset.get("name") == sys.argv[2]]
+          if len(matches) > 1:
+              raise SystemExit("duplicate release asset: " + sys.argv[2])
+          if matches:
+              print("{}\t{}".format(matches[0]["id"], matches[0].get("state")))
+          PY
+            )"
+            asset_id="${asset_record%%$'\t'*}"
+            asset_state="${asset_record#*$'\t'}"
+            if [ -n "$asset_record" ] && [ "$asset_state" = "starter" ]; then
+              # GitHub documents a `starter` asset as failed/incomplete and
+              # safe to delete. Never replace an uploaded, byte-bearing asset.
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+              gh release upload "$tag" "$asset"
+            elif [ -n "$asset_record" ] && [ "$asset_state" = "uploaded" ]; then
+              downloaded="$RUNNER_TEMP/existing-$name"
+              gh api -H "Accept: application/octet-stream" \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" > "$downloaded"
+              if ! cmp --silent "$asset" "$downloaded"; then
+                echo "::error::Existing release asset $name differs from the approved candidate."
+                exit 1
+              fi
+              echo "Verified existing release asset $name"
+            elif [ -n "$asset_record" ]; then
+              echo "::error::Existing release asset $name has unexpected state $asset_state."
+              exit 1
+            else
+              gh release upload "$tag" "$asset"
+            fi
+          done
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" > "$assets_json"
+          python3 - release "$assets_json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          local = {path.name for path in pathlib.Path(sys.argv[1]).iterdir() if path.is_file()}
+          with open(sys.argv[2], encoding="utf-8") as stream:
+              assets = json.load(stream)
+          remote = {asset.get("name") for asset in assets}
+          if remote != local:
+              raise SystemExit("release asset set is not exact after upload")
+          if any(asset.get("state") != "uploaded" for asset in assets):
+              raise SystemExit("release contains an asset that is not fully uploaded")
+          PY
+          for asset in release/*; do
+            name="$(basename "$asset")"
+            asset_id="$(python3 - "$assets_json" "$name" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              matches = [
+                  asset
+                  for asset in json.load(stream)
+                  if asset.get("name") == sys.argv[2]
+              ]
+          if len(matches) != 1:
+              raise SystemExit("release asset is missing or duplicated: " + sys.argv[2])
+          print(matches[0]["id"])
+          PY
+            )"
+            downloaded="$RUNNER_TEMP/verified-$name"
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" > "$downloaded"
+            if ! cmp --silent "$asset" "$downloaded"; then
+              echo "::error::Uploaded release asset $name differs from the approved bytes."
+              exit 1
+            fi
+          done
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag changed before release publication."
+            exit 1
+          fi
+          if [ "$release_is_draft" = "true" ]; then
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+              -F draft=false > "$RUNNER_TEMP/published-release.json"
+          else
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+              > "$RUNNER_TEMP/published-release.json"
+          fi
+          python3 - "$RUNNER_TEMP/published-release.json" "$tag" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              release = json.load(stream)
+          if release.get("tag_name") != sys.argv[2] or release.get("draft") is not False:
+              raise SystemExit("GitHub release did not reach the published state")
+          if release.get("prerelease") is not False:
+              raise SystemExit("GitHub release was unexpectedly marked as a prerelease")
+          if release.get("immutable") is not True:
+              raise SystemExit(
+                  "GitHub release is published but not immutable; enable release immutability"
+              )
+          PY

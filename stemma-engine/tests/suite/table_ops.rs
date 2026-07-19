@@ -737,6 +737,7 @@ fn set_cell_text_on_foreign_pending_insert_names_actionable_options() {
             .expect("table");
         tbl.rows[1].cells[0].tracking_status = Some(TrackingStatus::Inserted(RevisionInfo {
             revision_id: 0,
+            identity: 0,
             author: Some("Other Author".to_string()),
             date: None,
             apply_op_id: None,

@@ -74,6 +74,7 @@ use stemma::{
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 7,
+        identity: 0,
         author: Some("cross-path".to_string()),
         date: Some("2026-05-31T00:00:00Z".to_string()),
         apply_op_id: None,

@@ -91,6 +91,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
         materialization_mode: mode,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Styler".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -175,14 +176,15 @@ fn rendered_text(canon: &CanonDoc) -> String {
     out
 }
 
-/// The recorded pPrChange revision id on the first paragraph (for selective
-/// resolution).
+/// The pPrChange's MINTED IDENTITY on the first paragraph — the handle a
+/// caller addresses for selective resolution (H7), not the raw wire
+/// `revision_id`.
 fn first_para_pprchange_id(canon: &CanonDoc) -> u32 {
     first_para(canon)
         .formatting_change
         .as_ref()
         .expect("first paragraph carries a pPrChange")
-        .revision_id
+        .identity
 }
 
 // ─── Forward direction: plain paragraph re-styled to a caps-bearing style ─────

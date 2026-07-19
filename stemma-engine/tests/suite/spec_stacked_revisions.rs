@@ -35,6 +35,7 @@ use stemma::edit::{
     ResolvedSpanSelector,
 };
 use stemma::semantic_hash::block_guard;
+use stemma::tracked_model::{RevisionRecord, enumerate_revisions};
 use stemma::view::TrackStatus;
 use stemma::{BlockNode, Resolution, ResolveSelectionAction, RevisionInfo};
 
@@ -79,6 +80,7 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 60,
+        identity: 0,
         author: Some("stacked-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -137,6 +139,34 @@ fn selective(doc: &Document, ids: &[u32], action: ResolveSelectionAction) -> Doc
     .unwrap_or_else(|e| panic!("selective resolution failed: {e:?}"))
 }
 
+/// H7: a revision is addressed by its document-unique MINTED identity
+/// (surfaced as `RevisionRecord::revision_id`), never by the raw wire `w:id`,
+/// which Word reuses and is not unique. Discover the identity from the document
+/// by a stable property the test already knows. Deduped because one revision
+/// can enumerate under several carriers (e.g. every segment of a multi-segment
+/// insertion shares its identity).
+fn identities_where(doc: &Document, pred: impl Fn(&RevisionRecord) -> bool) -> Vec<u32> {
+    let mut ids: Vec<u32> = enumerate_revisions(&doc.snapshot().canonical)
+        .iter()
+        .filter(|r| pred(r))
+        .map(|r| r.revision_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The single minted identity of the revision authored by `author`.
+fn identity_of_author(doc: &Document, author: &str) -> u32 {
+    let ids = identities_where(doc, |r| r.author.as_deref() == Some(author));
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one revision identity for {author}, got {ids:?}"
+    );
+    ids[0]
+}
+
 // ─── Both markup orders, one state ───────────────────────────────────────────
 
 #[test]
@@ -185,10 +215,13 @@ fn the_read_surface_shows_one_span_with_compound_status() {
 fn extended_markdown_nests_the_stacked_tags() {
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
     let md = doc.to_markdown();
-    assert!(
-        md.contains("<ins id=1 by=\"AuthorA\"><del id=2 by=\"AuthorB\">cut </del></ins>"),
-        "the markdown nests honestly: {md}"
-    );
+    // The markdown carries each leg's minted identity (what a caller resolves
+    // by), not the raw wire ids — discover them from the document.
+    let ins_id = identity_of_author(&doc, "AuthorA");
+    let del_id = identity_of_author(&doc, "AuthorB");
+    let expected =
+        format!("<ins id={ins_id} by=\"AuthorA\"><del id={del_id} by=\"AuthorB\">cut </del></ins>");
+    assert!(md.contains(&expected), "the markdown nests honestly: {md}");
 }
 
 // ─── Resolutions: the four origin rules ──────────────────────────────────────
@@ -213,7 +246,11 @@ fn accept_all_and_reject_all_both_drop_the_stacked_text() {
 #[test]
 fn rule_1_accepting_the_insertion_leaves_the_deletion_pending_over_base() {
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
-    let resolved = selective(&doc, &[1], ResolveSelectionAction::Accept);
+    let resolved = selective(
+        &doc,
+        &[identity_of_author(&doc, "AuthorA")],
+        ResolveSelectionAction::Accept,
+    );
     let fp = fingerprint(&resolved);
     assert!(
         fp.iter().any(|(s, t)| s == "del(AuthorB)" && t == "cut "),
@@ -228,7 +265,11 @@ fn rule_1_accepting_the_insertion_leaves_the_deletion_pending_over_base() {
 #[test]
 fn rule_2_rejecting_the_insertion_cascades_the_deletion_away() {
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
-    let resolved = selective(&doc, &[1], ResolveSelectionAction::Reject);
+    let resolved = selective(
+        &doc,
+        &[identity_of_author(&doc, "AuthorA")],
+        ResolveSelectionAction::Reject,
+    );
     let fp = fingerprint(&resolved);
     assert!(
         !fp.iter()
@@ -240,7 +281,11 @@ fn rule_2_rejecting_the_insertion_cascades_the_deletion_away() {
 #[test]
 fn rule_3_accepting_the_deletion_drops_the_text() {
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
-    let resolved = selective(&doc, &[2], ResolveSelectionAction::Accept);
+    let resolved = selective(
+        &doc,
+        &[identity_of_author(&doc, "AuthorB")],
+        ResolveSelectionAction::Accept,
+    );
     let fp = fingerprint(&resolved);
     assert!(
         !fp.iter().any(|(_, t)| t.contains("cut")),
@@ -257,7 +302,11 @@ fn rule_3_accepting_the_deletion_drops_the_text() {
 #[test]
 fn rule_4_rejecting_the_deletion_restores_the_plain_insertion() {
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
-    let resolved = selective(&doc, &[2], ResolveSelectionAction::Reject);
+    let resolved = selective(
+        &doc,
+        &[identity_of_author(&doc, "AuthorB")],
+        ResolveSelectionAction::Reject,
+    );
     let fp = fingerprint(&resolved);
     assert!(
         fp.iter()
@@ -273,8 +322,10 @@ fn the_mixed_resolution_keeps_the_contested_text_as_base() {
     // the resolution row that motivated the whole selective-resolution
     // prerequisite (verified against real Word).
     let doc = Document::parse(&make_docx_with_body(DEL_IN_INS_P)).expect("parse");
-    let step1 = selective(&doc, &[1], ResolveSelectionAction::Accept);
-    let step2 = selective(&step1, &[2], ResolveSelectionAction::Reject);
+    let ins_id = identity_of_author(&doc, "AuthorA");
+    let del_id = identity_of_author(&doc, "AuthorB");
+    let step1 = selective(&doc, &[ins_id], ResolveSelectionAction::Accept);
+    let step2 = selective(&step1, &[del_id], ResolveSelectionAction::Reject);
     let fp = fingerprint(&step2);
     assert!(
         fp.iter().any(|(s, t)| s == "normal" && t.contains("cut")),
@@ -283,8 +334,8 @@ fn the_mixed_resolution_keeps_the_contested_text_as_base() {
 
     // And the composition commutes: reject the deletion first, then accept
     // the insertion.
-    let step1 = selective(&doc, &[2], ResolveSelectionAction::Reject);
-    let step2 = selective(&step1, &[1], ResolveSelectionAction::Accept);
+    let step1 = selective(&doc, &[del_id], ResolveSelectionAction::Reject);
+    let step2 = selective(&step1, &[ins_id], ResolveSelectionAction::Accept);
     let fp = fingerprint(&step2);
     assert!(
         fp.iter().any(|(s, t)| s == "normal" && t.contains("cut")),
@@ -299,38 +350,42 @@ fn cascaded_resolutions_are_enumerated_in_the_result() {
     use stemma::{DocxRuntime, SimpleRuntime};
     let runtime = SimpleRuntime::new();
 
-    // Rejecting A's insertion (id 1) implicitly resolves B's stacked
-    // deletion (id 2) — the result must say so.
-    let import = runtime
-        .import_docx(&make_docx_with_body(DEL_IN_INS_P))
-        .expect("import");
+    // The identities the caller resolves by (minting is deterministic for a
+    // given import, so the parsed Document and the runtime import agree):
+    // A's insertion and B's stacked deletion.
+    let docx = make_docx_with_body(DEL_IN_INS_P);
+    let doc = Document::parse(&docx).expect("parse");
+    let ins_id = identity_of_author(&doc, "AuthorA");
+    let del_id = identity_of_author(&doc, "AuthorB");
+
+    // Rejecting A's insertion implicitly resolves B's stacked deletion — the
+    // result must say so.
+    let import = runtime.import_docx(&docx).expect("import");
     let result = runtime
         .resolve_tracked_revisions(
             &import.doc_handle,
-            &std::collections::HashSet::from([1u32]),
+            &std::collections::HashSet::from([ins_id]),
             ResolveSelectionAction::Reject,
         )
         .expect("reject the insertion");
     assert_eq!(
         result.cascaded_revision_ids,
-        vec![2],
+        vec![del_id],
         "the cascade names B's deletion"
     );
 
-    // Accepting B's deletion (id 2) settles A's claim on the range.
-    let import = runtime
-        .import_docx(&make_docx_with_body(DEL_IN_INS_P))
-        .expect("import");
+    // Accepting B's deletion settles A's claim on the range.
+    let import = runtime.import_docx(&docx).expect("import");
     let result = runtime
         .resolve_tracked_revisions(
             &import.doc_handle,
-            &std::collections::HashSet::from([2u32]),
+            &std::collections::HashSet::from([del_id]),
             ResolveSelectionAction::Accept,
         )
         .expect("accept the deletion");
     assert_eq!(
         result.cascaded_revision_ids,
-        vec![1],
+        vec![ins_id],
         "the cascade names A's insertion"
     );
 }
@@ -591,9 +646,13 @@ fn stacked_row_mixed_resolution_keeps_the_row() {
     // row becomes a plain row. The outcome all-or-nothing can never reach
     // (Word /resolve gives the same answer).
     let doc = stacked_row_doc();
+    // Both of AuthorA's insertions (the row-structural trPr insert and the
+    // cell-content insert) and both of AuthorB's deletions.
+    let a_ins = identities_where(&doc, |r| r.author.as_deref() == Some("AuthorA"));
+    let b_del = identities_where(&doc, |r| r.author.as_deref() == Some("AuthorB"));
     let resolved = selective(
-        &selective(&doc, &[11, 13], ResolveSelectionAction::Accept),
-        &[12, 14],
+        &selective(&doc, &a_ins, ResolveSelectionAction::Accept),
+        &b_del,
         ResolveSelectionAction::Reject,
     );
     let texts = table_texts(&resolved);
@@ -608,18 +667,33 @@ fn stacked_row_mixed_resolution_keeps_the_row() {
 #[test]
 fn stacked_row_reject_insertion_cascades_the_deletion() {
     let doc = stacked_row_doc();
+    // The row-STRUCTURAL revision pair (trPr ins/del), disambiguated from the
+    // cell-content pair by its "row[..]" excerpt.
+    let row_ins = identities_where(&doc, |r| {
+        r.author.as_deref() == Some("AuthorA") && r.excerpt.starts_with("row[")
+    });
+    let row_del = identities_where(&doc, |r| {
+        r.author.as_deref() == Some("AuthorB") && r.excerpt.starts_with("row[")
+    });
+    assert_eq!(
+        row_ins.len(),
+        1,
+        "one row-structural insertion: {row_ins:?}"
+    );
+    assert_eq!(row_del.len(), 1, "one row-structural deletion: {row_del:?}");
     let snap = doc.snapshot();
     let cascaded = stemma::tracked_model::cascaded_resolution_ids(
         &snap.canonical,
-        &[11u32].into_iter().collect(),
+        &row_ins.iter().copied().collect(),
         ResolveSelectionAction::Reject,
     );
     assert!(
-        cascaded.contains(&12),
+        cascaded.contains(&row_del[0]),
         "the row deletion cascades: {cascaded:?}"
     );
-    // And resolving drops the row entirely.
-    let resolved = selective(&doc, &[11, 13], ResolveSelectionAction::Reject);
+    // And resolving drops the row entirely: reject both of AuthorA's insertions.
+    let a_ins = identities_where(&doc, |r| r.author.as_deref() == Some("AuthorA"));
+    let resolved = selective(&doc, &a_ins, ResolveSelectionAction::Reject);
     assert_eq!(table_texts(&resolved), vec!["Row one.", "Row three."]);
 }
 
@@ -691,8 +765,12 @@ fn stacked_mark_merges_paragraphs_in_both_full_resolutions() {
 fn stacked_mark_mixed_resolution_keeps_the_break() {
     let doc = stacked_mark_doc();
     let resolved = selective(
-        &selective(&doc, &[21], ResolveSelectionAction::Accept),
-        &[22],
+        &selective(
+            &doc,
+            &[identity_of_author(&doc, "AuthorA")],
+            ResolveSelectionAction::Accept,
+        ),
+        &[identity_of_author(&doc, "AuthorB")],
         ResolveSelectionAction::Reject,
     );
     let view = resolved.read();

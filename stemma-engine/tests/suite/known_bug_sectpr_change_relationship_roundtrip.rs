@@ -1,4 +1,4 @@
-//! KNOWN BUG (documented red, `#[ignore]`d): a `w:sectPrChange`'s embedded
+//! Regression: a `w:sectPrChange`'s embedded
 //! previous-state header/footer references corrupt `word/_rels/document.xml.rels`
 //! (I-REL-003) the SECOND time the document is reserialized while the change
 //! is still pending — reached here via a second `Document::apply` call, and
@@ -22,7 +22,7 @@
 //! leaves an authored sectPrChange genuinely PENDING while the document gets
 //! reserialized a second time still corrupts.
 //!
-//! ROOT CAUSE (traced precisely, not guessed):
+//! Former root cause (traced precisely, not guessed):
 //!
 //! 1. `apply_set_page_setup` (edit/verbs/page_setup.rs) snapshots the PRIOR
 //!    section properties into `SectionPropertyChange.previous_properties_raw`
@@ -56,17 +56,9 @@
 //!    "rId9". `validate_docx` then correctly flags this nonsense relationship
 //!    as I-REL-003 ("target does not exist in the package").
 //!
-//! This is a CLAUDE.md no-silent-fallback violation: `resolve_story_part_to_rid`
-//! silently treats "I cannot find this as a story part" as "mint a new
-//! relationship pointing nowhere" instead of refusing loud. The fix likely
-//! needs one of: (a) make `resolve_story_part_to_rid` recognize an input that
-//! is ALREADY a valid registered rId and return it unchanged (idempotent
-//! resolution), or (b) never bake a resolved rId into
-//! `previous_properties_raw` in the first place — keep the snapshot's
-//! reference as a placeholder across every rebuild until the change is
-//! actually resolved. Not attempted here — deeper than the enumeration/
-//! resolution scope this file's sibling gap was fixed under; flagged for its
-//! own task.
+//! This violated the no-silent-fallback rule. `resolve_story_part_to_rid` now
+//! recognizes an already-registered rId of the expected relationship type and
+//! returns it unchanged, making repeated snapshot resolution idempotent.
 //!
 //! Reproduction requires a header/footer reference that survives a
 //! save→reimport cycle while its sectPrChange stays unresolved — a
@@ -118,6 +110,7 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
 fn revision(id: u32, author: &str) -> RevisionInfo {
     RevisionInfo {
         revision_id: id,
+        identity: 0,
         author: Some(author.to_string()),
         date: Some("2026-06-12T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -125,10 +118,6 @@ fn revision(id: u32, author: &str) -> RevisionInfo {
 }
 
 #[test]
-#[ignore = "KNOWN BUG: sectPrChange header/footer ref round-trip corrupts \
-            relationships (I-REL-003) after save->reimport->partial-resolve->save; \
-            see this file's module doc for the traced root cause. Pre-existing, \
-            confirmed independent of the enumeration/resolution fix."]
 fn sectpr_change_survives_a_save_reimport_partial_resolve_save_cycle() {
     const ONE_PARA: &str =
         r#"<w:p><w:r><w:t>Safety glasses are recommended in the packing area.</w:t></w:r></w:p>"#;
@@ -231,15 +220,12 @@ fn sectpr_change_survives_a_save_reimport_partial_resolve_save_cycle() {
         author_b_result.is_ok(),
         "DOMAIN RULE: an unrelated body text edit, applied while a body \
          sectPrChange sits pending from an earlier save/reimport cycle, must \
-         never corrupt package relationships. Currently fails validation \
-         instead: {:?}",
+         never corrupt package relationships: {:?}",
         author_b_result.as_ref().err()
     );
 
-    // Unreachable while the bug stands: had Author B's edit applied cleanly,
-    // Author A's sectPrChange should still be selectively resolvable and the
-    // doc should still save clean afterward. Kept here as the documented
-    // target end-state for when the root cause (see module doc) is fixed.
+    // Author A's sectPrChange remains selectively resolvable and the document
+    // remains clean after another save.
     let doc = author_b_result.unwrap();
     let author_b_ids: HashSet<u32> = enumerate_revisions(&doc.snapshot().canonical)
         .into_iter()
@@ -273,6 +259,6 @@ fn sectpr_change_survives_a_save_reimport_partial_resolve_save_cycle() {
         second_save.is_ok(),
         "DOMAIN RULE: leaving a sectPrChange pending across a save/reimport/save \
          cycle must never corrupt package relationships, regardless of what else \
-         got resolved in between. Currently fails: {second_save:?}"
+         got resolved in between: {second_save:?}"
     );
 }

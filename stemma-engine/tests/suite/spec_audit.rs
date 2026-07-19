@@ -67,6 +67,7 @@ const PARAS_WITH_PENDING: &str = r#"<w:p><w:r><w:t>Service levels apply.</w:t></
 fn revision(id: u32, author: &str) -> RevisionInfo {
     RevisionInfo {
         revision_id: id,
+        identity: 0,
         author: Some(author.to_string()),
         date: Some("2026-07-04T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -102,6 +103,49 @@ fn apply(doc: &Document, step: EditStep, mode: MaterializationMode, rev: Revisio
         revision: rev,
     })
     .expect("edit applies")
+}
+
+/// Build a synthetic revision-heavy artifact entirely through public engine
+/// operations: diff authors a real move, then two unrelated tracked edits add
+/// distinct prior authors. Tests using this helper therefore audit a
+/// Stemma-produced artifact, the exact persistence boundary they specify.
+fn stemma_produced_revision_heavy_docx() -> Vec<u8> {
+    let before = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening language remains unchanged.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Bravo is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Charlie is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Prior edit target one.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Prior edit target two.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Unrelated editable tail.</w:t></w:r></w:p>"#,
+    ));
+    let target = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening language remains unchanged.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Charlie is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Bravo is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Prior edit target one.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Prior edit target two.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Unrelated editable tail.</w:t></w:r></w:p>"#,
+    ));
+    let base = Document::parse(&before).expect("parse synthetic move base");
+    let target = Document::parse(&target).expect("parse synthetic move target");
+    let moved = base
+        .diff_as(&target, "Mover")
+        .expect("author synthetic move");
+    let alice_step = replace_step(&moved, "target one", "reviewed target one");
+    let with_alice = apply(
+        &moved,
+        alice_step,
+        MaterializationMode::TrackedChange,
+        revision(1, "Alice"),
+    );
+    apply(
+        &with_alice,
+        replace_step(&with_alice, "target two", "reviewed target two"),
+        MaterializationMode::TrackedChange,
+        revision(2, "Bob"),
+    )
+    .serialize(&stemma::ExportOptions::default())
+    .expect("produce canonical revision-heavy input")
 }
 
 // ─── The identity audit ──────────────────────────────────────────────────────
@@ -175,13 +219,17 @@ fn tracked_edit_lands_in_census_not_direct_delta() {
     assert!(report.validator.ok, "{report:?}");
 }
 
-/// Receipts↔audit agreement, engine edition: the census's new ids are
-/// exactly the surviving ids above the baseline watermark — the same set
-/// the write receipt reports.
+/// Receipts↔audit agreement, engine edition: the census's new identities are
+/// exactly the after-side identity set minus the baseline identity set — the
+/// same rule the write receipt uses.
 #[test]
-fn census_ids_agree_with_the_watermark_rule() {
+fn census_ids_agree_with_identity_set_difference() {
     let doc = Document::parse(&make_docx_with_body(THREE_PARAS)).expect("parse");
-    let watermark = stemma::max_revision_id(&doc.snapshot().canonical);
+    let before_ids: std::collections::HashSet<u32> =
+        stemma::tracked_model::enumerate_revisions(&doc.snapshot().canonical)
+            .into_iter()
+            .map(|r| r.revision_id)
+            .collect();
     let step = replace_step(&doc, "Credits", "Credits are the exclusive remedy.");
     let edited = apply(
         &doc,
@@ -193,16 +241,15 @@ fn census_ids_agree_with_the_watermark_rule() {
     let report = edited.review().expect("review runs");
     let census_ids: std::collections::HashSet<u32> =
         report.new_revisions.iter().map(|r| r.revision_id).collect();
-    let watermark_ids: std::collections::HashSet<u32> =
+    let new_identity_ids: std::collections::HashSet<u32> =
         stemma::tracked_model::enumerate_revisions(&edited.snapshot().canonical)
             .into_iter()
             .map(|r| r.revision_id)
-            .filter(|id| *id > watermark)
+            .filter(|id| !before_ids.contains(id))
             .collect();
     assert_eq!(
-        census_ids, watermark_ids,
-        "in a session the record-identity census and the enumerated-watermark rule are the \
-         same set"
+        census_ids, new_identity_ids,
+        "in a session the audit census and receipt identity-set difference are the same set"
     );
 }
 
@@ -277,6 +324,165 @@ fn preexisting_revisions_left_alone_are_untouched() {
     assert!(report.untouched.violations.is_empty(), "{report:?}");
 }
 
+/// A saved artifact may use different OOXML `w:id` values from its input.
+/// Those values are diagnostics, not correspondence keys: a delivery audit
+/// must agree with the session receipt that every unrelated prior revision,
+/// including a grouped move, remained untouched.
+#[test]
+fn saved_unrelated_edit_preserves_multi_author_and_move_revisions() {
+    let before = stemma_produced_revision_heavy_docx();
+    let doc = Document::parse(&before).expect("parse revision-heavy input");
+    let step = replace_step(&doc, "Unrelated editable tail", "Unrelated revised tail.");
+    let edited = apply(
+        &doc,
+        step,
+        MaterializationMode::TrackedChange,
+        revision(1, "Current Editor"),
+    );
+
+    let session = edited.review().expect("session receipt audit runs");
+    assert!(
+        session
+            .preexisting_revisions
+            .iter()
+            .all(|row| row.disposition == RevisionDisposition::Untouched),
+        "the session receipt says every prior revision is preserved: {session:?}"
+    );
+    assert!(
+        session
+            .preexisting_revisions
+            .iter()
+            .any(|row| row.record.kind == RevisionKind::Move),
+        "the synthetic witness includes one grouped move: {session:?}"
+    );
+
+    let saved = edited
+        .serialize(&stemma::ExportOptions::default())
+        .expect("save revision-heavy output");
+    let delivery = stemma::audit(&before, &saved).expect("delivery audit runs");
+    assert_eq!(
+        delivery.preexisting_revisions, session.preexisting_revisions,
+        "save/reopen delivery evidence must agree with the session receipt"
+    );
+    assert!(delivery.direct_changes.is_empty(), "{delivery:?}");
+}
+
+/// Engine identities are stable across the save/reopen boundary for every
+/// semantically unchanged prior revision. The serializer is free to replace
+/// wire ids, so this compares the public enumeration identity by semantic row.
+#[test]
+fn prior_revision_identity_is_stable_across_save_and_reopen() {
+    let before = stemma_produced_revision_heavy_docx();
+    let doc = Document::parse(&before).expect("parse revision-heavy input");
+    let before_rows = stemma::tracked_model::enumerate_revisions(&doc.snapshot().canonical);
+
+    let step = replace_step(&doc, "Unrelated editable tail", "Unrelated revised tail.");
+    let edited = apply(
+        &doc,
+        step,
+        MaterializationMode::TrackedChange,
+        revision(1, "Current Editor"),
+    );
+    let edited_rows = stemma::tracked_model::enumerate_revisions(&edited.snapshot().canonical);
+    let saved = edited
+        .serialize(&stemma::ExportOptions::default())
+        .expect("save revision-heavy output");
+    let reopened = Document::parse(&saved).expect("reopen stemma-produced artifact");
+    let reopened_rows = stemma::tracked_model::enumerate_revisions(&reopened.snapshot().canonical);
+
+    for row in &reopened_rows {
+        let edited_id = edited_rows
+            .iter()
+            .find(|edited| {
+                edited.kind == row.kind
+                    && edited.author == row.author
+                    && edited.excerpt == row.excerpt
+            })
+            .map(|edited| edited.revision_id);
+        assert_eq!(
+            edited_id.as_ref(),
+            Some(&row.revision_id),
+            "produced revision identity changed on its first save/reopen: {row:?}"
+        );
+    }
+
+    for row in reopened_rows
+        .iter()
+        .filter(|row| row.author.as_deref() != Some("Current Editor"))
+    {
+        let before_id = before_rows
+            .iter()
+            .find(|before| {
+                before.kind == row.kind
+                    && before.author == row.author
+                    && before.excerpt == row.excerpt
+            })
+            .map(|before| before.revision_id);
+        assert_eq!(
+            before_id.as_ref(),
+            Some(&row.revision_id),
+            "unchanged revision identity changed across save/reopen: {row:?}"
+        );
+    }
+}
+
+/// Receipt/audit agreement is an invariant over the representative synthetic
+/// fixture shapes, not a one-off example. The session and delivery paths must
+/// assign the same disposition to every prior revision after an unrelated edit.
+#[test]
+fn session_and_delivery_prior_dispositions_agree_across_fixture_matrix() {
+    for (name, body, needle, replacement) in [
+        (
+            "multi-author inserts/deletes",
+            PARAS_WITH_PENDING,
+            "Left alone",
+            "Tail revised.",
+        ),
+        (
+            "multi-author with move",
+            THREE_PARAS,
+            "Unrelated editable tail",
+            "Unrelated revised tail.",
+        ),
+    ] {
+        let before = if name == "multi-author with move" {
+            stemma_produced_revision_heavy_docx()
+        } else {
+            make_docx_with_body(body)
+        };
+        let doc = Document::parse(&before).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let edited = apply(
+            &doc,
+            replace_step(&doc, needle, replacement),
+            MaterializationMode::TrackedChange,
+            revision(1, "Matrix Editor"),
+        );
+        let session = edited
+            .review()
+            .unwrap_or_else(|error| panic!("{name}: session audit: {error}"));
+        let saved = edited
+            .serialize(&stemma::ExportOptions::default())
+            .unwrap_or_else(|error| panic!("{name}: save: {error}"));
+        let delivery = stemma::audit(&before, &saved)
+            .unwrap_or_else(|error| panic!("{name}: delivery audit: {error}"));
+
+        let session_dispositions: Vec<_> = session
+            .preexisting_revisions
+            .iter()
+            .map(|row| (&row.record.revision_id, &row.disposition))
+            .collect();
+        let delivery_dispositions: Vec<_> = delivery
+            .preexisting_revisions
+            .iter()
+            .map(|row| (&row.record.revision_id, &row.disposition))
+            .collect();
+        assert_eq!(
+            delivery_dispositions, session_dispositions,
+            "{name}: session receipt and delivery audit disagree"
+        );
+    }
+}
+
 /// Resolving a pre-existing revision flips its disposition to Resolved, and
 /// the committed effect of that resolution is annotated on the direct-delta
 /// row it produces — attributed, not silently dropped and not misread as a
@@ -284,10 +490,21 @@ fn preexisting_revisions_left_alone_are_untouched() {
 #[test]
 fn resolved_preexisting_revision_reports_resolved_and_annotates_direct_delta() {
     let doc = Document::parse(&make_docx_with_body(PARAS_WITH_PENDING)).expect("parse");
-    // Accept Alice's deletion (#41); leave Bob's insertion (#42) pending.
+    // Address the revisions by their minted identities (H7), not the raw wire
+    // ids 41/42: Alice's deletion ("sole ") and Bob's insertion ("exclusive ").
+    let id_of = |author: &str, kind: RevisionKind| {
+        stemma::tracked_model::enumerate_revisions(&doc.snapshot().canonical)
+            .into_iter()
+            .find(|r| r.author.as_deref() == Some(author) && r.kind == kind)
+            .unwrap_or_else(|| panic!("a {kind:?} revision by {author} exists"))
+            .revision_id
+    };
+    let alice_del = id_of("Alice", RevisionKind::Delete);
+    let bob_ins = id_of("Bob", RevisionKind::Insert);
+    // Accept Alice's deletion; leave Bob's insertion pending.
     let resolved = doc
         .project(stemma::Resolution::Selective {
-            ids: std::collections::HashSet::from([41]),
+            ids: std::collections::HashSet::from([alice_del]),
             action: stemma::ResolveSelectionAction::Accept,
         })
         .expect("selective accept applies");
@@ -301,24 +518,24 @@ fn resolved_preexisting_revision_reports_resolved_and_annotates_direct_delta() {
             .unwrap_or_else(|| panic!("record {id} present: {report:?}"))
     };
     assert_eq!(
-        by_id(41).disposition,
+        by_id(alice_del).disposition,
         RevisionDisposition::Resolved,
         "{report:?}"
     );
     assert_eq!(
-        by_id(42).disposition,
+        by_id(bob_ins).disposition,
         RevisionDisposition::Untouched,
         "{report:?}"
     );
     assert!(report.new_revisions.is_empty(), "{report:?}");
 
     // Accepting the deletion moved committed content ("sole " is gone) —
-    // that committed change must be annotated with revision 41.
+    // that committed change must be annotated with the resolved revision.
     assert_eq!(report.direct_changes.len(), 1, "{report:?}");
     let row = &report.direct_changes[0];
     assert!(
-        row.coincides_with_resolution.contains(&41),
-        "the committed effect of resolving #41 is attributed: {row:?}"
+        row.coincides_with_resolution.contains(&alice_del),
+        "the committed effect of resolving Alice's deletion is attributed: {row:?}"
     );
     assert!(report.untouched.violations.is_empty(), "{report:?}");
 }
@@ -436,7 +653,102 @@ fn header_revision_appears_in_stateless_census() {
         1,
         "the header's new w:ins is in the census: {report:?}"
     );
-    assert_eq!(header_rows[0].revision_id, 201);
+    // H7: the census carries the minted identity, not the raw wire id 201.
+    assert_ne!(
+        header_rows[0].revision_id, 0,
+        "the census row carries a real minted identity: {report:?}"
+    );
     assert_eq!(header_rows[0].kind, RevisionKind::Insert);
+    assert!(report.untouched.violations.is_empty(), "{report:?}");
+}
+
+// ─── Untouched proof vs positional decoration refs ──────────────────────────
+
+/// Domain rule: the untouched proof compares DOCUMENT CONTENT. A tracked
+/// insertion in one paragraph must not indict a later, untouched paragraph
+/// merely because the engine's internal inline counter (embedded in
+/// decoration `opaque_ref`s) renumbered — that counter is a store reference,
+/// not content. Witnessed on wild documents: a one-word tracked edit made
+/// the verification fail on pure `decoration.opaque_ref` differences in
+/// otherwise untouched paragraphs.
+#[test]
+fn tracked_edit_does_not_indict_untouched_decoration_bearing_paragraph() {
+    let before = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening paragraph.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:bookmarkStart w:id="3" w:name="Anchor"/>"#,
+        r#"<w:r><w:t>Bookmarked paragraph.</w:t></w:r>"#,
+        r#"<w:bookmarkEnd w:id="3"/></w:p>"#,
+    ));
+    let after = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening paragraph.</w:t></w:r>"#,
+        r#"<w:ins w:id="90" w:author="Editor" w:date="2026-07-16T08:00:00Z">"#,
+        r#"<w:r><w:t xml:space="preserve"> Added.</w:t></w:r></w:ins></w:p>"#,
+        r#"<w:p><w:bookmarkStart w:id="3" w:name="Anchor"/>"#,
+        r#"<w:r><w:t>Bookmarked paragraph.</w:t></w:r>"#,
+        r#"<w:bookmarkEnd w:id="3"/></w:p>"#,
+    ));
+    let report = stemma::audit(&before, &after).expect("audit runs");
+    assert_eq!(report.new_revisions.len(), 1, "{report:?}");
+    assert!(report.direct_changes.is_empty(), "{report:?}");
+    assert!(
+        report.untouched.violations.is_empty(),
+        "the bookmarked paragraph is untouched content: {report:?}"
+    );
+}
+
+/// The counterpart that keeps the proof honest: a bookmark RENAMED in place
+/// (no tracked markup) IS a direct change to document content (§17.13.6.2 —
+/// the name is the bookmark's identity; the numeric id is a disposable
+/// pairing key) and must surface as an untouched-proof violation.
+#[test]
+fn silent_bookmark_rename_is_an_untouched_violation() {
+    let before = make_docx_with_body(concat!(
+        r#"<w:p><w:bookmarkStart w:id="3" w:name="Anchor"/>"#,
+        r#"<w:r><w:t>Bookmarked paragraph.</w:t></w:r>"#,
+        r#"<w:bookmarkEnd w:id="3"/></w:p>"#,
+    ));
+    let after = make_docx_with_body(concat!(
+        r#"<w:p><w:bookmarkStart w:id="3" w:name="Renamed"/>"#,
+        r#"<w:r><w:t>Bookmarked paragraph.</w:t></w:r>"#,
+        r#"<w:bookmarkEnd w:id="3"/></w:p>"#,
+    ));
+    let report = stemma::audit(&before, &after).expect("audit runs");
+    assert!(
+        !report.untouched.violations.is_empty(),
+        "a renamed bookmark is a content change the proof must surface: {report:?}"
+    );
+}
+
+/// Same rule for hyperlink-bearing paragraphs: hyperlink identity is the
+/// TARGET (url + anchor), not the engine's ephemeral inline NodeId — that id
+/// is minted from a document-global counter and renumbers whenever any
+/// earlier inline content shifts. A tracked insertion in one paragraph must
+/// not produce a direct-change row for an untouched hyperlink paragraph
+/// later in the document.
+#[test]
+fn tracked_edit_does_not_indict_untouched_hyperlink_paragraph() {
+    let hyperlink_para = concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">Email is </w:t></w:r>"#,
+        r#"<w:hyperlink w:anchor="section1" w:history="1">"#,
+        r#"<w:r><w:t>info@example.org</w:t></w:r></w:hyperlink></w:p>"#,
+    );
+    let before = make_docx_with_body(&format!(
+        r#"<w:p><w:r><w:t>Opening paragraph.</w:t></w:r></w:p>{hyperlink_para}"#
+    ));
+    let after = make_docx_with_body(&format!(
+        concat!(
+            r#"<w:p><w:r><w:t>Opening paragraph.</w:t></w:r>"#,
+            r#"<w:ins w:id="90" w:author="Editor" w:date="2026-07-16T08:00:00Z">"#,
+            r#"<w:r><w:t xml:space="preserve"> Added.</w:t></w:r></w:ins></w:p>"#,
+            "{}"
+        ),
+        hyperlink_para
+    ));
+    let report = stemma::audit(&before, &after).expect("audit runs");
+    assert_eq!(report.new_revisions.len(), 1, "{report:?}");
+    assert!(
+        report.direct_changes.is_empty(),
+        "an untouched hyperlink paragraph is not a direct change: {report:?}"
+    );
     assert!(report.untouched.violations.is_empty(), "{report:?}");
 }

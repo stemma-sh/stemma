@@ -135,6 +135,7 @@ fn deleted_row_doc_from(docx: &[u8], row_index: usize) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some(MUTATION_AUTHOR.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -172,6 +173,7 @@ fn inserted_row_doc() -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some(MUTATION_AUTHOR.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,

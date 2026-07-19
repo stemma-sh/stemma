@@ -141,6 +141,7 @@ fn simple_doc(para_id: &str, text: &str) -> CanonDoc {
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("Test Author".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,

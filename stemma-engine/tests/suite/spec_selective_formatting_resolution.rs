@@ -129,6 +129,7 @@ fn doc_with_ppr_change(id: u32) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: id,
+            identity: 0,
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -178,9 +179,20 @@ fn an_authored_ppr_change_is_enumerable_with_its_author() {
     assert_eq!(fmt[0].author.as_deref(), Some("fmt-test"));
 }
 
+/// The wire `w:id` the serializer wrote on the (single) `<w:pPrChange>` — the
+/// on-disk OOXML id, distinct from the engine identity under H7.
+fn serialized_pprchange_wire_id(xml: &str) -> Option<&str> {
+    let after = xml.split(r#"<w:pPrChange w:id=""#).nth(1)?;
+    after.split('"').next()
+}
+
 #[test]
 fn the_serialized_ppr_change_id_round_trips() {
     let doc = doc_with_ppr_change(41);
+    // H7 splits two ids that used to coincide: the caller-facing minted
+    // IDENTITY (what enumerate/Selective address) and the on-disk wire `w:id`
+    // (what the serializer emits; Word does not keep it unique). This test
+    // pins each against the right thing — never forcing them equal.
     let id = ppr_change_id(&doc);
     let bytes = doc
         .serialize(&stemma::ExportOptions {
@@ -197,17 +209,41 @@ fn the_serialized_ppr_change_id_round_trips() {
             .to_vec(),
     )
     .expect("utf8");
-    assert!(
-        xml.contains(&format!(r#"<w:pPrChange w:id="{id}""#)),
-        "the stored id is what the serializer emits (stable across saves): {xml}"
-    );
+    // (a) The serializer emits the change with a wire `w:id`.
+    let wire_id = serialized_pprchange_wire_id(&xml)
+        .unwrap_or_else(|| panic!("a pPrChange w:id is serialized: {xml}"))
+        .to_string();
+
     let reparsed = Document::parse(&bytes).expect("re-parse");
+    // (b) The IDENTITY handle survives the round-trip: the reparsed change
+    // still enumerates under the same minted id a caller would resolve by.
     let records = enumerate_revisions(&reparsed.snapshot().canonical);
     assert!(
         records
             .iter()
             .any(|r| r.kind.is_format() && r.revision_id == id),
-        "the id survives the round-trip: {records:?}"
+        "the identity handle survives the round-trip: {records:?}"
+    );
+    // (c) The wire `w:id` emission is stable across saves (deterministic).
+    let bytes2 = reparsed
+        .serialize(&stemma::ExportOptions {
+            mode: stemma::ExportMode::Redline,
+            validator_level: stemma::ValidatorLevel::Blocking,
+            validator: None,
+        })
+        .expect("re-serialize");
+    let xml2 = String::from_utf8(
+        stemma::docx::DocxArchive::read(&bytes2)
+            .expect("zip")
+            .get("word/document.xml")
+            .expect("document.xml")
+            .to_vec(),
+    )
+    .expect("utf8");
+    assert_eq!(
+        serialized_pprchange_wire_id(&xml2),
+        Some(wire_id.as_str()),
+        "the serialized wire id is stable across saves: {xml2}"
     );
 }
 
@@ -282,6 +318,7 @@ fn an_unselected_ppr_change_stays_pending() {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 90,
+                identity: 0,
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -306,7 +343,9 @@ fn an_unselected_ppr_change_stays_pending() {
         .formatting_change
         .as_ref()
         .expect("pPrChange still pending");
-    assert_eq!(fc.revision_id, fmt_id, "untouched, id intact");
+    // H7: the caller-facing handle is the minted identity (what `fmt_id` /
+    // enumerate report), not the wire `revision_id`.
+    assert_eq!(fc.identity, fmt_id, "untouched, id intact");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -390,6 +429,7 @@ fn doc_with_run_bold_change(id: u32) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: id,
+            identity: 0,
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -477,6 +517,7 @@ fn a_run_formatting_change_gets_a_stamped_id_even_when_the_caller_sends_the_zero
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 0, // the real-world sentinel, not a hand-picked id
+                identity: 0,
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -586,6 +627,7 @@ fn an_unselected_run_formatting_change_stays_pending() {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 90,
+                identity: 0,
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -610,7 +652,9 @@ fn an_unselected_run_formatting_change_stays_pending() {
         .formatting_change
         .as_ref()
         .expect("rPrChange still pending");
-    assert_eq!(fc.revision_id, fmt_id, "untouched, id intact");
+    // H7: the caller-facing handle is the minted identity (what `fmt_id` /
+    // enumerate report), not the wire `revision_id`.
+    assert_eq!(fc.identity, fmt_id, "untouched, id intact");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -725,6 +769,7 @@ fn doc_with_table_border_change(id: u32) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: id,
+            identity: 0,
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -791,6 +836,7 @@ fn doc_with_row_height_change(id: u32) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: id,
+            identity: 0,
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -864,6 +910,7 @@ fn doc_with_cell_shading_change(id: u32) -> Document {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: id,
+            identity: 0,
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,

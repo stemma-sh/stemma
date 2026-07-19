@@ -199,7 +199,7 @@ pub(crate) fn apply(
     // is carried through — the old blanket formatting refusal no longer
     // applies. Only refuse a base carrying an UNRESOLVED tracked change, which
     // the structural diff can't layer a fresh revision over.
-    validate_table_not_mid_redline(&base_table, step_index)?;
+    validate_table_not_mid_redline(&base_table, step_index, Some(transaction_floor))?;
 
     // A TRACKED column insert/delete over an EXPLICIT tblGrid is materialized
     // directly (not through the generic table diff): the diff's positional

@@ -23,6 +23,7 @@ use xmltree::Element;
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("Sentinel".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -590,11 +591,12 @@ fn insert_tail_case() -> InsertTailCase {
     let mut block_insert_ids = Vec::new();
     for tb in &edited.blocks {
         if let TrackingStatus::Inserted(r) = &tb.status {
-            block_insert_ids.push(r.revision_id);
+            // H7: address revisions by the engine-minted identity, not wire id.
+            block_insert_ids.push(r.identity);
         } else if let BlockNode::Paragraph(p) = &tb.block
             && let Some(TrackingStatus::Inserted(r)) = &p.para_mark_status
         {
-            anchor_mark_id = Some(r.revision_id);
+            anchor_mark_id = Some(r.identity);
         }
     }
     let doc = stemma::api::Document::parse(&make_docx_with_body(&body))
@@ -1325,17 +1327,26 @@ fn move_selective_states_agree_wire_vs_model_on_accept_and_reject() {
         .apply(&move_after(&orig[1], &orig[2], &orig[3]))
         .unwrap();
 
-    let mut ids: Vec<u32> = enumerate_revisions(&doc.snapshot().canonical)
+    let records: Vec<_> = enumerate_revisions(&doc.snapshot().canonical)
         .into_iter()
         .filter(|r| r.author.as_deref() == Some("Sentinel"))
-        .map(|r| r.revision_id)
         .collect();
+    // RFC-0004 §H7: a MOVE is ONE user intention. A two-block range move — its
+    // source content + source pilcrows + destination clones, all sharing one
+    // move_id — enumerates as ONE `Move` record under a SINGLE minted identity
+    // (it cannot strand a constituent). Any final-mark shift the move induces on
+    // a surviving paragraph is a SEPARATE, non-move revision.
+    let move_records = records
+        .iter()
+        .filter(|r| r.kind == stemma::RevisionKind::Move)
+        .count();
+    assert_eq!(
+        move_records, 1,
+        "the range move must enumerate as exactly one atomic Move record, got {records:?}"
+    );
+    let mut ids: Vec<u32> = records.iter().map(|r| r.revision_id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert!(
-        ids.len() >= 4,
-        "the range move minted several constituent ids"
-    );
 
     // Single-id and all-but-one subsets: the shapes that strand one constituent.
     let mut subsets: Vec<Vec<u32>> = ids.iter().map(|&i| vec![i]).collect();

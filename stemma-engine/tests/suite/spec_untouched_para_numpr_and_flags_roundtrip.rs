@@ -143,6 +143,7 @@ fn edit_a_different_paragraph(doc: &Document, target_text: &str) -> Vec<u8> {
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-06T00:00:00Z".to_string()),
             apply_op_id: None,
@@ -410,6 +411,7 @@ fn reject_restores_untouched_numpr_and_flags() {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 7,
+            identity: 0,
             author: Some("Spec".to_string()),
             date: Some("2026-07-06T00:00:00Z".to_string()),
             apply_op_id: None,

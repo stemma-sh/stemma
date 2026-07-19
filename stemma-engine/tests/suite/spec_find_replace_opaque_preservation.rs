@@ -165,6 +165,7 @@ fn doc(para: ParagraphNode) -> CanonDoc {
 fn revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 1,
+        identity: 0,
         author: Some("spec".to_string()),
         date: Some("2026-06-01T00:00:00Z".to_string()),
         apply_op_id: None,

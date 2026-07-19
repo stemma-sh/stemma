@@ -27,6 +27,7 @@ use xmltree::Element;
 fn test_revision() -> RevisionInfo {
     RevisionInfo {
         revision_id: 100,
+        identity: 0,
         author: Some("Edit Engine".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
@@ -1843,6 +1844,7 @@ fn edit_insert_multi_item_new_list_shares_single_override() {
         materialization_mode: MaterializationMode::TrackedChange,
         revision: RevisionInfo {
             revision_id: 200,
+            identity: 0,
             author: Some("Edit Engine".to_string()),
             date: Some("2026-04-13T00:00:00Z".to_string()),
             // A shared apply_op_id scopes the propagation pass — both

@@ -313,14 +313,17 @@ pub enum TrackStatus {
 }
 
 /// The revision metadata of a tracked change: who, when, and which apply produced
-/// it. This is the public projection of the IR's `RevisionInfo` — the internal
-/// `revision_id` numbering is surfaced (it is the stable id a caller groups
-/// adjacent spans by), but no other IR internals leak.
+/// it. This is the public projection of the IR's `RevisionInfo` — the
+/// engine-minted revision IDENTITY is surfaced (it is the stable id a caller
+/// groups adjacent spans by AND the handle accept/reject selectors address),
+/// but no other IR internals — notably not the non-unique wire `w:id` — leak.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RevisionView {
-    /// Stable id of this revision within the document. Adjacent spans sharing a
-    /// revision id belong to the same tracked change.
+    /// Stable engine-minted identity of this revision within the document
+    /// (RFC-0004 §H7). Adjacent spans sharing this id belong to the same tracked
+    /// change, and it is the value `Resolution::Selective` resolves — NOT the
+    /// wire `w:id`, which Word does not keep unique.
     pub revision_id: u32,
     /// Author of the change, when the source carried one. `None` when the DOCX
     /// had a `<w:ins>` / `<w:del>` with no `w:author` (Word anonymization,
@@ -534,7 +537,9 @@ impl From<&TrackingStatus> for TrackStatus {
 impl From<&crate::domain::RevisionInfo> for RevisionView {
     fn from(rev: &crate::domain::RevisionInfo) -> Self {
         RevisionView {
-            revision_id: rev.revision_id,
+            // Surface the engine-minted identity as the caller-facing revision
+            // id (the resolve handle), NOT the non-unique wire `w:id`.
+            revision_id: rev.identity,
             author: rev.author.clone(),
             date: rev.date.clone(),
             apply_op_id: rev.apply_op_id.clone(),
@@ -1184,7 +1189,7 @@ fn cell_paragraph_views(blocks: &[BlockNode]) -> Vec<CellParagraphView> {
                     );
                     let seg_rev = match &tracked_seg.status {
                         crate::domain::TrackingStatus::Inserted(r)
-                        | crate::domain::TrackingStatus::Deleted(r) => r.revision_id,
+                        | crate::domain::TrackingStatus::Deleted(r) => r.identity,
                         _ => 0,
                     };
                     if seg_rev != 0 {
@@ -1703,6 +1708,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
@@ -2049,6 +2055,7 @@ mod tests {
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 1,
+                identity: 0,
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-06-01T00:00:00Z".to_string()),
                 apply_op_id: None,

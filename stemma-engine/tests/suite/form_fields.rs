@@ -117,6 +117,7 @@ fn set_value_txn(block_id: NodeId, field_id: NodeId, value: FormFieldValue) -> E
         materialization_mode: MaterializationMode::Direct,
         revision: RevisionInfo {
             revision_id: 1,
+            identity: 0,
             author: Some("FF".to_string()),
             date: Some("2026-06-11T00:00:00Z".to_string()),
             apply_op_id: None,
