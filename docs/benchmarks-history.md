@@ -2,7 +2,7 @@
 
 This is the archival record behind [the benchmark report](benchmarks.md):
 per-lane tables for the older/cheaper model pins, the document-size detail,
-and the full wave-by-wave history — including the cells that were later
+and the full wave-by-wave history, including the cells that were later
 corrected, disqualified, or overturned, kept here so the corrections stay
 auditable. The headline numbers, methodology, caveats, and every claim we
 currently stand behind live in the main report; nothing here supersedes it.
@@ -18,9 +18,9 @@ main report for column definitions.
 
 ### Sonnet 4.6
 
-Historical replicated runs (June-era engine builds — this table compares
-model *and* engine era; n=3–5 per cell). Three vanilla cells never ran on
-this pin (—).
+Historical replicated runs used June-era engine builds, so this table compares
+both model and engine era. Each cell has 3 to 5 runs. Three vanilla cells never ran on
+this pin.
 
 | task | stemma success | vanilla success | stemma latency | vanilla latency | stemma tokens ÷ vanilla |
 |---|---|---|---|---|---|
@@ -30,7 +30,7 @@ this pin (—).
 | table-interior revision resolution | 5/5 | 3/5 | 30s | 251s | 0.26× |
 | paragraph-formatting revision (pPrChange) | 3/3 | 3/3 | 37s | 74s | 0.63× |
 | table/cell formatting-change selective resolution | 3/3 | 3/3 | 38s | 121s | 0.40× |
-| tracked table-row add + delete | 3/3 | — | 57s | — | — |
+| tracked table-row add + delete | 3/3 | not run | 57s | not run | not run |
 | tracked whole-section delete, renumbering | 3/3 | 3/3 | 28s | 40s | 1.14× |
 | tracked bold on defined terms (rPrChange) | 3/3 | 2/3 | 100s | 81s | 0.83× |
 | flatten a redline to a clean final | 3/3 | 0/3 | 27s | 54s | 0.56× |
@@ -44,8 +44,8 @@ this pin (—).
 | refusal / no-corruption under ambiguity | 4/5 | 4/5 | 209s | 261s | 0.31× |
 | add a comment | 3/3 | 3/3 | 29s | 30s | 0.87× |
 | insert an image with caption | 3/3 | 3/3 | 397s | 80s | 2.11× |
-| insert a native ToC field | 3/3 | — | 25s | — | — |
-| tracked edit inside a footnote body | 3/3 | — | 29s | — | — |
+| insert a native ToC field | 3/3 | not run | 25s | not run | not run |
+| tracked edit inside a footnote body | 3/3 | not run | 29s | not run | not run |
 | selective resolution @ ~300 markers | 3/3 | 3/3 | 121s | 305s | 0.30× |
 | @ ~1,000 markers | 3/3 | 3/3 | 149s | 345s | 0.78× |
 | @ ~3,050 markers | 3/3 | 3/3 | 224s | 427s | 0.50× |
@@ -53,7 +53,7 @@ this pin (—).
 ### Haiku 4.5
 
 Pinned wave 2026-07-04, same engines as the Sonnet 5 wave, n=3 per cell.
-Deferred tool-schema loading depressed several stemma cells — see the
+Deferred tool-schema loading depressed several stemma cells. See the
 invocation-barrier finding under the main report's
 [corrections](benchmarks.md#corrections-after-publication).
 
@@ -94,33 +94,34 @@ Reading the Haiku table:
 - Hand-editing OOXML collapses without a frontier model: Haiku's raw-XML arm
   fails even the lanes it aced on Sonnet 5 (f3, f5, auth-6, tracked table
   rows). Behind the engine, Haiku stays at or near 3/3 on the entire
-  resolution family — including the lanes Sonnet 5's raw-XML arm fails —
-  at roughly $0.10–0.25 per document.
+  resolution family, including the lanes Sonnet 5's raw-XML arm fails,
+  at roughly $0.10 to $0.25 per document.
 - The interface does not make a small model a large one: Haiku went 0/3 on
   every compound multi-step task (do-these-five-things-in-one-pass), while
   staying near-perfect on single-intent operations. Cheap models are an
   operational tier for decomposed calls, not planners.
 - Faster tokens did not mean faster tasks: on lanes Haiku handles cleanly it
-  is 1.3–4× faster than Sonnet 5, but retry loops on the lanes it fumbles
+  is 1.3 to 4× faster than Sonnet 5, but retry loops on the lanes it fumbles
   make its overall median *slower*. Task latency is turn count, not token
   rate.
-- The tracked-footnote cell (1/3 vs raw-XML's 3/3) — the tool arm's one loss
-  in three sweeps — was root-caused the same day as the invocation barrier
+- The tracked-footnote cell scored 1/3 versus raw-XML's 3/3, making it the
+  tool arm's one loss in three sweeps. It was root-caused the same day as the invocation barrier
   (the failing runs never invoked a stemma tool at all) and resolved by
   preloading tool schemas; see the main report's
   [corrections](benchmarks.md#corrections-after-publication).
 - Per-run forensics on every stemma-arm failure (both sweeps) are part of
   the suite's method; one previously-reported failure in this table was
   reclassified after forensics as a grading bug (the gate rejected a legal
-  self-closing `w:fldSimple`) — the gate was fixed, the run re-graded, and
+  self-closing `w:fldSimple`). The gate was fixed, the run re-graded, and
   the number above reflects it.
 
 ## Document size: flat vs. scaling (2026-07-04)
 
-The full detail behind the two negotiation-loop size rows in the main table
-— the identical task (same 43 tracked changes by two authors, same prompt,
-targets placed ≥75% deep) in a ~50-page and a ~150-page agreement, so
-document size is the only variable. Sonnet 5, n=3:
+The following table gives the full detail behind the two negotiation-loop
+size rows in the main table. Both use the identical task (the same 43 tracked
+changes by two authors, the same prompt, and targets placed at least 75% deep)
+in a ~50-page and a ~150-page agreement, so document size is the only
+variable. Sonnet 5, n=3:
 
 | document | arm | success | turns | latency | tokens |
 |---|---|---|---|---|---|
@@ -129,15 +130,15 @@ document size is the only variable. Sonnet 5, n=3:
 | ~150 pages | stemma | 2/3 | 29 | 144s | **1.57M** |
 | ~150 pages | vanilla | 3/3 | 46 | 261s | **3.47M** |
 
-Tripling the document moved stemma by one turn — and its token traffic did
+Tripling the document moved stemma by one turn, and its token traffic did
 not grow at all: the document stays server-side and the agent's traffic
 (outline, targeted reads, receipts) is size-invariant. The vanilla arm must
-move the XML through the context window, and scales with it — +33% tokens
+move the XML through the context window and scales with it: +33% tokens
 and +9 turns for the same 43 changes, its median run at 46 of 50 allowed
 turns, one rung from the ceiling. (stemma's one dropped rep at 150pp was an
-engine refusal fixed the same week — see the repo history for
+engine refusal fixed the same week; see the repo history for
 `comment_create` tracked-anchor support; the ladder predates the fix.) The
-engine itself resolves the 150-page redline in under two seconds — every
+engine itself resolves the 150-page redline in under two seconds. Every
 second in the table is agent loop, not engine.
 
 ## Wave history
@@ -150,26 +151,26 @@ revision-density ladder plus eight fresh capability probes at n=3, on the
 same-day development head. No cell mixes engine builds. "Pass" = every
 deterministic gate passed.
 
-### Wave 1 — decision-critical lanes (n=5 per arm)
+### Wave 1: decision-critical lanes (n=5 per arm)
 
 | lane | task | fixture | stemma | vanilla | verdict |
 |---|---|---|---|---|---|
-| res7 | produce accept-all + reject-all copies of a redline (roundtrip fidelity) | 6 KB, 47 revision markers, 2 authors | **5/5** · $0.30 | 2/4\* · $0.85 | **stemma win** — the one replicated quality moat |
+| res7 | produce accept-all + reject-all copies of a redline (roundtrip fidelity) | 6 KB, 47 revision markers, 2 authors | **5/5** · $0.30 | 2/4\* · $0.85 | **stemma win**, the one replicated quality moat |
 | f4 | move a section as a tracked change; auto-numbering + cross-refs must survive | 18 KB, ~10 pp, 0 revisions | 3/5 · $0.95 | **5/5** · $1.32 | **inversion: vanilla wins** |
-| f1 | apply counsel's list of 8 edits as tracked changes on a clean NDA | 18 KB, 6–8 pp, 0 revisions | 4/5 · $0.87 | 1/5 · $1.30 | stemma edge, both arms flippy |
+| f1 | apply counsel's list of 8 edits as tracked changes on a clean NDA | 18 KB, 6 to 8 pp, 0 revisions | 4/5 · $0.87 | 1/5 · $1.30 | stemma edge, both arms flippy |
 | res8 | selective formatting-change resolution (v1 prompt) | 6 KB, 47 markers | 2/5 · $0.28 | **5/5**† · $0.40 | **inversion: vanilla wins** under the v1 prompt (see the main report's corrections) |
 | f5 | edits adjacent to opaque objects (figures, footnote-in-sentence, hyperlink, term replace) | 43 KB, ~8 pp, images/equation/fields | 5/5 · $0.74 | 5/5 · $0.84 | **tie** |
 | auth6 | layer a tracked edit inside another author's pending insertion | 129 KB, 367 markers | 5/5 · $0.65 | 5/5 · **$0.34** | stable tie; **vanilla cheapest** |
-| safe6 | tighten a redline with no author identity given — never impersonate the existing reviewer | 129 KB, 367 markers | 4/5 · $0.69 | 3/4\* · n/p | tie (both flippy); no clean run ever impersonated |
+| safe6 | tighten a redline without an author identity while never impersonating the existing reviewer | 129 KB, 367 markers | 4/5 · $0.69 | 3/4\* · n/p | tie (both flippy); no clean run ever impersonated |
 
-† corrected 2026-07-02: originally published as vanilla 0/5. A gate bug —
-string-comparing serialized XML instead of the properties it encodes — had
+† corrected 2026-07-02: originally published as vanilla 0/5. The gate
+string-compared serialized XML instead of the properties it encodes. This had
 failed every vanilla run on a whitespace-only serializer-dialect diff while
 passing stemma's own (same-serializer) output. Gate fixed, all runs re-graded;
 see the main report's
 ["Corrections after publication"](benchmarks.md#corrections-after-publication).
 stemma's 2/5 stands: its misses left the change pending where the v1 prompt
-said "keep" (a defensible reading of an ambiguous word — the v2 lane below
+said "keep" (a defensible reading of an ambiguous word; the v2 lane below
 settles it).
 
 \* one vanilla run per starred cell was **disqualified by transcript audit**
@@ -195,25 +196,25 @@ Notes, in honesty order:
   was under-scoping (it added no authored edits that run), not impersonation;
   vanilla's one miss was a suite-invariant violation (it edited the input file
   in place), not impersonation either.
-  stemma's write surface does refuse author impersonation *by construction* —
+  stemma's write surface does refuse author impersonation *by construction*,
   but this benchmark never caught a competitor committing that failure, so it
   is reported as an engine property, not a demonstrated competitive failure.
   The vanilla cost for this lane is not published: the underlying task's
   frozen prompt names the stemma plugin, which sends a no-stemma agent
-  hunting for it — the authorship *gates* over the hand-made outputs are
+  hunting for it. The authorship *gates* over the hand-made outputs are
   unaffected, but the *economics* of those runs don't measure raw-XML editing.
 - **auth6 is the economics counterexample:** vanilla is ~2× cheaper there
-  ($0.31–0.39 vs $0.61–0.88, no spread overlap).
+  ($0.31 to $0.39 versus $0.61 to $0.88, with no spread overlap).
 - **res8 inverts once its gate is honest.** Vanilla hand-materialized the
   formatting-change acceptance correctly in all 5 runs; stemma's 2/5 comes
   from reading "keep this change" as leave-pending. With the prompt
-  disambiguated (res8v2 in the wave-2 table), both arms pass 3/3 — the lane
+  disambiguated (res8v2 in the wave-2 table), both arms pass 3/3. The lane
   is a tie, and the earlier "vanilla can't resolve formatting changes"
   reading is withdrawn.
 
-### Wave 2 — remaining gated lanes (n=3 per arm, public-release engine)
+### Wave 2: remaining gated lanes (n=3 per arm, public-release engine)
 
-Run 2026-07-02 on the public release (commit `e378b55`) under CLI 2.1.198,
+Run 2026-07-02 on the first public release build under CLI 2.1.198,
 after the harness hardening described in the main report's contamination
 section; transcript audit clean on all 36 runs. All lanes below share either
 the 6 KB / 47-marker engine-fabricated redline, the 18 KB real-Word NDA, or
@@ -237,8 +238,8 @@ Wave-2 honesty notes:
   more than the requested scope.
 - **The economics gap is task-shaped, not universal.** Under the newer CLI,
   vanilla reached near cost-parity on the surgical single-edit lanes (auth2,
-  res5, res4) — the earlier "stemma is always 2–5× cheaper" reading does not
-  hold there. The gap stays large (~4–8×) where the task forces bulk output
+  res5, res4), the earlier "stemma is always 2 to 5× cheaper" reading does not
+  hold there. The gap stays large (roughly 4 to 8×) where the task forces bulk output
   through the context window: full triage (f3), producing whole documents
   (cmp1, res6's clean copy). Same confound caveat as wave 1, in both
   directions.
@@ -246,7 +247,7 @@ Wave-2 honesty notes:
   the same lanes (different engine build and CLI); the superseded singles
   agree directionally and remain in the held-out run inventory.
 
-### Wave 3 — density ladder + capability probes (n=3 per arm, suite v2.1)
+### Wave 3: density ladder and capability probes (n=3 per arm, suite v2.1)
 
 Run 2026-07-02 (afternoon) under CLI 2.1.198; transcript audit clean on all
 66 runs. Two questions: does the resolution tie hold as revision density
@@ -254,32 +255,32 @@ scales by 10×, and what happens on document verbs *outside* the resolution
 family (tables, comments, images, footnotes, formatting, ToC, flatten)?
 All fixtures are fresh, engine-fabricated for this wave; at first
 publication their real-Word verification was pending (the oracle was
-unreachable) — the sweep ran 2026-07-03 and is folded into the clean-open
+unreachable). The sweep ran 2026-07-03 and is folded into the clean-open
 section below: all fixtures and outputs open clean, and Word's own
 revision census matches the frozen marker counts where Word can enumerate
-them. Engine build: the 2026-07-02 development head (same-day fix
-merges; the exact build commit was not pinned — disclosed, not hidden;
+them. The engine build was the 2026-07-02 development head with same-day
+fix merges. The exact build commit was not pinned, which is disclosed here;
 each lane's replications ran back-to-back on one binary). Runs that hit the
 turn ceiling with no output count as **failures**, not exclusions.
 
-**Density ladder** — the same two-author selective-resolution task on a
+**Density ladder:** the same two-author selective-resolution task on a
 ~61 pp agreement, fabricated at three revision densities:
 
 | lane | markers | stemma | vanilla | verdict |
 |---|---|---|---|---|
-| scale-d1 | 304 | 3/3 · $0.58 ($0.44–0.68) | 3/3 · $1.04 ($0.52–2.01) | tie on quality |
-| scale-d2 | 1,016 | 3/3 · $0.69 ($0.67–0.72) | 3/3 · $1.00 ($0.82–1.72) | tie on quality |
-| scale-d3 | 3,050 | 3/3 · $0.80 ($0.63–0.87) | 3/3 · $1.20 ($1.08–1.26) | tie on quality |
+| scale-d1 | 304 | 3/3 · $0.58 ($0.44 to $0.68) | 3/3 · $1.04 ($0.52 to $2.01) | tie on quality |
+| scale-d2 | 1,016 | 3/3 · $0.69 ($0.67 to $0.72) | 3/3 · $1.00 ($0.82 to $1.72) | tie on quality |
+| scale-d3 | 3,050 | 3/3 · $0.80 ($0.63 to $0.87) | 3/3 · $1.20 ($1.08 to $1.26) | tie on quality |
 
 There is **no density cliff for either arm**. The mechanism is worth
 stating: at these densities the vanilla agent stops hand-editing and writes
 itself a small resolver program over the XML, so marker count barely moves
-its cost — it effectively rebuilds a document engine per task. stemma stays
-~1.5–2× cheaper with a much tighter spread ($0.58→$0.80 across a 10×
-density increase, vs vanilla's $0.52–2.01 run-to-run swing at the lowest
+its cost because it effectively rebuilds a document engine per task. stemma stays
+roughly 1.5 to 2× cheaper with a much tighter spread (from $0.58 to $0.80 across a 10×
+density increase, versus vanilla's $0.52 to $2.01 run-to-run swing at the lowest
 tier). The economics confound from earlier waves applies here too.
 
-**Capability probes** — one verb per lane, small single-purpose fixtures:
+**Capability probes:** one verb per lane, using small single-purpose fixtures:
 
 | lane | task | stemma | vanilla | verdict |
 |---|---|---|---|---|
@@ -287,15 +288,15 @@ tier). The economics confound from earlier waves applies here too.
 | cmt-1 | add a comment (annotation; revision census unchanged) | 3/3 · $0.21 | 3/3 · $0.20 | tie |
 | img-1 | insert a provided image with caption | 3/3 · $0.95 | 3/3 · $0.33 | tie; **vanilla ~3× cheaper** |
 | fmt-a1 | tracked bold on defined terms (a true formatting change, not text churn) | **3/3** · $0.35 | 2/3 · $0.31 | stemma edge |
-| cmp-f1 | flatten a two-author redline (incl. footnote-story revisions) to a clean final copy | **3/3** · $0.16 | **0/3** · $0.25 | **stemma win — vanilla silently emptied the footnotes, all 3 runs** |
+| cmp-f1 | flatten a two-author redline (incl. footnote-story revisions) to a clean final copy | **3/3** · $0.16 | **0/3** · $0.25 | **stemma win because vanilla silently emptied the footnotes in all 3 runs** |
 | tbl-s1 | add + delete tracked table rows | 1/3 · $0.66 | **3/3** · $0.26 | **inversion: vanilla wins** |
 | toc-1 | insert a native, Word-updatable ToC field | 0/3 · $0.32 | 0/3 · $0.25 | **both arms fail** |
-| fn-a1 | tracked correction inside a footnote body | **0/3** (2 hit the turn ceiling) · $1.57 ($1.35–19.37) | **3/3** · $0.18 | **inversion: vanilla wins** |
+| fn-a1 | tracked correction inside a footnote body | **0/3** (2 hit the turn ceiling) · $1.57 ($1.35 to $19.37) | **3/3** · $0.18 | **inversion: vanilla wins** |
 
 Wave-3 honesty notes, worst-for-stemma first:
 
 - **fn-a1 is stemma's worst cell in the entire suite.** The tool surface had
-  no tracked path into footnote bodies, and — worse — its note-editing verb
+  no tracked path into footnote bodies. Worse, its note-editing verb
   neither supported tracked mode nor *refused* when the task demands it. One
   run edited the footnote untracked (caught by the no-untracked-mutations
   gate); the other two recognized untracked output would be wrong and burned
@@ -308,18 +309,18 @@ Wave-3 honesty notes, worst-for-stemma first:
   shipping untracked row surgery. Same genus as the wave-1 f4 loss:
   ergonomics of the write surface, measured honestly as a loss.
 - **toc-1 is a symmetric zero with asymmetric causes.** stemma simply had no
-  ToC verb — no run could produce a native field. Vanilla inserted a
+  ToC verb, so no run could produce a native field. Vanilla inserted a
   plausible ToC field every time but *also* mutated body text it had no
-  reason to touch — the same typographic-quote substitution in all three
+  reason to touch: the same typographic-quote substitution in all three
   runs, caught by the content-otherwise-unchanged gate.
 - **cmp-f1 is the strongest stemma-favorable replication of the wave.** All
   three vanilla runs produced a clean-looking final document whose footnote
-  text was *empty* — silent content loss, reported as success by the agent
+  text was *empty*. This silent content loss was reported as success by the agent
   every time. This is exactly the failure class the suite's MUST-NOT gates
   exist for, and the first time a competitor arm committed it reproducibly.
   Disclosure: the engine capability this lane exercises (story-aware
   revision handling) merged the same day, motivated by an engine gap found
-  while fabricating held-out fixtures for the res8 correction — the fix
+  while fabricating held-out fixtures for the res8 correction. The fix
   predates this lane's runs and was not derived from them.
 - **fmt-a1's vanilla miss is a fidelity trap worth naming:** it materialized
   the formatting change as delete + re-insert of the text, which reads as
@@ -345,20 +346,20 @@ stemma cells above remain in the record as the pre-fix baseline:
 | lane | stemma (pre-fix, wave 3) | stemma (post-fix, v2.2) | vanilla (wave 3) |
 |---|---|---|---|
 | toc-1 | 0/3 | **3/3** · $0.20 | 0/3 |
-| fn-a1 | 0/3 (2 DNF, worst run $19.37) | **3/3** · $0.22, 6–7 turns | 3/3 · $0.18 |
+| fn-a1 | 0/3 (2 DNF, worst run $19.37) | **3/3** · $0.22, 6 to 7 turns | 3/3 · $0.18 |
 | tbl-s1 | 1/3 | **3/3** · $0.29 | 3/3 · $0.26 |
 
-Read honestly: fn-a1 and tbl-s1 became ties (vanilla was already passing —
-the fix removes stemma's dead ends and the $19-DNF failure mode rather
+Read honestly: fn-a1 and tbl-s1 became ties because vanilla was already
+passing. The fix removes stemma's dead ends and the $19-DNF failure mode rather
 than beating anyone), and toc-1 became a stemma-only capability on this
 suite (vanilla's 0/3 body-text mutation stands). Transcript audit clean on
 all 9 runs. The 2026-07-03 oracle sweep additionally confirmed all nine
 outputs open clean in real Word AND that Word classifies the new verbs'
 machinery as real revisions (the footnote correction as insert+delete in
 the footnotes story; the row surgery as cell insertions/deletions; the ToC
-as a tracked insert) — not silently-ignored markup. Remaining caveat:
+as a tracked insert), rather than silently ignored markup. Remaining caveat:
 same-fixture re-runs after a fix are the weakest form of validation this
-suite accepts — fresh held-out fixtures for these three capability classes
+suite accepts. Fresh held-out fixtures for these three capability classes
 are the planned stronger check. (The 2026-07 model sweeps in the main
 report subsequently re-measured all three capabilities on fresh waves.)
 
@@ -368,15 +369,15 @@ Every wave-1 output docx was opened by a real Microsoft Word instance:
 **stemma 35/35 clean, vanilla 35/35 clean.** An earlier single run in which
 a vanilla output tripped Word's repair dialog did **not** replicate.
 Clean-open does not discriminate between a careful raw-XML agent and stemma
-on these lanes — that earlier "headline" was noise, and we retract it
+on these lanes. That earlier "headline" was noise, and we retract it
 explicitly.
 
 The 2026-07-03 sweep extended this to everything published since: **every
-graded output of waves 2 and 3 and the v2.2 post-fix re-runs — 124/124 —
-opens clean, zero repairs, both arms.** The eleven wave-3 fixtures also
+graded output of waves 2 and 3 and the v2.2 post-fix re-runs opens clean:
+124/124, zero repairs, across both arms.** The eleven wave-3 fixtures also
 open clean, and Word's own revision inventory matches the frozen census
 where Word can enumerate it (the flatten fixture's 8 markers exactly; the
 zero-marker capability fixtures at zero). The three density-ladder
-fixtures open clean but their census (304–3,050 markers) exceeds the
+fixtures open clean but their census (304 to 3,050 markers) exceeds the
 oracle's per-call Word timeout, so those three counts are engine-frozen
-only — disclosed rather than hidden.
+only, which is disclosed here.

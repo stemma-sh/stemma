@@ -303,6 +303,9 @@ struct UnreachableMatchReceipt {
 #[derive(Serialize)]
 struct VerificationReceipt {
     profile: &'static str,
+    artifact_stage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_sha256: Option<String>,
     validator_level: &'static str,
     validator_ok: bool,
     direct_changes: usize,
@@ -588,7 +591,7 @@ where
     let deliverable = refused == 0;
     let should_emit_output = applied > 0 && (deliverable || emit_partial);
 
-    let verification = if applied == 0 {
+    let in_memory_report = if applied == 0 {
         None
     } else {
         let report = document
@@ -607,17 +610,7 @@ where
                 audited_revision_ids.len()
             ));
         }
-        Some(VerificationReceipt {
-            profile: "stemma.worklist_verification.v0",
-            validator_level: "blocking",
-            validator_ok: report.validator.ok,
-            direct_changes: report.direct_changes.len(),
-            untouched_violations: report.untouched.violations.len(),
-            untouched_verified_blocks: report.untouched.verified_blocks,
-            untouched_parts: report.untouched.parts,
-            preexisting_revisions_preserved: report.preexisting_revisions.len(),
-            new_revisions: audited_revision_ids.len(),
-        })
+        Some(report)
     };
 
     let serialized_output =
@@ -628,6 +621,34 @@ where
         } else {
             None
         };
+    let verification = match (in_memory_report, serialized_output.as_deref()) {
+        (None, _) => None,
+        (Some(report), None) => Some(verification_receipt(
+            &report,
+            "in_memory_non_deliverable",
+            None,
+        )),
+        (Some(_), Some(bytes)) => {
+            let report = verify_serialized_delivery(input.bytes(), bytes)?;
+            let audited_revision_ids: BTreeSet<u32> = report
+                .new_revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            if audited_revision_ids != attributed_revision_ids {
+                return Err(format!(
+                    "serialized worklist receipt mismatch: attributed revision count {} differs from audit count {}",
+                    attributed_revision_ids.len(),
+                    audited_revision_ids.len()
+                ));
+            }
+            Some(verification_receipt(
+                &report,
+                "serialized_output",
+                Some(digest_bytes(bytes).hex),
+            ))
+        }
+    };
     let output_receipt = serialized_output.as_deref().map(|bytes| OutputReceipt {
         role: if deliverable {
             "output_redline"
@@ -1013,6 +1034,36 @@ fn verify_report(report: &stemma::audit::AuditReport) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_serialized_delivery(
+    input_bytes: &[u8],
+    output_bytes: &[u8],
+) -> Result<stemma::audit::AuditReport, String> {
+    let report = stemma::api::audit(input_bytes, output_bytes)
+        .map_err(|error| format!("cannot audit serialized worklist result: {error}"))?;
+    verify_report(&report)?;
+    Ok(report)
+}
+
+fn verification_receipt(
+    report: &stemma::audit::AuditReport,
+    artifact_stage: &'static str,
+    output_sha256: Option<String>,
+) -> VerificationReceipt {
+    VerificationReceipt {
+        profile: "stemma.worklist_verification.v0",
+        artifact_stage,
+        output_sha256,
+        validator_level: "blocking",
+        validator_ok: report.validator.ok,
+        direct_changes: report.direct_changes.len(),
+        untouched_violations: report.untouched.violations.len(),
+        untouched_verified_blocks: report.untouched.verified_blocks,
+        untouched_parts: report.untouched.parts.clone(),
+        preexisting_revisions_preserved: report.preexisting_revisions.len(),
+        new_revisions: report.new_revisions.len(),
+    }
+}
+
 fn digest_bytes(bytes: &[u8]) -> OutputDigestReceipt {
     OutputDigestReceipt {
         algorithm: "sha256",
@@ -1083,6 +1134,108 @@ fn default_expected_matches() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_delivery_verification_rejects_untracked_direct_change() {
+        let input_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../stemma-engine/testdata/simple-text/before.docx");
+        let before = std::fs::read(&input_path).expect("read fixture");
+        let document = Document::parse(&before).expect("parse fixture");
+        let options = ReplaceTextOptions {
+            old: "foo bar".to_string(),
+            new: "changed directly".to_string(),
+            author: "Approved Reviewer".to_string(),
+            scope: ReplaceTextScope::WholeDoc,
+            expected: ExpectedMatches::Count(1),
+            match_mode: MatchMode::Exact,
+            on_barrier_match: BarrierPolicy::Fail,
+        };
+        let plan = plan_replace_text(document.snapshot().canonical.as_ref(), &options)
+            .expect("plan direct edit");
+        let transaction = EditTransaction {
+            steps: plan.steps,
+            summary: Some("untracked direct change sentinel".to_string()),
+            materialization_mode: MaterializationMode::Direct,
+            revision: RevisionInfo {
+                revision_id: 0,
+                identity: 0,
+                author: Some("Approved Reviewer".to_string()),
+                date: None,
+                apply_op_id: Some("direct-sentinel".to_string()),
+            },
+        };
+        let after = document
+            .apply_authored(&transaction, false)
+            .expect("apply direct edit")
+            .serialize(&ExportOptions::default())
+            .expect("serialize direct edit");
+
+        let error = verify_serialized_delivery(&before, &after)
+            .expect_err("untracked direct output is not deliverable");
+        assert!(
+            error.contains("untracked direct change"),
+            "refusal names the failed invariant: {error}"
+        );
+    }
+
+    #[test]
+    fn complete_receipt_binds_verification_to_serialized_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let input_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../stemma-engine/testdata/simple-text/before.docx");
+        let worklist_path = directory.path().join("worklist.json");
+        let output_path = directory.path().join("verified.docx");
+        let receipt_path = directory.path().join("verified.receipt.json");
+        let artifacts = PathAuthority::explicit().unwrap();
+        let input = artifacts
+            .read_source(&input_path, "test_input", None)
+            .unwrap();
+        let worklist = serde_json::json!({
+            "schema": WORKLIST_SCHEMA,
+            "input": {
+                "sha256": input.identity().digest.hex,
+                "bytes": input.identity().bytes,
+            },
+            "author": "Approved Reviewer",
+            "changes": [{
+                "id": "change-1",
+                "old": "foo bar",
+                "new": "review-ready language"
+            }]
+        });
+        std::fs::write(
+            &worklist_path,
+            serde_json::to_vec_pretty(&worklist).unwrap(),
+        )
+        .unwrap();
+
+        let status = apply_worklist(
+            &artifacts,
+            &input_path,
+            &worklist_path,
+            &output_path,
+            Some(&receipt_path),
+            false,
+        )
+        .expect("verified apply succeeds");
+        assert!(matches!(status, ApplyStatus::Complete));
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(
+            receipt["verification"]["artifact_stage"],
+            "serialized_output"
+        );
+        assert_eq!(
+            receipt["verification"]["output_sha256"], receipt["output"]["digest"]["hex"],
+            "the post-serialization verdict is bound to the exact committed bytes"
+        );
+        let committed = std::fs::read(&output_path).expect("read committed output");
+        assert_eq!(
+            digest_bytes(&committed).hex,
+            receipt["verification"]["output_sha256"]
+        );
+    }
 
     #[test]
     fn post_receipt_failure_leaves_only_an_unconfirmed_diagnostic_receipt() {

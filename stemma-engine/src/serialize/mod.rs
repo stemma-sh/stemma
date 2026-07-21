@@ -12,8 +12,8 @@ use crate::domain::{
     FieldData, FieldKind, FormattingChange, FrameProperties, HyperlinkData, HyperlinkRun,
     InlineNode, LineSpacingRule, Mark, MarkValue, NodeId, OpaqueInlineNode, OpaqueKind,
     ParagraphNode, RevisionInfo, Shading, StyleProps, TableCellNode, TableFormatting,
-    TableMeasurement, TableNode, TableRowNode, TrackedBlock, TrackedSegment, TrackingStatus,
-    VerticalAlignment, VerticalMerge,
+    TableMeasurement, TableNode, TableRowNode, TextNode, TrackedBlock, TrackedSegment,
+    TrackingStatus, VerticalAlignment, VerticalMerge,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, HYPERLINK_REL_TYPE, RuntimeError, build_sdt_wrapper,
@@ -107,6 +107,7 @@ fn append_literal_prefix_runs(
     trailing_ws: &str,
     has_trailing_tab: bool,
     embed_trailing_tab_in_prefix_run: bool,
+    preserve_source_boundaries: bool,
     leading_rpr: Option<&crate::domain::PrefixLeadingRpr>,
     trailing_rpr: Option<&crate::domain::PrefixLeadingRpr>,
     marks: &[Mark],
@@ -114,7 +115,37 @@ fn append_literal_prefix_runs(
     directness: RunDirectness,
     deleted_text: bool,
     next_id: &mut u32,
-) {
+) -> Option<String> {
+    if preserve_source_boundaries
+        && let Some(provenance) = leading_rpr
+        && !provenance.source_runs.is_empty()
+    {
+        let mut pending_body_prefix = None;
+        for source_run in &provenance.source_runs {
+            if source_run.joins_body {
+                assert!(
+                    pending_body_prefix.is_none(),
+                    "a literal prefix can join at most one remaining body run"
+                );
+                pending_body_prefix = Some(source_run.text.clone());
+                continue;
+            }
+            let mut run = build_text_run_with_leading_tabs(
+                &source_run.text,
+                &source_run.marks,
+                &source_run.style_props,
+                source_run.rpr_authored,
+                deleted_text,
+                None,
+                next_id,
+                None,
+            );
+            apply_source_run_attrs(&mut run, &source_run.source_run_attrs);
+            parent.children.push(XMLNode::Element(run));
+        }
+        return pending_body_prefix;
+    }
+
     // The leading whitespace/tab run authored its OWN rPr (a tab-only run
     // preceding the label): emit it as its own run wearing that formatting —
     // folding it into the label run would silently swap its authored rPr for
@@ -190,7 +221,7 @@ fn append_literal_prefix_runs(
                     None,
                 )));
         }
-        return;
+        return None;
     }
     if !has_trailing_tab {
         // The separator whitespace is part of the SAME prefix run formatting:
@@ -218,6 +249,7 @@ fn append_literal_prefix_runs(
                 None,
             )));
     }
+    None
 }
 
 fn ensure_prefix_trailing_tab_consumed(
@@ -239,6 +271,18 @@ fn ensure_prefix_trailing_tab_consumed(
         });
     }
     Ok(())
+}
+
+fn apply_source_run_attrs(run: &mut Element, attrs: &[(String, String)]) {
+    for (name, value) in attrs {
+        assert!(
+            name.rsplit(':')
+                .next()
+                .is_some_and(|local| local.starts_with("rsid")),
+            "source run provenance may only contain rsid* attributes"
+        );
+        attr_set(run, name, value.clone());
+    }
 }
 
 fn tabbed_text_children(
@@ -620,7 +664,41 @@ fn append_inline_refs_to_container(
     mut resolve_rel_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
     pending_prefix_sep: &mut Option<String>,
 ) -> Result<(), RuntimeError> {
-    for &inline in inlines {
+    let mut index = 0;
+    while index < inlines.len() {
+        if let (InlineNode::HardBreak(hard_break), Some(InlineNode::Text(text))) =
+            (inlines[index], inlines.get(index + 1).copied())
+            && hard_break.joins_following_text_run
+        {
+            append_joined_break_text_run(
+                parent,
+                hard_break,
+                text,
+                deleted_text,
+                next_id,
+                pending_prefix_sep,
+            );
+            index += 2;
+            continue;
+        }
+        if let (InlineNode::Decoration(decoration), Some(InlineNode::Text(text))) =
+            (inlines[index], inlines.get(index + 1).copied())
+            && decoration.joins_following_text_run
+        {
+            append_joined_decoration_text_run(
+                parent,
+                decoration,
+                text,
+                deleted_text,
+                next_id,
+                bookmark_policy,
+                origin,
+                pending_prefix_sep,
+            )?;
+            index += 2;
+            continue;
+        }
+        let inline = inlines[index];
         let resolver = resolve_rel_rid
             .as_mut()
             .map(|resolver| &mut **resolver as &mut dyn FnMut(&str, &str) -> String);
@@ -634,6 +712,7 @@ fn append_inline_refs_to_container(
             resolver,
             pending_prefix_sep,
         )?;
+        index += 1;
     }
     Ok(())
 }
@@ -649,7 +728,41 @@ fn append_inlines_to_container(
     mut resolve_rel_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
     pending_prefix_sep: &mut Option<String>,
 ) -> Result<(), RuntimeError> {
-    for inline in inlines {
+    let mut index = 0;
+    while index < inlines.len() {
+        if let (InlineNode::HardBreak(hard_break), Some(InlineNode::Text(text))) =
+            (&inlines[index], inlines.get(index + 1))
+            && hard_break.joins_following_text_run
+        {
+            append_joined_break_text_run(
+                parent,
+                hard_break,
+                text,
+                deleted_text,
+                next_id,
+                pending_prefix_sep,
+            );
+            index += 2;
+            continue;
+        }
+        if let (InlineNode::Decoration(decoration), Some(InlineNode::Text(text))) =
+            (&inlines[index], inlines.get(index + 1))
+            && decoration.joins_following_text_run
+        {
+            append_joined_decoration_text_run(
+                parent,
+                decoration,
+                text,
+                deleted_text,
+                next_id,
+                bookmark_policy,
+                origin,
+                pending_prefix_sep,
+            )?;
+            index += 2;
+            continue;
+        }
+        let inline = &inlines[index];
         let resolver = resolve_rel_rid
             .as_mut()
             .map(|resolver| &mut **resolver as &mut dyn FnMut(&str, &str) -> String);
@@ -663,7 +776,111 @@ fn append_inlines_to_container(
             resolver,
             pending_prefix_sep,
         )?;
+        index += 1;
     }
+    Ok(())
+}
+
+fn build_break_element(break_type: &crate::domain::BreakType) -> Element {
+    let mut element = w_el("br");
+    match break_type {
+        crate::domain::BreakType::Page => attr_set(&mut element, "w:type", "page"),
+        crate::domain::BreakType::Column => attr_set(&mut element, "w:type", "column"),
+        crate::domain::BreakType::TextWrapping => {}
+    }
+    element
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_joined_break_text_run(
+    parent: &mut Element,
+    hard_break: &crate::domain::HardBreakNode,
+    text: &TextNode,
+    deleted_text: bool,
+    next_id: &mut u32,
+    pending_prefix_sep: &mut Option<String>,
+) {
+    if let Some(separator) = pending_prefix_sep.take() {
+        parent
+            .children
+            .push(XMLNode::Element(build_separator_run(&separator)));
+    }
+    let mut run = build_text_run_with_leading_tabs(
+        &text.text,
+        &text.marks,
+        &text.style_props,
+        text.rpr_authored,
+        deleted_text,
+        text.formatting_change.as_ref(),
+        next_id,
+        None,
+    );
+    apply_source_run_attrs(&mut run, &text.source_run_attrs);
+    let insert_at = usize::from(run.children.first().is_some_and(
+        |child| matches!(child, XMLNode::Element(el) if local_element_name(el) == "rPr"),
+    ));
+    run.children.insert(
+        insert_at,
+        XMLNode::Element(build_break_element(&hard_break.break_type)),
+    );
+    parent.children.push(XMLNode::Element(run));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_joined_decoration_text_run(
+    parent: &mut Element,
+    decoration: &crate::domain::DecorationNode,
+    text: &TextNode,
+    deleted_text: bool,
+    next_id: &mut u32,
+    bookmark_policy: &BookmarkIdPolicy,
+    origin: &str,
+    pending_prefix_sep: &mut Option<String>,
+) -> Result<(), RuntimeError> {
+    let raw_xml = decoration.raw_xml.as_deref().ok_or_else(|| RuntimeError {
+        code: ErrorCode::UnsupportedEdit,
+        message: "joined run decoration has no raw XML".to_string(),
+        details: ErrorDetails {
+            context: Some(format!("opaque_ref={}", decoration.opaque_ref)),
+            ..ErrorDetails::default()
+        },
+    })?;
+    let mut element =
+        crate::word_xml::parse_raw_fragment(raw_xml).map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "failed to parse joined run decoration XML".to_string(),
+            details: ErrorDetails {
+                context: Some(format!("opaque_ref={} err={source}", decoration.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        })?;
+    assert!(
+        decoration_requires_run_wrapper(&element),
+        "only run-level decorations can join a following text run"
+    );
+    let effective_origin = decoration.origin.as_deref().unwrap_or(origin);
+    let emit_decoration =
+        apply_decoration_id_policy(&mut element, bookmark_policy, effective_origin)?
+            != DecorationEmit::Skip;
+    let separator = pending_prefix_sep.take();
+    let mut run = build_text_run_with_leading_tabs(
+        &text.text,
+        &text.marks,
+        &text.style_props,
+        text.rpr_authored,
+        deleted_text,
+        text.formatting_change.as_ref(),
+        next_id,
+        separator.as_deref(),
+    );
+    apply_source_run_attrs(&mut run, &text.source_run_attrs);
+    if emit_decoration {
+        let insert_at = usize::from(run.children.first().is_some_and(
+            |child| matches!(child, XMLNode::Element(el) if local_element_name(el) == "rPr"),
+        ));
+        run.children.insert(insert_at, XMLNode::Element(element));
+    }
+    parent.children.push(XMLNode::Element(run));
     Ok(())
 }
 
@@ -681,7 +898,7 @@ fn append_single_inline(
     match inline {
         InlineNode::Text(text) => {
             let sep = pending_prefix_sep.take();
-            let run = build_text_run_with_leading_tabs(
+            let mut run = build_text_run_with_leading_tabs(
                 &text.text,
                 &text.marks,
                 &text.style_props,
@@ -691,6 +908,7 @@ fn append_single_inline(
                 next_id,
                 sep.as_deref(),
             );
+            apply_source_run_attrs(&mut run, &text.source_run_attrs);
             parent.children.push(XMLNode::Element(run));
         }
         InlineNode::HardBreak(hb) => {
@@ -700,17 +918,8 @@ fn append_single_inline(
                     .push(XMLNode::Element(build_separator_run(&sep)));
             }
             let mut run = w_el("r");
-            let mut br = w_el("br");
-            match hb.break_type {
-                crate::domain::BreakType::Page => {
-                    attr_set(&mut br, "w:type", "page");
-                }
-                crate::domain::BreakType::Column => {
-                    attr_set(&mut br, "w:type", "column");
-                }
-                crate::domain::BreakType::TextWrapping => {}
-            }
-            run.children.push(XMLNode::Element(br));
+            run.children
+                .push(XMLNode::Element(build_break_element(&hb.break_type)));
             parent.children.push(XMLNode::Element(run));
         }
         InlineNode::OpaqueInline(opaque) => {
@@ -1475,12 +1684,13 @@ pub(crate) fn serialize_paragraph_node(
                 }
                 _ => w_del(next_annotation_id(next_id), author, date),
             };
-            append_literal_prefix_runs(
+            let _ = append_literal_prefix_runs(
                 &mut prefix_container,
                 prefix.trim_end(),
                 &paragraph.literal_prefix_leading_ws,
                 &paragraph.literal_prefix_trailing_ws,
                 paragraph.literal_prefix_has_trailing_tab,
+                false,
                 false,
                 paragraph.literal_prefix_leading_rpr.as_deref(),
                 paragraph.literal_prefix_trailing_rpr.as_deref(),
@@ -1531,12 +1741,13 @@ pub(crate) fn serialize_paragraph_node(
                 }
                 _ => w_ins(next_annotation_id(next_id), rev_author, rev_date),
             };
-            append_literal_prefix_runs(
+            let _ = append_literal_prefix_runs(
                 &mut wrapper,
                 prefix.trim_end(),
                 &paragraph.literal_prefix_leading_ws,
                 &paragraph.literal_prefix_trailing_ws,
                 paragraph.literal_prefix_has_trailing_tab,
+                false,
                 false,
                 paragraph.literal_prefix_leading_rpr.as_deref(),
                 paragraph.literal_prefix_trailing_rpr.as_deref(),
@@ -1671,14 +1882,20 @@ pub(crate) fn serialize_paragraph_node(
             paragraph.segments.first().map(|segment| &segment.status),
             Some(TrackingStatus::Inserted(_)) | Some(TrackingStatus::Deleted(_))
         );
+    let mut has_source_boundary_witness = false;
     if let Some(prefix) = &literal_prefix {
-        append_literal_prefix_runs(
+        has_source_boundary_witness = paragraph
+            .literal_prefix_leading_rpr
+            .as_deref()
+            .is_some_and(|provenance| !provenance.source_runs.is_empty());
+        let source_pending = append_literal_prefix_runs(
             &mut p,
             prefix.trim_end(),
             &paragraph.literal_prefix_leading_ws,
             &paragraph.literal_prefix_trailing_ws,
             paragraph.literal_prefix_has_trailing_tab,
             embed_prefix_trailing_tab,
+            true,
             paragraph.literal_prefix_leading_rpr.as_deref(),
             paragraph.literal_prefix_trailing_rpr.as_deref(),
             &pfx_marks,
@@ -1687,8 +1904,14 @@ pub(crate) fn serialize_paragraph_node(
             false,
             next_id,
         );
+        if has_source_boundary_witness {
+            // The witness contains the complete consumed prefix stream. Either
+            // its final fragment rejoins the body, or all fragments were emitted
+            // above; never also emit the reconstructed legacy separator.
+            pending_prefix_sep = source_pending;
+        }
     }
-    if embed_prefix_trailing_tab {
+    if embed_prefix_trailing_tab && !has_source_boundary_witness {
         pending_prefix_sep = None;
     }
 
@@ -3028,6 +3251,7 @@ fn append_tracked_hyperlink_paragraph_opaque(
         tracked.runs = vec![HyperlinkRun {
             text: tracked.text.clone(),
             rpr_xml: None,
+            source_run_attrs: Vec::new(),
             status: status.clone(),
         }];
     } else {
@@ -6115,6 +6339,7 @@ pub(crate) fn build_hyperlink_element(data: &HyperlinkData) -> Element {
 /// is `<w:del>`.
 fn build_hyperlink_run(run: &HyperlinkRun, deleted: bool) -> Element {
     let mut r = w_el("r");
+    apply_source_run_attrs(&mut r, &run.source_run_attrs);
 
     // Restore rPr if present. These bytes were serialized by us during import
     // via serialize_element(), so a parse failure is a programmer bug.
@@ -7012,13 +7237,14 @@ mod tests {
 
         let mut paragraph = w_el("p");
         let mut next_id = 1u32;
-        append_literal_prefix_runs(
+        let _ = append_literal_prefix_runs(
             &mut paragraph,
             "(f)",
             "\t",
             "",
             false,
             false,
+            true,
             None,
             None,
             &[],
@@ -7115,6 +7341,7 @@ mod tests {
                             },
                             wrapper_marks: Vec::new(),
                             wrapper_style_props: StyleProps::default(),
+                            joins_following_text_run: false,
                             raw_xml: Some(bm_start_raw.to_vec()),
                             // Key: this decoration came from target during merge
                             origin: Some("target".to_string()),
@@ -7126,6 +7353,7 @@ mod tests {
                             marks: vec![],
                             style_props: StyleProps::default(),
                             rpr_authored: crate::domain::RunRprAuthored::default(),
+                            source_run_attrs: Vec::new(),
                             formatting_change: None,
                         }),
                     ],
@@ -7236,6 +7464,7 @@ mod tests {
                             },
                             wrapper_marks: Vec::new(),
                             wrapper_style_props: StyleProps::default(),
+                            joins_following_text_run: false,
                             raw_xml: Some(bm_end_raw.to_vec()),
                             // No origin override needed — block is Inserted,
                             // so it naturally gets origin="target"
@@ -7248,6 +7477,7 @@ mod tests {
                             marks: vec![],
                             style_props: StyleProps::default(),
                             rpr_authored: crate::domain::RunRprAuthored::default(),
+                            source_run_attrs: Vec::new(),
                             formatting_change: None,
                         }),
                     ],
@@ -7641,21 +7871,25 @@ mod tests {
                 HyperlinkRun {
                     text: "before ".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 },
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: " after".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 },
             ],
@@ -7723,6 +7957,7 @@ mod tests {
             runs: vec![HyperlinkRun {
                 text: "click here".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
             extra_attrs: vec![],
@@ -7737,6 +7972,38 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["r".to_string()]);
+    }
+
+    #[test]
+    fn hyperlink_run_restores_source_rsid_attrs() {
+        let data = HyperlinkData {
+            url: None,
+            anchor: Some("target".to_string()),
+            text: "click".to_string(),
+            r_id: None,
+            runs: vec![HyperlinkRun {
+                text: "click".to_string(),
+                rpr_xml: None,
+                source_run_attrs: vec![
+                    ("w:rsidR".to_string(), "00112233".to_string()),
+                    ("w:rsidRPr".to_string(), "00445566".to_string()),
+                ],
+                status: TrackingStatus::Normal,
+            }],
+            extra_attrs: vec![],
+        };
+
+        let hyperlink = build_hyperlink_element(&data);
+        let run = hyperlink
+            .children
+            .iter()
+            .find_map(|child| match child {
+                XMLNode::Element(element) if local_element_name(element) == "r" => Some(element),
+                _ => None,
+            })
+            .expect("hyperlink must contain its source run");
+        assert_eq!(attr_get(run, "w:rsidR"), Some(&"00112233".to_string()));
+        assert_eq!(attr_get(run, "w:rsidRPr"), Some(&"00445566".to_string()));
     }
 
     // ── cell content-control span ratchet ────────────────────────────────

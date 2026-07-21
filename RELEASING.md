@@ -24,14 +24,16 @@ maintainer checklist; contributors never need it.
    `id-token: write`, uses Node 24, enforces the Node 22.14.0/npm 11.5.1
    trusted-publishing floors, and requests provenance attestations.
 3. **Protected release environment.** In GitHub repository settings, create an
-   environment named exactly `release`. Add required reviewers, prevent
-   self-review, and disallow administrator bypass. The workflow's promotion
-   job must remain pending there while the exact build artifacts are run
-   through Word qualification. An unprotected environment defeats the release
-   gate and is a release blocker. Before building, CI queries the environment
-   and refuses to continue unless it finds named required reviewers with
-   self-review prevention; administrator-bypass policy remains a maintainer
-   setup check.
+   environment named exactly `release`. Add required reviewers and disallow
+   administrator bypass. With more than one maintainer, also enable
+   self-review prevention; a solo maintainer necessarily approves their own
+   dispatch, and the required-reviewer pause still gates promotion. The
+   workflow's promotion job must remain pending there while the exact build
+   artifacts are run through Word qualification. An unprotected environment
+   defeats the release gate and is a release blocker. Before building, CI
+   queries the environment and refuses to continue unless it finds named
+   required reviewers; it reports whether self-review is prevented, and
+   administrator-bypass policy remains a maintainer setup check.
 4. **Protected release-tag ruleset.** In repository Settings → Rules →
    Rulesets, create one active tag ruleset named exactly
    `protected-release-tags`. Include exactly `v*` (the API reports
@@ -105,12 +107,16 @@ maintainer checklist; contributors never need it.
    - **build** produces the five-platform binary matrix
      (linux x64/arm64 glibc, macOS x64/arm64, windows x64), stamps every
      binary with `version+g<commit>`, and runs both the edit/reopen smoke and
-     mandatory safe-artifact wire harness before upload; each uploaded target
-     includes the JSON conformance report and exact binary SHA-256;
+     mandatory safe-artifact wire harness before upload. The harness selects
+     the explicit `advanced` profile because its persistence-boundary cases
+     span both compact-core and expert escape-hatch producers, and refuses the
+     binary before running cases if any required tool is absent. Each uploaded
+     target includes the JSON conformance report and exact binary SHA-256;
    - **candidate-manifest** requires exactly those five native artifacts,
      independently re-hashes every binary/report, verifies native executable
-     architecture, build stamp, platform, timestamps, and the stable 21-case
-     result set, then uploads one content-minimized create-new manifest;
+     architecture, build stamp, platform, timestamps, the explicit conformance
+     tool profile, and the stable 21-case result set, then uploads one
+     content-minimized create-new manifest;
    - **release-approval** waits at the protected `release` environment. While
      it is pending, download the candidate manifest and exact artifacts, run
      the required Word/client qualification, and record the report. Reject the

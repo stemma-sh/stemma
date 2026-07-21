@@ -260,6 +260,7 @@ fn paragraph_text_to_inlines_with_formatting(
                     marks: marks.to_vec(),
                     style_props: style_props.clone(),
                     rpr_authored: crate::domain::RunRprAuthored::from_effective(marks, style_props),
+                    source_run_attrs: Vec::new(),
                     formatting_change: formatting_change.clone(),
                 }));
                 *inline_index += 1;
@@ -281,6 +282,7 @@ fn paragraph_text_to_inlines_with_formatting(
                     paragraph_id.0, segment_index, inline_index
                 )),
                 break_type: crate::domain::BreakType::TextWrapping,
+                joins_following_text_run: false,
             }));
             inline_index += 1;
         } else {
@@ -1013,10 +1015,10 @@ fn inline_changes_to_segments_with_opaques(
     // leaving user-authored field results (e.g. HYPERLINK display text) untouched.
     let segments = coalesce_split_field_sequences(segments);
     let segments = normalize_paragraph_opaque_reading_order(segments);
-    // Invariant M (domain-model §6): apply the edit path's compaction here too,
-    // as the final pass, so both materializers normalize segment boundaries
-    // identically. Runs last so the field/opaque passes above still see the
-    // un-merged boundaries they depend on.
+    // Invariant M (domain-model §6): apply the edit path's segment normalization
+    // here too, as the final pass, so both materializers normalize tracking
+    // boundaries identically. Runs last so the field/opaque passes above still
+    // see the unmerged segment boundaries they depend on.
     let mut segments = segments;
     crate::edit::normalize_segments(&mut segments);
     Ok(segments)
@@ -1521,6 +1523,8 @@ fn sync_literal_prefix_geometry(target: &ParagraphNode, paragraph: &mut Paragrap
     paragraph.literal_prefix_marks = target.literal_prefix_marks.clone();
     paragraph.literal_prefix_style_props = target.literal_prefix_style_props.clone();
     paragraph.literal_prefix_rpr_authored = target.literal_prefix_rpr_authored;
+    paragraph.literal_prefix_leading_rpr = target.literal_prefix_leading_rpr.clone();
+    paragraph.literal_prefix_trailing_rpr = target.literal_prefix_trailing_rpr.clone();
     paragraph.literal_prefix_leading_tab_twips = target.literal_prefix_leading_tab_twips;
     paragraph.literal_prefix_leading_tab_count = target.literal_prefix_leading_tab_count;
     paragraph.literal_prefix_leading_ws = target.literal_prefix_leading_ws.clone();
@@ -1740,6 +1744,7 @@ fn make_prefix_text_node(
             marks: source.literal_prefix_marks.clone(),
             style_props: source.literal_prefix_style_props.clone(),
             rpr_authored: source.literal_prefix_rpr_authored,
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         };
     }
@@ -1752,6 +1757,7 @@ fn make_prefix_text_node(
             marks: t.marks.clone(),
             style_props: t.style_props.clone(),
             rpr_authored: t.rpr_authored,
+            source_run_attrs: t.source_run_attrs.clone(),
             formatting_change: None,
         },
         None => TextNode {
@@ -1761,6 +1767,7 @@ fn make_prefix_text_node(
             marks: Vec::new(),
             style_props: StyleProps::default(),
             rpr_authored: RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         },
     }
@@ -5312,10 +5319,13 @@ fn fix_numbering_drift_for_normal_blocks(
                         _ => {}
                     }
                 } else {
-                    // Block was not modified by the diff — it's unchanged.
-                    // Materialize literal_prefix as inline text (structural
-                    // numbering is preserved for Word to synthesize).
-                    materialize_numbering_prefix_in_place(&mut merged.block);
+                    // Block was not modified by the diff — preserve it exactly.
+                    // In particular, keep a hoisted literal prefix structural:
+                    // materializing it here replaces its imported source-run
+                    // witness with one synthetic TextNode, so a later rebuild
+                    // cannot retain the original w:r boundaries. Prefixes only
+                    // need materialization when a changed/inserted/deleted block
+                    // must express them as revision content.
                 }
             }
         }
@@ -6036,6 +6046,7 @@ fn merge_paragraph_into_following(donor: &mut ParagraphNode, target: &mut Paragr
                 marks: target.literal_prefix_marks.clone(),
                 style_props: target.literal_prefix_style_props.clone(),
                 rpr_authored: target.literal_prefix_rpr_authored,
+                source_run_attrs: Vec::new(),
                 formatting_change: None,
             })],
         });
@@ -11376,6 +11387,7 @@ mod tests {
                 marks: Vec::new(),
                 style_props: StyleProps::default(),
                 rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
                 formatting_change: None,
             })]),
             block_text_hash: None,
@@ -11459,6 +11471,7 @@ mod tests {
             marks: Vec::new(),
             style_props: StyleProps::default(),
             rpr_authored: RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
@@ -12776,11 +12789,13 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
             ],
@@ -12834,11 +12849,13 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
             ],
@@ -12939,11 +12956,13 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
             ],
@@ -13049,11 +13068,13 @@ mod tests {
                     HyperlinkRun {
                         text: "old".to_string(),
                         rpr_xml: None,
+                        source_run_attrs: Vec::new(),
                         status: TrackingStatus::Deleted(rev(5)),
                     },
                     HyperlinkRun {
                         text: "new".to_string(),
                         rpr_xml: None,
+                        source_run_attrs: Vec::new(),
                         status: TrackingStatus::Inserted(rev(6)),
                     },
                 ],
@@ -14013,6 +14034,80 @@ mod tests {
         ));
     }
 
+    /// An identity diff has no numbering transition to express. A literal
+    /// prefix therefore stays in its structural slot, including the imported
+    /// source-run witness needed to reproduce its original w:r boundaries.
+    #[test]
+    fn merge_identity_preserves_literal_prefix_source_runs() {
+        let mut paragraph = match make_paragraph("p1", "Body") {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        paragraph.literal_prefix = Some("2.1.1.".to_string());
+        paragraph.literal_prefix_trailing_ws = " ".to_string();
+        paragraph.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![
+                crate::domain::LiteralPrefixSourceRun {
+                    text: "2.1.".to_string(),
+                    marks: Vec::new(),
+                    style_props: StyleProps::default(),
+                    rpr_authored: crate::domain::RunRprAuthored::default(),
+                    source_run_attrs: vec![("w:rsidR".to_string(), "00112233".to_string())],
+                    joins_body: false,
+                },
+                crate::domain::LiteralPrefixSourceRun {
+                    text: "1. ".to_string(),
+                    marks: Vec::new(),
+                    style_props: StyleProps::default(),
+                    rpr_authored: crate::domain::RunRprAuthored::default(),
+                    source_run_attrs: vec![("w:rsidRPr".to_string(), "00445566".to_string())],
+                    joins_body: false,
+                },
+            ],
+        }));
+        let base = make_doc(vec![BlockNode::Paragraph(paragraph.clone())]);
+        let diff = DocumentDiff {
+            base_fingerprint: base.meta.docx_fingerprint.clone(),
+            target_fingerprint: base.meta.docx_fingerprint.clone(),
+            changes: Vec::new(),
+        };
+        let revision = RevisionInfo {
+            revision_id: 1,
+            identity: 1,
+            author: Some("test".to_string()),
+            date: Some("2026-07-21T00:00:00Z".to_string()),
+            apply_op_id: None,
+        };
+
+        let merged = merge_diff(&base, &base, &diff, &revision)
+            .expect("identity merge")
+            .doc;
+        let actual = match &merged.blocks[0].block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => panic!("expected paragraph"),
+        };
+
+        assert_eq!(actual, &paragraph);
+        assert!(
+            actual
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.inlines)
+                .all(|inline| !matches!(
+                    inline,
+                    InlineNode::Text(text)
+                        if text.text_role
+                            == Some(TextRole::MaterializedPrefix(
+                                MaterializedPrefixKind::Structural,
+                            ))
+                )),
+            "identity merge must not synthesize a materialized-prefix text node"
+        );
+    }
+
     #[test]
     fn accept_reject_projection_roundtrip_text() {
         let base = make_doc(vec![make_paragraph("p1", "hello world")]);
@@ -14095,6 +14190,7 @@ mod tests {
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
                     rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 }),
                 InlineNode::from(TextNode {
@@ -14104,6 +14200,7 @@ mod tests {
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
                     rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 }),
             ],
@@ -14161,6 +14258,7 @@ mod tests {
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
                     rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 }),
                 InlineNode::from(TextNode {
@@ -14170,6 +14268,7 @@ mod tests {
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
                     rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 }),
             ],
@@ -14657,6 +14756,7 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
             raw_xml: Some(bookmark_raw.to_vec()),
             origin: None,
         });
@@ -14671,6 +14771,7 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
             raw_xml: Some(bookmark_end_raw.to_vec()),
             origin: None,
         });
@@ -14713,6 +14814,7 @@ mod tests {
                         marks: Vec::new(),
                         style_props: StyleProps::default(),
                         rpr_authored: RunRprAuthored::default(),
+                        source_run_attrs: Vec::new(),
                         formatting_change: None,
                     }),
                     bookmark_end,

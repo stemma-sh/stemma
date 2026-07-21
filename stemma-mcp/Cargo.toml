@@ -1,6 +1,6 @@
 [package]
 name = "stemma-mcp"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 # Uniform workspace toolchain floor (see stemma-engine/Cargo.toml for the full
 # derivation). This crate's rmcp stack alone requires >= 1.88 (darling 0.23);
@@ -21,13 +21,14 @@ path = "src/main.rs"
 [dependencies]
 # version alongside path: local builds use the workspace copy; a crates.io
 # publish resolves the same dependency from the registry.
-stemma = { path = "../stemma-engine", version = "0.2.0" }
-stemma-artifacts = { path = "../stemma-artifacts", version = "0.2.0" }
+stemma = { path = "../stemma-engine", version = "0.4.0" }
+stemma-artifacts = { path = "../stemma-artifacts", version = "0.4.0" }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+pathdiff = "0.2"
 base64 = "0.22"
 schemars = "1"
 anyhow = "1"
@@ -38,3 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0"
 tempfile = "3"
 zip = "0.6.6"
+stemma-artifacts = { path = "../stemma-artifacts", features = ["test-support"] }

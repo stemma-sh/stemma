@@ -8,6 +8,68 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-21
+
+### Added
+
+- MCP task declarations bind every declared target and read-only input by
+  SHA-256 before the first task mutation. Schema v1 admits exact-count tracked
+  replacement effects, validates each `effect_id` and replacement field before
+  mutation, and refuses task-bound operations whose outcome cannot be decided
+  later by revision identity.
+- The last target save now emits a create-once
+  `stemma.task_manifest.v1`. Complete manifests bind every input, target
+  baseline, committed output, passing save audit, full effect declaration, and
+  minted revision identities. Missing effects or a later write failure produce
+  an explicit partial manifest and a failing final call; abandoned tasks write
+  no manifest.
+- `stemma verify-task <manifest.json> [--root <dir>]` verifies a delivery from
+  its files alone. Exit `0` is verified complete, `1` verified partial, `2` an
+  artifact/evidence mismatch, and `3` usage, I/O, malformed JSON, or unknown
+  schema.
+
+### Changed
+
+- A task-bound `save_docx` no longer treats one valid document as task success.
+  Earlier saves report `task_pending` and `deliverable:false`; only the final
+  all-effects join can return a deliverable task result.
+- Task-manifest claims are intentionally limited: the format is unsigned and
+  verifies consistency with declared files and effects, not producer
+  authenticity, declaration timing, or effects omitted from the caller's
+  declaration.
+
+- Successful CLI `apply`/`execute` now reruns the delivery audit over the exact
+  serialized candidate before committing its receipt or DOCX. Complete
+  receipts bind `verification.artifact_stage: "serialized_output"` and
+  `verification.output_sha256` to the output artifact digest; standalone
+  `verify` remains available as an optional producer-neutral recheck.
+- MCP `save_docx` now runs a fresh session audit and refuses a non-deliverable
+  result before creating the destination path, then applies the serialized
+  package gate and create-new commit. The common agent path is therefore
+  `open_docx -> inspect_docx -> execute_plan -> save_docx`; `verify_docx`
+  remains available for detailed evidence inspection or producer-neutral
+  before/after audit. Successful typed accept/reject commands are retained as
+  session evidence, so their selected pre-existing revisions and exact ordered
+  committed-content effects are reported as expected rather than blocked.
+  Missing evidence, an engine-bypass resolution, or a direct mutation before,
+  between, or after those effects still fails closed. Producer-neutral audits
+  remain conservative because they have no session command evidence.
+- The untouched proof now expands a grouped tracked-move census identity to
+  every paired source and destination carrier. Verified delivery therefore
+  accepts correctly tracked moves while continuing to block any mutation not
+  covered by the exact move identity.
+- Core `inspect_docx` find now accepts an additive `patterns` array for up to
+  eight known phrases. Outcomes preserve input order and duplicates, report
+  zero matches explicitly, and reuse the singular result contract with exact
+  totals and continuation. Batch pages and their encoded response are capped
+  explicitly; singular find remains unchanged.
+- Safe-artifact release qualification now selects the explicit `advanced` MCP
+  profile required by its persistence-producer cases, verifies the required
+  tool set before running any case, and freezes that profile in the candidate
+  manifest. This keeps the harness independent of the product-default compact
+  surface while failing before mutation if the expected escape-hatch tools are
+  unavailable.
+
 ## [0.2.0] — 2026-07-18
 
 ### Added
@@ -197,6 +259,7 @@ applications.
   per-cell data.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/stemma-sh/stemma/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/stemma-sh/stemma/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/stemma-sh/stemma/releases/tag/v0.1.0

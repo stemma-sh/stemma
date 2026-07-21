@@ -1684,6 +1684,7 @@ mod tests {
             marks: vec![],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
@@ -1846,6 +1847,7 @@ mod tests {
                 InlineNode::HardBreak(HardBreakNode {
                     id: NodeId::from("br0"),
                     break_type: BreakType::TextWrapping,
+                    joins_following_text_run: false,
                 }),
                 text_inline("r1", " end"),
             ],

@@ -638,7 +638,21 @@ fn now_epoch_secs() -> u64 {
 // v6: CanonDoc gained `document_protection: Option<DocumentProtection>` (the
 // reported w:documentProtection declaration from settings.xml). Positional IR
 // shape change — breaking blob change, fail-fast gated.
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 6;
+// v7: PrefixLeadingRpr gained `source_runs: Vec<LiteralPrefixSourceRun>` so a
+// hoisted literal prefix can retain the source w:r boundaries it consumed.
+// Positional IR shape change — breaking blob change, fail-fast gated.
+// v8: DecorationNode gained `joins_following_text_run` so imported run-level
+// markers can retain a proven shared w:r carrier with their following text.
+// Positional IR shape change — breaking blob change, fail-fast gated.
+// v9: TextNode and LiteralPrefixSourceRun gained `source_run_attrs` so Word's
+// layout-observable run-level rsid provenance survives untouched rebuilds.
+// Positional IR shape change — breaking blob change, fail-fast gated.
+// v10: HyperlinkRun gained the same `source_run_attrs` provenance for runs
+// nested inside hyperlinks. Positional IR shape change — fail-fast gated.
+// v11: HardBreakNode gained `joins_following_text_run` so a source run that
+// begins with w:br can retain its Word-visible table-pagination behavior.
+// Positional IR shape change — breaking blob change, fail-fast gated.
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 11;
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
 
@@ -9408,6 +9422,7 @@ mod tests {
             marks: vec![],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })]
     }
@@ -9425,6 +9440,7 @@ mod tests {
                     marks: vec![],
                     style_props: StyleProps::default(),
                     rpr_authored: crate::domain::RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 })
             })
@@ -10595,6 +10611,7 @@ mod tests {
                 marks: vec![Mark::Bold],
                 style_props: StyleProps::default(),
                 rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
                 formatting_change: Some(FormattingChange {
                     previous_marks: vec![],
                     previous_style_props: StyleProps::default(),

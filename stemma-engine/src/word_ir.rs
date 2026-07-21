@@ -314,7 +314,9 @@ pub struct StackedDeletionLayer {
 pub struct Atom {
     pub kind: AtomKind,
     pub utf16_len: u32,
-    pub style_key: Option<String>,
+    /// Source w:r attributes whose `rsid*` provenance Word can consult during
+    /// layout. Stored as qualified-name/value pairs for exact re-emission.
+    pub source_run_attrs: Vec<(String, String)>,
     pub origin: AtomOrigin,
     /// Parsed formatting marks from w:rPr.
     pub marks: TextMarks,
@@ -959,7 +961,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 1, // Occupies space as a single barrier
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -981,7 +983,7 @@ impl ParagraphView {
                 atoms.push(Atom {
                     kind: AtomKind::Hyperlink(data),
                     utf16_len: 1, // Occupies space as a single barrier
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1025,7 +1027,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(&template),
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1043,7 +1045,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(&template),
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1070,7 +1072,7 @@ impl ParagraphView {
                         AtomKind::CommentRangeEnd { id }
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1090,7 +1092,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 0, // Zero-width!
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1127,7 +1129,7 @@ impl ParagraphView {
                                     raw_xml: serialize_element(&template),
                                 },
                                 utf16_len: 0,
-                                style_key: None,
+                                source_run_attrs: Vec::new(),
                                 origin: AtomOrigin {
                                     run_index: None,
                                     child_index: None,
@@ -1142,7 +1144,7 @@ impl ParagraphView {
                                     raw_xml: serialize_element(&template),
                                 },
                                 utf16_len: 0,
-                                style_key: None,
+                                source_run_attrs: Vec::new(),
                                 origin: AtomOrigin {
                                     run_index: None,
                                     child_index: None,
@@ -1160,7 +1162,7 @@ impl ParagraphView {
                                         raw_xml: serialize_element(bel),
                                     },
                                     utf16_len: 1,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1179,7 +1181,7 @@ impl ParagraphView {
                                 atoms.push(Atom {
                                     kind: AtomKind::Hyperlink(data),
                                     utf16_len: 1,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1203,7 +1205,7 @@ impl ParagraphView {
                                         AtomKind::CommentRangeEnd { id }
                                     },
                                     utf16_len: 0,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1219,7 +1221,7 @@ impl ParagraphView {
                                         raw_xml: serialize_element(bel),
                                     },
                                     utf16_len: 0,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1232,7 +1234,7 @@ impl ParagraphView {
                                 atoms.push(Atom {
                                     kind: AtomKind::Tab,
                                     utf16_len: 1,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1254,7 +1256,7 @@ impl ParagraphView {
                                 atoms.push(Atom {
                                     kind: AtomKind::Break(break_type),
                                     utf16_len: 1,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1270,7 +1272,7 @@ impl ParagraphView {
                                 atoms.push(Atom {
                                     kind: AtomKind::Widget { name, raw_xml },
                                     utf16_len: 1,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1289,7 +1291,7 @@ impl ParagraphView {
                                         raw_xml: serialize_element(bel),
                                     },
                                     utf16_len: 0,
-                                    style_key: None,
+                                    source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
                                         run_index: None,
                                         child_index: None,
@@ -1319,7 +1321,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1336,7 +1338,7 @@ impl ParagraphView {
                 atoms.push(Atom {
                     kind: AtomKind::Tab,
                     utf16_len: 1,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1351,7 +1353,7 @@ impl ParagraphView {
                 atoms.push(Atom {
                     kind: AtomKind::NoBreakHyphen,
                     utf16_len: 1,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1375,7 +1377,7 @@ impl ParagraphView {
                 atoms.push(Atom {
                     kind: AtomKind::Break(break_type),
                     utf16_len: 1,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1396,7 +1398,7 @@ impl ParagraphView {
                 atoms.push(Atom {
                     kind: AtomKind::Widget { name, raw_xml },
                     utf16_len: 1,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1420,7 +1422,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1451,7 +1453,7 @@ impl ParagraphView {
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 0,
-                    style_key: None,
+                    source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
@@ -1639,7 +1641,7 @@ fn is_run_decoration(local_name: &str) -> bool {
 
 fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> {
     let mut atoms = Vec::new();
-    let style_key = run_style_key(run);
+    let source_run_attrs = source_run_attrs(run);
     let marks = extract_text_marks(run);
 
     // MCE resolution (§9.3) precedes content classification: resolve any
@@ -1683,7 +1685,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             atoms.push(Atom {
                 utf16_len: utf16_len(&text),
                 kind: AtomKind::Text(text),
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1700,7 +1702,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             atoms.push(Atom {
                 kind: AtomKind::Tab,
                 utf16_len: 1,
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1717,7 +1719,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             atoms.push(Atom {
                 kind: AtomKind::NoBreakHyphen,
                 utf16_len: 1,
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1743,7 +1745,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             atoms.push(Atom {
                 kind: AtomKind::Break(break_type),
                 utf16_len: 1,
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1763,7 +1765,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 1,
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1783,7 +1785,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 0, // Zero-width
-                style_key: style_key.clone(),
+                source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
                     run_index: Some(run_index),
                     child_index: Some(child_index),
@@ -1829,7 +1831,39 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
         // Unknown run-level element - fail fast
         return Err(WordIrError::UnknownRunElement(element.name.clone()));
     }
-    Ok(atoms)
+    // Text and tab children from one source w:r are one formatting/layout
+    // carrier. Keep them in one atom when they are contiguous so the canonical
+    // model cannot later serialize `<w:tab/><w:t>…</w:t>` as two separate
+    // runs. Word's justification can observe that split even though the text
+    // and direct rPr are identical. Decorations/widgets/breaks remain explicit
+    // barriers and therefore prevent coalescing.
+    let mut coalesced: Vec<Atom> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let current_fragment = match &atom.kind {
+            AtomKind::Text(text) => Some(text.as_str()),
+            AtomKind::Tab => Some("\t"),
+            _ => None,
+        };
+        if let Some(fragment) = current_fragment
+            && let Some(previous) = coalesced.last_mut()
+        {
+            match &mut previous.kind {
+                AtomKind::Text(text) => {
+                    text.push_str(fragment);
+                    previous.utf16_len += atom.utf16_len;
+                    continue;
+                }
+                AtomKind::Tab => {
+                    previous.kind = AtomKind::Text(format!("\t{fragment}"));
+                    previous.utf16_len += atom.utf16_len;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        coalesced.push(atom);
+    }
+    Ok(coalesced)
 }
 
 /// Extract atoms for the STACKED state: a supported `ins`/`del` pair nested
@@ -2142,7 +2176,7 @@ fn tracked_change_atoms(
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 1, // Occupies space as a single barrier
-                style_key: None,
+                source_run_attrs: Vec::new(),
                 origin: AtomOrigin {
                     run_index: None,
                     child_index: None,
@@ -2178,7 +2212,7 @@ fn tracked_change_atoms(
                     AtomKind::CommentRangeEnd { id }
                 },
                 utf16_len: 0,
-                style_key: None,
+                source_run_attrs: Vec::new(),
                 origin: AtomOrigin {
                     run_index: None,
                     child_index: None,
@@ -2204,7 +2238,7 @@ fn tracked_change_atoms(
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 0, // Zero-width
-                style_key: None,
+                source_run_attrs: Vec::new(),
                 origin: AtomOrigin {
                     run_index: None,
                     child_index: None,
@@ -2331,7 +2365,7 @@ fn wrapper_content_child_atoms(
                 AtomKind::CommentRangeEnd { id }
             },
             utf16_len: 0,
-            style_key: None,
+            source_run_attrs: Vec::new(),
             origin: AtomOrigin {
                 run_index: None,
                 child_index: None,
@@ -2352,7 +2386,7 @@ fn wrapper_content_child_atoms(
                 raw_xml: serialize_element(element),
             },
             utf16_len: 0,
-            style_key: None,
+            source_run_attrs: Vec::new(),
             origin: AtomOrigin {
                 run_index: None,
                 child_index: None,
@@ -2395,7 +2429,7 @@ fn bidi_wrapper_atoms(wrapper: &Element, container_index: usize) -> Result<Vec<A
             raw_xml: marker_bytes.clone(),
         },
         utf16_len: 0,
-        style_key: None,
+        source_run_attrs: Vec::new(),
         origin: AtomOrigin {
             run_index: None,
             child_index: None,
@@ -2418,7 +2452,7 @@ fn bidi_wrapper_atoms(wrapper: &Element, container_index: usize) -> Result<Vec<A
             raw_xml: marker_bytes,
         },
         utf16_len: 0,
-        style_key: None,
+        source_run_attrs: Vec::new(),
         origin: AtomOrigin {
             run_index: None,
             child_index: None,
@@ -2474,7 +2508,7 @@ fn custom_xml_wrapper_atoms(
             raw_xml: marker_bytes.clone(),
         },
         utf16_len: 0,
-        style_key: None,
+        source_run_attrs: Vec::new(),
         origin: AtomOrigin {
             run_index: None,
             child_index: None,
@@ -2500,7 +2534,7 @@ fn custom_xml_wrapper_atoms(
             raw_xml: marker_bytes,
         },
         utf16_len: 0,
-        style_key: None,
+        source_run_attrs: Vec::new(),
         origin: AtomOrigin {
             run_index: None,
             child_index: None,
@@ -2616,13 +2650,21 @@ fn text_from_element(element: &Element) -> String {
     out
 }
 
-fn run_style_key(run: &Element) -> Option<String> {
-    let rpr = find_w_child(run, "rPr")?;
-    let mut buf = Vec::new();
-    if rpr.write(&mut buf).is_err() {
-        return None;
-    }
-    String::from_utf8(buf).ok()
+fn source_run_attrs(run: &Element) -> Vec<(String, String)> {
+    let mut attrs: Vec<_> = run
+        .attributes
+        .iter()
+        .filter(|(name, _)| name.local_name.starts_with("rsid"))
+        .map(|(name, value)| {
+            let qualified = name.prefix.as_deref().map_or_else(
+                || name.local_name.clone(),
+                |prefix| format!("{prefix}:{}", name.local_name),
+            );
+            (qualified, value.clone())
+        })
+        .collect();
+    attrs.sort();
+    attrs
 }
 
 /// Extract formatting marks from w:rPr child of a w:r element.
@@ -4535,7 +4577,7 @@ fn push_hoisted_marker_atoms(
         atoms.push(Atom {
             kind: AtomKind::Decoration { name, raw_xml },
             utf16_len: 0, // Zero-width
-            style_key: None,
+            source_run_attrs: Vec::new(),
             origin: AtomOrigin {
                 run_index: None,
                 child_index: None,
@@ -4605,6 +4647,7 @@ fn collect_hyperlink_runs_with_status(
                 out.push(HyperlinkRun {
                     text,
                     rpr_xml,
+                    source_run_attrs: source_run_attrs(el),
                     status: status.clone(),
                 });
             }
@@ -5056,6 +5099,57 @@ mod tests {
             atoms[0].kind
         );
         assert_eq!(atoms[0].utf16_len, 1, "widget should occupy 1 UTF-16 unit");
+    }
+
+    #[test]
+    fn run_atoms_keep_contiguous_text_and_tabs_in_one_run_atom() {
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:t>left</w:t><w:tab/><w:t xml:space="preserve"> right</w:t>
+        </w:r>"#;
+        let element = parse_with_whitespace(xml);
+        let atoms = run_atoms(&element, 7).expect("parse run");
+
+        assert_eq!(atoms.len(), 1, "one source run must remain one text atom");
+        assert!(
+            matches!(&atoms[0].kind, AtomKind::Text(text) if text == "left\t right"),
+            "text and tab children must retain their order in one carrier: {:?}",
+            atoms[0].kind
+        );
+        assert_eq!(atoms[0].utf16_len, 11);
+        assert_eq!(atoms[0].origin.run_index, Some(7));
+    }
+
+    #[test]
+    fn run_atoms_preserve_only_sorted_source_rsid_attrs() {
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            w:rsidRPr="00BB" w:rsidR="00AA" w:custom="discard-me">
+            <w:t>text</w:t>
+        </w:r>"#;
+        let element = parse_with_whitespace(xml);
+        let atoms = run_atoms(&element, 0).expect("parse run");
+
+        assert_eq!(
+            atoms[0].source_run_attrs,
+            vec![
+                ("w:rsidR".to_string(), "00AA".to_string()),
+                ("w:rsidRPr".to_string(), "00BB".to_string()),
+            ],
+            "editing-session provenance is retained deterministically, while unrelated attrs are rejected at the import edge"
+        );
+    }
+
+    #[test]
+    fn run_atoms_do_not_coalesce_across_a_run_decoration() {
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:t>before</w:t><w:lastRenderedPageBreak/><w:t>after</w:t>
+        </w:r>"#;
+        let element = parse_with_whitespace(xml);
+        let atoms = run_atoms(&element, 0).expect("parse run");
+
+        assert_eq!(atoms.len(), 3, "the decoration remains an explicit barrier");
+        assert!(matches!(&atoms[0].kind, AtomKind::Text(text) if text == "before"));
+        assert!(matches!(&atoms[1].kind, AtomKind::Decoration { .. }));
+        assert!(matches!(&atoms[2].kind, AtomKind::Text(text) if text == "after"));
     }
 
     #[test]
@@ -5964,7 +6058,7 @@ mod tests {
     #[test]
     fn test_extract_hyperlink_data_two_runs_with_rpr() {
         let xml = r#"<w:hyperlink xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:anchor="target">
-            <w:r>
+            <w:r w:rsidR="00112233">
                 <w:rPr><w:b/></w:rPr>
                 <w:t>bold part</w:t>
             </w:r>
@@ -5982,6 +6076,10 @@ mod tests {
             "should extract one HyperlinkRun per w:r"
         );
         assert_eq!(data.runs[0].text, "bold part");
+        assert_eq!(
+            data.runs[0].source_run_attrs,
+            vec![("w:rsidR".to_string(), "00112233".to_string())]
+        );
         assert!(
             data.runs[0].rpr_xml.is_some(),
             "first run (bold) must have rpr_xml"

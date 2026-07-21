@@ -1,14 +1,21 @@
 # CLI reference
 
+Use this page to look up the exact command, exit-code, worklist, and receipt
+contracts. For a first successful workflow, start with
+[Create your first redline](../getting-started.md).
+
 `stemma` is the canonical local process contract for Stemma's focused workflow:
 apply an explicit approved worklist to an existing DOCX and create a native
 tracked-changes redline. It also exposes the engine's existing compare, read,
 resolve, and validate verbs. Install/build instructions live in
 [stemma-cli/README.md](../../stemma-cli/README.md).
 
-The compact product path is `inspect -> execute -> verify`. `execute` is the
-agent-facing alias of the same worklist implementation documented as `apply`;
-there is one execution contract, not two engines.
+The compact product path is `inspect -> execute`: successful execution includes
+serialization, verification of the exact candidate bytes, and create-new
+commit. `execute` is the agent-facing alias of the same worklist implementation
+documented as `apply`; there is one execution contract, not two engines.
+Standalone `verify` is an optional producer-neutral recheck, not a required
+second pass after successful execution.
 
 Contract: **stdout carries data, stderr carries diagnostics.** `apply` persists
 its authoritative machine-readable receipt and mirrors it to stdout. Every
@@ -55,6 +62,7 @@ durability promise.
 | `stemma inspect <input> [--format markdown\|json]` | Emit the compact revision-aware projection, bound to the exact input identity. |
 | `stemma execute <input> --plan <json> -o <out>` | Execute a concrete plan; exact alias of `apply`. |
 | `stemma verify <before> <after> [--policy tracked-delivery-v0]` | Certify any producer's result; exit `3` when policy fails. |
+| `stemma verify-task <manifest.json> [--root <dir>]` | Verify an MCP task delivery from its manifest and artifact files. |
 | `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. |
 | `stemma compare <base> <target> -o <out> [--author NAME]` | Diff two files into a redline (`reject-all == base`, `accept-all == target`); `--author` attributes the revisions. |
 | `stemma extract <file> [--format text\|json]` | Read the body as plain text (default) or structured JSON. |
@@ -68,6 +76,11 @@ result is `fail`. By default an apply exit `3` creates no DOCX. `--emit-partial`
 requests a non-deliverable partial redline, but the status and exit remain
 partial/`3`.
 
+`verify-task` has its own four-way projection: `0` verified complete, `1`
+verified partial, `2` artifact/evidence mismatch, and `3` usage, I/O, malformed
+manifest, or unknown schema. A verified partial is a consistent statement about
+an incomplete task; it is not the same state as a verification mismatch.
+
 ## inspect, execute, verify
 
 `inspect` emits extended Markdown as the compact agent language. Its first line
@@ -79,14 +92,36 @@ object annotations. `--format json` wraps the same projection in
 `execute` is a visible alias for `apply`, and `--plan` is the corresponding
 alias for `--worklist`. Both routes execute `stemma.worklist.v0` through the
 same typed planner, tracked-change materializer, audit, and safe artifact
-boundary.
+boundary. The execution audit is rerun over the exact serialized candidate
+before its receipt or DOCX is committed.
 
 `verify` audits any before/after pair under `tracked-delivery-v0`. It passes
 only when the result validates, contains no untracked committed delta, leaves
 every pre-existing revision untouched, and has no unexplained untouched-scope
 violation. Its `stemma.verify.v0` JSON includes exact input identities and
 accepted/rejected projection hashes. A policy failure is a structured result
-on stdout with exit `3`, not an operational error.
+on stdout with exit `3`, not an operational error. Use it when the output came
+from another producer or when an independent recheck is useful; a successful
+`execute` has already passed the same delivery policy.
+
+## verify-task
+
+`verify-task` reads `stemma.task_manifest.v1`, every input and output it names,
+and no MCP session state. Paths resolve relative to the manifest directory;
+`--root` selects a different artifact directory for a relocated delivery. The
+command recomputes byte lengths, SHA-256 digests, save-time audit counts and
+commitments, then confirms that every revision identity claimed by a satisfied
+effect is present in the corresponding output.
+
+```bash
+stemma verify-task delivery/task.json
+```
+
+An unknown schema fails with exit `3`; it is never decoded as a nearby version.
+The manifest is unsigned. Verification proves consistency with the files, not
+producer authenticity, declaration timing, or completeness of the caller's
+intent. Creation is MCP-only; see
+[Verify a multi-document task delivery](../guides/verify-task-delivery.md).
 
 ## apply
 
@@ -188,6 +223,9 @@ status, deliverability, or exit code.
 - declared supported, conditionally detected, and unsearched regions;
 - validator result, direct-change count, untouched-scope violations,
   pre-existing revision preservation, and the audited new revision count;
+- `verification.artifact_stage`, which is `serialized_output` for a complete
+  delivery, and `verification.output_sha256`, which must equal the output
+  artifact digest;
 - expected output byte identity, the enforced `create_new` collision policy,
   and the process-exit/presence/identity checks required to confirm that those
   bytes were persisted.
@@ -196,10 +234,12 @@ Revision numbers are intentionally absent. Word revision IDs are session-local
 handles and can change when the exact output is reopened; publishing them as
 artifact identities would be misleading.
 
-Before output, Stemma blocks any untracked direct change, unexplained
-untouched-scope violation, changed/resolved pre-existing revision, invalid
-package, or disagreement between the execution-time item revision census and
-the package audit census.
+Before output, Stemma serializes the candidate and audits those exact bytes.
+It blocks any untracked direct change, unexplained untouched-scope violation,
+changed/resolved pre-existing revision, invalid package, disagreement between
+the execution-time item revision census and the serialized package audit
+census, or disagreement between the verification output hash and candidate
+bytes.
 
 Current coverage is intentionally narrow: top-level body paragraphs. Headers,
 footers, footnotes, endnotes, comments, textboxes, and nested table cells are
@@ -226,7 +266,7 @@ and redaction policy as the underlying matter.
 ## compare
 
 Discovers the deltas between two documents and materializes them as tracked
-changes on the output — the two versions collapse into one reviewable file you
+changes on the output. The two versions collapse into one reviewable file you
 step through in Word like any reviewer redline.
 
 ```
@@ -238,7 +278,7 @@ The receipt goes to stderr; nothing goes to stdout. The output path must not
 exist. A destination equal to or aliasing either input is also refused.
 
 > **Attribution.** By default the redline's tracked changes carry the engine's
-> own (blank) authorship — discovery has no authoring identity. Pass
+> own blank authorship because discovery has no authoring identity. Pass
 > `--author NAME` to attribute every discovered revision to `NAME` (it appears
 > as each change's `author`, and `resolve --accept-author`/`--reject-author`
 > can then select by it):
@@ -247,7 +287,7 @@ exist. A destination equal to or aliasing either input is also refused.
 > $ stemma compare memo.docx memo-v2.docx -o redline.docx --author "L. Marsh"
 > ```
 >
-> An empty `--author ""` is refused — omit the flag for an anonymous redline;
+> An empty `--author ""` is refused. Omit the flag for an anonymous redline;
 > there is no silent fallback to anonymous.
 
 ## extract
@@ -264,8 +304,8 @@ The text reading shows the document **as it stands**: on a redline, both the
 tracked deletion and the tracked insertion surface (here `now foo bar baz` was
 deleted and `what are the chances` inserted). To read one side, resolve first.
 
-`--format json` gives blocks plus a `revisions` array — the pending tracked
-changes, each with its `revision_id` (the id `resolve --accept-ids`/`--reject-ids`
+`--format json` gives blocks plus a `revisions` array of pending tracked
+changes. Each entry has its `revision_id` (the id `resolve --accept-ids`/`--reject-ids`
 takes), `kind`, `author`, `block_id`, and a short `excerpt`:
 
 ```
@@ -301,9 +341,9 @@ Fields are a projection of the engine's read view: `role` is one of `paragraph`,
 `heading` (with a `heading_level`), `table`, `opaque`; `style_id` and
 `heading_level` are omitted when absent. `author` is empty when the source change
 carried no `w:author` (Word anonymization, third-party tools, or a `compare`
-redline produced without `--author`). Revision ids are session handles read live from the document — always
-re-`extract` to get current ids, never reuse ids from a previous run or from raw
-XML.
+redline produced without `--author`). Revision ids are session handles read
+live from the document. Always re-run `extract` to get current ids. Never reuse
+ids from a previous run or from raw XML.
 
 ## resolve
 
@@ -323,8 +363,8 @@ $ stemma extract final.docx --format text
 This is a test what are the chances
 ```
 
-Accept keeps the new state; reject restores the prior state exactly (marker
-absence alone proves nothing — verify by content). A selection that matches
+Accept keeps the new state; reject restores the prior state exactly. Marker
+absence alone proves nothing, so verify by content. A selection that matches
 nothing fails loudly rather than writing an unchanged file: an unknown id, an
 author with no changes, or an accept/reject-all on a document with no pending
 changes are all errors, and no output is written.
@@ -340,10 +380,9 @@ Parse and validate a package. On success, exit `0` with an `OK` line reporting
 the block and pending-revision counts plus the exact input-binding values used
 by `stemma.worklist.v0`:
 
-```
-$ stemma validate redline.docx
-OK: redline.docx — 1 block, 2 pending revisions; bytes=<n> sha256=<hex>
-```
+For example, `stemma validate redline.docx` reports `OK:` followed by the
+document path, one block, two pending revisions, its byte count, and its
+SHA-256.
 
 On failure, exit nonzero with the structured reason on stderr:
 
@@ -364,7 +403,7 @@ stemma compare as-sent.docx as-returned.docx -o changed.docx
 stemma extract changed.docx --format json | jq '.revisions[] | {id: .revision_id, kind, excerpt}'
 ```
 
-**Flatten a redline to a clean final** — accept everything, leaving no revision
+**Flatten a redline to a clean final.** Accept everything, leaving no revision
 machinery:
 
 ```

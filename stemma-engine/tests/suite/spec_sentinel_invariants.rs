@@ -39,6 +39,10 @@
 //!
 //! Daily tier, corpus-free.
 
+use stemma::edit::{
+    ContentFragment, EditStep, EditTransaction, MaterializationMode, ParagraphContent,
+    apply_transaction,
+};
 use stemma::{
     BlockNode, CanonDoc, DiffChange, DocxRuntime, ExportMode, InlineNode, Mark, RevisionInfo,
     SimpleRuntime, TransactionMeta, accept_all, diff_documents, merge_diff,
@@ -589,6 +593,98 @@ fn formatting_tier_bundle() -> (Vec<u8>, Vec<u8>) {
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn sentinel_untouched_equal_format_run_boundaries_survive_text_edit() {
+    let source = pack(&document(
+        r#"<w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:t xml:space="preserve">Alpha </w:t></w:r><w:r><w:t xml:space="preserve">Beta </w:t></w:r><w:r><w:t>Gamma</w:t></w:r></w:p>"#,
+    ));
+    let runtime = SimpleRuntime::new();
+    let canon = std::sync::Arc::unwrap_or_clone(
+        runtime
+            .import_docx(&source)
+            .expect("import run-boundary sentinel")
+            .canonical,
+    );
+    let block_id = canon
+        .blocks
+        .iter()
+        .find_map(|tracked| match &tracked.block {
+            BlockNode::Paragraph(paragraph) => Some(paragraph.id.clone()),
+            _ => None,
+        })
+        .expect("sentinel must contain a paragraph");
+    let transaction = EditTransaction {
+        steps: vec![EditStep::ReplaceParagraphText {
+            block_id: block_id.clone(),
+            expect: "Alpha Beta Gamma".to_string(),
+            content: ParagraphContent {
+                fragments: vec![ContentFragment::Text("Alpha Beta Delta".to_string())],
+            },
+            rationale: None,
+            replacement_role: None,
+            semantic_hash: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: revision(),
+    };
+    let (edited, _) = apply_transaction(&canon, &transaction).expect("apply sentinel edit");
+    let paragraph = edited
+        .blocks
+        .iter()
+        .find_map(|tracked| match &tracked.block {
+            BlockNode::Paragraph(paragraph) if paragraph.id == block_id => Some(paragraph),
+            _ => None,
+        })
+        .expect("edited sentinel paragraph");
+    let untouched_runs: Vec<&str> = paragraph
+        .segments
+        .iter()
+        .filter(|segment| matches!(segment.status, stemma::TrackingStatus::Normal))
+        .flat_map(|segment| segment.inlines.iter())
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        untouched_runs,
+        vec!["Alpha ", "Beta "],
+        "an edit to Gamma must retain both untouched source runs"
+    );
+
+    let mut accepted = edited.clone();
+    accept_all(&mut accepted);
+    assert_eq!(all_text(&accepted), "Alpha Beta Delta");
+    let mut rejected = edited;
+    // This minimal witness has no styles part, so `None` is exact here.
+    stemma::reject_all_with_styles(&mut rejected, None);
+    assert_eq!(all_text(&rejected), "Alpha Beta Gamma");
+}
+
+#[test]
+fn sentinel_split_literal_prefix_runs_survive_rebuild() {
+    let source = pack(&document(
+        r#"<w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:t>1</w:t></w:r><w:r><w:t>.</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>Body text here.</w:t></w:r></w:p>"#,
+    ));
+    let rebuilt = stemma::api::Document::parse(&source)
+        .expect("parse split-prefix sentinel")
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize split-prefix sentinel");
+    let xml = extract_part(&rebuilt, "word/document.xml");
+    let paragraph = &xml
+        [xml.find("<w:p>").expect("paragraph start")..xml.find("</w:p>").expect("paragraph end")];
+    let run_count = paragraph.matches("<w:r>").count() + paragraph.matches("<w:r ").count();
+    assert_eq!(
+        run_count, 4,
+        "identity rebuild must retain both label runs, the separator run, and the body run: {paragraph}"
+    );
+    assert!(
+        paragraph.contains(">1</w:t>") && paragraph.contains(">.</w:t>"),
+        "the split label must not be consolidated into one run: {paragraph}"
+    );
+}
 
 #[test]
 fn sentinel_move_across_paragraph_boundary() {

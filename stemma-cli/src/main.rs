@@ -12,6 +12,7 @@
 //! shared application facade.
 
 mod apply;
+mod verify_task;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -88,6 +89,16 @@ enum Command {
         /// preservation of pending revisions, and a clean untouched proof.
         #[arg(long, value_enum, default_value_t = VerifyPolicy::TrackedDeliveryV0)]
         policy: VerifyPolicy,
+    },
+
+    /// Verify an evidence-carrying task delivery from its files alone.
+    VerifyTask {
+        /// The create-once task manifest emitted by stemma-mcp.
+        manifest: PathBuf,
+        /// Resolve manifest artifact paths from this directory instead of the
+        /// manifest's directory.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
     },
 
     /// Diff two files into a tracked-changes redline (reject-all == base,
@@ -209,6 +220,13 @@ fn run(command: Command) -> Result<ExitCode, String> {
             after,
             policy,
         } => return verify(&artifacts, &before, &after, policy),
+        Command::VerifyTask { manifest, root } => {
+            return Ok(verify_task::verify_task(
+                &artifacts,
+                &manifest,
+                root.as_deref(),
+            ));
+        }
         Command::Compare {
             base,
             target,

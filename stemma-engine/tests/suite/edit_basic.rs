@@ -95,6 +95,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
         marks: Vec::new(),
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }
@@ -108,6 +109,7 @@ fn make_text_with_marks(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
         marks,
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }
@@ -135,6 +137,7 @@ fn make_hard_break(id: &str) -> InlineNode {
     InlineNode::HardBreak(HardBreakNode {
         id: NodeId::from(id),
         break_type: BreakType::TextWrapping,
+        joins_following_text_run: false,
     })
 }
 
@@ -150,6 +153,7 @@ fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
             runs: vec![HyperlinkRun {
                 text: text.to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
             extra_attrs: vec![],
@@ -226,6 +230,7 @@ fn make_decoration(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: Default::default(),
+        joins_following_text_run: false,
         raw_xml: Some(b"<w:bookmarkStart/>".to_vec()),
         origin: None,
     })
@@ -4355,6 +4360,7 @@ fn replace_hyperlink_text_preserves_url_and_anchor() {
                 runs: vec![HyperlinkRun {
                     text: "See Section 5".to_string(),
                     rpr_xml: None,
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 }],
                 extra_attrs: vec![("w:tooltip".to_string(), "click for details".to_string())],
@@ -4487,11 +4493,13 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
             HyperlinkRun {
                 text: "click ".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
             HyperlinkRun {
                 text: "here".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Inserted(test_revision()),
             },
         ],
@@ -4593,11 +4601,13 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
             HyperlinkRun {
                 text: "click ".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
             HyperlinkRun {
                 text: "HERE".to_string(),
                 rpr_xml: Some(bold_rpr.clone()),
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
         ],

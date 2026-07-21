@@ -11,8 +11,11 @@ hatches over the same kernels.
    rows of a paged compact block index. Prefer find over walking every page.
    Paths stay under `STEMMA_MCP_WORKSPACE_ROOT`.
 2. **`inspect_docx(doc_id, ...)`** returns the first compact index page by default.
-   Prefer `query:"find"` plus `pattern`, then inspect one exact block. Block
-   inspection is compact by default: paragraphs keep exact text, guards,
+   Prefer `query:"find"` plus `pattern`, then inspect one exact block. When
+   several known phrases must be located, pass `patterns:[...]` once (maximum
+   eight). Each ordered pattern—including duplicates and zero matches—returns
+   its own singular-find result with exact totals and continuation; do not spend
+   one request per phrase. Block inspection is compact by default: paragraphs keep exact text, guards,
    list/role identity, and durable opaque anchors. A table block returns eight
    bounded cell locators by default and omits its aggregate body; page with
    `cell_offset`/`cell_limit`, then inspect a locator's `block_ids` for exact
@@ -53,13 +56,25 @@ When replacing a paragraph that contains an opaque span, preserve that anchor
 inside `content.content` as
 `{"type":"opaque_ref","attrs":{"id":"<opaque id from block segments>"}}`.
 Do not flatten, omit, or invent the anchor.
-4. **`verify_docx({doc_id})`** must report zero unexpected direct changes, zero
-   untouched-scope violations, intended pre-existing-revision dispositions, and
-   `validator.ok:true`. It also accepts a producer-neutral before/after path pair.
-   Audit lists return 16 rows by default with totals and continuation metadata;
-   retrieve remaining rows with `detail`, `offset`, and `limit` (maximum 64).
-5. **`save_docx(doc_id, path)`** commits only a complete, verified result to a
-   NEW unused path. Existing destinations and input aliases are refused.
+4. **`save_docx(doc_id, path)`** runs a fresh session audit and refuses a
+   non-deliverable result before creating the output path. A passing result is
+   serialized, checked by the blocking package gate, and committed to a NEW
+   unused path. Successful typed accept/reject calls are retained as session
+   evidence: their selected prior revisions and exact committed effects are
+   expected, while any changed prior revision or direct effect outside that
+   evidence still blocks. Existing destinations and input aliases are refused.
+
+Use **`verify_docx({doc_id})`** when you need to inspect the session audit
+without saving. It reports unexpected direct changes, untouched-scope
+violations, pre-existing-revision dispositions, and validator findings. It also
+accepts a producer-neutral before/after path pair. Audit lists return 16 rows by
+default with totals and continuation metadata; retrieve remaining rows with
+`detail`, `offset`, and `limit` (maximum 64). A separate call is not required
+before `save_docx`, because save runs a fresh delivery gate itself. Session
+reports partition raw `changed_prior_revisions` into
+`expected_changed_prior_revisions` and
+`unexpected_changed_prior_revisions`; producer-neutral audits have no command
+evidence and remain conservative.
 
 Use the individual read, edit, resolution, and audit tools only when an expert
 workflow needs separate steps or narrower receipts. Never silently broaden an
@@ -68,6 +83,44 @@ approved plan.
 `check_edit(doc_id, transaction)` dry-runs the same package-aware,
 author-protected path as `apply_edit` and discards the result. Use it before a
 risky advanced transaction, not before the focused batch.
+
+## Multi-document tasks (declare once, then prove the join)
+
+When the user's instruction is incomplete unless several files are all
+updated, do preflight reads first, then make the first mutating workflow a task:
+
+1. Ordinary `open_docx`/`inspect_docx` preflight is allowed. Learn exact text,
+   block IDs, and values carried from read-only inputs, but do not mutate a
+   target yet.
+2. Re-open the first target with `task:{task_id,manifest_path,inputs,targets}`.
+   This is the one complete declaration. Every target entry carries all its
+   effects. Each v1 effect is
+   `{effect_id,op:"replace_text",find,replace,match_mode,scope,expected_matches,on_barrier_match}`.
+   Use `scope:{}` for the ordinary body-and-table-cell search, or the same
+   `block_id` / complete `from_block_id`+`to_block_id` restriction the worklist
+   will use. Stemma hashes every declared input and target before returning.
+3. Open later targets with `open_docx({path,task_id})`. Drift from the
+   declaration-time hash refuses. A declaration cannot be extended or
+   restated.
+4. Preview and apply only `replacement_worklist` plans. Every worklist item
+   must name one `effect_id` and must exactly match its declaration. Preview
+   satisfies nothing. Transactions, direct mutation tools, comparisons, and
+   revision resolutions are refused in a task-bound session because v1 cannot
+   verify them one effect at a time by minted revision identity.
+5. Save every target to a distinct new path. An earlier save reports
+   `task.status:"executing"` and `deliverable:false`; do not report task
+   success. The last save writes the create-once manifest. It succeeds only
+   for `complete`. A `task_partial` error still carries the partial manifest
+   and names every unsatisfied effect. If an output write fails after another
+   target is already visible, the partial manifest claims only committed
+   outputs. An abandoned task writes no manifest; no manifest means no
+   delivery.
+
+The manifest is unsigned evidence, not authentication and not proof that the
+declaration captured all human intent. It binds only what was declared. The
+user can later run `stemma verify-task <manifest> [--root <dir>]` from the
+files alone (`0` complete, `1` verified partial, `2` mismatch, `3` usage/I/O/
+schema).
 
 ## Review rounds and dense documents (triage → bulk resolve → save early)
 
@@ -88,10 +141,12 @@ For "accept/reject <author>'s changes" tasks, especially on long documents:
 3. **Trust bounded receipts.** Bulk writes and resolutions return exact counts
    beside capped evidence lists carrying `omitted` and `set_sha256` commitments
    to the complete set. Submitted worklist items and transaction operations are
-   never capped: each has an inline outcome. Verify with `verify_docx`;
-   do not re-derive counts by re-reading the inventory.
-4. **Persist before polishing.** Once the requested changes are complete and
-   `verify_docx` is clean, `save_docx` IMMEDIATELY — completed-but-unsaved
+   never capped: each has an inline outcome. Do not re-derive counts by
+   re-reading the inventory; use `verify_docx` only when detailed audit evidence
+   needs inspection before delivery.
+4. **Persist before polishing.** Once the requested changes are complete, call
+   `save_docx` IMMEDIATELY. It runs the fresh verification gate and refuses
+   before path creation if the session is not deliverable. Completed-but-unsaved
    work is worthless if the session ends. Extra spot-checks and summary
    material come after the artifact exists, never before.
 

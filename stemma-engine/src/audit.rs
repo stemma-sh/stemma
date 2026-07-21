@@ -58,7 +58,7 @@ use std::collections::{HashMap, HashSet};
 use crate::diff::diff_documents;
 use crate::domain::{
     BlockNode, CanonDoc, DiffChange, HeaderFooterKind, InlineNode, NodeId, OpaqueKind, StoryScope,
-    TrackedBlock,
+    TrackedBlock, TrackingStatus,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, RuntimeError, ValidationReport, first_quarantined_block,
@@ -783,11 +783,16 @@ fn untouched_proof(
     let mut implicated_stories: HashSet<StoryScope> = HashSet::new();
     for r in new_revisions {
         note_implication(&mut implicated_after, &mut implicated_stories, r);
+        note_move_carrier_implications(after, r, &mut implicated_after);
     }
     let mut implicated_before: Implicated = HashSet::new();
     for p in preexisting {
         if !matches!(p.disposition, RevisionDisposition::Untouched) {
             note_implication(&mut implicated_before, &mut implicated_stories, &p.record);
+            note_move_carrier_implications(before, &p.record, &mut implicated_before);
+            if matches!(p.disposition, RevisionDisposition::Modified { .. }) {
+                note_move_carrier_implications(after, &p.record, &mut implicated_after);
+            }
         }
     }
     for change in direct_changes {
@@ -1170,6 +1175,100 @@ fn note_implication(
     } else if id != "body_section" {
         blocks.insert((record.location.clone(), record.block_id.clone()));
     }
+}
+
+/// A move census row represents every source and destination carrier sharing
+/// one engine identity. The representative row names only the first carrier
+/// in document order, so the untouched proof must recover and implicate the
+/// complete carrier set from the canonical document.
+fn note_move_carrier_implications(
+    doc: &CanonDoc,
+    record: &RevisionRecord,
+    blocks: &mut Implicated,
+) {
+    if record.kind != RevisionKind::Move {
+        return;
+    }
+
+    let mut note_story = |story: StoryScope, story_blocks: &[TrackedBlock]| {
+        if story != record.location {
+            return;
+        }
+        for block in story_blocks {
+            if block.move_id.is_some()
+                && tracked_block_has_revision_identity(block, record.revision_id)
+            {
+                blocks.insert((story.clone(), block_node_id(&block.block)));
+            }
+        }
+    };
+
+    note_story(StoryScope::Body, &doc.blocks);
+    for header in &doc.headers {
+        note_story(
+            header_scope(&header.part_name, &header.kind),
+            &header.blocks,
+        );
+    }
+    for footer in &doc.footers {
+        note_story(
+            footer_scope(&footer.part_name, &footer.kind),
+            &footer.blocks,
+        );
+    }
+    for footnote in &doc.footnotes {
+        note_story(
+            StoryScope::Footnote {
+                id: footnote.id.clone(),
+            },
+            &footnote.blocks,
+        );
+    }
+    for endnote in &doc.endnotes {
+        note_story(
+            StoryScope::Endnote {
+                id: endnote.id.clone(),
+            },
+            &endnote.blocks,
+        );
+    }
+    for comment in &doc.comments {
+        note_story(
+            StoryScope::Comment {
+                id: comment.id.clone(),
+            },
+            &comment.blocks,
+        );
+    }
+}
+
+fn tracked_block_has_revision_identity(block: &TrackedBlock, identity: u32) -> bool {
+    fn status_has_identity(status: &TrackingStatus, identity: u32) -> bool {
+        match status {
+            TrackingStatus::Normal => false,
+            TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision) => {
+                revision.identity == identity
+            }
+            TrackingStatus::InsertedThenDeleted(stacked) => {
+                stacked.inserted.identity == identity || stacked.deleted.identity == identity
+            }
+        }
+    }
+
+    if status_has_identity(&block.status, identity) {
+        return true;
+    }
+    let BlockNode::Paragraph(paragraph) = &block.block else {
+        return false;
+    };
+    paragraph
+        .segments
+        .iter()
+        .any(|segment| status_has_identity(&segment.status, identity))
+        || paragraph
+            .para_mark_status
+            .as_ref()
+            .is_some_and(|status| status_has_identity(status, identity))
 }
 
 /// Before-side / after-side block ids the raw diff's BODY-level rows

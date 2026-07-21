@@ -1257,6 +1257,7 @@ mod tests {
             marks: vec![],
             style_props: Default::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }

@@ -218,6 +218,42 @@ fn ordered_breaks_in_run_all_layout_only_concatenate() {
 }
 
 #[test]
+fn leading_break_keeps_its_following_text_run_carrier() {
+    let b = make_docx(
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:tcPr/><w:p><w:r w:rsidRPr="00112233"><w:rPr><w:b/></w:rPr><w:br/><w:t>line after break</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#,
+        &[],
+    );
+
+    let xml = reserialize(&b);
+    let root = xmltree::Element::parse(xml.as_bytes()).expect("parse serialized document.xml");
+    fn has_joined_break_text_run(element: &xmltree::Element) -> bool {
+        if element.name == "r" {
+            let child_names: Vec<&str> = element
+                .children
+                .iter()
+                .filter_map(|child| child.as_element().map(|child| child.name.as_str()))
+                .collect();
+            if child_names.windows(2).any(|pair| pair == ["br", "t"]) {
+                return true;
+            }
+        }
+        element
+            .children
+            .iter()
+            .any(|child| child.as_element().is_some_and(has_joined_break_text_run))
+    }
+
+    assert!(
+        has_joined_break_text_run(&root),
+        "an untouched source w:r beginning with w:br and followed by w:t must rebuild as one run; a synthetic break-only run changes Word's table pagination. XML: {xml}"
+    );
+    assert!(
+        xml.contains(r#"w:rsidRPr="00112233""#),
+        "the joined carrier keeps the following text run's source attributes"
+    );
+}
+
+#[test]
 fn clear_attr_ignored_on_page_break() {
     let b = make_docx(
         r#"<w:p><w:r><w:t>A</w:t><w:br w:type="page" w:clear="all"/><w:t>B</w:t></w:r></w:p><w:sectPr/>"#,

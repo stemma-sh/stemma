@@ -173,6 +173,7 @@ class CandidateManifestTests(unittest.TestCase):
                 "server_version": SERVER_VERSION,
                 "started_at": start.isoformat().replace("+00:00", "Z"),
                 "suite": SUITE,
+                "tool_profile": "advanced",
             }
             (target_dir / REPORT_NAME).write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -205,7 +206,7 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest_text = self.output.read_text(encoding="utf-8")
         manifest = json.loads(manifest_text)
-        self.assertEqual(manifest["schema"], "stemma.release.candidate_manifest/v1")
+        self.assertEqual(manifest["schema"], "stemma.release.candidate_manifest/v2")
         self.assertEqual(manifest["source"], {"git_sha": SOURCE_SHA})
         self.assertEqual(
             manifest["build"],
@@ -233,6 +234,9 @@ class CandidateManifestTests(unittest.TestCase):
             self.assertEqual(entry["platform"]["system"], system)
             self.assertEqual(entry["platform"]["machine"], machine)
             self.assertEqual(entry["qualification"]["passed_cases"], 21)
+            self.assertEqual(
+                entry["qualification"]["tool_profile"], "advanced"
+            )
 
     def test_prerelease_and_build_metadata_versions_are_rejected(self):
         for version in ("1.2.3-rc.1", "1.2.3+qualified.1"):
@@ -263,6 +267,22 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not passing", result.stderr)
         self.assertFalse(self.output.exists())
+
+    def test_wrong_or_missing_tool_profile_is_rejected_without_output(self):
+        target = TARGETS[0][0]
+        report_path, report = self._load_report(target)
+        for tool_profile in (None, "core"):
+            with self.subTest(tool_profile=tool_profile):
+                if tool_profile is None:
+                    report.pop("tool_profile", None)
+                else:
+                    report["tool_profile"] = tool_profile
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                result = self._run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("tool_profile is not advanced", result.stderr)
+                self.assertFalse(self.output.exists())
+                report["tool_profile"] = "advanced"
 
     def test_missing_target_is_rejected(self):
         missing_target = TARGETS[1][0]

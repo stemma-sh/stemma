@@ -2697,6 +2697,7 @@ fn structural_range_decoration(
         // Paragraph-level range marker (bookmark/customXml range): no host run.
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        joins_following_text_run: false,
         raw_xml: Some(crate::word_xml::serialize_raw_fragment(el)),
         origin: None,
     })
@@ -6040,6 +6041,14 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
     inlines: &mut Vec<InlineNode>,
     tracked: &[bool],
 ) -> Option<StrippedLiteralPrefix> {
+    strip_literal_prefix_with_metadata(inlines, tracked, None)
+}
+
+fn strip_literal_prefix_with_metadata(
+    inlines: &mut Vec<InlineNode>,
+    tracked: &[bool],
+    mut source_run_indices: Option<&mut Vec<Option<usize>>>,
+) -> Option<StrippedLiteralPrefix> {
     fn is_likely_clause_body_start(ch: char) -> bool {
         ch.is_ascii_uppercase() || matches!(ch, '[' | '"' | '\'' | '“' | '‘')
     }
@@ -6147,6 +6156,13 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
         tracked.len(),
         inlines.len()
     );
+    if let Some(origins) = source_run_indices.as_deref() {
+        assert_eq!(
+            origins.len(),
+            inlines.len(),
+            "source run provenance must be 1:1 with imported inlines"
+        );
+    }
     let mut guard_remaining = chars_to_strip;
     for (i, inline) in inlines.iter().enumerate() {
         if guard_remaining == 0 {
@@ -6176,6 +6192,7 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
     // Strip chars_to_strip characters from the front of text nodes
     let trailing_start = leading_ws + label.len();
     let mut trailing_node_formatting: Option<(Vec<Mark>, StyleProps, RunRprAuthored)> = None;
+    let mut source_runs: Vec<(Option<usize>, crate::domain::LiteralPrefixSourceRun)> = Vec::new();
     let mut remaining = chars_to_strip;
     let mut i = 0;
     while remaining > 0 && i < inlines.len() {
@@ -6183,7 +6200,32 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
             InlineNode::Text(t) => {
                 let node_start = chars_to_strip - remaining;
                 let consumed_len = t.text.len().min(remaining);
-                let consumed_text = &t.text[..consumed_len];
+                let consumed_text = t.text[..consumed_len].to_string();
+                let joins_body = t.text.len() > remaining;
+                let source_run_index = source_run_indices
+                    .as_deref()
+                    .and_then(|origins| origins.get(i))
+                    .copied()
+                    .flatten();
+                if let Some((previous_index, previous)) = source_runs.last_mut()
+                    && source_run_index.is_some()
+                    && *previous_index == source_run_index
+                {
+                    previous.text.push_str(&consumed_text);
+                    previous.joins_body |= joins_body;
+                } else {
+                    source_runs.push((
+                        source_run_index,
+                        crate::domain::LiteralPrefixSourceRun {
+                            text: consumed_text.clone(),
+                            marks: t.marks.clone(),
+                            style_props: t.style_props.clone(),
+                            rpr_authored: t.rpr_authored,
+                            source_run_attrs: t.source_run_attrs.clone(),
+                            joins_body,
+                        },
+                    ));
+                }
                 if fallback_prefix_formatting.is_none() {
                     fallback_prefix_formatting =
                         Some((t.marks.clone(), t.style_props.clone(), t.rpr_authored));
@@ -6206,6 +6248,9 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
                     remaining -= t.text.len();
                     // Remove this entire text node
                     inlines.remove(i);
+                    if let Some(origins) = source_run_indices.as_deref_mut() {
+                        origins.remove(i);
+                    }
                     // Don't increment i since we removed the element
                 } else {
                     // Partial strip
@@ -6223,6 +6268,24 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
             }
             _ => break, // Stop at hard break or opaque
         }
+    }
+
+    // A source run may contain multiple atoms (for example two w:tab children
+    // followed by w:t). If prefix stripping consumed the last prefix atom at an
+    // atom boundary, join it back to the first remaining atom from that SAME run.
+    if let Some((last_index, last_run)) = source_runs.last_mut()
+        && last_index.is_some()
+        && source_run_indices
+            .as_deref()
+            .and_then(|origins| {
+                inlines.iter().enumerate().find_map(|(index, inline)| {
+                    matches!(inline, InlineNode::Text(_)).then(|| origins[index])
+                })
+            })
+            .flatten()
+            == *last_index
+    {
+        last_run.joins_body = true;
     }
 
     if !captured_prefix_formatting
@@ -6257,7 +6320,7 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
     let leading_rpr = if leading_ws_str.is_empty() {
         None
     } else {
-        fallback_prefix_formatting.filter(|(m, sp, ra)| {
+        fallback_prefix_formatting.clone().filter(|(m, sp, ra)| {
             *m != prefix_marks || *sp != prefix_style_props || *ra != prefix_rpr_authored
         })
     };
@@ -6275,18 +6338,33 @@ pub(crate) fn strip_literal_prefix_with_tracked_flags(
         has_trailing_tab,
         leading_ws: leading_ws_str,
         trailing_ws: trailing_ws_str,
-        leading_rpr: leading_rpr.map(|(marks, style_props, rpr_authored)| {
-            crate::domain::PrefixLeadingRpr {
+        // This established field also carries the complete source-run witness.
+        // Populate it for every imported prefix, even when the leading run's
+        // formatting matches the label; old snapshots have an empty witness and
+        // continue through the historical synthesis path.
+        leading_rpr: {
+            let (marks, style_props, rpr_authored) = leading_rpr.unwrap_or_else(|| {
+                fallback_prefix_formatting.clone().unwrap_or_else(|| {
+                    (
+                        prefix_marks.clone(),
+                        prefix_style_props.clone(),
+                        prefix_rpr_authored,
+                    )
+                })
+            });
+            Some(crate::domain::PrefixLeadingRpr {
                 marks,
                 style_props,
                 rpr_authored,
-            }
-        }),
+                source_runs: source_runs.into_iter().map(|(_, run)| run).collect(),
+            })
+        },
         trailing_rpr: trailing_rpr.map(|(marks, style_props, rpr_authored)| {
             crate::domain::PrefixLeadingRpr {
                 marks,
                 style_props,
                 rpr_authored,
+                source_runs: Vec::new(),
             }
         }),
         marks: prefix_marks,
@@ -6493,10 +6571,19 @@ fn paragraph_from_element(
     // the body as a tracked segment so accept/reject can resolve it), or the
     // paragraph already carries structural numbering (see MODEL note above).
     let tracked_flags: Vec<bool> = view.atoms.iter().map(|a| a.tracking.is_some()).collect();
+    let mut source_run_indices: Vec<Option<usize>> = view
+        .atoms
+        .iter()
+        .map(|atom| atom.origin.run_index)
+        .collect();
     let strip_result = if has_structural_numbering {
         None
     } else {
-        strip_literal_prefix_with_tracked_flags(&mut inlines, &tracked_flags)
+        strip_literal_prefix_with_metadata(
+            &mut inlines,
+            &tracked_flags,
+            Some(&mut source_run_indices),
+        )
     };
     let (
         literal_prefix,
@@ -7521,7 +7608,7 @@ fn inline_nodes_from_atoms(
     para_style_id: Option<&str>,
 ) -> Result<Vec<InlineNode>, RuntimeError> {
     let mut out = Vec::new();
-    for atom in atoms {
+    for (atom_index, atom) in atoms.iter().enumerate() {
         // Resolve marks through style inheritance chain if style definitions are available.
         // Per ISO 29500-1 §17.7.4.17, when a run has no explicit rStyle, use the
         // default character style (w:type="character" w:default="1") if one exists.
@@ -7551,6 +7638,7 @@ fn inline_nodes_from_atoms(
                     marks: convert_text_marks_to_marks(&resolved_marks),
                     style_props: convert_text_marks_to_style_props(&resolved_marks)?,
                     rpr_authored: run_rpr_authored(&atom.marks),
+                    source_run_attrs: atom.source_run_attrs.clone(),
                     formatting_change: convert_rpr_change(&atom.marks)?,
                 }));
             }
@@ -7565,6 +7653,7 @@ fn inline_nodes_from_atoms(
                     marks: convert_text_marks_to_marks(&resolved_marks),
                     style_props: convert_text_marks_to_style_props(&resolved_marks)?,
                     rpr_authored: run_rpr_authored(&atom.marks),
+                    source_run_attrs: atom.source_run_attrs.clone(),
                     formatting_change: convert_rpr_change(&atom.marks)?,
                 }));
             }
@@ -7583,6 +7672,7 @@ fn inline_nodes_from_atoms(
                     marks: convert_text_marks_to_marks(&resolved_marks),
                     style_props: convert_text_marks_to_style_props(&resolved_marks)?,
                     rpr_authored: run_rpr_authored(&atom.marks),
+                    source_run_attrs: atom.source_run_attrs.clone(),
                     formatting_change: convert_rpr_change(&atom.marks)?,
                 }));
             }
@@ -7590,9 +7680,18 @@ fn inline_nodes_from_atoms(
                 let local_index = *inline_counter;
                 *inline_counter += 1;
                 let id = NodeId::from(format!("{}_br{}", block_id.0, local_index));
+                let joins_following_text_run = atom.origin.run_index.is_some()
+                    && atoms.get(atom_index + 1).is_some_and(|next| {
+                        next.origin.run_index == atom.origin.run_index
+                            && matches!(
+                                next.kind,
+                                AtomKind::Text(_) | AtomKind::Tab | AtomKind::NoBreakHyphen
+                            )
+                    });
                 out.push(InlineNode::HardBreak(crate::domain::HardBreakNode {
                     id,
                     break_type: break_type.clone(),
+                    joins_following_text_run,
                 }));
             }
             AtomKind::Widget { name, raw_xml } => {
@@ -7693,6 +7792,14 @@ fn inline_nodes_from_atoms(
                     } else {
                         (Vec::new(), StyleProps::default())
                     };
+                let joins_following_text_run = atom.origin.run_index.is_some()
+                    && atoms.get(atom_index + 1).is_some_and(|next| {
+                        next.origin.run_index == atom.origin.run_index
+                            && matches!(
+                                next.kind,
+                                AtomKind::Text(_) | AtomKind::Tab | AtomKind::NoBreakHyphen
+                            )
+                    });
                 out.push(InlineNode::from(DecorationNode {
                     id,
                     kind: deco_type,
@@ -7700,6 +7807,7 @@ fn inline_nodes_from_atoms(
                     proof_ref,
                     wrapper_marks,
                     wrapper_style_props,
+                    joins_following_text_run,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
                 }));
@@ -7731,6 +7839,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width move-range wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
                 }));
@@ -7759,6 +7868,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width bidi-wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
                 }));
@@ -7797,6 +7907,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width customXml/smartTag wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
                 }));
@@ -9039,6 +9150,11 @@ fn parse_story_block(
         // is tracked (then it must stay in the body as a tracked segment so
         // accept/reject can resolve it).
         let tracked_flags: Vec<bool> = view.atoms.iter().map(|a| a.tracking.is_some()).collect();
+        let mut source_run_indices: Vec<Option<usize>> = view
+            .atoms
+            .iter()
+            .map(|atom| atom.origin.run_index)
+            .collect();
         let (
             literal_prefix,
             literal_prefix_leading_tab_count,
@@ -9051,7 +9167,11 @@ fn parse_story_block(
             literal_prefix_rpr_authored,
             literal_prefix_leading_rpr,
             literal_prefix_trailing_rpr,
-        ) = match strip_literal_prefix_with_tracked_flags(&mut inlines, &tracked_flags) {
+        ) = match strip_literal_prefix_with_metadata(
+            &mut inlines,
+            &tracked_flags,
+            Some(&mut source_run_indices),
+        ) {
             Some(prefix) => (
                 Some(prefix.label),
                 prefix.leading_tab_count,
@@ -11344,6 +11464,7 @@ mod tests {
             marks: Vec::new(),
             style_props: StyleProps::default(),
             rpr_authored: RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
 

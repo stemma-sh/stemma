@@ -160,6 +160,37 @@ fn replace_text_in_clean_paragraph() {
     );
 }
 
+/// A text edit must preserve the source run boundaries outside the changed
+/// span. Equal-format runs are not redundant: Word's line layout can depend on
+/// their boundaries, especially in justified paragraphs.
+#[test]
+fn replace_text_preserves_untouched_equal_format_run_boundaries() {
+    let doc = Document::parse(&make_docx_with_body(
+        r#"<w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:t xml:space="preserve">Alpha </w:t></w:r><w:r><w:t xml:space="preserve">Beta </w:t></w:r><w:r><w:t>Gamma</w:t></w:r></w:p>"#,
+    ))
+    .expect("parse");
+    let block_id = first_block_id(&doc);
+
+    let edited = apply(&doc, &opts("Gamma", "Delta")).expect("replace final run");
+    let para = find_paragraph(&edited, &block_id);
+    let untouched_text_nodes: Vec<&str> = para
+        .segments
+        .iter()
+        .filter(|segment| matches!(segment.status, TrackingStatus::Normal))
+        .flat_map(|segment| segment.inlines.iter())
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        untouched_text_nodes,
+        vec!["Alpha ", "Beta "],
+        "the edit may change Gamma, but must not consolidate the two untouched source runs"
+    );
+}
+
 // ─── 2. Match inside an already-tracked paragraph (the headline case) ────────
 
 /// Body: "Payment due in " + <ins author=Stemma>"thirty "</ins> + "days." The

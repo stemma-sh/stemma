@@ -1,5 +1,5 @@
-name: Candidate evaluation report
-description: Report a content-safe result or setup blocker for an exact evaluation artifact
+name: Evaluation or first-use report
+description: Report a content-safe result or blocker bound to an exact public build
 title: "[evaluation] "
 labels:
   - evaluation
@@ -7,19 +7,30 @@ body:
   - type: markdown
     attributes:
       value: |
-        Do not include a real agreement, worklist, receipt, path, document hash, clause excerpt, or party/customer name. Use only content-safe identities and counts.
+        Bind the report to an exact public build. Do not include a real document, worklist, receipt, path, document hash, excerpt, filename, screenshot of content, or party/customer/matter name. Use only executable identities, stable codes, and content-safe counts.
   - type: input
-    id: candidate
+    id: release
     attributes:
-      label: Candidate and source SHA
-      placeholder: Candidate A / 58a73e7e...
+      label: Release and full source commit
+      placeholder: v0.3.0 / 40-character commit
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - CLI apply/execute
+        - MCP server
+        - Rust API
+        - Other documented surface
     validations:
       required: true
   - type: input
     id: target
     attributes:
-      label: Target and build stamp
-      placeholder: linux-x86_64-gnu / 0.1.0+g58a73e7.candidate-a
+      label: Target, installation route, and build stamp
+      placeholder: linux-x86_64-gnu / release archive / version+gcommit
     validations:
       required: true
   - type: input
@@ -29,20 +40,33 @@ body:
     validations:
       required: true
   - type: dropdown
-    id: stage
+    id: boundary
     attributes:
-      label: Furthest stage reached
+      label: First boundary that differed from the documented contract
       options:
-        - Artifact setup
-        - Terminal CLI result
-        - Word adjudication
+        - No difference; reporting a correct completion
+        - Installation or artifact identity
+        - Open or parse
+        - Inspect or target
+        - Execute or edit
+        - Verified delivery or save
+        - Desktop Word adjudication
+    validations:
+      required: true
+  - type: dropdown
+    id: blocker
+    attributes:
+      label: Did this block a deliverable?
+      options:
+        - "Yes"
+        - "No"
     validations:
       required: true
   - type: input
     id: tuple
     attributes:
-      label: Process exit and output/receipt presence
-      placeholder: exit 0; output present; receipt present
+      label: Process/tool result and artifact presence
+      placeholder: exit 0; output present; receipt present; identities agree
     validations:
       required: true
   - type: dropdown
@@ -51,16 +75,37 @@ body:
       label: Content-safe outcome
       options:
         - Correct completion
-        - Safe refusal
+        - Correct refusal
+        - Unexpected blocker
         - Incorrect output
         - Did not finish
+    validations:
+      required: true
+  - type: input
+    id: codes
+    attributes:
+      label: Stable codes and content-safe counts
+      description: Include status, deliverable, artifact stage, applied/refused counts, and stable refusal/validation codes. Do not paste excerpts or a receipt.
+      placeholder: partial; deliverable=false; 0 applied, 1 refused; validation_failed
+    validations:
+      required: true
+  - type: dropdown
+    id: word
+    attributes:
+      label: Desktop Word result
+      options:
+        - Not applicable
+        - Not checked
+        - Opens clean and accept/reject is correct
+        - Opens with a repair warning
+        - Accept/reject result is wrong
     validations:
       required: true
   - type: textarea
     id: detail
     attributes:
       label: Content-safe observation
-      description: Describe the setup blocker, refusal code, tuple disagreement, or minimized synthetic reproduction without document content.
+      description: Describe the first wrong boundary and, if needed, a minimized synthetic reproduction without real document content or identities.
     validations:
       required: true
   - type: checkboxes
@@ -68,5 +113,7 @@ body:
     attributes:
       label: Privacy confirmation
       options:
-        - label: I confirmed this report contains no real document, worklist, receipt, path, document hash, clause excerpt, or identifying matter data.
+        - label: I confirmed this report contains no real document, worklist, receipt, path, document hash, excerpt, filename, content screenshot, or identifying matter data.
+          required: true
+        - label: I understand a correct refusal is not a correct completion.
           required: true

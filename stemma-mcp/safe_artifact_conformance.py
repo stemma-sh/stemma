@@ -2,9 +2,11 @@
 """Qualify the stemma-mcp safe-artifact boundary over its stdio wire.
 
 This is an exact-binary conformance harness, not an in-process test. It starts
-the supplied executable with a synthetic ``STEMMA_MCP_WORKSPACE_ROOT``, copies
-the repository's licensed public DOCX sample into that root, and exercises the
-read and create-new persistence boundary through MCP.
+the supplied executable with a synthetic ``STEMMA_MCP_WORKSPACE_ROOT`` and the
+explicit ``advanced`` tool profile, copies the repository's licensed public
+DOCX sample into that root, and exercises the read and create-new persistence
+boundary through MCP. The advanced profile is part of this suite's contract:
+the boundary spans both the compact core and expert escape-hatch producers.
 
 Both advertised tool surfaces are qualified: a ``core``-profile session covers
 open/execute_plan/save (including the comparison producer plan), and an
@@ -42,6 +44,17 @@ from pathlib import Path
 
 
 SUITE_ID = "stemma.mcp.safe_artifact_conformance/v1"
+TOOL_PROFILE = "advanced"
+REQUIRED_TOOLS = frozenset(
+    {
+        "apply_edit",
+        "audit_docx",
+        "compare_docx",
+        "open_docx",
+        "review_session",
+        "save_docx",
+    }
+)
 DEFAULT_FIXTURE = (
     Path(__file__).resolve().parents[1]
     / "stemma-examples"
@@ -176,6 +189,9 @@ class McpClient:
         self._send("notifications/initialized", {}, notification=True)
         return result
 
+    def list_tools(self):
+        return self._send("tools/list", {})
+
     def call(self, name, arguments):
         result = self._send(
             "tools/call", {"name": name, "arguments": arguments}
@@ -241,6 +257,60 @@ class CaseRunner:
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def conformance_server_environment(workspace):
+    """Build the exact server environment required by this suite.
+
+    The server's behavior is selected by STEMMA_MCP_* variables, so every
+    inherited one is dropped before pinning the workspace root and the
+    suite's contractual profile.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("STEMMA_MCP_")
+    }
+    env["STEMMA_MCP_WORKSPACE_ROOT"] = str(workspace)
+    env["STEMMA_MCP_PROFILE"] = TOOL_PROFILE
+    return env
+
+
+def require_conformance_tools(payload):
+    """Parse and enforce the advertised MCP tool contract before any case."""
+    require(isinstance(payload, dict), "tools/list result is not an object")
+    require(
+        payload.get("nextCursor") is None,
+        "tools/list unexpectedly paginated the conformance tool surface",
+    )
+    tools = payload.get("tools")
+    require(isinstance(tools, list), "tools/list omitted its tools array")
+    names = []
+    for index, tool in enumerate(tools):
+        require(
+            isinstance(tool, dict),
+            "tools/list entry {} is not an object".format(index),
+        )
+        name = tool.get("name")
+        require(
+            isinstance(name, str) and name,
+            "tools/list entry {} has no non-empty name".format(index),
+        )
+        names.append(name)
+    require(
+        len(names) == len(set(names)),
+        "tools/list advertised duplicate tool names",
+    )
+    missing = sorted(REQUIRED_TOOLS - set(names))
+    require(
+        not missing,
+        "{} profile omitted conformance tools {}; advertised {}".format(
+            TOOL_PROFILE,
+            ", ".join(missing),
+            ", ".join(sorted(names)),
+        ),
+    )
+    return frozenset(names)
 
 
 def sha256_file(path):
@@ -412,20 +482,11 @@ def run_suite(binary, fixture, timeout_seconds):
         shutil.copyfile(str(fixture), str(input_path))
         shutil.copyfile(str(fixture), str(outside_input))
 
-        # The server's behavior is selected by STEMMA_MCP_* variables, so pin
-        # every one this run depends on and drop the rest.
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("STEMMA_MCP_")
-        }
-        env["STEMMA_MCP_WORKSPACE_ROOT"] = str(workspace)
+        env = conformance_server_environment(workspace)
         client = McpClient(
             binary, dict(env, STEMMA_MCP_PROFILE="core"), timeout_seconds
         )
-        advanced = McpClient(
-            binary, dict(env, STEMMA_MCP_PROFILE="advanced"), timeout_seconds
-        )
+        advanced = McpClient(binary, env, timeout_seconds)
         try:
             initialized = client.initialize()
             server_info = initialized.get("serverInfo") or {}
@@ -435,6 +496,7 @@ def run_suite(binary, fixture, timeout_seconds):
                 advanced_info.get("version") == state["server_version"],
                 "core and advanced sessions report different server builds",
             )
+            require_conformance_tools(advanced.list_tools())
 
             def open_relative():
                 supplied = "input.docx"
@@ -974,6 +1036,7 @@ def run_suite(binary, fixture, timeout_seconds):
                 },
                 "server_version": state.get("server_version"),
                 "suite": SUITE_ID,
+                "tool_profile": TOOL_PROFILE,
             }
         finally:
             if client is not None:
@@ -1027,6 +1090,7 @@ def main(argv=None):
             "ok": False,
             "suite": SUITE_ID,
             "suite_error": "{}: {}".format(type(error).__name__, error),
+            "tool_profile": TOOL_PROFILE,
         }
         exit_code = 2
     summary["finished_at"] = utc_now()

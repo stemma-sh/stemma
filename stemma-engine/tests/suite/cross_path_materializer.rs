@@ -237,36 +237,60 @@ fn render_projection(segs: &[NormalizedSeg]) -> String {
 
 // ── building canon_b for the MERGE path ───────────────────────────────────
 
-/// Clone `canon_a` and replace the target paragraph's segments with a single
-/// Normal text segment carrying `new_text`. Everything else about the
-/// paragraph (id, style, numbering, all other fields) is preserved by the
-/// clone — only the inline text content is swapped. This is the minimal,
-/// honest "target document" whose only difference from the base is the
-/// first-word replacement.
-fn build_target_doc(canon_a: &CanonDoc, block_id: &NodeId, new_text: &str) -> CanonDoc {
+/// Clone `canon_a` and replace the first word while retaining the source text
+/// nodes. Zero-width decorations are omitted from this synthetic target, as in
+/// the original characterization: the materializer carries those base anchors.
+/// The text-node boundaries are retained because they are part of the layout
+/// surface this comparison now guards.
+fn build_target_doc(
+    canon_a: &CanonDoc,
+    block_id: &NodeId,
+    old_word: &str,
+    new_word: &str,
+    expected_text: &str,
+) -> CanonDoc {
     let mut canon_b = canon_a.clone();
     let mut replaced = false;
     for tb in &mut canon_b.blocks {
         if let BlockNode::Paragraph(p) = &mut tb.block
             && &p.id == block_id
         {
-            let text_node = InlineNode::from(TextNode {
-                id: NodeId::from(format!("{}__t0", block_id.0)),
-                text_role: None,
-                text: new_text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                rpr_authored: stemma::domain::RunRprAuthored::default(),
-                formatting_change: None,
-            });
-            p.segments = normal_segment(vec![text_node]);
+            let mut text_inlines: Vec<InlineNode> = p
+                .segments
+                .iter()
+                .flat_map(|segment| segment.inlines.iter())
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(InlineNode::Text(text.clone())),
+                    _ => None,
+                })
+                .collect();
+            for inline in &mut text_inlines {
+                if let InlineNode::Text(text) = inline
+                    && text.text.contains(old_word)
+                {
+                    text.text = text.text.replacen(old_word, new_word, 1);
+                    replaced = true;
+                    break;
+                }
+            }
+            let actual_text: String = text_inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                actual_text, expected_text,
+                "build_target_doc: first word must be replaceable inside one existing text node"
+            );
+            p.segments = normal_segment(text_inlines);
             // The text content changed — invalidate the import-time caches so
             // the diff engine recomputes from the new inlines rather than a
             // stale hash/rendered string. (No silent fallback: we don't want
             // the diff to see the OLD text via a cache.)
             p.block_text_hash = None;
             p.rendered_text = None;
-            replaced = true;
             break;
         }
     }
@@ -349,7 +373,7 @@ fn run_fixture(fixture: &str) -> Option<FixtureOutcome> {
     let edit_segs = project_segments(&find_para(&edited, &block_id).segments);
 
     // ── MERGE path ───────────────────────────────────────────────────────
-    let canon_b = build_target_doc(&canon_a, &block_id, &new_text);
+    let canon_b = build_target_doc(&canon_a, &block_id, &first_word, "REPLACED", &new_text);
     let diff = diff_documents(&canon_a, &canon_b)
         .unwrap_or_else(|e| panic!("diff_documents {fixture} block {block_id}: {e}"));
     let merged = merge_diff(&canon_a, &canon_b, &diff, &revision)
@@ -607,6 +631,7 @@ fn opaque_base_text(block_id: &NodeId, slot: &str, text: &str) -> InlineNode {
         marks: vec![],
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }

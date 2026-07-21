@@ -980,6 +980,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "pbkdf2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "stemma"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1402,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-api"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "serde",
@@ -1416,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-artifacts"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "same-file",
  "serde",
@@ -1428,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-cli"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "serde",
@@ -1443,10 +1449,11 @@ dependencies = [
 
 [[package]]
 name = "stemma-mcp"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
+ "pathdiff",
  "rmcp",
  "schemars",
  "serde",

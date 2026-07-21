@@ -7015,6 +7015,7 @@ fn set_paragraph_plain_text(para: &mut ParagraphNode, text: &str) {
         marks: Vec::new(),
         style_props: StyleProps::default(),
         rpr_authored: RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     });
     para.segments = normal_segment(vec![inline]);
@@ -7074,9 +7075,10 @@ fn apply_replace_paragraph_text(
     // ── Phase 4: Normalize ──
     // Invariant M (domain-model §6): both materializers run the SAME pass set in
     // the SAME fixed order — field-coalescing, then opaque reading-order, then
-    // compaction. The first two are guarded no-ops on ordinary edit output (see
-    // their doc comments); running them here makes the edit and merge paths
-    // converge on one lowering rather than two with divergent coverage.
+    // segment normalization. The first two are guarded no-ops on ordinary edit
+    // output (see their doc comments); running them here makes the edit and
+    // merge paths converge on one lowering rather than two with divergent
+    // coverage.
     let segments = crate::tracked_model::coalesce_split_field_sequences(segments);
     let mut segments = crate::tracked_model::normalize_paragraph_opaque_reading_order(segments);
     normalize_segments(&mut segments);
@@ -7207,6 +7209,7 @@ fn apply_formatting_only_replace(
                     marks: new_marks,
                     style_props: new_style_props,
                     rpr_authored,
+                    source_run_attrs: node.source_run_attrs.clone(),
                     formatting_change,
                 }));
                 start = end;
@@ -7895,6 +7898,7 @@ impl<'a> OldTextCursor<'a> {
                     marks: original_text_node.marks.clone(),
                     style_props: original_text_node.style_props.clone(),
                     rpr_authored: original_text_node.rpr_authored,
+                    source_run_attrs: original_text_node.source_run_attrs.clone(),
                     // A whole kept run preserves its tracked formatting change; a
                     // split portion drops it (computed above).
                     formatting_change,
@@ -8069,6 +8073,7 @@ fn output_inserted_text_node(
         marks,
         style_props,
         rpr_authored,
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     });
     *rev_counter += 1;
@@ -8164,15 +8169,19 @@ fn next_revision(base: &RevisionInfo, counter: &mut u32) -> RevisionInfo {
 ///
 /// 1. Merge adjacent segments with identical TrackingStatus (including RevisionInfo).
 /// 2. Drop empty segments (no inlines).
-/// 3. Merge adjacent text nodes within the same segment that have identical formatting.
 ///
-/// This compaction pass is shared by both materializers (Invariant M,
+/// Text-node boundaries are deliberately preserved. They correspond to source
+/// `w:r` boundaries, which can affect Word's line layout even when neighbouring
+/// runs have identical modeled formatting.
+///
+/// This segment-normalization pass is shared by both materializers (Invariant M,
 /// domain-model §6). The edit path has always run it; the merge path now runs it
 /// too, as the final pass, after field-coalescing and opaque reading-order
-/// normalization, so those passes still see the un-compacted segment boundaries
+/// normalization, so those passes still see the unmerged segment boundaries
 /// they rely on.
 pub(crate) fn normalize_segments(segments: &mut Vec<TrackedSegment>) {
-    // First pass: merge adjacent segments with identical status
+    // Merge adjacent segments with identical status while retaining every
+    // inline boundary in order.
     let mut merged: Vec<TrackedSegment> = Vec::new();
     for segment in segments.drain(..) {
         if segment.inlines.is_empty() {
@@ -8186,35 +8195,6 @@ pub(crate) fn normalize_segments(segments: &mut Vec<TrackedSegment>) {
         }
         merged.push(segment);
     }
-
-    // Second pass: merge adjacent text nodes with identical formatting within
-    // each segment. This keeps the model clean — multiple diff tokens that map
-    // to the same original TextNode or same formatting don't produce redundant
-    // InlineNode::Text entries.
-    for segment in &mut merged {
-        let mut compacted: Vec<InlineNode> = Vec::new();
-        for inline in segment.inlines.drain(..) {
-            if let InlineNode::Text(ref new_text) = inline
-                && let Some(InlineNode::Text(prev_text)) = compacted.last_mut()
-                && prev_text.marks == new_text.marks
-                && prev_text.style_props == new_text.style_props
-                && prev_text.rpr_authored == new_text.rpr_authored
-                // A run carrying a tracked formatting change (rPrChange) is distinct
-                // from one that isn't, even at identical marks — e.g. an un-bolded
-                // run is now plain like its neighbours but still carries the pending
-                // change. Merging would silently drop the tracked change.
-                && prev_text.formatting_change == new_text.formatting_change
-            {
-                prev_text.text.push_str(&new_text.text);
-                continue;
-            }
-            compacted.push(inline);
-        }
-        segment.inlines = compacted;
-    }
-
-    // Drop any segments that became empty after compaction
-    merged.retain(|s| !s.inlines.is_empty());
 
     *segments = merged;
 }
@@ -8455,6 +8435,7 @@ fn synthesize_new_hyperlink_inline(
         runs: vec![HyperlinkRun {
             text: text.to_string(),
             rpr_xml: None,
+            source_run_attrs: Vec::new(),
             status: TrackingStatus::Normal,
         }],
         extra_attrs: vec![],
@@ -8503,6 +8484,7 @@ fn build_text_node_from_exemplar(
         marks,
         style_props,
         rpr_authored,
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     }
 }
@@ -12820,6 +12802,7 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Normal,
                 });
                 nearest_rpr = run.rpr_xml.clone();
@@ -12837,6 +12820,7 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Deleted(revision.clone()),
                 });
                 nearest_rpr = run.rpr_xml.clone();
@@ -12851,6 +12835,7 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: new_text.to_string(),
                     rpr_xml: nearest_rpr.clone(),
+                    source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(revision.clone()),
                 });
             }
@@ -12865,6 +12850,7 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Normal,
                 });
             }
@@ -12937,6 +12923,7 @@ mod tests {
             marks: Vec::new(),
             style_props: StyleProps::default(),
             rpr_authored: RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
@@ -13205,18 +13192,25 @@ mod tests {
         ];
         normalize_segments(&mut segments);
         assert_eq!(segments.len(), 1, "adjacent Normal segments must merge");
-        // The two adjacent same-formatting text nodes also compact into one.
-        assert_eq!(segments[0].inlines.len(), 1);
-        match &segments[0].inlines[0] {
-            InlineNode::Text(t) => assert_eq!(t.text, "Hello world"),
-            other => panic!("expected merged text node, got {other:?}"),
-        }
+        let texts: Vec<&str> = segments[0]
+            .inlines
+            .iter()
+            .map(|inline| match inline {
+                InlineNode::Text(text) => text.text.as_str(),
+                other => panic!("expected text node, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["Hello ", "world"],
+            "segment normalization must preserve source run boundaries"
+        );
     }
 
     /// Two adjacent Normal text nodes that are identical in every OTHER
     /// respect but carry different preserved-rPr remainders (one run kept an
     /// unmodeled `w:eastAsianLayout`, its neighbor didn't) are format-distinct
-    /// and must NOT compact into one node — merging would silently drop
+    /// and must remain separate — merging would silently drop
     /// whichever run's preserved content lost the coin flip.
     #[test]
     fn normalize_does_not_merge_text_nodes_with_differing_preserved_props() {
@@ -13245,7 +13239,7 @@ mod tests {
         assert_eq!(
             segments[0].inlines.len(),
             2,
-            "runs with differing preserved rPr remainders must not coalesce into one text node"
+            "runs with differing preserved rPr remainders must remain separate"
         );
     }
 

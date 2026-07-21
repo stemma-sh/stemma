@@ -32,11 +32,18 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stemma_artifacts::{ArtifactError, ArtifactIdentity, PathAuthority, ReadArtifact};
 
+mod task_delivery;
+use task_delivery::{
+    PendingTaskDeclaration, TaskDeclarationArg, TaskRegistry, TaskSaveOutcome,
+    TaskWriteFailureOutcome,
+};
+
 use stemma::edit_v4::parse_transaction;
 use stemma::extended_markdown::to_extended_markdown_blocks;
 use stemma::view::{
-    BlockRole, BlockView, FormFieldIdentity, OpaqueAnchorKind, OpaqueMetadata, SegmentView,
-    TextMark, TrackStatus, build_document_view, build_document_view_from_canon, build_outline,
+    BlockRole, BlockView, DocumentView, FormFieldIdentity, OpaqueAnchorKind, OpaqueMetadata,
+    SegmentView, TextMark, TrackStatus, build_document_view, build_document_view_from_canon,
+    build_outline,
 };
 use stemma::{
     BlockNode, CanonDoc, DocHandle, DocxRuntime, ExportMode, NoteType, Resolution,
@@ -52,6 +59,14 @@ struct OpenArgs {
     /// Path to a .docx under the MCP workspace root. Relative paths resolve
     /// from that root.
     path: String,
+    /// Complete task declaration. Valid only on the first open for a task and
+    /// mutually exclusive with task_id.
+    #[serde(default)]
+    task: Option<TaskDeclarationArg>,
+    /// Existing task to bind this declared target to. Mutually exclusive with
+    /// task.
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -132,6 +147,11 @@ struct InspectDocxArgs {
     /// exact operation name to retrieve only that entry.
     #[serde(default)]
     pattern: Option<String>,
+    /// Additive batch form for query="find": one to eight non-empty patterns.
+    /// Mutually exclusive with pattern. Outcomes retain input order and
+    /// duplicates; offset/limit and cell_offset/cell_limit apply to each.
+    #[serde(default)]
+    patterns: Option<Vec<String>>,
     /// Valid only for query="revisions": AND-combined author, kind, and block
     /// range filters matching the revision inventory contract.
     #[serde(default)]
@@ -1130,7 +1150,7 @@ struct ReplaceTextBatchArgs {
     allow_existing_author: bool,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplaceTextScopeArg {
     /// Restrict to one paragraph id, including a paragraph nested in a table
@@ -1368,22 +1388,24 @@ const SERVER_VERSION: &str = match option_env!("STEMMA_MCP_BUILD_STAMP") {
 /// not fork this guidance into a separate skill.
 const INSTRUCTIONS: &str = include_str!("instructions.md");
 const CORE_INSTRUCTIONS: &str = "Stemma core profile: open_docx -> inspect_docx -> \
-execute_plan -> verify_docx -> save_docx. Inspect before editing. execute_plan previews or \
+execute_plan -> save_docx. Inspect before editing. execute_plan previews or \
 applies one explicit v4 transaction or revision-resolution selection through the typed engine; for several literal \
 substitutions use its explicit replacement_worklist path instead of one read/edit round trip per phrase. Never invent block \
 ids, span handles, guards, revision authors, or unsupported operations. Inspect query=operations before an unfamiliar \
 transaction and query=notes before editing a footnote/endnote. The operations catalog is parser-derived and also maps every \
-historical tool to its five-tool route. Use execute_plan comparison (without doc_id) to produce a redline from two files. Treat any plan error, \
+historical tool to its five-tool route. For several known phrases, use inspect_docx query=find with patterns=[...] once; each ordered pattern has its own exact total and bounded continuation. Use execute_plan comparison (without doc_id) to produce a redline from two files. Treat any plan error, \
 unexplained direct_delta row, unexpected changed pre-existing revision, untouched violation, or NEW validator issue as \
 incomplete. Comment-story rows are requested annotations, and property_change rows are direct \
 OOXML property edits such as image resizing or hyperlink retargeting; reconcile them with the \
 user's requested operations and disclose them rather than rejecting a valid output. Rows carrying \
-coincides_with_resolution are the committed effect of an explicit revision resolution and must \
-be reconciled with the requested selector. Validator findings unchanged from baseline are \
+coincides_with_resolution disclose a possible resolution effect; session_resolution_evidenced=true \
+means the row's exact ordered content transition reconciles with successful typed resolution commands. \
+Validator findings unchanged from baseline are \
 pre-existing evidence, not a regression; \
 disclose them, but do not withhold an otherwise valid requested output. Ordinary edits must remain pending tracked changes: resolution is not a finalize \
 step, and must be used only when the user explicitly asks to accept, reject, or clean up \
-revisions. Save only after verification passes, and always to a new path. Set \
+revisions. save_docx runs a fresh session audit, refuses a non-deliverable result before path creation, then runs the serialized package gate and commits to a new path. \
+Use verify_docx to inspect detailed session evidence without saving or to audit a producer-neutral before/after pair; it is not a required call before save_docx. Set \
 STEMMA_MCP_PROFILE=advanced only for expert escape-hatch tools, not broader semantics.";
 
 // ─── Runtime configuration (parsed at the edge) ──────────────────────────────
@@ -1420,6 +1442,10 @@ const DEFAULT_FIND_LIMIT: usize = 16;
 const MAX_FIND_LIMIT: usize = 64;
 const DEFAULT_FIND_CELL_LIMIT: usize = 4;
 const MAX_FIND_CELL_LIMIT: usize = 64;
+const MAX_BATCH_FIND_PATTERNS: usize = 8;
+const MAX_BATCH_FIND_LIMIT: usize = 16;
+const MAX_BATCH_FIND_CELL_LIMIT: usize = 4;
+const MAX_BATCH_FIND_RESPONSE_BYTES: usize = 256 * 1024;
 const FIND_CELL_EXCERPT_CHARS: usize = 120;
 const FIND_TEXT_EXCERPT_CHARS: usize = 240;
 const DEFAULT_BLOCK_CELL_LIMIT: usize = 8;
@@ -1995,6 +2021,127 @@ fn match_excerpt(text: &str, needle_lower: &str, limit: usize) -> String {
     let flank = (limit - needle_chars) / 2;
     let start = match_start.saturating_sub(flank).min(total - limit);
     text.chars().skip(start).take(limit).collect()
+}
+
+/// Build one bounded find page from an already-built view.
+///
+/// Singular and batch find both call this function, so batching changes only
+/// transport shape: matching, totals, ordering, excerpts, and continuation
+/// remain the singular contract.
+fn find_page(
+    view: &DocumentView,
+    pattern: &str,
+    offset: usize,
+    limit: usize,
+    cell_offset: usize,
+    cell_limit: usize,
+) -> Result<Value, String> {
+    let needle = pattern.to_lowercase();
+    let mut matches = Vec::new();
+    for block in &view.blocks {
+        let is_table = matches!(block.role, BlockRole::Table);
+        let all_matching_cells: Vec<_> = if is_table {
+            block
+                .cells
+                .iter()
+                .filter(|cell| cell.text.to_lowercase().contains(&needle))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let matching_cell_count = all_matching_cells.len();
+        let matching_cells: Vec<Value> = all_matching_cells
+            .into_iter()
+            .skip(cell_offset)
+            .take(cell_limit)
+            .map(|cell| {
+                let text_chars = cell.text.chars().count();
+                let text_excerpt =
+                    match_excerpt(&cell.text, &needle, FIND_CELL_EXCERPT_CHARS);
+                json!({
+                    "row": cell.row,
+                    "col": cell.col,
+                    "block_id": cell.paragraphs.first().map(|paragraph| paragraph.block_id.as_str()),
+                    "text_excerpt": text_excerpt,
+                    "text_chars": text_chars,
+                    "text_truncated": text_chars > FIND_CELL_EXCERPT_CHARS,
+                })
+            })
+            .collect();
+        let matching_cells_returned = matching_cells.len();
+        let matching_cells_next = cell_offset + matching_cells_returned;
+        let text_chars = block.text.chars().count();
+        let base = |matched_in: &str| {
+            let mut row = json!({
+                "id": block.id.to_string(),
+                "role": role_label(&block.role),
+                "role_token": block.role_token,
+                "list": list_json(block.list.as_ref()),
+                "matched_in": matched_in,
+                "text": null,
+            });
+            if is_table {
+                row["table_text_omitted"] = json!(true);
+                row["matching_cells"] = json!(matching_cells);
+                row["matching_cell_count"] = json!(matching_cell_count);
+                row["matching_cells_offset"] = json!(cell_offset);
+                row["matching_cells_limit"] = json!(cell_limit);
+                row["matching_cells_returned"] = json!(matching_cells_returned);
+                row["matching_cells_has_more"] = json!(matching_cells_next < matching_cell_count);
+                row["matching_cells_next_offset"] = json!(
+                    (matching_cells_next < matching_cell_count).then_some(matching_cells_next)
+                );
+            } else {
+                row["text_excerpt"] =
+                    json!(match_excerpt(&block.text, &needle, FIND_TEXT_EXCERPT_CHARS));
+                row["text_chars"] = json!(text_chars);
+                row["text_truncated"] = json!(text_chars > FIND_TEXT_EXCERPT_CHARS);
+                row["text_omitted"] = json!(true);
+            }
+            row
+        };
+        if block.text.to_lowercase().contains(&needle) {
+            matches.push(base("text"));
+        }
+        for (matched_in, anchor) in opaque_metadata_matches(block, &needle) {
+            let mut row = base(matched_in);
+            row["anchor"] = anchor;
+            matches.push(row);
+        }
+    }
+
+    let total = matches.len();
+    if offset > total {
+        return Err(format!(
+            "find offset {offset} exceeds total match count {total}"
+        ));
+    }
+    let page: Vec<Value> = matches.into_iter().skip(offset).take(limit).collect();
+    let returned = page.len();
+    let next = offset + returned;
+    Ok(json!({
+        "pattern": pattern,
+        "count": total,
+        "matches": page,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "has_more": next < total,
+        "next_offset": if next < total { Some(next) } else { None },
+        "cell_offset": cell_offset,
+        "cell_limit": cell_limit,
+    }))
+}
+
+fn batch_find_response_bytes(payload: &Value) -> Result<usize, usize> {
+    let encoded_bytes = serde_json::to_vec(payload)
+        .expect("batch find payload is always JSON-serializable")
+        .len();
+    if encoded_bytes > MAX_BATCH_FIND_RESPONSE_BYTES {
+        Err(encoded_bytes)
+    } else {
+        Ok(encoded_bytes)
+    }
 }
 
 /// Apply the [`MAX_REVISION_ROWS`] cap, returning the rows to emit and — ONLY
@@ -2952,14 +3099,37 @@ impl StemmaServer {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+/// Session evidence for typed revision resolutions that successfully committed.
+///
+/// The audit itself remains end-state-derived. This evidence supplies the one
+/// fact a producer-neutral before/after comparison cannot know: which changed
+/// pre-existing revisions were explicitly selected through this session's
+/// accept/reject command. Structural locations are retained because legitimate
+/// resolution effects can surface at a neighboring paragraph or containing
+/// table rather than at the revision record's own block id.
+#[derive(Clone, Debug, Default)]
+struct SessionResolutionEvidence {
+    revision_ids: HashSet<u32>,
+    /// Ordered committed-content transitions derived independently by auditing
+    /// each successful resolution's exact before/after snapshots. Final review
+    /// must be able to replay a location's whole chain from the session
+    /// baseline row to the current row; a direct edit before, between, or after
+    /// these transitions breaks the chain and remains unexplained.
+    direct_transition_batches: Vec<Vec<stemma::audit::DirectChange>>,
+}
+
 #[derive(Clone, Debug)]
 struct SessionSources {
     artifacts: Vec<ArtifactIdentity>,
+    resolutions: SessionResolutionEvidence,
 }
 
 impl SessionSources {
     fn new(artifacts: Vec<ArtifactIdentity>) -> Self {
-        Self { artifacts }
+        Self {
+            artifacts,
+            resolutions: SessionResolutionEvidence::default(),
+        }
     }
 }
 
@@ -2983,6 +3153,8 @@ struct StemmaServer {
     /// unknown-id one. Grows by one small string per open; never pruned (an
     /// issued id that the runtime no longer holds is, by definition, evicted).
     issued_doc_ids: Arc<Mutex<HashSet<String>>>,
+    /// Hash-bound multi-document delivery tasks and doc_id associations.
+    tasks: Arc<Mutex<TaskRegistry>>,
     // The COMPOSED router (base + read-projections + read-index + agentic),
     // built in `new()`. `#[tool_handler(router = self.tool_router)]` routes
     // every wire call through THIS field, so all merged routers are reachable.
@@ -3013,6 +3185,7 @@ impl StemmaServer {
             source_artifacts: Arc::new(Mutex::new(HashMap::new())),
             artifact_session_gate: Arc::new(Mutex::new(())),
             issued_doc_ids: Arc::new(Mutex::new(HashSet::new())),
+            tasks: Arc::new(Mutex::new(TaskRegistry::default())),
             // Routers are composed with `+`. Each parallel stream contributes
             // its own named router; the base `tool_router()` carries the core
             // open/read/edit/save tools, `read_projections_router()` the
@@ -3100,6 +3273,69 @@ impl StemmaServer {
             Some(artifacts) if !artifacts.is_empty() => Ok(artifacts),
             _ => Err(Self::missing_source_state(doc_id)),
         }
+    }
+
+    fn session_resolution_evidence(
+        &self,
+        doc_id: &str,
+    ) -> Result<SessionResolutionEvidence, CallToolResult> {
+        self.source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned")
+            .get(doc_id)
+            .filter(|session| !session.artifacts.is_empty())
+            .map(|session| session.resolutions.clone())
+            .ok_or_else(|| Self::missing_source_state(doc_id))
+    }
+
+    fn record_resolution_evidence(
+        &self,
+        doc_id: &str,
+        revision_ids: HashSet<u32>,
+        direct_transitions: Vec<stemma::audit::DirectChange>,
+    ) {
+        let mut sessions = self
+            .source_artifacts
+            .lock()
+            .expect("source_artifacts mutex poisoned");
+        let session = sessions
+            .get_mut(doc_id)
+            .filter(|session| !session.artifacts.is_empty())
+            .expect("resolution source state disappeared while artifact_session_gate was held");
+        session.resolutions.revision_ids.extend(revision_ids);
+        session
+            .resolutions
+            .direct_transition_batches
+            .push(direct_transitions);
+    }
+
+    /// Derive the exact committed-content effect of one successful typed
+    /// resolution. This is an independent audit of the operation's before and
+    /// after snapshots, not a receipt-derived block whitelist.
+    fn resolution_direct_transitions(
+        before: &stemma::runtime::EditSnapshot,
+        after: &stemma::runtime::EditSnapshot,
+    ) -> Result<Vec<stemma::audit::DirectChange>, CallToolResult> {
+        let before_bytes = stemma::serialize_snapshot(before, &stemma::ExportOptions::unchecked())
+            .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
+        let after_bytes = stemma::serialize_snapshot(after, &stemma::ExportOptions::unchecked())
+            .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
+        let before_styles = stemma::style_table_from_docx(&before_bytes)
+            .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
+        let after_styles = stemma::style_table_from_docx(&after_bytes)
+            .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
+        let report = stemma::audit::audit_documents(
+            &before.canonical,
+            &after.canonical,
+            before_styles.as_ref(),
+            after_styles.as_ref(),
+            stemma::runtime::ValidationReport {
+                ok: true,
+                issues: Vec::new(),
+            },
+        )
+        .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
+        Ok(report.direct_changes)
     }
 
     fn record_sources(
@@ -3391,34 +3627,97 @@ impl StemmaServer {
                        membership), plus returned/has_more/next_offset. Prefer inspect_docx \
                        query='find' for known wording or query='index' with offset/limit for \
                        another page; do not request every page as a substitute for find/window. \
-                       open_docx deliberately does not echo an unbounded document projection."
+                       open_docx deliberately does not echo an unbounded document projection. \
+                       For a multi-document delivery, the first task-bearing call supplies the \
+                       complete task declaration; later declared targets use task_id."
     )]
     async fn open_docx(&self, Parameters(args): Parameters<OpenArgs>) -> CallToolResult {
+        if args.task.is_some() && args.task_id.is_some() {
+            return fail(
+                "invalid_argument",
+                "open_docx accepts task or task_id, never both",
+            );
+        }
+        if args
+            .task_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return fail("invalid_argument", "task_id must be a non-empty string");
+        }
+        let task_id = args
+            .task
+            .as_ref()
+            .map(|task| task.task_id.clone())
+            .or_else(|| args.task_id.clone());
+        let _task_guard = task_id.as_ref().map(|_| {
+            self.artifact_session_gate
+                .lock()
+                .expect("artifact_session_gate mutex poisoned")
+        });
+        let mut pending_task: Option<PendingTaskDeclaration> = None;
         // The artifact boundary checks the metadata cap before buffering and
         // checks it again while reading, so growth during the read also refuses.
-        let source =
-            match self
-                .artifacts
-                .read_source(&args.path, "input_docx", self.max_doc_bytes())
-            {
-                Ok(source) => source,
-                Err(ArtifactError::SourceTooLarge { size, limit, .. }) => {
-                    return fail_json(json!({
-                        "code": "doc_too_large",
-                        "error": format!(
-                            "'{}' is {} bytes, over the {}-byte open limit. Raise \
-                             {ENV_MAX_DOC_BYTES} to open larger files (or set it to 0 to \
-                             disable the cap).",
-                            args.path, size, limit,
-                        ),
-                        "path": args.path,
-                        "size_bytes": size,
-                        "limit_bytes": limit,
-                        "env_var": ENV_MAX_DOC_BYTES,
-                    }));
+        let source = match (args.task, args.task_id.as_deref()) {
+            (Some(declaration), None) => {
+                match self.prepare_task_declaration(declaration, &args.path) {
+                    Ok(pending) => {
+                        let source = self
+                            .read_source(&args.path, "task_open_target", self.max_doc_bytes())
+                            .and_then(|source| {
+                                if source.identity().digest != pending.source.identity().digest
+                                    || source.identity().bytes != pending.source.identity().bytes
+                                {
+                                    return Err(fail_json(json!({
+                                        "code": "task_input_drift",
+                                        "error": format!(
+                                            "target {:?} changed while its task declaration was being bound",
+                                            args.path
+                                        ),
+                                        "task_id": pending.task.task_id,
+                                    })));
+                                }
+                                Ok(source)
+                            });
+                        pending_task = Some(pending);
+                        match source {
+                            Ok(source) => source,
+                            Err(failure) => return failure,
+                        }
+                    }
+                    Err(failure) => return failure,
                 }
-                Err(error) => return artifact_fail(error),
-            };
+            }
+            (None, Some(task_id)) => match self.prepare_existing_task_open(task_id, &args.path) {
+                Ok(source) => source,
+                Err(failure) => return failure,
+            },
+            (None, None) => {
+                match self
+                    .artifacts
+                    .read_source(&args.path, "input_docx", self.max_doc_bytes())
+                {
+                    Ok(source) => source,
+                    Err(ArtifactError::SourceTooLarge { size, limit, .. }) => {
+                        return fail_json(json!({
+                            "code": "doc_too_large",
+                            "error": format!(
+                                "'{}' is {} bytes, over the {}-byte open limit. Raise \
+                                 {ENV_MAX_DOC_BYTES} to open larger files (or set it to 0 to \
+                                 disable the cap).",
+                                args.path, size, limit,
+                            ),
+                            "path": args.path,
+                            "size_bytes": size,
+                            "limit_bytes": limit,
+                            "env_var": ENV_MAX_DOC_BYTES,
+                        }));
+                    }
+                    Err(error) => return artifact_fail(error),
+                }
+            }
+            (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
+        };
         let input_artifact = source.identity().clone();
         let import = match self.runtime.import_docx(source.bytes()) {
             Ok(r) => r,
@@ -3438,6 +3737,16 @@ impl StemmaServer {
                 doc_id.clone(),
                 SessionSources::new(vec![input_artifact.clone()]),
             );
+        if task_id.is_some()
+            && let Err(failure) = self.register_task_doc(
+                pending_task,
+                task_id.as_deref(),
+                &input_artifact.resolved_path,
+                &doc_id,
+            )
+        {
+            return failure;
+        }
         let page = match self.core_index_page(&doc_id, 0, DEFAULT_CORE_INDEX_LIMIT) {
             Ok(page) => page,
             Err(failure) => return failure,
@@ -3452,6 +3761,7 @@ impl StemmaServer {
             "block_count": page["total_blocks"],
             "total_chars": page["total_chars"],
             "server_version": SERVER_VERSION,
+            "task_id": task_id,
             "input_artifact": input_artifact,
             "index": page["entries"],
             "index_offset": page["offset"],
@@ -3573,124 +3883,13 @@ impl StemmaServer {
             );
         }
         let handle = DocHandle(args.doc_id.clone());
-        let needle = args.pattern.to_lowercase();
         let result = self.runtime.with(&handle, move |snap| {
             let view = build_document_view(snap);
-            let mut matches = Vec::new();
-            for b in &view.blocks {
-                let is_table = matches!(b.role, BlockRole::Table);
-                let all_matching_cells: Vec<_> = if is_table {
-                    b.cells
-                        .iter()
-                        .filter(|cell| cell.text.to_lowercase().contains(&needle))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let matching_cell_count = all_matching_cells.len();
-                let matching_cells: Vec<Value> = all_matching_cells
-                    .into_iter()
-                    .skip(cell_offset)
-                    .take(cell_limit)
-                    .map(|cell| {
-                        let text_chars = cell.text.chars().count();
-                        let text_excerpt =
-                            match_excerpt(&cell.text, &needle, FIND_CELL_EXCERPT_CHARS);
-                        json!({
-                            "row": cell.row,
-                            "col": cell.col,
-                            "block_id": cell.paragraphs.first().map(|p| p.block_id.as_str()),
-                            "text_excerpt": text_excerpt,
-                            "text_chars": text_chars,
-                                "text_truncated": text_chars > FIND_CELL_EXCERPT_CHARS,
-                        })
-                    })
-                    .collect();
-                let matching_cells_returned = matching_cells.len();
-                let matching_cells_next = cell_offset + matching_cells_returned;
-                let text_chars = b.text.chars().count();
-                // Common block fields, shared by a text match and any anchor
-                // match in this block.
-                let base = |matched_in: &str| {
-                    let mut row = json!({
-                        "id": b.id.to_string(),
-                        "role": role_label(&b.role),
-                        // So a phrase found inside a table resolves to a cell
-                        // address, and a phrase in a list paragraph carries its
-                        // list membership.
-                        "role_token": b.role_token,
-                        "list": list_json(b.list.as_ref()),
-                        "matched_in": matched_in,
-                    });
-                    // Keep each role's locator honest and minimal: tables need
-                    // cell continuation, paragraphs need a match-centered
-                    // excerpt. Neither carries irrelevant empty fields from
-                    // the other shape.
-                    row["text"] = Value::Null;
-                    if is_table {
-                        row["table_text_omitted"] = json!(true);
-                        row["matching_cells"] = json!(matching_cells);
-                        row["matching_cell_count"] = json!(matching_cell_count);
-                        row["matching_cells_offset"] = json!(cell_offset);
-                        row["matching_cells_limit"] = json!(cell_limit);
-                        row["matching_cells_returned"] = json!(matching_cells_returned);
-                        row["matching_cells_has_more"] =
-                            json!(matching_cells_next < matching_cell_count);
-                        row["matching_cells_next_offset"] = json!(
-                            (matching_cells_next < matching_cell_count)
-                                .then_some(matching_cells_next)
-                        );
-                    } else {
-                        row["text_excerpt"] =
-                            json!(match_excerpt(&b.text, &needle, FIND_TEXT_EXCERPT_CHARS));
-                        row["text_chars"] = json!(text_chars);
-                        row["text_truncated"] = json!(text_chars > FIND_TEXT_EXCERPT_CHARS);
-                        row["text_omitted"] = json!(true);
-                    }
-                    row
-                };
-                // Existing behavior, unchanged except for the additive
-                // `matched_in: "text"` tag.
-                if b.text.to_lowercase().contains(&needle) {
-                    matches.push(base("text"));
-                }
-                // New: match the needle against each opaque anchor's surfaced
-                // metadata (tag/alias/value/field result/ffData name/dropdown
-                // entries/image alt). A hit reports WHERE it matched and the
-                // anchor id, so the agent can feed it to a write verb.
-                for (matched_in, anchor) in opaque_metadata_matches(b, &needle) {
-                    let mut row = base(matched_in);
-                    row["anchor"] = anchor;
-                    matches.push(row);
-                }
-            }
-            matches
+            find_page(&view, &args.pattern, offset, limit, cell_offset, cell_limit)
         });
         match result {
-            Ok(matches) => {
-                let total = matches.len();
-                if offset > total {
-                    return fail(
-                        "invalid_argument",
-                        format!("find offset {offset} exceeds total match count {total}"),
-                    );
-                }
-                let page: Vec<Value> = matches.into_iter().skip(offset).take(limit).collect();
-                let returned = page.len();
-                let next = offset + returned;
-                ok(json!({
-                    "pattern": args.pattern,
-                    "count": total,
-                    "matches": page,
-                    "offset": offset,
-                    "limit": limit,
-                    "returned": returned,
-                    "has_more": next < total,
-                    "next_offset": if next < total { Some(next) } else { None },
-                    "cell_offset": cell_offset,
-                    "cell_limit": cell_limit,
-                }))
-            }
+            Ok(Ok(payload)) => ok(payload),
+            Ok(Err(message)) => fail("invalid_argument", message),
             Err(e) => fail(
                 &format!("{:?}", e.code),
                 format!("doc not open: {}", e.message),
@@ -3854,6 +4053,9 @@ impl StemmaServer {
         txn: &stemma::edit::EditTransaction,
         allow_existing_author: bool,
     ) -> (CallToolResult, bool) {
+        if let Some(failure) = self.refuse_direct_task_mutation(&handle.0, "direct mutation tool") {
+            return (failure, false);
+        }
         // Capture the pre-edit canonical so the receipt can name exactly which
         // blocks changed (honest before/after structural diff) and which
         // revision ids are newly created.
@@ -3955,10 +4157,13 @@ impl StemmaServer {
 
     #[tool(
         description = "Export an open document to a .docx file at the given path, \
-                       including any tracked changes applied. Runs a fresh session audit and the \
-                       blocking serialization gate before commit. Returns exact input/output \
-                       identities, an audit decision commitment, validation result, and final \
-                       deliverability verdict."
+                       including any tracked changes applied. Runs a fresh session audit and \
+                       refuses before path creation unless that audit is deliverable; then runs \
+                       the blocking serialization gate and commits create-new. Returns exact \
+                       input/output identities, the passing audit decision commitment, and \
+                       validation result. In a declared task, earlier target saves remain \
+                       task-pending; the last target save writes a create-once complete or \
+                       partial manifest and returns success only when every effect is satisfied."
     )]
     async fn save_docx(&self, Parameters(args): Parameters<SaveArgs>) -> CallToolResult {
         let handle = DocHandle(args.doc_id.clone());
@@ -3966,6 +4171,10 @@ impl StemmaServer {
             .artifact_session_gate
             .lock()
             .expect("artifact_session_gate mutex poisoned");
+        let task_binding = match self.prepare_task_save(&args.doc_id, &args.path) {
+            Ok(binding) => binding,
+            Err(failure) => return failure,
+        };
         // Bind the save to a fresh audit of this exact in-memory generation.
         // Audit detail stays out of the save receipt; its exact decision counts,
         // verdict, and commitment remain inline below.
@@ -3977,13 +4186,33 @@ impl StemmaServer {
             Ok(bytes) => bytes,
             Err(error) => return fail(&format!("{:?}", error.code), error.message),
         };
-        let mut audit = audit_report_json(&audit_report, None, None, None)
-            .expect("default audit page coordinates are valid");
+        let resolution_evidence = match self.session_resolution_evidence(&args.doc_id) {
+            Ok(evidence) => evidence,
+            Err(failure) => return failure,
+        };
+        let mut audit =
+            audit_report_json(&audit_report, Some(&resolution_evidence), None, None, None)
+                .expect("default audit page coordinates are valid");
         attach_baseline_validation(
             &mut audit,
             &stemma::api::validate(&baseline_bytes),
             &audit_report.validator,
         );
+        if audit["verdict"]["deliverable"] != true {
+            return fail_json(json!({
+                "code": "verification_failed",
+                "error": "save refused: the fresh session audit is not deliverable; no output path was created",
+                "audit": {
+                    "counts": audit["counts"],
+                    "verdict": audit["verdict"],
+                },
+                "remediation": {
+                    "kind": "inspect_verification",
+                    "tool": "verify_docx",
+                    "arguments": {"doc_id": args.doc_id},
+                },
+            }));
+        }
         let audit_decision = json!({
             "counts": audit["counts"],
             "verdict": audit["verdict"],
@@ -4003,37 +4232,140 @@ impl StemmaServer {
             Ok(artifacts) => artifacts,
             Err(failure) => return failure,
         };
-        let output_artifact =
-            match self
-                .artifacts
-                .commit_new(&args.path, "output_docx", &bytes, &input_artifacts)
-            {
-                Ok(output) => output,
-                Err(error) => return artifact_fail(error),
+        let input_artifacts =
+            match self.task_protected_sources(task_binding.as_ref(), input_artifacts) {
+                Ok(artifacts) => artifacts,
+                Err(failure) => return failure,
             };
-        let audit_deliverable = audit["verdict"]["deliverable"] == true;
-        let final_status = if audit_deliverable {
-            "pass"
-        } else {
-            "review_required"
+        let output_artifact = match self.artifacts.commit_new(
+            &args.path,
+            "output_docx",
+            &bytes,
+            &input_artifacts,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let failure_message = error.to_string();
+                let task_failure =
+                    match self.record_task_write_failure(task_binding.as_ref(), &failure_message) {
+                        Ok(outcome) => outcome,
+                        Err(failure) => return failure,
+                    };
+                return match task_failure {
+                    TaskWriteFailureOutcome::Retryable => artifact_fail(error),
+                    TaskWriteFailureOutcome::Partial {
+                        task_id,
+                        manifest,
+                        unsatisfied_effects,
+                    } => fail_json(json!({
+                        "code": "task_partial",
+                        "error": format!(
+                            "task {task_id:?} terminated partial after an output commit failed: {failure_message}"
+                        ),
+                        "task": {
+                            "task_id": task_id,
+                            "status": "partial",
+                            "manifest": manifest,
+                            "unsatisfied_effects": unsatisfied_effects,
+                        },
+                        "failed_output": {
+                            "path": args.path,
+                            "committed": false,
+                            "error": failure_message,
+                        },
+                        "verdict": {"status": "partial", "deliverable": false},
+                    })),
+                };
+            }
         };
-        ok(json!({
+        let audit_scope = if task_binding.is_some() {
+            "declared_task_to_saved_output"
+        } else {
+            "open_session_to_saved_output"
+        };
+        let audit_binding = json!({
+            "doc_id": args.doc_id,
+            "scope": audit_scope,
+            "output_sha256": output_artifact.identity.digest.hex.clone(),
+            "set_sha256": audit_set_sha256,
+            "counts": audit_decision["counts"],
+            "verdict": audit_decision["verdict"],
+        });
+        let task_outcome = if task_binding.is_some() {
+            let typed_audit_binding = serde_json::from_value(audit_binding.clone())
+                .expect("the task save audit receipt always matches the task audit model");
+            let committed_revision_ids: HashSet<u32> = audit_report
+                .new_revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            match self.record_task_save(
+                task_binding.as_ref(),
+                &output_artifact,
+                typed_audit_binding,
+                &committed_revision_ids,
+            ) {
+                Ok(outcome) => outcome,
+                Err(failure) => return failure,
+            }
+        } else {
+            TaskSaveOutcome::NotFinal
+        };
+        let document_receipt = json!({
             "path": args.path,
             "bytes_written": bytes.len(),
             "input_artifacts": input_artifacts,
             "output_artifact": output_artifact,
-            "audit_binding": {
-                "doc_id": args.doc_id,
-                "scope": "open_session_to_saved_output",
-                "output_sha256": output_artifact.identity.digest.hex.clone(),
-                "set_sha256": audit_set_sha256,
-                "counts": audit_decision["counts"],
-                "verdict": audit_decision["verdict"],
-            },
+            "audit_binding": audit_binding,
             "validation": {"level": "blocking", "ok": true},
-            "verdict": {"status": final_status, "deliverable": audit_deliverable},
-            "server_version": SERVER_VERSION,
-        }))
+        });
+        match task_outcome {
+            TaskSaveOutcome::NotFinal if task_binding.is_none() => {
+                let mut payload = document_receipt;
+                payload["verdict"] = json!({"status": "pass", "deliverable": true});
+                payload["server_version"] = json!(SERVER_VERSION);
+                ok(payload)
+            }
+            TaskSaveOutcome::NotFinal => ok(json!({
+                "document": document_receipt,
+                "task": {
+                    "task_id": task_binding.expect("task save has a binding").task_id,
+                    "status": "executing",
+                    "deliverable": false,
+                },
+                "verdict": {"status": "task_pending", "deliverable": false},
+                "server_version": SERVER_VERSION,
+            })),
+            TaskSaveOutcome::Complete { task_id, manifest } => ok(json!({
+                "document": document_receipt,
+                "task": {
+                    "task_id": task_id,
+                    "status": "complete",
+                    "manifest": manifest,
+                },
+                "verdict": {"status": "pass", "deliverable": true},
+                "server_version": SERVER_VERSION,
+            })),
+            TaskSaveOutcome::Partial {
+                task_id,
+                manifest,
+                unsatisfied_effects,
+            } => fail_json(json!({
+                "code": "task_partial",
+                "error": format!(
+                    "task {task_id:?} terminated partial; unsatisfied effects: {}",
+                    unsatisfied_effects.join(", ")
+                ),
+                "document": document_receipt,
+                "task": {
+                    "task_id": task_id,
+                    "status": "partial",
+                    "manifest": manifest,
+                    "unsatisfied_effects": unsatisfied_effects,
+                },
+                "verdict": {"status": "partial", "deliverable": false},
+            })),
+        }
     }
 
     #[tool(
@@ -4388,27 +4720,7 @@ impl StemmaServer {
         receipt
     }
 
-    #[tool(description = "Apply a WHOLE find/replace worklist in one call — the \
-                       'counsel sent a list of changes' shape. Takes `replacements`: \
-                       a list of {old, new, expected_matches?, scope?, match_mode?, \
-                       on_barrier_match?}, each with the SAME semantics as replace_text \
-                       (server-side match, tracked splice through existing redlines, no \
-                       read_block/handles). Applied in order against live state, so a \
-                       later item sees earlier edits. NON-ATOMIC by design: every item's \
-                       outcome is reported per-item and a failure never blocks the rest — \
-                       a wrong needle (MatchCountMismatch, with the per-match \
-                       {block_id, excerpt} contexts + diagnosis) or a no-op is recorded \
-                       under `failed` for one-shot re-issue, while the matching items \
-                       still apply. Returns {applied, failed, items:[{index, old, status, \
-                       match_count, changed_blocks | error, ...}]}. Use this instead of N \
-                       replace_text round trips whenever you have more than one phrase to \
-                       change. preview=true runs the same ordered, non-atomic semantics on a \
-                       throwaway snapshot: successful items feed later planning but nothing \
-                       persists.")]
-    async fn replace_text_batch(
-        &self,
-        Parameters(args): Parameters<ReplaceTextBatchArgs>,
-    ) -> CallToolResult {
+    fn replace_text_batch_impl(&self, args: ReplaceTextBatchArgs) -> CallToolResult {
         if args.author.trim().is_empty() {
             return fail("invalid_argument", "author must be a non-empty string");
         }
@@ -4528,6 +4840,10 @@ impl StemmaServer {
                         .collect();
                     let skipped = straddles_json(&plan.skipped_straddles);
                     let before = Arc::clone(&canonical);
+                    let before_revision_ids: HashSet<u32> = revision_rows(&before)
+                        .into_iter()
+                        .map(|revision| revision.revision_id)
+                        .collect();
                     let transaction = stemma::edit::EditTransaction {
                         steps: plan.steps,
                         summary: Some("replace_text_batch".to_string()),
@@ -4552,6 +4868,13 @@ impl StemmaServer {
                     match outcome {
                         Ok((after, next_preview)) => {
                             let changed = changed_block_ids(&before, &after);
+                            let mut revision_ids: Vec<u32> = revision_rows(&after)
+                                .into_iter()
+                                .map(|revision| revision.revision_id)
+                                .filter(|identity| !before_revision_ids.contains(identity))
+                                .collect();
+                            revision_ids.sort_unstable();
+                            revision_ids.dedup();
                             let unreached = unreached_cells_json(
                                 &before,
                                 &item.old,
@@ -4565,6 +4888,7 @@ impl StemmaServer {
                             };
                             items.push(json!({"index": index, "old": item.old, "status": status,
                                 "match_count": match_count, "matches": matched,
+                                "revision_ids": revision_ids,
                                 "changed_blocks": changed,
                                 "normalization_applied": normalization,
                                 "skipped_straddles": skipped,
@@ -4617,6 +4941,23 @@ impl StemmaServer {
             "failed": failed,
             "items": outcomes.into_rows(),
         }))
+    }
+
+    #[tool(
+        description = "Apply a whole tracked find/replace worklist in one call. \
+                       Items run in order and report complete per-item outcomes; one \
+                       refusal does not hide other outcomes. preview=true uses a \
+                       throwaway snapshot."
+    )]
+    async fn replace_text_batch(
+        &self,
+        Parameters(args): Parameters<ReplaceTextBatchArgs>,
+    ) -> CallToolResult {
+        if let Some(failure) = self.refuse_direct_task_mutation(&args.doc_id, "replace_text_batch")
+        {
+            return failure;
+        }
+        self.replace_text_batch_impl(args)
     }
 }
 
@@ -5539,9 +5880,13 @@ fn default_core_barrier_policy() -> CoreBarrierPolicy {
 /// and causes numeric counts to arrive as `"2"`. The compact edge models the
 /// two domain states explicitly instead of accepting or guessing stringified
 /// numbers.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CoreReplacementItem {
+    /// Task effect association. Required in a task-bound session and forbidden
+    /// otherwise.
+    #[serde(default)]
+    effect_id: Option<String>,
     old: String,
     new: String,
     #[serde(default)]
@@ -6091,8 +6436,12 @@ impl StemmaServer {
                        16 blocks; use offset/limit, maximum 256). Its prose is exact; tables are \
                        bounded summaries with four cell previews and route to query='block' for all \
                        cells. Prefer query='find' plus pattern to \
-                       locate wording or opaque metadata, \
-                       then query='block' plus block_id for compact exact text, guards, durable opaque \
+                       locate one known phrase or opaque metadata. For several known phrases, pass \
+                       patterns=[...] (maximum 8) instead; every ordered pattern, including \
+                       duplicates and zero matches, gets the same singular result shape with exact \
+                       totals and continuation. Batch pages are capped at 16 matches per pattern, \
+                       4 matching cells per table, and 256 KiB encoded. Then use \
+                       query='block' plus block_id for compact exact text, guards, durable opaque \
                        anchors, nested table-cell paragraphs, and list identity. Table blocks return \
                        8 bounded cell locators by default; page them with cell_offset/cell_limit \
                        (maximum 64), then inspect a locator's block_ids for exact cell paragraphs. Pass \
@@ -6121,6 +6470,7 @@ impl StemmaServer {
         let has_query_args = args.block_id.is_some()
             || args.detail.is_some()
             || args.pattern.is_some()
+            || args.patterns.is_some()
             || args.filter.is_some()
             || args.from_block_id.is_some()
             || args.to_block_id.is_some()
@@ -6132,6 +6482,7 @@ impl StemmaServer {
         let has_non_index_args = args.block_id.is_some()
             || args.detail.is_some()
             || args.pattern.is_some()
+            || args.patterns.is_some()
             || args.filter.is_some()
             || args.from_block_id.is_some()
             || args.to_block_id.is_some()
@@ -6173,6 +6524,8 @@ impl StemmaServer {
             }
             InspectQuery::Block => {
                 if args.pattern.is_some()
+                    || args.patterns.is_some()
+                    || args.filter.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
@@ -6232,6 +6585,7 @@ impl StemmaServer {
                 if args.block_id.is_some()
                     || args.detail.is_some()
                     || args.pattern.is_some()
+                    || args.patterns.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
@@ -6255,6 +6609,7 @@ impl StemmaServer {
                 if args.block_id.is_some()
                     || args.detail.is_some()
                     || args.pattern.is_some()
+                    || args.patterns.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
@@ -6318,38 +6673,155 @@ impl StemmaServer {
             InspectQuery::Find => {
                 if args.block_id.is_some()
                     || args.detail.is_some()
+                    || args.filter.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
                 {
                     return fail(
                         "invalid_argument",
-                        "query 'find' accepts only doc_id, pattern, offset, limit, cell_offset, and cell_limit",
+                        "query 'find' accepts only doc_id, exactly one of pattern or patterns, offset, limit, cell_offset, and cell_limit",
                     );
                 }
-                let Some(pattern) = args.pattern else {
-                    return fail("invalid_argument", "query 'find' requires pattern");
-                };
-                if pattern.trim().is_empty() {
-                    return fail(
+                match (args.pattern, args.patterns) {
+                    (Some(_), Some(_)) => fail(
                         "invalid_argument",
-                        "query 'find' requires non-empty pattern",
-                    );
+                        "query 'find' requires exactly one of pattern or patterns, not both",
+                    ),
+                    (None, None) => fail(
+                        "invalid_argument",
+                        "query 'find' requires exactly one of pattern or patterns",
+                    ),
+                    (Some(pattern), None) => {
+                        if pattern.trim().is_empty() {
+                            return fail(
+                                "invalid_argument",
+                                "query 'find' requires non-empty pattern",
+                            );
+                        }
+                        self.find(Parameters(FindArgs {
+                            doc_id: args.doc_id,
+                            pattern,
+                            offset: args.offset,
+                            limit: args.limit,
+                            cell_offset: args.cell_offset,
+                            cell_limit: args.cell_limit,
+                        }))
+                        .await
+                    }
+                    (None, Some(patterns)) => {
+                        if patterns.is_empty() || patterns.len() > MAX_BATCH_FIND_PATTERNS {
+                            return fail(
+                                "invalid_argument",
+                                format!(
+                                    "query 'find' patterns must contain 1 to {MAX_BATCH_FIND_PATTERNS} entries, got {}",
+                                    patterns.len()
+                                ),
+                            );
+                        }
+                        if let Some((index, _)) = patterns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, pattern)| pattern.trim().is_empty())
+                        {
+                            return fail(
+                                "invalid_argument",
+                                format!(
+                                    "query 'find' patterns[{index}] must be a non-empty string"
+                                ),
+                            );
+                        }
+                        let offset = args.offset.unwrap_or(0);
+                        let limit = args.limit.unwrap_or(DEFAULT_FIND_LIMIT);
+                        let cell_offset = args.cell_offset.unwrap_or(0);
+                        let cell_limit = args.cell_limit.unwrap_or(DEFAULT_FIND_CELL_LIMIT);
+                        if limit == 0 || limit > MAX_BATCH_FIND_LIMIT {
+                            return fail(
+                                "invalid_argument",
+                                format!(
+                                    "batch find limit must be between 1 and {MAX_BATCH_FIND_LIMIT}, got {limit}; use continuation or singular pattern for larger pages"
+                                ),
+                            );
+                        }
+                        if cell_limit == 0 || cell_limit > MAX_BATCH_FIND_CELL_LIMIT {
+                            return fail(
+                                "invalid_argument",
+                                format!(
+                                    "batch find cell_limit must be between 1 and {MAX_BATCH_FIND_CELL_LIMIT}, got {cell_limit}; use continuation or singular pattern for larger pages"
+                                ),
+                            );
+                        }
+                        let handle = DocHandle(args.doc_id);
+                        let result = self.runtime.with(&handle, move |snapshot| {
+                            let view = build_document_view(snapshot);
+                            patterns
+                                .iter()
+                                .enumerate()
+                                .map(|(pattern_index, pattern)| {
+                                    find_page(
+                                        &view,
+                                        pattern,
+                                        offset,
+                                        limit,
+                                        cell_offset,
+                                        cell_limit,
+                                    )
+                                    .map(|result| {
+                                        json!({
+                                            "pattern_index": pattern_index,
+                                            "result": result,
+                                        })
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                        });
+                        let outcomes = match result {
+                            Ok(Ok(outcomes)) => outcomes,
+                            Ok(Err(message)) => return fail("invalid_argument", message),
+                            Err(error) => {
+                                return fail(
+                                    &format!("{:?}", error.code),
+                                    format!("doc not open: {}", error.message),
+                                );
+                            }
+                        };
+                        let payload = json!({
+                            "pattern_count": outcomes.len(),
+                            "outcomes": outcomes,
+                            "limits": {
+                                "max_patterns": MAX_BATCH_FIND_PATTERNS,
+                                "max_matches_per_pattern": MAX_BATCH_FIND_LIMIT,
+                                "max_matching_cells_per_table": MAX_BATCH_FIND_CELL_LIMIT,
+                                "max_response_bytes": MAX_BATCH_FIND_RESPONSE_BYTES,
+                            },
+                            "server_version": SERVER_VERSION,
+                        });
+                        if let Err(encoded_bytes) = batch_find_response_bytes(&payload) {
+                            return fail_json(json!({
+                                "code": "response_too_large",
+                                "error": format!(
+                                    "batch find response is {encoded_bytes} bytes, exceeding the {MAX_BATCH_FIND_RESPONSE_BYTES}-byte cap; lower limit, request fewer patterns, or use singular find"
+                                ),
+                                "actual_bytes": encoded_bytes,
+                                "max_bytes": MAX_BATCH_FIND_RESPONSE_BYTES,
+                                "remediation": {
+                                    "kind": "narrow_batch_find",
+                                    "max_patterns": MAX_BATCH_FIND_PATTERNS,
+                                    "max_limit": MAX_BATCH_FIND_LIMIT,
+                                    "max_cell_limit": MAX_BATCH_FIND_CELL_LIMIT,
+                                },
+                            }));
+                        }
+                        ok(payload)
+                    }
                 }
-                self.find(Parameters(FindArgs {
-                    doc_id: args.doc_id,
-                    pattern,
-                    offset: args.offset,
-                    limit: args.limit,
-                    cell_offset: args.cell_offset,
-                    cell_limit: args.cell_limit,
-                }))
-                .await
             }
             InspectQuery::Window => {
                 if args.block_id.is_some()
                     || args.detail.is_some()
                     || args.pattern.is_some()
+                    || args.patterns.is_some()
+                    || args.filter.is_some()
                     || args.offset.is_some()
                     || args.limit.is_some()
                     || args.cell_offset.is_some()
@@ -6379,6 +6851,8 @@ impl StemmaServer {
             InspectQuery::Section => {
                 if args.detail.is_some()
                     || args.pattern.is_some()
+                    || args.patterns.is_some()
+                    || args.filter.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
@@ -6473,6 +6947,8 @@ impl StemmaServer {
             InspectQuery::Operations => {
                 if args.block_id.is_some()
                     || args.detail.is_some()
+                    || args.patterns.is_some()
+                    || args.filter.is_some()
                     || args.from_block_id.is_some()
                     || args.to_block_id.is_some()
                     || args.format.is_some()
@@ -6540,12 +7016,14 @@ impl StemmaServer {
                        anchor, preserve it in content.content as \
                        {type:'opaque_ref',attrs:{id:'<opaque id from inspect block anchors>'}}. \
                        For bulk literal changes use replacement_worklist:{author,replacements:[ \
-                       {old,new,expected_matches?:2,replace_all?:false,scope?,match_mode?, \
+                       {effect_id?,old,new,expected_matches?:2,replace_all?:false,scope?,match_mode?, \
                        on_barrier_match?}]}; use replace_all:true instead of expected_matches \
                        only when every occurrence is intended. Omitted scope searches top-level \
                        and table-cell paragraphs; use scope only to restrict or disambiguate. It \
                        supports an exact throwaway preview or apply, reports every item independently, and avoids \
-                       one search/read/edit round trip per phrase. It is explicitly non-atomic: \
+                       one search/read/edit round trip per phrase. A task-bound session requires \
+                       every item to name and exactly match one declared effect_id; other plan \
+                       shapes are refused there. It is explicitly non-atomic: \
                        failed items are returned alongside applied items for exact re-issue. \
                        Resolution is NOT a finalize step: for ordinary fill/edit tasks leave both \
                        existing and newly authored revisions pending; accept/reject only when the \
@@ -6598,6 +7076,25 @@ impl StemmaServer {
                 "transaction, resolution, and replacement_worklist require a non-empty doc_id",
             );
         };
+        if let Some(binding) = self.task_doc_binding(&doc_id)
+            && replacement_worklist.is_none()
+        {
+            let shape = if transaction.is_some() {
+                "transaction"
+            } else {
+                "resolution"
+            };
+            return fail_json(json!({
+                "code": "task_plan_shape_undeclarable",
+                "error": format!(
+                    "{shape} cannot execute in task {:?}: task manifest v1 admits only declaration-matched replacement_worklist items",
+                    binding.task_id
+                ),
+                "task_id": binding.task_id,
+                "doc_id": doc_id,
+                "shape": shape,
+            }));
+        }
         match (transaction, resolution, replacement_worklist) {
             (Some(transaction), None, None) => {
                 let mut result = self
@@ -6680,6 +7177,15 @@ impl StemmaServer {
                         "mode is valid only for transaction plans; replacement_worklist always authors tracked changes",
                     );
                 }
+                let _session_guard = self
+                    .artifact_session_gate
+                    .lock()
+                    .expect("artifact_session_gate mutex poisoned");
+                let task_binding =
+                    match self.validate_task_worklist(&doc_id, &worklist.replacements) {
+                        Ok(binding) => binding,
+                        Err(failure) => return failure,
+                    };
                 let mut replacements = Vec::with_capacity(worklist.replacements.len());
                 for (index, item) in worklist.replacements.into_iter().enumerate() {
                     if item.replace_all && item.expected_matches.is_some() {
@@ -6703,15 +7209,19 @@ impl StemmaServer {
                         on_barrier_match: item.on_barrier_match.as_str().to_string(),
                     });
                 }
-                let mut result = self
-                    .replace_text_batch(Parameters(ReplaceTextBatchArgs {
-                        doc_id,
-                        author: worklist.author,
-                        replacements,
-                        preview,
-                        allow_existing_author,
-                    }))
-                    .await;
+                let mut result = self.replace_text_batch_impl(ReplaceTextBatchArgs {
+                    doc_id,
+                    author: worklist.author,
+                    replacements,
+                    preview,
+                    allow_existing_author,
+                });
+                if !preview
+                    && let Some(binding) = &task_binding
+                    && let Err(failure) = self.record_task_worklist_outcomes(binding, &mut result)
+                {
+                    return failure;
+                }
                 if preview {
                     attach_preview_apply_cue(&mut result);
                 }
@@ -6730,11 +7240,13 @@ impl StemmaServer {
                        pair redundantly recomputes the same engine evidence. \
                        Returns new tracked changes, direct \
                        untracked delta, dispositions of pre-existing revisions, untouched-scope \
-                       proof, validation, and exact input identities. A direct_delta row is \
-                       unexplained unless explanation identifies a comment_annotation, \
-                       property_change, or revision_resolution; reconcile those explained rows \
-                       with the requested comment, direct OOXML property operation, or selector, \
-                       and treat every other row as incomplete. Every list is explicitly \
+                       proof, validation, and exact input identities. Session mode partitions \
+                       changed prior revisions into expected (selected by a successful typed \
+                       accept/reject command) and unexpected; producer-neutral mode has no such \
+                       command evidence and remains conservative. A direct_delta row is \
+                       unexplained unless it is an allowed comment/property effect or carries \
+                       session_resolution_evidenced=true after exact ordered-transition \
+                       reconciliation. Every list is explicitly \
                        paged (16 rows by default, 64 maximum); use detail with offset/limit to \
                        retrieve every finding without flooding conversation history. Optional render.path commits \
                        a create-new audit redline. baseline_validator describes the input before \
@@ -6889,16 +7401,23 @@ impl StemmaServer {
                        task), and report what you resolved distinctly in your final summary."
     )]
     async fn accept_changes(&self, Parameters(args): Parameters<AcceptArgs>) -> CallToolResult {
+        if let Some(failure) = self.refuse_direct_task_mutation(&args.doc_id, "accept_changes") {
+            return failure;
+        }
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        if let Err(failure) = self.session_resolution_evidence(&args.doc_id) {
+            return failure;
+        }
         let ids = match self.resolve_revision_ids(&args.doc_id, args.selector) {
             Ok(ids) => ids,
             Err(r) => return r,
         };
         let handle = DocHandle(args.doc_id.clone());
-        let before = match self
-            .runtime
-            .with(&handle, |snap| Arc::clone(&snap.canonical))
-        {
-            Ok(c) => c,
+        let before = match self.runtime.with(&handle, Clone::clone) {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 return fail(
                     &format!("{:?}", e.code),
@@ -6906,14 +7425,39 @@ impl StemmaServer {
                 );
             }
         };
+        // Derive the evidence from the same pure projection the runtime will
+        // commit, before mutating session state. If serialization or audit
+        // cannot explain the projected transition, the command fails without
+        // having partially committed a resolution.
+        let projected = match before.project(Resolution::Selective {
+            ids: ids.clone(),
+            action: ResolveSelectionAction::Accept,
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return fail(&format!("{:?}", error.code), error.message),
+        };
+        let direct_transitions = match Self::resolution_direct_transitions(&before, &projected) {
+            Ok(transitions) => transitions,
+            Err(failure) => return failure,
+        };
         match self
             .runtime
             .resolve_tracked_revisions(&handle, &ids, ResolveSelectionAction::Accept)
         {
             Ok(result) => {
-                let mut accepted: Vec<u32> = ids.into_iter().collect();
+                assert_eq!(
+                    result.canonical, projected.canonical,
+                    "runtime selective-accept result diverged from its preflight projection"
+                );
+                let mut accepted: Vec<u32> = ids.iter().copied().collect();
                 accepted.sort_unstable();
-                let changed = changed_block_ids(&before, &result.canonical);
+                let changed = changed_block_ids(&before.canonical, &result.canonical);
+                let evidence_ids: HashSet<u32> = accepted
+                    .iter()
+                    .copied()
+                    .chain(result.cascaded_revision_ids.iter().copied())
+                    .collect();
+                self.record_resolution_evidence(&args.doc_id, evidence_ids, direct_transitions);
                 let (changed_blocks, block_count) =
                     match self.changed_block_rows(&args.doc_id, &changed) {
                         Ok(v) => v,
@@ -6954,16 +7498,23 @@ impl StemmaServer {
                        task), and report what you resolved distinctly in your final summary."
     )]
     async fn reject_changes(&self, Parameters(args): Parameters<RejectArgs>) -> CallToolResult {
+        if let Some(failure) = self.refuse_direct_task_mutation(&args.doc_id, "reject_changes") {
+            return failure;
+        }
+        let _session_guard = self
+            .artifact_session_gate
+            .lock()
+            .expect("artifact_session_gate mutex poisoned");
+        if let Err(failure) = self.session_resolution_evidence(&args.doc_id) {
+            return failure;
+        }
         let ids = match self.resolve_revision_ids(&args.doc_id, args.selector) {
             Ok(ids) => ids,
             Err(r) => return r,
         };
         let handle = DocHandle(args.doc_id.clone());
-        let before = match self
-            .runtime
-            .with(&handle, |snap| Arc::clone(&snap.canonical))
-        {
-            Ok(c) => c,
+        let before = match self.runtime.with(&handle, Clone::clone) {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 return fail(
                     &format!("{:?}", e.code),
@@ -6971,14 +7522,35 @@ impl StemmaServer {
                 );
             }
         };
+        let projected = match before.project(Resolution::Selective {
+            ids: ids.clone(),
+            action: ResolveSelectionAction::Reject,
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return fail(&format!("{:?}", error.code), error.message),
+        };
+        let direct_transitions = match Self::resolution_direct_transitions(&before, &projected) {
+            Ok(transitions) => transitions,
+            Err(failure) => return failure,
+        };
         match self
             .runtime
             .resolve_tracked_revisions(&handle, &ids, ResolveSelectionAction::Reject)
         {
             Ok(result) => {
-                let mut rejected: Vec<u32> = ids.into_iter().collect();
+                assert_eq!(
+                    result.canonical, projected.canonical,
+                    "runtime selective-reject result diverged from its preflight projection"
+                );
+                let mut rejected: Vec<u32> = ids.iter().copied().collect();
                 rejected.sort_unstable();
-                let changed = changed_block_ids(&before, &result.canonical);
+                let changed = changed_block_ids(&before.canonical, &result.canonical);
+                let evidence_ids: HashSet<u32> = rejected
+                    .iter()
+                    .copied()
+                    .chain(result.cascaded_revision_ids.iter().copied())
+                    .collect();
+                self.record_resolution_evidence(&args.doc_id, evidence_ids, direct_transitions);
                 let (changed_blocks, block_count) =
                     match self.changed_block_rows(&args.doc_id, &changed) {
                         Ok(v) => v,
@@ -7107,6 +7679,8 @@ impl StemmaServer {
                        itself a finding), preexisting (every revision already pending at open, \
                        with disposition untouched|modified|resolved; resolved rows' committed \
                        effects are annotated on direct rows via coincides_with_resolution), \
+                       counts that partition changed prior revisions into expected and unexpected \
+                       using successful typed resolution evidence, \
                        untouched ({verified_blocks, parts, violations} — every block outside \
                        the reported changes verified structurally identical to the baseline), \
                        and validator (the package verdict on the would-be save bytes). The \
@@ -7131,7 +7705,17 @@ impl StemmaServer {
             Ok(r) => r,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
-        let mut payload = match audit_report_json(&report, args.detail, args.offset, args.limit) {
+        let resolution_evidence = match self.session_resolution_evidence(&args.doc_id) {
+            Ok(evidence) => evidence,
+            Err(failure) => return failure,
+        };
+        let mut payload = match audit_report_json(
+            &report,
+            Some(&resolution_evidence),
+            args.detail,
+            args.offset,
+            args.limit,
+        ) {
             Ok(payload) => payload,
             Err(message) => return fail("invalid_argument", message),
         };
@@ -7203,10 +7787,11 @@ impl StemmaServer {
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
         let input_artifacts = vec![before.identity().clone(), after.identity().clone()];
-        let mut payload = match audit_report_json(&report, args.detail, args.offset, args.limit) {
-            Ok(payload) => payload,
-            Err(message) => return fail("invalid_argument", message),
-        };
+        let mut payload =
+            match audit_report_json(&report, None, args.detail, args.offset, args.limit) {
+                Ok(payload) => payload,
+                Err(message) => return fail("invalid_argument", message),
+            };
         let baseline_validation = stemma::api::validate(before.bytes());
         attach_baseline_validation(&mut payload, &baseline_validation, &report.validator);
         payload["before_path"] = json!(args.before_path);
@@ -7473,7 +8058,41 @@ fn audit_direct_change_explanation(c: &stemma::audit::DirectChange) -> Option<&'
     }
 }
 
-fn audit_direct_row_json(c: &stemma::audit::DirectChange) -> Value {
+fn session_evidences_resolution_effect(
+    change: &stemma::audit::DirectChange,
+    evidence: Option<&SessionResolutionEvidence>,
+) -> bool {
+    let Some(evidence) = evidence else {
+        return false;
+    };
+    let mut current = change.old_excerpt.clone();
+    let mut matched = false;
+    for batch in &evidence.direct_transition_batches {
+        let mut candidates = batch.iter().filter(|transition| {
+            transition.story == change.story
+                && transition.block_id == change.block_id
+                && transition.old_excerpt == current
+        });
+        let Some(transition) = candidates.next() else {
+            continue;
+        };
+        // Two effects in one atomic resolution with the same location and
+        // starting value are ambiguous to replay. Refuse to attribute the
+        // final row rather than guessing.
+        if candidates.next().is_some() {
+            return false;
+        }
+        current = transition.new_excerpt.clone();
+        matched = true;
+    }
+    // A later direct mutation changes the final value and fails here.
+    matched && current == change.new_excerpt
+}
+
+fn audit_direct_row_json(
+    c: &stemma::audit::DirectChange,
+    resolution_evidence: Option<&SessionResolutionEvidence>,
+) -> Value {
     json!({
         "story": c.story,
         "kind": c.kind.as_str(),
@@ -7482,6 +8101,8 @@ fn audit_direct_row_json(c: &stemma::audit::DirectChange) -> Value {
         "new_excerpt": c.new_excerpt.as_deref().map(cap_excerpt),
         "coincides_with_resolution": c.coincides_with_resolution,
         "explanation": audit_direct_change_explanation(c),
+        "session_resolution_evidenced":
+            session_evidences_resolution_effect(c, resolution_evidence),
     })
 }
 
@@ -7492,6 +8113,7 @@ fn audit_direct_row_json(c: &stemma::audit::DirectChange) -> Value {
 /// identity fields (`doc_id` / paths) and optional `render`.
 fn audit_report_json(
     report: &stemma::audit::AuditReport,
+    resolution_evidence: Option<&SessionResolutionEvidence>,
     detail: Option<AuditDetail>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -7501,13 +8123,31 @@ fn audit_report_json(
     let unexplained_direct_changes = report
         .direct_changes
         .iter()
-        .filter(|change| audit_direct_change_explanation(change).is_none())
+        .filter(|change| {
+            let intrinsically_explained = matches!(&change.story, StoryScope::Comment { .. })
+                || (change.kind == stemma::audit::DirectChangeKind::BlockModified
+                    && change.old_excerpt == change.new_excerpt);
+            !intrinsically_explained
+                && !session_evidences_resolution_effect(change, resolution_evidence)
+        })
         .count();
     let changed_prior_revisions = report
         .preexisting_revisions
         .iter()
         .filter(|prior| !matches!(&prior.disposition, RevisionDisposition::Untouched))
         .count();
+    let expected_changed_prior_revisions = report
+        .preexisting_revisions
+        .iter()
+        .filter(|prior| {
+            matches!(&prior.disposition, RevisionDisposition::Resolved)
+                && resolution_evidence.is_some_and(|evidence| {
+                    evidence.revision_ids.contains(&prior.record.revision_id)
+                })
+        })
+        .count();
+    let unexpected_changed_prior_revisions =
+        changed_prior_revisions - expected_changed_prior_revisions;
 
     let census: Vec<Value> = report
         .new_revisions
@@ -7517,7 +8157,7 @@ fn audit_report_json(
     let direct: Vec<Value> = report
         .direct_changes
         .iter()
-        .map(audit_direct_row_json)
+        .map(|change| audit_direct_row_json(change, resolution_evidence))
         .collect();
     let preexisting: Vec<Value> = report
         .preexisting_revisions
@@ -7605,6 +8245,8 @@ fn audit_report_json(
             "unexplained_direct_changes": unexplained_direct_changes,
             "preexisting_revisions": report.preexisting_revisions.len(),
             "changed_prior_revisions": changed_prior_revisions,
+            "expected_changed_prior_revisions": expected_changed_prior_revisions,
+            "unexpected_changed_prior_revisions": unexpected_changed_prior_revisions,
             "untouched_violations": report.untouched.violations.len(),
             "validator_issues": report.validator.issues.len(),
             "new_validator_issues": Value::Null,
@@ -7670,7 +8312,7 @@ fn attach_baseline_validation(
     let blocking_finding_count = payload["counts"]["unexplained_direct_changes"]
         .as_u64()
         .expect("audit count is an integer")
-        + payload["counts"]["changed_prior_revisions"]
+        + payload["counts"]["unexpected_changed_prior_revisions"]
             .as_u64()
             .expect("audit count is an integer")
         + payload["counts"]["untouched_violations"]
@@ -7876,6 +8518,7 @@ mod tests {
             "## Sharp edges",
             "AuthorImpersonation",
             "replace_text",
+            "## Multi-document tasks",
             "## Policy: layer beside, don't resolve, unless asked",
         ] {
             assert!(
@@ -7893,7 +8536,7 @@ mod tests {
     /// A minimal DOCX (no styles part → Normal-styled paragraphs) whose body is
     /// `body_inner`, optionally with a numbering.xml carrying numId=1 (decimal)
     /// and numId=2 (bullet).
-    fn make_docx(body_inner: &str, with_numbering: bool) -> Vec<u8> {
+    pub(super) fn make_docx(body_inner: &str, with_numbering: bool) -> Vec<u8> {
         let document_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
@@ -9360,6 +10003,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -9505,6 +10149,7 @@ mod tests {
                     block_id: None,
                     detail: None,
                     pattern: None,
+                    patterns: None,
                     filter: None,
                     from_block_id: None,
                     to_block_id: None,
@@ -9729,7 +10374,7 @@ mod tests {
         }))
     }
 
-    fn structured(result: &CallToolResult) -> Value {
+    pub(super) fn structured(result: &CallToolResult) -> Value {
         result
             .structured_content
             .clone()
@@ -9745,6 +10390,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(&make_multi_para_docx(10)),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"]
@@ -9931,6 +10578,68 @@ mod tests {
         );
     }
 
+    /// A move toward the start of the document places its destination copy
+    /// before its source shadow. The collapsed move census row names that
+    /// first destination carrier, but verified delivery must still account
+    /// for the paired source carrier and permit the save.
+    #[tokio::test]
+    async fn save_docx_delivers_tracked_move_with_destination_before_source() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(6))
+            .expect("write input");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("open doc id")
+            .to_string();
+
+        let moved = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: doc_id.clone(),
+                transaction: TransactionArg(json!({
+                    "ops": [{
+                        "op": "move",
+                        "target": "p_4",
+                        "destination": { "anchor": "p_1", "position": "after" },
+                    }],
+                    "revision": { "author": "Mover" },
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(structured(&moved)["applied"], true, "{moved:?}");
+
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "moved.docx".to_string(),
+            }))
+            .await;
+        let payload = structured(&saved);
+        assert_eq!(saved.is_error, Some(false), "{payload}");
+        assert_eq!(
+            payload["audit_binding"]["verdict"]["deliverable"], true,
+            "{payload}"
+        );
+        assert_eq!(
+            payload["audit_binding"]["counts"]["untouched_violations"],
+            0
+        );
+        assert!(
+            workspace.path().join("moved.docx").is_file(),
+            "verified save creates the requested destination"
+        );
+    }
+
     /// A transaction with no move op reports an empty `moves` list — the
     /// field is always present (predictable shape), never omitted.
     #[tokio::test]
@@ -9964,6 +10673,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(&make_multi_para_docx(102)),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"]
@@ -10069,6 +10780,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -10110,6 +10822,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(&make_multi_para_docx(10)),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"]
@@ -10168,6 +10882,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(&make_multi_para_docx(3)),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"]
@@ -10225,6 +10941,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(bytes),
+                task: None,
+                task_id: None,
             }))
             .await;
         structured(&open)["doc_id"]
@@ -10888,6 +11606,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: Some(RevisionFilter {
                     by_author: Some("Prior".to_string()),
                     by_kind: Some("insert".to_string()),
@@ -11054,6 +11773,7 @@ mod tests {
                     block_id: Some(table_id.clone()),
                     detail: None,
                     pattern: None,
+                    patterns: None,
                     filter: None,
                     from_block_id: None,
                     to_block_id: None,
@@ -11200,6 +11920,7 @@ mod tests {
                 block_id: Some(cell_id.clone()),
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -11266,6 +11987,7 @@ mod tests {
             block_id: Some(cell_id.clone()),
             detail,
             pattern: None,
+            patterns: None,
             filter: None,
             from_block_id: None,
             to_block_id: None,
@@ -11409,6 +12131,7 @@ mod tests {
                     block_id: Some(hit["id"].as_str().expect("block id").to_string()),
                     detail: None,
                     pattern: None,
+                    patterns: None,
                     filter: None,
                     from_block_id: None,
                     to_block_id: None,
@@ -11446,6 +12169,7 @@ mod tests {
         let worklist = || ReplacementWorklistArg {
             author: "Cell Worklist Test".to_string(),
             replacements: vec![CoreReplacementItem {
+                effect_id: None,
                 old: "R0C1".to_string(),
                 new: "CELL REPLACED".to_string(),
                 scope: None,
@@ -11487,6 +12211,7 @@ mod tests {
                     block_id: Some(cell_id.clone()),
                     detail: None,
                     pattern: None,
+                    patterns: None,
                     filter: None,
                     from_block_id: None,
                     to_block_id: None,
@@ -11525,6 +12250,7 @@ mod tests {
                     block_id: Some(cell_id),
                     detail: None,
                     pattern: None,
+                    patterns: None,
                     filter: None,
                     from_block_id: None,
                     to_block_id: None,
@@ -11798,6 +12524,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: write_temp_docx(&make_multi_para_docx(3)),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"].as_str().unwrap().to_string();
@@ -11967,6 +12695,7 @@ mod tests {
             "counts": {
                 "unexplained_direct_changes": 0,
                 "changed_prior_revisions": 0,
+                "unexpected_changed_prior_revisions": 0,
                 "untouched_violations": 0,
             },
         });
@@ -12181,6 +12910,8 @@ mod tests {
         let open = server
             .open_docx(Parameters(OpenArgs {
                 path: before_path.clone(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&open)["doc_id"].as_str().unwrap().to_string();
@@ -12274,6 +13005,395 @@ mod tests {
         }
     }
 
+    /// Delivery invariant: save is the commit boundary, so a fresh audit that
+    /// finds an unexplained direct change must refuse before the destination
+    /// exists. Returning "review_required" after writing would turn a failed
+    /// trust decision into an apparently usable artifact.
+    #[tokio::test]
+    async fn save_docx_refuses_non_deliverable_audit_before_path_creation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(3))
+            .expect("write input");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("open doc id")
+            .to_string();
+
+        let applied = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: doc_id.clone(),
+                transaction: replace_txn_arg("p_2", "Paragraph 1", "Paragraph 1 changed directly."),
+                mode: Some("direct".to_string()),
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(structured(&applied)["applied"], true, "{applied:?}");
+
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "must-not-exist.docx".to_string(),
+            }))
+            .await;
+        let payload = structured(&saved);
+        assert_eq!(saved.is_error, Some(true), "{payload}");
+        assert_eq!(payload["code"], "verification_failed", "{payload}");
+        assert_eq!(payload["audit"]["verdict"]["deliverable"], false);
+        assert!(
+            payload["audit"]["counts"]["unexplained_direct_changes"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "the refusal exposes the blocking finding count: {payload}"
+        );
+        assert!(
+            !workspace.path().join("must-not-exist.docx").exists(),
+            "a failed audit must not create a deliverable"
+        );
+    }
+
+    /// Delivery distinguishes a requested typed resolution from an unexpected
+    /// changed prior revision. Both audits observe a resolved pre-existing
+    /// revision; only the MCP command is session evidence that the transition
+    /// was intended. A blanket "resolved is deliverable" rule would make the
+    /// bypass half of this regression fail.
+    #[tokio::test]
+    async fn save_docx_allows_only_session_evidenced_prior_revision_resolution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("input.docx"), filter_selector_docx())
+            .expect("write input");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("open doc id")
+            .to_string();
+        let selector = ChangeSelector::ByFilter {
+            by_author: Some("AuthorB".to_string()),
+            by_kind: Some("insert".to_string()),
+            by_block_range: Some(BlockRange {
+                from_block_id: "p_3".to_string(),
+                to_block_id: "p_3".to_string(),
+            }),
+        };
+        let rejected = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id: doc_id.clone(),
+                selector,
+            }))
+            .await;
+        assert_eq!(rejected.is_error, Some(false), "{}", structured(&rejected));
+
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id: doc_id.clone(),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        let review = structured(&review);
+        assert_eq!(review["counts"]["changed_prior_revisions"], 1, "{review}");
+        assert_eq!(
+            review["counts"]["expected_changed_prior_revisions"], 1,
+            "{review}"
+        );
+        assert_eq!(
+            review["counts"]["unexpected_changed_prior_revisions"], 0,
+            "{review}"
+        );
+        assert_eq!(review["verdict"]["deliverable"], true, "{review}");
+
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: "resolved.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "{}", structured(&saved));
+        assert!(workspace.path().join("resolved.docx").is_file());
+
+        let stateless = server
+            .audit_docx(Parameters(AuditDocxArgs {
+                before_path: "input.docx".to_string(),
+                after_path: "resolved.docx".to_string(),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        let stateless = structured(&stateless);
+        assert_eq!(
+            stateless["counts"]["unexpected_changed_prior_revisions"], 1,
+            "producer-neutral audit has no session command evidence: {stateless}"
+        );
+        assert_eq!(stateless["verdict"]["deliverable"], false, "{stateless}");
+
+        let direct = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: doc_id.clone(),
+                transaction: replace_txn_arg("p_3", "End stop.", "End changed directly."),
+                mode: Some("direct".to_string()),
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(direct.is_error, Some(false), "{}", structured(&direct));
+        let refused_same_block = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "same-block-direct.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            structured(&refused_same_block)["code"],
+            "verification_failed",
+            "a later direct edit cannot inherit an earlier resolution transition"
+        );
+        assert!(!workspace.path().join("same-block-direct.docx").exists());
+
+        let bypass_authority =
+            PathAuthority::rooted(workspace.path()).expect("second rooted authority");
+        let bypass = StemmaServer::with_config_and_authority(Config::defaults(), bypass_authority);
+        let opened = bypass
+            .open_docx(Parameters(OpenArgs {
+                path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let bypass_doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("bypass doc id")
+            .to_string();
+        let ids = bypass
+            .resolve_revision_ids(
+                &bypass_doc_id,
+                ChangeSelector::ByFilter {
+                    by_author: Some("AuthorB".to_string()),
+                    by_kind: Some("insert".to_string()),
+                    by_block_range: Some(BlockRange {
+                        from_block_id: "p_3".to_string(),
+                        to_block_id: "p_3".to_string(),
+                    }),
+                },
+            )
+            .expect("resolve ids");
+        bypass
+            .runtime
+            .resolve_tracked_revisions(
+                &DocHandle(bypass_doc_id.clone()),
+                &ids,
+                ResolveSelectionAction::Reject,
+            )
+            .expect("engine resolution");
+
+        let refused = bypass
+            .save_docx(Parameters(SaveArgs {
+                doc_id: bypass_doc_id,
+                path: "unexpected-resolution.docx".to_string(),
+            }))
+            .await;
+        let refused = structured(&refused);
+        assert_eq!(refused["code"], "verification_failed", "{refused}");
+        assert_eq!(
+            refused["audit"]["counts"]["unexpected_changed_prior_revisions"], 1,
+            "{refused}"
+        );
+        assert!(!workspace.path().join("unexpected-resolution.docx").exists());
+    }
+
+    /// Resolution evidence follows the typed operation's structural footprint,
+    /// not only the revision record's own block id. Accepting a deleted
+    /// paragraph mark removes its following paragraph; resolving text inside a
+    /// cell is reported by the audit at the containing table. Both are expected
+    /// effects of the selected revision set and must remain saveable.
+    #[tokio::test]
+    async fn save_docx_reconciles_paragraph_join_and_table_resolution_effects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let paragraph_join = make_docx(
+            concat!(
+                r#"<w:p><w:pPr><w:rPr><w:del w:id="1" w:author="Resolver" w:date="2026-01-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>First</w:t></w:r></w:p>"#,
+                r#"<w:p><w:r><w:t>Second</w:t></w:r></w:p>"#,
+            ),
+            false,
+        );
+        std::fs::write(workspace.path().join("paragraph.docx"), paragraph_join)
+            .expect("write paragraph fixture");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "paragraph.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("paragraph doc id")
+            .to_string();
+        let accepted = server
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByAuthor {
+                    author: "Resolver".to_string(),
+                },
+            }))
+            .await;
+        assert_eq!(accepted.is_error, Some(false), "{}", structured(&accepted));
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "paragraph-resolved.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "{}", structured(&saved));
+
+        let before_mutation_authority =
+            PathAuthority::rooted(workspace.path()).expect("before-mutation rooted authority");
+        let before_mutation =
+            StemmaServer::with_config_and_authority(Config::defaults(), before_mutation_authority);
+        let opened = before_mutation
+            .open_docx(Parameters(OpenArgs {
+                path: "paragraph.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let before_mutation_doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("before-mutation doc id")
+            .to_string();
+        let direct_before = before_mutation
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id: before_mutation_doc_id.clone(),
+                transaction: replace_txn_arg("p_2", "Second", "Altered"),
+                mode: Some("direct".to_string()),
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(
+            direct_before.is_error,
+            Some(false),
+            "{}",
+            structured(&direct_before)
+        );
+        let accepted = before_mutation
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id: before_mutation_doc_id.clone(),
+                selector: ChangeSelector::ByAuthor {
+                    author: "Resolver".to_string(),
+                },
+            }))
+            .await;
+        assert_eq!(accepted.is_error, Some(false), "{}", structured(&accepted));
+        let refused_before = before_mutation
+            .save_docx(Parameters(SaveArgs {
+                doc_id: before_mutation_doc_id,
+                path: "direct-before-resolution.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(
+            structured(&refused_before)["code"],
+            "verification_failed",
+            "an earlier direct edit cannot be absorbed into a later paragraph-join transition"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join("direct-before-resolution.docx")
+                .exists()
+        );
+
+        let table = make_docx(
+            concat!(
+                r#"<w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/><w:p>"#,
+                r#"<w:r><w:t xml:space="preserve">Price </w:t></w:r>"#,
+                r#"<w:del w:id="2" w:author="ResolverA" w:date="2026-01-01T00:00:00Z"><w:r><w:delText>113</w:delText></w:r></w:del>"#,
+                r#"<w:ins w:id="3" w:author="ResolverA" w:date="2026-01-01T00:00:00Z"><w:r><w:t>999</w:t></w:r></w:ins>"#,
+                r#"<w:r><w:t xml:space="preserve"> term </w:t></w:r>"#,
+                r#"<w:del w:id="4" w:author="ResolverB" w:date="2026-01-02T00:00:00Z"><w:r><w:delText>30</w:delText></w:r></w:del>"#,
+                r#"<w:ins w:id="5" w:author="ResolverB" w:date="2026-01-02T00:00:00Z"><w:r><w:t>45</w:t></w:r></w:ins>"#,
+                r#"</w:p></w:tc></w:tr></w:tbl>"#,
+            ),
+            false,
+        );
+        std::fs::write(workspace.path().join("table.docx"), table).expect("write table fixture");
+        let authority = PathAuthority::rooted(workspace.path()).expect("second rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "table.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("table doc id")
+            .to_string();
+        for author in ["ResolverA", "ResolverB"] {
+            let accepted = server
+                .accept_changes(Parameters(AcceptArgs {
+                    doc_id: doc_id.clone(),
+                    selector: ChangeSelector::ByAuthor {
+                        author: author.to_string(),
+                    },
+                }))
+                .await;
+            assert_eq!(
+                accepted.is_error,
+                Some(false),
+                "{author}: {}",
+                structured(&accepted)
+            );
+        }
+        let review = server
+            .review_session(Parameters(ReviewSessionArgs {
+                doc_id: doc_id.clone(),
+                render: None,
+                detail: None,
+                offset: None,
+                limit: None,
+            }))
+            .await;
+        let review = structured(&review);
+        assert_eq!(review["counts"]["changed_prior_revisions"], 4, "{review}");
+        assert_eq!(
+            review["counts"]["unexpected_changed_prior_revisions"], 0,
+            "{review}"
+        );
+        assert_eq!(
+            review["counts"]["unexplained_direct_changes"], 0,
+            "{review}"
+        );
+        assert_eq!(review["verdict"]["deliverable"], true, "{review}");
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: "table-resolved.docx".to_string(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "{}", structured(&saved));
+    }
+
     #[tokio::test]
     async fn rooted_mcp_open_refuses_traversal_and_symlink_escape() {
         let world = tempfile::tempdir().expect("world");
@@ -12290,6 +13410,8 @@ mod tests {
         let traversal = server
             .open_docx(Parameters(OpenArgs {
                 path: "../outside.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(structured(&traversal)["code"], "artifact_outside_workspace");
@@ -12299,6 +13421,8 @@ mod tests {
             let escaped = server
                 .open_docx(Parameters(OpenArgs {
                     path: "escaped.docx".to_string(),
+                    task: None,
+                    task_id: None,
                 }))
                 .await;
             assert_eq!(structured(&escaped)["code"], "artifact_outside_workspace");
@@ -12307,6 +13431,8 @@ mod tests {
         let absolute_inside = server
             .open_docx(Parameters(OpenArgs {
                 path: input.display().to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(
@@ -12326,6 +13452,8 @@ mod tests {
         let stream_read = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx:hidden".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(structured(&stream_read)["code"], "artifact_read_failed");
@@ -12368,6 +13496,8 @@ mod tests {
         let alias_result = server
             .open_docx(Parameters(OpenArgs {
                 path: "input-alias.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(alias_result.is_error, Some(true));
@@ -12421,6 +13551,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
@@ -12513,6 +13645,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
@@ -12582,6 +13716,8 @@ mod tests {
         let denied = server
             .open_docx(Parameters(OpenArgs {
                 path: outside.path().join("outside.docx").display().to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(
@@ -12595,6 +13731,8 @@ mod tests {
         let denied = server
             .open_docx(Parameters(OpenArgs {
                 path: outside_input.display().to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(structured(&denied)["code"], "artifact_outside_workspace");
@@ -12602,6 +13740,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         assert_eq!(
@@ -12897,7 +14037,9 @@ mod tests {
     #[test]
     fn core_guidance_is_materially_smaller_than_the_advanced_playbook() {
         assert!(CORE_INSTRUCTIONS.contains("open_docx -> inspect_docx"));
-        assert!(CORE_INSTRUCTIONS.contains("verify_docx -> save_docx"));
+        assert!(CORE_INSTRUCTIONS.contains("execute_plan -> save_docx"));
+        assert!(CORE_INSTRUCTIONS.contains("patterns=[...]"));
+        assert!(CORE_INSTRUCTIONS.contains("not a required call before save_docx"));
         assert!(CORE_INSTRUCTIONS.contains("resolution is not a finalize"));
         assert!(
             CORE_INSTRUCTIONS.len() * 10 < INSTRUCTIONS.len(),
@@ -13036,6 +14178,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
@@ -13070,6 +14214,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_source_registry_refuses_resolution_before_mutation() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &filter_selector_docx()).await;
+        let before = server
+            .resolve_revision_ids(
+                &doc_id,
+                ChangeSelector::ByAuthor {
+                    author: "AuthorB".to_string(),
+                },
+            )
+            .expect("AuthorB revisions before refused command");
+        assert!(!before.is_empty());
+        server.source_artifacts.lock().unwrap().remove(&doc_id);
+
+        let rejected = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByAuthor {
+                    author: "AuthorB".to_string(),
+                },
+            }))
+            .await;
+        assert_eq!(
+            structured(&rejected)["code"],
+            "artifact_session_state_missing"
+        );
+        let after = server
+            .resolve_revision_ids(
+                &doc_id,
+                ChangeSelector::ByAuthor {
+                    author: "AuthorB".to_string(),
+                },
+            )
+            .expect("AuthorB revisions after refused command");
+        assert_eq!(
+            after, before,
+            "failure to establish resolution evidence must leave the runtime unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_source_registry_refuses_path_backed_image_before_mutation() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(3))
@@ -13080,6 +14265,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
@@ -13124,6 +14311,8 @@ mod tests {
         let opened = server
             .open_docx(Parameters(OpenArgs {
                 path: "input.docx".to_string(),
+                task: None,
+                task_id: None,
             }))
             .await;
         let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
@@ -13161,7 +14350,11 @@ mod tests {
         assert!(docx.len() as u64 > 100, "fixture must exceed the tiny cap");
         let path = write_temp_docx(&docx);
         let result = server
-            .open_docx(Parameters(OpenArgs { path: path.clone() }))
+            .open_docx(Parameters(OpenArgs {
+                path: path.clone(),
+                task: None,
+                task_id: None,
+            }))
             .await;
         assert_eq!(result.is_error, Some(true), "over-cap open is an error");
         let payload = structured(&result);
@@ -13191,7 +14384,11 @@ mod tests {
         });
         let path = write_temp_docx(&make_multi_para_docx(3));
         let result = server
-            .open_docx(Parameters(OpenArgs { path: path.clone() }))
+            .open_docx(Parameters(OpenArgs {
+                path: path.clone(),
+                task: None,
+                task_id: None,
+            }))
             .await;
         assert_eq!(result.is_error, Some(false), "cap 0 opens any size");
         std::fs::remove_file(&path).ok();
@@ -13245,6 +14442,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -13270,6 +14468,7 @@ mod tests {
                 block_id: Some("p_1".to_string()),
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -13377,6 +14576,7 @@ mod tests {
         let server = StemmaServer::new();
         let doc_id = open_and_id(&server, &make_multi_para_docx(3)).await;
         let item = |old: &str, new: &str| CoreReplacementItem {
+            effect_id: None,
             old: old.to_string(),
             new: new.to_string(),
             scope: None,
@@ -13473,6 +14673,7 @@ mod tests {
         let worklist = || ReplacementWorklistArg {
             author: "Reviewing Counsel".to_string(),
             replacements: vec![CoreReplacementItem {
+                effect_id: None,
                 old: "rate of 8% above base rate".to_string(),
                 new: "rate of 2% above base rate".to_string(),
                 scope: None,
@@ -13581,6 +14782,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -13601,6 +14803,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: Some("Paragraph 2".to_string()),
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -13621,6 +14824,7 @@ mod tests {
                 block_id: None,
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: Some("p_2".to_string()),
                 to_block_id: Some("p_3".to_string()),
@@ -13640,6 +14844,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_batch_find_preserves_pattern_order_duplicates_and_zero_outcomes() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(20)).await;
+        let args: InspectDocxArgs = serde_json::from_value(json!({
+            "doc_id": doc_id.clone(),
+            "query": "find",
+            "patterns": ["Paragraph 2", "absent phrase", "Paragraph 2"],
+            "limit": 16
+        }))
+        .expect("patterns[] is an additive typed find input");
+
+        let result = server.inspect_docx(Parameters(args)).await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["pattern_count"], 3);
+        assert_eq!(payload["outcomes"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["outcomes"][0]["pattern_index"], 0);
+        assert_eq!(payload["outcomes"][0]["result"]["pattern"], "Paragraph 2");
+        assert_eq!(payload["outcomes"][0]["result"]["count"], 1);
+        assert_eq!(payload["outcomes"][0]["result"]["matches"][0]["id"], "p_3");
+        assert_eq!(payload["outcomes"][1]["pattern_index"], 1);
+        assert_eq!(payload["outcomes"][1]["result"]["pattern"], "absent phrase");
+        assert_eq!(payload["outcomes"][1]["result"]["count"], 0);
+        assert_eq!(payload["outcomes"][2]["pattern_index"], 2);
+        assert_eq!(
+            payload["outcomes"][2]["result"], payload["outcomes"][0]["result"],
+            "duplicate patterns retain independent ordered outcomes with singular-find semantics"
+        );
+        let singular_args: InspectDocxArgs = serde_json::from_value(json!({
+            "doc_id": doc_id,
+            "query": "find",
+            "pattern": "Paragraph 2",
+            "limit": 16
+        }))
+        .unwrap();
+        let singular = server.inspect_docx(Parameters(singular_args)).await;
+        let mut singular_payload = structured(&singular);
+        singular_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("server_version");
+        assert_eq!(
+            payload["outcomes"][0]["result"], singular_payload,
+            "batch result pages are exactly the singular find contract"
+        );
+        assert_eq!(payload["limits"]["max_patterns"], 8);
+        assert_eq!(payload["limits"]["max_matches_per_pattern"], 16);
+        assert_eq!(payload["limits"]["max_matching_cells_per_table"], 4);
+        assert!(
+            serde_json::to_vec(&payload).unwrap().len() <= 256 * 1024,
+            "a successful batch response stays under the advertised byte cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_batch_find_pages_each_pattern_with_exact_totals() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(20)).await;
+        let first_args: InspectDocxArgs = serde_json::from_value(json!({
+            "doc_id": doc_id.clone(),
+            "query": "find",
+            "patterns": ["Paragraph"],
+            "limit": 16
+        }))
+        .unwrap();
+        let first = structured(&server.inspect_docx(Parameters(first_args)).await);
+        let first_result = &first["outcomes"][0]["result"];
+        assert_eq!(first_result["count"], 20);
+        assert_eq!(first_result["returned"], 16);
+        assert_eq!(first_result["has_more"], true);
+        assert_eq!(first_result["next_offset"], 16);
+        assert_eq!(first_result["matches"][0]["id"], "p_1");
+        assert_eq!(first_result["matches"][15]["id"], "p_16");
+
+        let second_args: InspectDocxArgs = serde_json::from_value(json!({
+            "doc_id": doc_id,
+            "query": "find",
+            "patterns": ["Paragraph"],
+            "offset": 16,
+            "limit": 16
+        }))
+        .unwrap();
+        let second = structured(&server.inspect_docx(Parameters(second_args)).await);
+        let second_result = &second["outcomes"][0]["result"];
+        assert_eq!(second_result["count"], 20);
+        assert_eq!(second_result["returned"], 4);
+        assert_eq!(second_result["has_more"], false);
+        assert_eq!(second_result["next_offset"], Value::Null);
+        assert_eq!(second_result["matches"][0]["id"], "p_17");
+        assert_eq!(second_result["matches"][3]["id"], "p_20");
+    }
+
+    #[tokio::test]
+    async fn compact_batch_find_rejects_ambiguous_empty_and_unbounded_inputs() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let cases = [
+            (
+                json!({
+                    "doc_id": doc_id,
+                    "query": "find",
+                    "pattern": "Paragraph",
+                    "patterns": ["Paragraph"]
+                }),
+                "exactly one of pattern or patterns",
+            ),
+            (
+                json!({"doc_id": doc_id, "query": "find", "patterns": []}),
+                "1 to 8 entries",
+            ),
+            (
+                json!({"doc_id": doc_id, "query": "find", "patterns": ["Paragraph", " "]}),
+                "patterns[1]",
+            ),
+            (
+                json!({
+                    "doc_id": doc_id,
+                    "query": "find",
+                    "patterns": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                }),
+                "1 to 8 entries",
+            ),
+            (
+                json!({
+                    "doc_id": doc_id,
+                    "query": "find",
+                    "patterns": ["Paragraph"],
+                    "limit": 17
+                }),
+                "batch find limit must be between 1 and 16",
+            ),
+            (
+                json!({
+                    "doc_id": doc_id,
+                    "query": "find",
+                    "patterns": ["Paragraph"],
+                    "cell_limit": 5
+                }),
+                "batch find cell_limit must be between 1 and 4",
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let args: InspectDocxArgs = serde_json::from_value(value).unwrap();
+            let result = server.inspect_docx(Parameters(args)).await;
+            let payload = structured(&result);
+            assert_eq!(result.is_error, Some(true), "{payload}");
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected)),
+                "expected '{expected}' in {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_find_response_cap_fails_loud() {
+        let oversized = json!({
+            "outcomes": ["x".repeat(MAX_BATCH_FIND_RESPONSE_BYTES)]
+        });
+        let actual = batch_find_response_bytes(&oversized)
+            .expect_err("oversized batch response must be refused");
+        assert!(actual > MAX_BATCH_FIND_RESPONSE_BYTES);
+        assert_eq!(
+            batch_find_response_bytes(&json!({"outcomes": []})),
+            Ok(r#"{"outcomes":[]}"#.len())
+        );
+    }
+
+    #[tokio::test]
     async fn compact_surface_refuses_ambiguous_query_and_verify_modes() {
         let server = StemmaServer::new();
         let bad_query = server
@@ -13649,6 +15024,7 @@ mod tests {
                 block_id: Some("p_1".to_string()),
                 detail: None,
                 pattern: None,
+                patterns: None,
                 filter: None,
                 from_block_id: None,
                 to_block_id: None,
@@ -13676,9 +15052,9 @@ mod tests {
     }
 }
 
-/// Documentation-truth guards: the tool reference and the crate README must stay
-/// in sync with the ACTUAL registered tool surface and the real
-/// `#[serde(deny_unknown_fields)]` argument structs.
+/// Public-contract guards: the tool reference and crate README must stay in
+/// sync with the actual registered surface, and task-delivery tests drive the
+/// same private wire argument structs used by the router.
 ///
 /// These live in the binary crate (not `tests/`) on purpose: the arg structs and
 /// the composed `ToolRouter` are private to this crate, so a `tests/` integration
@@ -13689,7 +15065,8 @@ mod tests {
 /// agents paste verbatim) that names a field the struct rejects — e.g. the
 /// `compare_docx {base,target,out}` vs. the real `{base_path,target_path,out_path}`.
 #[cfg(test)]
-mod doc_drift {
+mod public_contract_tests {
+    use super::tests::{make_docx, structured};
     use super::*;
     use std::collections::BTreeSet;
 
@@ -13734,7 +15111,21 @@ mod doc_drift {
         env!("CARGO_MANIFEST_DIR"),
         "/../docs/reference/mcp.md"
     ));
+    const MCP_ADVANCED_MD: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/reference/mcp-advanced.md"
+    ));
     const MCP_README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+
+    /// The five core-profile tools, documented in the core reference; the
+    /// remaining registered tools are documented in the advanced reference.
+    const CORE_TOOLS: &[&str] = &[
+        "open_docx",
+        "inspect_docx",
+        "execute_plan",
+        "verify_docx",
+        "save_docx",
+    ];
 
     /// Deserialize `value` against the argument struct the named tool actually
     /// binds. Every struct is `#[serde(deny_unknown_fields)]`, so a stray field
@@ -13904,15 +15295,22 @@ mod doc_drift {
         assert_eq!(actual.len(), 31, "expected exactly 31 registered tools");
     }
 
-    /// Every registered tool is documented in both surfaces, and the README's
-    /// stated count matches. Loud, specific failures name the missing tool.
+    /// Every registered tool is documented — the five core tools in the core
+    /// reference, the complete surface in the advanced reference — and the
+    /// README's stated count matches. Loud, specific failures name the tool.
     #[test]
     fn every_tool_documented_and_counts_agree() {
+        for name in CORE_TOOLS {
+            assert!(
+                MCP_MD.contains(&format!("`{name}")),
+                "core tool `{name}` is registered but absent from docs/reference/mcp.md"
+            );
+        }
         for name in EXPECTED_TOOLS {
             let needle = format!("`{name}");
             assert!(
-                MCP_MD.contains(&needle),
-                "tool `{name}` is registered but absent from docs/reference/mcp.md"
+                MCP_MD.contains(&needle) || MCP_ADVANCED_MD.contains(&needle),
+                "tool `{name}` is registered but absent from both MCP references"
             );
             assert!(
                 MCP_README.contains(&needle),
@@ -13925,7 +15323,7 @@ mod doc_drift {
         );
     }
 
-    /// Every fully-literal tool-call example in mcp.md still deserializes against
+    /// Every fully-literal tool-call example in the MCP references still deserializes against
     /// the tool's real `deny_unknown_fields` arg struct.
     ///
     /// Convention for the paste-ready recipe blocks: `...` marks an elided
@@ -13936,7 +15334,8 @@ mod doc_drift {
     #[test]
     fn documented_examples_deserialize_against_arg_structs() {
         let tools: BTreeSet<&str> = EXPECTED_TOOLS.iter().copied().collect();
-        let examples = tool_call_examples(MCP_MD, &tools);
+        let mut examples = tool_call_examples(MCP_MD, &tools);
+        examples.extend(tool_call_examples(MCP_ADVANCED_MD, &tools));
 
         let mut checked = 0usize;
         let mut names_seen = BTreeSet::new();
@@ -13949,13 +15348,13 @@ mod doc_drift {
             let sanitized = raw.replace("...", "\"__elided__\"");
             let value: Value = serde_json::from_str(&sanitized).unwrap_or_else(|e| {
                 panic!(
-                    "mcp.md `{name}` example is not valid JSON after placeholder \
+                    "MCP reference `{name}` example is not valid JSON after placeholder \
                      substitution: {e}\n---\n{raw}\n---"
                 )
             });
             if let Err(e) = check_args(&name, value) {
                 panic!(
-                    "mcp.md `{name}` example no longer deserializes against its \
+                    "MCP reference `{name}` example no longer deserializes against its \
                      #[serde(deny_unknown_fields)] arg struct: {e}\n---\n{raw}\n---"
                 );
             }
@@ -13967,7 +15366,7 @@ mod doc_drift {
         // nothing is a silent fallback, not a pass.
         assert!(
             checked >= 8,
-            "expected to verify several literal mcp.md examples, only checked {checked}"
+            "expected to verify several literal MCP reference examples, only checked {checked}"
         );
         for must in [
             "compare_docx",
@@ -13977,8 +15376,503 @@ mod doc_drift {
         ] {
             assert!(
                 names_seen.contains(must),
-                "expected a literal `{must}` example in mcp.md to be verified"
+                "expected a literal `{must}` example in the MCP references to be verified"
             );
         }
+    }
+
+    fn declared_replacement(
+        effect_id: &str,
+        find: &str,
+        replace: &str,
+    ) -> task_delivery::TaskEffectArg {
+        task_delivery::TaskEffectArg {
+            effect_id: effect_id.to_string(),
+            op: task_delivery::TaskEffectOperationArg::ReplaceText,
+            find: find.to_string(),
+            replace: replace.to_string(),
+            match_mode: task_delivery::TaskMatchModeArg::Exact,
+            scope: task_delivery::TaskEffectScopeArg::default(),
+            expected_matches: 1,
+            on_barrier_match: task_delivery::TaskBarrierPolicyArg::Skip,
+        }
+    }
+
+    fn task_worklist_item(effect_id: &str, old: &str, new: &str) -> CoreReplacementItem {
+        CoreReplacementItem {
+            effect_id: Some(effect_id.to_string()),
+            old: old.to_string(),
+            new: new.to_string(),
+            scope: None,
+            expected_matches: Some(1),
+            replace_all: false,
+            match_mode: CoreReplacementMatchMode::Exact,
+            on_barrier_match: CoreBarrierPolicy::Skip,
+        }
+    }
+
+    async fn execute_task_item(
+        server: &StemmaServer,
+        doc_id: &str,
+        effect_id: &str,
+        old: &str,
+        new: &str,
+    ) -> CallToolResult {
+        server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.to_string()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(ReplacementWorklistArg {
+                    author: "Task Agent".to_string(),
+                    replacements: vec![task_worklist_item(effect_id, old, new)],
+                }),
+                comparison: None,
+                preview: false,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn task_last_save_writes_partial_manifest_and_names_unexecuted_effect() {
+        let temp = tempfile::tempdir().expect("task tempdir");
+        let first_path = temp.path().join("first.docx");
+        let second_path = temp.path().join("second.docx");
+        let first_output = temp.path().join("out-first.docx");
+        let second_output = temp.path().join("out-second.docx");
+        let manifest_path = temp.path().join("task.json");
+        std::fs::write(
+            &first_path,
+            make_docx("<w:p><w:r><w:t>Alpha old</w:t></w:r></w:p>", false),
+        )
+        .expect("first target");
+        std::fs::write(
+            &second_path,
+            make_docx("<w:p><w:r><w:t>Beta old</w:t></w:r></w:p>", false),
+        )
+        .expect("second target");
+
+        let server = StemmaServer::new();
+        let first_open = server
+            .open_docx(Parameters(OpenArgs {
+                path: first_path.to_string_lossy().into_owned(),
+                task: Some(TaskDeclarationArg {
+                    task_id: "task-partial".to_string(),
+                    manifest_path: manifest_path.to_string_lossy().into_owned(),
+                    inputs: vec![],
+                    targets: vec![
+                        task_delivery::TaskTargetArg {
+                            path: first_path.to_string_lossy().into_owned(),
+                            effects: vec![declared_replacement(
+                                "e-alpha",
+                                "Alpha old",
+                                "Alpha new",
+                            )],
+                        },
+                        task_delivery::TaskTargetArg {
+                            path: second_path.to_string_lossy().into_owned(),
+                            effects: vec![
+                                declared_replacement("e-beta-missing", "Beta absent", "Beta new"),
+                                declared_replacement("e-beta-never", "Beta old", "Beta final"),
+                            ],
+                        },
+                    ],
+                }),
+                task_id: None,
+            }))
+            .await;
+        assert_eq!(
+            first_open.is_error,
+            Some(false),
+            "{}",
+            structured(&first_open)
+        );
+        let first_doc_id = structured(&first_open)["doc_id"]
+            .as_str()
+            .expect("first task doc_id")
+            .to_string();
+        let applied =
+            execute_task_item(&server, &first_doc_id, "e-alpha", "Alpha old", "Alpha new").await;
+        assert_eq!(applied.is_error, Some(false), "{}", structured(&applied));
+        let first_save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: first_doc_id,
+                path: first_output.to_string_lossy().into_owned(),
+            }))
+            .await;
+        assert_eq!(
+            first_save.is_error,
+            Some(false),
+            "{}",
+            structured(&first_save)
+        );
+        assert_eq!(structured(&first_save)["task"]["status"], "executing");
+        assert_eq!(structured(&first_save)["verdict"]["deliverable"], false);
+        assert!(
+            !manifest_path.exists(),
+            "non-final save must not write manifest"
+        );
+
+        let second_open = server
+            .open_docx(Parameters(OpenArgs {
+                path: second_path.to_string_lossy().into_owned(),
+                task: None,
+                task_id: Some("task-partial".to_string()),
+            }))
+            .await;
+        assert_eq!(
+            second_open.is_error,
+            Some(false),
+            "{}",
+            structured(&second_open)
+        );
+        let second_doc_id = structured(&second_open)["doc_id"]
+            .as_str()
+            .expect("second task doc_id")
+            .to_string();
+        let unsatisfiable = execute_task_item(
+            &server,
+            &second_doc_id,
+            "e-beta-missing",
+            "Beta absent",
+            "Beta new",
+        )
+        .await;
+        let unsatisfiable_payload = structured(&unsatisfiable);
+        assert_eq!(
+            unsatisfiable.is_error,
+            Some(false),
+            "{unsatisfiable_payload}"
+        );
+        assert_eq!(unsatisfiable_payload["failed"], 1);
+        assert_eq!(unsatisfiable_payload["items"][0]["status"], "mismatch");
+        let final_save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: second_doc_id,
+                path: second_output.to_string_lossy().into_owned(),
+            }))
+            .await;
+        let final_payload = structured(&final_save);
+        assert_eq!(final_save.is_error, Some(true), "{final_payload}");
+        assert_eq!(final_payload["code"], "task_partial");
+        assert_eq!(
+            final_payload["task"]["unsatisfied_effects"],
+            json!(["e-beta-missing", "e-beta-never"])
+        );
+        let manifest = stemma_artifacts::decode_task_manifest(
+            &std::fs::read(&manifest_path).expect("partial manifest exists"),
+        )
+        .expect("partial manifest validates");
+        assert_eq!(
+            manifest.status,
+            stemma_artifacts::TaskManifestStatus::Partial
+        );
+        assert_eq!(
+            manifest.targets[0].effects[0].status,
+            stemma_artifacts::TaskEffectStatus::Satisfied
+        );
+        assert_eq!(
+            manifest.targets[1].effects[0].status,
+            stemma_artifacts::TaskEffectStatus::Unsatisfied
+        );
+        assert!(
+            manifest.targets[1].effects[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("mismatch"))
+        );
+        assert_eq!(
+            manifest.targets[1].effects[1].status,
+            stemma_artifacts::TaskEffectStatus::Unsatisfied
+        );
+        assert_eq!(
+            manifest.targets[1].effects[1].reason.as_deref(),
+            Some("no execute_plan named this effect")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_midstream_output_write_failure_commits_an_honest_partial_manifest() {
+        let temp = tempfile::tempdir().expect("task tempdir");
+        let first_path = temp.path().join("first.docx");
+        let second_path = temp.path().join("second.docx");
+        let first_output = temp.path().join("out-first.docx");
+        let second_output = temp.path().join("out-second.docx");
+        let manifest_path = temp.path().join("task.json");
+        std::fs::write(
+            &first_path,
+            make_docx("<w:p><w:r><w:t>First old</w:t></w:r></w:p>", false),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_path,
+            make_docx("<w:p><w:r><w:t>Second old</w:t></w:r></w:p>", false),
+        )
+        .unwrap();
+
+        let mut server = StemmaServer::new();
+        let first_open = server
+            .open_docx(Parameters(OpenArgs {
+                path: first_path.to_string_lossy().into_owned(),
+                task: Some(TaskDeclarationArg {
+                    task_id: "task-write-failure".to_string(),
+                    manifest_path: manifest_path.to_string_lossy().into_owned(),
+                    inputs: vec![],
+                    targets: vec![
+                        task_delivery::TaskTargetArg {
+                            path: first_path.to_string_lossy().into_owned(),
+                            effects: vec![declared_replacement(
+                                "e-first",
+                                "First old",
+                                "First new",
+                            )],
+                        },
+                        task_delivery::TaskTargetArg {
+                            path: second_path.to_string_lossy().into_owned(),
+                            effects: vec![declared_replacement(
+                                "e-second",
+                                "Second old",
+                                "Second new",
+                            )],
+                        },
+                    ],
+                }),
+                task_id: None,
+            }))
+            .await;
+        let first_doc_id = structured(&first_open)["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first_apply =
+            execute_task_item(&server, &first_doc_id, "e-first", "First old", "First new").await;
+        assert_eq!(first_apply.is_error, Some(false));
+        let first_save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: first_doc_id,
+                path: first_output.to_string_lossy().into_owned(),
+            }))
+            .await;
+        assert_eq!(first_save.is_error, Some(false));
+        assert!(first_output.exists());
+
+        let second_open = server
+            .open_docx(Parameters(OpenArgs {
+                path: second_path.to_string_lossy().into_owned(),
+                task: None,
+                task_id: Some("task-write-failure".to_string()),
+            }))
+            .await;
+        let second_doc_id = structured(&second_open)["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_apply = execute_task_item(
+            &server,
+            &second_doc_id,
+            "e-second",
+            "Second old",
+            "Second new",
+        )
+        .await;
+        assert_eq!(second_apply.is_error, Some(false));
+
+        server.artifacts = stemma_artifacts::PathAuthority::explicit_at(temp.path())
+            .unwrap()
+            .with_commit_failpoint(stemma_artifacts::CommitFailpoint::AfterStageSyncOnce);
+        let failed_save = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: second_doc_id.clone(),
+                path: second_output.to_string_lossy().into_owned(),
+            }))
+            .await;
+        let payload = structured(&failed_save);
+        assert_eq!(failed_save.is_error, Some(true), "{payload}");
+        assert_eq!(payload["code"], "task_partial");
+        assert_eq!(payload["failed_output"]["committed"], false);
+        assert!(!second_output.exists());
+        assert!(manifest_path.exists());
+
+        let manifest =
+            stemma_artifacts::decode_task_manifest(&std::fs::read(&manifest_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest.status,
+            stemma_artifacts::TaskManifestStatus::Partial
+        );
+        assert!(manifest.targets[0].output.is_some());
+        assert_eq!(
+            manifest.targets[0].effects[0].status,
+            stemma_artifacts::TaskEffectStatus::Satisfied
+        );
+        assert!(manifest.targets[1].output.is_none());
+        assert_eq!(
+            manifest.targets[1].effects[0].status,
+            stemma_artifacts::TaskEffectStatus::Unsatisfied
+        );
+        assert!(
+            manifest.targets[1].effects[0]
+                .minted_revision_ids
+                .is_empty()
+        );
+        assert!(
+            manifest.targets[1].effects[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not committed"))
+        );
+
+        let after_termination = execute_task_item(
+            &server,
+            &second_doc_id,
+            "e-second",
+            "Second old",
+            "Second new",
+        )
+        .await;
+        assert_eq!(structured(&after_termination)["code"], "task_terminated");
+    }
+
+    #[tokio::test]
+    async fn task_effect_id_cannot_substitute_an_unrelated_replacement() {
+        let temp = tempfile::tempdir().expect("task tempdir");
+        let target_path = temp.path().join("target.docx");
+        let manifest_path = temp.path().join("task.json");
+        std::fs::write(
+            &target_path,
+            make_docx(
+                "<w:p><w:r><w:t>Declared old; unrelated old</w:t></w:r></w:p>",
+                false,
+            ),
+        )
+        .expect("target");
+        let server = StemmaServer::new();
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: target_path.to_string_lossy().into_owned(),
+                task: Some(TaskDeclarationArg {
+                    task_id: "task-substitution".to_string(),
+                    manifest_path: manifest_path.to_string_lossy().into_owned(),
+                    inputs: vec![],
+                    targets: vec![task_delivery::TaskTargetArg {
+                        path: target_path.to_string_lossy().into_owned(),
+                        effects: vec![declared_replacement(
+                            "e-declared",
+                            "Declared old",
+                            "Declared new",
+                        )],
+                    }],
+                }),
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("task doc_id")
+            .to_string();
+        let refused = execute_task_item(
+            &server,
+            &doc_id,
+            "e-declared",
+            "unrelated old",
+            "unrelated new",
+        )
+        .await;
+        let payload = structured(&refused);
+        assert_eq!(refused.is_error, Some(true), "{payload}");
+        assert_eq!(payload["code"], "effect_declaration_mismatch");
+
+        let document = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::Document,
+                block_id: None,
+                detail: None,
+                pattern: None,
+                patterns: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let content = structured(&document)["content"]
+            .as_str()
+            .expect("document content")
+            .to_string();
+        assert!(content.contains("unrelated old"));
+        assert!(!content.contains("unrelated new"));
+    }
+
+    #[tokio::test]
+    async fn task_complete_is_limited_to_the_effects_the_caller_declared() {
+        // Schema v1 deliberately trusts the declaration. It can verify the
+        // declared effect, but it cannot detect omitted intent.
+        let temp = tempfile::tempdir().expect("task tempdir");
+        let target_path = temp.path().join("target.docx");
+        let output_path = temp.path().join("output.docx");
+        let manifest_path = temp.path().join("task.json");
+        std::fs::write(
+            &target_path,
+            make_docx("<w:p><w:r><w:t>Only declared old</w:t></w:r></w:p>", false),
+        )
+        .expect("target");
+        let server = StemmaServer::new();
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: target_path.to_string_lossy().into_owned(),
+                task: Some(TaskDeclarationArg {
+                    task_id: "task-complete".to_string(),
+                    manifest_path: manifest_path.to_string_lossy().into_owned(),
+                    inputs: vec![],
+                    targets: vec![task_delivery::TaskTargetArg {
+                        path: target_path.to_string_lossy().into_owned(),
+                        effects: vec![declared_replacement(
+                            "e-only",
+                            "Only declared old",
+                            "Only declared new",
+                        )],
+                    }],
+                }),
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"]
+            .as_str()
+            .expect("task doc_id")
+            .to_string();
+        let applied = execute_task_item(
+            &server,
+            &doc_id,
+            "e-only",
+            "Only declared old",
+            "Only declared new",
+        )
+        .await;
+        assert_eq!(applied.is_error, Some(false), "{}", structured(&applied));
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id,
+                path: output_path.to_string_lossy().into_owned(),
+            }))
+            .await;
+        let payload = structured(&saved);
+        assert_eq!(saved.is_error, Some(false), "{payload}");
+        assert_eq!(payload["task"]["status"], "complete");
+        assert_eq!(payload["verdict"]["deliverable"], true);
+        let manifest = stemma_artifacts::decode_task_manifest(
+            &std::fs::read(&manifest_path).expect("complete manifest exists"),
+        )
+        .expect("complete manifest validates");
+        assert_eq!(
+            manifest.status,
+            stemma_artifacts::TaskManifestStatus::Complete
+        );
     }
 }

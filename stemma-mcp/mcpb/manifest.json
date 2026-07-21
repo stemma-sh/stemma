@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "stemma",
   "display_name": "Stemma — DOCX tracked changes",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Structure-aware Microsoft Word (.docx) editing with tracked changes, for agents.",
   "long_description": "Stemma opens a .docx into a typed intermediate representation, lets an agent read its outline/text/markdown, apply tracked-change edits (insert, delete, replace, formatting, comments, images, table ops), validate the result against OOXML, and save — all as real Word tracked changes that open clean and accept/reject correctly. Malformed input or unsupported edits fail loudly rather than silently corrupting the document.",
   "author": {

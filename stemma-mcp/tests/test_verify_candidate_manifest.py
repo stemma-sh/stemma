@@ -134,6 +134,7 @@ class VerifyCandidateManifestTests(unittest.TestCase):
                 "server_version": SERVER_VERSION,
                 "started_at": started.isoformat().replace("+00:00", "Z"),
                 "suite": builder.REPORT_SUITE,
+                "tool_profile": builder.REPORT_TOOL_PROFILE,
             }
             (target_dir / builder.REPORT_NAME).write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n",

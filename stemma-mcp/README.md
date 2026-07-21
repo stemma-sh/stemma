@@ -40,6 +40,14 @@ and continuation metadata rather than an unbounded structural-diff echo. Only
 after its intent, untouched-scope, prior-revision, and validator checks pass
 should `save_docx` commit to a new path.
 
+For a multi-document instruction, the first task-bearing `open_docx` can bind
+the complete replacement set and every input by hash. Earlier target saves stay
+non-deliverable at task level; the final save writes a complete or partial
+create-once manifest that `stemma verify-task` can check later without the MCP
+session. The manifest is unsigned evidence: it cannot authenticate its producer
+or detect intent omitted from the declaration. See the
+[task-delivery guide](../docs/guides/verify-task-delivery.md).
+
 The [CLI `stemma.worklist.v0` contract](../docs/reference/cli.md#apply) is the
 canonical local interface. MCP remains a thin adapter; it does not define a
 second plan or receipt standard.
@@ -69,7 +77,7 @@ startup rather than silently selecting a surface.
 
 | Tool | What it does |
 |---|---|
-| `open_docx` | Open a workspace-confined `.docx`; returns a `doc_id`, exact `input_artifact` identity, and a compact `index` (one row per block: stable `id`, `role`, heading depth, a 120-char `text_preview`, char/byte length, and tracking `block_status`). |
+| `open_docx` | Open a workspace-confined `.docx`; returns a `doc_id`, exact `input_artifact` identity, and a compact `index`. It also hosts the optional complete task declaration (`task`) or a later target binding (`task_id`). |
 | `save_docx` | Export an open doc (including tracked changes) to a new `.docx` path. Gates the bytes through the engine's post-serialization OOXML linker and refuses an existing destination or input alias. |
 | `compare_docx` | Diff two `.docx` files and commit a redline to a new path (target with tracked changes vs base). |
 

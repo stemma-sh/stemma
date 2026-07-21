@@ -219,6 +219,48 @@ fn tracked_edit_lands_in_census_not_direct_delta() {
     assert!(report.validator.ok, "{report:?}");
 }
 
+/// A tracked move is one logical revision with two structural locations: the
+/// moveFrom source shadow and the moveTo destination copy. The census collapses
+/// those carriers into one row, but that row must still account for both
+/// locations in the untouched proof.
+#[test]
+fn tracked_move_accounts_for_source_shadow_and_destination_copy() {
+    let before = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening language remains unchanged.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Bravo is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Charlie is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Closing language remains unchanged.</w:t></w:r></w:p>"#,
+    ));
+    let target = make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t>Opening language remains unchanged.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Charlie is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Paragraph Bravo is long enough for move detection.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Closing language remains unchanged.</w:t></w:r></w:p>"#,
+    ));
+    let base = Document::parse(&before).expect("parse move base");
+    let target = Document::parse(&target).expect("parse move target");
+    let moved = base.diff_as(&target, "Mover").expect("author tracked move");
+
+    let report = moved.review().expect("review tracked move");
+    assert_eq!(
+        report
+            .new_revisions
+            .iter()
+            .filter(|row| row.kind == RevisionKind::Move)
+            .count(),
+        1,
+        "one move intention produces one census row: {report:?}"
+    );
+    assert!(
+        report.direct_changes.is_empty(),
+        "a tracked move is not a direct change: {report:?}"
+    );
+    assert!(
+        report.untouched.violations.is_empty(),
+        "both carriers are accounted for by the move census row: {report:?}"
+    );
+}
+
 /// Receipts↔audit agreement, engine edition: the census's new identities are
 /// exactly the after-side identity set minus the baseline identity set — the
 /// same rule the write receipt uses.

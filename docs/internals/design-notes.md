@@ -1,7 +1,8 @@
 # Design notes
 
-Decision records for shipped designs — the "why it is this way" a future
-contributor needs, without the draft-negotiation history.
+These decision records explain why shipped designs work as they do. They keep
+the reasoning a future contributor needs without preserving draft negotiation
+history.
 
 ## Audit / session review (RFC 0001, shipped)
 
@@ -23,6 +24,21 @@ The decisions:
 - **Accept-vs-reject attribution is content-based.** Both resolutions remove
   the marker; only content distinguishes them. Anything that grades or
   reports resolution state must compare text, never marker presence.
+
+### Verified-delivery follow-up
+
+The common MCP save path now hard-gates the objective delivery invariants:
+unexplained committed delta, changed prior revisions without successful typed
+session resolution evidence, untouched-scope violations, and new validator
+issues. This does not claim to infer the caller's whole task intent.
+
+A successful accept/reject command records its exact selected identities plus
+an independently audited before/after committed-content transition batch.
+Final review replays those batches in order. A direct mutation before, between,
+or after them breaks the chain and remains unexplained; a block-id allowlist
+was rejected because it would let later mutations inherit an earlier
+resolution's exemption. Stateless audit remains conservative because a file
+pair contains no session command evidence.
 
 ## Policy
 

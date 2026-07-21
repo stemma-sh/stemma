@@ -36,6 +36,7 @@ fn text(id: &str, t: &str) -> InlineNode {
         marks: vec![],
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }

@@ -99,10 +99,16 @@ jobs:
                   "release environment must have exactly one required-reviewers rule"
               )
           rule = reviewer_rules[0]
-          if not rule.get("prevent_self_review"):
-              raise SystemExit("release environment must prevent self-review")
           if not rule.get("reviewers"):
               raise SystemExit("release environment must name at least one reviewer")
+          if rule.get("prevent_self_review"):
+              print("release environment prevents self-review")
+          else:
+              print(
+                  "release environment allows self-review "
+                  "(solo-maintainer contract: the required-reviewer pause "
+                  "still gates promotion)"
+              )
           print("release environment protection is configured")
           PY
       - name: Verify release tag mutation protection
@@ -217,12 +223,52 @@ jobs:
           echo "Requested release version: $REQUESTED_VERSION"
           echo "Approved candidate identity: candidate-manifest workflow artifact"
 
+  release-package:
+    # Every fallible preparation step runs BEFORE anything irreversible. If
+    # packaging fails, the run stops here with no tag bound and no package
+    # published, so the same version can be fixed and re-dispatched cleanly.
+    # 0.2.0 lost its release assets precisely because this work ran after npm
+    # had already published: a trivial shell error became unrecoverable.
+    name: package approved assets before publication
+    needs: release-approval
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          # Native target artifacts are named for Rust target triples (at
+          # least two dashes); fetching by pattern plus explicit names keeps
+          # later-run artifacts such as `release-assets` out of the verifier's
+          # exact-layout root, including on a re-run of failed jobs.
+          pattern: "*-*-*"
+          path: binaries
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-manifest
+          path: binaries/candidate-manifest
+      - name: Re-verify downloaded candidate against the approved manifest
+        run: |
+          python3 stemma-mcp/verify_candidate_manifest.py \
+            binaries "$REQUESTED_VERSION" "$GITHUB_SHA"
+      - name: Package archives, conformance reports, and checksums
+        run: |
+          bash stemma-mcp/package_release_assets.sh \
+            binaries "$REQUESTED_VERSION" release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release
+          if-no-files-found: error
+
   release-claim:
     # Claim the approved version before npm's irreversible publication. This
     # prevents an ordinary concurrent writer from binding the name elsewhere;
     # the native package stamp and npm provenance remain the source identity.
     name: bind approved source to release tag
-    needs: release-approval
+    needs: release-package
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -272,7 +318,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # Native target artifacts are named for Rust target triples (at
+          # least two dashes); fetching by pattern plus explicit names keeps
+          # later-run artifacts such as `release-assets` out of the verifier's
+          # exact-layout root, including on a re-run of failed jobs.
+          pattern: "*-*-*"
           path: binaries
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-manifest
+          path: binaries/candidate-manifest
       - name: Re-verify downloaded candidate against the approved manifest
         run: |
           python3 stemma-mcp/verify_candidate_manifest.py \
@@ -348,49 +403,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # Every native target artifact is named for a Rust target triple and
+          # therefore carries at least two dashes; `candidate-manifest` and
+          # `release-assets` carry one and are fetched by name below. Keeping
+          # them apart preserves the verifier's exact-layout requirement.
+          pattern: "*-*-*"
           path: binaries
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-manifest
+          path: binaries/candidate-manifest
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
       - name: Re-verify downloaded candidate against the approved manifest
         run: |
           python3 stemma-mcp/verify_candidate_manifest.py \
             binaries "$REQUESTED_VERSION" "$GITHUB_SHA"
-      - name: Package archives, conformance reports, and checksums
+      - name: Verify the approved assets against their recorded checksums
         run: |
           set -euo pipefail
-          version="$REQUESTED_VERSION"
-          mkdir -p release
-          cp binaries/candidate-manifest/candidate-manifest.json release/
-          for dir in binaries/*/; do
-            target="$(basename "$dir")"
-            if [ "$target" = "candidate-manifest" ]; then
-              continue
-            fi
-            case "$target" in
-              *windows*)
-                python3 - "$dir" "release/stemma-mcp-$version-$target.zip" <<'PY'
-                import pathlib
-                import sys
-                import zipfile
-
-                source = pathlib.Path(sys.argv[1])
-                output = pathlib.Path(sys.argv[2])
-                with zipfile.ZipFile(output, "x", zipfile.ZIP_DEFLATED) as archive:
-                    for path in sorted(source.iterdir(), key=lambda item: item.name):
-                        info = zipfile.ZipInfo(path.name, (1980, 1, 1, 0, 0, 0))
-                        info.compress_type = zipfile.ZIP_DEFLATED
-                        info.external_attr = 0o644 << 16
-                        archive.writestr(info, path.read_bytes())
-                PY
-                ;;
-              *)
-                chmod 0755 "$dir"/stemma-mcp
-                tar --sort=name --mtime='UTC 1980-01-01' \
-                  --owner=0 --group=0 --numeric-owner --format=ustar \
-                  -C "$dir" -cf - . \
-                  | gzip -n > "release/stemma-mcp-$version-$target.tar.gz"
-                ;;
-            esac
-          done
-          (cd release && sha256sum * > sha256sums.txt)
+          cd release
+          sha256sum -c sha256sums.txt
       - name: Create or complete the exact draft, then publish it
         env:
           GH_TOKEN: ${{ github.token }}

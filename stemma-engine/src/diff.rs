@@ -7389,6 +7389,7 @@ mod tests {
                 marks: Vec::new(),
                 style_props: StyleProps::default(),
                 rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
                 formatting_change: None,
             })]),
             block_text_hash: Some(sha256_hex(text.as_bytes())),
@@ -7498,6 +7499,7 @@ mod tests {
                 color: style_props.color.is_some(),
                 ..Default::default()
             },
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
@@ -9647,6 +9649,7 @@ mod tests {
             marks: vec![Mark::Bold],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
         let new_inlines = vec![InlineNode::from(TextNode {
@@ -9656,6 +9659,7 @@ mod tests {
             marks: vec![Mark::Italic],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
         let result = build_full_replace(&old_inlines, &new_inlines, &HashMap::new());
@@ -11068,6 +11072,7 @@ mod tests {
                 marks,
                 style_props: StyleProps::default(),
                 rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
                 formatting_change: None,
             })]),
             block_text_hash: Some(sha256_hex(text.as_bytes())),
@@ -11128,6 +11133,7 @@ mod tests {
             marks: vec![],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
         let target_inlines = vec![InlineNode::from(TextNode {
@@ -11137,6 +11143,7 @@ mod tests {
             marks: vec![Mark::Bold],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
 
@@ -11227,6 +11234,7 @@ mod tests {
             marks: vec![Mark::Bold],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
         let target_inlines = vec![InlineNode::from(TextNode {
@@ -11236,6 +11244,7 @@ mod tests {
             marks: vec![Mark::Bold],
             style_props: StyleProps::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
 
@@ -11272,6 +11281,7 @@ mod tests {
                 font_size: true,
                 ..Default::default()
             },
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
         let target_inlines = vec![InlineNode::from(TextNode {
@@ -11287,6 +11297,7 @@ mod tests {
                 font_size: true,
                 ..Default::default()
             },
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
 
@@ -11459,6 +11470,7 @@ mod tests {
                     marks: marks.clone(),
                     style_props: StyleProps::default(),
                     rpr_authored: crate::domain::RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 })
             })

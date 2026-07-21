@@ -568,6 +568,7 @@ fn replace_result_run(para: &mut crate::domain::ParagraphNode, span: &FieldSpan,
         marks: Vec::new(),
         style_props: crate::domain::StyleProps::default(),
         rpr_authored: RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     });
     if let Some(sep) = span.separate {

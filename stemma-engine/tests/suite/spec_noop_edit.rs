@@ -113,6 +113,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
         marks: Vec::new(),
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }
@@ -125,6 +126,7 @@ fn make_text_with_marks(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
         marks,
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }

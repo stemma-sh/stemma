@@ -1156,6 +1156,7 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 marks,
                 style_props,
                 rpr_authored: _, // parse-time provenance flag, not content
+                source_run_attrs,
                 formatting_change,
             } = ta.as_ref();
             let TextNode {
@@ -1165,6 +1166,7 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 marks: b_marks,
                 style_props: b_style_props,
                 rpr_authored: _,
+                source_run_attrs: b_source_run_attrs,
                 formatting_change: b_formatting_change,
             } = tb.as_ref();
             compare_opt(diffs, &format!("{path}.text_role"), text_role, b_text_role);
@@ -1175,6 +1177,12 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 &format!("{path}.style_props"),
                 style_props,
                 b_style_props,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.source_run_attrs"),
+                source_run_attrs,
+                b_source_run_attrs,
             );
             compare_opt_text_formatting_change(
                 diffs,
@@ -1188,16 +1196,24 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
             let HardBreakNode {
                 id: _, // ephemeral NodeId
                 break_type,
+                joins_following_text_run,
             } = ha;
             let HardBreakNode {
                 id: _,
                 break_type: b_break_type,
+                joins_following_text_run: b_joins_following_text_run,
             } = hb;
             compare_val(
                 diffs,
                 &format!("{path}.break_type"),
                 break_type,
                 b_break_type,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.joins_following_text_run"),
+                joins_following_text_run,
+                b_joins_following_text_run,
             );
         }
         (InlineNode::OpaqueInline(oa), InlineNode::OpaqueInline(ob)) => {
@@ -1356,6 +1372,7 @@ fn compare_decorations(
         // fonts and size the auto-number renders in.
         wrapper_marks,
         wrapper_style_props,
+        joins_following_text_run,
         // raw_xml is the verbatim element bytes. The load-bearing identity
         // inside them is the `w:name` attribute (bookmarks §17.13.6.2, move
         // ranges §17.13.5.24/.26) — compared below. The numeric `w:id` is a
@@ -1373,6 +1390,7 @@ fn compare_decorations(
         proof_ref: _,
         wrapper_marks: b_wrapper_marks,
         wrapper_style_props: b_wrapper_style_props,
+        joins_following_text_run: b_joins_following_text_run,
         raw_xml: b_raw_xml,
         origin: _,
     } = b;
@@ -1394,6 +1412,12 @@ fn compare_decorations(
         &format!("{path}.decoration.wrapper_style_props"),
         wrapper_style_props,
         b_wrapper_style_props,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.decoration.joins_following_text_run"),
+        joins_following_text_run,
+        b_joins_following_text_run,
     );
 }
 
@@ -2321,6 +2345,7 @@ mod segment_coalescing_tests {
             marks: Vec::new(),
             style_props: StyleProps::default(),
             rpr_authored: Default::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
@@ -2337,6 +2362,7 @@ mod segment_coalescing_tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
             raw_xml: Some(br#"<w:bookmarkEnd w:id="2"/>"#.to_vec()),
             origin: None,
         })

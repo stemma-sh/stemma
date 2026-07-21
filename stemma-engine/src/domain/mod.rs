@@ -603,8 +603,10 @@ pub struct ParagraphNode {
     /// run and (winning per §17.3.2.26) changes its rendering.
     #[serde(default)]
     pub literal_prefix_rpr_authored: RunRprAuthored,
-    /// Formatting of the run(s) that carried the prefix's LEADING whitespace,
-    /// when it differs from the label's formatting. A paragraph like
+    /// Source-run provenance for the hoisted prefix, plus formatting of the
+    /// run(s) that carried its LEADING whitespace. Imported prefixes populate
+    /// this even when leading formatting matches the label so serialization can
+    /// retain every consumed source-run boundary. A paragraph like
     /// `[Arial rPr + tab] (c) [tab] Body` authors the leading tab in its OWN
     /// run whose rPr the label-formatting slot cannot represent — without this
     /// carrier the leading tab re-emits wearing the label's formatting and the
@@ -1107,6 +1109,7 @@ impl ParagraphNode {
                     marks: vec![],
                     style_props: StyleProps::default(),
                     rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
                     formatting_change: None,
                 })],
             }],
@@ -3749,6 +3752,28 @@ pub struct PrefixLeadingRpr {
     pub marks: Vec<Mark>,
     pub style_props: StyleProps,
     pub rpr_authored: RunRprAuthored,
+    /// Source runs consumed by literal-prefix hoisting, in document order.
+    /// Empty on snapshots predating boundary preservation. When populated, the
+    /// serializer replays these runs instead of synthesizing one label run.
+    #[serde(default)]
+    pub source_runs: Vec<LiteralPrefixSourceRun>,
+}
+
+/// One source text run (or consumed prefix fragment of one) removed from the
+/// normal inline stream when a literal enumerator was hoisted.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LiteralPrefixSourceRun {
+    pub text: String,
+    pub marks: Vec<Mark>,
+    pub style_props: StyleProps,
+    pub rpr_authored: RunRprAuthored,
+    /// Source w:r `rsid*` attributes, preserved because Word can consult them
+    /// while laying out justified text.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
+    /// The prefix ended inside this source run. Its consumed text must be
+    /// prepended to the first remaining body fragment in the same emitted run.
+    pub joins_body: bool,
 }
 
 /// The paragraph MARK's authored OFF toggles from `w:pPr/w:rPr` (§17.3.1.29
@@ -4053,6 +4078,11 @@ pub struct TextNode {
     /// content-equality comparisons.
     #[serde(default)]
     pub rpr_authored: RunRprAuthored,
+    /// Source w:r `rsid*` attributes. These nominal editing-session values are
+    /// layout-observable in Word on some justified documents, so untouched
+    /// runs retain them verbatim instead of treating them as cosmetic churn.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
     /// Tracked formatting change from w:rPrChange, if present.
     pub formatting_change: Option<FormattingChange>,
 }
@@ -4072,6 +4102,12 @@ pub enum BreakType {
 pub struct HardBreakNode {
     pub id: NodeId,
     pub break_type: BreakType,
+    /// This break and the immediately following TextNode were children of the
+    /// same imported `w:r`. Word's table pagination can distinguish a leading
+    /// break in the text run from a synthetic break-only run, so untouched
+    /// content retains that proven carrier relationship.
+    #[serde(default)]
+    pub joins_following_text_run: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -4118,6 +4154,12 @@ pub struct DecorationNode {
     pub wrapper_marks: Vec<Mark>,
     #[serde(default)]
     pub wrapper_style_props: StyleProps,
+    /// This run-level decoration and the immediately following TextNode were
+    /// children of the same imported w:r. The serializer may rejoin exactly
+    /// that proven pair; `false` means the boundary is unknown and must remain
+    /// separate rather than guessed from matching formatting.
+    #[serde(default)]
+    pub joins_following_text_run: bool,
     /// Raw XML bytes for roundtripping the original element.
     pub raw_xml: Option<Vec<u8>>,
     /// Document origin override for the serializer's bookmark id policy
@@ -5375,6 +5417,9 @@ pub struct HyperlinkRun {
     /// Stored as self-contained XML so it can be round-tripped without
     /// holding a reference to the original parse tree.
     pub rpr_xml: Option<Vec<u8>>,
+    /// Source w:r `rsid*` attributes; see `TextNode::source_run_attrs`.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
     /// Tracking status for this run. Defaults to `Normal` for backward
     /// compatibility with snapshots written before in-hyperlink edits
     /// became representable. See the type-level docs for the layering

@@ -679,6 +679,7 @@ fn template_paragraph(cell: &TableCellNode, cell_id: &NodeId, text: &str) -> Par
         marks: Vec::new(),
         style_props: crate::domain::StyleProps::default(),
         rpr_authored: RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     });
     let segments: Vec<TrackedSegment> = normal_segment(vec![inline]);
@@ -814,6 +815,7 @@ mod tests {
                         marks: Vec::new(),
                         style_props: crate::domain::StyleProps::default(),
                         rpr_authored: RunRprAuthored::default(),
+                        source_run_attrs: Vec::new(),
                         formatting_change: None,
                     })]),
                     &format!("r{r}c{c}"),

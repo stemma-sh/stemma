@@ -174,6 +174,7 @@ fn make_text(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
         marks,
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }
@@ -189,6 +190,7 @@ fn make_hyperlink(id: &str) -> InlineNode {
             runs: vec![HyperlinkRun {
                 text: "example".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
             extra_attrs: vec![],

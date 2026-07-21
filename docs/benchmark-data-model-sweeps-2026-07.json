@@ -1,10 +1,6 @@
 {
- "_doc": "Per-cell aggregates for the model sweeps quoted in README.md. Raw runs (full agent transcripts, frozen fixtures/prompts, ground truth) are held out \u2014 unpublished for the same reason ML benchmarks hold out test sets: publishing them would contaminate every future wave; every number here is derived from those runs by the deterministic gates described in docs/benchmarks.md. A run passes its cell iff every gate passes; DNF = hit the 50-turn ceiling; no best-of-N anywhere.",
- "date": "2026-07-04",
- "engine_pins": {
-  "main_lanes": "46206e9 (release)",
-  "neg/size lanes": "880c49a (worktree, release)"
- },
+ "_doc": "Per-cell aggregates for the model sweeps quoted in docs/benchmarks.md. Raw runs (full agent transcripts, frozen fixtures/prompts, ground truth) are held out \u2014 unpublished for the same reason ML benchmarks hold out test sets: publishing them would contaminate every future wave; every number here is derived from those runs by the deterministic gates described in docs/benchmarks.md. A run passes its cell iff every gate passes; DNF = hit the 50-turn ceiling or the harness wall-clock ceiling; no best-of-N anywhere. Stemma-arm cells carry the engine release version and agent contract; see engine_provenance.",
+ "date": "2026-07 (v0.1-line sweeps 07-03/04; v0.2.0 re-run 07-18)",
  "protocol": "cold headless claude -p, frozen prompts, n=3 per cell, max 50 turns",
  "cells": [
   {
@@ -17,7 +13,9 @@
    "median_cost_usd": 0.42,
    "median_wall_clock_s": 22.6,
    "median_turns": 8,
-   "median_total_tokens": 417881
+   "median_total_tokens": 417881,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res8v2",
@@ -41,7 +39,9 @@
    "median_cost_usd": 0.22,
    "median_wall_clock_s": 87.5,
    "median_turns": 11,
-   "median_total_tokens": 408376
+   "median_total_tokens": 408376,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res8v2",
@@ -65,7 +65,9 @@
    "median_cost_usd": 0.45,
    "median_wall_clock_s": 25.3,
    "median_turns": 10,
-   "median_total_tokens": 328944
+   "median_total_tokens": 328944,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res7",
@@ -89,7 +91,9 @@
    "median_cost_usd": 0.11,
    "median_wall_clock_s": 22.7,
    "median_turns": 9,
-   "median_total_tokens": 284163
+   "median_total_tokens": 284163,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res7",
@@ -113,7 +117,9 @@
    "median_cost_usd": 0.4,
    "median_wall_clock_s": 30.3,
    "median_turns": 9,
-   "median_total_tokens": 392064
+   "median_total_tokens": 392064,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "hk-tblpr",
@@ -137,7 +143,9 @@
    "median_cost_usd": 0.08,
    "median_wall_clock_s": 19.0,
    "median_turns": 7,
-   "median_total_tokens": 216682
+   "median_total_tokens": 216682,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "hk-tblpr",
@@ -161,7 +169,9 @@
    "median_cost_usd": 0.41,
    "median_wall_clock_s": 24.3,
    "median_turns": 7,
-   "median_total_tokens": 365876
+   "median_total_tokens": 365876,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "tbl-s1r2",
@@ -185,7 +195,9 @@
    "median_cost_usd": 0.23,
    "median_wall_clock_s": 86.3,
    "median_turns": 12,
-   "median_total_tokens": 491820
+   "median_total_tokens": 491820,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "tbl-s1r2",
@@ -209,7 +221,9 @@
    "median_cost_usd": 0.4,
    "median_wall_clock_s": 19.7,
    "median_turns": 7,
-   "median_total_tokens": 363359
+   "median_total_tokens": 363359,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth-d1",
@@ -233,7 +247,9 @@
    "median_cost_usd": 0.11,
    "median_wall_clock_s": 29.9,
    "median_turns": 7,
-   "median_total_tokens": 269624
+   "median_total_tokens": 269624,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth-d1",
@@ -257,7 +273,9 @@
    "median_cost_usd": 0.51,
    "median_wall_clock_s": 41.9,
    "median_turns": 14,
-   "median_total_tokens": 501069
+   "median_total_tokens": 501069,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "fmt-a1",
@@ -281,7 +299,9 @@
    "median_cost_usd": 0.13,
    "median_wall_clock_s": 32.0,
    "median_turns": 12,
-   "median_total_tokens": 293698
+   "median_total_tokens": 293698,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "fmt-a1",
@@ -305,7 +325,9 @@
    "median_cost_usd": 0.36,
    "median_wall_clock_s": 24.2,
    "median_turns": 7,
-   "median_total_tokens": 334348
+   "median_total_tokens": 334348,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmp-f1",
@@ -329,7 +351,9 @@
    "median_cost_usd": 0.25,
    "median_wall_clock_s": 111.0,
    "median_turns": 6,
-   "median_total_tokens": 213289
+   "median_total_tokens": 213289,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmp-f1",
@@ -353,7 +377,9 @@
    "median_cost_usd": 1.11,
    "median_wall_clock_s": 177.8,
    "median_turns": 26,
-   "median_total_tokens": 1539743
+   "median_total_tokens": 1539743,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f1",
@@ -377,7 +403,9 @@
    "median_cost_usd": 0.25,
    "median_wall_clock_s": 64.4,
    "median_turns": 26,
-   "median_total_tokens": 775217
+   "median_total_tokens": 775217,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f1",
@@ -401,7 +429,9 @@
    "median_cost_usd": 0.47,
    "median_wall_clock_s": 33.4,
    "median_turns": 9,
-   "median_total_tokens": 436414
+   "median_total_tokens": 436414,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f3",
@@ -425,7 +455,9 @@
    "median_cost_usd": 0.45,
    "median_wall_clock_s": 23.3,
    "median_turns": 9,
-   "median_total_tokens": 273289
+   "median_total_tokens": 273289,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f3",
@@ -449,7 +481,9 @@
    "median_cost_usd": 1.32,
    "median_wall_clock_s": 265.9,
    "median_turns": 27,
-   "median_total_tokens": 1761182
+   "median_total_tokens": 1761182,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f4",
@@ -473,7 +507,9 @@
    "median_cost_usd": 0.37,
    "median_wall_clock_s": 165.0,
    "median_turns": 24,
-   "median_total_tokens": 1342635
+   "median_total_tokens": 1342635,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f4",
@@ -497,7 +533,9 @@
    "median_cost_usd": 0.88,
    "median_wall_clock_s": 110.7,
    "median_turns": 23,
-   "median_total_tokens": 1196816
+   "median_total_tokens": 1196816,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f5",
@@ -521,7 +559,9 @@
    "median_cost_usd": 0.29,
    "median_wall_clock_s": 96.1,
    "median_turns": 29,
-   "median_total_tokens": 1364063
+   "median_total_tokens": 1364063,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "f5",
@@ -545,7 +585,9 @@
    "median_cost_usd": 0.37,
    "median_wall_clock_s": 17.3,
    "median_turns": 7,
-   "median_total_tokens": 300948
+   "median_total_tokens": 300948,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth2",
@@ -569,7 +611,9 @@
    "median_cost_usd": 0.1,
    "median_wall_clock_s": 20.2,
    "median_turns": 7,
-   "median_total_tokens": 271768
+   "median_total_tokens": 271768,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth2",
@@ -593,7 +637,9 @@
    "median_cost_usd": 0.6,
    "median_wall_clock_s": 36.4,
    "median_turns": 10,
-   "median_total_tokens": 642717
+   "median_total_tokens": 642717,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth6",
@@ -617,7 +663,9 @@
    "median_cost_usd": 0.22,
    "median_wall_clock_s": 53.6,
    "median_turns": 9,
-   "median_total_tokens": 458985
+   "median_total_tokens": 458985,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "auth6",
@@ -641,7 +689,9 @@
    "median_cost_usd": 2.34,
    "median_wall_clock_s": 402.4,
    "median_turns": 28,
-   "median_total_tokens": 3050430
+   "median_total_tokens": 3050430,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "safe6",
@@ -665,7 +715,9 @@
    "median_cost_usd": 0.33,
    "median_wall_clock_s": 96.2,
    "median_turns": 15,
-   "median_total_tokens": 985366
+   "median_total_tokens": 985366,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "safe6",
@@ -689,7 +741,9 @@
    "median_cost_usd": 0.52,
    "median_wall_clock_s": 41.8,
    "median_turns": 10,
-   "median_total_tokens": 556118
+   "median_total_tokens": 556118,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res4",
@@ -713,7 +767,9 @@
    "median_cost_usd": 0.48,
    "median_wall_clock_s": 238.4,
    "median_turns": 11,
-   "median_total_tokens": 404409
+   "median_total_tokens": 404409,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res4",
@@ -737,7 +793,9 @@
    "median_cost_usd": 0.41,
    "median_wall_clock_s": 28.8,
    "median_turns": 7,
-   "median_total_tokens": 353020
+   "median_total_tokens": 353020,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res5",
@@ -761,7 +819,9 @@
    "median_cost_usd": 0.11,
    "median_wall_clock_s": 25.4,
    "median_turns": 8,
-   "median_total_tokens": 319276
+   "median_total_tokens": 319276,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res5",
@@ -785,7 +845,9 @@
    "median_cost_usd": 0.43,
    "median_wall_clock_s": 25.5,
    "median_turns": 7,
-   "median_total_tokens": 370142
+   "median_total_tokens": 370142,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res6",
@@ -809,7 +871,9 @@
    "median_cost_usd": 0.09,
    "median_wall_clock_s": 18.5,
    "median_turns": 6,
-   "median_total_tokens": 233217
+   "median_total_tokens": 233217,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "res6",
@@ -833,7 +897,9 @@
    "median_cost_usd": 0.37,
    "median_wall_clock_s": 19.6,
    "median_turns": 7,
-   "median_total_tokens": 278483
+   "median_total_tokens": 278483,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmp1",
@@ -857,7 +923,9 @@
    "median_cost_usd": 0.1,
    "median_wall_clock_s": 27.3,
    "median_turns": 5,
-   "median_total_tokens": 166118
+   "median_total_tokens": 166118,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmp1",
@@ -881,7 +949,9 @@
    "median_cost_usd": 0.39,
    "median_wall_clock_s": 19.2,
    "median_turns": 7,
-   "median_total_tokens": 361046
+   "median_total_tokens": 361046,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmt-1",
@@ -905,7 +975,9 @@
    "median_cost_usd": 0.09,
    "median_wall_clock_s": 19.3,
    "median_turns": 5,
-   "median_total_tokens": 191079
+   "median_total_tokens": 191079,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "cmt-1",
@@ -929,7 +1001,9 @@
    "median_cost_usd": 0.91,
    "median_wall_clock_s": 163.3,
    "median_turns": 24,
-   "median_total_tokens": 1398215
+   "median_total_tokens": 1398215,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "img-1",
@@ -953,7 +1027,9 @@
    "median_cost_usd": 0.68,
    "median_wall_clock_s": 351.5,
    "median_turns": 18,
-   "median_total_tokens": 768480
+   "median_total_tokens": 768480,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "img-1",
@@ -977,7 +1053,9 @@
    "median_cost_usd": 0.38,
    "median_wall_clock_s": 15.6,
    "median_turns": 6,
-   "median_total_tokens": 309241
+   "median_total_tokens": 309241,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "toc-1r2",
@@ -1001,7 +1079,9 @@
    "median_cost_usd": 0.09,
    "median_wall_clock_s": 16.4,
    "median_turns": 5,
-   "median_total_tokens": 192143
+   "median_total_tokens": 192143,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "toc-1r2",
@@ -1025,7 +1105,9 @@
    "median_cost_usd": 0.43,
    "median_wall_clock_s": 20.8,
    "median_turns": 8,
-   "median_total_tokens": 429498
+   "median_total_tokens": 429498,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "fn-a1r2",
@@ -1049,7 +1131,9 @@
    "median_cost_usd": 0.7,
    "median_wall_clock_s": 193.0,
    "median_turns": 51,
-   "median_total_tokens": 4414422
+   "median_total_tokens": 4414422,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "fn-a1r2",
@@ -1073,7 +1157,9 @@
    "median_cost_usd": 1.1,
    "median_wall_clock_s": 76.5,
    "median_turns": 19,
-   "median_total_tokens": 1299263
+   "median_total_tokens": 1299263,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d1",
@@ -1097,7 +1183,9 @@
    "median_cost_usd": 0.54,
    "median_wall_clock_s": 59.4,
    "median_turns": 7,
-   "median_total_tokens": 256530
+   "median_total_tokens": 256530,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d1",
@@ -1121,7 +1209,9 @@
    "median_cost_usd": 1.28,
    "median_wall_clock_s": 105.2,
    "median_turns": 24,
-   "median_total_tokens": 1643370
+   "median_total_tokens": 1643370,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d2",
@@ -1145,7 +1235,9 @@
    "median_cost_usd": 0.35,
    "median_wall_clock_s": 102.9,
    "median_turns": 12,
-   "median_total_tokens": 401302
+   "median_total_tokens": 401302,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d2",
@@ -1169,7 +1261,9 @@
    "median_cost_usd": 1.23,
    "median_wall_clock_s": 152.9,
    "median_turns": 42,
-   "median_total_tokens": 2425931
+   "median_total_tokens": 2425931,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d3",
@@ -1193,7 +1287,9 @@
    "median_cost_usd": 0.62,
    "median_wall_clock_s": 312.3,
    "median_turns": 16,
-   "median_total_tokens": 630814
+   "median_total_tokens": 630814,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "scale-d3",
@@ -1217,7 +1313,9 @@
    "median_cost_usd": 0.83,
    "median_wall_clock_s": 107.9,
    "median_turns": 18,
-   "median_total_tokens": 1113914
+   "median_total_tokens": 1113914,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "neg-1",
@@ -1241,7 +1339,9 @@
    "median_cost_usd": 0.28,
    "median_wall_clock_s": 108.8,
    "median_turns": 30,
-   "median_total_tokens": 1344234
+   "median_total_tokens": 1344234,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "neg-1",
@@ -1265,7 +1365,9 @@
    "median_cost_usd": 0.46,
    "median_wall_clock_s": 43.3,
    "median_turns": 10,
-   "median_total_tokens": 412096
+   "median_total_tokens": 412096,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "neg-2",
@@ -1289,7 +1391,9 @@
    "median_cost_usd": 0.26,
    "median_wall_clock_s": 113.7,
    "median_turns": 8,
-   "median_total_tokens": 289646
+   "median_total_tokens": 289646,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "neg-2",
@@ -1313,7 +1417,9 @@
    "median_cost_usd": 1.07,
    "median_wall_clock_s": 132.5,
    "median_turns": 28,
-   "median_total_tokens": 1769578
+   "median_total_tokens": 1769578,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "size-1",
@@ -1337,7 +1443,9 @@
    "median_cost_usd": 0.32,
    "median_wall_clock_s": 115.4,
    "median_turns": 24,
-   "median_total_tokens": 1111958
+   "median_total_tokens": 1111958,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "size-1",
@@ -1361,7 +1469,9 @@
    "median_cost_usd": 1.01,
    "median_wall_clock_s": 144.3,
    "median_turns": 29,
-   "median_total_tokens": 1565516
+   "median_total_tokens": 1565516,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "size-2",
@@ -1385,7 +1495,9 @@
    "median_cost_usd": 0.76,
    "median_wall_clock_s": 154.6,
    "median_turns": 33,
-   "median_total_tokens": 2680575
+   "median_total_tokens": 2680575,
+   "engine": "v0.1",
+   "contract": "appended-skill"
   },
   {
    "lane": "size-2",
@@ -1400,691 +1512,361 @@
    "median_total_tokens": 1744919
   },
   {
-   "lane": "res7",
+   "lane": "auth-d1",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.3,
-   "median_wall_clock_s": 29.9,
-   "median_turns": 8,
-   "median_total_tokens": 235404
-  },
-  {
-   "lane": "res7",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.85,
-   "median_wall_clock_s": 250.9,
-   "median_turns": 18,
-   "median_total_tokens": 919002
-  },
-  {
-   "lane": "res8",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 2,
-   "dnf": 0,
-   "median_cost_usd": 0.28,
-   "median_wall_clock_s": 41.4,
-   "median_turns": 6,
-   "median_total_tokens": 269619
-  },
-  {
-   "lane": "res8",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.4,
-   "median_wall_clock_s": 76.1,
-   "median_turns": 11,
-   "median_total_tokens": 541197
-  },
-  {
-   "lane": "res8v2",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.22,
-   "median_wall_clock_s": 37.2,
-   "median_turns": 8,
-   "median_total_tokens": 253011
-  },
-  {
-   "lane": "res8v2",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.33,
-   "median_wall_clock_s": 73.9,
-   "median_turns": 11,
-   "median_total_tokens": 399612
-  },
-  {
-   "lane": "f1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 4,
-   "dnf": 0,
-   "median_cost_usd": 0.87,
-   "median_wall_clock_s": 336.2,
-   "median_turns": 24,
-   "median_total_tokens": 837527
-  },
-  {
-   "lane": "f1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 1,
-   "dnf": 0,
-   "median_cost_usd": 1.3,
-   "median_wall_clock_s": 358.3,
-   "median_turns": 22,
-   "median_total_tokens": 1820231
-  },
-  {
-   "lane": "f4",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.95,
-   "median_wall_clock_s": 406.2,
-   "median_turns": 22,
-   "median_total_tokens": 946196
-  },
-  {
-   "lane": "f4",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 1.32,
-   "median_wall_clock_s": 406.6,
-   "median_turns": 22,
-   "median_total_tokens": 1574043
-  },
-  {
-   "lane": "f5",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.74,
-   "median_wall_clock_s": 279.7,
-   "median_turns": 20,
-   "median_total_tokens": 789919
-  },
-  {
-   "lane": "f5",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.84,
-   "median_wall_clock_s": 188.0,
-   "median_turns": 18,
-   "median_total_tokens": 1203171
-  },
-  {
-   "lane": "auth6",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.65,
-   "median_wall_clock_s": 106.9,
-   "median_turns": 14,
-   "median_total_tokens": 850479
-  },
-  {
-   "lane": "auth6",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 5,
-   "dnf": 0,
-   "median_cost_usd": 0.34,
-   "median_wall_clock_s": 63.5,
-   "median_turns": 8,
-   "median_total_tokens": 385324
-  },
-  {
-   "lane": "safe6",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 4,
-   "dnf": 0,
-   "median_cost_usd": 0.69,
-   "median_wall_clock_s": 208.6,
-   "median_turns": 11,
-   "median_total_tokens": 664968
-  },
-  {
-   "lane": "safe6",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 4,
-   "dnf": 0,
-   "median_cost_usd": 1.27,
-   "median_wall_clock_s": 261.4,
-   "median_turns": 39,
-   "median_total_tokens": 2175997
-  },
-  {
-   "lane": "res4",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
    "median_cost_usd": 0.29,
-   "median_wall_clock_s": 76.2,
-   "median_turns": 10,
-   "median_total_tokens": 365527
-  },
-  {
-   "lane": "res4",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 2,
-   "dnf": 0,
-   "median_cost_usd": 0.59,
-   "median_wall_clock_s": 188.3,
-   "median_turns": 9,
-   "median_total_tokens": 486957
-  },
-  {
-   "lane": "res5",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.21,
-   "median_wall_clock_s": 59.6,
-   "median_turns": 6,
-   "median_total_tokens": 214732
-  },
-  {
-   "lane": "res5",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.26,
-   "median_wall_clock_s": 59.0,
+   "median_wall_clock_s": 23.9,
    "median_turns": 8,
-   "median_total_tokens": 308503
-  },
-  {
-   "lane": "res6",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.18,
-   "median_wall_clock_s": 30.4,
-   "median_turns": 6,
-   "median_total_tokens": 220261
-  },
-  {
-   "lane": "res6",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.64,
-   "median_wall_clock_s": 190.0,
-   "median_turns": 12,
-   "median_total_tokens": 613792
+   "median_total_tokens": 377129
   },
   {
    "lane": "auth2",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.16,
-   "median_wall_clock_s": 31.4,
-   "median_turns": 7,
-   "median_total_tokens": 243556
-  },
-  {
-   "lane": "auth2",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.19,
-   "median_wall_clock_s": 31.5,
-   "median_turns": 6,
-   "median_total_tokens": 211057
-  },
-  {
-   "lane": "f3",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.26,
-   "median_wall_clock_s": 68.2,
-   "median_turns": 10,
-   "median_total_tokens": 383810
-  },
-  {
-   "lane": "f3",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.99,
-   "median_wall_clock_s": 249.7,
-   "median_turns": 12,
-   "median_total_tokens": 779783
-  },
-  {
-   "lane": "cmp1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.11,
-   "median_wall_clock_s": 10.4,
-   "median_turns": 3,
-   "median_total_tokens": 90091
-  },
-  {
-   "lane": "cmp1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.85,
-   "median_wall_clock_s": 215.9,
-   "median_turns": 13,
-   "median_total_tokens": 642527
-  },
-  {
-   "lane": "hk-tblpr",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.19,
-   "median_wall_clock_s": 37.9,
+   "median_cost_usd": 0.3,
+   "median_wall_clock_s": 29.3,
    "median_turns": 8,
-   "median_total_tokens": 228805
+   "median_total_tokens": 380844
   },
   {
-   "lane": "hk-tblpr",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.41,
-   "median_wall_clock_s": 120.6,
-   "median_turns": 14,
-   "median_total_tokens": 570843
-  },
-  {
-   "lane": "scale-d1",
+   "lane": "auth6",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.58,
-   "median_wall_clock_s": 120.8,
-   "median_turns": 14,
-   "median_total_tokens": 505337
-  },
-  {
-   "lane": "scale-d1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 1.04,
-   "median_wall_clock_s": 305.0,
-   "median_turns": 39,
-   "median_total_tokens": 1711034
-  },
-  {
-   "lane": "scale-d2",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.69,
-   "median_wall_clock_s": 148.6,
-   "median_turns": 26,
-   "median_total_tokens": 1043388
-  },
-  {
-   "lane": "scale-d2",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 1.0,
-   "median_wall_clock_s": 345.1,
-   "median_turns": 26,
-   "median_total_tokens": 1346226
-  },
-  {
-   "lane": "scale-d3",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.8,
-   "median_wall_clock_s": 224.0,
-   "median_turns": 23,
-   "median_total_tokens": 855767
-  },
-  {
-   "lane": "scale-d3",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 1.2,
-   "median_wall_clock_s": 426.9,
-   "median_turns": 34,
-   "median_total_tokens": 1700523
-  },
-  {
-   "lane": "tbl-s1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 1,
-   "dnf": 0,
-   "median_cost_usd": 0.66,
-   "median_wall_clock_s": 215.9,
-   "median_turns": 21,
-   "median_total_tokens": 887086
-  },
-  {
-   "lane": "tbl-s1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.26,
-   "median_wall_clock_s": 53.7,
-   "median_turns": 7,
-   "median_total_tokens": 258861
-  },
-  {
-   "lane": "auth-d1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.21,
-   "median_wall_clock_s": 28.2,
-   "median_turns": 7,
-   "median_total_tokens": 241984
-  },
-  {
-   "lane": "auth-d1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.2,
-   "median_wall_clock_s": 39.8,
-   "median_turns": 6,
-   "median_total_tokens": 212766
-  },
-  {
-   "lane": "fmt-a1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.35,
-   "median_wall_clock_s": 99.8,
-   "median_turns": 14,
-   "median_total_tokens": 346282
-  },
-  {
-   "lane": "fmt-a1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 2,
-   "dnf": 0,
-   "median_cost_usd": 0.31,
-   "median_wall_clock_s": 80.6,
+   "median_cost_usd": 0.43,
+   "median_wall_clock_s": 54.4,
    "median_turns": 11,
-   "median_total_tokens": 414716
+   "median_total_tokens": 567401
   },
   {
    "lane": "cmp-f1",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.16,
-   "median_wall_clock_s": 26.6,
-   "median_turns": 5,
-   "median_total_tokens": 163731
+   "median_cost_usd": 0.44,
+   "median_wall_clock_s": 62.6,
+   "median_turns": 12,
+   "median_total_tokens": 603189
   },
   {
-   "lane": "cmp-f1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
+   "lane": "cmp1",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
-   "passes": 0,
+   "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.25,
-   "median_wall_clock_s": 53.8,
-   "median_turns": 9,
-   "median_total_tokens": 293106
+   "median_cost_usd": 0.23,
+   "median_wall_clock_s": 19.0,
+   "median_turns": 5,
+   "median_total_tokens": 224667
   },
   {
    "lane": "cmt-1",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.21,
-   "median_wall_clock_s": 29.4,
-   "median_turns": 7,
-   "median_total_tokens": 240748
-  },
-  {
-   "lane": "cmt-1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 3,
-   "dnf": 0,
-   "median_cost_usd": 0.2,
-   "median_wall_clock_s": 30.4,
+   "median_cost_usd": 0.29,
+   "median_wall_clock_s": 29.0,
    "median_turns": 8,
-   "median_total_tokens": 276913
+   "median_total_tokens": 372513
   },
   {
-   "lane": "img-1",
+   "lane": "f1",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 2,
+   "dnf": 1,
+   "median_cost_usd": 1.19,
+   "median_wall_clock_s": 229.1,
+   "median_turns": 34,
+   "median_total_tokens": 1624126
+  },
+  {
+   "lane": "f3",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.95,
-   "median_wall_clock_s": 397.3,
-   "median_turns": 19,
-   "median_total_tokens": 939555
+   "median_cost_usd": 0.62,
+   "median_wall_clock_s": 90.8,
+   "median_turns": 17,
+   "median_total_tokens": 776588
   },
   {
-   "lane": "img-1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
+   "lane": "f4",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.33,
-   "median_wall_clock_s": 80.3,
-   "median_turns": 15,
-   "median_total_tokens": 444353
+   "median_cost_usd": 1.5,
+   "median_wall_clock_s": 325.7,
+   "median_turns": 31,
+   "median_total_tokens": 2297612
   },
   {
-   "lane": "toc-1",
+   "lane": "f5",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 0,
-   "dnf": 0,
-   "median_cost_usd": 0.32,
-   "median_wall_clock_s": 99.8,
-   "median_turns": 8,
-   "median_total_tokens": 303585
-  },
-  {
-   "lane": "toc-1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 0,
-   "dnf": 0,
-   "median_cost_usd": 0.25,
-   "median_wall_clock_s": 58.3,
-   "median_turns": 7,
-   "median_total_tokens": 257015
-  },
-  {
-   "lane": "fn-a1",
-   "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 3,
-   "passes": 0,
-   "dnf": 2,
-   "median_cost_usd": 1.57,
-   "median_wall_clock_s": 654.2,
-   "median_turns": 51,
-   "median_total_tokens": 2379061
-  },
-  {
-   "lane": "fn-a1",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.18,
-   "median_wall_clock_s": 27.6,
-   "median_turns": 6,
-   "median_total_tokens": 208012
+   "median_cost_usd": 0.67,
+   "median_wall_clock_s": 103.6,
+   "median_turns": 23,
+   "median_total_tokens": 822117
   },
   {
-   "lane": "toc-1r2",
+   "lane": "fmt-a1",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.2,
-   "median_wall_clock_s": 25.2,
-   "median_turns": 5,
-   "median_total_tokens": 187064
+   "median_cost_usd": 0.39,
+   "median_wall_clock_s": 35.2,
+   "median_turns": 11,
+   "median_total_tokens": 541963
   },
   {
    "lane": "fn-a1r2",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.22,
-   "median_wall_clock_s": 28.9,
-   "median_turns": 7,
-   "median_total_tokens": 248400
+   "median_cost_usd": 0.31,
+   "median_wall_clock_s": 28.7,
+   "median_turns": 9,
+   "median_total_tokens": 426496
+  },
+  {
+   "lane": "hk-tblpr",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.43,
+   "median_wall_clock_s": 62.5,
+   "median_turns": 13,
+   "median_total_tokens": 635248
+  },
+  {
+   "lane": "img-1",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.82,
+   "median_wall_clock_s": 95.2,
+   "median_turns": 21,
+   "median_total_tokens": 1287761
+  },
+  {
+   "lane": "res4",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.57,
+   "median_wall_clock_s": 90.0,
+   "median_turns": 16,
+   "median_total_tokens": 696298
+  },
+  {
+   "lane": "res5",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.4,
+   "median_wall_clock_s": 56.2,
+   "median_turns": 10,
+   "median_total_tokens": 489834
+  },
+  {
+   "lane": "res6",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.57,
+   "median_wall_clock_s": 81.4,
+   "median_turns": 13,
+   "median_total_tokens": 655691
+  },
+  {
+   "lane": "res7",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.59,
+   "median_wall_clock_s": 73.7,
+   "median_turns": 14,
+   "median_total_tokens": 790277
+  },
+  {
+   "lane": "res8v2",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 0.46,
+   "median_wall_clock_s": 50.0,
+   "median_turns": 14,
+   "median_total_tokens": 652060
+  },
+  {
+   "lane": "safe6",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 5.15,
+   "median_wall_clock_s": 923.3,
+   "median_turns": 67,
+   "median_total_tokens": 6754872
+  },
+  {
+   "lane": "scale-d1",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 1.09,
+   "median_wall_clock_s": 135.5,
+   "median_turns": 28,
+   "median_total_tokens": 1504468
+  },
+  {
+   "lane": "scale-d2",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 1.74,
+   "median_wall_clock_s": 227.8,
+   "median_turns": 35,
+   "median_total_tokens": 2804901
+  },
+  {
+   "lane": "scale-d3",
+   "arm": "stemma",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
+   "dnf": 0,
+   "median_cost_usd": 2.46,
+   "median_wall_clock_s": 239.7,
+   "median_turns": 47,
+   "median_total_tokens": 2293587
   },
   {
    "lane": "tbl-s1r2",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
    "n": 3,
    "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.29,
-   "median_wall_clock_s": 57.2,
+   "median_cost_usd": 0.33,
+   "median_wall_clock_s": 34.9,
    "median_turns": 9,
-   "median_total_tokens": 333555
+   "median_total_tokens": 435993
   },
   {
-   "lane": "f2",
+   "lane": "toc-1r2",
    "arm": "stemma",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 0,
+   "model": "claude-sonnet-5",
+   "engine": "v0.2.0",
+   "contract": "five-tool",
+   "n": 3,
+   "passes": 3,
    "dnf": 0,
-   "median_cost_usd": 0.69,
-   "median_wall_clock_s": 208.6,
-   "median_turns": 11,
-   "median_total_tokens": 664968
-  },
-  {
-   "lane": "f2",
-   "arm": "vanilla",
-   "model": "claude-sonnet-4-6",
-   "n": 5,
-   "passes": 0,
-   "dnf": 0,
-   "median_cost_usd": 1.27,
-   "median_wall_clock_s": 261.4,
-   "median_turns": 39,
-   "median_total_tokens": 2175997
+   "median_cost_usd": 0.34,
+   "median_wall_clock_s": 34.2,
+   "median_turns": 10,
+   "median_total_tokens": 439375
   }
  ],
  "_regrade_note": "toc-1r2/stemma/claude-haiku-4-5 re-graded 2026-07-04 after a gate fix (paired-only fldSimple regex rejected the legal self-closing form); run-level REGRADED.txt marker in the held-out raw-run archive.",
- "_s46_note": "claude-sonnet-4-6 cells are the historical replicated-era runs (n>=3, disqualified runs excluded) recorded in the held-out run inventory; durations extracted from the same raw transcripts. Lane coverage differs slightly (3 vanilla cells absent).",
- "_tokens_note": "median_total_tokens = input + output + cache_creation + cache_read per run (everything that transited the model's context), median across the cell's runs."
+ "_tokens_note": "median_total_tokens = input + output + cache_creation + cache_read per run (everything that transited the model's context), median across the cell's runs.",
+ "_retired_note": "claude-sonnet-4-6 cells were retired from this file at the v0.2.0 refresh (2026-07-20): the live report's claims are Sonnet-5/Haiku-4.5 only. The historical per-lane tables remain in docs/benchmarks-history.md and every raw run remains in the held-out inventory.",
+ "engine_provenance": {
+  "v0.1": "the 2026-07-03/04 sweeps ran on pre-release development builds of the line released as v0.1.0 (two builds: main lanes and the negotiation/size lanes; no cell mixes builds), with the stemma skill document appended to the system prompt (the v0.1 agent contract). Exact builds are pinned in the held-out inventory.",
+  "v0.2.0": "the 2026-07-18 re-run executed on the v0.2.0 release-qualification build under the shipped five-tool compact contract (no appended skill; guidance is tool-native). The published v0.2.0 release adds release-packaging and conformance-tooling commits on top of the qualified build \u2014 disclosed, not hidden; the exact build is pinned in the held-out inventory."
+ }
 }

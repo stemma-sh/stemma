@@ -1,0 +1,215 @@
+name: complete release assets
+
+# Recovery path for a release whose packages published but whose GitHub
+# release did not complete.
+#
+# `release.yml` cannot do this itself: `workflow_dispatch` reads the workflow
+# file from the ref you select, and its version-guard refuses a run whose SHA
+# differs from the one the existing tag binds. A ref carrying a fix is a
+# different SHA (refused), and the tagged SHA carries the unfixed file — so a
+# failed publication is otherwise unrecoverable at that version. 0.2.0 hit
+# exactly this and shipped without release assets.
+#
+# This attaches the assets `release.yml` already packaged and uploaded for the
+# approved candidate. It never builds, never packages, and never publishes a
+# package: it uploads bytes that were verified before publication and refuses
+# unless the tag still names the expected source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released MAJOR.MINOR.PATCH, without the v prefix"
+        required: true
+        type: string
+      commit_sha:
+        description: "Full 40-character SHA the release tag must bind"
+        required: true
+        type: string
+      run_id:
+        description: "release.yml run id that produced and approved the assets"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  REQUESTED_VERSION: ${{ inputs.version }}
+  REQUESTED_COMMIT_SHA: ${{ inputs.commit_sha }}
+  SOURCE_RUN_ID: ${{ inputs.run_id }}
+
+jobs:
+  complete:
+    name: attach approved assets to an existing release tag
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      contents: write # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs and the existing tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Version must be stable MAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Commit must be a full lowercase hexadecimal SHA."
+            exit 1
+          fi
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Run id must be numeric."
+            exit 1
+          fi
+          tag="v$REQUESTED_VERSION"
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ -z "$tag_sha" ]; then
+            echo "::error::Tag $tag does not exist; this workflow only completes an already claimed release."
+            exit 1
+          fi
+          if [ "$tag_sha" != "$REQUESTED_COMMIT_SHA" ]; then
+            echo "::error::Tag $tag binds $tag_sha, not the supplied $REQUESTED_COMMIT_SHA."
+            exit 1
+          fi
+          run_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" --jq '.head_sha')"
+          if [ "$run_sha" != "$REQUESTED_COMMIT_SHA" ]; then
+            echo "::error::Run ${SOURCE_RUN_ID} built $run_sha, not the tagged $REQUESTED_COMMIT_SHA."
+            exit 1
+          fi
+          echo "Completing $tag at $tag_sha from run ${SOURCE_RUN_ID}"
+      - name: Verify tag mutation protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" \
+            > "$RUNNER_TEMP/tag-rulesets.json"
+          ruleset_id="$(python3 stemma-mcp/verify_release_tag_ruleset.py \
+            select "$RUNNER_TEMP/tag-rulesets.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/rulesets/$ruleset_id?includes_parents=true" \
+            > "$RUNNER_TEMP/release-tag-ruleset.json"
+          python3 stemma-mcp/verify_release_tag_ruleset.py \
+            verify "$RUNNER_TEMP/release-tag-ruleset.json" "$ruleset_id"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify the approved assets against their recorded checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -c sha256sums.txt
+      - name: Confirm the assets belong to this version and source
+        run: |
+          set -euo pipefail
+          python3 - release "$REQUESTED_VERSION" "$REQUESTED_COMMIT_SHA" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          directory = pathlib.Path(sys.argv[1])
+          version, sha = sys.argv[2], sys.argv[3]
+          manifest = json.loads((directory / "candidate-manifest.json").read_text("utf-8"))
+          if manifest["build"]["version"] != version:
+              raise SystemExit("manifest version is not " + version)
+          if manifest["source"]["git_sha"] != sha:
+              raise SystemExit("manifest source SHA is not " + sha)
+          archives = sorted(
+              path.name
+              for path in directory.iterdir()
+              if path.name not in {"candidate-manifest.json", "sha256sums.txt"}
+          )
+          if len(archives) != 5:
+              raise SystemExit("expected five platform archives, found: " + ", ".join(archives))
+          for name in archives:
+              if version not in name:
+                  raise SystemExit("archive does not name version " + version + ": " + name)
+          print("assets match {} at {}".format(version, sha))
+          PY
+      - name: Create or complete the release, then publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          release_json="$RUNNER_TEMP/release.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > "$release_json" 2>/dev/null; then
+            notes="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed."
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="$tag" \
+              -f target_commitish="$REQUESTED_COMMIT_SHA" \
+              -f name="$tag" \
+              -f body="$notes" \
+              -F draft=true > "$release_json"
+          fi
+          release_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$release_json")"
+          if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prerelease"])' "$release_json")" != "False" ]; then
+            echo "::error::Release must not be marked as a prerelease."
+            exit 1
+          fi
+
+          # Never replace an uploaded, byte-bearing asset: an existing asset
+          # must already match the approved bytes or the run fails closed.
+          for asset in release/*; do
+            name="$(basename "$asset")"
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
+              --jq ".[] | select(.name == \"$name\") | \"\(.id)\t\(.state)\"")"
+            if [ -z "$existing" ]; then
+              gh release upload "$tag" "$asset"
+              continue
+            fi
+            asset_id="${existing%%$'\t'*}"
+            asset_state="${existing#*$'\t'}"
+            if [ "$asset_state" = "starter" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+              gh release upload "$tag" "$asset"
+            elif [ "$asset_state" = "uploaded" ]; then
+              downloaded="$RUNNER_TEMP/existing-$name"
+              gh api -H "Accept: application/octet-stream" \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id" > "$downloaded"
+              if ! cmp --silent "$asset" "$downloaded"; then
+                echo "::error::Existing asset $name differs from the approved bytes."
+                exit 1
+              fi
+              echo "Verified existing asset $name"
+            else
+              echo "::error::Existing asset $name has unexpected state $asset_state."
+              exit 1
+            fi
+          done
+
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" \
+            -F draft=false > "$release_json"
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
+            > "$RUNNER_TEMP/assets.json"
+          python3 - release "$RUNNER_TEMP/assets.json" "$release_json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          local = {path.name for path in pathlib.Path(sys.argv[1]).iterdir() if path.is_file()}
+          assets = json.load(open(sys.argv[2], encoding="utf-8"))
+          remote = [asset.get("name") for asset in assets]
+          if len(remote) != len(set(remote)):
+              raise SystemExit("release contains duplicate asset names")
+          if set(remote) != local:
+              raise SystemExit("release asset set is not exact after upload")
+          if any(asset.get("state") != "uploaded" for asset in assets):
+              raise SystemExit("release contains an asset that is not fully uploaded")
+          release = json.load(open(sys.argv[3], encoding="utf-8"))
+          if release.get("draft") is not False:
+              raise SystemExit("release is still a draft")
+          if release.get("prerelease") is not False:
+              raise SystemExit("release is marked as a prerelease")
+          if release.get("immutable") is not True:
+              raise SystemExit("release is not immutable; enable release immutability")
+          print("published immutable release with an exact asset set")
+          PY

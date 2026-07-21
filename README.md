@@ -1,219 +1,215 @@
-# stemma
+# Stemma
+
+<p align="center">
+  <a href="https://github.com/stemma-sh/stemma/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/stemma-sh/stemma/ci.yml?branch=main&style=flat-square" alt="CI status"></a>
+  <a href="https://crates.io/crates/stemma-cli"><img src="https://img.shields.io/crates/v/stemma-cli?style=flat-square" alt="crates.io version"></a>
+  <a href="https://www.npmjs.com/package/@stemma-sh/mcp"><img src="https://img.shields.io/npm/v/@stemma-sh/mcp?style=flat-square" alt="npm version"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="MIT or Apache-2.0 license"></a>
+</p>
 
 **Safe tracked changes for Word automation.**
 
-Give Stemma an existing `.docx` and a short approved worklist. It creates a new,
-Word-native redline while preserving the original document and any revisions it
-already contains. Every requested item is reported as applied or explicitly
-refused; ambiguity is never silently guessed.
+Stemma edits existing Word documents using native tracked changes.
 
-```text
-existing DOCX + approved old-to-new changes
-    -> tracked-native execution
-    -> scope and preservation audit
-    -> new redline DOCX + machine-readable receipt
-```
+Give it a `.docx` and a list of approved replacements. Stemma creates a new
+redline that reviewers can accept or reject in Microsoft Word. It preserves the
+original document and refuses ambiguous changes instead of guessing.
 
-The v0.2.0 product focus is this workflow. The typed Rust engine remains the
-correctness kernel, the CLI is the canonical process contract, and MCP is the
-agent adapter. The HTTP/editor demo and broad low-level verb surface remain
-available, but are not where current product development is focused.
+Stemma is built for agents, scripts, and review workflows that need to change
+contracts, policies, and other sensitive documents without flattening them to
+plain text or hand-editing OOXML.
 
-## Compact agent workflow
+In [published agent benchmarks](docs/benchmarks.md), Stemma reaches 95% task
+success, compared with 82% for raw OOXML editing through the stock DOCX skill.
 
-The default product shape is three semantic stages:
+[Documentation](docs/README.md) ·
+[CLI reference](docs/reference/cli.md) ·
+[MCP setup](stemma-mcp/README.md) ·
+[Benchmarks](docs/benchmarks.md) ·
+[Changelog](CHANGELOG.md)
 
-```text
-inspect -> execute -> verify
-```
+## Quick start
 
-`inspect` emits compact, revision-aware extended Markdown rather than exposing
-the typed IR. `execute` compiles an exact-input-bound plan through the typed
-engine. `verify` independently certifies any before/after pair and returns
-accepted/rejected projection identities. Markdown is the agent language, never
-the source of truth.
-
-## Try the workflow
-
-From a clone:
+Install the CLI:
 
 ```bash
-demo_dir="$(mktemp -d)"
-cargo run -p stemma-cli -- inspect \
-  stemma-engine/testdata/simple-text/before.docx
-cargo run -p stemma-cli -- execute \
-  stemma-engine/testdata/simple-text/before.docx \
-  --plan stemma-cli/examples/approved-worklist.json \
-  -o "$demo_dir/redline.docx" \
-  --receipt "$demo_dir/receipt.json"
-cargo run -p stemma-cli -- verify \
-  stemma-engine/testdata/simple-text/before.docx \
-  "$demo_dir/redline.docx"
+cargo install stemma-cli
 ```
 
-The example worklist is deliberately concrete:
+### Compare two versions
+
+If you have an original and a revised document, turn their differences into
+native tracked changes:
+
+```bash
+stemma compare as-sent.docx as-returned.docx \
+  -o changed.docx \
+  --author "Approved Reviewer"
+```
+
+Stemma creates `changed.docx` and reports the result:
+
+```text
+wrote redline to changed.docx (<n> tracked revisions); bytes=<n> sha256=<hex> collision_policy=create_new disposition=created
+```
+
+**Rejecting every change reconstructs `as-sent.docx`. Accepting every change
+reconstructs `as-returned.docx`.**
+
+### Apply approved changes
+
+For a controlled worklist, first inspect the exact identity of the document:
+
+```bash
+stemma validate agreement.docx
+```
+
+The command prints the file's byte count and SHA-256. Put those values into a
+short approved worklist:
 
 ```json
 {
   "schema": "stemma.worklist.v0",
   "input": {
-    "sha256": "2cdfb8ecd1a27ef7132ebbaa1f718d6705ea6532bf3b155c09bfd7e87d410667",
-    "bytes": 11431
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "bytes": 48271
   },
   "author": "Approved Reviewer",
   "changes": [
     {
-      "id": "change-1",
-      "old": "foo bar",
-      "new": "review-ready language",
+      "id": "payment-term",
+      "old": "Payment is due within 30 days.",
+      "new": "Payment is due within 45 days.",
       "expected_matches": 1
     }
   ]
 }
 ```
 
-`redline.docx` opens in Word with a native tracked replacement. Rejecting the
-new revisions restores the input text; accepting them shows the approved new
-text. `receipt.json` contains exact input, worklist, and output SHA-256
-identities, complete per-item outcomes, new revision counts, preservation of
-pre-existing revisions, untouched-scope findings, and package validation.
-
-The worklist's required input hash and byte count bind approval to one exact
-document. `stemma validate INPUT` prints both values. An all-applied worklist
-creates the redline and exits `0`. If any item is refused, Stemma persists the
-receipt, creates no DOCX, and exits `3`. `--emit-partial` is an explicit escape
-hatch that creates a non-deliverable partial redline and still exits `3`.
-
-The durable receipt defaults to `<out>.receipt.json`; `--receipt FILE` overrides
-it. Receipt and DOCX paths are create-new. The receipt is committed first, so a
-failed DOCX commit can leave a diagnostic receipt without a DOCX, but never a
-DOCX without its receipt. Delivery therefore requires the documented process
-exit plus output presence and receipt hash/size agreement; the receipt makes
-those checks explicit. JSON is also mirrored to stdout for pipelines; a closed
-stdout does not invalidate the durable result.
-
-Receipts contain paths, hashes, match excerpts, and diagnoses. Treat them as
-document-sensitive metadata rather than publishing them by default.
-
-The experimental `stemma.worklist.v0` scope is intentionally narrow: guarded
-old-to-new changes in top-level body paragraphs. Exact match count defaults to
-one; optional block/range scope and `normalize_ws` matching handle deliberate
-disambiguation. Matches crossing tracked/opaque barriers are refused. Matches
-in top-level table cells are detected and refused for default-scope items.
-Nested table cells, headers, footers, notes, comments, and textboxes are
-named as unsearched receipt limitations.
-
-Full command and receipt contract: [CLI reference](docs/reference/cli.md).
-For the historical pre-release Candidate A identity and its synthetic
-walkthrough, see [Evaluate the approved-worklist workflow](docs/evaluation.md).
-
-## Agent adapter
-
-The released MCP server runs from npm without a Rust toolchain. Its default
-`core` profile exposes 5 tools over the complete typed edit transaction; set
-`STEMMA_MCP_PROFILE=advanced` to opt into the full 31-tool expert surface:
+Save that as `changes.json`, replacing the example hash and byte count with the
+values reported for your document. Then create the redline:
 
 ```bash
-npx -y @stemma-sh/mcp
+stemma apply agreement.docx \
+  --worklist changes.json \
+  -o agreement-redline.docx
 ```
 
-The compact agent path is:
+On success, Stemma writes `agreement-redline.docx`, saves a durable receipt at
+`agreement-redline.docx.receipt.json`, and returns the same receipt on stdout.
+Its decisive fields include:
 
-```text
-open_docx -> inspect_docx -> execute_plan -> verify_docx -> save_docx
+```json
+{
+  "status": "complete",
+  "deliverable": true,
+  "summary": {
+    "total": 1,
+    "applied": 1,
+    "refused": 0
+  }
+}
 ```
 
-`inspect_docx` defaults to the first page of a compact current index and selects bounded find or
-window reads, a paged document projection with exact prose and bounded table
-summaries, block detail, revisions, styles, editable notes, historical
-accepted/rejected/redline projections, or the complete parser-derived edit
-operation catalog.
-Table block detail is a bounded page of cell locators; every cell paragraph id
-remains available for exact follow-up inspection.
-`execute_plan` previews or applies the existing atomic v4 transaction, executes
-an explicitly non-atomic server-side literal-replacement worklist with per-item
-outcomes, handles an accept/reject selection, or produces a tracked redline
-from a two-file comparison through the typed engine.
-Worklist preview uses a throwaway snapshot, and the default whole-body scope
-includes table-cell paragraphs with the same formatting-preserving tracked
-splice as top-level body text.
-Receipts omit whole-table content. `verify_docx` audits either the open session
-or any producer's before/after pair; each audit section is explicitly paged
-with totals and continuation metadata. Treat any
-plan error, direct change, unexpected prior-revision change, untouched-scope
-violation, or validator issue as incomplete. Save only to a new path. The MCP
-workspace boundary confines agent-controlled reads and writes to
-`STEMMA_MCP_WORKSPACE_ROOT`. See the
-[MCP golden path](stemma-mcp/README.md) and
-[filesystem contract](docs/reference/mcp.md#filesystem-and-artifact-boundary).
+The complete receipt also records exact artifact hashes and every item outcome,
+including diagnoses for refused changes.
+
+`agreement-redline.docx` is a new Word document containing a native tracked
+replacement. The original is never overwritten. If the old text is missing,
+duplicated, or unsafe to replace, Stemma refuses the worklist instead of
+silently choosing a target.
+
+See the [worklist format and complete CLI contract](docs/reference/cli.md#apply).
+
+## Use Stemma with an agent
+
+The Stemma MCP server ships with prebuilt binaries for Linux, macOS, and
+Windows. For example, add it to Claude Code with:
+
+```bash
+claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
+claude mcp list
+```
+
+The server gives agents a compact workflow for opening, inspecting, editing,
+verifying, and saving Word documents. The DOCX stays server-side, and the agent
+requests only the parts it needs.
+
+See [MCP setup and configuration for other clients](stemma-mcp/README.md).
 
 ## Why Stemma
 
-- **Layered Word revisions.** New tracked changes are authored beside existing
-  reviewers' revisions rather than flattening the document through Markdown.
-- **Bounded execution.** Match counts, optional scopes, author separation, and
-  tracked/opaque barriers turn ambiguity into a named refusal.
-- **Evidence before delivery.** Blocking OOXML validation, preservation audit,
-  exact artifact identity, and create-new output semantics run before success.
-- **A typed safety kernel.** DOCX bytes are parsed into one canonical typed IR;
-  tracked insert/delete/format semantics and accept/reject projections are not
-  hand-written XML splices at the adapter edge.
+Word documents are not plain text. They contain revisions, formatting,
+comments, tables, fields, notes, and content that must survive an edit.
 
-The engine and historical agent evaluations remain documented in the
-[benchmark report](docs/benchmarks.md) and
-[per-cell data](docs/benchmark-data-model-sweeps-2026-07.json). The CLI worklist
-remains the narrow approved-replacement contract; the MCP core exposes the same
-typed transaction and assurance kernels as the advanced profile through a
-smaller semantic surface.
+Common automation approaches either flatten the document or manipulate its XML
+directly. Stemma models Word revisions explicitly, including what accepting or
+rejecting each change must produce.
 
-The project is **pre-1.0**. A `0.x` minor release may change the experimental
-worklist or receipt contract with changelog notice. See the
-[stability policy](docs/guide/stability.md).
+- **Reviewable output:** changes appear as native Word revisions.
+- **Bounded execution:** stale, missing, or ambiguous instructions are refused.
+- **Preservation:** existing revisions and content outside the requested change
+  remain part of the document.
+- **Verified delivery:** output is validated and written to a new path without
+  replacing the source or another existing file.
+- **Multi-file evidence:** an MCP task can bind declared replacements and inputs
+  before mutation, then emit a manifest that is independently checkable from
+  the delivered files. The manifest does not prove undeclared intent.
 
-## When stemma is the wrong tool
+## Current scope
 
-- **Generating documents from templates, no tracked changes involved**:
-  python-docx or plain OOXML templating is simpler.
-- **One-shot format conversion** (DOCX to Markdown/HTML and done): use pandoc;
-  Stemma's projections exist to serve editing loops, not conversion pipelines.
-- **Byte-identical round-trips**: out of contract by design; render fidelity and
-  content completeness are the guarantees in the
-  [fidelity contract](docs/guide/fidelity.md).
-- **Broad interactive Word editing**: Stemma deliberately uses Word as the
-  review surface rather than building another general-purpose editor.
+The focused CLI worklist currently supports explicit old-to-new changes in
+top-level body paragraphs. It can guard expected match counts, restrict a
+replacement to a block or range, and normalize deliberate whitespace or quote
+differences. Unsupported or ambiguous cases are reported rather than guessed.
 
-## Workspace
+The engine and MCP server expose broader editing and revision workflows. Stemma
+is still pre-1.0, so experimental contracts may change between `0.x` minor
+releases with changelog notice.
 
-| Component | Role |
-|---|---|
-| [`stemma-engine/`](stemma-engine/) | Correctness kernel: import, typed IR, tracked edit semantics, serialization, and validation. |
-| [`stemma-artifacts/`](stemma-artifacts/) | Shared host boundary: path authority, exact identity, protected sources, and create-new commits. |
-| [`stemma-cli/`](stemma-cli/) | Canonical process contract: approved worklist apply, compare, extract, resolve, and validate. |
-| [`stemma-mcp/`](stemma-mcp/) | Agent adapter over stdio. |
-| [`stemma-api/`](stemma-api/) | Maintenance-only HTTP demonstration surface; not a production service. |
-| [`stemma-examples/`](stemma-examples/) | Maintenance-only browser demonstration assets served by `stemma-api`. |
+Stemma is not intended for:
 
-## Documentation
+- generating new documents from templates;
+- one-way conversion from DOCX to Markdown or HTML;
+- byte-identical XML round trips;
+- replacing Word as a general-purpose interactive editor.
 
-The [docs](docs/README.md) include the
-[CLI contract](docs/reference/cli.md),
-[MCP reference](docs/reference/mcp.md),
-[engine guide](docs/guide/concepts.md), and
-[benchmark history](docs/benchmarks.md).
+See the [fidelity contract](docs/guide/fidelity.md) and
+[stability policy](docs/guide/stability.md) before building a durable
+integration.
 
-## How this was built
+## Documentation by goal
 
-Most of this code was written by AI (Claude). The human was used for domain,
-direction, taste, and ideas.
+- Applying approved changes: [CLI reference](docs/reference/cli.md)
+- Verifying a multi-document delivery: [task-delivery guide](docs/guides/verify-task-delivery.md)
+- Connecting an agent: [MCP setup](stemma-mcp/README.md)
+- Embedding the Rust engine: [engine README](stemma-engine/README.md)
+- Understanding revisions and fidelity: [guide](docs/guide/concepts.md)
+- Reviewing evidence: [benchmarks](docs/benchmarks.md)
+- Contributing: [contributor guide](CONTRIBUTING.md)
+
+## Development
+
+From a source checkout:
+
+```bash
+mise install
+just gate
+```
+
+The workspace contains the Rust engine, CLI, MCP server, shared artifact
+boundary, and a local HTTP/editor demonstration. See the
+[architecture map](docs/internals/architecture.md) for the component layout.
+
+Most of the code was written with AI assistance. Human maintainers provide the
+domain model, product direction, review, and release decisions.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and expectations, and
-[SECURITY.md](SECURITY.md) for vulnerability reports. AI-assisted contributions
-are welcome and held to the same bar: `just gate` green, tests justified from
-the domain, and honest PR descriptions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull request expectations.
+Report security issues through [SECURITY.md](SECURITY.md).
 
 ## License
 
-Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT)
-at your option.
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at
+your option.

@@ -108,6 +108,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
         marks: Vec::new(),
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }

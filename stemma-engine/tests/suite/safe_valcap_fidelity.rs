@@ -73,12 +73,6 @@ fn diff_fixture(fixture: &str) -> stemma::DocumentDiff {
     diff_documents(&before, &after).expect("diff_documents")
 }
 
-fn element_to_string(el: &Element) -> String {
-    let mut buf = Vec::new();
-    el.write(&mut buf).expect("serialize element");
-    String::from_utf8(buf).expect("utf-8")
-}
-
 fn generate_redline_document_xml(fixture: &str) -> Element {
     let redline = generate_redline_docx(fixture);
     let mut zip = ZipArchive::new(Cursor::new(redline)).expect("open redline zip");
@@ -357,35 +351,35 @@ fn find_first_field_run<'a>(root: &'a Element, tag: &str) -> &'a Element {
     visit(root, tag).unwrap_or_else(|| panic!("should find run containing {tag}"))
 }
 
-fn find_first_text_run_containing<'a>(root: &'a Element, needle: &str) -> &'a Element {
-    fn run_text(run: &Element) -> String {
-        let mut out = String::new();
-        for child in &run.children {
-            if let XMLNode::Element(el) = child
-                && (is_w_tag(el, "t") || is_w_tag(el, "delText"))
-                && let Some(text) = el.get_text()
-            {
-                out.push_str(&text);
-            }
+fn text_run_content(run: &Element) -> String {
+    let mut out = String::new();
+    for child in &run.children {
+        if let XMLNode::Element(el) = child
+            && (is_w_tag(el, "t") || is_w_tag(el, "delText"))
+            && let Some(text) = el.get_text()
+        {
+            out.push_str(&text);
         }
-        out
     }
+    out
+}
 
-    fn visit<'a>(el: &'a Element, needle: &str) -> Option<&'a Element> {
-        if is_w_tag(el, "r") && run_text(el).contains(needle) {
-            return Some(el);
-        }
+fn text_runs(root: &Element) -> Vec<&Element> {
+    fn visit<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
         for child in &el.children {
-            if let XMLNode::Element(node) = child
-                && let Some(found) = visit(node, needle)
-            {
-                return Some(found);
+            if let XMLNode::Element(node) = child {
+                if is_w_tag(node, "r") {
+                    out.push(node);
+                } else {
+                    visit(node, out);
+                }
             }
         }
-        None
     }
 
-    visit(root, needle).unwrap_or_else(|| panic!("should find run containing text {needle:?}"))
+    let mut out = Vec::new();
+    visit(root, &mut out);
+    out
 }
 
 fn find_prefix_segment_text_nodes(
@@ -470,30 +464,44 @@ fn safe_valcap_clause_redline_prefix_run_does_not_serialize_leading_tab_font_fam
     for fixture in ["safe-valcap-vs-discount", "safe-valcap-vs-mfn"] {
         let document_xml = generate_redline_document_xml(fixture);
         let paragraph = find_paragraph_containing_xml(&document_xml, "Dissolution Event before");
-        let prefix_run = find_first_text_run_containing(paragraph, "(c)");
-        let rpr = find_w_child(prefix_run, "rPr").expect("prefix run rPr");
-        let font_family =
-            find_w_child(rpr, "rFonts").and_then(|fonts| attr_value(fonts, "w:ascii"));
+        let runs = text_runs(paragraph);
+        let prefix_start = runs
+            .windows(3)
+            .position(|window| {
+                text_run_content(window[0]) == "("
+                    && text_run_content(window[1]) == "c"
+                    && text_run_content(window[2]) == ")"
+            })
+            .expect("source-faithful '(c)' prefix run sequence");
 
+        for prefix_run in &runs[prefix_start..prefix_start + 3] {
+            let rpr = find_w_child(prefix_run, "rPr").expect("prefix run rPr");
+            let font_family =
+                find_w_child(rpr, "rFonts").and_then(|fonts| attr_value(fonts, "w:ascii"));
+            assert_ne!(
+                font_family,
+                Some("Arial"),
+                "visible clause prefix fragments should not carry Arial from the leading-tab run",
+            );
+        }
+
+        // The source authored the leading tab in a separate Arial run. Keep
+        // that run boundary instead of folding its formatting into the label.
+        let leading_run = prefix_start
+            .checked_sub(1)
+            .and_then(|index| runs.get(index))
+            .expect("leading tab run before '(c)'");
         assert!(
-            font_family != Some("Arial"),
-            "visible clause prefix run should not carry Arial from the empty leading-tab run",
+            leading_run.children.iter().any(|child| {
+                matches!(child, XMLNode::Element(element) if is_w_tag(element, "tab"))
+            }),
+            "leading source run should still carry the consumed tab",
         );
-        // The leading tab now re-emits as its OWN run wearing its authored
-        // formatting (literal_prefix_leading_rpr) — source-faithful, instead
-        // of being folded into the label run. Verify the tab precedes the
-        // label within the paragraph and carries the authored Arial.
-        let para_xml = element_to_string(paragraph);
-        let label_pos = para_xml.find("(c)").expect("label present");
-        let lead = &para_xml[..label_pos];
-        assert!(
-            lead.contains("<w:tab"),
-            "the consumed leading tab must still emit, before the label; paragraph: {para_xml}"
-        );
-        assert!(
-            lead.contains("Arial"),
-            "the leading tab run keeps its authored Arial rFonts \
-             (literal_prefix_leading_rpr); paragraph: {para_xml}"
+        let leading_rpr = find_w_child(leading_run, "rPr").expect("leading tab run rPr");
+        assert_eq!(
+            find_w_child(leading_rpr, "rFonts").and_then(|fonts| attr_value(fonts, "w:ascii")),
+            Some("Arial"),
+            "the separate leading tab run should keep its authored Arial font",
         );
     }
 }

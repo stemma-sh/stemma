@@ -100,6 +100,20 @@ fn leading_tab_run_keeps_its_authored_rfonts() {
     );
 }
 
+/// Equal-format source runs are still distinct layout units. Hoisting a
+/// literal prefix must not collapse a split label into one synthesized run.
+#[test]
+fn split_literal_prefix_keeps_source_run_boundaries() {
+    let para = edited_first_para(
+        r#"<w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:t>1</w:t></w:r><w:r><w:t>.</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>Body text here.</w:t></w:r></w:p>"#,
+    );
+    let run_count = para.matches("<w:r>").count() + para.matches("<w:r ").count();
+    assert_eq!(
+        run_count, 4,
+        "the two label runs, separator run, and body run must remain distinct; paragraph: {para}"
+    );
+}
+
 /// Bold variant (the SAFE-template w:b case).
 #[test]
 fn leading_tab_run_keeps_its_authored_bold() {

@@ -1,9 +1,12 @@
 # stemma-cli
 
 A thin command-line interface to the `stemma` DOCX engine. Its primary job is
-to provide a compact `inspect -> execute -> verify` front end over the typed
-DOCX engine. `execute` applies an explicit approved worklist and creates a
-native Word redline with complete item outcomes. It also exposes compare,
+to provide a compact `inspect -> verified execute` front end over the typed
+DOCX engine. `execute` applies an explicit approved worklist, verifies the exact
+serialized candidate, and creates a native Word redline with complete item
+outcomes. The standalone `verify` command remains a producer-neutral audit; it
+is not required after a successful `execute`. `verify-task` checks an MCP task
+manifest and its files without session state. The CLI also exposes compare,
 extract, resolve, and validate as maintenance verbs.
 
 The binary is named `stemma`. General-purpose verbs drive the engine's stable
@@ -58,6 +61,7 @@ stemma apply    <input.docx> --worklist <changes.json> -o <redline.docx>
 stemma inspect  <input.docx> [--format markdown|json]
 stemma execute  <input.docx> --plan <changes.json> -o <redline.docx>
 stemma verify   <before.docx> <after.docx> [--policy tracked-delivery-v0]
+stemma verify-task <manifest.json> [--root <artifact-dir>]
 stemma compare  <base.docx> <target.docx> -o <redline.docx> [--author NAME]
 stemma extract  <file.docx> [--format text|json]
 stemma resolve  <file.docx> -o <out.docx> (--accept-all | --reject-all
@@ -68,9 +72,12 @@ stemma validate <file.docx>
 
 - `apply` consumes an exact-input-bound experimental `stemma.worklist.v0` and
   commits its authoritative `stemma.apply_receipt.v0` sidecar before any
-  Word-native redline. The sidecar defaults to `<out>.receipt.json`; stdout is
-  a best-effort mirror. Exit `0` means every item applied. If any item refuses,
-  exit `3` writes a non-deliverable partial receipt and no DOCX by default.
+  Word-native redline. Before commit, it audits the exact serialized candidate;
+  a complete receipt binds that passing audit to the output SHA-256 with
+  `verification.artifact_stage: "serialized_output"`. The sidecar defaults to
+  `<out>.receipt.json`; stdout is a best-effort mirror. Exit `0` means every
+  item applied and the candidate passed delivery verification. If any item
+  refuses, exit `3` writes a non-deliverable partial receipt and no DOCX by default.
   `--emit-partial` explicitly requests a diagnostic partial redline; it remains
   non-deliverable and still exits `3`. Receipt-only delivery is invalid: the
   actual exit, output presence, and output hash/size must match the receipt's
@@ -82,6 +89,10 @@ stemma validate <file.docx>
   accept-all reading is the target. `--author NAME` attributes every discovered
   revision to `NAME`; omit it for an anonymous redline (an empty `--author ""`
   is refused, not silently anonymized).
+- `verify-task` recomputes every artifact identity, audit binding, and claimed
+  revision identity. It exits `0` for verified complete, `1` for verified
+  partial, `2` for a mismatch, and `3` for usage/I/O/schema failure. The
+  manifest is unsigned evidence and cannot prove undeclared intent.
 - `extract --format json` gives blocks plus a `revisions` array (pending tracked
   changes with `revision_id` / `kind` / `author` / `block_id` / `excerpt`).
 - `resolve` requires exactly one disposition; a selection that matches nothing

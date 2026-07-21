@@ -114,6 +114,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
         marks: Vec::new(),
         style_props: StyleProps::default(),
         rpr_authored: stemma::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         formatting_change: None,
     })
 }
@@ -642,6 +643,7 @@ fn doc_with_hyperlink(para_id: &str, hyperlink_id: &str, url: &str, text: &str) 
             runs: vec![HyperlinkRun {
                 text: text.to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
             extra_attrs: vec![],
@@ -921,6 +923,7 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
             runs: vec![HyperlinkRun {
                 text: "click".to_string(),
                 rpr_xml: None,
+                source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
             extra_attrs: vec![],

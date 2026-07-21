@@ -14,7 +14,11 @@ default:
 # Merge gate: mirrors ci.yml job for job so a green gate means a green push.
 # Must be green with no env set. The only CI coverage this cannot replicate
 # locally is the Windows/macOS leg of the test matrix.
-gate: contamination lint test conformance npm-smoke msrv
+gate: contamination docs-check lint test conformance npm-smoke msrv
+
+[doc("Validate public documentation links, anchors, and style rules")]
+docs-check:
+    python3 scripts/check-docs.py
 
 # Lint results are only meaningful on the toolchain pinned in .mise.toml (new
 # stables ship new clippy lints), so refuse to lint on anything else rather

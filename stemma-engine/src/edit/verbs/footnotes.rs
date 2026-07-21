@@ -796,6 +796,7 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: ref_style_props,
+        joins_following_text_run: false,
         raw_xml: Some(format!("<w:{ref_tag}/>").into_bytes()),
         origin: None,
     });
@@ -1078,6 +1079,7 @@ mod tests {
             marks: vec![],
             style_props: Default::default(),
             rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }

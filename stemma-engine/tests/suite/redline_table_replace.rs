@@ -52,6 +52,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
             marks: vec![],
             style_props: StyleProps::default(),
             rpr_authored: stemma::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })]),
         block_text_hash: None,

@@ -22,12 +22,21 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use same_file::is_same_file;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use thiserror::Error;
+
+mod task_manifest;
+
+pub use task_manifest::*;
 
 /// The digest algorithm used for exact artifact identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -141,6 +150,8 @@ pub struct PathAuthority {
     mode: AuthorityMode,
     #[cfg(any(test, feature = "test-support"))]
     failpoint: Option<CommitFailpoint>,
+    #[cfg(any(test, feature = "test-support"))]
+    failpoint_fired: Arc<AtomicBool>,
 }
 
 impl PathAuthority {
@@ -159,6 +170,8 @@ impl PathAuthority {
             mode: AuthorityMode::Rooted { root: resolved },
             #[cfg(any(test, feature = "test-support"))]
             failpoint: None,
+            #[cfg(any(test, feature = "test-support"))]
+            failpoint_fired: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -182,6 +195,8 @@ impl PathAuthority {
             mode: AuthorityMode::Explicit { base: resolved },
             #[cfg(any(test, feature = "test-support"))]
             failpoint: None,
+            #[cfg(any(test, feature = "test-support"))]
+            failpoint_fired: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -190,6 +205,36 @@ impl PathAuthority {
         match &self.mode {
             AuthorityMode::Rooted { root } => Some(root),
             AuthorityMode::Explicit { .. } => None,
+        }
+    }
+
+    /// Resolve and validate a create-new destination without writing it.
+    ///
+    /// This is a declaration-time check only; callers must still use
+    /// commit_new, which repeats the collision check atomically at commit time.
+    /// It exists so a task can bind its manifest destination and reject an
+    /// existing path before any document mutation.
+    pub fn resolve_new_path(&self, path: impl AsRef<Path>) -> Result<PathBuf, ArtifactError> {
+        let supplied_path = path.as_ref().to_path_buf();
+        require_utf8_identity_path(&supplied_path, "destination", "supplied")?;
+        require_no_windows_stream_syntax(&supplied_path, "destination")?;
+        let (resolved_path, _) = self.resolve_destination(&supplied_path)?;
+        require_utf8_identity_path(&resolved_path, "destination", "resolved")?;
+        require_no_windows_stream_syntax(&resolved_path, "destination")?;
+        match fs::symlink_metadata(&resolved_path) {
+            Ok(_) => {
+                if let Ok(existing_resolved) = fs::canonicalize(&resolved_path) {
+                    self.require_authorized(&supplied_path, &existing_resolved)?;
+                }
+                Err(ArtifactError::OutputExists {
+                    path: resolved_path,
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(resolved_path),
+            Err(source) => Err(ArtifactError::DestinationMetadata {
+                path: resolved_path,
+                source,
+            }),
         }
     }
 
@@ -599,6 +644,7 @@ impl PathAuthority {
     #[doc(hidden)]
     pub fn with_commit_failpoint(mut self, failpoint: CommitFailpoint) -> Self {
         self.failpoint = Some(failpoint);
+        self.failpoint_fired = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -614,6 +660,16 @@ impl PathAuthority {
                 point: "after_stage_sync",
                 destination: destination.to_path_buf(),
             }),
+            Some(CommitFailpoint::AfterStageSyncOnce) => {
+                if self.failpoint_fired.swap(true, Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(ArtifactError::InjectedFailure {
+                        point: "after_stage_sync_once",
+                        destination: destination.to_path_buf(),
+                    })
+                }
+            }
             Some(CommitFailpoint::CorruptStagedBytes) => {
                 staged
                     .as_file_mut()
@@ -655,6 +711,7 @@ impl PathAuthority {
 #[doc(hidden)]
 pub enum CommitFailpoint {
     AfterStageSync,
+    AfterStageSyncOnce,
     CorruptStagedBytes,
     AfterCommit,
 }

@@ -22,8 +22,9 @@ import sys
 from pathlib import Path
 
 
-MANIFEST_SCHEMA = "stemma.release.candidate_manifest/v1"
+MANIFEST_SCHEMA = "stemma.release.candidate_manifest/v2"
 REPORT_SUITE = "stemma.mcp.safe_artifact_conformance/v1"
+REPORT_TOOL_PROFILE = "advanced"
 REPORT_NAME = "safe-artifact-conformance.json"
 REPORT_CASE_COUNT = 21
 MAX_REPORT_BYTES = 5 * 1024 * 1024
@@ -281,6 +282,12 @@ def validate_report(report, target, spec, binary_identity, expected_server_versi
         report.get("suite") == REPORT_SUITE,
         "{} conformance suite is not {}".format(target, REPORT_SUITE),
     )
+    require(
+        report.get("tool_profile") == REPORT_TOOL_PROFILE,
+        "{} conformance tool_profile is not {}".format(
+            target, REPORT_TOOL_PROFILE
+        ),
+    )
     require(report.get("ok") is True, "{} conformance report is not passing".format(target))
     require(
         report.get("server_version") == expected_server_version,
@@ -442,6 +449,7 @@ def validate_target(artifacts_root, target, spec, expected_server_version):
             "passed_cases": REPORT_CASE_COUNT,
             "started_at": validated["started_at"],
             "suite": REPORT_SUITE,
+            "tool_profile": REPORT_TOOL_PROFILE,
         },
         "report": {
             "bytes": report_identity["bytes"],

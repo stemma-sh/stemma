@@ -6,10 +6,17 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use stemma::ExportOptions;
 use stemma::api::Document;
+use stemma::audit::{DirectChangeKind, RevisionDisposition};
 use stemma::edit_v4::parse_transaction;
-use stemma_artifacts::PathAuthority;
+use stemma::{ExportOptions, StoryScope};
+use stemma_artifacts::{
+    DeclaredTaskEffect, ManifestArtifact, ManifestIdentity, PathAuthority, TASK_MANIFEST_SCHEMA_V1,
+    TaskAuditBinding, TaskAuditCounts, TaskAuditScope, TaskAuditStatus, TaskAuditVerdict,
+    TaskBarrierPolicy, TaskEffectOperation, TaskEffectStatus, TaskManifest, TaskManifestEffect,
+    TaskManifestProducer, TaskManifestStatus, TaskManifestTarget, TaskMatchMode,
+    TaskReplacementScope, encode_task_manifest,
+};
 
 /// Absolute path to a fixture under the engine's testdata tree.
 fn fixture(rel: &str) -> PathBuf {
@@ -74,6 +81,167 @@ fn receipt_for(output: &Path) -> PathBuf {
     PathBuf::from(format!("{}.receipt.json", output.display()))
 }
 
+fn canonical_set_sha256(rows: &[serde_json::Value]) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn encode(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Null => out.push_str("null"),
+            serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            serde_json::Value::Number(value) => out.push_str(&value.to_string()),
+            serde_json::Value::String(value) => {
+                out.push_str(&serde_json::to_string(value).unwrap())
+            }
+            serde_json::Value::Array(values) => {
+                out.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    encode(value, out);
+                }
+                out.push(']');
+            }
+            serde_json::Value::Object(values) => {
+                out.push('{');
+                let mut keys: Vec<_> = values.keys().collect();
+                keys.sort_unstable();
+                for (index, key) in keys.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(key).unwrap());
+                    out.push(':');
+                    encode(&values[*key], out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    let mut encoded = String::new();
+    encode(&serde_json::Value::Array(rows.to_vec()), &mut encoded);
+    format!("{:x}", Sha256::digest(encoded.as_bytes()))
+}
+
+fn task_manifest_for(
+    before_path: &Path,
+    after_path: &Path,
+    status: TaskManifestStatus,
+) -> TaskManifest {
+    let authority = PathAuthority::explicit().unwrap();
+    let before = authority
+        .read_source(before_path, "target_input", None)
+        .unwrap();
+    let after = authority
+        .read_source(after_path, "target_output", None)
+        .unwrap();
+    let report = stemma::api::audit(before.bytes(), after.bytes()).unwrap();
+    let baseline_validation = stemma::api::validate(before.bytes());
+    let new_validator_issues = report
+        .validator
+        .issues
+        .iter()
+        .filter(|issue| !baseline_validation.issues.contains(issue))
+        .count() as u64;
+    let changed_prior_revisions = report
+        .preexisting_revisions
+        .iter()
+        .filter(|prior| !matches!(prior.disposition, RevisionDisposition::Untouched))
+        .count() as u64;
+    let unexplained_direct_changes = report
+        .direct_changes
+        .iter()
+        .filter(|change| {
+            !matches!(&change.story, StoryScope::Comment { .. })
+                && !(change.kind == DirectChangeKind::BlockModified
+                    && change.old_excerpt == change.new_excerpt)
+        })
+        .count() as u64;
+    let counts = TaskAuditCounts {
+        new_revisions: report.new_revisions.len() as u64,
+        direct_changes: report.direct_changes.len() as u64,
+        unexplained_direct_changes,
+        preexisting_revisions: report.preexisting_revisions.len() as u64,
+        changed_prior_revisions,
+        expected_changed_prior_revisions: 0,
+        unexpected_changed_prior_revisions: changed_prior_revisions,
+        untouched_violations: report.untouched.violations.len() as u64,
+        validator_issues: report.validator.issues.len() as u64,
+        new_validator_issues,
+    };
+    let blocking_finding_count = counts.unexplained_direct_changes
+        + counts.unexpected_changed_prior_revisions
+        + counts.untouched_violations
+        + counts.new_validator_issues;
+    assert_eq!(blocking_finding_count, 0, "test delivery must be clean");
+    let verdict = TaskAuditVerdict {
+        status: TaskAuditStatus::Pass,
+        deliverable: true,
+        blocking_finding_count,
+    };
+    let decision = serde_json::json!({"counts": counts, "verdict": verdict});
+    let (effect_status, minted_revision_ids, reason) = match status {
+        TaskManifestStatus::Complete => (
+            TaskEffectStatus::Satisfied,
+            report
+                .new_revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect(),
+            None,
+        ),
+        TaskManifestStatus::Partial => (
+            TaskEffectStatus::Unsatisfied,
+            Vec::new(),
+            Some("declared effect was not executed".to_string()),
+        ),
+    };
+    TaskManifest {
+        schema: TASK_MANIFEST_SCHEMA_V1.to_string(),
+        task_id: "offline-verification-test".to_string(),
+        status,
+        producer: TaskManifestProducer {
+            name: "stemma-mcp".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        inputs: vec![],
+        targets: vec![TaskManifestTarget {
+            path: before_path.file_name().unwrap().into(),
+            input: ManifestIdentity::from_identity(before.identity()).unwrap(),
+            doc_id: Some("doc-offline".to_string()),
+            output: Some(
+                ManifestArtifact::from_identity(after_path.file_name().unwrap(), after.identity())
+                    .unwrap(),
+            ),
+            audit_binding: Some(TaskAuditBinding {
+                doc_id: "doc-offline".to_string(),
+                scope: TaskAuditScope::DeclaredTaskToSavedOutput,
+                output_sha256: after.identity().digest.hex.clone(),
+                set_sha256: canonical_set_sha256(std::slice::from_ref(&decision)),
+                counts,
+                verdict,
+            }),
+            effects: vec![TaskManifestEffect {
+                declaration: DeclaredTaskEffect {
+                    effect_id: "e1".to_string(),
+                    op: TaskEffectOperation::ReplaceText,
+                    find: "foo bar".to_string(),
+                    replace: "review-ready language".to_string(),
+                    match_mode: TaskMatchMode::Exact,
+                    scope: TaskReplacementScope::BodyAndTables,
+                    expected_matches: 1,
+                    on_barrier_match: TaskBarrierPolicy::Skip,
+                },
+                status: effect_status,
+                minted_revision_ids,
+                reason,
+            }],
+        }],
+    }
+}
+
 fn dangling_hyperlink_docx() -> Vec<u8> {
     use std::io::Write as _;
     use zip::write::FileOptions;
@@ -81,7 +249,7 @@ fn dangling_hyperlink_docx() -> Vec<u8> {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
     let document_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
-    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:hyperlink r:id="rId99"><w:r><w:t>dangling link</w:t></w:r></w:hyperlink></w:p><w:sectPr/></w:body></w:document>"#;
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:hyperlink r:id="rId99"><w:r><w:t>dangling link</w:t></w:r></w:hyperlink></w:p><w:p><w:r><w:t>editable text</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
 
     let mut bytes = Vec::new();
     {
@@ -152,6 +320,14 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     assert_eq!(receipt["verification"]["validator_ok"], true);
     assert_eq!(receipt["verification"]["direct_changes"], 0);
     assert_eq!(receipt["verification"]["untouched_violations"], 0);
+    assert_eq!(
+        receipt["verification"]["artifact_stage"],
+        "serialized_output"
+    );
+    assert_eq!(
+        receipt["verification"]["output_sha256"],
+        receipt["output"]["digest"]["hex"]
+    );
     assert_eq!(
         receipt["coverage"]["supported"],
         serde_json::json!(["top_level_body_paragraphs"])
@@ -1329,6 +1505,62 @@ fn blocking_validation_failure_creates_no_output() {
 }
 
 #[test]
+fn apply_blocking_validation_failure_creates_no_docx() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = dir.path().join("dangling-link.docx");
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("must-not-exist.docx");
+    let receipt = receipt_for(&out);
+    let bytes = dangling_hyperlink_docx();
+    Document::parse(&bytes).expect("fixture imports so apply reaches delivery verification");
+    assert!(
+        !stemma::api::validate(&bytes).ok,
+        "fixture must carry a blocking dangling-relationship defect"
+    );
+    std::fs::write(&invalid, bytes).expect("write invalid fixture");
+    write_worklist_for(
+        &worklist,
+        &invalid,
+        "Approved Reviewer",
+        serde_json::json!([{
+            "id": "change-1",
+            "old": "editable text",
+            "new": "still tracked but structurally invalid",
+            "expected_matches": 1
+        }]),
+    );
+
+    let output = run(&[
+        "apply",
+        invalid.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "delivery verification must refuse a blocking validator failure"
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is the refusal receipt");
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["deliverable"], false);
+    assert_eq!(result["items"][0]["code"], "validation_failed");
+    assert!(
+        result["items"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("I-REL-001")),
+        "receipt identifies the blocking validation finding: {result}"
+    );
+    assert!(!out.exists(), "validation happens before DOCX commit");
+    assert!(
+        receipt.exists(),
+        "the non-deliverable refusal remains observable in its durable receipt"
+    );
+}
+
+#[test]
 fn unknown_revision_id_is_a_named_error() {
     let dir = tempfile::tempdir().unwrap();
     let redline = dir.path().join("redline.docx");
@@ -1956,4 +2188,115 @@ fn apply_keeps_explicit_underline_none_on_untouched_field_runs() {
         verify.status.success(),
         "verify must pass on an honest delivery: {verify:?}"
     );
+}
+
+#[test]
+fn verify_task_projects_complete_partial_mismatch_and_schema_to_distinct_exit_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = dir.path().join("before.docx");
+    let after = dir.path().join("after.docx");
+    let worklist = dir.path().join("worklist.json");
+    std::fs::copy(fixture("simple-text/before.docx"), &before).unwrap();
+    write_worklist_for(
+        &worklist,
+        &before,
+        "Task Verifier Test",
+        serde_json::json!([{
+            "id": "e1",
+            "old": "foo bar",
+            "new": "review-ready language",
+            "expected_matches": 1
+        }]),
+    );
+    let apply = run(&[
+        "apply",
+        before.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        after.to_str().unwrap(),
+    ]);
+    assert!(apply.status.success(), "test delivery creation: {apply:?}");
+
+    let manifest_dir = dir.path().join("manifests");
+    std::fs::create_dir(&manifest_dir).unwrap();
+    let complete_path = manifest_dir.join("complete.json");
+    std::fs::write(
+        &complete_path,
+        encode_task_manifest(&task_manifest_for(
+            &before,
+            &after,
+            TaskManifestStatus::Complete,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let complete = run(&[
+        "verify-task",
+        complete_path.to_str().unwrap(),
+        "--root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(complete.status.code(), Some(0), "{complete:?}");
+    let complete_receipt: serde_json::Value = serde_json::from_slice(&complete.stdout).unwrap();
+    assert_eq!(complete_receipt["status"], "complete");
+    assert_eq!(complete_receipt["effects_verified"], 1);
+
+    let partial_path = manifest_dir.join("partial.json");
+    std::fs::write(
+        &partial_path,
+        encode_task_manifest(&task_manifest_for(
+            &before,
+            &after,
+            TaskManifestStatus::Partial,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let partial = run(&[
+        "verify-task",
+        partial_path.to_str().unwrap(),
+        "--root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(partial.status.code(), Some(1), "{partial:?}");
+    let partial_receipt: serde_json::Value = serde_json::from_slice(&partial.stdout).unwrap();
+    assert_eq!(partial_receipt["status"], "partial");
+    assert_eq!(
+        partial_receipt["unsatisfied_effects"],
+        serde_json::json!(["e1"])
+    );
+
+    let original_after = std::fs::read(&after).unwrap();
+    std::fs::write(&after, b"altered after manifest creation").unwrap();
+    let mismatch = run(&[
+        "verify-task",
+        complete_path.to_str().unwrap(),
+        "--root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(mismatch.status.code(), Some(2), "{mismatch:?}");
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("does not match manifest identity"));
+    std::fs::write(&after, original_after).unwrap();
+
+    let unknown_path = manifest_dir.join("unknown.json");
+    let mut unknown: serde_json::Value = serde_json::from_slice(
+        &encode_task_manifest(&task_manifest_for(
+            &before,
+            &after,
+            TaskManifestStatus::Complete,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    unknown["schema"] = serde_json::json!("stemma.task_manifest.v99");
+    std::fs::write(&unknown_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+    let unknown = run(&[
+        "verify-task",
+        unknown_path.to_str().unwrap(),
+        "--root",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert_eq!(unknown.status.code(), Some(3), "{unknown:?}");
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown task manifest schema"));
 }

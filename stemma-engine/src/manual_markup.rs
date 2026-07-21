@@ -699,6 +699,7 @@ mod tests {
             marks: vec![],
             style_props: props,
             rpr_authored: RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
             formatting_change: None,
         })
     }
