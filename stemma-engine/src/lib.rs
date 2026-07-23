@@ -159,3 +159,15 @@ pub use styles::StyleTable;
 pub use table::*;
 pub use table_diff::*;
 pub use tracked_model::*;
+
+// Compile-check the Rust snippets embedded in the narrative docs pages: each
+// page is included as a hidden doctest carrier, so its `rust,no_run` fences
+// build against the real facade in `cargo test --doc` (part of the gate)
+// instead of silently drifting from the API they document.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/reference/embedding.md")]
+pub struct EmbeddingPageSnippets;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/guide/persistence.md")]
+pub struct PersistencePageSnippets;

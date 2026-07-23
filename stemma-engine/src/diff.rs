@@ -6080,11 +6080,16 @@ pub fn project_tracked_document(
                     };
                     let mut seg_parts =
                         inlines_to_segments(&tracked_seg.inlines, change_type_str, &note_markers);
-                    // Stamp this segment's revision id onto its Inserted/Deleted parts
-                    // so a review UI can map a redline span to its `revisions` entry
-                    // for selective accept/reject.
+                    // Stamp this segment's revision IDENTITY onto its
+                    // Inserted/Deleted parts so a review UI can map a redline
+                    // span to its `revisions` entry for selective accept/reject.
+                    // This must be `identity` (engine-minted, document-unique,
+                    // what `Resolution::Selective` addresses), NEVER the wire
+                    // `revision_id`, which Word does not keep unique. `0` (the
+                    // pre-identity sentinel) leaves the parts unstamped, per the
+                    // `InlineChange::rev_id` contract.
                     let seg_rev = match &tracked_seg.status {
-                        TrackingStatus::Inserted(r) | TrackingStatus::Deleted(r) => r.revision_id,
+                        TrackingStatus::Inserted(r) | TrackingStatus::Deleted(r) => r.identity,
                         _ => 0,
                     };
                     if seg_rev != 0 {

@@ -8,7 +8,7 @@ contracts. For a first successful workflow, start with
 apply an explicit approved worklist to an existing DOCX and create a native
 tracked-changes redline. It also exposes the engine's existing compare, read,
 resolve, and validate verbs. Install/build instructions live in
-[stemma-cli/README.md](../../stemma-cli/README.md).
+[stemma-cli/README.md](https://github.com/stemma-sh/stemma/blob/main/stemma-cli/README.md).
 
 The compact product path is `inspect -> execute`: successful execution includes
 serialization, verification of the exact candidate bytes, and create-new
@@ -339,7 +339,16 @@ $ stemma extract redline.docx --format json
 
 Fields are a projection of the engine's read view: `role` is one of `paragraph`,
 `heading` (with a `heading_level`), `table`, `opaque`; `style_id` and
-`heading_level` are omitted when absent. `author` is empty when the source change
+`heading_level` are omitted when absent. Every `text` value is the current
+redline reading: pending insertions and not-yet-accepted deletions are both
+present, exactly what Word shows with tracked changes displayed. For a
+`table` block, `text` is that reading flattened: every cell paragraph's text
+joined by single spaces, recursing into nested tables (structure and cell
+addressing live in the richer reads, see the
+[read model reference](read-model.md)). For an
+`opaque` block, `text` is the empty string: an opaque block has no readable
+text, and this command emits no placeholder label for it.
+`author` is empty when the source change
 carried no `w:author` (Word anonymization, third-party tools, or a `compare`
 redline produced without `--author`). Revision ids are session handles read
 live from the document. Always re-run `extract` to get current ids. Never reuse

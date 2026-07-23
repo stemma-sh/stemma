@@ -17,7 +17,10 @@ two Word documents and produces one native tracked-changes comparison.
 | Verify a multi-document delivery | [Verify a task delivery](guides/verify-task-delivery.md) |
 | Review, accept, or reject revisions | [Review and resolve changes](guides/review-and-resolve.md) |
 | Fix an error or refusal | [Troubleshooting](help/troubleshooting.md) |
-| Embed the Rust engine | [`stemma-engine` README](../stemma-engine/README.md) |
+| Read working code for a common flow | [Examples](examples.md) |
+| Embed the Rust engine | [`stemma-engine` README](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/README.md) |
+| Build a viewer, renderer, or service | [Embed the engine](reference/embedding.md); render from the [read model reference](reference/read-model.md) |
+| Store documents and edits durably | [Persist and replay](guide/persistence.md) |
 
 ## Understand the model
 
@@ -32,6 +35,8 @@ The guide explains the ideas that make Stemma safe:
    promise.
 5. [Stability](guide/stability.md): compatibility guarantees for each public
    surface.
+6. [Persist and replay](guide/persistence.md): the storage model, and why it
+   fits an agent-editing product.
 
 ## Look up an exact contract
 
@@ -40,6 +45,14 @@ The guide explains the ideas that make Stemma safe:
 - [MCP core reference](reference/mcp.md): the default five-tool agent surface.
 - [MCP advanced reference](reference/mcp-advanced.md): optional expert tools,
   v4 transactions, and advanced recipes.
+- [v4 operation reference](reference/operations.md): every transaction
+  operation, its accepted fields, and canonical shapes, generated from the
+  engine's parser table.
+- [Read model reference](reference/read-model.md): the typed views a renderer
+  consumes (blocks, segments, run formatting, revision identity), generated
+  from live engine values and labeled version-bound.
+- [Embed the engine](reference/embedding.md): the facade lifecycle, hosting
+  sessions, the concurrency model, and the map to rustdoc.
 - [HTTP API](reference/http.md): local demonstration transport, not a stable
   hosted product surface.
 
@@ -51,8 +64,8 @@ The guide explains the ideas that make Stemma safe:
 - [Architecture](internals/architecture.md): workspace and engine map.
 - [Testing](internals/testing.md): validation tiers and contributor test commands.
 - [Design notes](internals/design-notes.md): decisions behind shipped designs.
-- [RFC 0001](rfcs/0001-audit-and-session-review.md) and
-  [RFC 0002](rfcs/0002-opaque-descent.md): detailed design records.
+- [Change log](https://github.com/stemma-sh/stemma/blob/main/CHANGELOG.md):
+  the release history, and where every announced breaking change lands.
 
 For source setup and contribution expectations, see
-[CONTRIBUTING.md](../CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/stemma-sh/stemma/blob/main/CONTRIBUTING.md).

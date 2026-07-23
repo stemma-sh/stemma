@@ -19,4 +19,4 @@ Three tiers, each catching what the previous can't:
 
 The full map covers the invariants catalog, gate recipes, and environment
 variables. It is documented in
-[stemma-engine/docs/testing_strategy.md](../../stemma-engine/docs/testing_strategy.md).
+[stemma-engine/docs/testing_strategy.md](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/docs/testing_strategy.md).

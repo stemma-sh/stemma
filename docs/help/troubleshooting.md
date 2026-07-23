@@ -84,5 +84,5 @@ problem. Do not convert a validation failure into apparent success.
 - CLI details: [CLI reference](../reference/cli.md)
 - Agent details: [MCP core reference](../reference/mcp.md)
 - Advanced refusals: [MCP advanced reference](../reference/mcp-advanced.md)
-- Security reports: [SECURITY.md](../../SECURITY.md)
+- Security reports: [SECURITY.md](https://github.com/stemma-sh/stemma/blob/main/SECURITY.md)
 - Other bugs: use the repository issue templates

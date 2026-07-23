@@ -61,9 +61,11 @@ pub struct BlockView {
     /// role that `insert` accepts even for a `Normal`-styled doc, where
     /// `style_id` is `null`.
     pub role_token: Option<String>,
-    /// Concatenated visible text (accept-all reading: what the block *says*).
-    /// This is what a plain-paragraph [`crate::edit::EditStep`]'s `expect`
-    /// matches against.
+    /// Concatenated visible text: the CURRENT redline reading, with pending
+    /// insertions and not-yet-accepted deletions both present, exactly what
+    /// Word shows with tracked changes displayed. (For the accept-all or
+    /// reject-all reading, project the document first.) This is what a
+    /// plain-paragraph [`crate::edit::EditStep`]'s `expect` matches against.
     pub text: String,
     /// Block-level tracked status (whole-block insert/delete), from
     /// `TrackedBlock.status`.
@@ -144,7 +146,8 @@ pub struct TableCellView {
     /// `gridBefore`; a horizontally-merged cell occupies its first column).
     pub col: usize,
     /// Concatenated visible text of every paragraph in the cell, blocks joined
-    /// by a single space (the same accept-all reading `BlockView::text` uses).
+    /// by a single space (the same current-redline reading `BlockView::text`
+    /// uses).
     pub text: String,
     /// Horizontal span (gridSpan); 1 = no merge.
     pub col_span: usize,
@@ -167,7 +170,7 @@ pub struct TableCellView {
     ///
     /// These are single-document `Unchanged` segments (no tracked-change diff):
     /// the table block is read-only in the render surface, so no per-cell redline
-    /// is projected. `text` stays the flat accept-all reading for cell ADDRESSING
+    /// is projected. `text` stays the flat current-redline reading for cell ADDRESSING
     /// (`table_op.set_cell_text`); `paragraphs` is the render projection.
     pub paragraphs: Vec<CellParagraphView>,
 }
@@ -890,7 +893,8 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
 }
 
 /// Concatenate the visible text of a paragraph's tracked segments — the
-/// targetable, accept-all reading of the block.
+/// targetable, current-redline reading of the block (pending insertions and
+/// deletions both present).
 fn paragraph_text(segments: &[TrackedSegment]) -> String {
     let mut out = String::new();
     for segment in segments {
@@ -1232,7 +1236,8 @@ fn cell_text_from_blocks(blocks: &[BlockNode]) -> String {
 }
 
 /// Concatenate the visible text of every paragraph in a table cell, blocks
-/// joined by a single space — the accept-all reading used for cell addressing.
+/// joined by a single space — the current-redline reading used for cell
+/// addressing.
 fn cell_text(cell: &crate::domain::TableCellNode) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in &cell.blocks {
@@ -1358,9 +1363,9 @@ pub fn build_document_view_from_canon(canonical: &CanonDoc) -> DocumentView {
 /// placeholder. The two are intentionally different functions with different
 /// contracts; do not collapse them.
 ///
-/// This reads from the *projected view* (accept-all reading of tracked status:
-/// the view surfaces both Deleted and Inserted spans, so the string is the
-/// union of visible text — call [`crate::api::Document::read_accepted`] /
+/// This reads from the *projected view* (current-redline reading of tracked
+/// status: the view surfaces both Deleted and Inserted spans, so the string is
+/// the union of visible text — call [`crate::api::Document::read_accepted`] /
 /// [`read_rejected`](crate::api::Document::read_rejected) first to pick a
 /// resolution). It deliberately does **not** reuse [`paragraph_text`] (which
 /// drops opaque anchors), because that would drop the field results and U+FFFC

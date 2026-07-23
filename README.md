@@ -9,28 +9,62 @@
 
 **Safe tracked changes for Word automation.**
 
-Stemma edits existing Word documents using native tracked changes.
+Stemma edits existing Word documents using native tracked changes. Give it a
+`.docx` and the changes you want; it creates a new redline that reviewers
+accept or reject in Microsoft Word. The original is preserved, and ambiguous
+changes are refused instead of guessed.
 
-Give it a `.docx` and a list of approved replacements. Stemma creates a new
-redline that reviewers can accept or reject in Microsoft Word. It preserves the
-original document and refuses ambiguous changes instead of guessing.
+<!-- Screenshot: a Stemma-produced redline open in Word (tracked changes
+     visible, author attributed). Place the image here before promotion. -->
 
-Stemma is built for agents, scripts, and review workflows that need to change
-contracts, policies, and other sensitive documents without flattening them to
-plain text or hand-editing OOXML.
+Use it to:
 
-In [published agent benchmarks](docs/benchmarks.md), Stemma reaches 95% task
-success, compared with 82% for raw OOXML editing through the stock DOCX skill.
+- turn a returned draft into one clean, attributed redline (contracts,
+  policies, any negotiated document);
+- let an AI assistant propose edits that your reviewers accept or reject in
+  Word, not in a chat window;
+- fill an existing `.docx` template into a finished document: text, tables,
+  and content controls, edited in place, with tracked changes or silently
+  (direct mode);
+- apply the same approved wording change across many documents, with a
+  per-file receipt.
 
-[Documentation](docs/README.md) ·
-[CLI reference](docs/reference/cli.md) ·
+Everything runs on your machine, as a command-line tool or a local MCP
+server: documents are read and written locally and never sent to a service.
+
+In [published agent benchmarks](https://stemma.sh/docs/benchmarks), Stemma reaches 95% task
+success, compared with 82% for the same model editing the raw document XML
+directly.
+
+[Documentation](https://stemma.sh/docs) ·
+[CLI reference](https://stemma.sh/docs/reference/cli) ·
 [MCP setup](stemma-mcp/README.md) ·
-[Benchmarks](docs/benchmarks.md) ·
+[Benchmarks](https://stemma.sh/docs/benchmarks) ·
 [Changelog](CHANGELOG.md)
 
-## Quick start
+## Quick start: with an AI assistant
 
-Install the CLI:
+The Stemma MCP server ships prebuilt binaries for Linux, macOS, and Windows;
+`npx` fetches the right one, so there is nothing to build. Add it to Claude
+Code with:
+
+```bash
+claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
+```
+
+Then ask for the edit in plain language, for example: *"Open nda.docx and
+extend the confidentiality term from 2 to 3 years as a tracked change, then
+save it as nda-redline.docx."* The agent opens, inspects, edits, verifies,
+and saves; the result opens in Word as an ordinary redline, attributed to the
+author you chose, ready to accept or reject.
+
+The document stays on your machine with the server; the agent requests only
+the parts it needs. See
+[MCP setup and configuration for other clients](stemma-mcp/README.md).
+
+## Quick start: command line
+
+The CLI installs from source via the Rust toolchain:
 
 ```bash
 cargo install stemma-cli
@@ -119,23 +153,7 @@ replacement. The original is never overwritten. If the old text is missing,
 duplicated, or unsafe to replace, Stemma refuses the worklist instead of
 silently choosing a target.
 
-See the [worklist format and complete CLI contract](docs/reference/cli.md#apply).
-
-## Use Stemma with an agent
-
-The Stemma MCP server ships with prebuilt binaries for Linux, macOS, and
-Windows. For example, add it to Claude Code with:
-
-```bash
-claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
-claude mcp list
-```
-
-The server gives agents a compact workflow for opening, inspecting, editing,
-verifying, and saving Word documents. The DOCX stays server-side, and the agent
-requests only the parts it needs.
-
-See [MCP setup and configuration for other clients](stemma-mcp/README.md).
+See the [worklist format and complete CLI contract](https://stemma.sh/docs/reference/cli#apply).
 
 ## Why Stemma
 
@@ -169,23 +187,24 @@ releases with changelog notice.
 
 Stemma is not intended for:
 
-- generating new documents from templates;
+- authoring documents from scratch or from a template language (filling an
+  existing `.docx` template by editing it is in scope);
 - one-way conversion from DOCX to Markdown or HTML;
 - byte-identical XML round trips;
 - replacing Word as a general-purpose interactive editor.
 
-See the [fidelity contract](docs/guide/fidelity.md) and
-[stability policy](docs/guide/stability.md) before building a durable
+See the [fidelity contract](https://stemma.sh/docs/guide/fidelity) and
+[stability policy](https://stemma.sh/docs/guide/stability) before building a durable
 integration.
 
 ## Documentation by goal
 
-- Applying approved changes: [CLI reference](docs/reference/cli.md)
-- Verifying a multi-document delivery: [task-delivery guide](docs/guides/verify-task-delivery.md)
+- Applying approved changes: [CLI reference](https://stemma.sh/docs/reference/cli)
+- Verifying a multi-document delivery: [task-delivery guide](https://stemma.sh/docs/guides/verify-task-delivery)
 - Connecting an agent: [MCP setup](stemma-mcp/README.md)
 - Embedding the Rust engine: [engine README](stemma-engine/README.md)
-- Understanding revisions and fidelity: [guide](docs/guide/concepts.md)
-- Reviewing evidence: [benchmarks](docs/benchmarks.md)
+- Understanding revisions and fidelity: [guide](https://stemma.sh/docs/guide/concepts)
+- Reviewing evidence: [benchmarks](https://stemma.sh/docs/benchmarks)
 - Contributing: [contributor guide](CONTRIBUTING.md)
 
 ## Development
@@ -199,7 +218,7 @@ just gate
 
 The workspace contains the Rust engine, CLI, MCP server, shared artifact
 boundary, and a local HTTP/editor demonstration. See the
-[architecture map](docs/internals/architecture.md) for the component layout.
+[architecture map](https://stemma.sh/docs/internals/architecture) for the component layout.
 
 Most of the code was written with AI assistance. Human maintainers provide the
 domain model, product direction, review, and release decisions.

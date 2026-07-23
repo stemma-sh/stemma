@@ -13,6 +13,13 @@ DOCX bytes -> import -> CanonDoc -> edit / diff -> apply -> serialize -> DOCX by
 - **`stemma-mcp`** exposes the engine to agents over stdio.
 - **`stemma-api`** is the local HTTP demonstration transport.
 
+The CLI, MCP, and HTTP crates are adapters over the engine's `api::Document`
+facade (plus `SimpleRuntime` for session management). A new consumer, a
+viewer, a renderer, a hosted service, depends on the facade the same way,
+not on a transport's JSON: see [Embed the engine](../reference/embedding.md);
+the shapes it reads from are the
+[read model reference](../reference/read-model.md).
+
 The browser review editor lives under `stemma-examples` and uses the HTTP API.
 
 Inside the engine, the load-bearing ideas:

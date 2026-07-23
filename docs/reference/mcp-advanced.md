@@ -107,9 +107,13 @@ Operation families include:
 - styles and content controls;
 - page setup, headers, and footers.
 
-Retrieve the current parser-derived operation catalog through
-`inspect_docx` with `query:"operations"`. This is authoritative for accepted
-fields and examples.
+The complete catalog is published as the
+[v4 operation reference](operations.md): every operation, its accepted
+fields, and canonical shapes, generated from the engine's parser table. At
+runtime, retrieve the same catalog through `inspect_docx` with
+`query:"operations"`; the running server's answer is authoritative for its
+own version and additionally lists the MCP edge fields (such as image
+`path`).
 
 ## Path-backed images
 
@@ -142,8 +146,22 @@ input. Only the host operator should raise process-wide limits.
 | `StyleNotFound` | A requested style does not exist. | Read current styles or create the style in the same transaction. |
 | `InvalidRange` | A revision selector matched nothing. | Re-read revisions and correct the selector. |
 
-Marks are objects such as `[{"type":"bold"}]`, not strings. Span replacement
-takes plain text; use a whole-paragraph replacement for mark changes.
+The `AuthorImpersonation` override is the `allow_existing_author` argument on
+the mutating tools, a per-call assertion that deliberately continues that
+author's own work (it is never a transaction field):
+
+```text
+apply_edit  {"doc_id": ...,
+             "transaction": {"ops": [{"op": "delete", "target": "p_7"}],
+                             "revision": {"author": "J. Osei"}},
+             "allow_existing_author": true}
+```
+
+Every `marks` field takes an array of tagged objects such as
+`[{"type":"bold"}]`, never bare strings, on text nodes and on `set_format`
+alike; the grammar is specified under
+[content nodes](operations.md#content-nodes). Span replacement takes plain
+text; use a whole-paragraph replacement for mark changes.
 
 ## Recipes
 
@@ -202,6 +220,7 @@ existing author's identity, or end with unsaved in-memory state.
 ## Related
 
 - [MCP core reference](mcp.md)
+- [Read model reference](read-model.md)
 - [Use Stemma with an agent](../guides/use-with-an-agent.md)
 - [Troubleshooting](../help/troubleshooting.md)
 - [Filesystem and artifact boundary](mcp.md#filesystem-and-artifact-boundary)

@@ -14,8 +14,8 @@ for transactions, MCP tool calls, and HTTP. They evolve under different rules.
 
 The Rust surface is tiered, and the tiers *are* the stability contract. This is
 documented in full at the top of
-[`stemma-engine/src/lib.rs`](../../stemma-engine/src/lib.rs) and in
-[`stemma-engine/README.md`](../../stemma-engine/README.md); in short:
+[`stemma-engine/src/lib.rs`](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/src/lib.rs) and in
+[`stemma-engine/README.md`](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/README.md); in short:
 
 - **Tier 1: the `api::Document` facade.** The intended public surface and the
   one new consumers should depend on. Stable within a `0.x` minor release line.
@@ -30,14 +30,20 @@ documented in full at the top of
 Persist **DOCX bytes plus edit transactions** for durability. Never persist the
 IR or an `EditSnapshot`. Together the bytes and transactions reconstruct any
 past state by replay; a stored snapshot becomes a migration problem on the next
-engine release.
+engine release. The rule as a working flow (what to store, how to replay, the
+failure modes, checkpointing) is [Persist and replay](persistence.md).
+
+The Tier 2 and 3 READ shapes a renderer consumes (blocks, segments, run
+formatting, revision identity) are documented, with the same generation and
+drift-guard rigor as the stable write wire but the opposite stability promise,
+in the [read model reference](../reference/read-model.md).
 
 ## Wire surfaces
 
 ### v4 transaction JSON: additive, unknown fields rejected
 
 The v4 edit-transaction schema
-([`stemma-engine/src/edit_v4.rs`](../../stemma-engine/src/edit_v4.rs)) is the
+([`stemma-engine/src/edit_v4.rs`](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/src/edit_v4.rs)) is the
 durable, cross-boundary edit format. Its evolution is **additive**: new optional
 fields and new op types may appear in a minor release; the meaning of an existing
 op does not change under it.
@@ -50,11 +56,14 @@ silently ignoring it is exactly the "best-effort into an unknown state" this
 project refuses. Author against the fields the schema defines; do not send
 speculative keys expecting them to be ignored.
 
+The complete operation catalog, generated from that parser table, is published
+as the [v4 operation reference](../reference/operations.md).
+
 Because the format is additive and strict, a transaction that a newer engine
 accepts is still accepted by that engine after a minor bump; a transaction using
 a *newer* field will be rejected by an *older* engine (rather than
 mis-interpreted). Any breaking change to an existing field's meaning gets a
-[CHANGELOG](../../CHANGELOG.md) entry.
+[CHANGELOG](https://github.com/stemma-sh/stemma/blob/main/CHANGELOG.md) entry.
 
 ### MCP tool schema: additive, renames are announced
 
@@ -67,7 +76,7 @@ The [MCP tool surface](../reference/mcp.md) evolves additively within `0.x`:
   do not consume.
 - Making a previously-optional parameter required, renaming a tool or a
   parameter, or removing one is a breaking change and gets a
-  [CHANGELOG](../../CHANGELOG.md) entry.
+  [CHANGELOG](https://github.com/stemma-sh/stemma/blob/main/CHANGELOG.md) entry.
 
 Build agents against documented tool arguments; unknown arguments are rejected at
 the wire edge for the same reason transactions reject unknown fields.
@@ -88,7 +97,7 @@ offline verifier trusts.
 editor, not a product surface. Its routes and JSON shapes **carry no stability
 guarantee** and may change or disappear in any release without a changelog entry.
 It is also loopback-only with no authentication. See
-[SECURITY.md](../../SECURITY.md). If you need a stable programmatic surface,
+[SECURITY.md](https://github.com/stemma-sh/stemma/blob/main/SECURITY.md). If you need a stable programmatic surface,
 embed the Rust `api::Document` facade or drive the MCP tools.
 
 ## Summary

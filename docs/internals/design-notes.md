@@ -6,7 +6,6 @@ history.
 
 ## Audit / session review (RFC 0001, shipped)
 
-The full document: [RFC 0001](../rfcs/0001-audit-and-session-review.md).
 The decisions:
 
 - **One core, two surfaces.** `review_session` (a handle's open-time

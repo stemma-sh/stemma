@@ -38,6 +38,7 @@ use task_delivery::{
     TaskWriteFailureOutcome,
 };
 
+use stemma::edit_v4::catalog as op_catalog;
 use stemma::edit_v4::parse_transaction;
 use stemma::extended_markdown::to_extended_markdown_blocks;
 use stemma::view::{
@@ -318,185 +319,6 @@ impl TransactionArg {
     }
 }
 
-/// The canonical JSON shape(s) of one v4 op, for teaching the model after a
-/// schema error (the discovery tax: structural runs spent 3–8 calls guessing
-/// `move` destinations and `set_image_attrs` fields). Placeholders `<...>` are
-/// the caller's to fill. Most ops have exactly one shape; `move` has two
-/// (single-block and range) because a malformed move is ambiguous about
-/// which the caller meant — teach both. EVERY shape here is itself a
-/// parse-valid v4 op — pinned by `op_shapes_are_themselves_schema_valid`,
-/// because an error message that suggests an INVALID shape is a new trap,
-/// not a fix. A new required field on any op makes its shape stale and fails
-/// that test by construction.
-fn v4_op_shapes(op: &str) -> &'static [&'static str] {
-    match op {
-        "replace" => &[
-            r#"{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text>"}]}}"#,
-        ],
-        "insert" => &[
-            r#"{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"paragraph","role":"body_text","content":[{"type":"text","text":"<new text>"}]}]}"#,
-            // A native table-of-contents field — `levels` is optional (default
-            // 1-3); see the `insert` doc comment above for the full contract.
-            r#"{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"toc"}]}"#,
-        ],
-        "delete" => &[r#"{"op":"delete","target":"<block_id>"}"#],
-        // Single block, then the contiguous range form (moves several blocks
-        // — a section — in one op; `from`/`to` in either doc order).
-        "move" => &[
-            r#"{"op":"move","target":"<block_id>","destination":{"anchor":"<block_id>","position":"after"}}"#,
-            r#"{"op":"move","target":{"from":"<block_id>","to":"<block_id>"},"destination":{"anchor":"<block_id>","position":"after"}}"#,
-        ],
-        "set_image_attrs" => &[
-            r#"{"op":"set_image_attrs","target":"<block_id>","drawing_id":"<drawing_id>","resize":{"cx":4320000,"cy":2880000}}"#,
-        ],
-        // Retarget a hyperlink: `expect_href` is REQUIRED whenever `attrs.href`
-        // is set (optimistic concurrency — the adapter refuses a stale retarget
-        // without it), so the shape shows it. The agent reads the current href
-        // from any read tool before retargeting.
-        "set_attr" => &[
-            r#"{"op":"set_attr","target":"<hyperlink_id>","attrs":{"href":"<new_url>"},"expect_href":"<current_url>"}"#,
-        ],
-        // In-place table edit. The inner op is tagged on `kind` (not `op`); the
-        // common case is one cell's text. `insert_row`'s `cells` carries the
-        // new row's content in the SAME op — no separate fill step needed;
-        // omit `cells` (or give fewer than the column count) for a
-        // blank/partly-blank row.
-        "table_op" => &[
-            r#"{"op":"table_op","target":"<table_id>","table_op":{"kind":"set_cell_text","row_index":0,"col_index":0,"text":"<new text>"}}"#,
-            r#"{"op":"table_op","target":"<table_id>","table_op":{"kind":"insert_row","ref_row":0,"position":"after","cells":["<row content, one per column, left-to-right>"]}}"#,
-            r#"{"op":"table_op","target":"<table_id>","table_op":{"kind":"delete_row","row_index":0}}"#,
-        ],
-        // Insert a footnote/endnote reference after `expect` in `target`, plus
-        // its story body. `note_kind` is `"footnote"` | `"endnote"`.
-        "insert_note" => &[
-            r#"{"op":"insert_note","target":"<block_id>","expect":"<substring currently in the block>","note_kind":"footnote","body":"<note body text>"}"#,
-        ],
-        // Replace an existing note's body by its `note_id` (from list_revisions
-        // or read_index's notes section).
-        "edit_note" => &[
-            r#"{"op":"edit_note","note_id":"<note_id>","note_kind":"footnote","body":"<new note body text>"}"#,
-        ],
-        // Delete a note and its body-side reference run, by `note_id`.
-        "delete_note" => &[r#"{"op":"delete_note","note_id":"<note_id>","note_kind":"footnote"}"#],
-        "set_format" => &[
-            r#"{"op":"set_format","target":"<block_id>","expect":"<exact text>","marks":[{"type":"bold"}]}"#,
-        ],
-        "set_para_format" => &[
-            r#"{"op":"set_para_format","target":"<block_id>","align":"center","spacing":{"after":120}}"#,
-        ],
-        "set_cell_format" => &[
-            r#"{"op":"set_cell_format","target":"<table_id>","row_index":0,"col_index":0,"shading":{"fill":"D9EAF7"}}"#,
-        ],
-        "set_row_format" => &[
-            r#"{"op":"set_row_format","target":"<table_id>","row_index":0,"height":360,"height_rule":"exact"}"#,
-        ],
-        "set_table_format" => &[
-            r#"{"op":"set_table_format","target":"<table_id>","width":{"w":5000,"width_type":"pct"}}"#,
-        ],
-        "apply_style" => &[r#"{"op":"apply_style","target":"<block_id>","style_id":"Heading1"}"#],
-        "create_style" => &[
-            r#"{"op":"create_style","style_id":"Heading1","style_type":"para","name":"Heading 1","run_props":{"font_family":"Georgia","font_size_half_points":32,"bold":true},"para_props":{"spacing_before":240,"spacing_after":120}}"#,
-        ],
-        "modify_style" => &[
-            r#"{"op":"modify_style","style_id":"Normal","style_type":"para","name":"Normal","run_props":{"font_family":"Georgia","font_size_half_points":24},"para_props":{}}"#,
-        ],
-        "set_doc_defaults" => {
-            &[r#"{"op":"set_doc_defaults","font_family":"Georgia","font_size_half_points":24}"#]
-        }
-        "set_page_setup" => &[
-            r#"{"op":"set_page_setup","target":{"section":"body"},"margins":{"top":1440,"bottom":1440,"left":1440,"right":1440,"header":720,"footer":720}}"#,
-        ],
-        "set_numbering" => &[
-            r#"{"op":"set_numbering","target":"<block_id>","change":{"kind":"remove"}}"#,
-            r#"{"op":"set_numbering","target":"<block_id>","change":{"kind":"split"}}"#,
-        ],
-        "insert_bookmark" => &[
-            r#"{"op":"insert_bookmark","target":"<block_id>","expect":"<anchor text>","name":"bookmark_name"}"#,
-        ],
-        "insert_cross_ref" => &[
-            r#"{"op":"insert_cross_ref","target":"<block_id>","expect":"<anchor text>","bookmark":"bookmark_name","ref_kind":"ref","as_hyperlink":true}"#,
-        ],
-        "comment_create" => &[
-            r#"{"op":"comment_create","target":"<block_id>","expect":"<anchor text>","body":"<comment text>","author":"Reviewer"}"#,
-        ],
-        "comment_reply" => &[
-            r#"{"op":"comment_reply","parent_comment_id":"<comment_id>","body":"<reply text>","author":"Reviewer"}"#,
-        ],
-        "comment_resolve" => {
-            &[r#"{"op":"comment_resolve","comment_id":"<comment_id>","done":true}"#]
-        }
-        "comment_delete" => &[r#"{"op":"comment_delete","comment_id":"<comment_id>"}"#],
-        "insert_image" => &[
-            r#"{"op":"insert_image","target":"<block_id>","bytes_base64":"AAAA","format":"png","alt_text":"<description>"}"#,
-        ],
-        "replace_image" => &[
-            r#"{"op":"replace_image","target":"<block_id>","drawing_id":"<drawing_id>","bytes_base64":"AAAA","format":"png"}"#,
-        ],
-        "blocks_to_table" => &[
-            r#"{"op":"blocks_to_table","from":"<block_id>","to":"<block_id>","delimiter":" — ","header":["Feature","Notes"]}"#,
-        ],
-        _ => &[],
-    }
-}
-
-fn operation_group(op: &str) -> &'static str {
-    match op {
-        "replace" | "insert" | "delete" | "move" | "blocks_to_table" => "content",
-        "set_attr" | "set_format" | "set_para_format" | "apply_style" | "create_style"
-        | "modify_style" | "set_doc_defaults" => "formatting_and_styles",
-        "set_cell_format" | "set_row_format" | "set_table_format" | "table_op" => "tables",
-        "insert_cross_ref" | "insert_bookmark" | "rename_bookmark" | "remove_bookmark" => {
-            "references"
-        }
-        "set_numbering" => "numbering",
-        "set_image_attrs" | "delete_image" | "insert_image" | "replace_image"
-        | "set_image_layout" => "images",
-        "comment_create" | "comment_reply" | "comment_resolve" | "comment_delete" => "comments",
-        "insert_note" | "edit_note" | "delete_note" => "notes",
-        "set_page_setup" | "set_section_type" | "insert_section_break" => "sections",
-        "edit_header"
-        | "edit_footer"
-        | "create_header"
-        | "create_footer"
-        | "set_header_footer_mode" => "headers_and_footers",
-        "insert_equation" => "equations",
-        "wrap_content_control"
-        | "wrap_blocks_content_control"
-        | "set_content_control_value"
-        | "sdt_text_fill" => "content_controls",
-        "set_form_field_value" => "form_fields",
-        "set_textbox_text" | "opaque_text_edit" => "textboxes_and_opaque_content",
-        _ => "other",
-    }
-}
-
-fn operation_cue(op: &str) -> &'static str {
-    match op {
-        "replace" => "Tracked whole-paragraph or guarded span replacement.",
-        "insert" => "Insert paragraphs, tables, or a native table of contents at an anchor.",
-        "delete" => "Track deletion of one block.",
-        "move" => "Track relocation of one block or one contiguous range in a single op.",
-        "table_op" => "Structural table edits; insert_row carries cell text in the same op.",
-        "insert_note" => "Insert a footnote/endnote reference and its story body.",
-        "edit_note" => "Edit one note body by note_id from inspect_docx query=notes.",
-        "delete_note" => "Delete one note and its body-side reference by note_id.",
-        "comment_create" => "Create an anchored comment; comments are annotations, not revisions.",
-        "set_image_attrs" => {
-            "Resize an existing drawing or change alt text; this is a direct property edit."
-        }
-        "insert_image" => {
-            "Insert image bytes/path at a paragraph; dimensions may use intrinsic size."
-        }
-        "replace_image" => "Replace an existing drawing's media by drawing_id.",
-        "create_style" | "modify_style" => "Create or modify one named Word style.",
-        "set_doc_defaults" => "Change inherited document-default font settings once.",
-        "set_page_setup" => "Change page geometry for the body or a paragraph's section.",
-        "blocks_to_table" => "Convert a contiguous paragraph range into a tracked table.",
-        "opaque_text_edit" => "Tracked find/replace inside a textbox or inline content control.",
-        _ => "Typed transaction operation; use the advertised fields and preview before apply.",
-    }
-}
-
 /// Fields accepted by the MCP edge before the transaction reaches the engine
 /// parser. Keep these separate from `operation_vocabulary()` so the catalog is
 /// honest about both contracts: `path` is a real compact-surface input, while
@@ -625,21 +447,21 @@ fn operation_catalog(operation: Option<&str>) -> Result<Value, String> {
                 .join(", ")
         ));
     }
-    let operations: Vec<Value> = vocabulary
-        .iter()
-        .filter(|(name, _)| operation.is_none_or(|wanted| wanted == *name))
-        .map(|(name, fields)| {
-            let mut accepted_fields = fields.to_vec();
-            accepted_fields.extend_from_slice(operation_edge_fields(name));
+    let operations: Vec<Value> = op_catalog::operation_catalog()
+        .into_iter()
+        .filter(|spec| operation.is_none_or(|wanted| wanted == spec.name))
+        .map(|spec| {
+            let mut accepted_fields = spec.fields.to_vec();
+            accepted_fields.extend_from_slice(operation_edge_fields(spec.name));
             json!({
-                "name": name,
-                "group": operation_group(name),
+                "name": spec.name,
+                "group": spec.group,
                 "accepted_fields": accepted_fields,
-                "parser_fields": fields,
-                "mcp_edge_fields": operation_edge_fields(name),
-                "cue": operation_cue(name),
-                "examples": v4_op_shapes(name),
-                "mcp_edge_examples": operation_edge_examples(name),
+                "parser_fields": spec.fields,
+                "mcp_edge_fields": operation_edge_fields(spec.name),
+                "cue": spec.cue,
+                "examples": spec.examples,
+                "mcp_edge_examples": operation_edge_examples(spec.name),
             })
         })
         .collect();
@@ -675,8 +497,9 @@ fn augment_schema_error(txn_json: &str, base: &str) -> String {
         for op in ops {
             if let Some(name) = op.get("op").and_then(Value::as_str)
                 && seen.insert(name)
+                && let Some(spec) = op_catalog::operation_spec(name)
             {
-                for shape in v4_op_shapes(name) {
+                for shape in spec.examples {
                     shapes.push(format!("  {name}: {shape}"));
                 }
             }
@@ -10965,57 +10788,6 @@ mod tests {
         }
     }
 
-    /// THE HARDENING (write-surface seam): every op shape the schema-error path
-    /// suggests must ITSELF parse as a valid v4 op. An error message that
-    /// teaches an invalid shape is a new trap, not a fix — and "it's just an
-    /// error echo" is exactly how the next untyped-param defect would describe
-    /// itself. A new required field on any op makes its shape stale and trips
-    /// this test by construction.
-    #[test]
-    fn op_shapes_are_themselves_schema_valid() {
-        for op in [
-            "replace",
-            "insert",
-            "delete",
-            "move",
-            "set_image_attrs",
-            "set_attr",
-            "table_op",
-            "insert_note",
-            "edit_note",
-            "delete_note",
-            "set_format",
-            "set_para_format",
-            "set_cell_format",
-            "set_row_format",
-            "set_table_format",
-            "apply_style",
-            "create_style",
-            "modify_style",
-            "set_doc_defaults",
-            "set_page_setup",
-            "set_numbering",
-            "insert_bookmark",
-            "insert_cross_ref",
-            "comment_create",
-            "comment_reply",
-            "comment_resolve",
-            "comment_delete",
-            "insert_image",
-            "replace_image",
-            "blocks_to_table",
-        ] {
-            let shapes = v4_op_shapes(op);
-            assert!(!shapes.is_empty(), "a shape for every listed op: {op}");
-            for shape in shapes {
-                let txn = format!(r#"{{"ops":[{shape}],"revision":{{"author":"shape-test"}}}}"#);
-                parse_transaction(&txn).unwrap_or_else(|e| {
-                    panic!("the suggested {op} shape must be parse-valid; got {e}: {shape}")
-                });
-            }
-        }
-    }
-
     /// A bad `move` (missing `destination`) gets the canonical move shape
     /// appended to its schema error, so the model fixes it in one follow-up.
     #[tokio::test]
@@ -12338,25 +12110,6 @@ mod tests {
             p["table_receipts"].as_array().map(|a| a.len()),
             Some(0),
             "no table_op ran, so table_receipts must be empty: {p}"
-        );
-    }
-
-    /// The `table_op` teaching shapes cover BOTH `insert_row` (showing the
-    /// `cells` field that carries the new row's content) and `delete_row` —
-    /// not just `set_cell_text` — so a schema-error follow-up can fix a
-    /// misshapen row-structural op in one try.
-    #[test]
-    fn table_op_shapes_teach_insert_row_with_cells_and_delete_row() {
-        let shapes = v4_op_shapes("table_op");
-        assert!(
-            shapes
-                .iter()
-                .any(|s| s.contains("insert_row") && s.contains("cells")),
-            "table_op shapes must show insert_row carrying `cells`: {shapes:?}"
-        );
-        assert!(
-            shapes.iter().any(|s| s.contains("delete_row")),
-            "table_op shapes must show delete_row: {shapes:?}"
         );
     }
 

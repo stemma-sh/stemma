@@ -2551,6 +2551,11 @@ pub fn operation_vocabulary() -> &'static [(&'static str, &'static [&'static str
     OP_FIELDS
 }
 
+/// The engine-owned operation catalog: [`OP_FIELDS`] decorated with groups,
+/// cues, and canonical parse-valid shapes. Every transport and the generated
+/// reference page project this one catalog.
+pub mod catalog;
+
 // ─── Schema validation (parse step) ──────────────────────────────────────────
 //
 // The schema check verifies structural well-formedness of an already-deserialized

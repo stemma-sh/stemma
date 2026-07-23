@@ -20,6 +20,24 @@ gate: contamination docs-check lint test conformance npm-smoke msrv
 docs-check:
     python3 scripts/check-docs.py
 
+# docs/reference/operations.md is generated from the engine op catalog
+# (stemma-engine/src/edit_v4/catalog.rs); the gate fails when it drifts.
+[doc("Regenerate docs/reference/operations.md from the engine op catalog")]
+regen-operations-reference:
+    cargo test -p stemma --test operations_reference regenerate_operations_reference -- --ignored
+
+# docs/reference/read-model.md is generated from live engine view values
+# (stemma-engine/tests/read_model_reference.rs); the gate fails when it drifts.
+[doc("Regenerate docs/reference/read-model.md from the engine read model")]
+regen-read-model-reference:
+    cargo test -p stemma --test read_model_reference regenerate_read_model_reference -- --ignored
+
+# docs/examples.md is generated from the stemma-engine/examples/ inventory
+# (stemma-engine/tests/examples_reference.rs); the gate fails when it drifts.
+[doc("Regenerate docs/examples.md from the example inventory")]
+regen-examples-reference:
+    cargo test -p stemma --test examples_reference regenerate_examples_reference -- --ignored
+
 # Lint results are only meaningful on the toolchain pinned in .mise.toml (new
 # stables ship new clippy lints), so refuse to lint on anything else rather
 # than report a green that CI will contradict.

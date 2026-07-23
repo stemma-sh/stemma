@@ -37,6 +37,7 @@
 //! | `GET  /api/documents/{id}/revisions` | — | `{ revisions }` (pending tracked changes) |
 //! | `POST /api/documents/{id}/resolve` | `{ revision_ids, action }` | `{ document }` (accept/reject) |
 //! | `GET  /api/documents/{id}/export?mode=redline\|accepted\|rejected` | — | `.docx` bytes |
+//! | `GET  /api/operations` | — | `{ operations }` (the engine's v4 op catalog: fields, cues, canonical shapes) |
 //!
 //! Everything else is served as static files from `stemma-examples`, so
 //! `cargo run -p stemma-api` and then opening the printed URL is the whole demo:
@@ -65,6 +66,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use stemma::api::{BlockRole, BlockView, Document, DocumentView, SegmentView, TrackStatus};
+use stemma::edit_v4::catalog::operation_catalog;
 use stemma::edit_v4::parse_transaction;
 use stemma::runtime::build_tracked_document_view_from_snapshot;
 use stemma::semantic_hash::block_semantic_hash_for_full_doc_block;
@@ -402,6 +404,49 @@ async fn export(
             .expect("content-disposition is valid"),
     );
     Ok((headers, bytes).into_response())
+}
+
+/// `GET /api/operations` — the engine's v4 operation catalog: every op the
+/// transaction parser accepts, with its accepted fields, group, one-line cue,
+/// and canonical shape(s) (placeholders `<...>` are the caller's to fill).
+///
+/// This is the same engine-owned catalog (`stemma::edit_v4::catalog`) the MCP
+/// server projects via `inspect_docx query="operations"`, minus that
+/// transport's edge-only image `path` fields: `/apply` hands the transaction
+/// straight to the engine parser, so `insert_image`/`replace_image` take
+/// `bytes_base64` here. Shapes are returned as JSON objects; every one is
+/// parse-valid by construction (test-pinned in the engine), so the `expect`
+/// below can only trip on a programmer bug, never on user input.
+async fn operations() -> Json<Value> {
+    let operations: Vec<Value> = operation_catalog()
+        .into_iter()
+        .map(|spec| {
+            let examples: Vec<Value> = spec
+                .examples
+                .iter()
+                .map(|shape| {
+                    serde_json::from_str(shape)
+                        .expect("catalog shapes are parse-valid JSON, pinned by engine tests")
+                })
+                .collect();
+            json!({
+                "name": spec.name,
+                "group": spec.group,
+                "fields": spec.fields,
+                "cue": spec.cue,
+                "examples": examples,
+            })
+        })
+        .collect();
+    Json(json!({
+        "transaction_envelope": {
+            "ops": "non-empty ordered operation array",
+            "revision": {"author": "required tracked-change author", "date": "optional ISO-8601"},
+            "summary": "optional",
+        },
+        "operation_count": operations.len(),
+        "operations": operations,
+    }))
 }
 
 /// `GET /api/documents/{id}/rich` — the **rich read projection**: stemma's full
@@ -756,6 +801,7 @@ fn app(state: AppState) -> Router {
         .route("/api/documents/{id}/revisions", get(revisions))
         .route("/api/documents/{id}/resolve", post(resolve))
         .route("/api/documents/{id}/export", get(export))
+        .route("/api/operations", get(operations))
         // Anything not under /api is served from the examples' static assets, so
         // the front-end and API share an origin (no CORS) and one command runs
         // the whole demo. The landing page links to each example.
@@ -959,6 +1005,38 @@ mod tests {
         seeded
             .serialize(&ExportOptions::default())
             .expect("serialize the seeded redline")
+    }
+
+    /// `GET /api/operations` serves the engine catalog verbatim: one row per
+    /// parser op, examples as JSON objects, and no MCP edge fields — this
+    /// transport's `/apply` feeds the engine parser directly, so advertising
+    /// `path` on the image ops would teach a field the parser rejects.
+    #[tokio::test]
+    async fn operations_serves_the_engine_catalog_without_mcp_edge_fields() {
+        let payload = operations().await.0;
+        assert_eq!(
+            payload["operation_count"].as_u64(),
+            Some(stemma::edit_v4::operation_vocabulary().len() as u64),
+            "one catalog row per parser op: {payload}"
+        );
+        let ops = payload["operations"].as_array().expect("operations array");
+        let insert_image = ops
+            .iter()
+            .find(|row| row["name"] == "insert_image")
+            .expect("insert_image row");
+        let fields = insert_image["fields"].as_array().expect("fields array");
+        assert!(
+            fields.iter().any(|f| f == "bytes_base64") && !fields.iter().any(|f| f == "path"),
+            "insert_image must advertise the parser's bytes_base64, never the MCP edge path: {insert_image}"
+        );
+        let replace = ops
+            .iter()
+            .find(|row| row["name"] == "replace")
+            .expect("replace row");
+        assert!(
+            replace["examples"][0].is_object(),
+            "examples are decoded JSON objects, not strings: {replace}"
+        );
     }
 
     /// THE CONTRACT: `POST /apply` refuses a write whose `revision.author`

@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
+DOCS_SITE = "https://stemma.sh/docs"
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
@@ -69,6 +70,26 @@ def main() -> int:
 
         for raw_target in MARKDOWN_LINK.findall(text):
             path_text, fragment = split_target(raw_target)
+
+            # Links to the published docs site are still links into docs/:
+            # map https://stemma.sh/docs[/<path>] back onto the source file so
+            # existence and anchors stay validated (the site serves the same
+            # tree GitBook publishes from docs/).
+            if path_text == DOCS_SITE or path_text.startswith(DOCS_SITE + "/"):
+                page = path_text[len(DOCS_SITE) :].strip("/")
+                target = DOCS / (f"{page}.md" if page else "README.md")
+                if not target.exists():
+                    errors.append(
+                        f"{relative_source}: docs-site link has no source page: "
+                        f"{raw_target}"
+                    )
+                elif fragment and fragment not in heading_anchors(target):
+                    errors.append(
+                        f"{relative_source}: missing anchor #{fragment} in "
+                        f"{target.relative_to(ROOT)}"
+                    )
+                continue
+
             if (
                 not path_text
                 and not fragment
@@ -83,6 +104,17 @@ def main() -> int:
             except ValueError:
                 errors.append(
                     f"{relative_source}: link escapes repository: {raw_target}"
+                )
+                continue
+
+            # docs/ is the GitBook publishing root (.gitbook.yaml `root`).
+            # The published site cannot serve files outside it, so a relative
+            # link from a docs page must stay inside docs/; anything in the
+            # wider repository needs an absolute URL.
+            if source.is_relative_to(DOCS) and not target.is_relative_to(DOCS):
+                errors.append(
+                    f"{relative_source}: link escapes the GitBook root "
+                    f"(use an absolute URL): {raw_target}"
                 )
                 continue
 

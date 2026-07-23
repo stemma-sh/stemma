@@ -97,6 +97,21 @@ jobs:
       - name: Assemble, install, smoke
         run: bash stemma-mcp/npm/smoke-launcher.sh target/debug/stemma-mcp
 
+  docs:
+    # Mirrors `just docs-check`. The generated-page drift guards and the
+    # doctest-compiled snippets already run inside the `test` job; this is the
+    # other half of the docs contract: style rules, link and anchor
+    # resolution, the GitBook publishing-root boundary, and validation of
+    # stemma.sh/docs site URLs against their source pages. Without it, a
+    # docs-only edit (for example from the GitHub web editor) could break the
+    # published site while CI stays green.
+    name: docs (style, links, anchors, site boundary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate public documentation
+        run: python3 scripts/check-docs.py
+
   contamination:
     # Guard the public/private split: nothing tracked in this repo may name the
     # maintainer-only repository, a contributor's absolute home path, or the

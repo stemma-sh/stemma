@@ -80,7 +80,9 @@ Prefer targeted `inspect_docx` queries:
 
 Find results are locators, not substitutes for exact reads. Inspect a returned
 block id before editing it. Request `detail:"formatting"` only when complete run
-spans, marks, and style properties are needed.
+spans, marks, and style properties are needed. The shapes these reads project
+are the engine's read model, documented field by field in the
+[read model reference](read-model.md).
 
 Reads are explicitly bounded. Find returns at most 16 matches by default.
 Document pages default to 16 top-level blocks. Table reads return paged cell
@@ -212,7 +214,7 @@ Stable artifact failure codes:
 |---|---|
 | Stale guard or expected text | Re-read the block and rebuild the plan. |
 | Match-count mismatch | Narrow or scope the replacement, or correct the expected count. |
-| Existing author collision | Use a distinct author or make the documented explicit override. |
+| Existing author collision | Use a distinct author, or continue that author deliberately by passing `allow_existing_author: true` on the mutating call. |
 | Opaque content would be destroyed | Edit around the opaque object or choose a structure-aware operation. |
 | Empty revision selection | Re-read the current revision list and correct the selector. |
 | Existing output | Choose a new output path. |
