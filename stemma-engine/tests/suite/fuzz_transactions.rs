@@ -467,6 +467,25 @@ fn pick_word(rng: &mut Rng, text: &str) -> Option<String> {
     }
 }
 
+/// Pick a whole word whose text occurs exactly once. `set_format.expect` is a
+/// target guard, so an ambiguous substring is correctly refused rather than
+/// interpreted as "the first one".
+fn pick_unique_word(rng: &mut Rng, text: &str) -> Option<String> {
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .filter(|word| {
+            word.chars().all(|c| c.is_alphabetic())
+                && word.len() >= 2
+                && text.match_indices(*word).count() == 1
+        })
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(rng.pick(&words).to_string())
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The verb generator. Produces a vector of VALID `EditStep`s over `base`.
 // Validity rules enforced by construction:
@@ -565,7 +584,7 @@ fn gen_step(
             rationale: None,
         }),
         Verb::SetRunFormatting => {
-            let word = pick_word(rng, &p.text)?;
+            let word = pick_unique_word(rng, &p.text)?;
             let marks = InlineMarkSet {
                 bold: rng.bool(),
                 italic: rng.bool(),

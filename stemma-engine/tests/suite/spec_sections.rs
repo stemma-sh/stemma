@@ -166,6 +166,27 @@ fn spec_page_borders_parsed() {
     assert_eq!(top.size, Some(12));
 }
 
+/// ISO 29500-1 §17.18.2: ST_Border includes schema-defined art values for
+/// page borders. They are typed and round-trip; an unknown token still fails
+/// at the boundary instead of silently becoming `none`.
+#[test]
+fn spec_page_border_art_styles_are_validated_and_lossless() {
+    for value in [
+        "balloons3Colors",
+        "holly",
+        "shadowedSquares",
+        "twistedLines1",
+    ] {
+        let style = stemma::domain::BorderStyle::from_page_border_xml_str(value)
+            .expect("schema-defined page-border art style should parse");
+        assert_eq!(style.to_xml_str(), value);
+    }
+    assert!(
+        stemma::domain::BorderStyle::from_page_border_xml_str("inventedBorder").is_err(),
+        "unknown page-border tokens must fail loud"
+    );
+}
+
 // -- line numbering (§17.6.8) -----------------------------------------------
 
 /// ISO 29500-1 §17.6.8: lnNumType attributes (countBy, start, restart) should

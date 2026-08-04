@@ -31,8 +31,7 @@
 
 use super::super::{EditError, InlineMarkSet, MaterializationMode, RunStyleEdit};
 use super::super::{
-    block_at, block_at_mut, check_ancestor_table_tracking, find_paragraph_path,
-    validate_block_is_editable,
+    block_at, block_at_mut, block_id_of, check_ancestor_table_tracking, find_paragraph_path,
 };
 use crate::domain::{
     BlockNode, CanonDoc, FormattingChange, InlineNode, Mark, MarkValue, NodeId, ParagraphNode,
@@ -50,6 +49,11 @@ struct SpanPlan {
     end: usize,
 }
 
+struct TargetPlan {
+    segment_index: usize,
+    span: SpanPlan,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     doc: &mut CanonDoc,
@@ -59,11 +63,15 @@ pub(crate) fn apply(
     marks: InlineMarkSet,
     style: &RunStyleEdit,
     revision: &RevisionInfo,
+    transaction_floor: u32,
     mode: MaterializationMode,
     step_index: usize,
 ) -> Result<(), EditError> {
     if marks.is_empty() && style.is_empty() {
         return Err(EditError::NoFormattingRequested { step_index });
+    }
+    if marks.has_conflict() {
+        return Err(EditError::ConflictingFormattingMarks { step_index });
     }
 
     // Validate value-bearing properties at the verb edge, before mutating
@@ -89,7 +97,7 @@ pub(crate) fn apply(
         step_index,
     })?;
     if path.is_top_level() {
-        validate_block_is_editable(&doc.blocks[path.top_block], step_index)?;
+        validate_top_level_block_status(&doc.blocks[path.top_block], step_index)?;
     } else {
         check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
     }
@@ -130,8 +138,35 @@ pub(crate) fn apply(
         unreachable!("checked paragraph above");
     };
     apply_to_paragraph(
-        para, block_id, expect, marks, style, revision, mode, step_index,
+        para,
+        block_id,
+        expect,
+        marks,
+        style,
+        revision,
+        transaction_floor,
+        mode,
+        step_index,
     )
+}
+
+fn validate_top_level_block_status(
+    block: &crate::domain::TrackedBlock,
+    step_index: usize,
+) -> Result<(), EditError> {
+    let (status, block_id) = match &block.status {
+        TrackingStatus::Normal => return Ok(()),
+        TrackingStatus::Inserted(_) => ("inserted", block_id_of(&block.block).clone()),
+        TrackingStatus::Deleted(_) => ("deleted", block_id_of(&block.block).clone()),
+        TrackingStatus::InsertedThenDeleted(_) => {
+            ("inserted_then_deleted", block_id_of(&block.block).clone())
+        }
+    };
+    Err(EditError::BlockHasTrackedStatus {
+        block_id,
+        status,
+        step_index,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,25 +177,85 @@ fn apply_to_paragraph(
     marks: InlineMarkSet,
     style: &RunStyleEdit,
     revision: &RevisionInfo,
+    transaction_floor: u32,
     mode: MaterializationMode,
     step_index: usize,
 ) -> Result<(), EditError> {
-    for seg_idx in 0..para.segments.len() {
-        if para.segments[seg_idx].status != TrackingStatus::Normal {
-            continue;
+    let matches: Vec<TargetPlan> = para
+        .segments
+        .iter()
+        .enumerate()
+        .flat_map(|(segment_index, segment)| {
+            find_spans(&segment.inlines, expect)
+                .into_iter()
+                .map(move |span| TargetPlan {
+                    segment_index,
+                    span,
+                })
+        })
+        .collect();
+
+    if matches.len() > 1 {
+        return Err(EditError::AmbiguousFormatTarget {
+            block_id: block_id.clone(),
+            expected: expect.to_string(),
+            occurrences: matches.len(),
+            step_index,
+        });
+    }
+
+    if let Some(target) = matches.into_iter().next() {
+        let segment = &para.segments[target.segment_index];
+        let existing_revisions = formatting_changes_in_span(&segment.inlines, &target.span);
+        let (tracking_status, container_revision) = tracking_context(&segment.status);
+
+        if !existing_revisions.is_empty() {
+            let conflict = existing_revisions.iter().find(|existing_revision| {
+                mode == MaterializationMode::Direct
+                    || segment.status != TrackingStatus::Normal
+                    || existing_revision.identity != 0
+                    || existing_revision.revision_id < transaction_floor
+            });
+            if let Some(existing_revision) = conflict {
+                return Err(EditError::FormatRevisionConflict {
+                    block_id: block_id.clone(),
+                    text: expect.to_string(),
+                    tracking_status,
+                    existing_revision: Box::new((*existing_revision).clone()),
+                    container_revision: Box::new(container_revision),
+                    step_index,
+                });
+            }
+        } else if segment.status != TrackingStatus::Normal {
+            // Word preserves a first rPrChange inside pending inserted text as
+            // an independently attributed, independently resolvable proposal.
+            // Author exactly that proven shape. Direct mode still refuses: it
+            // would alter text that exists only inside an unresolved proposal
+            // without recording a separately reviewable intention. Deleted and
+            // stacked text remain outside the v0.5 authoring contract.
+            let first_format_on_pending_insert = mode == MaterializationMode::TrackedChange
+                && matches!(segment.status, TrackingStatus::Inserted(_));
+            if !first_format_on_pending_insert {
+                return Err(EditError::FormatTargetNotEditable {
+                    block_id: block_id.clone(),
+                    text: expect.to_string(),
+                    tracking_status,
+                    container_revision: Box::new(container_revision),
+                    step_index,
+                });
+            }
         }
-        if let Some(plan) = find_span(&para.segments[seg_idx].inlines, expect) {
-            return apply_span(
-                &mut para.segments[seg_idx].inlines,
-                block_id,
-                plan,
-                marks,
-                style,
-                revision,
-                mode,
-                step_index,
-            );
-        }
+
+        return apply_span(
+            &mut para.segments[target.segment_index].inlines,
+            block_id,
+            target.span,
+            marks,
+            style,
+            revision,
+            mode,
+            step_index,
+        );
     }
 
     let visible: String = para
@@ -182,7 +277,11 @@ fn apply_to_paragraph(
 
 /// Find `expect` within a single contiguous run of TextNodes. Returns the
 /// inline-index range and the char offsets of the match inside that run.
-fn find_span(inlines: &[InlineNode], expect: &str) -> Option<SpanPlan> {
+fn find_spans(inlines: &[InlineNode], expect: &str) -> Vec<SpanPlan> {
+    if expect.is_empty() {
+        return Vec::new();
+    }
+    let mut plans = Vec::new();
     let mut i = 0;
     while i < inlines.len() {
         if !matches!(inlines[i], InlineNode::Text(_)) {
@@ -201,8 +300,8 @@ fn find_span(inlines: &[InlineNode], expect: &str) -> Option<SpanPlan> {
                 _ => break,
             }
         }
-        if let Some((start, end)) = char_find(&concat, expect) {
-            return Some(SpanPlan {
+        for (start, end) in char_find_all(&concat, expect) {
+            plans.push(SpanPlan {
                 first: i,
                 last: j - 1,
                 start,
@@ -211,7 +310,38 @@ fn find_span(inlines: &[InlineNode], expect: &str) -> Option<SpanPlan> {
         }
         i = j.max(i + 1);
     }
-    None
+    plans
+}
+
+fn formatting_changes_in_span<'a>(
+    inlines: &'a [InlineNode],
+    plan: &SpanPlan,
+) -> Vec<&'a FormattingChange> {
+    let mut changes = Vec::new();
+    let mut offset = 0usize;
+    for inline in &inlines[plan.first..=plan.last] {
+        let InlineNode::Text(node) = inline else {
+            unreachable!("span contains text nodes only");
+        };
+        let end = offset + node.text.chars().count();
+        let intersects = plan.start < end && plan.end > offset;
+        if intersects && let Some(change) = &node.formatting_change {
+            changes.push(change);
+        }
+        offset = end;
+    }
+    changes
+}
+
+fn tracking_context(status: &TrackingStatus) -> (&'static str, Option<RevisionInfo>) {
+    match status {
+        TrackingStatus::Normal => ("normal", None),
+        TrackingStatus::Inserted(revision) => ("inserted", Some(revision.clone())),
+        TrackingStatus::Deleted(revision) => ("deleted", Some(revision.clone())),
+        TrackingStatus::InsertedThenDeleted(stacked) => {
+            ("inserted_then_deleted", Some(stacked.deleted.clone()))
+        }
+    }
 }
 
 /// A valid w:color literal is the keyword `auto` or exactly six hex digits
@@ -222,14 +352,14 @@ fn is_valid_color(value: &str) -> bool {
 }
 
 /// Byte `find` mapped to a `[start, end)` char-offset range.
-fn char_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-    if needle.is_empty() {
-        return None;
-    }
-    let byte = haystack.find(needle)?;
-    let start = haystack[..byte].chars().count();
-    let end = start + needle.chars().count();
-    Some((start, end))
+fn char_find_all(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    haystack
+        .match_indices(needle)
+        .map(|(byte, matched)| {
+            let start = haystack[..byte].chars().count();
+            (start, start + matched.chars().count())
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,7 +378,8 @@ fn apply_span(
     // the FIRST change's snapshot as the reject-all baseline, so "make it bigger,
     // then recolor it" composes into one rPrChange that still reverts to the
     // original (B6). (block_id/step_index are no longer needed here.)
-    let _ = (block_id, step_index);
+    let before = inlines.clone();
+    let mut changed = false;
 
     // Rebuild the covered run, splitting boundary runs so the formatted span is
     // exactly [start, end). Pieces outside the span keep their original rPr.
@@ -287,7 +418,7 @@ fn apply_span(
 
         let mut mid = node.clone(); // keeps the original id
         mid.text = inside;
-        apply_marks(&mut mid, marks, style, revision, mode);
+        changed |= apply_marks(&mut mid, marks, style, revision, mode);
         rebuilt.push(InlineNode::Text(mid));
 
         if !after.is_empty() {
@@ -303,12 +434,27 @@ fn apply_span(
     let tail = inlines.split_off(plan.first);
     inlines.extend(rebuilt);
     inlines.extend(tail);
+    if !changed {
+        // D5: report what the target ALREADY reads. The caller asked for a
+        // state the run is already in; naming that state is what lets them
+        // drop the step or fix the half they got wrong.
+        let current_formatting = describe_run_formatting(&before);
+        *inlines = before;
+        return Err(EditError::NoFormattingChange {
+            block_id: block_id.clone(),
+            step_index,
+            current_formatting,
+        });
+    }
     Ok(())
 }
 
 fn ensure_mark(marks: &mut Vec<Mark>, mark: Mark) {
-    if !marks.contains(&mark) {
-        marks.push(mark);
+    // Insert in canonical (declaration) order rather than appending: marks are
+    // a set, and import always emits them in that order, so appending would
+    // leave the model holding an ordering no reopened document can reproduce.
+    if let Err(position) = marks.binary_search(&mark) {
+        marks.insert(position, mark);
     }
 }
 
@@ -318,7 +464,7 @@ fn apply_marks(
     style: &RunStyleEdit,
     revision: &RevisionInfo,
     mode: MaterializationMode,
-) {
+) -> bool {
     // Two distinct "before" snapshots:
     //  - live_*: the run's state right now, used only to detect a true no-op.
     //  - baseline_*: what reject-all must restore. If the run already carries a
@@ -339,9 +485,21 @@ fn apply_marks(
                 fc.previous_style_props.clone(),
                 fc.previous_rpr_authored,
             ),
+            // Record only what the run itself AUTHORED. Word's `w:rPrChange`
+            // holds the previous DIRECT `rPr` — adjudicated: formatting a run
+            // whose italic comes from its paragraph style writes
+            // `<w:rPrChange><w:rPr/></w:rPrChange>`, with no `<w:i/>` in it.
+            //
+            // Capturing the effective values instead stores history the wire
+            // cannot express: the serializer filters this snapshot through its
+            // own provenance on emission, so the inherited slots are dropped on
+            // save and absent on reopen. That left the same document with two
+            // in-memory shapes — effective before a save, direct after — and a
+            // reject before the save would have materialized style-inherited
+            // formatting onto the run, silently cutting it loose from its style.
             None => (
-                live_marks.clone(),
-                live_style_props.clone(),
+                crate::serialize::direct_marks(&live_marks, previous_directness),
+                crate::serialize::direct_run_style_props(&live_style_props, previous_directness),
                 previous_directness,
             ),
         };
@@ -351,26 +509,52 @@ fn apply_marks(
     if marks.bold {
         ensure_mark(&mut node.marks, Mark::Bold);
         node.rpr_authored.bold = true;
+        node.rpr_authored.bold_off = false;
+    } else if marks.bold_off {
+        node.marks.retain(|mark| *mark != Mark::Bold);
+        node.rpr_authored.bold = true;
+        node.rpr_authored.bold_off = true;
     }
     if marks.italic {
         ensure_mark(&mut node.marks, Mark::Italic);
         node.rpr_authored.italic = true;
+        node.rpr_authored.italic_off = false;
+    } else if marks.italic_off {
+        node.marks.retain(|mark| *mark != Mark::Italic);
+        node.rpr_authored.italic = true;
+        node.rpr_authored.italic_off = true;
     }
     if marks.underline {
         ensure_mark(&mut node.marks, Mark::Underline);
         node.rpr_authored.underline = true;
+        node.rpr_authored.underline_off = false;
+    } else if marks.underline_off {
+        node.marks.retain(|mark| *mark != Mark::Underline);
+        node.rpr_authored.underline = true;
+        node.rpr_authored.underline_off = true;
     }
     if marks.subscript {
+        node.marks.retain(|mark| *mark != Mark::Superscript);
         ensure_mark(&mut node.marks, Mark::Subscript);
+        node.rpr_authored.vert_align = true;
+    } else if marks.subscript_off {
+        node.marks.retain(|mark| *mark != Mark::Subscript);
         node.rpr_authored.vert_align = true;
     }
     if marks.superscript {
+        node.marks.retain(|mark| *mark != Mark::Subscript);
         ensure_mark(&mut node.marks, Mark::Superscript);
+        node.rpr_authored.vert_align = true;
+    } else if marks.superscript_off {
+        node.marks.retain(|mark| *mark != Mark::Superscript);
         node.rpr_authored.vert_align = true;
     }
     // `strike` is a tri-state style prop, not a boolean Mark.
     if marks.strike {
         node.style_props.strike = MarkValue::On;
+        node.rpr_authored.strike = true;
+    } else if marks.strike_off {
+        node.style_props.strike = MarkValue::Off;
         node.rpr_authored.strike = true;
     }
     // `caps`/`smallCaps` are tri-state style props too (w:caps §17.3.2.5,
@@ -379,9 +563,15 @@ fn apply_marks(
     if marks.caps {
         node.style_props.caps = MarkValue::On;
         node.rpr_authored.caps = true;
+    } else if marks.caps_off {
+        node.style_props.caps = MarkValue::Off;
+        node.rpr_authored.caps = true;
     }
     if marks.small_caps {
         node.style_props.small_caps = MarkValue::On;
+        node.rpr_authored.small_caps = true;
+    } else if marks.small_caps_off {
+        node.style_props.small_caps = MarkValue::Off;
         node.rpr_authored.small_caps = true;
     }
 
@@ -405,6 +595,18 @@ fn apply_marks(
     if let Some(font_family) = &style.font_family {
         node.style_props.font_family = Some(font_family.clone());
         node.style_props.font_family_theme = None;
+        // Imported runs may carry an exact source-form rFonts child because
+        // independently-authored script slots are layout data. A font edit is
+        // new authorship: retaining that old child would override the requested
+        // family during serialization. The v1 edit contract authors the Latin
+        // family in both ascii and hAnsi, so let the typed emitter synthesize
+        // that documented shape.
+        node.style_props.preserved.retain(|prop| {
+            prop.name
+                .rsplit_once(':')
+                .map_or(prop.name.as_str(), |(_, local)| local)
+                != "rFonts"
+        });
         node.rpr_authored.font_family = true;
         node.rpr_authored.font_family_theme = false;
     }
@@ -428,7 +630,7 @@ fn apply_marks(
         && node.style_props == live_style_props
         && current_directness == previous_directness
     {
-        return;
+        return false;
     }
 
     match mode {
@@ -436,21 +638,78 @@ fn apply_marks(
         // serializer emits one w:rPrChange whose reject-all restores the run's
         // pre-any-format state, even after several stacked format edits.
         MaterializationMode::TrackedChange => {
-            node.formatting_change = Some(FormattingChange {
-                revision_id: revision.revision_id,
-                identity: 0,
-                previous_marks: baseline_marks,
-                previous_style_props: baseline_style_props,
-                previous_rpr_authored: baseline_rpr_authored,
-                author: revision.author.clone().unwrap_or_default(),
-                date: revision.date.clone(),
-            });
+            if node.formatting_change.is_none() {
+                node.formatting_change = Some(FormattingChange {
+                    revision_id: revision.revision_id,
+                    identity: 0,
+                    previous_marks: baseline_marks,
+                    previous_style_props: baseline_style_props,
+                    previous_rpr_authored: baseline_rpr_authored,
+                    author: revision.author.clone().unwrap_or_default(),
+                    date: revision.date.clone(),
+                });
+            }
         }
         // Direct mutation: keep the new marks, no tracked change.
         MaterializationMode::Direct => {
             node.formatting_change = None;
         }
     }
+    true
+}
+
+/// Summarize the formatting a span already carries, for the no-op refusal.
+///
+/// Marks first (they are what most patches ask for), then the style slots a
+/// patch can set. Runs are summarized as a set: a span whose runs disagree
+/// reports every state present, because "some bold" is exactly the situation a
+/// caller needs to see.
+fn describe_run_formatting(inlines: &[InlineNode]) -> String {
+    let mut marks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut colors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut sizes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut any_text = false;
+    for inline in inlines {
+        let InlineNode::Text(text) = inline else {
+            continue;
+        };
+        any_text = true;
+        for mark in &text.marks {
+            marks.insert(format!("{mark:?}").to_lowercase());
+        }
+        if let Some(color) = &text.style_props.color {
+            colors.insert(color.to_string());
+        }
+        if let Some(size) = text.style_props.font_size {
+            sizes.insert(size);
+        }
+    }
+    if !any_text {
+        return "no text runs".to_string();
+    }
+    let mut parts = Vec::new();
+    parts.push(if marks.is_empty() {
+        "marks=none".to_string()
+    } else {
+        format!("marks={}", marks.into_iter().collect::<Vec<_>>().join("+"))
+    });
+    if !colors.is_empty() {
+        parts.push(format!(
+            "color={}",
+            colors.into_iter().collect::<Vec<_>>().join("/")
+        ));
+    }
+    if !sizes.is_empty() {
+        parts.push(format!(
+            "size={}",
+            sizes
+                .into_iter()
+                .map(|size| size.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    parts.join(" ")
 }
 
 #[cfg(test)]

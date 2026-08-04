@@ -114,6 +114,10 @@ pub enum WordIrError {
         element: String,
         attribute: &'static str,
     },
+    InvalidBreakAttribute {
+        attribute: &'static str,
+        value: String,
+    },
     /// A tracked-change container nested inside another tracked-change
     /// container reached atom extraction. Silently skipping it (the
     /// earlier behavior) lost the inner revision — e.g. B's pending
@@ -176,6 +180,9 @@ impl fmt::Display for WordIrError {
                     "missing required attribute {attribute} on element {element}"
                 )
             }
+            WordIrError::InvalidBreakAttribute { attribute, value } => {
+                write!(f, "invalid {attribute} value on w:br: {value:?}")
+            }
             WordIrError::NestedTrackedChange { outer, inner } => {
                 write!(
                     f,
@@ -229,7 +236,11 @@ pub enum AtomKind {
     /// both identically). softHyphen stays a zero-width Decoration (§17.3.3.29).
     NoBreakHyphen,
     /// Line/page/column break per ISO 29500-1 §17.3.3.1.
-    Break(crate::domain::BreakType),
+    Break {
+        break_type: crate::domain::BreakType,
+        type_is_explicit: bool,
+        clear: Option<crate::domain::BreakClear>,
+    },
     /// Widget that occupies space (images, embedded objects, etc.).
     /// Contributes U+FFFC to block_text().
     /// Stores the element name and raw XML bytes for roundtripping.
@@ -275,6 +286,44 @@ pub enum AtomKind {
     /// End of an inline custom-XML / smart-tag wrapper. See
     /// `CustomXmlWrapperStart`.
     CustomXmlWrapperEnd { raw_xml: Vec<u8> },
+}
+
+fn break_atom_kind(element: &Element, local_name: &str) -> Result<AtomKind, WordIrError> {
+    if local_name == "cr" {
+        return Ok(AtomKind::Break {
+            break_type: crate::domain::BreakType::TextWrapping,
+            type_is_explicit: false,
+            clear: None,
+        });
+    }
+
+    let authored_type = attr_get(element, "w:type");
+    let break_type = authored_type
+        .map(|value| {
+            crate::domain::BreakType::from_xml_str(value).map_err(|_| {
+                WordIrError::InvalidBreakAttribute {
+                    attribute: "w:type",
+                    value: value.clone(),
+                }
+            })
+        })
+        .transpose()?
+        .unwrap_or(crate::domain::BreakType::TextWrapping);
+    let clear = attr_get(element, "w:clear")
+        .map(|value| {
+            crate::domain::BreakClear::from_xml_str(value).map_err(|_| {
+                WordIrError::InvalidBreakAttribute {
+                    attribute: "w:clear",
+                    value: value.clone(),
+                }
+            })
+        })
+        .transpose()?;
+    Ok(AtomKind::Break {
+        break_type,
+        type_is_explicit: authored_type.is_some(),
+        clear,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,9 +389,17 @@ pub enum MarkValue {
 /// Tri-state formatting marks extracted from w:rPr.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct TextMarks {
+    /// The source run authored its rPr after run content. Word tolerates this
+    /// noncanonical order and can render it differently from normalized order.
+    pub rpr_after_content: bool,
     pub bold: MarkValue,
     pub italic: MarkValue,
     pub underline: MarkValue,
+    /// A val-absent `w:u` carried other authored attributes (for example
+    /// `w:color`). Word preserves and renders this tolerated form differently
+    /// from a synthesized `w:val="single"`, so it is emitted from `preserved`
+    /// rather than normalized through the underline enum.
+    pub preserve_val_absent_underline: bool,
     pub strike: MarkValue,
     pub double_strike: MarkValue,
     pub subscript: MarkValue,
@@ -358,6 +415,10 @@ pub struct TextMarks {
     pub shadow: MarkValue,
     /// Font family from w:rFonts (w:ascii or w:hAnsi attribute).
     pub font_family: Option<IStr>,
+    /// Exact independently-authored `w:rFonts` slots. `font_family` remains the
+    /// resolved projection used by layout consumers; this map is round-trip
+    /// provenance for contexts such as paragraph marks.
+    pub authored_rfonts: crate::domain::AuthoredRFonts,
     /// Theme font reference for ascii/hAnsi slot (e.g., "majorHAnsi", "minorHAnsi").
     /// Resolved to an actual font name during style resolution via ThemeFonts.
     pub font_family_theme: Option<IStr>,
@@ -530,7 +591,12 @@ pub struct PprChange {
     /// Previous framePr from the inner w:pPr.
     pub previous_frame_pr: Option<FrameProperties>,
     /// Previous paragraph mark run properties from the inner w:pPr/w:rPr.
-    pub previous_paragraph_mark_rpr: TextMarks,
+    /// The previous paragraph-mark run properties (`w:pPrChange/w:pPr/w:rPr`).
+    /// `None` when the inner pPr carries NO rPr — which is how this
+    /// serializer persists "the mark formatting did not change", and must be
+    /// read back as exactly that (the LIVE mark values), never as "the
+    /// previous mark had no formatting".
+    pub previous_paragraph_mark_rpr: Option<TextMarks>,
     /// Unmodeled children of the inner w:pPr, captured verbatim (see
     /// `crate::domain::PreservedProp`) so they survive re-serialization and
     /// are restored onto the paragraph's own pPr remainder when this change
@@ -829,6 +895,16 @@ impl ParagraphView {
         rel_lookup: &std::collections::HashMap<String, String>,
     ) -> Result<Self, WordIrError> {
         let mut atoms = Vec::new();
+        // Wire-run ordinal, unique per actual `w:r` in this paragraph
+        // (including runs inside tracked containers and transparent
+        // wrappers). `run_index` exists so ADJACENT atoms can prove they
+        // shared one wire run (joins_following_text_run, literal-prefix
+        // source runs); the paragraph-child index used before collided for
+        // sibling runs inside one w:ins/w:del, and the serializer then
+        // merged wire runs with DISTINCT rPr (observed in the wild: a bare
+        // `separate` fldChar swallowed the styled field result's rStyle
+        // when a deleted field was restored on reject).
+        let mut run_ordinal: usize = 0;
         let mut num_props = DirectNumPr::Absent;
         let mut style_id = None;
         let mut alignment = None;
@@ -889,7 +965,10 @@ impl ParagraphView {
                 ppr_change = extract_ppr_change(element);
                 section_properties = extract_section_properties(element, rel_lookup);
                 para_mark_status = extract_para_mark_status(element);
-                paragraph_mark_rpr = extract_paragraph_mark_rpr(element);
+                // For the LIVE mark, an absent rPr genuinely means "no direct
+                // mark properties" — only the pPrChange SNAPSHOT distinguishes
+                // absent (= unchanged) from empty.
+                paragraph_mark_rpr = extract_paragraph_mark_rpr(element).unwrap_or_default();
                 mirror_indents = extract_optional_bool(element, "mirrorIndents");
                 auto_space_de = extract_optional_bool(element, "autoSpaceDE");
                 auto_space_dn = extract_optional_bool(element, "autoSpaceDN");
@@ -940,13 +1019,13 @@ impl ParagraphView {
 
             // Handle runs - contain actual text content
             if is_w_tag(element, "r") {
-                atoms.extend(run_atoms(element, index)?);
+                atoms.extend(run_atoms(element, next_run_ordinal(&mut run_ordinal))?);
                 continue;
             }
 
             // Handle tracked changes containers (del/ins) - recurse into their runs
             if is_w_tag(element, "del") || is_w_tag(element, "ins") {
-                atoms.extend(tracked_change_atoms(element, index)?);
+                atoms.extend(tracked_change_atoms(element, index, &mut run_ordinal)?);
                 continue;
             }
 
@@ -1002,7 +1081,7 @@ impl ParagraphView {
             // preserve the wrapper element for byte-verbatim round-trip. Mirrors
             // the moveFrom/moveTo start/end-marker shape below.
             if local_name == "bdo" || local_name == "dir" {
-                atoms.extend(bidi_wrapper_atoms(element, index)?);
+                atoms.extend(bidi_wrapper_atoms(element, index, &mut run_ordinal)?);
                 continue;
             }
 
@@ -1012,7 +1091,7 @@ impl ParagraphView {
             // revisions), preserving the wrapper + its customXmlPr/smartTagPr
             // for byte-verbatim round-trip. Mirrors the bdo/dir shape above.
             if local_name == "customXml" || local_name == "smartTag" {
-                atoms.extend(custom_xml_wrapper_atoms(element, index)?);
+                atoms.extend(custom_xml_wrapper_atoms(element, index, &mut run_ordinal)?);
                 continue;
             }
 
@@ -1037,7 +1116,7 @@ impl ParagraphView {
                     tracking: None,
                 });
                 // Flatten inner runs as normal atoms (text visible for diffing)
-                atoms.extend(tracked_change_atoms(element, index)?);
+                atoms.extend(tracked_change_atoms(element, index, &mut run_ordinal)?);
                 // Emit end marker carrying the same childless wrapper bytes,
                 // so the serializer can re-wrap the move content on round-trip.
                 atoms.push(Atom {
@@ -1118,9 +1197,9 @@ impl ParagraphView {
                             continue;
                         }
                         if is_w_tag(bel, "r") {
-                            atoms.extend(run_atoms(bel, index)?);
+                            atoms.extend(run_atoms(bel, next_run_ordinal(&mut run_ordinal))?);
                         } else if is_w_tag(bel, "del") || is_w_tag(bel, "ins") {
-                            atoms.extend(tracked_change_atoms(bel, index)?);
+                            atoms.extend(tracked_change_atoms(bel, index, &mut run_ordinal)?);
                         } else if is_w_tag(bel, "moveFrom") || is_w_tag(bel, "moveTo") {
                             let mut template = bel.clone();
                             template.children.clear();
@@ -1138,7 +1217,7 @@ impl ParagraphView {
                                 marks: TextMarks::default(),
                                 tracking: None,
                             });
-                            atoms.extend(tracked_change_atoms(bel, index)?);
+                            atoms.extend(tracked_change_atoms(bel, index, &mut run_ordinal)?);
                             atoms.push(Atom {
                                 kind: AtomKind::TrackedMoveEnd {
                                     raw_xml: serialize_element(&template),
@@ -1244,17 +1323,8 @@ impl ParagraphView {
                                     tracking: None,
                                 });
                             } else if bl == "br" || bl == "cr" {
-                                let break_type = if bl == "cr" {
-                                    crate::domain::BreakType::TextWrapping
-                                } else {
-                                    match attr_get(bel, "w:type").map(|s| s.as_str()) {
-                                        Some("page") => crate::domain::BreakType::Page,
-                                        Some("column") => crate::domain::BreakType::Column,
-                                        _ => crate::domain::BreakType::TextWrapping,
-                                    }
-                                };
                                 atoms.push(Atom {
-                                    kind: AtomKind::Break(break_type),
+                                    kind: break_atom_kind(bel, &bl)?,
                                     utf16_len: 1,
                                     source_run_attrs: Vec::new(),
                                     origin: AtomOrigin {
@@ -1365,17 +1435,8 @@ impl ParagraphView {
                 continue;
             }
             if local_name == "br" || local_name == "cr" {
-                let break_type = if local_name == "cr" {
-                    crate::domain::BreakType::TextWrapping
-                } else {
-                    match attr_get(element, "w:type").map(|s| s.as_str()) {
-                        Some("page") => crate::domain::BreakType::Page,
-                        Some("column") => crate::domain::BreakType::Column,
-                        _ => crate::domain::BreakType::TextWrapping,
-                    }
-                };
                 atoms.push(Atom {
-                    kind: AtomKind::Break(break_type),
+                    kind: break_atom_kind(element, &local_name)?,
                     utf16_len: 1,
                     source_run_attrs: Vec::new(),
                     origin: AtomOrigin {
@@ -1519,7 +1580,7 @@ impl ParagraphView {
                 AtomKind::Text(text) => out.push_str(text),
                 AtomKind::Tab => out.push('\t'),
                 AtomKind::NoBreakHyphen => out.push('\u{2011}'),
-                AtomKind::Break(_) => out.push('\n'),
+                AtomKind::Break { .. } => out.push('\n'),
                 AtomKind::Widget { .. } => out.push(BARRIER_CHAR),
                 AtomKind::Hyperlink(_) => out.push(BARRIER_CHAR),
                 AtomKind::Decoration { .. }
@@ -1639,6 +1700,14 @@ fn is_run_decoration(local_name: &str) -> bool {
     )
 }
 
+/// Advance the paragraph's wire-run ordinal: every actual `w:r` gets a
+/// distinct `run_index`, so equal indexes prove two atoms shared one run.
+fn next_run_ordinal(counter: &mut usize) -> usize {
+    let value = *counter;
+    *counter += 1;
+    value
+}
+
 fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> {
     let mut atoms = Vec::new();
     let source_run_attrs = source_run_attrs(run);
@@ -1733,17 +1802,8 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 
         // Breaks (line, page, column) per ISO 29500-1 §17.3.3.1
         if local_name == "br" || local_name == "cr" {
-            let break_type = if local_name == "cr" {
-                crate::domain::BreakType::TextWrapping
-            } else {
-                match attr_get(element, "w:type").map(|s| s.as_str()) {
-                    Some("page") => crate::domain::BreakType::Page,
-                    Some("column") => crate::domain::BreakType::Column,
-                    _ => crate::domain::BreakType::TextWrapping,
-                }
-            };
             atoms.push(Atom {
-                kind: AtomKind::Break(break_type),
+                kind: break_atom_kind(element, &local_name)?,
                 utf16_len: 1,
                 source_run_attrs: source_run_attrs.clone(),
                 origin: AtomOrigin {
@@ -1877,7 +1937,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 fn stacked_atoms(
     outer: &Element,
     inner: &Element,
-    container_index: usize,
+    run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
     fn rev_fields(el: &Element) -> Result<(u32, String, Option<String>), WordIrError> {
         let revision_id: u32 = attr_value(el, "id")
@@ -1916,7 +1976,7 @@ fn stacked_atoms(
             _ => continue,
         };
         if is_w_tag(element, "r") {
-            atoms.extend(run_atoms(element, container_index)?);
+            atoms.extend(run_atoms(element, next_run_ordinal(run_ordinal))?);
             continue;
         }
         if is_w_tag(element, "ins")
@@ -2046,6 +2106,7 @@ fn resolve_run_alternate_content(children: &[XMLNode]) -> Result<Vec<XMLNode>, W
 fn tracked_change_atoms(
     container: &Element,
     container_index: usize,
+    run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
     let tracking = if is_w_tag(container, "ins")
         || is_w_tag(container, "del")
@@ -2103,7 +2164,7 @@ fn tracked_change_atoms(
         };
         // Tracked changes contain runs (w:r)
         if is_w_tag(element, "r") {
-            atoms.extend(run_atoms(element, container_index)?);
+            atoms.extend(run_atoms(element, next_run_ordinal(run_ordinal))?);
             continue;
         }
         // A tracked container nested inside this one: parse one of the three
@@ -2138,12 +2199,12 @@ fn tracked_change_atoms(
                 });
             }
             if stacked_pair {
-                atoms.extend(stacked_atoms(container, element, container_index)?);
+                atoms.extend(stacked_atoms(container, element, run_ordinal)?);
             } else {
                 // Parse the inner revision normally. The final tagging loop
                 // deliberately does not overwrite its context with the outer
                 // move context.
-                atoms.extend(tracked_change_atoms(element, container_index)?);
+                atoms.extend(tracked_change_atoms(element, container_index, run_ordinal)?);
             }
             continue;
         }
@@ -2156,11 +2217,15 @@ fn tracked_change_atoms(
         // Silently skipping (the pre-customXml-transparent behavior) dropped
         // the wrapped text from the IR entirely.
         if local_name == "customXml" || local_name == "smartTag" {
-            atoms.extend(custom_xml_wrapper_atoms(element, container_index)?);
+            atoms.extend(custom_xml_wrapper_atoms(
+                element,
+                container_index,
+                run_ordinal,
+            )?);
             continue;
         }
         if local_name == "bdo" || local_name == "dir" {
-            atoms.extend(bidi_wrapper_atoms(element, container_index)?);
+            atoms.extend(bidi_wrapper_atoms(element, container_index, run_ordinal)?);
             continue;
         }
         // Paragraph-level widgets are legal tracked content (CT_RunTrackChange
@@ -2324,6 +2389,7 @@ fn tracked_change_atoms(
 fn wrapper_content_child_atoms(
     element: &Element,
     container_index: usize,
+    run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
     // Property child of a customXml/smartTag wrapper — carried in the marker
     // bytes as metadata, not document content. (Never appears inside bdo/dir.)
@@ -2331,7 +2397,7 @@ fn wrapper_content_child_atoms(
         return Ok(Vec::new());
     }
     if is_w_tag(element, "r") {
-        return run_atoms(element, container_index);
+        return run_atoms(element, next_run_ordinal(run_ordinal));
     }
     // Tracked-change envelopes (EG_RunLevelElts). `tracked_change_atoms` reads
     // the revision context off the container and handles all four verbs.
@@ -2340,13 +2406,13 @@ fn wrapper_content_child_atoms(
         || is_w_tag(element, "moveFrom")
         || is_w_tag(element, "moveTo")
     {
-        return tracked_change_atoms(element, container_index);
+        return tracked_change_atoms(element, container_index, run_ordinal);
     }
     if is_w_tag(element, "customXml") || is_w_tag(element, "smartTag") {
-        return custom_xml_wrapper_atoms(element, container_index);
+        return custom_xml_wrapper_atoms(element, container_index, run_ordinal);
     }
     if is_w_tag(element, "bdo") || is_w_tag(element, "dir") {
-        return bidi_wrapper_atoms(element, container_index);
+        return bidi_wrapper_atoms(element, container_index, run_ordinal);
     }
     let local_name = local_element_name(element);
     // Comment range markers — extract w:id for typed round-tripping, exactly as
@@ -2418,7 +2484,11 @@ fn wrapper_content_child_atoms(
 /// The serializer's `renest_inline_bidi_wrappers` pass folds the intervening
 /// atoms back into the wrapper, reconstructing `<w:bdo>…children…</w:bdo>`
 /// verbatim, so a decoration between two runs keeps its position.
-fn bidi_wrapper_atoms(wrapper: &Element, container_index: usize) -> Result<Vec<Atom>, WordIrError> {
+fn bidi_wrapper_atoms(
+    wrapper: &Element,
+    container_index: usize,
+    run_ordinal: &mut usize,
+) -> Result<Vec<Atom>, WordIrError> {
     let mut template = wrapper.clone();
     template.children.clear();
     let marker_bytes = serialize_element(&template);
@@ -2444,7 +2514,11 @@ fn bidi_wrapper_atoms(wrapper: &Element, container_index: usize) -> Result<Vec<A
             XMLNode::Element(el) => el,
             _ => continue,
         };
-        atoms.extend(wrapper_content_child_atoms(element, container_index)?);
+        atoms.extend(wrapper_content_child_atoms(
+            element,
+            container_index,
+            run_ordinal,
+        )?);
     }
 
     atoms.push(Atom {
@@ -2488,6 +2562,7 @@ fn bidi_wrapper_atoms(wrapper: &Element, container_index: usize) -> Result<Vec<A
 fn custom_xml_wrapper_atoms(
     wrapper: &Element,
     container_index: usize,
+    run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
     // Template = the wrapper with its CONTENT children removed but its property
     // child (customXmlPr/smartTagPr) kept. The Pr child is metadata, not
@@ -2526,7 +2601,11 @@ fn custom_xml_wrapper_atoms(
         // Same shared dispatcher as `bidi_wrapper_atoms` — one content model
         // (EG_PContent), one classification. The property child
         // (customXmlPr/smartTagPr) is skipped there (already in the template).
-        atoms.extend(wrapper_content_child_atoms(element, container_index)?);
+        atoms.extend(wrapper_content_child_atoms(
+            element,
+            container_index,
+            run_ordinal,
+        )?);
     }
 
     atoms.push(Atom {
@@ -2670,10 +2749,27 @@ fn source_run_attrs(run: &Element) -> Vec<(String, String)> {
 /// Extract formatting marks from w:rPr child of a w:r element.
 /// Delegates to `parse_rpr_element` — the single canonical rPr parser.
 fn extract_text_marks(run: &Element) -> TextMarks {
-    let Some(rpr) = find_w_child(run, "rPr") else {
+    let mut rpr = None;
+    let mut rpr_index = None;
+    let mut content_index = None;
+    for (index, child) in run.children.iter().enumerate() {
+        let XMLNode::Element(element) = child else {
+            continue;
+        };
+        if is_w_tag(element, "rPr") && rpr.is_none() {
+            rpr = Some(element);
+            rpr_index = Some(index);
+        } else if content_index.is_none() {
+            content_index = Some(index);
+        }
+    }
+    let Some(rpr) = rpr else {
         return TextMarks::default();
     };
-    parse_rpr_element(rpr)
+    let mut marks = parse_rpr_element(rpr);
+    marks.rpr_after_content =
+        matches!((rpr_index, content_index), (Some(rpr), Some(content)) if rpr > content);
+    marks
 }
 
 /// Canonical parser for a w:rPr element. All rPr parsing goes through here.
@@ -2712,6 +2808,14 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             "u" => {
                 marks.underline = parse_underline_value(el);
                 marks.underline_style = attr_value(el, "val").cloned();
+                if marks.underline_style.is_none() && !el.attributes.is_empty() {
+                    marks.preserve_val_absent_underline = true;
+                    marks.preserved.push(crate::domain::PreservedProp {
+                        name: qualified_element_name(el),
+                        raw_xml: String::from_utf8(serialize_element(el))
+                            .expect("serialize_element always emits valid UTF-8 XML"),
+                    });
+                }
             }
 
             // --- Vertical alignment (superscript/subscript) ---
@@ -2721,6 +2825,10 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
                     match val.as_str() {
                         "subscript" => marks.subscript = MarkValue::On,
                         "superscript" => marks.superscript = MarkValue::On,
+                        "baseline" => {
+                            marks.subscript = MarkValue::Off;
+                            marks.superscript = MarkValue::Off;
+                        }
                         _ => {}
                     }
                 }
@@ -2728,6 +2836,30 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
 
             // --- Fonts ---
             "rFonts" => {
+                // `font_family` below is deliberately a resolved projection:
+                // it selects one effective Latin font for domain consumers.
+                // That projection cannot represent independently-authored
+                // script slots (for example ascii present, hAnsi absent), and
+                // Word can lay those two shapes out differently. Preserve the
+                // authored child as source-form provenance as well as parsing
+                // its typed/effective values.
+                marks.preserved.push(crate::domain::PreservedProp {
+                    name: qualified_element_name(el),
+                    raw_xml: String::from_utf8(serialize_element(el))
+                        .expect("serialize_element always emits valid UTF-8 XML"),
+                });
+                marks.authored_rfonts = crate::domain::AuthoredRFonts {
+                    ascii: attr_value(el, "ascii").map(|s| IStr::from(s.as_str())),
+                    h_ansi: attr_value(el, "hAnsi").map(|s| IStr::from(s.as_str())),
+                    ascii_theme: attr_value(el, "asciiTheme").map(|s| IStr::from(s.as_str())),
+                    h_ansi_theme: attr_value(el, "hAnsiTheme").map(|s| IStr::from(s.as_str())),
+                    east_asia: attr_value(el, "eastAsia").map(|s| IStr::from(s.as_str())),
+                    east_asia_theme: attr_value(el, "eastAsiaTheme")
+                        .map(|s| IStr::from(s.as_str())),
+                    cs: attr_value(el, "cs").map(|s| IStr::from(s.as_str())),
+                    cs_theme: attr_value(el, "cstheme").map(|s| IStr::from(s.as_str())),
+                    hint: attr_value(el, "hint").map(|s| IStr::from(s.as_str())),
+                };
                 // w:rFonts — prefer w:ascii, fall back to w:hAnsi
                 marks.font_family = attr_value(el, "ascii")
                     .or_else(|| attr_value(el, "hAnsi"))
@@ -3949,10 +4081,8 @@ fn extract_ppr_change(p_pr: &Element) -> Option<PprChange> {
     })
 }
 
-fn extract_paragraph_mark_rpr(p_pr: &Element) -> TextMarks {
-    find_w_child(p_pr, "rPr")
-        .map(parse_rpr_element)
-        .unwrap_or_default()
+fn extract_paragraph_mark_rpr(p_pr: &Element) -> Option<TextMarks> {
+    find_w_child(p_pr, "rPr").map(parse_rpr_element)
 }
 
 /// Extract paragraph mark tracking status from w:pPr/w:rPr (§17.13.5.28).
@@ -4120,15 +4250,9 @@ pub(crate) fn parse_section_properties(
         let parse_edge = |name: &str| -> Option<Border> {
             let el = find_w_child(pg_borders, name)?;
             let style_str = attr_value(el, "val").map(|s| s.as_str()).unwrap_or("none");
-            let style = match BorderStyle::from_xml_str(style_str) {
-                Ok(s) => s,
-                Err(e) => {
-                    if crate::runtime::runtime_timing_logs_enabled() {
-                        eprintln!("parse section pgBorders edge: {e}, defaulting to None");
-                    }
-                    BorderStyle::None
-                }
-            };
+            let style = BorderStyle::from_page_border_xml_str(style_str).unwrap_or_else(|error| {
+                panic!("invalid w:pgBorders/{name} w:val={style_str:?}: {error}")
+            });
             Some(Border {
                 style,
                 size: attr_value(el, "sz").and_then(|v| v.parse::<u32>().ok()),
@@ -4258,8 +4382,12 @@ pub(crate) fn parse_section_properties(
     // stores document-independent part paths, never raw rIds.
     let mut header_refs = Vec::new();
     let mut footer_refs = Vec::new();
-    for child in &sect_pr.children {
+    for (source_index, child) in sect_pr.children.iter().enumerate() {
         if let xmltree::XMLNode::Element(el) = child {
+            let source_order = Some(
+                u32::try_from(source_index)
+                    .expect("w:sectPr contains more than u32::MAX child nodes"),
+            );
             if is_w_tag(el, "headerReference") {
                 if let Some(rel_id) = attr_value(el, "id") {
                     let kind = parse_header_footer_kind(attr_value(el, "type").map(|s| s.as_str()));
@@ -4267,6 +4395,7 @@ pub(crate) fn parse_section_properties(
                         header_refs.push(crate::domain::StoryRef {
                             kind,
                             part_path: part_path.clone(),
+                            source_order,
                             synthesized: false,
                         });
                     } else {
@@ -4281,6 +4410,7 @@ pub(crate) fn parse_section_properties(
                     footer_refs.push(crate::domain::StoryRef {
                         kind,
                         part_path: part_path.clone(),
+                        source_order,
                         synthesized: false,
                     });
                 } else {
@@ -4641,12 +4771,21 @@ fn collect_hyperlink_runs_with_status(
         match local.as_str() {
             "r" => {
                 // Direct run: extract rPr and text.
-                let rpr_xml = find_child_element(el, "rPr").map(serialize_element);
+                let mut rpr_elements = el.children.iter().filter_map(|child| {
+                    let XMLNode::Element(element) = child else {
+                        return None;
+                    };
+                    (local_element_name(element) == "rPr").then_some(element)
+                });
+                let rpr_xml = rpr_elements.next().map(serialize_element);
+                let additional_rpr_xml = rpr_elements.map(serialize_element).collect();
                 let mut text = String::new();
                 extract_text_recursive(el, &mut text);
                 out.push(HyperlinkRun {
                     text,
                     rpr_xml,
+                    additional_rpr_xml,
+                    source_xml: Some(serialize_element(el)),
                     source_run_attrs: source_run_attrs(el),
                     status: status.clone(),
                 });
@@ -4682,18 +4821,6 @@ fn collect_hyperlink_runs_with_status(
             }
         }
     }
-}
-
-/// Returns the first child element with the given local name, if any.
-fn find_child_element<'a>(element: &'a Element, local: &str) -> Option<&'a Element> {
-    element.children.iter().find_map(|c| {
-        if let XMLNode::Element(el) = c
-            && local_element_name(el) == local
-        {
-            return Some(el);
-        }
-        None
-    })
 }
 
 fn extract_text_recursive(element: &Element, out: &mut String) {

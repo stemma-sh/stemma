@@ -281,6 +281,7 @@ pub(crate) fn apply_create(
     let new_ref = crate::domain::StoryRef {
         kind: kind.clone(),
         part_path: part_name.clone(),
+        source_order: None,
         synthesized: false,
     };
     if is_header {
@@ -386,6 +387,7 @@ pub(crate) fn apply_set_mode(
     even_and_odd: Option<bool>,
     link: Option<HeaderFooterLink>,
     step_index: usize,
+    explicitly_unlinked: &mut std::collections::HashSet<String>,
 ) -> Result<(), EditError> {
     // Refuse a fully-empty request — no silent no-op.
     if title_page.is_none() && even_and_odd.is_none() && link.is_none() {
@@ -408,7 +410,7 @@ pub(crate) fn apply_set_mode(
 
     // Link / unlink a header/footer reference on the body section.
     if let Some(link_op) = link {
-        apply_link(doc, &link_op, step_index)?;
+        apply_link(doc, &link_op, step_index, explicitly_unlinked)?;
     }
 
     Ok(())
@@ -422,6 +424,7 @@ fn apply_link(
     doc: &mut CanonDoc,
     link_op: &HeaderFooterLink,
     step_index: usize,
+    explicitly_unlinked: &mut std::collections::HashSet<String>,
 ) -> Result<(), EditError> {
     // Resolve an existing story part for the requested kind BEFORE borrowing the
     // section mutably (LINK needs it; UNLINK does not).
@@ -463,10 +466,17 @@ fn apply_link(
         refs.push(crate::domain::StoryRef {
             kind: link_op.kind.clone(),
             part_path,
+            source_order: None,
             synthesized: false,
         });
     } else {
-        // Unlink: drop every reference of the requested kind.
+        // Unlink: drop every reference of the requested kind. Record the parts
+        // it detached — the story itself survives an unlink and stays
+        // addressable by kind, so end-of-transaction orphan pruning must not
+        // treat these as garbage (see `prune_newly_unreferenced_stories`).
+        for detached in refs.iter().filter(|r| r.kind == link_op.kind) {
+            explicitly_unlinked.insert(detached.part_path.clone());
+        }
         refs.retain(|r| r.kind != link_op.kind);
     }
     Ok(())
@@ -511,24 +521,55 @@ mod tests {
     #[test]
     fn empty_mode_request_is_refused() {
         let mut doc = empty_doc();
-        let err = apply_set_mode(&mut doc, None, None, None, 0)
-            .expect_err("empty mode request must be refused");
+        let err = apply_set_mode(
+            &mut doc,
+            None,
+            None,
+            None,
+            0,
+            &mut std::collections::HashSet::new(),
+        )
+        .expect_err("empty mode request must be refused");
         assert!(matches!(err, EditError::NoHeaderFooterModeRequested { .. }));
     }
 
     #[test]
     fn title_page_toggle_sets_section_flag() {
         let mut doc = empty_doc();
-        apply_set_mode(&mut doc, Some(true), None, None, 0).expect("toggle ok");
+        apply_set_mode(
+            &mut doc,
+            Some(true),
+            None,
+            None,
+            0,
+            &mut std::collections::HashSet::new(),
+        )
+        .expect("toggle ok");
         assert_eq!(doc.body_section_properties.unwrap().title_page, Some(true));
     }
 
     #[test]
     fn even_and_odd_toggle_records_three_state() {
         let mut doc = empty_doc();
-        apply_set_mode(&mut doc, None, Some(true), None, 0).expect("toggle ok");
+        apply_set_mode(
+            &mut doc,
+            None,
+            Some(true),
+            None,
+            0,
+            &mut std::collections::HashSet::new(),
+        )
+        .expect("toggle ok");
         assert_eq!(doc.even_and_odd_headers, Some(true));
-        apply_set_mode(&mut doc, None, Some(false), None, 0).expect("toggle ok");
+        apply_set_mode(
+            &mut doc,
+            None,
+            Some(false),
+            None,
+            0,
+            &mut std::collections::HashSet::new(),
+        )
+        .expect("toggle ok");
         assert_eq!(doc.even_and_odd_headers, Some(false));
     }
 
@@ -545,6 +586,7 @@ mod tests {
                 link: true,
             }),
             0,
+            &mut std::collections::HashSet::new(),
         )
         .expect_err("link to non-existent header must fail");
         assert!(matches!(
@@ -573,6 +615,7 @@ mod tests {
                 link: true,
             }),
             0,
+            &mut std::collections::HashSet::new(),
         )
         .expect("link ok");
         let refs = &doc.body_section_properties.as_ref().unwrap().header_refs;
@@ -589,6 +632,7 @@ mod tests {
                 link: false,
             }),
             0,
+            &mut std::collections::HashSet::new(),
         )
         .expect("unlink ok");
         assert!(

@@ -997,6 +997,8 @@ fn runtime_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::NoOpEdit => "no_op_edit",
         ErrorCode::PrefixDuplicatesLabel => "prefix_duplicates_label",
         ErrorCode::AmbiguousAnchorAfterMove => "ambiguous_anchor_after_move",
+        ErrorCode::FormatRevisionConflict => "format_revision_conflict",
+        ErrorCode::AmbiguousFormatTarget => "ambiguous_format_target",
         ErrorCode::InvalidDocx => "invalid_docx",
         ErrorCode::InvalidSnapshot => "invalid_snapshot",
         ErrorCode::InternalError => "internal_error",

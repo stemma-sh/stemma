@@ -63,6 +63,8 @@ fn formatting_txn(block_id: NodeId) -> EditTransaction {
                     right: Some(edge.clone()),
                     inside_h: Some(edge.clone()),
                     inside_v: Some(edge),
+                    tl2br: None,
+                    tr2bl: None,
                 }),
                 width: Some(TableMeasurement {
                     w: 5000,

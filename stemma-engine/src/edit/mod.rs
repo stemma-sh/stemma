@@ -14,6 +14,8 @@
 //! Scope: step application only. No LLM generation, no ProseMirror translation,
 //! no HTTP endpoints.
 
+use std::collections::HashSet;
+
 use crate::domain::{
     Alignment, BlockNode, BorderSet, CanonDoc, CellFormatting, CellFormattingChange, CellMargins,
     FieldData, FieldKind, FieldSemantic, FormattingChange, HeaderFooterKind, HeightRule,
@@ -339,7 +341,9 @@ pub enum EditStep {
         expect: String,
         /// Optional full-block semantic hash precondition.
         semantic_hash: Option<String>,
-        /// Marks to turn on over the matched span (additive).
+        /// Boolean-mark patch over the matched span. Each mark has independent
+        /// on/off flags; neither flag means unchanged. The v4 edge guarantees
+        /// that a mark cannot request both states at once.
         marks: InlineMarkSet,
         /// Value-bearing run-style properties to set over the matched span
         /// (color, highlight, font family, font size). Separate from `marks`
@@ -1656,37 +1660,76 @@ struct NewHyperlinkAtom {
 const HYPERLINK_PLACEHOLDER_BASE: u32 = 0xE000;
 const HYPERLINK_PLACEHOLDER_MAX: u32 = 0xF8FF;
 
-/// A set of inline marks from the LLM-facing markup — the universal marks
-/// applicable to any text span. Five of these (bold/italic/underline/subscript/
-/// superscript) map directly to `Mark` enum variants; `strike` maps to
-/// `StyleProps.strike = MarkValue::On`. Kept as a plain struct of flags
-/// to keep the parser small and to let the insert-path projector compose
-/// marks cleanly with exemplar formatting.
+/// A boolean inline-mark patch. The positive flags retain their original
+/// on-only meaning for styled insertion; the matching `*_off` flags are used
+/// by `SetRunFormatting` to represent an explicit false. Both false means the
+/// property is omitted/unchanged. A pair may never both be true.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InlineMarkSet {
     pub bold: bool,
+    pub bold_off: bool,
     pub italic: bool,
+    pub italic_off: bool,
     pub underline: bool,
+    pub underline_off: bool,
     pub strike: bool,
+    pub strike_off: bool,
     pub subscript: bool,
+    pub subscript_off: bool,
     pub superscript: bool,
+    pub superscript_off: bool,
     /// All-caps display (`w:caps`, §17.3.2.5). A `StyleProps` tri-state, not a
     /// `Mark` enum variant — set turns it `MarkValue::On`.
     pub caps: bool,
+    pub caps_off: bool,
     /// Small-caps display (`w:smallCaps`, §17.3.2.33). Same tri-state lift.
     pub small_caps: bool,
+    pub small_caps_off: bool,
 }
 
 impl InlineMarkSet {
     pub fn is_empty(&self) -> bool {
         !(self.bold
+            || self.bold_off
             || self.italic
+            || self.italic_off
             || self.underline
+            || self.underline_off
             || self.strike
+            || self.strike_off
             || self.subscript
+            || self.subscript_off
             || self.superscript
+            || self.superscript_off
             || self.caps
-            || self.small_caps)
+            || self.caps_off
+            || self.small_caps
+            || self.small_caps_off)
+    }
+
+    pub fn has_conflict(&self) -> bool {
+        (self.bold && self.bold_off)
+            || (self.italic && self.italic_off)
+            || (self.underline && self.underline_off)
+            || (self.strike && self.strike_off)
+            || (self.subscript && self.subscript_off)
+            || (self.superscript && self.superscript_off)
+            || (self.caps && self.caps_off)
+            || (self.small_caps && self.small_caps_off)
+            || (self.subscript && self.superscript)
+    }
+
+    /// Explicit-off flags belong only to `SetRunFormatting`. Styled replacement
+    /// content remains the legacy on-only mark surface.
+    pub fn has_off(&self) -> bool {
+        self.bold_off
+            || self.italic_off
+            || self.underline_off
+            || self.strike_off
+            || self.subscript_off
+            || self.superscript_off
+            || self.caps_off
+            || self.small_caps_off
     }
 }
 
@@ -1889,6 +1932,11 @@ pub struct EditTransaction {
 /// interface.
 #[derive(Clone, Debug)]
 pub enum EditError {
+    /// The transaction's semantic revision digest collided in the public
+    /// 32-bit identity domain. Refuse atomically rather than probing to an id
+    /// that could change after save/reopen.
+    RevisionIdentityCollision { candidate: u32, records: String },
+
     /// The target block_id does not exist in the document.
     BlockNotFound { block_id: NodeId, step_index: usize },
 
@@ -1909,6 +1957,35 @@ pub enum EditError {
     /// The target paragraph contains segments with non-Normal
     /// tracking status.
     ParagraphContainsTrackedSegments { block_id: NodeId, step_index: usize },
+
+    /// `set_format.expect` matched more than one target in the paragraph.
+    AmbiguousFormatTarget {
+        block_id: NodeId,
+        expected: String,
+        occurrences: usize,
+        step_index: usize,
+    },
+
+    /// The exact target already carries a pending run-format revision that
+    /// cannot be absorbed by this logical transaction.
+    FormatRevisionConflict {
+        block_id: NodeId,
+        text: String,
+        tracking_status: &'static str,
+        existing_revision: Box<FormattingChange>,
+        container_revision: Box<Option<RevisionInfo>>,
+        step_index: usize,
+    },
+
+    /// The exact target is a pending text state this release deliberately does
+    /// not author formatting onto.
+    FormatTargetNotEditable {
+        block_id: NodeId,
+        text: String,
+        tracking_status: &'static str,
+        container_revision: Box<Option<RevisionInfo>>,
+        step_index: usize,
+    },
 
     /// The `expect` substring was not found in any single text
     /// section of the paragraph.
@@ -2311,6 +2388,22 @@ pub enum EditError {
     /// `SetRunFormatting` was dispatched with no marks set — refusing a no-op
     /// formatting request.
     NoFormattingRequested { step_index: usize },
+
+    /// `SetRunFormatting` requested mutually incompatible states.
+    ConflictingFormattingMarks { step_index: usize },
+
+    /// `SetRunFormatting` was non-empty but would change neither rendering nor
+    /// direct-formatting provenance on its exact target.
+    NoFormattingChange {
+        block_id: NodeId,
+        step_index: usize,
+        /// What the target already reads, as `mark=state` pairs (D5, decided
+        /// from 1,685 gauntlet refusals: this fired 614 times because callers
+        /// cannot tell in advance that a patch is a no-op). Saying only "no
+        /// effect" leaves the caller to guess which half of the patch was
+        /// already true.
+        current_formatting: String,
+    },
 
     /// `SetRunFormatting` was asked to set a color that is neither a 6-hex-digit
     /// RGB value nor the literal `"auto"`. We refuse rather than coerce.
@@ -3113,12 +3206,24 @@ pub enum EditError {
         /// guidance.
         paragraph_label: String,
         current_text: String,
+        /// The caller's own leading text with the duplicated label removed —
+        /// the string that WOULD have been accepted (D5, decided from 1,685
+        /// gauntlet refusals: this refusal recurred at attempts 0 through 5
+        /// within single lifecycles, so describing the fix was not enough).
+        /// The engine computed the label in order to detect the duplication;
+        /// withholding the correction while describing it is a choice, not a
+        /// limit.
+        corrected_content: String,
     },
 }
 
 impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EditError::RevisionIdentityCollision { candidate, records } => write!(
+                f,
+                "transaction refused before commit: canonical revision identity {candidate} is already occupied for {records}"
+            ),
             EditError::BlockNotFound {
                 block_id,
                 step_index,
@@ -3145,6 +3250,35 @@ impl std::fmt::Display for EditError {
             } => write!(
                 f,
                 "step {step_index}: paragraph '{block_id}' contains existing tracked changes"
+            ),
+            EditError::AmbiguousFormatTarget {
+                block_id,
+                expected,
+                occurrences,
+                step_index,
+            } => write!(
+                f,
+                "step {step_index}: set_format target {expected:?} occurs {occurrences} times in paragraph '{block_id}'; supply a longer unique expect"
+            ),
+            EditError::FormatRevisionConflict {
+                text,
+                tracking_status,
+                existing_revision,
+                step_index,
+                ..
+            } => write!(
+                f,
+                "step {step_index}: cannot add a formatting change to {text:?} ({tracking_status}): pending format revision {} by {} must remain independently resolvable",
+                existing_revision.identity, existing_revision.author
+            ),
+            EditError::FormatTargetNotEditable {
+                text,
+                tracking_status,
+                step_index,
+                ..
+            } => write!(
+                f,
+                "step {step_index}: cannot format {text:?}: target tracking state is {tracking_status}; resolve it or leave it pending"
             ),
             EditError::ExpectMismatch {
                 block_id,
@@ -3564,6 +3698,19 @@ impl std::fmt::Display for EditError {
                 f,
                 "step {step_index}: set_run_formatting requested no marks; \
                  refusing a no-op formatting change"
+            ),
+            EditError::ConflictingFormattingMarks { step_index } => write!(
+                f,
+                "step {step_index}: set_run_formatting requested incompatible mark states"
+            ),
+            EditError::NoFormattingChange {
+                block_id,
+                step_index,
+                current_formatting,
+            } => write!(
+                f,
+                "step {step_index}: set_run_formatting would not change rendering or \
+                 provenance on '{block_id}'; it already reads {current_formatting}"
             ),
             EditError::InvalidColorValue { value, step_index } => write!(
                 f,
@@ -4363,6 +4510,7 @@ impl std::fmt::Display for EditError {
                 label,
                 paragraph_label,
                 current_text,
+                corrected_content,
             } => {
                 if label == paragraph_label {
                     write!(
@@ -4370,7 +4518,7 @@ impl std::fmt::Display for EditError {
                         "step {step_index}: replacement content for paragraph '{}' begins \
                          with '{label}', which duplicates this paragraph's numbering label; \
                          it already reads '{current_text}' — omit the leading '{label}' (the \
-                         numbering is already present)",
+                         numbering is already present); send '{corrected_content}' instead",
                         block_id.0
                     )
                 } else {
@@ -4382,7 +4530,7 @@ impl std::fmt::Display for EditError {
                          result would read '{paragraph_label}{label}…'. Changing a \
                          paragraph's numbering label via text replace is not supported — \
                          omit the label and edit the body text only (it already reads \
-                         '{current_text}')",
+                         '{current_text}'); send '{corrected_content}' instead",
                         block_id.0
                     )
                 }
@@ -8085,6 +8233,10 @@ fn output_inserted_text_node(
 /// surgical insert path (`output_inserted_text_node`) and the segment-replace
 /// exemplar builder so the two can never drift in what a mark intent produces.
 fn apply_mark_overrides(marks: &mut Vec<Mark>, style_props: &mut StyleProps, ov: InlineMarkSet) {
+    assert!(
+        !ov.has_off(),
+        "explicit-off marks are valid only for SetRunFormatting"
+    );
     for (enabled, mark) in [
         (ov.bold, Mark::Bold),
         (ov.italic, Mark::Italic),
@@ -8104,11 +8256,14 @@ fn apply_mark_overrides(marks: &mut Vec<Mark>, style_props: &mut StyleProps, ov:
 /// Claim per-slot run-rPr provenance for the marks an edit just authored via an
 /// [`InlineMarkSet`]. Without this the serializer's directness filter
 /// (`direct_marks`) treats the added mark as style-inherited and never emits it
-/// — the run silently loses its bold/italic/etc. on export. Add-only by
-/// construction: an `InlineMarkSet` cannot express authored-OFF (`w:b w:val="0"`
-/// is the documented presence-only `Vec<Mark>` residue), so this only ever
-/// widens the claim.
+/// — the run silently loses its bold/italic/etc. on export. Styled replacement
+/// is an on-only surface; explicit-off flags are reserved for SetRunFormatting
+/// and fail at this boundary rather than being ignored.
 fn claim_authored_marks(rpr_authored: &mut crate::domain::RunRprAuthored, ov: InlineMarkSet) {
+    assert!(
+        !ov.has_off(),
+        "explicit-off marks are valid only for SetRunFormatting"
+    );
     rpr_authored.bold |= ov.bold;
     rpr_authored.italic |= ov.italic;
     rpr_authored.underline |= ov.underline;
@@ -8129,6 +8284,10 @@ fn claim_authored_marks(rpr_authored: &mut crate::domain::RunRprAuthored, ov: In
 /// only forced off when it was explicitly On, so an inherited (Inherit) strike on an
 /// untouched run is preserved (no spurious rPrChange).
 fn set_mark_surface(marks: &mut Vec<Mark>, style_props: &mut StyleProps, target: InlineMarkSet) {
+    assert!(
+        !target.has_off(),
+        "explicit-off marks are valid only for SetRunFormatting"
+    );
     for (enabled, mark) in [
         (target.bold, Mark::Bold),
         (target.italic, Mark::Italic),
@@ -8218,16 +8377,253 @@ struct MovedSourceInfo {
 }
 
 fn unique_inserted_block_id(blocks: &[TrackedBlock], original_id: &NodeId) -> NodeId {
-    if find_block_index(blocks, original_id).is_none() {
+    // Collision-check EVERY block id in the tree, nested cell blocks
+    // included — the same scope the role-exemplar lookup draws candidate ids
+    // from (`find_paragraph_anywhere`). Checking only the top level let an
+    // insert whose exemplar lives in a table cell keep the exemplar's id
+    // verbatim, and a later step addressing that id found the CELL paragraph
+    // first — formatting a paragraph the caller never named (wave-8
+    // lifecycle 385: two paragraphs both named p_4).
+    fn id_in_use(blocks: &[TrackedBlock], id: &NodeId) -> bool {
+        fn block_uses(block: &BlockNode, id: &NodeId) -> bool {
+            if block_id_of(block) == id {
+                return true;
+            }
+            if let BlockNode::Table(table) = block {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        if cell.blocks.iter().any(|nested| block_uses(nested, id)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        blocks.iter().any(|tracked| block_uses(&tracked.block, id))
+    }
+    if !id_in_use(blocks, original_id) {
         return original_id.clone();
     }
     let mut suffix = 1usize;
     loop {
         let candidate = NodeId::from(format!("{}__ins{}", original_id.0, suffix));
-        if find_block_index(blocks, &candidate).is_none() {
+        if !id_in_use(blocks, &candidate) {
             return candidate;
         }
         suffix += 1;
+    }
+}
+
+fn collect_para_ids_from_block(block: &BlockNode, used: &mut HashSet<String>) {
+    match block {
+        BlockNode::Paragraph(paragraph) => {
+            if let Some(id) = &paragraph.para_id {
+                used.insert(id.clone());
+            }
+        }
+        BlockNode::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for nested in &cell.blocks {
+                        collect_para_ids_from_block(nested, used);
+                    }
+                }
+            }
+        }
+        BlockNode::OpaqueBlock(_) => {}
+    }
+}
+
+fn collect_used_para_ids(doc: &CanonDoc) -> HashSet<String> {
+    fn collect_tracked(blocks: &[TrackedBlock], used: &mut HashSet<String>) {
+        for tracked in blocks {
+            collect_para_ids_from_block(&tracked.block, used);
+        }
+    }
+
+    let mut used = HashSet::new();
+    collect_tracked(&doc.blocks, &mut used);
+    for story in &doc.headers {
+        collect_tracked(&story.blocks, &mut used);
+    }
+    for story in &doc.footers {
+        collect_tracked(&story.blocks, &mut used);
+    }
+    for story in &doc.footnotes {
+        collect_tracked(&story.blocks, &mut used);
+    }
+    for story in &doc.endnotes {
+        collect_tracked(&story.blocks, &mut used);
+    }
+    for story in &doc.comments {
+        collect_tracked(&story.blocks, &mut used);
+    }
+    for extended in &doc.comments_extended {
+        used.insert(extended.para_id.clone());
+        if let Some(parent) = &extended.para_id_parent {
+            used.insert(parent.clone());
+        }
+    }
+    used
+}
+
+/// Allocate the persisted `w14:paraId` for a newly inserted body paragraph.
+///
+/// Canonical `NodeId`s are snapshot-local addresses and can change when a DOCX
+/// is reopened. A paragraph created by the engine therefore needs its own
+/// durable Word identity immediately: later revision identities use paraId as
+/// the carrier discriminator, so authoring the same follow-up edit before or
+/// after a reopen must hash to the same proposal identity.
+fn fresh_inserted_para_id(doc: &CanonDoc, block: &BlockNode) -> String {
+    let used = collect_used_para_ids(doc);
+
+    let BlockNode::Paragraph(paragraph) = block else {
+        unreachable!("paraId allocation is only valid for paragraphs")
+    };
+
+    // Word treats paraId as a signed 32-bit value. Seed from the stable
+    // insertion payload, never the snapshot-local NodeId: reopening can rename
+    // an engine-inserted block from (say) p_14 to p_3__ins1 while it remains the
+    // same paragraph. Identical payloads in one document probe to consecutive
+    // unused values, deterministically on both the continuous and reopened
+    // session paths.
+    let mut seed = 0x2000_0000u32;
+    for byte in b"stemma.inserted_para_id.v2\0"
+        .iter()
+        .copied()
+        .chain(paragraph.literal_prefix.as_deref().unwrap_or("").bytes())
+        .chain(std::iter::once(0))
+        .chain(crate::tracked_model::extract_block_text_for_hash(block).bytes())
+    {
+        seed = seed.wrapping_mul(31).wrapping_add(u32::from(byte)) & 0x7fff_ffff;
+    }
+    loop {
+        let candidate = format!("{seed:08X}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        seed = seed.wrapping_add(1) & 0x7fff_ffff;
+    }
+}
+
+/// Persist a durable carrier before minting the first revision authored into
+/// a legacy paragraph that has no `w14:paraId`.
+///
+/// The import fallback carrier is intentionally content-derived, but content
+/// can change again later in the same editing lineage. Once an authored
+/// proposal exists, keeping that fallback would therefore make its identity
+/// depend on whether the document was reopened before the later edit. Assigning
+/// paraId at this boundary makes the proposal carrier stable on wire without
+/// rewriting untouched legacy paragraphs.
+fn ensure_new_revision_carrier_para_ids(doc: &mut CanonDoc) {
+    use std::collections::HashMap;
+
+    fn status_has_unminted_revision(status: &TrackingStatus) -> bool {
+        match status {
+            TrackingStatus::Normal => false,
+            TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision) => {
+                revision.identity == 0
+            }
+            TrackingStatus::InsertedThenDeleted(stacked) => {
+                stacked.inserted.identity == 0 || stacked.deleted.identity == 0
+            }
+        }
+    }
+
+    fn paragraph_has_unminted_revision(paragraph: &ParagraphNode) -> bool {
+        paragraph
+            .para_mark_status
+            .as_ref()
+            .is_some_and(status_has_unminted_revision)
+            || paragraph
+                .formatting_change
+                .as_ref()
+                .is_some_and(|change| change.identity == 0)
+            || paragraph
+                .section_property_change
+                .as_ref()
+                .is_some_and(|change| change.revision.identity == 0)
+            || paragraph.segments.iter().any(|segment| {
+                status_has_unminted_revision(&segment.status)
+                    || segment.inlines.iter().any(|inline| match inline {
+                        InlineNode::Text(text) => text
+                            .formatting_change
+                            .as_ref()
+                            .is_some_and(|change| change.identity == 0),
+                        InlineNode::OpaqueInline(opaque) => {
+                            if let OpaqueKind::Hyperlink(data) = &opaque.kind {
+                                data.runs
+                                    .iter()
+                                    .any(|run| status_has_unminted_revision(&run.status))
+                            } else {
+                                false
+                            }
+                        }
+                        InlineNode::HardBreak(_)
+                        | InlineNode::Decoration(_)
+                        | InlineNode::CommentRangeStart { .. }
+                        | InlineNode::CommentRangeEnd { .. }
+                        | InlineNode::CommentReference { .. } => false,
+                    })
+            })
+    }
+
+    fn visit(
+        block: &mut BlockNode,
+        used: &mut HashSet<String>,
+        ordinals: &mut HashMap<String, u32>,
+    ) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                let carrier_text = format!(
+                    "{}\0{}",
+                    paragraph.literal_prefix.as_deref().unwrap_or(""),
+                    crate::tracked_model::extract_block_text_for_hash(&BlockNode::Paragraph(
+                        paragraph.clone(),
+                    ))
+                );
+                let text_hash = crate::import::sha256_hex(carrier_text.as_bytes());
+                let ordinal = ordinals.entry(text_hash.clone()).or_default();
+                let paragraph_ordinal = *ordinal;
+                *ordinal += 1;
+
+                if paragraph.para_id.is_some() || !paragraph_has_unminted_revision(paragraph) {
+                    return;
+                }
+
+                let seed_material =
+                    format!("stemma.authored_carrier_para_id.v1\0{text_hash}\0{paragraph_ordinal}");
+                let digest = crate::import::sha256_hex(seed_material.as_bytes());
+                let mut seed = u32::from_str_radix(&digest[..8], 16)
+                    .expect("sha256 hex prefix must parse")
+                    & 0x7fff_ffff;
+                loop {
+                    let candidate = format!("{seed:08X}");
+                    if used.insert(candidate.clone()) {
+                        paragraph.para_id = Some(candidate);
+                        break;
+                    }
+                    seed = seed.wrapping_add(1) & 0x7fff_ffff;
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit(nested, used, ordinals);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    let mut used = collect_used_para_ids(doc);
+    let mut ordinals = HashMap::new();
+    for tracked in &mut doc.blocks {
+        visit(&mut tracked.block, &mut used, &mut ordinals);
     }
 }
 
@@ -8336,6 +8732,56 @@ fn first_text_formatting(para: &ParagraphNode) -> FormattingContext {
     }
 }
 
+/// Formatting Word applies when typing at the physical start of a paragraph.
+///
+/// Literal-prefix extraction removes the source prefix runs from `segments`,
+/// so `first_content_text_node()` deliberately skips them. That is correct for
+/// content replacements, but not for a role-less insert before the paragraph:
+/// Word's insertion point precedes the prefix and inherits the first physical
+/// source run. Prefer the preserved source-run witness, then the prefix's
+/// modeled formatting for older snapshots that predate that witness.
+fn host_leading_text_formatting(para: &ParagraphNode) -> FormattingContext {
+    if para.literal_prefix.is_some() {
+        if let Some(source_run) = para
+            .literal_prefix_leading_rpr
+            .as_deref()
+            .and_then(|prefix| prefix.source_runs.first())
+        {
+            return FormattingContext {
+                marks: source_run.marks.clone(),
+                style_props: source_run.style_props.clone(),
+                rpr_authored: source_run.rpr_authored,
+            };
+        }
+        return FormattingContext {
+            marks: para.literal_prefix_marks.clone(),
+            style_props: para.literal_prefix_style_props.clone(),
+            rpr_authored: para.literal_prefix_rpr_authored,
+        };
+    }
+    // A break-only run is still the first physical run and owns Word's typing
+    // format at the insertion point. It can differ from the first text run
+    // (plain break followed by bold/highlighted text in the lifecycle witness).
+    for inline in para.all_inlines() {
+        match inline {
+            InlineNode::HardBreak(hard_break) => {
+                return FormattingContext {
+                    marks: hard_break.wrapper_marks.clone(),
+                    style_props: hard_break.wrapper_style_props.clone(),
+                    rpr_authored: hard_break.wrapper_rpr_authored,
+                };
+            }
+            InlineNode::Text(_) => break,
+            InlineNode::OpaqueInline(_)
+            | InlineNode::Decoration(_)
+            | InlineNode::CommentRangeStart { .. }
+            | InlineNode::CommentRangeEnd { .. }
+            | InlineNode::CommentReference { .. } => {}
+        }
+    }
+    first_text_formatting(para)
+}
+
 fn find_paragraph_in_block<'a>(
     block: &'a BlockNode,
     paragraph_id: &NodeId,
@@ -8435,6 +8881,8 @@ fn synthesize_new_hyperlink_inline(
         runs: vec![HyperlinkRun {
             text: text.to_string(),
             rpr_xml: None,
+            additional_rpr_xml: Vec::new(),
+            source_xml: None,
             source_run_attrs: Vec::new(),
             status: TrackingStatus::Normal,
         }],
@@ -8451,6 +8899,8 @@ fn synthesize_new_hyperlink_inline(
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     })
@@ -8542,6 +8992,7 @@ fn resolve_paragraph_spec(
     doc: &CanonDoc,
     spec: &ParagraphBlockSpec,
     step_index: usize,
+    host: Option<&ParagraphNode>,
 ) -> Result<BlockNode, EditError> {
     // Content is already parsed by the wire-format edge (v3 markup parser or
     // v4 adapter). Inserts produce brand-new content so `<opaque>` / `<anchor>`
@@ -8560,14 +9011,32 @@ fn resolve_paragraph_spec(
         }
     }
 
-    let role = spec
-        .role
-        .as_ref()
-        .ok_or_else(|| EditError::UnsupportedParagraphRole {
-            role: "<none>".to_string(),
-            reason: "inserted paragraphs currently require an explicit role".to_string(),
-            step_index,
-        })?;
+    // role: None = inherit from the HOST paragraph — the paragraph a Word
+    // user's insertion point sits inside (the anchor for insert-before; the
+    // FOLLOWING paragraph for insert-after, because Word's zero-width range
+    // at anchor.End is past the pilcrow). Word's typing inherits that
+    // paragraph's pPr and leading run formatting wholesale — adjudicated on
+    // the live oracle (wave-8 real-word census: indent, widow control,
+    // style id and run marks all followed the host). Only the insert paths
+    // supply a host; other BlockSpec consumers keep the explicit-role
+    // requirement.
+    let Some(role) = spec.role.as_ref() else {
+        let Some(host) = host else {
+            return Err(EditError::UnsupportedParagraphRole {
+                role: "<none>".to_string(),
+                reason: "a role-less paragraph insert is only defined where a host                      paragraph exists to inherit from"
+                    .to_string(),
+                step_index,
+            });
+        };
+        if spec.restart_numbering {
+            return Err(EditError::UnsupportedNumberingRestart {
+                role: None,
+                step_index,
+            });
+        }
+        return resolve_paragraph_from_host(doc, host, spec, step_index);
+    };
 
     let vocab = extract_vocabulary(doc);
     let role_entry = resolve_role_entry(doc, &vocab, role, step_index)?;
@@ -8710,6 +9179,85 @@ fn resolve_paragraph_spec(
     Ok(BlockNode::from(para))
 }
 
+/// Resolve a role-less paragraph insert by inheriting from the HOST
+/// paragraph — Word's typing semantics (see the `role: None` comment in
+/// [`resolve_paragraph_spec`]). The clone carries the host's pPr (indent,
+/// spacing, style, widow control, numbering membership) and its leading run
+/// formatting; the host's CONTENT-derived state (text, baked label, numbering
+/// label text, tracked state) does not travel.
+fn resolve_paragraph_from_host(
+    _doc: &CanonDoc,
+    host: &ParagraphNode,
+    spec: &ParagraphBlockSpec,
+    step_index: usize,
+) -> Result<BlockNode, EditError> {
+    if spec.list.is_some() {
+        return Err(EditError::UnsupportedParagraphStructure {
+            block_id: NodeId::from("<insert>".to_string()),
+            reason: "a role-less (host-inheriting) insert takes its list membership from                  the host paragraph; pass an explicit role to combine `list` with an insert"
+                .to_string(),
+            step_index,
+        });
+    }
+    let fmt = host_leading_text_formatting(host);
+    let mut para = host.clone();
+    para.segments = {
+        let mut inlines: Vec<InlineNode> = Vec::with_capacity(spec.content.fragments.len());
+        for (idx, fragment) in spec.content.fragments.iter().enumerate() {
+            let node_id = NodeId::from(format!("{}_t{idx}", para.id.0));
+            match fragment {
+                ContentFragment::Text(text) => inlines.push(InlineNode::from(
+                    build_text_node_from_exemplar(node_id, &fmt, text.clone(), None),
+                )),
+                ContentFragment::StyledText { text, marks } => inlines.push(InlineNode::from(
+                    build_text_node_from_exemplar(node_id, &fmt, text.clone(), Some(*marks)),
+                )),
+                other => {
+                    return Err(EditError::UnsupportedParagraphStructure {
+                        block_id: NodeId::from("<insert>".to_string()),
+                        reason: format!(
+                            "a role-less (host-inheriting) insert supports plain and styled                              text fragments only, got {other:?}"
+                        ),
+                        step_index,
+                    });
+                }
+            }
+        }
+        if inlines.is_empty() {
+            Vec::new()
+        } else {
+            normal_segment(inlines)
+        }
+    };
+    para.block_text_hash = None;
+    para.rendered_text = None;
+    para.para_mark_status = None;
+    para.para_split = false;
+    para.section_property_change = None;
+    para.formatting_change = None;
+    strip_position_bound_state(&mut para);
+    // The host's baked text label belongs to the host's CONTENT; Word's
+    // split does not duplicate it (oracle evidence: an insert between
+    // "1.Inspect…" and "2.Conduct…" carried their indent but no label).
+    para.literal_prefix = None;
+    para.literal_prefix_marks = Vec::new();
+    para.literal_prefix_style_props = StyleProps::default();
+    para.literal_prefix_leading_tab_twips = None;
+    para.literal_prefix_leading_tab_count = 0;
+    para.literal_prefix_has_trailing_tab = false;
+    para.literal_prefix_trailing_tab_stop_twips = None;
+    para.literal_prefix_rpr_authored = RunRprAuthored::default();
+    para.literal_prefix_leading_rpr = None;
+    para.literal_prefix_trailing_rpr = None;
+    // Auto-numbering membership DOES travel (Word renumbers the list), but
+    // the rendered label text is position-derived and re-synthesized.
+    if let Some(ref mut numbering) = para.numbering {
+        numbering.synthesized_text.clear();
+        numbering.restart_numbering = false;
+    }
+    Ok(BlockNode::from(para))
+}
+
 fn toc_field_spec(spec: &TocBlockSpec) -> TocFieldSpec {
     TocFieldSpec {
         levels: spec.levels,
@@ -8763,6 +9311,8 @@ fn resolve_toc_spec(
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     });
@@ -8795,9 +9345,9 @@ fn resolve_toc_spec(
 ///   rels are unregistered. A new paragraph is never a section boundary.
 /// * `para_id` / `text_id` — `w14:paraId` / `w14:textId` are meant to be
 ///   document-unique identities (commentsExtended threading, editor identity).
-///   A clone would emit a duplicate id; drop them so the inserted paragraph has
-///   no stale identity (the attribute is optional; Word regenerates one on next
-///   save).
+///   A clone would emit duplicate ids, so both are cleared here. The body
+///   insertion materializer assigns a fresh deterministic `para_id` after it
+///   chooses the paragraph's unique block address; `text_id` remains absent.
 ///
 /// Deliberately KEPT (formatting the insert is meant to inherit): style_id,
 /// align/indent/spacing/borders/shading, numbering (may be overridden by
@@ -8815,9 +9365,10 @@ fn resolve_block_spec(
     doc: &CanonDoc,
     spec: &BlockSpec,
     step_index: usize,
+    host: Option<&ParagraphNode>,
 ) -> Result<BlockNode, EditError> {
     match spec {
-        BlockSpec::Paragraph(paragraph) => resolve_paragraph_spec(doc, paragraph, step_index),
+        BlockSpec::Paragraph(paragraph) => resolve_paragraph_spec(doc, paragraph, step_index, host),
         BlockSpec::Toc(toc) => resolve_toc_spec(doc, toc, step_index),
         BlockSpec::Table(table) => resolve_table_spec(doc, table, step_index),
     }
@@ -8888,7 +9439,7 @@ fn resolve_table_spec(
             // and paragraphs don't collide across cells.
             let mut blocks: Vec<BlockNode> = Vec::with_capacity(cell_spec.content.len());
             for (block_in_cell_idx, child_spec) in cell_spec.content.iter().enumerate() {
-                let mut child = resolve_block_spec(doc, child_spec, step_index)?;
+                let mut child = resolve_block_spec(doc, child_spec, step_index, None)?;
                 let child_id = NodeId::from(format!("{}_b{block_in_cell_idx}", cell_id.0));
                 match &mut child {
                     BlockNode::Paragraph(p) => p.id = child_id,
@@ -9221,13 +9772,7 @@ fn apply_delete_block_range(
     rev_counter: &mut u32,
 ) {
     for tracked_block in &mut doc.blocks[start..=end] {
-        tracked_block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-        if let BlockNode::Paragraph(p) = &mut tracked_block.block {
-            p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                revision,
-                rev_counter,
-            )));
-        }
+        crate::tracked_model::mark_whole_block_deleted(tracked_block, revision, rev_counter);
     }
 }
 
@@ -9330,6 +9875,30 @@ fn check_destination_anchor_not_moved(
     })
 }
 
+/// The paragraph Word's zero-width insertion range sits inside for an insert
+/// at `anchor_block_id`/`position` — the anchor itself for Before, the next
+/// top-level paragraph for After (Word's Range(anchor.End, anchor.End) is
+/// past the pilcrow), falling back to the anchor when nothing paragraph-
+/// shaped follows. Consumed by role-less (host-inheriting) paragraph specs.
+fn insert_host_paragraph<'a>(
+    doc: &'a CanonDoc,
+    anchor_block_id: &NodeId,
+    position: InsertPosition,
+) -> Option<&'a ParagraphNode> {
+    let index = doc
+        .blocks
+        .iter()
+        .position(|tracked| block_id_of(&tracked.block) == anchor_block_id)?;
+    let paragraph_at = |i: usize| match &doc.blocks.get(i)?.block {
+        BlockNode::Paragraph(paragraph) => Some(&**paragraph),
+        _ => None,
+    };
+    match position {
+        InsertPosition::Before => paragraph_at(index),
+        InsertPosition::After => paragraph_at(index + 1).or_else(|| paragraph_at(index)),
+    }
+}
+
 fn apply_insert_paragraphs(
     doc: &mut CanonDoc,
     anchor_block_id: &NodeId,
@@ -9341,7 +9910,12 @@ fn apply_insert_paragraphs(
 
     let mut resolved_blocks = Vec::with_capacity(blocks.len());
     for block in blocks {
-        resolved_blocks.push(resolve_block_spec(doc, block, ctx.step_index)?);
+        resolved_blocks.push(resolve_block_spec(
+            doc,
+            block,
+            ctx.step_index,
+            insert_host_paragraph(doc, anchor_block_id, position),
+        )?);
     }
 
     let effective_anchor = match position {
@@ -9364,8 +9938,13 @@ fn apply_insert_paragraphs(
     let mut last_inserted_id = None;
     for (insert_idx, mut block) in (start_idx..).zip(resolved_blocks) {
         let block_id = unique_inserted_block_id(&doc.blocks, block_id_of(&block));
+        let para_id =
+            matches!(&block, BlockNode::Paragraph(_)).then(|| fresh_inserted_para_id(doc, &block));
         match &mut block {
-            BlockNode::Paragraph(p) => p.id = block_id.clone(),
+            BlockNode::Paragraph(p) => {
+                p.id = block_id.clone();
+                p.para_id = para_id;
+            }
             BlockNode::Table(t) => t.id = block_id.clone(),
             BlockNode::OpaqueBlock(o) => o.id = block_id.clone(),
         }
@@ -9403,7 +9982,12 @@ fn apply_insert_paragraphs_direct(
 ) -> Result<(), EditError> {
     let mut resolved_blocks = Vec::with_capacity(blocks.len());
     for block in blocks {
-        resolved_blocks.push(resolve_block_spec(doc, block, step_index)?);
+        resolved_blocks.push(resolve_block_spec(
+            doc,
+            block,
+            step_index,
+            insert_host_paragraph(doc, anchor_block_id, position),
+        )?);
     }
 
     let effective_anchor = match position {
@@ -9426,8 +10010,13 @@ fn apply_insert_paragraphs_direct(
     let mut last_inserted_id = None;
     for (insert_idx, mut block) in (start_idx..).zip(resolved_blocks) {
         let block_id = unique_inserted_block_id(&doc.blocks, block_id_of(&block));
+        let para_id =
+            matches!(&block, BlockNode::Paragraph(_)).then(|| fresh_inserted_para_id(doc, &block));
         match &mut block {
-            BlockNode::Paragraph(p) => p.id = block_id.clone(),
+            BlockNode::Paragraph(p) => {
+                p.id = block_id.clone();
+                p.para_id = para_id;
+            }
             BlockNode::Table(t) => t.id = block_id.clone(),
             BlockNode::OpaqueBlock(o) => o.id = block_id.clone(),
         }
@@ -9482,13 +10071,18 @@ fn apply_structural_replace_direct(
 
     let mut resolved_blocks = Vec::with_capacity(blocks.len());
     for block in blocks {
-        resolved_blocks.push(resolve_block_spec(doc, block, step_index)?);
+        resolved_blocks.push(resolve_block_spec(doc, block, step_index, None)?);
     }
 
     for (insert_idx, mut block) in (start..).zip(resolved_blocks) {
         let block_id = unique_inserted_block_id(&doc.blocks, block_id_of(&block));
+        let para_id =
+            matches!(&block, BlockNode::Paragraph(_)).then(|| fresh_inserted_para_id(doc, &block));
         match &mut block {
-            BlockNode::Paragraph(p) => p.id = block_id.clone(),
+            BlockNode::Paragraph(p) => {
+                p.id = block_id.clone();
+                p.para_id = para_id;
+            }
             BlockNode::Table(t) => t.id = block_id.clone(),
             BlockNode::OpaqueBlock(o) => o.id = block_id.clone(),
         }
@@ -9685,11 +10279,17 @@ fn apply_move_block_range(
 /// then swapped for different numbering). The serializer uses this
 /// to emit `numId=0` in the inner pPr so the reject-view numbering
 /// state machine correctly skips the paragraph.
-fn snapshot_paragraph_formatting(
+pub(crate) fn snapshot_paragraph_formatting(
     p: &ParagraphNode,
     revision: &RevisionInfo,
 ) -> ParagraphFormattingChange {
-    let numbering_explicitly_absent = p.numbering.is_none() && p.literal_prefix.is_none();
+    // §17.13.5.29 + §17.9.18: a paragraph that explicitly SUPPRESSED its
+    // style's numbering carried `numId=0` in its direct pPr, and the previous-
+    // state record must keep saying so — otherwise rejecting this change
+    // "restores" a paragraph with no direct numPr and the style's list
+    // resurrects, swapping the rendered label.
+    let numbering_explicitly_absent =
+        p.numbering_suppressed || (p.numbering.is_none() && p.literal_prefix.is_none());
     ParagraphFormattingChange {
         revision_id: revision.revision_id,
         identity: 0,
@@ -9697,11 +10297,16 @@ fn snapshot_paragraph_formatting(
         // The pPrChange inner pPr is the previous DIRECT formatting (§17.13.5.29),
         // so snapshot the AUTHORED-direct indent/spacing — not the resolved
         // effective value (which would bake inherited numbering/style into the
-        // "before" state and un-round-trip on reject). Fall back to the effective
-        // value only for synthesized paragraphs that never populated the authored
-        // field.
-        previous_indentation: p.authored_indent.clone().or_else(|| p.indent.clone()),
-        previous_spacing: p.authored_spacing.clone().or_else(|| p.spacing.clone()),
+        // "before" state and un-round-trip on reject). Synthesized paragraphs
+        // identify direct authorship with the same emission gates as import.
+        previous_indentation: p
+            .has_direct_indent
+            .then(|| p.authored_indent.clone().or_else(|| p.indent.clone()))
+            .flatten(),
+        previous_spacing: p
+            .has_direct_spacing
+            .then(|| p.authored_spacing.clone().or_else(|| p.spacing.clone()))
+            .flatten(),
         previous_numbering: p.numbering.clone(),
         previous_numbering_explicitly_absent: numbering_explicitly_absent,
         previous_style_id: p.style_id.clone(),
@@ -9717,6 +10322,7 @@ fn snapshot_paragraph_formatting(
         previous_literal_prefix_trailing_tab_stop_twips: p.literal_prefix_trailing_tab_stop_twips,
         previous_paragraph_mark_marks: p.paragraph_mark_marks.clone(),
         previous_paragraph_mark_style_props: p.paragraph_mark_style_props.clone(),
+        previous_paragraph_mark_rfonts: p.paragraph_mark_rfonts.clone(),
         previous_paragraph_mark_rpr_off: p.paragraph_mark_rpr_off,
         previous_text_direction: p.text_direction.clone(),
         previous_text_alignment: p.text_alignment.clone(),
@@ -9825,6 +10431,7 @@ fn copy_paragraph_formatting_from_exemplar(target: &mut ParagraphNode, exemplar:
     target.heading_level = exemplar.heading_level.clone();
     target.paragraph_mark_marks = exemplar.paragraph_mark_marks.clone();
     target.paragraph_mark_style_props = exemplar.paragraph_mark_style_props.clone();
+    target.paragraph_mark_rfonts = exemplar.paragraph_mark_rfonts.clone();
     target.paragraph_mark_rpr_off = exemplar.paragraph_mark_rpr_off;
     target.mirror_indents = exemplar.mirror_indents;
     target.auto_space_de = exemplar.auto_space_de;
@@ -9905,7 +10512,7 @@ fn apply_set_block_range_attr(
         restart_numbering: false,
         list: None,
     };
-    let resolved = resolve_paragraph_spec(doc, &spec, ctx.step_index)?;
+    let resolved = resolve_paragraph_spec(doc, &spec, ctx.step_index, None)?;
     let exemplar_para = match resolved {
         BlockNode::Paragraph(p) => p,
         _ => unreachable!("resolve_paragraph_spec returns BlockNode::Paragraph"),
@@ -10005,6 +10612,15 @@ pub fn apply_transaction_with_id_floor(
     // spuriously stale merely because an earlier step in this transaction
     // changed it.
     let transaction_base = doc;
+    let referenced_stories_before =
+        crate::tracked_model::section_referenced_part_paths(transaction_base);
+    // Header/footer parts detached by an explicit unlink step. A reference that
+    // disappears this way leaves an addressable story behind, unlike one whose
+    // carrying content was deleted — see `prune_newly_unreferenced_stories`.
+    let mut explicitly_unlinked_stories: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let split_tracking_prefixes_before =
+        crate::tracked_model::split_tracking_boundary_prefix_ids(transaction_base);
     let mut doc = doc.clone();
     // Fixed for the whole call: any revision_id >= this floor was minted by
     // THIS transaction (see `apply_set_cell_text_in_place`'s "own pending
@@ -10090,12 +10706,19 @@ pub fn apply_transaction_with_id_floor(
                     && let Some((label, paragraph_label)) =
                         numbering_label_duplicated_by(para, leading)
                 {
+                    let corrected_content = leading
+                        .trim_start_matches([' ', '\t'])
+                        .strip_prefix(label.as_str())
+                        .unwrap_or(leading)
+                        .trim_start_matches([' ', '\t'])
+                        .to_string();
                     return Err(EditError::PrefixDuplicatesLabel {
                         block_id: block_id.clone(),
                         step_index,
                         label,
                         paragraph_label,
                         current_text: paragraph_text_with_label(para),
+                        corrected_content,
                     });
                 }
 
@@ -10265,12 +10888,19 @@ pub fn apply_transaction_with_id_floor(
                     && let Some((label, paragraph_label)) =
                         numbering_label_duplicated_by(para, leading)
                 {
+                    let corrected_content = leading
+                        .trim_start_matches([' ', '\t'])
+                        .strip_prefix(label.as_str())
+                        .unwrap_or(leading)
+                        .trim_start_matches([' ', '\t'])
+                        .to_string();
                     return Err(EditError::PrefixDuplicatesLabel {
                         block_id: block_id.clone(),
                         step_index,
                         label,
                         paragraph_label,
                         current_text: paragraph_text_with_label(para),
+                        corrected_content,
                     });
                 }
 
@@ -10729,6 +11359,7 @@ pub fn apply_transaction_with_id_floor(
                     *marks,
                     style,
                     &revision,
+                    transaction_floor,
                     transaction.materialization_mode,
                     step_index,
                 )?;
@@ -11173,6 +11804,7 @@ pub fn apply_transaction_with_id_floor(
                     *even_and_odd,
                     link.clone(),
                     step_index,
+                    &mut explicitly_unlinked_stories,
                 )?;
             }
             EditStep::InsertEquation {
@@ -11537,10 +12169,41 @@ pub fn apply_transaction_with_id_floor(
         }
     }
 
+    ensure_new_revision_carrier_para_ids(&mut doc);
+    crate::tracked_model::prune_newly_unreferenced_stories(
+        &mut doc,
+        &referenced_stories_before,
+        &explicitly_unlinked_stories,
+    );
+
+    // Same rule as `merge_diff`: only prefixes THIS transaction split across the
+    // tracking boundary are canonicalized. A paragraph that already carried the
+    // shape on input is the source document's own state, and rewriting it would
+    // perturb the serialization of revisions that predate this transaction.
+    let produced_split_tracking_prefixes: std::collections::HashSet<_> =
+        crate::tracked_model::split_tracking_boundary_prefix_ids(&doc)
+            .difference(&split_tracking_prefixes_before)
+            .cloned()
+            .collect();
+    crate::tracked_model::canonicalize_split_tracking_boundary_prefix_ids(
+        &mut doc,
+        &produced_split_tracking_prefixes,
+    );
+
+    // A block this transaction marked wholly inserted or deleted carries its
+    // label inside the proposal, matching `merge_diff`. Left hoisted, the
+    // untracked-only `literal_prefix` describes a state import cannot rebuild.
+    crate::tracked_model::materialize_block_tracked_prefixes(&mut doc.blocks);
+
     // H7: authoring creates new revisions with identity 0; mint stable
     // identities for them (existing identities are preserved) before the doc
     // leaves the producer, so enumerate/Selective can address them.
-    crate::import::mint_identities(&mut doc);
+    crate::import::try_mint_identities(&mut doc).map_err(|error| {
+        EditError::RevisionIdentityCollision {
+            candidate: error.candidate,
+            records: error.records,
+        }
+    })?;
     // H2: one unified body-state validator after this producer's normalizers.
     crate::tracked_model::debug_assert_body_invariants(&doc, "apply_transaction");
     Ok((doc, pending))
@@ -12788,6 +13451,7 @@ fn rewrite_hyperlink_runs(
     let mut new_runs: Vec<HyperlinkRun> = Vec::new();
     let mut cursor: usize = 0;
     let mut nearest_rpr: Option<Vec<u8>> = None;
+    let mut nearest_additional_rpr: Vec<Vec<u8>> = Vec::new();
     let mut inserted_emitted = false;
 
     for run in &data.runs {
@@ -12802,10 +13466,13 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    additional_rpr_xml: run.additional_rpr_xml.clone(),
+                    source_xml: None,
                     source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Normal,
                 });
                 nearest_rpr = run.rpr_xml.clone();
+                nearest_additional_rpr = run.additional_rpr_xml.clone();
             }
         }
 
@@ -12820,10 +13487,13 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    additional_rpr_xml: run.additional_rpr_xml.clone(),
+                    source_xml: None,
                     source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Deleted(revision.clone()),
                 });
                 nearest_rpr = run.rpr_xml.clone();
+                nearest_additional_rpr = run.additional_rpr_xml.clone();
             }
         }
 
@@ -12835,6 +13505,8 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: new_text.to_string(),
                     rpr_xml: nearest_rpr.clone(),
+                    additional_rpr_xml: nearest_additional_rpr.clone(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(revision.clone()),
                 });
@@ -12850,6 +13522,8 @@ fn rewrite_hyperlink_runs(
                 new_runs.push(HyperlinkRun {
                     text: slice.to_string(),
                     rpr_xml: run.rpr_xml.clone(),
+                    additional_rpr_xml: run.additional_rpr_xml.clone(),
+                    source_xml: None,
                     source_run_attrs: run.source_run_attrs.clone(),
                     status: TrackingStatus::Normal,
                 });
@@ -12945,6 +13619,8 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })
@@ -13002,6 +13678,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -13034,6 +13711,42 @@ mod tests {
             date: Some("2026-06-03T00:00:00Z".to_string()),
             apply_op_id: None,
         }
+    }
+
+    #[test]
+    fn paragraph_format_snapshot_does_not_materialize_inherited_indent_or_spacing() {
+        let mut paragraph = paragraph_block(
+            "p1",
+            normal_segment(vec![text_inline("t1", "\tdefinition")]),
+        );
+        paragraph.indent = Some(Indentation {
+            left: Some(0),
+            right: None,
+            effective_first_line_twips: None,
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+        paragraph.spacing = Some(ParagraphSpacing {
+            before: Some(120),
+            after: None,
+            before_lines: None,
+            after_lines: None,
+            before_autospacing: None,
+            after_autospacing: None,
+            line: None,
+            line_rule: None,
+        });
+        paragraph.has_direct_indent = false;
+        paragraph.has_direct_spacing = false;
+        paragraph.authored_indent = None;
+        paragraph.authored_spacing = None;
+
+        let snapshot = snapshot_paragraph_formatting(&paragraph, &revision());
+
+        assert_eq!(snapshot.previous_indentation, None);
+        assert_eq!(snapshot.previous_spacing, None);
     }
 
     fn replace_tx(block_id: &str, expect: &str, new_text: &str) -> EditTransaction {
@@ -13172,6 +13885,67 @@ mod tests {
             }
             other => panic!("expected BlockHasTrackedStatus, got {other:?}"),
         }
+    }
+
+    /// The first engine-authored proposal in a legacy paragraph must persist a
+    /// carrier before its identity is minted. Otherwise a later content change
+    /// changes the text-derived fallback carrier and reopening re-identifies
+    /// the earlier proposal.
+    #[test]
+    fn first_authored_revision_persists_carrier_before_identity_minting() {
+        let base = empty_doc(vec![normal_tracked_block(BlockNode::from(
+            paragraph_block("p1", normal_segment(vec![text_inline("t1", "alpha beta")])),
+        ))]);
+        let (mut edited, _) = apply_transaction(&base, &replace_tx("p1", "beta", "alpha gamma"))
+            .expect("tracked replacement must succeed");
+
+        let paragraph = match &edited.blocks[0].block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => panic!("expected paragraph"),
+        };
+        assert!(
+            paragraph.para_id.is_some(),
+            "authoring into a paraId-less paragraph must persist a durable carrier"
+        );
+        let original_ids: std::collections::BTreeSet<_> =
+            crate::tracked_model::enumerate_revisions(&edited)
+                .into_iter()
+                .filter(|record| record.author.as_deref() == Some("unit-test"))
+                .map(|record| record.revision_id)
+                .collect();
+        assert!(!original_ids.is_empty());
+
+        // Model a later edit that changes the fallback text stream, followed by
+        // reopen (wire carriers have no canonical identity and are re-minted).
+        let BlockNode::Paragraph(paragraph) = &mut edited.blocks[0].block else {
+            panic!("expected paragraph")
+        };
+        paragraph.segments.push(TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: vec![text_inline("t2", " tail")],
+        });
+        for segment in &mut paragraph.segments {
+            match &mut segment.status {
+                TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision) => {
+                    revision.identity = 0;
+                }
+                TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => {}
+            }
+        }
+        if let Some(TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision)) =
+            &mut paragraph.para_mark_status
+        {
+            revision.identity = 0;
+        }
+        crate::import::mint_identities(&mut edited);
+
+        let reopened_ids: std::collections::BTreeSet<_> =
+            crate::tracked_model::enumerate_revisions(&edited)
+                .into_iter()
+                .filter(|record| record.author.as_deref() == Some("unit-test"))
+                .map(|record| record.revision_id)
+                .collect();
+        assert_eq!(reopened_ids, original_ids);
     }
 
     // ── normalize_segments edge cases ────────────────────────────────────────

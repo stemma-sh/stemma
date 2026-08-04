@@ -30,6 +30,7 @@ pub fn canonicalize_table(table: &TableNode) -> Result<CanonicalTable, String> {
         .iter()
         .map(|r| r.tracking_status.clone())
         .collect();
+    let row_para_ids: Vec<Option<String>> = table.rows.iter().map(|r| r.para_id.clone()).collect();
 
     if n_rows == 0 || n_cols == 0 {
         return Ok(CanonicalTable {
@@ -40,6 +41,7 @@ pub fn canonicalize_table(table: &TableNode) -> Result<CanonicalTable, String> {
             owner_grid: Vec::new(),
             formatting: table.formatting.clone(),
             row_tracking,
+            row_para_ids,
         });
     }
 
@@ -137,6 +139,7 @@ pub fn canonicalize_table(table: &TableNode) -> Result<CanonicalTable, String> {
         owner_grid,
         formatting: table.formatting.clone(),
         row_tracking,
+        row_para_ids,
     })
 }
 
@@ -296,6 +299,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,

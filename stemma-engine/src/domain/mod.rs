@@ -67,6 +67,11 @@ pub fn materialized_prefix_node_id(paragraph_id: &NodeId, kind: MaterializedPref
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum TextRole {
     MaterializedPrefix(MaterializedPrefixKind),
+    /// This one-character text node was authored as `<w:noBreakHyphen/>`.
+    /// Its semantic projection is U+2011, but Word's layout is source-form
+    /// sensitive, so canonical serialization must restore the element rather
+    /// than emit a literal U+2011 inside `w:t`.
+    NoBreakHyphen,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -258,6 +263,16 @@ pub use story::*;
 pub struct StoryRef {
     pub kind: HeaderFooterKind,
     pub part_path: String,
+    /// Authored position within the section's repeatable
+    /// `EG_HdrFtrReferences` group. Word can treat this otherwise schema-valid
+    /// interleaving as layout-significant on first open, so modeled section
+    /// rebuilds must not regroup headers and footers by story type.
+    /// References created by an edit have no source position and serialize
+    /// after imported references in the operation's deterministic order.
+    // Do not skip `None`: runtime snapshots use positional bincode, so every
+    // field must remain present in the binary sequence.
+    #[serde(default)]
+    pub source_order: Option<u32>,
     /// Parse-time provenance: this ref was INHERITED from a previous section
     /// (§17.10.2 resolution) or synthesized (§17.10.5 blank first-section
     /// header), not authored by this sectPr. Inherited refs must not be
@@ -675,6 +690,11 @@ pub struct ParagraphNode {
     pub paragraph_mark_marks: Vec<Mark>,
     /// Direct value-carrying style properties on the paragraph mark from w:pPr/w:rPr.
     pub paragraph_mark_style_props: StyleProps,
+    /// Exact authored `w:rFonts` slots on the paragraph mark. Kept separately
+    /// from the resolved style projection so absent and independently-valued
+    /// script attributes survive rebuilds.
+    #[serde(default)]
+    pub paragraph_mark_rfonts: AuthoredRFonts,
     /// AUTHORED OFF toggles on the paragraph mark's `w:pPr/w:rPr` (§17.3.1.29
     /// CT_ParaRPr) that the presence-only `paragraph_mark_marks: Vec<Mark>` cannot
     /// represent — the pilcrow analogue of `RunRprAuthored::{bold_off, italic_off,
@@ -1076,7 +1096,15 @@ impl ParagraphNode {
         ParagraphNode {
             id: NodeId::from(id),
             style_id: None,
-            align: None,
+            // `align` holds the EFFECTIVE value and `has_direct_align` its
+            // provenance — the convention import produces for every paragraph
+            // it reads. This paragraph carries no style, so its effective
+            // alignment is the document default, which is left (§17.3.1.13:
+            // `w:jc` absent means left for LTR text). Leaving `None` here made
+            // a story paragraph WE created differ from the identical paragraph
+            // after a save and reopen, which is a session-split violation for a
+            // note nobody touched.
+            align: Some(Alignment::Left),
             has_direct_align: false,
             indent: None,
             has_direct_indent: false,
@@ -1136,6 +1164,7 @@ impl ParagraphNode {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: AuthoredRFonts::default(),
             paragraph_mark_rpr_off: ParaMarkRprOff::default(),
             para_split: false,
             section_property_change: None,
@@ -1162,9 +1191,10 @@ impl ParagraphNode {
 }
 
 pub fn materialized_prefix_kind_for_text(text: &TextNode) -> Option<MaterializedPrefixKind> {
-    text.text_role
-        .as_ref()
-        .map(|TextRole::MaterializedPrefix(kind)| *kind)
+    match text.text_role.as_ref() {
+        Some(TextRole::MaterializedPrefix(kind)) => Some(*kind),
+        Some(TextRole::NoBreakHyphen) | None => None,
+    }
 }
 
 pub fn is_materialized_prefix_text(text: &TextNode) -> bool {
@@ -2515,6 +2545,10 @@ pub struct BorderSet {
     pub inside_h: Option<Border>,
     /// Vertical inside border (table-level only).
     pub inside_v: Option<Border>,
+    /// Diagonal border from the top-left to the bottom-right (cell-level only).
+    pub tl2br: Option<Border>,
+    /// Diagonal border from the top-right to the bottom-left (cell-level only).
+    pub tr2bl: Option<Border>,
 }
 
 /// Border style values per OOXML §17.18.2 `ST_Border`.
@@ -2547,6 +2581,9 @@ pub enum BorderStyle {
     Outset,
     Inset,
     Nil,
+    /// Schema-defined art border. The engine admits these only on page
+    /// borders, where ISO/IEC 29500 defines their rendering.
+    Art(BorderArtStyle),
 }
 
 impl BorderStyle {
@@ -2583,7 +2620,12 @@ impl BorderStyle {
         }
     }
 
-    pub fn to_xml_str(&self) -> &'static str {
+    /// Parse the wider ST_Border vocabulary permitted by w:pgBorders.
+    pub fn from_page_border_xml_str(s: &str) -> Result<Self, String> {
+        Self::from_xml_str(s).or_else(|_| BorderArtStyle::parse(s).map(Self::Art))
+    }
+
+    pub fn to_xml_str(&self) -> &str {
         match self {
             Self::None => "none",
             Self::Single => "single",
@@ -2612,9 +2654,219 @@ impl BorderStyle {
             Self::Outset => "outset",
             Self::Inset => "inset",
             Self::Nil => "nil",
+            Self::Art(style) => style.as_xml_str(),
         }
     }
 }
+
+/// A validated art-border token from ISO/IEC 29500 ST_Border.
+///
+/// The inner string is private and deserialization revalidates it, so callers
+/// cannot manufacture an unknown token and accidentally serialize invalid
+/// OOXML.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BorderArtStyle(String);
+
+impl BorderArtStyle {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        ART_BORDER_XML_VALUES
+            .contains(&value)
+            .then(|| Self(value.to_string()))
+            .ok_or_else(|| format!("unknown page-border art style: {value:?}"))
+    }
+
+    pub fn as_xml_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for BorderArtStyle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BorderArtStyle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+const ART_BORDER_XML_VALUES: &[&str] = &[
+    "apples",
+    "archedScallops",
+    "babyPacifier",
+    "babyRattle",
+    "balloons3Colors",
+    "balloonsHotAir",
+    "basicBlackDashes",
+    "basicBlackDots",
+    "basicBlackSquares",
+    "basicThinLines",
+    "basicWhiteDashes",
+    "basicWhiteDots",
+    "basicWhiteSquares",
+    "basicWideInline",
+    "basicWideMidline",
+    "basicWideOutline",
+    "bats",
+    "birds",
+    "birdsFlight",
+    "cabins",
+    "cakeSlice",
+    "candyCorn",
+    "celticKnotwork",
+    "certificateBanner",
+    "chainLink",
+    "champagneBottle",
+    "checkedBarBlack",
+    "checkedBarColor",
+    "checkered",
+    "christmasTree",
+    "circlesLines",
+    "circlesRectangles",
+    "classicalWave",
+    "clocks",
+    "compass",
+    "confetti",
+    "confettiGrays",
+    "confettiOutline",
+    "confettiStreamers",
+    "confettiWhite",
+    "cornerTriangles",
+    "couponCutoutDashes",
+    "couponCutoutDots",
+    "crazyMaze",
+    "creaturesButterfly",
+    "creaturesFish",
+    "creaturesInsects",
+    "creaturesLadyBug",
+    "crossStitch",
+    "cup",
+    "decoArch",
+    "decoArchColor",
+    "decoBlocks",
+    "diamondsGray",
+    "doubleD",
+    "doubleDiamonds",
+    "earth1",
+    "earth2",
+    "earth3",
+    "eclipsingSquares1",
+    "eclipsingSquares2",
+    "eggsBlack",
+    "fans",
+    "film",
+    "firecrackers",
+    "flowersBlockPrint",
+    "flowersDaisies",
+    "flowersModern1",
+    "flowersModern2",
+    "flowersPansy",
+    "flowersRedRose",
+    "flowersRoses",
+    "flowersTeacup",
+    "flowersTiny",
+    "gems",
+    "gingerbreadMan",
+    "gradient",
+    "handmade1",
+    "handmade2",
+    "heartBalloon",
+    "heartGray",
+    "hearts",
+    "heebieJeebies",
+    "holly",
+    "houseFunky",
+    "hypnotic",
+    "iceCreamCones",
+    "lightBulb",
+    "lightning1",
+    "lightning2",
+    "mapPins",
+    "mapleLeaf",
+    "mapleMuffins",
+    "marquee",
+    "marqueeToothed",
+    "moons",
+    "mosaic",
+    "musicNotes",
+    "northwest",
+    "ovals",
+    "packages",
+    "palmsBlack",
+    "palmsColor",
+    "paperClips",
+    "papyrus",
+    "partyFavor",
+    "partyGlass",
+    "pencils",
+    "people",
+    "peopleWaving",
+    "peopleHats",
+    "poinsettias",
+    "postageStamp",
+    "pumpkin1",
+    "pushPinNote2",
+    "pushPinNote1",
+    "pyramids",
+    "pyramidsAbove",
+    "quadrants",
+    "rings",
+    "safari",
+    "sawtooth",
+    "sawtoothGray",
+    "scaredCat",
+    "seattle",
+    "shadowedSquares",
+    "sharksTeeth",
+    "shorebirdTracks",
+    "skyrocket",
+    "snowflakeFancy",
+    "snowflakes",
+    "sombrero",
+    "southwest",
+    "stars",
+    "starsTop",
+    "stars3d",
+    "starsBlack",
+    "starsShadowed",
+    "sun",
+    "swirligig",
+    "tornPaper",
+    "tornPaperBlack",
+    "trees",
+    "triangleParty",
+    "triangles",
+    "triangle1",
+    "triangle2",
+    "triangleCircle1",
+    "triangleCircle2",
+    "shapes1",
+    "shapes2",
+    "twistedLines1",
+    "twistedLines2",
+    "vine",
+    "waveline",
+    "weavingAngles",
+    "weavingBraid",
+    "weavingRibbon",
+    "weavingStrips",
+    "whiteFlowers",
+    "woodwork",
+    "xIllusions",
+    "zanyTriangles",
+    "zigZag",
+    "zigZagStitch",
+    "custom",
+];
 
 /// A single border edge.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -3106,6 +3358,11 @@ pub struct CanonicalTable {
     /// Per-row tracked change status from w:trPr (w:ins or w:del).
     /// Indexed by row number. Only present for rows with native tracking.
     pub row_tracking: Vec<Option<TrackingStatus>>,
+    /// Persisted `w14:paraId` row identities, when present.
+    ///
+    /// Diff alignment uses an identity only when it occurs exactly once on
+    /// both sides. Otherwise it falls back to the row's semantic signature.
+    pub row_para_ids: Vec<Option<String>>,
 }
 
 impl CanonicalTable {
@@ -3223,13 +3480,17 @@ pub enum RangeMarkerRole {
     End,
 }
 
-/// The `Text` and `OpaqueInline` variants box their payloads so `InlineNode`
-/// stays small (one machine word + discriminant) instead of ~1 KB. A
+/// The `Text` and `OpaqueInline` variants box their payloads to bound the common
+/// case. `HardBreak` remains inline for public-API compatibility: boxing that
+/// published tuple variant would break every downstream constructor and match.
+/// Its source-fidelity payload is intentionally larger than the marker variants.
+/// A
 /// paragraph's `Vec<InlineNode>` reserves `len * sizeof(InlineNode)`
 /// contiguously, so an unboxed 1 KB variant made each paragraph's inline buffer
 /// ~21 KB. `Box<T>` is serde/bincode-transparent (serializes as the inner
 /// value), so snapshot blobs keep the same wire shape.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InlineNode {
     Text(Box<TextNode>),
     HardBreak(HardBreakNode),
@@ -3300,9 +3561,14 @@ pub struct ThemeColorRef {
     pub theme_tint: Option<IStr>,
 }
 
-/// A preserved, unmodeled property child: the verbatim XML of an rPr child
-/// element the engine does not model, captured at import and re-emitted at
-/// serialization so it survives round-trip.
+/// A source-form-preserved property child: the verbatim XML of an rPr child
+/// whose authored shape cannot be represented exactly by the normalized style
+/// projection, captured at import and re-emitted at serialization.
+///
+/// Most entries are unmodeled extension children. A modeled property may also
+/// use this boundary when its normalized domain view is intentionally lossy;
+/// `w:rFonts` is the canonical example because consumers need one effective
+/// Latin font while Word layout observes independently-authored script slots.
 /// Invariant: never synthesized by the engine — only carried from a parsed
 /// source part. Two runs whose preserved sets differ are format-distinct
 /// (they must not coalesce), which the derived PartialEq provides.
@@ -3312,6 +3578,32 @@ pub struct PreservedProp {
     pub name: String,
     /// Verbatim serialized element subtree.
     pub raw_xml: String,
+}
+
+/// An authored `w:rFonts` attribute map.
+///
+/// Unlike [`StyleProps::font_family`], which is a resolved projection that
+/// intentionally chooses one Latin font for consumers, this preserves the
+/// independent OOXML script slots exactly. Word consults these slots when it
+/// lays out the paragraph mark itself, including otherwise-empty paragraphs
+/// carrying anchored drawings.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct AuthoredRFonts {
+    pub ascii: Option<IStr>,
+    pub h_ansi: Option<IStr>,
+    pub ascii_theme: Option<IStr>,
+    pub h_ansi_theme: Option<IStr>,
+    pub east_asia: Option<IStr>,
+    pub east_asia_theme: Option<IStr>,
+    pub cs: Option<IStr>,
+    pub cs_theme: Option<IStr>,
+    pub hint: Option<IStr>,
+}
+
+impl AuthoredRFonts {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Value-carrying style properties for text runs.
@@ -3530,6 +3822,10 @@ pub struct ParagraphFormattingChange {
     pub previous_paragraph_mark_marks: Vec<Mark>,
     /// Previous direct paragraph-mark value-carrying style props from w:pPr/w:rPr.
     pub previous_paragraph_mark_style_props: StyleProps,
+    /// Exact previous paragraph-mark `w:rFonts` slots from the pPrChange
+    /// snapshot; see `ParagraphNode::paragraph_mark_rfonts`.
+    #[serde(default)]
+    pub previous_paragraph_mark_rfonts: AuthoredRFonts,
     /// Previous authored OFF toggles on the paragraph mark's w:pPr/w:rPr (the
     /// pilcrow analogue that `previous_paragraph_mark_marks` cannot carry).
     #[serde(default)]
@@ -3803,6 +4099,10 @@ pub struct ParaMarkRprOff {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RunRprAuthored {
+    /// The imported source run placed rPr after its content. This is layout
+    /// provenance, not a formatting value; synthesized runs leave it false.
+    #[serde(default)]
+    pub rpr_after_content: bool,
     /// w:rFonts w:ascii / w:hAnsi (literal font name).
     pub font_family: bool,
     /// w:rFonts w:asciiTheme / w:hAnsiTheme.
@@ -3933,6 +4233,7 @@ impl RunRprAuthored {
     /// prefixes) and synthesized runs that author every prop they carry: emit
     /// every prop as-is.
     pub const ALL: Self = Self {
+        rpr_after_content: false,
         font_family: true,
         font_family_theme: true,
         font_east_asia: true,
@@ -4007,6 +4308,7 @@ impl RunRprAuthored {
     pub fn from_effective(marks: &[Mark], props: &StyleProps) -> Self {
         let mv = |v: &MarkValue| *v != MarkValue::Inherit;
         Self {
+            rpr_after_content: false,
             font_family: props.font_family.is_some(),
             font_family_theme: props.font_family_theme.is_some(),
             font_east_asia: props.font_east_asia.is_some(),
@@ -4098,10 +4400,87 @@ pub enum BreakType {
     Column,
 }
 
+impl BreakType {
+    pub fn from_xml_str(value: &str) -> Result<Self, String> {
+        match value {
+            "textWrapping" => Ok(Self::TextWrapping),
+            "page" => Ok(Self::Page),
+            "column" => Ok(Self::Column),
+            other => Err(format!("unknown break type: {other:?}")),
+        }
+    }
+
+    pub fn to_xml_str(&self) -> &'static str {
+        match self {
+            Self::TextWrapping => "textWrapping",
+            Self::Page => "page",
+            Self::Column => "column",
+        }
+    }
+}
+
+/// Authored `w:br/@w:clear` restart behavior (§17.18.3).
+///
+/// `Option<BreakClear>` distinguishes an omitted attribute (the default) from
+/// an explicitly-authored `none`. For text-wrapping breaks, left/right/all are
+/// layout instructions: following text must restart below the named class of
+/// floating object, so dropping this attribute can repaginate the document.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum BreakClear {
+    None,
+    Left,
+    Right,
+    All,
+}
+
+impl BreakClear {
+    pub fn from_xml_str(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            "all" => Ok(Self::All),
+            other => Err(format!("unknown break clear value: {other:?}")),
+        }
+    }
+
+    pub fn to_xml_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct HardBreakNode {
     pub id: NodeId,
     pub break_type: BreakType,
+    /// Whether the source `w:br` explicitly authored `w:type`. The omitted
+    /// value defaults to `textWrapping`, but preserving explicit authorship
+    /// avoids source-shape churn when the canonical model is rebuilt.
+    #[serde(default)]
+    pub type_is_explicit: bool,
+    /// Exact authored clear behavior. `None` means the attribute was absent.
+    #[serde(default)]
+    pub clear: Option<BreakClear>,
+    /// Effective formatting of the source run that carried this break. A
+    /// break-only run still has a Word-visible line box, so its rPr is layout
+    /// data rather than decoration.
+    #[serde(default)]
+    pub wrapper_marks: Vec<Mark>,
+    #[serde(default)]
+    pub wrapper_style_props: StyleProps,
+    /// Direct-formatting provenance for the wrapper rPr. Inherited values must
+    /// not be materialized as direct formatting during rebuild.
+    #[serde(default)]
+    pub wrapper_rpr_authored: RunRprAuthored,
+    /// Source w:r `rsid*` attributes, preserved for the same Word-layout
+    /// stability contract as text runs.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
     /// This break and the immediately following TextNode were children of the
     /// same imported `w:r`. Word's table pagination can distinguish a leading
     /// break in the text run from a synthetic break-only run, so untouched
@@ -4121,6 +4500,17 @@ pub struct OpaqueInlineNode {
     /// run-level opaque elements like `w:fldChar` or `w:instrText`.
     pub wrapper_marks: Vec<Mark>,
     pub wrapper_style_props: StyleProps,
+    /// Source `w:r` attributes for run-level opaque elements. These are
+    /// load-bearing for the same reason as text/break run attributes and must
+    /// remain on a synthesized wrapper.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
+    /// The next text node originated in this opaque element's source run.
+    /// Custom footnote markers are the important Word-layout case: splitting
+    /// `footnoteReference` and its following mark across runs changes footnote
+    /// pagination even when their visible formatting is identical.
+    #[serde(default)]
+    pub joins_following_text_run: bool,
     /// Raw XML bytes for roundtripping opaque elements.
     /// Used to reconstruct the element during redline generation.
     pub raw_xml: Option<Vec<u8>>,
@@ -4236,8 +4626,15 @@ pub enum DecorationType {
     CustomXmlWrapperEnd,
 }
 
-/// A formatting mark (kept for backwards compatibility).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// A formatting mark.
+///
+/// Marks are a SET: a run is bold and italic, with no meaningful order between
+/// them. The model keeps the vector in DECLARATION order so one domain state
+/// has exactly one representation — import emits them in this order, and
+/// `ensure_mark` inserts rather than appends, so a run formatted bold-then-
+/// italic and one formatted italic-then-bold compare equal and survive a
+/// save and reopen identically.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Mark {
     Bold,
     Italic,
@@ -5417,6 +5814,17 @@ pub struct HyperlinkRun {
     /// Stored as self-contained XML so it can be round-tripped without
     /// holding a reference to the original parse tree.
     pub rpr_xml: Option<Vec<u8>>,
+    /// Additional authored `<w:rPr>` siblings in source order. Although the
+    /// schema expects one rPr, Word consumes later property elements found in
+    /// real-world documents; dropping them can change font metrics and layout.
+    #[serde(default)]
+    pub additional_rpr_xml: Vec<Vec<u8>>,
+    /// Verbatim source `<w:r>` for imported hyperlink display runs. Real Word
+    /// documents can contain tolerated, noncanonical child ordering whose
+    /// rendering cannot be reconstructed from the normalized fields alone.
+    /// Edit paths clear this field when they split or synthesize a run.
+    #[serde(default)]
+    pub source_xml: Option<Vec<u8>>,
     /// Source w:r `rsid*` attributes; see `TextNode::source_run_attrs`.
     #[serde(default)]
     pub source_run_attrs: Vec<(String, String)>,

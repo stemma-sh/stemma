@@ -957,10 +957,20 @@ impl StyleDefinitions {
         if direct.is_some() {
             return direct;
         }
+        // §17.3.1.44: the spec default is ON — widow control's is the one
+        // pPr toggle whose absence means TRUE. The EFFECTIVE value is
+        // therefore never "inherit nothing": an explicit `w:widowControl`
+        // and an absent one with no chain contribution are the SAME state,
+        // and Word freely rewrites one spelling into the other on resave.
+        // Leaving the effective field None for the absent spelling gave that
+        // one state two representations, and every comparison across a Word
+        // save tripped on it (wave-8 real-word v6 reject-endpoint family).
+        // `has_direct_widow_control` still gates wire emission.
         style_id
             .and_then(|id| self.para_props.get(id))
             .and_then(|p| p.widow_control)
             .or(self.ppr_defaults.widow_control)
+            .or(Some(true))
     }
 
     /// Resolve effective keepNext for a paragraph (§17.3.1.14).
@@ -1079,6 +1089,9 @@ impl StyleDefinitions {
         let para_marks = para_style_id.and_then(|id| self.para_styles.get(id));
 
         let mut result = TextMarks {
+            rpr_after_content: direct.rpr_after_content,
+            preserve_val_absent_underline: direct.preserve_val_absent_underline,
+            authored_rfonts: direct.authored_rfonts.clone(),
             // Toggle properties — XOR across hierarchy levels (§17.7.3).
             bold: resolve_toggle_mark(
                 direct.bold.clone(),
@@ -2139,6 +2152,10 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
                     match val.as_str() {
                         "subscript" => marks.subscript = MarkValue::On,
                         "superscript" => marks.superscript = MarkValue::On,
+                        "baseline" => {
+                            marks.subscript = MarkValue::Off;
+                            marks.superscript = MarkValue::Off;
+                        }
                         _ => {}
                     }
                 }
@@ -2156,7 +2173,16 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
                 marks.font_east_asia_theme =
                     attr_get(el, "w:eastAsiaTheme").map(|s| IStr::from(s.as_str()));
                 marks.font_cs = attr_get(el, "w:cs").map(|s| IStr::from(s.as_str()));
-                marks.font_cs_theme = attr_get(el, "w:csTheme").map(|s| IStr::from(s.as_str()));
+                // The normative attribute is lowercase-t "cstheme" — the lone
+                // exception among asciiTheme/hAnsiTheme/eastAsiaTheme
+                // (§17.3.2.26). Reading only "csTheme" silently dropped the
+                // docDefaults cs slot, so every run's effective font_cs lost
+                // the theme contribution real Word resolves (wave-8 real-word
+                // v5 lifecycle 0). word_ir's run parser was fixed for this
+                // same trap earlier; this is the styles-part twin.
+                marks.font_cs_theme = attr_get(el, "w:cstheme")
+                    .or_else(|| attr_get(el, "w:csTheme"))
+                    .map(|s| IStr::from(s.as_str()));
             }
             "sz" => {
                 marks.font_size = attr_get(el, "w:val").and_then(|v| {
@@ -2970,6 +2996,8 @@ fn extract_conditional_cell_borders(tc_pr: &Element) -> Option<BorderSet> {
         .or_else(|| extract_domain_border_edge(tc_borders, "end"));
     let inside_h = extract_domain_border_edge(tc_borders, "insideH");
     let inside_v = extract_domain_border_edge(tc_borders, "insideV");
+    let tl2br = extract_domain_border_edge(tc_borders, "tl2br");
+    let tr2bl = extract_domain_border_edge(tc_borders, "tr2bl");
 
     if top.is_some()
         || bottom.is_some()
@@ -2977,6 +3005,8 @@ fn extract_conditional_cell_borders(tc_pr: &Element) -> Option<BorderSet> {
         || right.is_some()
         || inside_h.is_some()
         || inside_v.is_some()
+        || tl2br.is_some()
+        || tr2bl.is_some()
     {
         Some(BorderSet {
             top,
@@ -2985,6 +3015,8 @@ fn extract_conditional_cell_borders(tc_pr: &Element) -> Option<BorderSet> {
             right,
             inside_h,
             inside_v,
+            tl2br,
+            tr2bl,
         })
     } else {
         None
@@ -3018,6 +3050,8 @@ fn extract_table_borders(tbl_pr: &Element) -> Option<BorderSet> {
             right,
             inside_h,
             inside_v,
+            tl2br: None,
+            tr2bl: None,
         })
     } else {
         None
@@ -3557,6 +3591,32 @@ mod tests {
             </w:styles>"#,
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn doc_defaults_cstheme_reaches_the_effective_cs_font() {
+        // The normative attribute is lowercase-t "cstheme" (§17.3.2.26) — the
+        // lone exception among the theme slots. With no theme part loaded the
+        // resolver applies the MS-OI29500 §17.3.2.26c fallback, so the theme
+        // reference surviving the PARSE is observable as font_cs becoming
+        // "Times New Roman" rather than staying empty.
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:asciiTheme="minorHAnsi" w:cstheme="minorBidi"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let resolved = defs.resolve(&TextMarks::default(), None, None);
+        assert_eq!(
+            resolved.font_cs_theme.as_deref(),
+            Some("minorBidi"),
+            "docDefaults' lowercase cstheme attribute must survive the parse"
+        );
+        assert_eq!(
+            resolved.font_cs.as_deref(),
+            Some("Times New Roman"),
+            "and resolve into the effective cs slot (empty-theme fallback)"
+        );
     }
 
     #[test]

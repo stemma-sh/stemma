@@ -131,7 +131,34 @@ fn reserialize(bytes: &[u8]) -> String {
     document_xml_of(&out)
 }
 
+fn identity_rebuild_xml(bytes: &[u8]) -> String {
+    let doc = Document::parse(bytes).expect("parse");
+    let rebuilt = doc.diff(&doc).expect("identity diff");
+    let out = rebuilt
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize canonical rebuild");
+    document_xml_of(&out)
+}
+
 // ─── Specs ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn hyperlink_run_preserves_every_authored_rpr_element() {
+    let body = r#"<w:p><w:hyperlink r:id="rId10"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>Long URL</w:t><w:rPr><w:sz w:val="18"/></w:rPr></w:r></w:hyperlink></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let xml = identity_rebuild_xml(&b);
+
+    assert!(
+        xml.contains(r#"<w:sz w:val="18""#),
+        "ISO 29500-1 §17.3.2.28/§17.16.22: Word consumes every authored rPr in a hyperlink run, including a later size override. Canonical rebuild must not silently discard the later property element: {xml}"
+    );
+    let text = xml.find("<w:t>Long URL</w:t>").expect("hyperlink text");
+    let size = xml.find(r#"<w:sz w:val="18""#).expect("later size rPr");
+    assert!(
+        text < size,
+        "Word-compatible rebuild must preserve the source child order for tolerated noncanonical hyperlink runs: Word applies this trailing rPr, while moving it before the text changes the rendered size: {xml}"
+    );
+}
 
 #[test]
 fn hyperlink_nested_bookmark_preserved_on_serialize() {

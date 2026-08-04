@@ -5,9 +5,9 @@ use similar::{Algorithm, DiffOp};
 
 use crate::diff::{diff_block_content_with_marks, diff_nested_tables};
 use crate::domain::{
-    BlockNode, BlockProvenance, CanonDoc, CellFormatting, CellFormattingChange, CommentStory,
-    DiffChange, EndnoteStory, FieldData, FieldKind, FooterStory, FootnoteStory, HeaderStory,
-    InlineChange, InlineChangeSegmentType, InlineNode, Mark, MaterializedPrefixKind,
+    Alignment, BlockNode, BlockProvenance, CanonDoc, CellFormatting, CellFormattingChange,
+    CommentStory, DiffChange, EndnoteStory, FieldData, FieldKind, FooterStory, FootnoteStory,
+    HeaderStory, InlineChange, InlineChangeSegmentType, InlineNode, Mark, MaterializedPrefixKind,
     NestedTableDiffKind, NodeId, OpaqueKind, ParagraphFormattingChange, ParagraphNode,
     RevisionInfo, RunRprAuthored, SectionProperties, SectionPropertyChange, StackedRevision,
     StoryScope, StyleProps, TableCellNode, TableDiffResult, TableNode, TableRowAlignment, TextNode,
@@ -282,6 +282,15 @@ fn paragraph_text_to_inlines_with_formatting(
                     paragraph_id.0, segment_index, inline_index
                 )),
                 break_type: crate::domain::BreakType::TextWrapping,
+                type_is_explicit: false,
+                clear: None,
+                wrapper_marks: marks.to_vec(),
+                wrapper_style_props: style_props.clone(),
+                wrapper_rpr_authored: crate::domain::RunRprAuthored::from_effective(
+                    marks,
+                    &style_props,
+                ),
+                source_run_attrs: Vec::new(),
                 joins_following_text_run: false,
             }));
             inline_index += 1;
@@ -1359,15 +1368,23 @@ fn apply_block_deleted(
             context: format!("{context}:{}", block_id_to_delete.0),
         });
     };
-    let tb = &mut blocks[idx];
-    tb.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-    if let BlockNode::Paragraph(p) = &mut tb.block {
-        p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
+    mark_whole_block_deleted(&mut blocks[idx], revision, rev_counter);
+    Ok(())
+}
+
+/// Mark one complete block deleted in the public canonical model.
+pub(crate) fn mark_whole_block_deleted(
+    tracked_block: &mut TrackedBlock,
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) {
+    tracked_block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
+    if let BlockNode::Paragraph(paragraph) = &mut tracked_block.block {
+        paragraph.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
             revision,
             rev_counter,
         )));
     }
-    Ok(())
 }
 
 fn apply_block_inserted(
@@ -1710,20 +1727,38 @@ pub(crate) fn inject_structural_markers_at_offsets(
     }
 }
 
-fn strip_materialized_prefix_geometry(text: &str) -> (String, u8, bool) {
-    let leading_tab_count = text.bytes().take_while(|b| *b == b'\t').count() as u8;
+fn strip_materialized_prefix_geometry(text: &str) -> (String, String, String, u8, bool) {
+    // Split the SAME way `materialized_prefix_text` composed: it emits
+    // `literal_prefix_leading_ws` verbatim — spaces or tabs — ahead of the
+    // label. Stripping only tabs left a space indent glued onto the label, so
+    // a materialize/re-hoist cycle moved indent geometry into authored text and
+    // `reject` stopped being the identity on any space-indented list item.
+    let leading_ws: String = text
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let leading_tab_count = leading_ws.bytes().filter(|b| *b == b'\t').count() as u8;
     let has_trailing_tab = text.ends_with('\t');
-    let text_without_leading = text.trim_start_matches('\t');
-    let label = if has_trailing_tab {
-        text_without_leading
-            .strip_suffix('\t')
-            .unwrap_or(text_without_leading)
-    } else {
-        text_without_leading
-            .strip_suffix(' ')
-            .unwrap_or(text_without_leading)
-    };
-    (label.to_string(), leading_tab_count, has_trailing_tab)
+    let text_without_leading = &text[leading_ws.len()..];
+    // Mirror the composer at this end too: it appends
+    // `literal_prefix_trailing_ws` verbatim, which may be several characters,
+    // so removing a single one leaves the remainder glued to the label.
+    let trailing_ws: String = text_without_leading
+        .chars()
+        .rev()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let label = &text_without_leading[..text_without_leading.len() - trailing_ws.len()];
+    (
+        label.to_string(),
+        leading_ws,
+        trailing_ws,
+        leading_tab_count,
+        has_trailing_tab,
+    )
 }
 
 /// Create a prefix `TextNode` that inherits direct formatting (marks,
@@ -1969,9 +2004,10 @@ fn apply_block_modified(
             // extraction can distinguish this from "base had a literal prefix
             // replaced by structural numbering" (where the current numPr should
             // still be counted in the reject view).
-            let numbering_explicitly_absent = original_numbering.is_none()
-                && new_para.numbering.is_some()
-                && !original_has_prefix;
+            let numbering_explicitly_absent = paragraph.numbering_suppressed
+                || (original_numbering.is_none()
+                    && new_para.numbering.is_some()
+                    && !original_has_prefix);
             paragraph.formatting_change = Some(ParagraphFormattingChange {
                 revision_id: revision.revision_id,
                 identity: 0,
@@ -1979,13 +2015,23 @@ fn apply_block_modified(
                 // Snapshot AUTHORED-direct indent/spacing (previous DIRECT pPr),
                 // not resolved effective — see snapshot_paragraph_formatting.
                 previous_indentation: paragraph
-                    .authored_indent
-                    .clone()
-                    .or_else(|| paragraph.indent.clone()),
+                    .has_direct_indent
+                    .then(|| {
+                        paragraph
+                            .authored_indent
+                            .clone()
+                            .or_else(|| paragraph.indent.clone())
+                    })
+                    .flatten(),
                 previous_spacing: paragraph
-                    .authored_spacing
-                    .clone()
-                    .or_else(|| paragraph.spacing.clone()),
+                    .has_direct_spacing
+                    .then(|| {
+                        paragraph
+                            .authored_spacing
+                            .clone()
+                            .or_else(|| paragraph.spacing.clone())
+                    })
+                    .flatten(),
                 previous_numbering: original_numbering.clone(),
                 previous_numbering_explicitly_absent: numbering_explicitly_absent,
                 previous_style_id: paragraph.style_id.clone(),
@@ -2003,6 +2049,7 @@ fn apply_block_modified(
                     .literal_prefix_trailing_tab_stop_twips,
                 previous_paragraph_mark_marks: paragraph.paragraph_mark_marks.clone(),
                 previous_paragraph_mark_style_props: paragraph.paragraph_mark_style_props.clone(),
+                previous_paragraph_mark_rfonts: paragraph.paragraph_mark_rfonts.clone(),
                 previous_paragraph_mark_rpr_off: paragraph.paragraph_mark_rpr_off,
                 previous_text_direction: paragraph.text_direction.clone(),
                 previous_text_alignment: paragraph.text_alignment.clone(),
@@ -2063,6 +2110,7 @@ fn apply_block_modified(
             paragraph.section_properties = new_para.section_properties.clone();
             paragraph.paragraph_mark_marks = new_para.paragraph_mark_marks.clone();
             paragraph.paragraph_mark_style_props = new_para.paragraph_mark_style_props.clone();
+            paragraph.paragraph_mark_rfonts = new_para.paragraph_mark_rfonts.clone();
             paragraph.paragraph_mark_rpr_off = new_para.paragraph_mark_rpr_off;
             sync_literal_prefix_geometry(new_para, paragraph);
             // Only update numbering when the prefix was not already materialized
@@ -2097,6 +2145,7 @@ fn apply_block_modified(
         sync_literal_prefix_geometry(new_p, paragraph);
         paragraph.paragraph_mark_marks = new_p.paragraph_mark_marks.clone();
         paragraph.paragraph_mark_style_props = new_p.paragraph_mark_style_props.clone();
+        paragraph.paragraph_mark_rfonts = new_p.paragraph_mark_rfonts.clone();
         paragraph.paragraph_mark_rpr_off = new_p.paragraph_mark_rpr_off;
     }
 
@@ -2888,26 +2937,12 @@ pub(crate) fn normalize_final_mark_attribution(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
 ) {
-    let Some(last) = blocks.len().checked_sub(1) else {
+    let Some(last) = document_final_paragraph_index(blocks) else {
         return;
     };
-    // A body always ends in a paragraph; a trailing table/opaque is neither
-    // valid nor something we can re-attribute a paragraph mark to.
     let BlockNode::Paragraph(final_para) = &blocks[last].block else {
-        return;
+        unreachable!("document_final_paragraph_index only returns paragraphs");
     };
-    // A move tail needs the move-aware rule. The moveTo DESTINATION copy that
-    // ends the document leaves an insertion-class mark on the document-final
-    // pilcrow (Word can't resolve it, exactly like a plain insert tail) — shift
-    // it to the anchor. The moveFrom SHADOW (Deleted + move_id) sits at its
-    // ORIGINAL position and is resolved by the moveFromRange pairing there, so
-    // leave it and its paired half untouched.
-    if blocks[last].move_id.is_some() {
-        if matches!(blocks[last].status, TrackingStatus::Inserted(_)) {
-            normalize_moved_final_mark(blocks, last, revision, rev_counter);
-        }
-        return;
-    }
     // What serialize would emit for the final pilcrow: the paragraph's own
     // para_mark_status, else the block-level status (see
     // `serialize::serialize_paragraph_node`). `Some(Normal)` (an already
@@ -2916,6 +2951,22 @@ pub(crate) fn normalize_final_mark_attribution(
         .para_mark_status
         .clone()
         .unwrap_or_else(|| blocks[last].status.clone());
+    // A move tail needs the move-aware rule. The moveTo DESTINATION copy that
+    // ends the document leaves an insertion-class mark on the document-final
+    // pilcrow (Word can't resolve it, exactly like a plain insert tail) — shift
+    // it to the anchor. The moveFrom SHADOW (Deleted + move_id) sits at its
+    // ORIGINAL position and is resolved by the moveFromRange pairing there, so
+    // leave it and its paired half untouched. Critically, an ALREADY-suppressed
+    // move tail has effective Normal and must remain untouched by later edits;
+    // re-normalizing it would mint an unrelated break on its old anchor.
+    if blocks[last].move_id.is_some() {
+        if matches!(effective, TrackingStatus::Inserted(_))
+            && matches!(blocks[last].status, TrackingStatus::Inserted(_))
+        {
+            normalize_moved_final_mark(blocks, last, revision, rev_counter);
+        }
+        return;
+    }
     match effective {
         TrackingStatus::Inserted(_) => {
             normalize_inserted_final_mark(blocks, last, revision, rev_counter);
@@ -2927,6 +2978,26 @@ pub(crate) fn normalize_final_mark_attribution(
         // leave any pre-existing one untouched.
         TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => {}
     }
+}
+
+/// Locate the paragraph whose pilcrow is the document-final paragraph mark.
+///
+/// Word permits zero-width range-marker halves as direct `w:body` children
+/// after the last `w:p` (for example a `w:bookmarkEnd` whose range closes at
+/// the end of the document). Import represents those byte-faithfully as typed
+/// opaque blocks. They do not render a block or displace the last paragraph's
+/// pilcrow, so skip only those identified range markers. A trailing table,
+/// content control, or unknown opaque block is not silently treated as
+/// zero-width: its final-mark semantics are not established here.
+fn document_final_paragraph_index(blocks: &[TrackedBlock]) -> Option<usize> {
+    for (index, block) in blocks.iter().enumerate().rev() {
+        match &block.block {
+            BlockNode::Paragraph(_) => return Some(index),
+            BlockNode::OpaqueBlock(opaque) if opaque.range_marker.is_some() => {}
+            BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => return None,
+        }
+    }
+    None
 }
 
 /// The shared anchor rule for the tail-mark normalizers: a moveFrom SHADOW
@@ -2976,6 +3047,17 @@ fn normalize_inserted_final_mark(
         && matches!(blocks[run_start - 1].status, TrackingStatus::Inserted(_))
         && matches!(blocks[run_start - 1].block, BlockNode::Paragraph(_))
         && blocks[run_start - 1].move_id.is_none()
+        // `Some(Normal)` is the explicit suppression left when an EARLIER
+        // tail insertion adopted the then-document-final mark. A later append
+        // must stop there and use that paragraph as its anchor; consuming it
+        // into the new run can walk back to a table/opaque and strand the new
+        // final pilcrow. Paragraphs minted together in the current insertion
+        // batch have no such pre-existing suppression.
+        && !matches!(
+            &blocks[run_start - 1].block,
+            BlockNode::Paragraph(p)
+                if matches!(p.para_mark_status, Some(TrackingStatus::Normal))
+        )
     {
         run_start -= 1;
     }
@@ -2994,8 +3076,8 @@ fn normalize_inserted_final_mark(
     };
     let anchor_marks = anchor.paragraph_mark_marks.clone();
     let anchor_style = anchor.paragraph_mark_style_props.clone();
+    let anchor_rfonts = anchor.paragraph_mark_rfonts.clone();
     let anchor_off = anchor.paragraph_mark_rpr_off;
-
     // Final paragraph: suppress its own mark marker and adopt the original final
     // mark's formatting. It stays a block-level Inserted paragraph (runs remain
     // inserted); only the pilcrow is untracked.
@@ -3003,6 +3085,7 @@ fn normalize_inserted_final_mark(
         p.para_mark_status = Some(TrackingStatus::Normal);
         p.paragraph_mark_marks = anchor_marks;
         p.paragraph_mark_style_props = anchor_style;
+        p.paragraph_mark_rfonts = anchor_rfonts;
         p.paragraph_mark_rpr_off = anchor_off;
     }
 
@@ -3028,6 +3111,8 @@ fn normalize_inserted_final_mark(
             rev_counter,
         )));
     }
+
+    record_displaced_final_mark_properties(blocks, last, anchor_idx);
 }
 
 /// Move tail: the document ends at a moveTo DESTINATION copy (block-level
@@ -3061,6 +3146,65 @@ fn normalize_inserted_final_mark(
 /// still merges the anchor's break into the moveTo copy the same reject removes
 /// (a no-op). Only a moveFrom SHADOW anchor (block-`Deleted` + `move_id`) is left
 /// untouched, its mark resolved by its own pairing.
+/// Record the original final paragraph's properties on the paragraph that
+/// inherits its mark.
+///
+/// When the final-mark rule hands the document-final pilcrow to a different
+/// paragraph, that paragraph now stands where the original final paragraph
+/// stood — and on reject its content merges into whatever properties it
+/// carries. Keeping only its own `pPr` makes the reject unreachable: the
+/// original final paragraph's style is nowhere in the wire, so no consumer,
+/// Word included, can restore it.
+///
+/// Word's own encoding, observed 2026-07-25 by comparing a paragraph moved to
+/// the end of a document (Word 16.0 `CompareDocuments`): the surviving final
+/// paragraph keeps its OWN `pStyle` and carries a `w:pPrChange` whose inner
+/// `pPr` is the anchor's. Accept then keeps the moved content's style and
+/// reject restores the original final paragraph's — both endpoints exact.
+/// This mirrors that shape. A paragraph that already carries a formatting
+/// change is left alone: its own pending pPrChange is the caller's proposal,
+/// not ours to overwrite.
+fn record_displaced_final_mark_properties(
+    blocks: &mut [TrackedBlock],
+    last: usize,
+    anchor_idx: usize,
+) {
+    // The record belongs to the SAME proposal that displaced the mark, so it
+    // carries that block's existing tracking revision rather than a freshly
+    // minted one. Displacing the final mark is one intention — the same rule
+    // that gives an inserted note's two carriers one identity — and minting a
+    // second identity here would grow the revision inventory on every move or
+    // insertion landing at the end of a document, so an unselected id could
+    // vanish under a selective resolution that never named it.
+    let carrier = match &blocks[last].status {
+        TrackingStatus::Inserted(revision) => revision.clone(),
+        // Only an insertion-class carrier reaches the final-mark rules.
+        _ => return,
+    };
+    let BlockNode::Paragraph(anchor) = &blocks[anchor_idx].block else {
+        return;
+    };
+    let previous = crate::edit::snapshot_paragraph_formatting(anchor, &carrier);
+    let BlockNode::Paragraph(final_para) = &blocks[last].block else {
+        return;
+    };
+    if final_para.formatting_change.is_some() {
+        return;
+    }
+    // Identical properties need no record — Word emits none when a split
+    // leaves both halves under the same style.
+    let current = crate::edit::snapshot_paragraph_formatting(final_para, &carrier);
+    if current == previous {
+        return;
+    }
+    if let BlockNode::Paragraph(p) = &mut blocks[last].block {
+        p.formatting_change = Some(ParagraphFormattingChange {
+            identity: carrier.identity,
+            ..previous
+        });
+    }
+}
+
 fn normalize_moved_final_mark(
     blocks: &mut [TrackedBlock],
     last: usize,
@@ -3096,6 +3240,7 @@ fn normalize_moved_final_mark(
     };
     let anchor_marks = anchor.paragraph_mark_marks.clone();
     let anchor_style = anchor.paragraph_mark_style_props.clone();
+    let anchor_rfonts = anchor.paragraph_mark_rfonts.clone();
     let anchor_off = anchor.paragraph_mark_rpr_off;
 
     // Final moved-in paragraph: suppress its own pilcrow marker and adopt the
@@ -3105,6 +3250,7 @@ fn normalize_moved_final_mark(
         p.para_mark_status = Some(TrackingStatus::Normal);
         p.paragraph_mark_marks = anchor_marks;
         p.paragraph_mark_style_props = anchor_style;
+        p.paragraph_mark_rfonts = anchor_rfonts;
         p.paragraph_mark_rpr_off = anchor_off;
     }
 
@@ -3118,6 +3264,8 @@ fn normalize_moved_final_mark(
             rev_counter,
         )));
     }
+
+    record_displaced_final_mark_properties(blocks, last, anchor_idx);
 }
 
 /// Delete tail: the final paragraph is being tracked-deleted. Turn it into the
@@ -3239,12 +3387,11 @@ fn mark_final_paragraph_runs_deleted(
 ///    rejecting it merges the empty tail back and restores the original final
 ///    paragraph — with no id invented and no other projection changed.
 fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
-    let Some(last) = blocks.len().checked_sub(1) else {
+    let Some(last) = document_final_paragraph_index(blocks) else {
         return;
     };
-    // Only a trailing paragraph carries the document-final mark.
     let BlockNode::Paragraph(final_para) = &blocks[last].block else {
-        return;
+        unreachable!("document_final_paragraph_index only returns paragraphs");
     };
     // What serialize emits for the final pilcrow (see `effective_final_mark` in
     // the sentinel tests): the paragraph's own `para_mark_status`, else the
@@ -3279,12 +3426,18 @@ fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
     // break with no follower. Materialize the empty tail paragraph that break
     // introduces, and make it the untracked document-final mark.
     let tail = empty_tail_after_stranded_break(final_para, blocks);
-    blocks.push(TrackedBlock {
-        block: BlockNode::from(tail),
-        status: TrackingStatus::Normal,
-        move_id: None,
-        block_sdt_wrap: None,
-    });
+    // Keep any zero-width range-marker halves after the final paragraph in
+    // their original body order: the materialized tail belongs immediately
+    // after the stranded break and before those closing markers.
+    blocks.insert(
+        last + 1,
+        TrackedBlock {
+            block: BlockNode::from(tail),
+            status: TrackingStatus::Normal,
+            move_id: None,
+            block_sdt_wrap: None,
+        },
+    );
 }
 
 /// Build the empty untracked-mark paragraph that a stranded pending break on
@@ -3667,8 +3820,17 @@ fn apply_paragraph_diff_in_cell(
         || section_properties_changed;
 
     if any_changed {
-        let numbering_explicitly_absent =
-            original_numbering.is_none() && new_para.numbering.is_some() && !original_has_prefix;
+        // §17.13.5.29: the inner pPr is the COMPLETE previous direct state. A
+        // paragraph that explicitly suppressed its style's numbering
+        // (`numId=0`, §17.9.18) carried that suppression in its direct pPr —
+        // dropping it from the record makes a reject resurrect the style's
+        // list and swap the paragraph's rendered label (wild witness: a
+        // literal "64." label became an auto-numbered "1." after an
+        // alignment-only edit was rejected).
+        let numbering_explicitly_absent = paragraph.numbering_suppressed
+            || (original_numbering.is_none()
+                && new_para.numbering.is_some()
+                && !original_has_prefix);
         paragraph.formatting_change = Some(ParagraphFormattingChange {
             revision_id: revision.revision_id,
             identity: 0,
@@ -3676,13 +3838,23 @@ fn apply_paragraph_diff_in_cell(
             // Snapshot AUTHORED-direct indent/spacing (previous DIRECT pPr),
             // not resolved effective — see snapshot_paragraph_formatting.
             previous_indentation: paragraph
-                .authored_indent
-                .clone()
-                .or_else(|| paragraph.indent.clone()),
+                .has_direct_indent
+                .then(|| {
+                    paragraph
+                        .authored_indent
+                        .clone()
+                        .or_else(|| paragraph.indent.clone())
+                })
+                .flatten(),
             previous_spacing: paragraph
-                .authored_spacing
-                .clone()
-                .or_else(|| paragraph.spacing.clone()),
+                .has_direct_spacing
+                .then(|| {
+                    paragraph
+                        .authored_spacing
+                        .clone()
+                        .or_else(|| paragraph.spacing.clone())
+                })
+                .flatten(),
             previous_numbering: original_numbering.clone(),
             previous_numbering_explicitly_absent: numbering_explicitly_absent,
             previous_style_id: paragraph.style_id.clone(),
@@ -3699,6 +3871,7 @@ fn apply_paragraph_diff_in_cell(
                 .literal_prefix_trailing_tab_stop_twips,
             previous_paragraph_mark_marks: paragraph.paragraph_mark_marks.clone(),
             previous_paragraph_mark_style_props: paragraph.paragraph_mark_style_props.clone(),
+            previous_paragraph_mark_rfonts: paragraph.paragraph_mark_rfonts.clone(),
             previous_paragraph_mark_rpr_off: paragraph.paragraph_mark_rpr_off,
             previous_text_direction: paragraph.text_direction.clone(),
             previous_text_alignment: paragraph.text_alignment.clone(),
@@ -4184,20 +4357,47 @@ pub(crate) fn mark_cell_content_deleted(
     for (idx, block) in cell.blocks.iter_mut().enumerate() {
         match block {
             BlockNode::Paragraph(p) => {
-                // Convert all existing segments to deleted.
-                let all_inlines: Vec<InlineNode> =
-                    p.segments.iter().flat_map(|s| s.inlines.clone()).collect();
-                if !all_inlines.is_empty() {
-                    p.segments = vec![TrackedSegment {
-                        status: TrackingStatus::Deleted(next_revision(revision, rev_counter)),
-                        inlines: all_inlines,
-                    }];
+                // Delete the CURRENT reading without erasing any pre-existing
+                // revision layer. In particular, an inserted run inside a row
+                // that is now deleted is `InsertedThenDeleted`: rejecting the
+                // row deletion restores the pending insertion, after which
+                // rejecting that insertion still removes it. Flattening every
+                // segment into one fresh `Deleted` carrier loses the inner
+                // insertion and makes reject-all retain text that was absent
+                // from the baseline.
+                for segment in &mut p.segments {
+                    segment.status = match &segment.status {
+                        TrackingStatus::Normal => {
+                            TrackingStatus::Deleted(next_revision(revision, rev_counter))
+                        }
+                        TrackingStatus::Inserted(inserted) => {
+                            TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+                                inserted: inserted.clone(),
+                                deleted: next_revision(revision, rev_counter),
+                            }))
+                        }
+                        // Already-deleted content is outside the current
+                        // reading, so this row deletion does not target it.
+                        other => other.clone(),
+                    };
                 }
                 if Some(idx) != last_para_idx {
-                    p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                        revision,
-                        rev_counter,
-                    )));
+                    p.para_mark_status = Some(match &p.para_mark_status {
+                        Some(TrackingStatus::Inserted(inserted)) => {
+                            TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+                                inserted: inserted.clone(),
+                                deleted: next_revision(revision, rev_counter),
+                            }))
+                        }
+                        Some(TrackingStatus::Deleted(_))
+                        | Some(TrackingStatus::InsertedThenDeleted(_)) => p
+                            .para_mark_status
+                            .clone()
+                            .expect("matched an existing paragraph-mark status"),
+                        Some(TrackingStatus::Normal) | None => {
+                            TrackingStatus::Deleted(next_revision(revision, rev_counter))
+                        }
+                    });
                 }
             }
             BlockNode::Table(t) => {
@@ -4813,6 +5013,29 @@ pub fn merge_diff(
     // endnotes) so w:numPr never survives into serialized redline XML.
     materialize_numbering_in_story_blocks(&mut merged);
 
+    // A merge can combine a retained manual label with a deletion whose first
+    // source run begins at the label/body separator. `literal_prefix` cannot
+    // represent that mixed tracking boundary by itself: serialization rejoins
+    // the separator to the deleted body, and reopen otherwise sees a different
+    // segment shape. Restore the explicit normal-prefix + tracked-body model at
+    // the producer boundary.
+    // Only paragraphs this merge PUT INTO that shape qualify. A paragraph the
+    // diff merely edited keeps its label in `literal_prefix`, where the
+    // serializer and the redline reader both expect it; materializing every
+    // changed paragraph moves the label into the body run stream and changes
+    // run grouping the caller never asked to change. One already split in the
+    // base is the source document's own state and is likewise left alone.
+    let mut base_split_ids = HashSet::new();
+    collect_split_tracking_boundary_prefix_ids(&base.blocks, &mut base_split_ids);
+    let mut merged_split_ids = HashSet::new();
+    collect_split_tracking_boundary_prefix_ids(&merged.blocks, &mut merged_split_ids);
+    let produced_split_ids: HashSet<NodeId> = merged_split_ids
+        .difference(&base_split_ids)
+        .cloned()
+        .collect();
+    materialize_split_tracking_boundary_prefixes(&mut merged.blocks, &produced_split_ids);
+    materialize_block_tracked_prefixes(&mut merged.blocks);
+
     // Track section property changes (w:sectPrChange §17.13.5.32).
     //
     // Clear the base's parsed sectPrChange — if the base archive already had one,
@@ -4854,6 +5077,267 @@ pub fn merge_diff(
         doc: merged,
         block_provenance: provenance,
     })
+}
+
+fn collect_split_tracking_boundary_prefix_ids(blocks: &[TrackedBlock], ids: &mut HashSet<NodeId>) {
+    fn visit_block(block: &BlockNode, outer_tracked: bool, ids: &mut HashSet<NodeId>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                let source_runs = paragraph
+                    .literal_prefix_leading_rpr
+                    .as_deref()
+                    .map(|provenance| provenance.source_runs.as_slice())
+                    .unwrap_or_default();
+                if source_runs
+                    .iter()
+                    .position(|source| source.joins_body)
+                    .is_some_and(|index| index > 0)
+                    && (outer_tracked
+                        || (paragraph
+                            .para_mark_status
+                            .as_ref()
+                            .is_some_and(|status| !matches!(status, TrackingStatus::Normal))
+                            && paragraph
+                                .segments
+                                .iter()
+                                .any(|segment| !matches!(segment.status, TrackingStatus::Normal))))
+                {
+                    ids.insert(paragraph.id.clone());
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            visit_block(nested, false, ids);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    for tracked in blocks {
+        visit_block(
+            &tracked.block,
+            !matches!(tracked.status, TrackingStatus::Normal),
+            ids,
+        );
+    }
+}
+
+fn materialize_split_tracking_boundary_prefixes(
+    blocks: &mut [TrackedBlock],
+    changed_ids: &HashSet<NodeId>,
+) {
+    fn clear_literal_prefix(paragraph: &mut ParagraphNode) {
+        paragraph.literal_prefix = None;
+        paragraph.literal_prefix_marks.clear();
+        paragraph.literal_prefix_style_props = StyleProps::default();
+        paragraph.literal_prefix_rpr_authored = RunRprAuthored::default();
+        paragraph.literal_prefix_leading_rpr = None;
+        paragraph.literal_prefix_trailing_rpr = None;
+        paragraph.literal_prefix_leading_tab_twips = None;
+        paragraph.literal_prefix_leading_tab_count = 0;
+        paragraph.literal_prefix_leading_ws.clear();
+        paragraph.literal_prefix_trailing_ws.clear();
+        paragraph.literal_prefix_has_trailing_tab = false;
+        paragraph.literal_prefix_trailing_tab_stop_twips = None;
+        paragraph.rendered_text = None;
+    }
+
+    fn source_inline(
+        paragraph_id: &NodeId,
+        index: usize,
+        source: &crate::domain::LiteralPrefixSourceRun,
+    ) -> InlineNode {
+        InlineNode::from(TextNode {
+            id: NodeId::from(format!(
+                "{}_tracking_boundary_prefix_{index}",
+                paragraph_id.0
+            )),
+            text_role: None,
+            text: source.text.clone(),
+            marks: source.marks.clone(),
+            style_props: source.style_props.clone(),
+            rpr_authored: source.rpr_authored,
+            source_run_attrs: source.source_run_attrs.clone(),
+            formatting_change: None,
+        })
+    }
+
+    fn visit_paragraph(
+        paragraph: &mut ParagraphNode,
+        outer_tracked: bool,
+        changed_ids: &HashSet<NodeId>,
+    ) {
+        if !changed_ids.contains(&paragraph.id) || paragraph.literal_prefix.is_none() {
+            return;
+        }
+        let source_runs = paragraph
+            .literal_prefix_leading_rpr
+            .as_deref()
+            .map(|provenance| provenance.source_runs.clone())
+            .unwrap_or_default();
+        let Some(join_index) = source_runs.iter().position(|source| source.joins_body) else {
+            return;
+        };
+        if join_index == 0 || source_runs[..join_index].iter().any(|run| run.joins_body) {
+            return;
+        }
+        let tracked_segment_index = paragraph.segments.iter().position(|segment| {
+            !matches!(segment.status, TrackingStatus::Normal)
+                && segment
+                    .inlines
+                    .iter()
+                    .any(|inline| matches!(inline, InlineNode::Text(_)))
+        });
+        if tracked_segment_index.is_none() && outer_tracked {
+            let Some(segment_index) = paragraph.segments.iter().position(|segment| {
+                segment
+                    .inlines
+                    .iter()
+                    .any(|inline| matches!(inline, InlineNode::Text(_)))
+            }) else {
+                return;
+            };
+            let prefix_inlines: Vec<_> = source_runs
+                .iter()
+                .enumerate()
+                .map(|(index, source)| source_inline(&paragraph.id, index, source))
+                .collect();
+            paragraph.segments[segment_index]
+                .inlines
+                .splice(0..0, prefix_inlines);
+            clear_literal_prefix(paragraph);
+            return;
+        }
+        let Some(segment_index) = tracked_segment_index else {
+            return;
+        };
+
+        let normal_inlines = source_runs[..join_index]
+            .iter()
+            .enumerate()
+            .map(|(index, source)| source_inline(&paragraph.id, index, source))
+            .collect();
+        let tracked_inlines: Vec<_> = source_runs[join_index..]
+            .iter()
+            .enumerate()
+            .map(|(index, source)| source_inline(&paragraph.id, join_index + index, source))
+            .collect();
+        paragraph.segments[segment_index]
+            .inlines
+            .splice(0..0, tracked_inlines);
+        paragraph.segments.insert(
+            segment_index,
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: normal_inlines,
+            },
+        );
+        clear_literal_prefix(paragraph);
+    }
+
+    fn visit_block(block: &mut BlockNode, outer_tracked: bool, changed_ids: &HashSet<NodeId>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                visit_paragraph(paragraph, outer_tracked, changed_ids)
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested, false, changed_ids);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    for tracked in blocks {
+        visit_block(
+            &mut tracked.block,
+            !matches!(tracked.status, TrackingStatus::Normal),
+            changed_ids,
+        );
+    }
+}
+
+/// Normalize the mixed wire shape where a retained manual label ends in one
+/// source run and its separator shares the following tracked body run. This is
+/// an import-edge transformation and must run before revision identities are
+/// minted, so the identity digest is derived from the stable explicit segment
+/// model that serialization will reproduce.
+pub(crate) fn canonicalize_imported_split_tracking_boundary_prefixes(doc: &mut CanonDoc) {
+    fn normalize(blocks: &mut [TrackedBlock]) {
+        let mut ids = HashSet::new();
+        collect_split_tracking_boundary_prefix_ids(blocks, &mut ids);
+        materialize_split_tracking_boundary_prefixes(blocks, &ids);
+    }
+
+    normalize(&mut doc.blocks);
+    for story in &mut doc.headers {
+        normalize(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        normalize(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        normalize(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        normalize(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        normalize(&mut story.blocks);
+    }
+}
+
+pub(crate) fn split_tracking_boundary_prefix_ids(doc: &CanonDoc) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    collect_split_tracking_boundary_prefix_ids(&doc.blocks, &mut ids);
+    for story in &doc.headers {
+        collect_split_tracking_boundary_prefix_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.footers {
+        collect_split_tracking_boundary_prefix_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.footnotes {
+        collect_split_tracking_boundary_prefix_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.endnotes {
+        collect_split_tracking_boundary_prefix_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.comments {
+        collect_split_tracking_boundary_prefix_ids(&story.blocks, &mut ids);
+    }
+    ids
+}
+
+pub(crate) fn canonicalize_split_tracking_boundary_prefix_ids(
+    doc: &mut CanonDoc,
+    ids: &HashSet<NodeId>,
+) {
+    materialize_split_tracking_boundary_prefixes(&mut doc.blocks, ids);
+    for story in &mut doc.headers {
+        materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
+    }
+    for story in &mut doc.footers {
+        materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
+    }
+    for story in &mut doc.footnotes {
+        materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
+    }
+    for story in &mut doc.endnotes {
+        materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
+    }
+    for story in &mut doc.comments {
+        materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
+    }
 }
 
 /// Process numbering prefixes in story blocks (headers, footers,
@@ -4938,6 +5422,7 @@ fn sync_non_numbering_properties(para: &mut ParagraphNode, target_para: &Paragra
     para.section_properties = target_para.section_properties.clone();
     para.paragraph_mark_marks = target_para.paragraph_mark_marks.clone();
     para.paragraph_mark_style_props = target_para.paragraph_mark_style_props.clone();
+    para.paragraph_mark_rfonts = target_para.paragraph_mark_rfonts.clone();
     para.paragraph_mark_rpr_off = target_para.paragraph_mark_rpr_off;
     para.auto_space_de = target_para.auto_space_de;
     para.auto_space_dn = target_para.auto_space_dn;
@@ -5592,12 +6077,42 @@ fn resolve_custom_xml_range_governed_wrappers(p: &mut ParagraphNode) {
 fn normalize_paragraph_after_projection(
     paragraph: &mut ParagraphNode,
     preserve_formatting_change: bool,
-) {
+) -> bool {
+    let had_literal_prefix = paragraph.literal_prefix.is_some();
     paragraph
         .segments
         .retain(|segment| !segment.inlines.is_empty());
     for segment in &mut paragraph.segments {
         segment.status = TrackingStatus::Normal;
+        // A settled (now-Normal) opaque run must carry no deleted-form
+        // content: `w:delText`/`w:delInstrText` are the INSIDE-a-`w:del`
+        // spellings (I-TC-001), and once the deletion is rejected the raw
+        // bytes must restore to `w:t`/`w:instrText` in the MODEL too — the
+        // serializer already coerces by container on the wire, so leaving
+        // the stale spelling in memory made the projection disagree with
+        // its own save/reopen (wave-8 replay lane legal__088: a rejected
+        // field kept `delInstrText` in its opaque raw).
+        for inline in &mut segment.inlines {
+            if let InlineNode::OpaqueInline(opaque) = inline
+                && let Some(raw) = &opaque.raw_xml
+            {
+                let raw_str = String::from_utf8_lossy(raw);
+                if raw_str.contains("delInstrText") || raw_str.contains("delText") {
+                    let restored = raw_str
+                        .replace("<w:delInstrText", "<w:instrText")
+                        .replace("</w:delInstrText", "</w:instrText")
+                        .replace("<w:delText", "<w:t")
+                        .replace("</w:delText", "</w:t");
+                    let restored_bytes = restored.into_bytes();
+                    // The hash names the raw transport bytes; a fresh parse of
+                    // this same restored spelling computes Some(digest), so
+                    // clearing it here would give one state two spellings and
+                    // fail projection == save/reopen.
+                    opaque.content_hash = Some(crate::import::sha256_hex(&restored_bytes));
+                    opaque.raw_xml = Some(restored_bytes);
+                }
+            }
+        }
     }
     paragraph.para_mark_status = None;
 
@@ -5667,6 +6182,10 @@ fn normalize_paragraph_after_projection(
                 paragraph.literal_prefix_marks = prefix.marks;
                 paragraph.literal_prefix_style_props = prefix.style_props;
                 paragraph.literal_prefix_rpr_authored = prefix.rpr_authored;
+                paragraph.literal_prefix_leading_rpr = prefix.leading_rpr.map(Box::new);
+                paragraph.literal_prefix_trailing_rpr = prefix.trailing_rpr.map(Box::new);
+                paragraph.literal_prefix_leading_ws = prefix.leading_ws;
+                paragraph.literal_prefix_trailing_ws = prefix.trailing_ws;
                 paragraph.literal_prefix_leading_tab_twips = if prefix.has_leading_tab {
                     // In tracked model projection we don't have tab stop context,
                     // so we store a sentinel; the diff pipeline uses the ParagraphNode's
@@ -5692,6 +6211,22 @@ fn normalize_paragraph_after_projection(
                 inlines: all_inlines,
             });
         }
+    } else if paragraph.segments.len() > 1 {
+        // literal_prefix already present: no prefix re-extraction, but the
+        // settled segments must still coalesce. Every segment above was just
+        // set to Normal, and a freshly-parsed document spells that state as
+        // ONE segment — a projection-time paragraph JOIN otherwise leaves the
+        // donor's and target's segments split forever (one domain state, two
+        // partitions), and the projection disagrees with its own save/reopen.
+        let all_inlines: Vec<InlineNode> = paragraph
+            .segments
+            .drain(..)
+            .flat_map(|s| s.inlines)
+            .collect();
+        paragraph.segments.push(TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: all_inlines,
+        });
     }
 
     // Clear tracked formatting changes — they've been resolved by the
@@ -5738,6 +6273,59 @@ fn normalize_paragraph_after_projection(
         // No prefix or numbering — clear rendered_text.
         paragraph.rendered_text = None;
     }
+
+    !had_literal_prefix && paragraph.literal_prefix.is_some()
+}
+
+/// Remove full-resolution-only zero-width decoration state and join text whose
+/// only authored boundary was a proofing-error marker.
+///
+/// Word removes `proofErr` start/end markers during Accept All / Reject All and
+/// joins the equal-format text fragments they had split. Merely deleting the
+/// markers leaves hundreds of artificial shaping boundaries; globally merging
+/// equal runs is also wrong because Word preserves unrelated authored run
+/// boundaries. `crossed_proof_error` names the exact, bounded join condition.
+fn settle_full_resolution_decorations(inlines: &mut Vec<InlineNode>) {
+    let mut settled: Vec<InlineNode> = Vec::with_capacity(inlines.len());
+    let mut crossed_proof_error = false;
+
+    for inline in inlines.drain(..) {
+        match &inline {
+            InlineNode::Decoration(decoration)
+                if decoration.kind == crate::domain::DecorationType::MoveRange =>
+            {
+                crossed_proof_error = false;
+            }
+            InlineNode::Decoration(decoration)
+                if decoration.kind == crate::domain::DecorationType::ProofError =>
+            {
+                crossed_proof_error = true;
+            }
+            InlineNode::Text(next)
+                if crossed_proof_error
+                    && next.text_role.is_none()
+                    && next.formatting_change.is_none() =>
+            {
+                if let Some(InlineNode::Text(previous)) = settled.last_mut()
+                    && previous.text_role.is_none()
+                    && previous.formatting_change.is_none()
+                    && previous.marks == next.marks
+                    && previous.style_props == next.style_props
+                    && previous.rpr_authored == next.rpr_authored
+                {
+                    previous.text.push_str(&next.text);
+                } else {
+                    settled.push(inline);
+                }
+                crossed_proof_error = false;
+            }
+            _ => {
+                settled.push(inline);
+                crossed_proof_error = false;
+            }
+        }
+    }
+    *inlines = settled;
 }
 
 fn leading_materialized_prefix_text_index(inlines: &[InlineNode]) -> Option<usize> {
@@ -5769,10 +6357,12 @@ fn strip_materialized_prefix_by_id(inlines: &mut Vec<InlineNode>, paragraph: &mu
     };
     // Extract the prefix label (materialization adds trailing space: "{pfx_trimmed} ")
     if let Some(InlineNode::Text(t)) = inlines.get(prefix_idx) {
-        let (label, leading_tab_count, has_trailing_tab) =
+        let (label, leading_ws, trailing_ws, leading_tab_count, has_trailing_tab) =
             strip_materialized_prefix_geometry(&t.text);
         if !label.is_empty() {
             paragraph.literal_prefix = Some(label);
+            paragraph.literal_prefix_leading_ws = leading_ws;
+            paragraph.literal_prefix_trailing_ws = trailing_ws;
             paragraph.literal_prefix_leading_tab_twips = if leading_tab_count > 0 {
                 paragraph.literal_prefix_leading_tab_twips.or(Some(0))
             } else {
@@ -6018,6 +6608,126 @@ fn paragraph_emptied_by_accept_reject(p: &ParagraphNode, keep_inserted: bool) ->
 /// Only merges paragraphs whose block-level status means they survive the retain
 /// filter -- paragraphs that will be removed entirely (e.g. block status=Deleted
 /// on accept) should not trigger a merge even if para_mark_status is also Deleted.
+/// A block-level tracked paragraph carries its label inside the proposal.
+///
+/// A manual label is body text the author typed, unlike structural numbering
+/// which Word generates from `numPr`. `literal_prefix` is a view over
+/// UNTRACKED leading body text: prefix stripping refuses any character that
+/// came from `w:ins`/`w:del`, so the field cannot represent a label belonging
+/// to a proposal. The whole-paragraph lifts in import rely on that, treating a
+/// hoisted label as proof the change does not cover the paragraph and
+/// declining to restore the block-level shape.
+///
+/// `merge_diff` already materializes labels on tracked blocks. This applies the
+/// same rule on the transaction producer, which kept them hoisted and so built
+/// a state import cannot reconstruct: the model says block-tracked with normal
+/// segments, the reopened document says normal block with tracked segments.
+pub(crate) fn materialize_block_tracked_prefixes(blocks: &mut [TrackedBlock]) {
+    // Only top-level blocks carry a tracking status; cell content is untracked
+    // `BlockNode`s, so there is no block-level proposal to disagree about
+    // inside a table.
+    for tracked in blocks.iter_mut() {
+        if matches!(tracked.status, TrackingStatus::Normal) {
+            continue;
+        }
+        let BlockNode::Paragraph(paragraph) = &tracked.block else {
+            continue;
+        };
+        if paragraph.literal_prefix.is_none() {
+            continue;
+        }
+        materialize_numbering_prefix_in_place(&mut tracked.block);
+    }
+}
+
+/// Restore a whole-paragraph proposal's hoisted label into its tracked body.
+///
+/// Prefix hoisting strips the enumerator out of the body stream. A paragraph
+/// whose pilcrow and body are one tracked proposal must carry that label
+/// inside the proposal before a paragraph-mark merge moves or resolves it,
+/// or the label outlives the text it labels.
+fn materialize_whole_paragraph_tracked_prefix(paragraph: &mut ParagraphNode) {
+    let Some(label) = paragraph.literal_prefix.as_deref() else {
+        return;
+    };
+    let source_runs = paragraph
+        .literal_prefix_leading_rpr
+        .as_deref()
+        .map(|provenance| provenance.source_runs.as_slice())
+        .unwrap_or_default();
+    if !source_runs.iter().any(|source_run| source_run.joins_body) {
+        // The prefix ended at a source-run boundary. Its following tracked
+        // body therefore says nothing about the prefix's own tracking state;
+        // keep the prefix in its explicit base slot.
+        return;
+    }
+    let prefix_body_segment = paragraph.segments.iter().position(|segment| {
+        segment
+            .inlines
+            .iter()
+            .any(|inline| matches!(inline, InlineNode::Text(_)))
+    });
+    let Some(segment_index) = prefix_body_segment.filter(|&segment_index| {
+        matches!(
+            (
+                &paragraph.para_mark_status,
+                &paragraph.segments[segment_index].status
+            ),
+            (
+                Some(TrackingStatus::Inserted(_)),
+                TrackingStatus::Inserted(_)
+            ) | (Some(TrackingStatus::Deleted(_)), TrackingStatus::Deleted(_))
+                | (
+                    Some(TrackingStatus::InsertedThenDeleted(_)),
+                    TrackingStatus::InsertedThenDeleted(_)
+                )
+        )
+    }) else {
+        return;
+    };
+
+    // A whole-paragraph insertion/deletion carries both a tracked pilcrow and
+    // tracked body. Prefix hoisting removes its literal enumerator from that
+    // body stream, so restore the enumerator inside the same tracked segment
+    // before a paragraph-mark merge moves or resolves the paragraph.
+    let prefix_inlines = if source_runs.is_empty() {
+        vec![InlineNode::from(TextNode {
+            id: NodeId::from(format!("{}_premerge_tracked_prefix", paragraph.id.0)),
+            text_role: None,
+            text: materialized_prefix_text(label, paragraph),
+            marks: paragraph.literal_prefix_marks.clone(),
+            style_props: paragraph.literal_prefix_style_props.clone(),
+            rpr_authored: paragraph.literal_prefix_rpr_authored,
+            source_run_attrs: Vec::new(),
+            formatting_change: None,
+        })]
+    } else {
+        source_runs
+            .iter()
+            .enumerate()
+            .map(|(index, source_run)| {
+                InlineNode::from(TextNode {
+                    id: NodeId::from(format!(
+                        "{}_premerge_tracked_prefix_{index}",
+                        paragraph.id.0
+                    )),
+                    text_role: None,
+                    text: source_run.text.clone(),
+                    marks: source_run.marks.clone(),
+                    style_props: source_run.style_props.clone(),
+                    rpr_authored: source_run.rpr_authored,
+                    source_run_attrs: source_run.source_run_attrs.clone(),
+                    formatting_change: None,
+                })
+            })
+            .collect()
+    };
+    paragraph.segments[segment_index]
+        .inlines
+        .splice(0..0, prefix_inlines);
+    paragraph.literal_prefix = None;
+}
+
 /// Move the donor paragraph's content to the FRONT of the join target,
 /// keeping the user-visible literal labels where their bytes actually are
 /// (§17.13.5.15 / §17.13.5.19 joins keep the FOLLOWING paragraph's
@@ -6033,23 +6743,97 @@ fn paragraph_emptied_by_accept_reject(p: &ParagraphNode, keep_inserted: bool) ->
 ///   paragraph PROPERTIES, which the join resolves to the target's (Word
 ///   drops the donor's number on a join too).
 fn merge_paragraph_into_following(donor: &mut ParagraphNode, target: &mut ParagraphNode) {
+    materialize_whole_paragraph_tracked_prefix(donor);
+    materialize_whole_paragraph_tracked_prefix(target);
     let mut merged = std::mem::take(&mut donor.segments);
 
     if let Some(label) = target.literal_prefix.take() {
-        let text = materialized_prefix_text(&label, target);
-        merged.push(TrackedSegment {
-            status: TrackingStatus::Normal,
-            inlines: vec![InlineNode::from(TextNode {
+        let source_runs = target
+            .literal_prefix_leading_rpr
+            .as_deref()
+            .map(|provenance| provenance.source_runs.clone())
+            .unwrap_or_default();
+        let mut prefix_inlines = Vec::new();
+        if source_runs.is_empty() {
+            prefix_inlines.push(InlineNode::from(TextNode {
                 id: NodeId::from(format!("{}_premerge_prefix", target.id.0)),
                 text_role: None,
-                text,
+                text: materialized_prefix_text(&label, target),
                 marks: target.literal_prefix_marks.clone(),
                 style_props: target.literal_prefix_style_props.clone(),
                 rpr_authored: target.literal_prefix_rpr_authored,
                 source_run_attrs: Vec::new(),
                 formatting_change: None,
-            })],
-        });
+            }));
+        } else {
+            for (index, source_run) in source_runs.into_iter().enumerate() {
+                if source_run.joins_body {
+                    let first_body_text = target.segments.iter_mut().find_map(|segment| {
+                        let normal = matches!(segment.status, TrackingStatus::Normal);
+                        segment
+                            .inlines
+                            .iter_mut()
+                            .find_map(|inline| match inline {
+                                InlineNode::Text(text) => Some(text),
+                                _ => None,
+                            })
+                            .map(|text| (normal, text))
+                    });
+                    let join_target = first_body_text.and_then(|(normal, text)| {
+                        (normal
+                            && (
+                                &text.marks,
+                                &text.style_props,
+                                text.rpr_authored,
+                                &text.source_run_attrs,
+                            ) == (
+                                &source_run.marks,
+                                &source_run.style_props,
+                                source_run.rpr_authored,
+                                &source_run.source_run_attrs,
+                            ))
+                            .then_some(text)
+                    });
+                    if let Some(first_body_text) = join_target {
+                        first_body_text.text.insert_str(0, &source_run.text);
+                    } else {
+                        // The prefix and body originally shared one w:r, but a
+                        // later tracked edit wrapped/replaced the body. A run
+                        // cannot cross that wrapper. Materialize the surviving
+                        // base prefix as its own Normal run immediately before
+                        // the tracked body; folding it into the wrapper would
+                        // falsely make base text part of the proposal.
+                        prefix_inlines.push(InlineNode::from(TextNode {
+                            id: NodeId::from(format!("{}_premerge_prefix_{index}", target.id.0)),
+                            text_role: None,
+                            text: source_run.text,
+                            marks: source_run.marks,
+                            style_props: source_run.style_props,
+                            rpr_authored: source_run.rpr_authored,
+                            source_run_attrs: source_run.source_run_attrs,
+                            formatting_change: None,
+                        }));
+                    }
+                } else {
+                    prefix_inlines.push(InlineNode::from(TextNode {
+                        id: NodeId::from(format!("{}_premerge_prefix_{index}", target.id.0)),
+                        text_role: None,
+                        text: source_run.text,
+                        marks: source_run.marks,
+                        style_props: source_run.style_props,
+                        rpr_authored: source_run.rpr_authored,
+                        source_run_attrs: source_run.source_run_attrs,
+                        formatting_change: None,
+                    }));
+                }
+            }
+        }
+        if !prefix_inlines.is_empty() {
+            merged.push(TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: prefix_inlines,
+            });
+        }
     }
     merged.append(&mut target.segments);
     target.segments = merged;
@@ -6166,8 +6950,7 @@ pub(crate) fn project_block_for_accept_reject(block: &mut BlockNode, keep_insert
         // = true), which never changes a paragraph's style, so no style table is
         // needed to re-resolve style-inherited run marks. The reject paths that
         // DO change the style thread their `StyleDefinitions` in explicitly.
-        /*style_defs=*/
-        None,
+        ResolutionDefinitions::NONE,
     );
 }
 
@@ -6186,20 +6969,66 @@ pub(crate) fn project_block_for_accept_reject(block: &mut BlockNode, keep_insert
 /// keeps BOTH on accept.
 pub(crate) fn project_block_for_text_edit_prep(block: &mut BlockNode) {
     project_block_inner(
-        block, /*keep_inserted=*/ true, /*preserve_formatting_change=*/ true,
+        block,
+        /*keep_inserted=*/ true,
+        /*preserve_formatting_change=*/ true,
         // Text-edit prep is an accept-for-text projection that PRESERVES the
         // formatting-change record and never alters `style_id` — nothing to
         // re-resolve.
-        /*style_defs=*/
-        None,
+        ResolutionDefinitions::NONE,
     );
+}
+
+/// The package data a projection re-resolves inherited paragraph geometry
+/// against. A resolution that restores a numbering prefix (rejecting a
+/// pPrChange, accepting a deletion that owned the label) must recompute the
+/// indent Word would compute: the style chain's effective indent, the
+/// numbering level's own indent, and the document default tab stop that
+/// positions the label. The three travel together because any one of them
+/// alone resolves a *different* geometry than Word does — passing only the
+/// styles is how the no-styles case (W8-F2) silently produced a wrong indent.
+/// `None` means the package genuinely has no such part, never "unavailable
+/// here".
+#[derive(Clone, Copy)]
+pub(crate) struct ResolutionDefinitions<'a> {
+    pub(crate) styles: Option<&'a crate::styles::StyleDefinitions>,
+    pub(crate) numbering: Option<&'a crate::numbering::NumberingDefinitions>,
+    pub(crate) default_tab_stop: i32,
+}
+
+impl ResolutionDefinitions<'_> {
+    /// For projections that provably cannot change inherited geometry: an
+    /// accept-only path that never rewrites `style_id`, never restores a
+    /// numbering prefix, and so has nothing to re-resolve. 720 twips is the
+    /// OOXML default `w:defaultTabStop` (§17.15.1.25) — what a package with no
+    /// settings entry inherits. Reaching for this on a path that CAN restore a
+    /// prefix reintroduces W8-F2.
+    pub(crate) const NONE: Self = Self {
+        styles: None,
+        numbering: None,
+        default_tab_stop: 720,
+    };
+}
+
+impl<'a> ResolutionDefinitions<'a> {
+    /// All the style-table-only public entry points can supply: no numbering
+    /// definitions, spec-default tab stop. Those entry points already document
+    /// themselves as DEGRADED for exactly this reason — a restored numbering
+    /// prefix re-resolves its indent from the style chain alone. The runtime
+    /// projection threads the full definitions instead.
+    pub(crate) fn styles_only(styles: Option<&'a crate::styles::StyleDefinitions>) -> Self {
+        Self {
+            styles,
+            ..Self::NONE
+        }
+    }
 }
 
 fn project_block_inner(
     block: &mut BlockNode,
     keep_inserted: bool,
     preserve_formatting_change: bool,
-    style_defs: Option<&crate::styles::StyleDefinitions>,
+    defs: ResolutionDefinitions<'_>,
 ) {
     match block {
         BlockNode::Paragraph(p) => {
@@ -6207,6 +7036,7 @@ fn project_block_inner(
             // pPrChange-driven style swap and re-resolve style-inherited run
             // marks against the resulting style (see below).
             let style_before = p.style_id.clone();
+            let rejected_paragraph_formatting = !keep_inserted && p.formatting_change.is_some();
             // Handle paragraph formatting change (pPrChange, §17.13.5.29).
             // The child pPr inside pPrChange is the COMPLETE previous state.
             if !keep_inserted {
@@ -6235,15 +7065,54 @@ fn project_block_inner(
                 p.section_property_change = None;
             }
 
-            p.segments.retain(|segment| match segment.status {
-                TrackingStatus::Normal => true,
-                TrackingStatus::Inserted(_) => keep_inserted,
-                TrackingStatus::Deleted(_) => !keep_inserted,
-                // The stacked state drops in BOTH full resolutions (origin
-                // rules 2 and 3): accept-all accepts the deletion; reject-all
-                // rejects the insertion and the nested deletion goes with it.
-                TrackingStatus::InsertedThenDeleted(_) => false,
-            });
+            if preserve_formatting_change {
+                p.segments.retain(|segment| match segment.status {
+                    TrackingStatus::Normal => true,
+                    TrackingStatus::Inserted(_) => keep_inserted,
+                    TrackingStatus::Deleted(_) => !keep_inserted,
+                    TrackingStatus::InsertedThenDeleted(_) => false,
+                });
+            } else {
+                let mut surviving = Vec::with_capacity(p.segments.len());
+                for segment in p.segments.drain(..) {
+                    let survives = match segment.status {
+                        TrackingStatus::Normal => true,
+                        TrackingStatus::Inserted(_) => keep_inserted,
+                        TrackingStatus::Deleted(_) => !keep_inserted,
+                        // The stacked state drops in BOTH full resolutions
+                        // (origin rules 2 and 3).
+                        TrackingStatus::InsertedThenDeleted(_) => false,
+                    };
+                    if survives {
+                        surviving.push(segment);
+                    }
+                }
+                p.segments = surviving;
+            }
+
+            // A move resolves as a UNIT with its content (§17.13.5.21–.28):
+            // the retain above settles the moveFrom/moveTo content by segment
+            // status (accept keeps the destination, reject the source), so
+            // the zero-width move markup — the split container markers and
+            // the move*Range* delimiters, both `DecorationType::MoveRange` —
+            // must go with it in BOTH directions, exactly as the byte path
+            // drops them (`is_move_range_marker`, normalize.rs) and the
+            // selective path does (`remove_move_decorations`). Left behind,
+            // the serializer re-nests them into `w:moveFrom`/`w:moveTo`
+            // wrappers and the output re-imports as still-pending — a
+            // half-resolved move no further resolution can clear.
+            for segment in &mut p.segments {
+                segment.inlines.retain(|inline| {
+                    !matches!(
+                        inline,
+                        InlineNode::Decoration(decoration)
+                            if decoration.kind == crate::domain::DecorationType::MoveRange
+                    )
+                });
+            }
+            p.paragraph_mark_style_props
+                .preserved
+                .retain(|property| property.name != "w:moveFrom" && property.name != "w:moveTo");
 
             // Handle run-level formatting changes (rPrChange) on text nodes,
             // and project tracked changes inside hyperlink display text
@@ -6257,6 +7126,10 @@ fn project_block_inner(
                                 reject_text_formatting(t);
                             } else if !preserve_formatting_change {
                                 t.formatting_change = None;
+                            }
+                            if !preserve_formatting_change {
+                                t.source_run_attrs
+                                    .retain(|(name, _)| name.rsplit(':').next() != Some("rsidDel"));
                             }
                         }
                         InlineNode::OpaqueInline(opaque) => {
@@ -6322,6 +7195,32 @@ fn project_block_inner(
                 }
             }
 
+            if !preserve_formatting_change {
+                // A full accept/reject settles every move carrier and clears
+                // Word's ephemeral proofing-error ranges in this paragraph.
+                // Word performs both cleanups during Accept All / Reject All:
+                // keeping proofErr markers makes its next save run a proofing
+                // rewrite, changing run shaping after the engine has claimed a
+                // fully-resolved result. Identity rebuilds and unresolved
+                // documents retain proofErr byte-faithfully; this branch is
+                // deliberately scoped to the full-resolution boundary.
+                //
+                // Imported inline move wrappers are represented as zero-width
+                // bracket decorations around typed tracked content;
+                // paragraph-mark moveFrom/moveTo carriers are preserved rPr
+                // children. The typed status projection above has already
+                // kept/dropped the content, so retaining either carrier would
+                // make Word report a phantom pending move. Clear them from
+                // every surviving paragraph, including one that received the
+                // markers when a moved paragraph mark was merged into it.
+                for segment in &mut p.segments {
+                    settle_full_resolution_decorations(&mut segment.inlines);
+                }
+                p.paragraph_mark_style_props.preserved.retain(|property| {
+                    property.name != "w:moveFrom" && property.name != "w:moveTo"
+                });
+            }
+
             // Resolve customXml*Range-governed wrappers (§17.13.5.4-.11). A
             // customXmlIns/Del/MoveFrom/MoveToRange marks the customXml/smartTag
             // WRAPPER markup itself as the revision, so accepting OR rejecting it
@@ -6332,21 +7231,74 @@ fn project_block_inner(
             // collapse.
             resolve_custom_xml_range_governed_wrappers(p);
 
-            // A reverted (or applied) paragraph-style change swaps `style_id`
-            // underneath runs whose `style_props` were resolved against the old
-            // style at import — re-run the cascade so style-inherited marks
-            // (caps, bold, fonts, …) match the resulting style. Runs are
-            // re-resolved AFTER their own rPrChange rejects above so we operate
-            // on each run's final direct rPr. Only fires when the style actually
-            // changed (so accept, which keeps the style, is untouched) and when
-            // the caller supplied the style table.
-            if let Some(style_defs) = style_defs
-                && p.style_id != style_before
+            // Rejecting a run rPrChange restores the PREVIOUS *direct* rPr.
+            // After a save/reopen that snapshot intentionally contains only
+            // authored properties; inherited font/size/color values are not
+            // serialized inside rPrChange. Re-run the cascade after every
+            // rejection so the restored direct state regains the paragraph /
+            // character-style values it had before the edit. The same pass is
+            // also required when a rejected paragraph-style change swaps
+            // `style_id`. It runs AFTER both rejection paths, against their
+            // final direct rPr, and only when the caller supplied the style
+            // table.
+            if let Some(style_defs) = defs.styles
+                && (!keep_inserted || p.style_id != style_before)
             {
+                if rejected_paragraph_formatting {
+                    reresolve_paragraph_alignment(p, style_defs);
+                    reresolve_paragraph_numbering(p, style_defs, defs.numbering);
+                }
                 reresolve_paragraph_style_inherited_marks(p, style_defs);
             }
 
-            normalize_paragraph_after_projection(p, preserve_formatting_change);
+            let restored_literal_prefix =
+                normalize_paragraph_after_projection(p, preserve_formatting_change);
+            // Effective indent is a VIEW over (style chain, numbering, direct
+            // ind, body tab presence), and projection can move every input: a
+            // pPrChange reject swaps the style, a mark-reject merge makes the
+            // follower's pPr govern the merged content, and dropping segments
+            // can remove the tab that import absorbed a hanging indent into
+            // (wave-8 lifecycles 47/257: a merged `yNumberedItem` paragraph
+            // kept the donor era's absorbed 0 where a save/reopen resolves
+            // 879/-879). With the style table present the resolver is
+            // idempotent when nothing changed, so recompute unconditionally;
+            // without it (degraded public entry points) recomputing would
+            // DROP style-resolved values, so keep the narrow triggers.
+            if defs.styles.is_some() || rejected_paragraph_formatting || restored_literal_prefix {
+                reresolve_paragraph_indent(p, defs);
+            }
+            // Spacing is the same kind of view (§17.3.1.33 per-attribute over
+            // direct + style chain) and goes stale the same ways; unlike
+            // indent it has no text-dependent absorption, so only the style
+            // table gates it.
+            if let Some(styles) = defs.styles {
+                reresolve_paragraph_spacing(p, styles);
+                // The pPr toggles are the same per-attribute cascades: a
+                // pPrChange reject restores the authored-direct snapshot, and
+                // every toggle the snapshot omits still inherits from the
+                // style chain (contextual spacing was the witnessed one —
+                // wave-8 real-word v7 L6 — widow control's §17.3.1.44 default
+                // additionally floors at ON; see the resolvers).
+                let style_id = p
+                    .style_id
+                    .as_deref()
+                    .or_else(|| styles.default_para_style_id());
+                let widow_direct = p
+                    .has_direct_widow_control
+                    .then_some(p.widow_control)
+                    .flatten();
+                p.widow_control = styles.resolve_effective_widow_control(style_id, widow_direct);
+                let contextual_direct = p
+                    .has_direct_contextual_spacing
+                    .then_some(p.contextual_spacing)
+                    .flatten();
+                p.contextual_spacing =
+                    styles.resolve_effective_contextual_spacing(style_id, contextual_direct);
+                let keep_next_direct = p.has_direct_keep_next.then_some(p.keep_next).flatten();
+                p.keep_next = styles.resolve_effective_keep_next(style_id, keep_next_direct);
+                let keep_lines_direct = p.has_direct_keep_lines.then_some(p.keep_lines).flatten();
+                p.keep_lines = styles.resolve_effective_keep_lines(style_id, keep_lines_direct);
+            }
         }
         BlockNode::Table(t) => {
             // Handle table formatting change (tblPrChange, §17.13.5.34).
@@ -6436,7 +7388,7 @@ fn project_block_inner(
                             nested,
                             keep_inserted,
                             preserve_formatting_change,
-                            style_defs,
+                            defs,
                         );
                     }
                     drop_emptied_nested_tables(&mut cell.blocks, &nested_had_rows);
@@ -6451,6 +7403,37 @@ fn project_block_inner(
                     t.formatting.grid_cols.remove(col);
                 }
             }
+
+            // Cell borders are an effective VIEW baked at import by the
+            // MS-OI29500 §17.4.66 conflict passes (table-vs-cell weight,
+            // adjacent-edge weight). A projection that restores or removes
+            // rows re-shapes the table without re-running them, so a
+            // reject-restored row's cells kept authored-only (None) borders
+            // where a save/reopen bakes the table set back in (wave-8 replay
+            // lane policies__383). Recompute on a clone and copy back ONLY
+            // for cells WITHOUT direct borders: an authored cell's `.borders`
+            // is its emission source for non-import construction
+            // (`authored_borders` fallback), and baking there would corrupt
+            // what the serializer writes.
+            let mut baked_rows = t.rows.clone();
+            crate::import::resolve_table_cell_border_conflicts(
+                &mut baked_rows,
+                &t.formatting.borders,
+            );
+            crate::import::resolve_adjacent_cell_border_conflicts(&mut baked_rows);
+            for (row, baked_row) in t.rows.iter_mut().zip(baked_rows) {
+                for (cell, baked_cell) in row.cells.iter_mut().zip(baked_row.cells) {
+                    if !cell.formatting.has_direct_borders {
+                        cell.formatting.borders = baked_cell.formatting.borders;
+                    }
+                }
+            }
+            // The geometry digest was computed at import; the projection just
+            // settled row/cell tracking (dropped rows, settled merges), so the
+            // cached value describes the PRE-projection grid. Recompute so the
+            // projected table equals its own save/reopen (which hashes the
+            // actual rows it parses).
+            t.structure_hash = crate::import::compute_table_structure_hash(&t.rows);
         }
         BlockNode::OpaqueBlock(_) => {}
     }
@@ -6522,7 +7505,7 @@ fn drop_emptied_nested_tables(blocks: &mut Vec<BlockNode>, had_rows: &[bool]) {
 fn project_blocks_for_accept_reject(
     blocks: &mut Vec<TrackedBlock>,
     keep_inserted: bool,
-    style_defs: Option<&crate::styles::StyleDefinitions>,
+    defs: ResolutionDefinitions<'_>,
 ) {
     // Resolve the two Word-reachable move mixtures through the same explicit
     // origin transitions as selective projection. Full projection otherwise
@@ -6595,6 +7578,11 @@ fn project_blocks_for_accept_reject(
         .collect();
     for tb in blocks.iter_mut() {
         tb.status = TrackingStatus::Normal;
+        // The full resolution settles every move, so no block may keep its
+        // move-pair name: a stale `move_id` on a now-Normal block would make
+        // the serializer re-emit `w:moveFrom`/`w:moveTo` carriers for a move
+        // that no longer exists (see the mark/status guard in serialize).
+        tb.move_id = None;
         // Call `project_block_inner` directly (rather than the style-agnostic
         // `project_block_for_accept_reject` wrapper) so the style table threads
         // through to the pPrChange-reject re-resolution.
@@ -6602,7 +7590,7 @@ fn project_blocks_for_accept_reject(
             &mut tb.block,
             keep_inserted,
             /*preserve_formatting_change=*/ false,
-            style_defs,
+            defs,
         );
     }
     let mut idx = 0;
@@ -6617,6 +7605,74 @@ fn project_blocks_for_accept_reject(
 
     // Re-pair any range marker the projection tore.
     collapse_resolution_torn_range_markers(blocks, &range_pair_inventory);
+
+    // A numbered paragraph's rendered label is a VIEW over its position in
+    // the numbering sequence, and this projection can remove earlier items
+    // in the same list — the import-time counter is then stale (a reopened
+    // save re-derives "1." where the stale view still says "2."). Re-derive
+    // every label in document order with the same machinery import uses.
+    // Without the numbering table the label cannot be re-derived; the
+    // paragraph then keeps its import-time label (same degraded contract as
+    // the style-table-less re-resolvers above).
+    renumber_projected_blocks(blocks, defs.numbering);
+}
+
+fn renumber_projected_blocks(
+    blocks: &mut [TrackedBlock],
+    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+) {
+    if let Some(numbering_defs) = numbering_defs {
+        let mut state = crate::numbering::NumberingState::new();
+        fn renumber_block(
+            block: &mut BlockNode,
+            numbering_defs: &crate::numbering::NumberingDefinitions,
+            state: &mut crate::numbering::NumberingState,
+        ) {
+            match block {
+                BlockNode::Paragraph(paragraph) => {
+                    if paragraph.numbering_suppressed {
+                        return;
+                    }
+                    let Some(numbering) = &mut paragraph.numbering else {
+                        return;
+                    };
+                    let Ok(label) =
+                        state.synthesize(numbering_defs, numbering.num_id, numbering.ilvl)
+                    else {
+                        // Unresolvable numId in a wild document: the label
+                        // cannot be re-derived; keep the import-time one.
+                        return;
+                    };
+                    if numbering.synthesized_text != label {
+                        numbering.synthesized_text = label.clone();
+                        let body: String = paragraph
+                            .segments
+                            .iter()
+                            .flat_map(|segment| &segment.inlines)
+                            .filter_map(|inline| match inline {
+                                InlineNode::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        paragraph.rendered_text = Some(format!("{label}	{body}"));
+                    }
+                }
+                BlockNode::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            for nested in &mut cell.blocks {
+                                renumber_block(nested, numbering_defs, state);
+                            }
+                        }
+                    }
+                }
+                BlockNode::OpaqueBlock(_) => {}
+            }
+        }
+        for tracked in blocks {
+            renumber_block(&mut tracked.block, numbering_defs, &mut state);
+        }
+    }
 }
 
 // ============================================================================
@@ -6710,14 +7766,14 @@ type RangePairKey = (RangePairFamily, String);
 /// must be visible to the pairing, or its inline partner's removal would orphan
 /// it.
 enum RangeHalf {
-    Inline(InlineNode),
+    Inline(Box<InlineNode>),
     OpaqueBlock,
 }
 
 impl RangeHalf {
     fn inline(&self) -> Option<&InlineNode> {
         match self {
-            RangeHalf::Inline(n) => Some(n),
+            RangeHalf::Inline(n) => Some(n.as_ref()),
             RangeHalf::OpaqueBlock => None,
         }
     }
@@ -6768,7 +7824,7 @@ fn capture_range_pair_inventory(
                     for inline in &seg.inlines {
                         if let Some((family, id, role)) = classify_range_pair_marker(inline) {
                             let slot = map.entry((family, id)).or_default();
-                            assign(slot, role, RangeHalf::Inline(inline.clone()));
+                            assign(slot, role, RangeHalf::Inline(Box::new(inline.clone())));
                         }
                     }
                 }
@@ -7722,6 +8778,7 @@ pub fn enumerate_revisions(doc: &CanonDoc) -> Vec<RevisionRecord> {
     // sentinel 0. Without this the inventory could report zero while a textbox
     // hides twenty live tracked changes.
     let interior_demoted = classify_interior_ids(doc).demoted;
+    let mut frame_ordinal: u32 = 0;
     crate::opaque_targets::visit_opaque_interiors(doc, &mut |block_id, location, interior| {
         match interior {
             crate::opaque_targets::OpaqueInteriorRef::Inline(o) => {
@@ -7736,10 +8793,23 @@ pub fn enumerate_revisions(doc: &CanonDoc) -> Vec<RevisionRecord> {
                     // sees them, not a false zero (RFC-0002 §Phase-3). A
                     // drawing carrying interior tracked changes IS a textbox; other
                     // opaque kinds (SDT, object) keep their hosting story.
-                    let text_frame =
-                        matches!(o.kind, OpaqueKind::Drawing).then(|| StoryScope::TextFrame {
-                            anchor: o.id.clone(),
-                        });
+                    //
+                    // The anchor is the frame's ordinal in DOCUMENT ORDER, not a
+                    // node id and not the hosting block id. Node ids embed a
+                    // document-wide inline counter and block ids are positional,
+                    // so either renames the story whenever content churns ABOVE
+                    // the frame across a save/reopen — and a record's location
+                    // must not move when the revision did not (wave-8 lifecycle
+                    // 913; the host here has no paraId and duplicated text, so
+                    // no per-paragraph durable key exists). The named boundary:
+                    // adding or removing a FRAME above renames later frames —
+                    // a change to the frame population itself, the same rule
+                    // ordinals follow everywhere in the identity model.
+                    let text_frame = matches!(o.kind, OpaqueKind::Drawing).then(|| {
+                        let anchor = NodeId::from(format!("frame_{frame_ordinal}"));
+                        frame_ordinal += 1;
+                        StoryScope::TextFrame { anchor }
+                    });
                     let loc = text_frame.as_ref().unwrap_or(location);
                     enumerate_opaque_interior_revisions(
                         &mut out,
@@ -7929,13 +8999,17 @@ fn enumerate_table_revisions(
         });
     }
     for (ri, row) in t.rows.iter().enumerate() {
+        let row_label = row
+            .para_id
+            .as_deref()
+            .map_or_else(|| ri.to_string(), |para_id| format!("id:{para_id}"));
         if let Some(status) = &row.tracking_status {
             push_status_records(
                 out,
                 status,
                 block_id,
                 location,
-                &format!("row[{ri}]: {}", row_text_excerpt(row)),
+                &format!("row[{row_label}]: {}", row_text_excerpt(row)),
             );
         }
         if let Some(fc) = &row.formatting_change {
@@ -7947,7 +9021,7 @@ fn enumerate_table_revisions(
                 kind: RevisionKind::FormatRow,
                 block_id: block_id.clone(),
                 location: location.clone(),
-                excerpt: format!("row[{ri}] formatting"),
+                excerpt: format!("row[{row_label}] formatting"),
             });
         }
         for (ci, cell) in row.cells.iter().enumerate() {
@@ -7989,6 +9063,15 @@ fn enumerate_paragraph_revisions(
     block_id: &NodeId,
     location: &StoryScope,
 ) {
+    let paragraph_text: String = p
+        .segments
+        .iter()
+        .flat_map(|segment| segment.inlines.iter())
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
     for segment in &p.segments {
         let text: String = segment
             .inlines
@@ -8005,7 +9088,12 @@ fn enumerate_paragraph_revisions(
                 _ => None,
             })
             .collect();
-        push_status_records(out, &segment.status, block_id, location, &text);
+        let excerpt = if text.is_empty() {
+            paragraph_text.as_str()
+        } else {
+            text.as_str()
+        };
+        push_status_records(out, &segment.status, block_id, location, excerpt);
         for inline in &segment.inlines {
             match inline {
                 InlineNode::Text(t) => {
@@ -8056,7 +9144,12 @@ fn enumerate_paragraph_revisions(
         }
     }
     if let Some(status) = &p.para_mark_status {
-        push_status_records(out, status, block_id, location, "\u{00b6} paragraph mark");
+        let excerpt = if paragraph_text.is_empty() {
+            "\u{00b6} paragraph mark".to_string()
+        } else {
+            format!("\u{00b6} paragraph mark: {paragraph_text}")
+        };
+        push_status_records(out, status, block_id, location, &excerpt);
     }
     if let Some(fc) = &p.formatting_change {
         out.push(RevisionRecord {
@@ -8478,14 +9571,21 @@ pub(crate) fn reject_paragraph_formatting(p: &mut ParagraphNode) {
     let Some(fc) = p.formatting_change.take() else {
         return;
     };
+    // Effective paragraph values can differ from the authored-direct snapshot
+    // Word stores inside pPrChange (style cascade, numbering indentation, and
+    // tab absorption all contribute). If this formatting change did not alter
+    // the paragraph's direct indent/spacing, retain the already-correct
+    // effective value rather than replacing it with the raw snapshot on reject.
+    let effective_indent_before = p.indent.clone();
+    let effective_spacing_before = p.spacing.clone();
+    let direct_indent_before = p.authored_indent.clone();
+    let direct_spacing_before = p.authored_spacing.clone();
     let crate::domain::ParagraphFormattingChange {
         previous_alignment,
         previous_indentation,
         previous_spacing,
         previous_numbering,
-        // A serialization hint (numId=0 vs prefix disambiguation), not a separate
-        // live field: the live numbering is restored via `previous_numbering`.
-        previous_numbering_explicitly_absent: _,
+        previous_numbering_explicitly_absent,
         previous_style_id,
         previous_keep_next,
         previous_keep_lines,
@@ -8499,6 +9599,7 @@ pub(crate) fn reject_paragraph_formatting(p: &mut ParagraphNode) {
         previous_literal_prefix_trailing_tab_stop_twips,
         previous_paragraph_mark_marks,
         previous_paragraph_mark_style_props,
+        previous_paragraph_mark_rfonts,
         previous_paragraph_mark_rpr_off,
         previous_text_direction,
         previous_text_alignment,
@@ -8541,13 +9642,27 @@ pub(crate) fn reject_paragraph_formatting(p: &mut ParagraphNode) {
     // as import of a direct-only paragraph).
     p.authored_indent = previous_indentation.clone();
     p.authored_spacing = previous_spacing.clone();
-    p.indent = previous_indentation;
-    p.spacing = previous_spacing;
+    p.indent = if direct_indent_before == previous_indentation {
+        effective_indent_before
+    } else {
+        previous_indentation
+    };
+    p.spacing = if direct_spacing_before == previous_spacing {
+        effective_spacing_before
+    } else {
+        previous_spacing
+    };
     // Restore the numbering emission gate to match the base numbering. Like the
     // authored_indent restore above, reject treats the restored value as direct
     // (there is no live cascade to re-resolve here — the pPrChange inner pPr is
     // the previous DIRECT pPr).
     p.has_direct_numbering = previous_numbering.is_some();
+    // The inner pPr carries `numId=0` when the base had no numbering
+    // (§17.9.18), and every consumer — Word, and our own byte path — reads
+    // that back as EXPLICIT suppression. The model has to say the same thing,
+    // or rejecting the change leaves the archive claiming suppression while
+    // the typed projection claims inherited numbering.
+    p.numbering_suppressed = previous_numbering.is_none() && previous_numbering_explicitly_absent;
     p.numbering = previous_numbering;
     p.style_id = previous_style_id;
     p.keep_next = previous_keep_next;
@@ -8562,6 +9677,7 @@ pub(crate) fn reject_paragraph_formatting(p: &mut ParagraphNode) {
     p.literal_prefix_trailing_tab_stop_twips = previous_literal_prefix_trailing_tab_stop_twips;
     p.paragraph_mark_marks = previous_paragraph_mark_marks;
     p.paragraph_mark_style_props = previous_paragraph_mark_style_props;
+    p.paragraph_mark_rfonts = previous_paragraph_mark_rfonts;
     p.paragraph_mark_rpr_off = previous_paragraph_mark_rpr_off;
     p.text_direction = previous_text_direction;
     p.text_alignment = previous_text_alignment;
@@ -8642,6 +9758,433 @@ fn reresolve_paragraph_style_inherited_marks(
             para_style_id,
         )
         .expect(expect_ctx);
+    }
+}
+
+/// Re-resolve the effective alignment after rejecting a pPrChange. The inner
+/// pPr stores only the previous direct `w:jc`; when it is absent, the paragraph
+/// must regain alignment from its restored/default style rather than collapsing
+/// to the raw absence.
+fn reresolve_paragraph_alignment(
+    paragraph: &mut ParagraphNode,
+    style_defs: &crate::styles::StyleDefinitions,
+) {
+    let style_id = paragraph
+        .style_id
+        .as_deref()
+        .or_else(|| style_defs.default_para_style_id());
+    let direct = paragraph
+        .has_direct_align
+        .then_some(paragraph.align.as_ref())
+        .flatten()
+        .map(crate::serialize::alignment_to_string);
+    paragraph.align = style_defs
+        .resolve_effective_alignment(style_id, direct)
+        .as_deref()
+        .map(|value| match value {
+            "left" | "start" => Alignment::Left,
+            "center" => Alignment::Center,
+            "right" | "end" => Alignment::Right,
+            "both" | "justify" => Alignment::Justify,
+            "distribute" => Alignment::Distribute,
+            "highKashida" => Alignment::HighKashida,
+            "lowKashida" => Alignment::LowKashida,
+            "mediumKashida" => Alignment::MediumKashida,
+            "numTab" => Alignment::NumTab,
+            "thaiDistribute" => Alignment::ThaiDistribute,
+            other => panic!("imported style table produced unknown alignment {other:?}"),
+        })
+        .or(Some(Alignment::Left));
+}
+
+/// Re-resolve effective numbering after rejecting a `w:pPrChange`.
+///
+/// The change record restores the previous DIRECT pPr. When its inner pPr has
+/// no `w:numPr`, numbering must fall through to the restored paragraph style
+/// (and then to §17.9.23's pStyle reverse binding), exactly as a fresh import
+/// does. Treating the direct absence as an effective absence makes an in-memory
+/// reject lose a label that returns as soon as the projection is saved and
+/// reopened.
+fn reresolve_paragraph_numbering(
+    paragraph: &mut ParagraphNode,
+    styles: &crate::styles::StyleDefinitions,
+    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+) {
+    let Some(numbering_defs) = numbering_defs else {
+        // The public style-only projection entry point explicitly has no
+        // numbering table and therefore cannot construct NumberingInfo's
+        // presentation fields. Keep its documented degraded behavior.
+        return;
+    };
+
+    // An unmodeled direct numPr (for example, a dangling numId) remains in the
+    // preserved pPr. It still blocks style inheritance on a fresh import, so it
+    // must also block it here even though it cannot become typed NumberingInfo.
+    if paragraph
+        .preserved_ppr
+        .iter()
+        .any(|property| property.name == "numPr" || property.name == "w:numPr")
+    {
+        paragraph.numbering = None;
+        return;
+    }
+
+    let direct = if paragraph.numbering_suppressed {
+        crate::word_ir::DirectNumPr::Suppressed
+    } else if paragraph.has_direct_numbering {
+        let numbering = paragraph
+            .numbering
+            .as_ref()
+            .expect("direct numbering emission gate requires typed numbering");
+        crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps {
+            num_id: numbering.num_id,
+            ilvl: numbering.ilvl,
+        })
+    } else {
+        crate::word_ir::DirectNumPr::Absent
+    };
+
+    let mut effective = styles.resolve_effective_num_props(paragraph.style_id.as_deref(), &direct);
+    if effective.is_none()
+        && direct == crate::word_ir::DirectNumPr::Absent
+        && let Some(style_id) = paragraph.style_id.as_deref()
+        && let Some(&(num_id, ilvl)) = numbering_defs.build_pstyle_reverse_map().get(style_id)
+    {
+        effective = Some(crate::word_ir::NumProps { num_id, ilvl });
+    }
+
+    paragraph.numbering = effective.and_then(|num_props| {
+        let level = numbering_defs.get_level(num_props.num_id, num_props.ilvl)?;
+        Some(crate::domain::NumberingInfo {
+            num_id: num_props.num_id,
+            ilvl: num_props.ilvl,
+            // `project_blocks_for_accept_reject` replays the complete story in
+            // document order immediately after this paragraph pass and fills
+            // the exact counter-derived label.
+            synthesized_text: String::new(),
+            is_bullet: level.num_fmt == crate::numbering::NumFormat::Bullet,
+            restart_numbering: false,
+        })
+    });
+}
+
+/// Re-resolve effective paragraph spacing after projection: the spacing
+/// sibling of [`reresolve_paragraph_indent`], rebuilt from the same sources
+/// (authored-direct `w:spacing` through the style chain, §17.3.1.33
+/// per-attribute) so an in-memory projection agrees with its save/reopen. A
+/// pPrChange reject restores the authored-direct snapshot, which silently
+/// drops the style chain's contribution (wave-8 lifecycle 704: the restored
+/// direct `after=320` erased the style's `line=276/auto`).
+pub(crate) fn reresolve_paragraph_spacing(
+    paragraph: &mut ParagraphNode,
+    styles: &crate::styles::StyleDefinitions,
+) {
+    let style_id = paragraph
+        .style_id
+        .as_deref()
+        .or_else(|| styles.default_para_style_id());
+    let direct = paragraph
+        .has_direct_spacing
+        .then_some(paragraph.authored_spacing.as_ref())
+        .flatten()
+        .map(|spacing| crate::word_ir::SpacingProps {
+            before: spacing.before,
+            after: spacing.after,
+            before_lines: spacing.before_lines,
+            after_lines: spacing.after_lines,
+            before_autospacing: spacing.before_autospacing,
+            after_autospacing: spacing.after_autospacing,
+            line: spacing.line,
+            line_rule: spacing.line_rule.as_ref().map(|rule| {
+                match rule {
+                    crate::domain::LineSpacingRule::Auto => "auto",
+                    crate::domain::LineSpacingRule::Exact => "exact",
+                    crate::domain::LineSpacingRule::AtLeast => "atLeast",
+                }
+                .to_string()
+            }),
+        });
+    paragraph.spacing = styles
+        .resolve_effective_spacing(style_id, direct.as_ref())
+        .map(|spacing| crate::domain::ParagraphSpacing {
+            before: spacing.before,
+            after: spacing.after,
+            before_lines: spacing.before_lines,
+            after_lines: spacing.after_lines,
+            before_autospacing: spacing.before_autospacing,
+            after_autospacing: spacing.after_autospacing,
+            line: spacing.line,
+            line_rule: spacing.line_rule.as_deref().and_then(|rule| match rule {
+                "auto" => Some(crate::domain::LineSpacingRule::Auto),
+                "exact" => Some(crate::domain::LineSpacingRule::Exact),
+                "atLeast" => Some(crate::domain::LineSpacingRule::AtLeast),
+                _ => None,
+            }),
+        });
+}
+
+/// Re-resolve effective indentation after projection restores authored pPr.
+///
+/// A pPrChange snapshots authored-direct properties, while `ParagraphNode::indent`
+/// is the effective rendering projection after style inheritance and tab
+/// absorption. Rebuild that projection from its sources so an in-memory reject
+/// agrees with save/reopen. This also handles a restored materialized literal
+/// prefix: its tab is no longer body text, so a hanging indent must stop being
+/// absorbed into `left`.
+pub(crate) fn reresolve_paragraph_indent(
+    paragraph: &mut ParagraphNode,
+    defs: ResolutionDefinitions<'_>,
+) {
+    let ResolutionDefinitions {
+        styles,
+        numbering: numbering_defs,
+        default_tab_stop,
+    } = defs;
+    let style_id = paragraph
+        .style_id
+        .as_deref()
+        .or_else(|| styles.and_then(crate::styles::StyleDefinitions::default_para_style_id));
+    let direct = paragraph
+        .has_direct_indent
+        .then_some(paragraph.authored_indent.as_ref())
+        .flatten()
+        .map(|indent| crate::word_ir::IndentProps {
+            left: indent.left,
+            right: indent.right,
+            effective_first_line_twips: indent.effective_first_line_twips,
+            start_chars: indent.start_chars,
+            end_chars: indent.end_chars,
+            first_line_chars: indent.first_line_chars,
+            hanging_chars: indent.hanging_chars,
+        });
+    let numbering_level_indent = paragraph
+        .numbering
+        .as_ref()
+        .and_then(|numbering| numbering_defs?.get_level(numbering.num_id, numbering.ilvl))
+        .and_then(|level| level.indent.as_ref());
+    let resolved = if let Some(styles) = styles {
+        styles.resolve_effective_indent(style_id, direct.as_ref(), numbering_level_indent)
+    } else {
+        direct.or_else(|| {
+            numbering_level_indent.map(|indent| crate::word_ir::IndentProps {
+                left: indent.left,
+                right: indent.right,
+                effective_first_line_twips: indent.effective_first_line_twips,
+                start_chars: None,
+                end_chars: None,
+                first_line_chars: None,
+                hanging_chars: None,
+            })
+        })
+    };
+    paragraph.indent = resolved
+        .as_ref()
+        .map(|indent| {
+            let body_has_tab = paragraph.literal_prefix.is_none()
+                && paragraph.segments.iter().any(|segment| {
+                    segment.inlines.iter().any(|inline| {
+                        matches!(inline, InlineNode::Text(text) if text.text.contains('\t'))
+                    })
+                });
+            let first_line = indent.effective_first_line_twips.unwrap_or(0);
+
+            if paragraph.literal_prefix.is_some() {
+                crate::domain::Indentation {
+                    left: Some(indent.left.unwrap_or(0)),
+                    right: indent.right,
+                    effective_first_line_twips: indent.effective_first_line_twips,
+                    start_chars: indent.start_chars,
+                    end_chars: indent.end_chars,
+                    first_line_chars: None,
+                    hanging_chars: None,
+                }
+            } else if body_has_tab && first_line < 0 {
+                crate::domain::Indentation {
+                    left: Some(indent.left.unwrap_or(0) + first_line),
+                    right: indent.right,
+                    effective_first_line_twips: None,
+                    start_chars: indent.start_chars,
+                    end_chars: indent.end_chars,
+                    first_line_chars: None,
+                    hanging_chars: None,
+                }
+            } else {
+                crate::domain::Indentation {
+                    left: indent.left,
+                    right: indent.right,
+                    effective_first_line_twips: indent.effective_first_line_twips,
+                    start_chars: indent.start_chars,
+                    end_chars: indent.end_chars,
+                    first_line_chars: indent.first_line_chars,
+                    hanging_chars: indent.hanging_chars,
+                }
+            }
+        })
+        .or_else(|| {
+            paragraph
+                .literal_prefix
+                .is_some()
+                .then_some(crate::domain::Indentation {
+                    left: Some(0),
+                    right: None,
+                    effective_first_line_twips: None,
+                    start_chars: None,
+                    end_chars: None,
+                    first_line_chars: None,
+                    hanging_chars: None,
+                })
+        });
+
+    // `effective_tab_stops_rel` is a derived view over the same style/direct
+    // pPr sources. Re-hoisting a materialized prefix moves its separator tab
+    // out of body text and changes the body origin, so retaining the old list
+    // makes the in-memory projection disagree with a save/reopen.
+    let resolved_stops = if let Some(styles) = styles {
+        styles.resolve_effective_tabs(style_id, Some(&paragraph.tab_stops))
+    } else {
+        paragraph
+            .tab_stops
+            .iter()
+            .filter(|stop| stop.alignment != crate::domain::TabAlignment::Clear)
+            .cloned()
+            .collect()
+    };
+    let left = resolved
+        .as_ref()
+        .and_then(|indent| indent.left)
+        .unwrap_or(0);
+    let first_line = resolved
+        .as_ref()
+        .and_then(|indent| indent.effective_first_line_twips)
+        .unwrap_or(0);
+    let effective_edge = left + first_line;
+    let body_tab_count = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.matches('\t').count()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let prefix_had_tab = paragraph.literal_prefix.is_some()
+        && (paragraph.literal_prefix_leading_tab_count > 0
+            || paragraph.literal_prefix_leading_ws.contains('\t')
+            || paragraph.literal_prefix_has_trailing_tab
+            || paragraph.literal_prefix_trailing_ws.contains('\t'));
+    let tab_stops_abs = crate::word_ir::synthesize_default_tab_stops(
+        &resolved_stops,
+        body_tab_count + usize::from(prefix_had_tab),
+        default_tab_stop,
+        effective_edge,
+    );
+    let body_left = if prefix_had_tab {
+        tab_stops_abs
+            .iter()
+            .find(|stop| stop.position > effective_edge)
+            .map(|stop| stop.position)
+            .unwrap_or(effective_edge)
+    } else {
+        effective_edge
+    };
+    paragraph.effective_tab_stops_rel = tab_stops_abs
+        .into_iter()
+        .map(|mut stop| {
+            stop.position -= body_left;
+            stop
+        })
+        .filter(|stop| stop.position > 0)
+        .collect();
+    paragraph.literal_prefix_leading_tab_twips = (paragraph.literal_prefix_leading_tab_count > 0
+        || paragraph.literal_prefix_leading_ws.contains('\t'))
+    .then_some(body_left - left);
+    paragraph.literal_prefix_trailing_tab_stop_twips = (prefix_had_tab
+        && resolved_stops.iter().any(|stop| stop.position == body_left))
+    .then_some(body_left - left);
+}
+
+/// Re-apply the package style cascade to every paragraph run in a canonical
+/// document without changing node or revision identities.
+///
+/// Runtime edits keep the typed canonical tree in memory after writing the
+/// corresponding DOCX. Newly synthesized runs intentionally carry only their
+/// exemplar's direct-property provenance; WordprocessingML import, however,
+/// exposes their effective values after applying document defaults and the
+/// paragraph/character style chains. Normalizing the rebuilt snapshot here
+/// makes the next edit observe the same formatting whether the caller keeps the
+/// session alive or serializes and reopens it between transactions.
+pub(crate) fn reresolve_document_style_inherited_marks(
+    doc: &mut CanonDoc,
+    style_defs: &crate::styles::StyleDefinitions,
+    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+) {
+    fn normalize_paragraph(
+        paragraph: &mut ParagraphNode,
+        style_defs: &crate::styles::StyleDefinitions,
+        _numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+    ) {
+        reresolve_paragraph_style_inherited_marks(paragraph, style_defs);
+    }
+
+    fn visit_bare(
+        blocks: &mut [BlockNode],
+        style_defs: &crate::styles::StyleDefinitions,
+        numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+    ) {
+        for block in blocks {
+            match block {
+                BlockNode::Paragraph(paragraph) => {
+                    normalize_paragraph(paragraph, style_defs, numbering_defs);
+                }
+                BlockNode::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            visit_bare(&mut cell.blocks, style_defs, numbering_defs);
+                        }
+                    }
+                }
+                BlockNode::OpaqueBlock(_) => {}
+            }
+        }
+    }
+
+    fn visit_tracked(
+        blocks: &mut [TrackedBlock],
+        style_defs: &crate::styles::StyleDefinitions,
+        numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+    ) {
+        for tracked in blocks {
+            match &mut tracked.block {
+                BlockNode::Paragraph(paragraph) => {
+                    normalize_paragraph(paragraph, style_defs, numbering_defs);
+                }
+                BlockNode::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            visit_bare(&mut cell.blocks, style_defs, numbering_defs);
+                        }
+                    }
+                }
+                BlockNode::OpaqueBlock(_) => {}
+            }
+        }
+    }
+
+    visit_tracked(&mut doc.blocks, style_defs, numbering_defs);
+    for story in &mut doc.headers {
+        visit_tracked(&mut story.blocks, style_defs, numbering_defs);
+    }
+    for story in &mut doc.footers {
+        visit_tracked(&mut story.blocks, style_defs, numbering_defs);
+    }
+    for story in &mut doc.footnotes {
+        visit_tracked(&mut story.blocks, style_defs, numbering_defs);
+    }
+    for story in &mut doc.endnotes {
+        visit_tracked(&mut story.blocks, style_defs, numbering_defs);
+    }
+    for story in &mut doc.comments {
+        visit_tracked(&mut story.blocks, style_defs, numbering_defs);
     }
 }
 
@@ -8738,16 +10281,27 @@ pub(crate) fn reject_cell_formatting(cell: &mut crate::domain::TableCellNode) {
 
 fn project_block_for_selected_resolution(
     block: &mut BlockNode,
+    outer_tracking_resolved: bool,
     action: ResolveSelectionAction,
     selected_revision_ids: &HashSet<u32>,
     interior_selected: &HashSet<u32>,
-    style_defs: Option<&crate::styles::StyleDefinitions>,
+    defs: ResolutionDefinitions<'_>,
 ) {
     match block {
         BlockNode::Paragraph(p) => {
+            let paragraph_tracking_resolved =
+                p.segments.iter().any(|segment| {
+                    status_carries_selected_id(&segment.status, selected_revision_ids)
+                }) || p.para_mark_status.as_ref().is_some_and(|status| {
+                    status_carries_selected_id(status, selected_revision_ids)
+                });
             // Snapshot the style so a selectively-rejected pPrChange that swaps
             // it triggers run re-resolution below, exactly like the full path.
             let style_before = p.style_id.clone();
+            let rejects_paragraph_formatting = action == ResolveSelectionAction::Reject
+                && p.formatting_change.as_ref().is_some_and(|change| {
+                    change.revision_id != 0 && selected_revision_ids.contains(&change.identity)
+                });
             p.segments.retain(|segment| {
                 selected_tracking_outcome(&segment.status, action, selected_revision_ids)
                     != SelectedTrackingOutcome::Drop
@@ -8921,14 +10475,32 @@ fn project_block_for_selected_resolution(
             // A selectively-rejected paragraph-style change swaps `style_id`
             // under runs resolved against the old style — re-run the cascade so
             // their style-inherited marks match, mirroring the full path.
-            if let Some(style_defs) = style_defs
-                && p.style_id != style_before
+            if let Some(style_defs) = defs.styles
+                && (rejects_paragraph_formatting || p.style_id != style_before)
             {
+                if rejects_paragraph_formatting {
+                    reresolve_paragraph_alignment(p, style_defs);
+                    reresolve_paragraph_numbering(p, style_defs, defs.numbering);
+                }
                 reresolve_paragraph_style_inherited_marks(p, style_defs);
             }
 
-            if !paragraph_has_unresolved_tracking(p) && p.formatting_change.is_none() {
-                normalize_paragraph_after_projection(p, /*preserve_formatting_change=*/ false);
+            // Projection normalization is a content-resolution operation: it
+            // flattens segments and may re-hoist a materialized literal prefix.
+            // Applying it to every already-clean paragraph makes a selective
+            // resolution mutate unrelated pending whole-block insertions. Only
+            // normalize when this selection actually resolved the paragraph's
+            // own text/pilcrow tracking or its enclosing block tracking.
+            if (outer_tracking_resolved || paragraph_tracking_resolved)
+                && !paragraph_has_unresolved_tracking(p)
+                && p.formatting_change.is_none()
+            {
+                let restored_literal_prefix = normalize_paragraph_after_projection(
+                    p, /*preserve_formatting_change=*/ false,
+                );
+                if rejects_paragraph_formatting || restored_literal_prefix {
+                    reresolve_paragraph_indent(p, defs);
+                }
             }
         }
         BlockNode::Table(t) => {
@@ -9031,10 +10603,11 @@ fn project_block_for_selected_resolution(
                     for nested in &mut cell.blocks {
                         project_block_for_selected_resolution(
                             nested,
+                            false,
                             action,
                             selected_revision_ids,
                             interior_selected,
-                            style_defs,
+                            defs,
                         );
                     }
                     drop_emptied_nested_tables(&mut cell.blocks, &nested_had_rows);
@@ -9050,7 +10623,7 @@ fn project_blocks_for_selected_resolution(
     action: ResolveSelectionAction,
     selected_revision_ids: &HashSet<u32>,
     interior_selected: &HashSet<u32>,
-    style_defs: Option<&crate::styles::StyleDefinitions>,
+    defs: ResolutionDefinitions<'_>,
 ) {
     let resolved_move_names = selected_move_names(blocks, selected_revision_ids);
     let move_plans = selected_move_plans(blocks, selected_revision_ids);
@@ -9088,17 +10661,19 @@ fn project_blocks_for_selected_resolution(
         })
         .collect();
     for tb in blocks.iter_mut() {
-        if selected_tracking_outcome(&tb.status, action, selected_revision_ids)
-            == SelectedTrackingOutcome::KeepNormal
-        {
+        let outer_tracking_resolved =
+            selected_tracking_outcome(&tb.status, action, selected_revision_ids)
+                == SelectedTrackingOutcome::KeepNormal;
+        if outer_tracking_resolved {
             tb.status = TrackingStatus::Normal;
         }
         project_block_for_selected_resolution(
             &mut tb.block,
+            outer_tracking_resolved,
             action,
             selected_revision_ids,
             interior_selected,
-            style_defs,
+            defs,
         );
     }
     let mut idx = 0;
@@ -9114,6 +10689,7 @@ fn project_blocks_for_selected_resolution(
     collapse_resolution_torn_range_markers(blocks, &range_pair_inventory);
     resolve_selected_move_layout(blocks, action, &move_plans);
     clear_resolved_move_markup(blocks, &resolved_move_names);
+    renumber_projected_blocks(blocks, defs.numbering);
 }
 
 #[derive(Clone)]
@@ -10057,6 +11633,21 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
     action: ResolveSelectionAction,
     style_defs: Option<&crate::styles::StyleDefinitions>,
 ) -> Result<Option<bool>, Vec<u32>> {
+    resolve_selected_revisions_with_definitions(
+        doc,
+        selected_revision_ids,
+        action,
+        ResolutionDefinitions::styles_only(style_defs),
+    )
+}
+
+pub(crate) fn resolve_selected_revisions_with_definitions(
+    doc: &mut CanonDoc,
+    selected_revision_ids: &HashSet<u32>,
+    action: ResolveSelectionAction,
+    defs: ResolutionDefinitions<'_>,
+) -> Result<Option<bool>, Vec<u32>> {
+    let referenced_stories_before = section_referenced_part_paths(doc);
     let resolvable = resolvable_revision_ids(doc);
     let mut unresolved: Vec<u32> = selected_revision_ids
         .difference(&resolvable)
@@ -10082,7 +11673,7 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
         action,
         selected_revision_ids,
         &interior_selected,
-        style_defs,
+        defs,
     );
     // Re-establish the document-final-mark invariant the projection can break
     // (suppression stripped off a tracked tail, or an anchor stranded as final
@@ -10095,7 +11686,7 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
             action,
             selected_revision_ids,
             &interior_selected,
-            style_defs,
+            defs,
         );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
@@ -10105,28 +11696,44 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
             action,
             selected_revision_ids,
             &interior_selected,
-            style_defs,
+            defs,
         );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footnotes {
+        let rejected_insert = note_story_insert_identity(&story.blocks)
+            .is_some_and(|identity| selected_revision_ids.contains(&identity));
         project_blocks_for_selected_resolution(
             &mut story.blocks,
             action,
             selected_revision_ids,
             &interior_selected,
-            style_defs,
+            defs,
         );
+        if rejected_insert
+            && action == ResolveSelectionAction::Reject
+            && !note_story_has_body_content(&story.blocks)
+        {
+            story.blocks.clear();
+        }
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.endnotes {
+        let rejected_insert = note_story_insert_identity(&story.blocks)
+            .is_some_and(|identity| selected_revision_ids.contains(&identity));
         project_blocks_for_selected_resolution(
             &mut story.blocks,
             action,
             selected_revision_ids,
             &interior_selected,
-            style_defs,
+            defs,
         );
+        if rejected_insert
+            && action == ResolveSelectionAction::Reject
+            && !note_story_has_body_content(&story.blocks)
+        {
+            story.blocks.clear();
+        }
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.comments {
@@ -10143,7 +11750,7 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
             action,
             selected_revision_ids,
             &interior_selected,
-            style_defs,
+            defs,
         );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
@@ -10175,23 +11782,24 @@ pub(crate) fn resolve_selected_revisions_with_style_defs(
                 && selected_revision_ids.contains(&change.revision.identity)
     );
     if !should_resolve {
+        prune_newly_unreferenced_stories(
+            doc,
+            &referenced_stories_before,
+            // A projection runs no link verb, so nothing here is an explicit
+            // detach: every lost reference lost its carrying content.
+            &std::collections::HashSet::new(),
+        );
         return Ok(None);
     }
-    let change = doc
-        .body_section_property_change
-        .take()
-        .expect("just matched Some above");
     let keep_new = action == ResolveSelectionAction::Accept;
-    if !keep_new
-        && let Some(prev) = parse_previous_section_properties(&change.previous_properties_raw)
-    {
-        doc.body_section_properties = Some(prev);
-    }
-    // If the raw snapshot fails to parse on reject, leave the current
-    // properties in place rather than fabricate a default — same defensive
-    // stance as `project_body_section_for_accept_reject`'s reject arm (a
-    // sectPrChange the engine authored always round-trips; this is a
-    // defensive branch, not an expected path).
+    project_body_section_for_accept_reject(doc, keep_new);
+    prune_newly_unreferenced_stories(
+        doc,
+        &referenced_stories_before,
+        // A projection runs no link verb, so nothing here is an explicit
+        // detach: every lost reference lost its carrying content.
+        &std::collections::HashSet::new(),
+    );
     Ok(Some(keep_new))
 }
 
@@ -10213,6 +11821,50 @@ fn recompute_content_hash(blocks: &[TrackedBlock]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// The identity of an engine-authored whole-note insertion, in either its live
+/// outer-block form or its serialized content+pilcrow form.
+fn note_story_insert_identity(blocks: &[TrackedBlock]) -> Option<u32> {
+    let first = blocks.first()?;
+    if let TrackingStatus::Inserted(revision) = &first.status {
+        return Some(revision.identity);
+    }
+    let BlockNode::Paragraph(paragraph) = &first.block else {
+        return None;
+    };
+    let Some(TrackingStatus::Inserted(mark)) = &paragraph.para_mark_status else {
+        return None;
+    };
+    paragraph
+        .segments
+        .iter()
+        .any(|segment| {
+            matches!(
+                &segment.status,
+                TrackingStatus::Inserted(revision) if revision.identity == mark.identity
+            )
+        })
+        .then_some(mark.identity)
+}
+
+/// A note body's auto-number decoration is structural scaffolding, not note
+/// content. After rejecting an inserted note, a reopened story can retain only
+/// that marker; treat the story as empty so the existing orphan cleanup removes
+/// it just like the live outer-block representation.
+fn note_story_has_body_content(blocks: &[TrackedBlock]) -> bool {
+    blocks.iter().any(|tracked| match &tracked.block {
+        BlockNode::Paragraph(paragraph) => paragraph.all_inlines().any(|inline| match inline {
+            InlineNode::Text(text) => !text.text.is_empty(),
+            InlineNode::OpaqueInline(_) | InlineNode::HardBreak(_) => true,
+            InlineNode::Decoration(_)
+            | InlineNode::CommentRangeStart { .. }
+            | InlineNode::CommentRangeEnd { .. }
+            | InlineNode::CommentReference { .. } => false,
+        }),
+        BlockNode::Table(_) => true,
+        BlockNode::OpaqueBlock(_) => true,
+    })
 }
 
 /// Extract text from a block for hashing (mirrors `runtime::extract_block_text`).
@@ -10394,27 +12046,34 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
 }
 
 pub fn accept_all(doc: &mut CanonDoc) {
-    // Accept keeps each paragraph's CURRENT style (it only drops the pPrChange
-    // record), so no run mark needs re-resolving — the style table is not needed.
-    project_blocks_for_accept_reject(&mut doc.blocks, true, None);
+    accept_all_with_definitions(doc, ResolutionDefinitions::NONE);
+}
+
+pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
+    let referenced_stories_before = section_referenced_part_paths(doc);
+    // Accept keeps each paragraph's current style, but resolving inserted text
+    // can restore a materialized literal prefix. That changes derived indent
+    // and tab geometry and therefore needs the package definitions to match a
+    // save/reopen projection.
+    project_blocks_for_accept_reject(&mut doc.blocks, true, defs);
     for story in &mut doc.headers {
-        project_blocks_for_accept_reject(&mut story.blocks, true, None);
+        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footers {
-        project_blocks_for_accept_reject(&mut story.blocks, true, None);
+        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, true, None);
+        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.endnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, true, None);
+        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.comments {
-        project_blocks_for_accept_reject(&mut story.blocks, true, None);
+        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     // Remove comment stories whose blocks were all projected away, or that
@@ -10434,6 +12093,13 @@ pub fn accept_all(doc: &mut CanonDoc) {
     // Body-level section change (w:sectPrChange, §17.13.5.32): accept keeps the
     // new section properties and drops the change record.
     project_body_section_for_accept_reject(doc, true);
+    prune_newly_unreferenced_stories(
+        doc,
+        &referenced_stories_before,
+        // A projection runs no link verb, so nothing here is an explicit
+        // detach: every lost reference lost its carrying content.
+        &std::collections::HashSet::new(),
+    );
 }
 
 /// Accept/reject a body-level `w:sectPrChange` (§17.13.5.32) at the model layer.
@@ -10500,9 +12166,39 @@ fn prune_blank_unreferenced_stories(doc: &mut CanonDoc) {
         .retain(|f| referenced.contains(&f.part_name) || story_has_visible_text(&f.blocks));
 }
 
+/// Remove a header/footer part only when this transaction removed its last
+/// section reference *by removing the content that carried it*. This is
+/// intentionally relative to the pre-transaction reference set: content-bearing
+/// parts that were already orphaned on input remain the document's own state,
+/// while a part orphaned by deleting the paragraph or section that referenced
+/// it follows the archive-level resolution and is removed — which is what makes
+/// `accept(track(P))` and `direct(P)` agree for such a deletion.
+///
+/// `explicitly_unlinked` names the one way a reference disappears WITHOUT its
+/// story becoming garbage: the header/footer link verb detaching it on request.
+/// Unlink's whole contract is that the story survives and stays addressable by
+/// kind, so a later link can restore the reference; pruning it there would make
+/// the verb silently destructive and unlink/relink irreversible.
+pub(crate) fn prune_newly_unreferenced_stories(
+    doc: &mut CanonDoc,
+    referenced_before: &std::collections::HashSet<String>,
+    explicitly_unlinked: &std::collections::HashSet<String>,
+) {
+    let referenced_after = section_referenced_part_paths(doc);
+    let newly_unreferenced: std::collections::HashSet<_> = referenced_before
+        .difference(&referenced_after)
+        .filter(|part| !explicitly_unlinked.contains(*part))
+        .cloned()
+        .collect();
+    doc.headers
+        .retain(|story| !newly_unreferenced.contains(&story.part_name));
+    doc.footers
+        .retain(|story| !newly_unreferenced.contains(&story.part_name));
+}
+
 /// Every header/footer part path referenced by the body section or by any
 /// paragraph-level (mid-document) section break.
-fn section_referenced_part_paths(doc: &CanonDoc) -> std::collections::HashSet<String> {
+pub(crate) fn section_referenced_part_paths(doc: &CanonDoc) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let mut collect = |sp: &SectionProperties| {
         for r in sp.header_refs.iter().chain(sp.footer_refs.iter()) {
@@ -10624,27 +12320,40 @@ pub(crate) fn reject_all_with_style_defs(
     doc: &mut CanonDoc,
     style_defs: Option<&crate::styles::StyleDefinitions>,
 ) {
-    project_blocks_for_accept_reject(&mut doc.blocks, false, style_defs);
+    reject_all_with_definitions(doc, ResolutionDefinitions::styles_only(style_defs));
+}
+
+pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
+    let referenced_stories_before = section_referenced_part_paths(doc);
+    project_blocks_for_accept_reject(&mut doc.blocks, false, defs);
     for story in &mut doc.headers {
-        project_blocks_for_accept_reject(&mut story.blocks, false, style_defs);
+        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footers {
-        project_blocks_for_accept_reject(&mut story.blocks, false, style_defs);
+        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, false, style_defs);
+        let rejected_insert = note_story_insert_identity(&story.blocks).is_some();
+        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        if rejected_insert && !note_story_has_body_content(&story.blocks) {
+            story.blocks.clear();
+        }
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.endnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, false, style_defs);
+        let rejected_insert = note_story_insert_identity(&story.blocks).is_some();
+        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        if rejected_insert && !note_story_has_body_content(&story.blocks) {
+            story.blocks.clear();
+        }
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.comments {
         // On reject, clear story-level deletion tracking (keep the comment).
         story.tracking_status = None;
-        project_blocks_for_accept_reject(&mut story.blocks, false, style_defs);
+        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     // Remove comment stories whose blocks were all projected away.
@@ -10658,6 +12367,13 @@ pub(crate) fn reject_all_with_style_defs(
     // Body-level section change (w:sectPrChange, §17.13.5.32): reject restores
     // the prior section properties and drops the change record.
     project_body_section_for_accept_reject(doc, false);
+    prune_newly_unreferenced_stories(
+        doc,
+        &referenced_stories_before,
+        // A projection runs no link verb, so nothing here is an explicit
+        // detach: every lost reference lost its carrying content.
+        &std::collections::HashSet::new(),
+    );
 }
 
 // =============================================================================
@@ -10848,6 +12564,7 @@ pub(crate) fn assert_body_invariants(doc: &CanonDoc) -> Result<(), Vec<Invariant
 /// resolve it, and `renormalize_final_mark_after_selective` re-establishes it
 /// after a selective projection. So this fuller check is wired only after
 /// `project`.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn assert_resolution_body_invariants(doc: &CanonDoc) -> Result<(), Vec<InvariantViolation>> {
     let mut violations = Vec::new();
     check_final_mark(&doc.blocks, &mut violations);
@@ -10913,6 +12630,7 @@ pub(crate) fn debug_assert_resolution_body_invariants(_doc: &CanonDoc, _producer
 /// The two invariants below are different: import NEVER constructs a
 /// `Some(Normal)` pilcrow suppression or a block-level `InsertedThenDeleted`, so
 /// their appearance after import IS an import bug — worth a debug panic.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn assert_import_body_invariants(doc: &CanonDoc) -> Result<(), Vec<InvariantViolation>> {
     let mut violations = Vec::new();
     check_mark_suppression(&doc.blocks, &mut violations);
@@ -10944,6 +12662,7 @@ pub(crate) fn debug_assert_import_body_invariants(doc: &CanonDoc, producer: &str
 pub(crate) fn debug_assert_import_body_invariants(_doc: &CanonDoc, _producer: &str) {}
 
 /// A short human word for a tracking status, for violation messages.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn tracking_status_word(status: &TrackingStatus) -> &'static str {
     match status {
         TrackingStatus::Normal => "normal",
@@ -10957,15 +12676,14 @@ fn tracking_status_word(status: &TrackingStatus) -> &'static str {
 /// change. Mirrors `renormalize_final_mark_after_selective`'s forbidden state
 /// (`effective` mark is `Inserted`/`Deleted`) and `normalize_final_mark_
 /// attribution`'s single exemption (a document-final moveFrom shadow).
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn check_final_mark(blocks: &[TrackedBlock], out: &mut Vec<InvariantViolation>) {
-    let Some(last) = blocks.len().checked_sub(1) else {
+    let Some(last) = document_final_paragraph_index(blocks) else {
         return;
     };
     let tb = &blocks[last];
     let BlockNode::Paragraph(p) = &tb.block else {
-        // A body always ends in a paragraph; a trailing table/opaque is a
-        // separate structural concern, not the final-mark rule.
-        return;
+        unreachable!("document_final_paragraph_index only returns paragraphs");
     };
     // What serialize emits for the final pilcrow: the paragraph's own
     // para_mark_status, else the block-level status.
@@ -11315,6 +13033,7 @@ mod tests {
             previous_literal_prefix_trailing_tab_stop_twips: Some(1440),
             previous_paragraph_mark_marks: vec![Mark::Bold],
             previous_paragraph_mark_style_props: StyleProps::default(),
+            previous_paragraph_mark_rfonts: Default::default(),
             previous_paragraph_mark_rpr_off: Default::default(),
             previous_text_direction: None,
             previous_text_alignment: None,
@@ -11413,6 +13132,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -11458,6 +13178,8 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })
@@ -11501,6 +13223,8 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })
@@ -11523,6 +13247,8 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: Some(format!("field:{instruction_text}:{result_text}")),
         })
@@ -12347,6 +14073,99 @@ mod tests {
         })
     }
 
+    #[test]
+    fn later_tail_insert_stops_at_a_previously_suppressed_insert_anchor() {
+        let table = h2_table(
+            "tbl",
+            vec![h2_row(
+                "row",
+                vec![h2_cell(
+                    "cell",
+                    vec![BlockNode::from(h2_para("cell_p"))],
+                    None,
+                )],
+                None,
+            )],
+        );
+        let mut prior_tail = h2_para("prior_tail");
+        prior_tail.para_mark_status = Some(TrackingStatus::Normal);
+        let new_a = h2_para("new_a");
+        let new_b = h2_para("new_b");
+        let mut blocks = vec![
+            normal_tracked_block(table),
+            TrackedBlock {
+                block: BlockNode::from(prior_tail),
+                status: TrackingStatus::Inserted(h2_rev(1)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+            TrackedBlock {
+                block: BlockNode::from(new_a),
+                status: TrackingStatus::Inserted(h2_rev(10)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+            TrackedBlock {
+                block: BlockNode::from(new_b),
+                status: TrackingStatus::Inserted(h2_rev(11)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+        ];
+        let mut next_revision_id = 12;
+
+        normalize_final_mark_attribution(&mut blocks, &h2_rev(10), &mut next_revision_id);
+
+        let BlockNode::Paragraph(prior_tail) = &blocks[1].block else {
+            panic!("prior tail must remain a paragraph");
+        };
+        assert!(
+            matches!(
+                prior_tail.para_mark_status,
+                Some(TrackingStatus::Inserted(_))
+            ),
+            "the prior final insertion becomes the anchor for the new break"
+        );
+        let BlockNode::Paragraph(new_final) = &blocks[3].block else {
+            panic!("new final block must be a paragraph");
+        };
+        assert!(
+            matches!(new_final.para_mark_status, Some(TrackingStatus::Normal)),
+            "the new document-final pilcrow must be suppressed"
+        );
+    }
+
+    #[test]
+    fn later_edit_does_not_renormalize_an_already_suppressed_move_tail() {
+        let anchor = h2_para("anchor");
+        let mut moved_tail = h2_para("moved_tail");
+        moved_tail.para_mark_status = Some(TrackingStatus::Normal);
+        let mut blocks = vec![
+            normal_tracked_block(BlockNode::from(anchor)),
+            TrackedBlock {
+                block: BlockNode::from(moved_tail),
+                status: TrackingStatus::Inserted(h2_rev(1)),
+                move_id: Some("prior-move".to_string()),
+                block_sdt_wrap: None,
+            },
+        ];
+        let mut next_revision_id = 50;
+
+        normalize_final_mark_attribution(&mut blocks, &h2_rev(50), &mut next_revision_id);
+
+        let BlockNode::Paragraph(anchor) = &blocks[0].block else {
+            panic!("anchor must remain a paragraph");
+        };
+        assert!(
+            anchor.para_mark_status.is_none(),
+            "a later edit must not add its revision to the prior move's anchor"
+        );
+        assert_eq!(
+            next_revision_id, 50,
+            "no revision is minted for an already-normalized move tail"
+        );
+    }
+
     /// Invariant 1 is RESOLUTION-scoped: a pending final mark is flagged by
     /// `assert_resolution_body_invariants` but NOT by the universal
     /// `assert_body_invariants` (merge/apply legitimately leave one, and it is
@@ -12687,6 +14506,162 @@ mod tests {
     }
 
     #[test]
+    fn selective_resolution_does_not_normalize_unrelated_inserted_prefix() {
+        let selected = RevisionInfo {
+            revision_id: 1,
+            identity: 1,
+            author: Some("Editor".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let pending_block = RevisionInfo {
+            revision_id: 2,
+            identity: 2,
+            author: Some("Counterparty".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+
+        let mut edited = make_paragraph("edited", "");
+        let BlockNode::Paragraph(edited_paragraph) = &mut edited else {
+            unreachable!()
+        };
+        edited_paragraph.segments = vec![
+            tracked_text_segment(
+                "edited_old",
+                "old",
+                TrackingStatus::Deleted(selected.clone()),
+            ),
+            tracked_text_segment("edited_new", "new", TrackingStatus::Inserted(selected)),
+        ];
+
+        // This is the stable in-memory shape of a pending whole-paragraph
+        // insertion whose manual label is carried inside the inserted content.
+        // Resolving a different identity must preserve it byte-for-byte.
+        let mut unrelated = make_paragraph("unrelated", "body");
+        let BlockNode::Paragraph(unrelated_paragraph) = &mut unrelated else {
+            unreachable!()
+        };
+        unrelated_paragraph.segments[0].inlines.insert(
+            0,
+            InlineNode::from(TextNode {
+                id: materialized_prefix_node_id(
+                    &unrelated_paragraph.id,
+                    MaterializedPrefixKind::Structural,
+                ),
+                text_role: None,
+                text: "46.\t".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                formatting_change: None,
+            }),
+        );
+
+        let trailing = make_paragraph("trailing", "tail");
+        let mut doc = make_doc(vec![edited, unrelated, trailing]);
+        doc.blocks[1].status = TrackingStatus::Inserted(pending_block);
+        let before = doc.blocks[1].clone();
+
+        resolve_selected_revisions_with_styles(
+            &mut doc,
+            &HashSet::from([1_u32]),
+            ResolveSelectionAction::Accept,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(doc.blocks[1], before);
+    }
+
+    #[test]
+    fn accept_all_restores_style_geometry_for_inserted_literal_prefix() {
+        let inserted = RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Editor".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let mut block = make_paragraph("clause", "Clause body");
+        let BlockNode::Paragraph(paragraph) = &mut block else {
+            unreachable!()
+        };
+        paragraph.style_id = Some("nzHeading5".into());
+        paragraph.segments[0].inlines.insert(
+            0,
+            InlineNode::from(TextNode {
+                id: materialized_prefix_node_id(&paragraph.id, MaterializedPrefixKind::Structural),
+                text_role: Some(TextRole::MaterializedPrefix(
+                    MaterializedPrefixKind::Structural,
+                )),
+                text: "46.\t".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                formatting_change: None,
+            }),
+        );
+        let mut doc = make_doc(vec![block, make_paragraph("tail", "Tail")]);
+        doc.blocks[0].status = TrackingStatus::Inserted(inserted);
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                 <w:style w:type="paragraph" w:styleId="Heading5">
+                   <w:pPr>
+                     <w:tabs><w:tab w:val="left" w:pos="879"/></w:tabs>
+                     <w:ind w:left="879" w:hanging="879"/>
+                   </w:pPr>
+                 </w:style>
+                 <w:style w:type="paragraph" w:styleId="zHeading5">
+                   <w:basedOn w:val="Heading5"/>
+                   <w:pPr>
+                     <w:tabs>
+                       <w:tab w:val="clear" w:pos="879"/>
+                       <w:tab w:val="left" w:pos="1446"/>
+                     </w:tabs>
+                     <w:ind w:left="1446" w:right="284"/>
+                   </w:pPr>
+                 </w:style>
+                 <w:style w:type="paragraph" w:styleId="nzHeading5">
+                   <w:basedOn w:val="zHeading5"/>
+                 </w:style>
+               </w:styles>"#,
+        )
+        .expect("styles part must parse");
+
+        accept_all_with_definitions(
+            &mut doc,
+            ResolutionDefinitions {
+                styles: Some(&styles),
+                numbering: None,
+                default_tab_stop: 360,
+            },
+        );
+
+        let BlockNode::Paragraph(paragraph) = &doc.blocks[0].block else {
+            unreachable!()
+        };
+        assert!(matches!(doc.blocks[0].status, TrackingStatus::Normal));
+        assert_eq!(paragraph.literal_prefix.as_deref(), Some("46."));
+        assert_eq!(
+            paragraph.indent,
+            Some(crate::domain::Indentation {
+                left: Some(1446),
+                right: Some(284),
+                effective_first_line_twips: Some(-879),
+                start_chars: None,
+                end_chars: None,
+                first_line_chars: None,
+                hanging_chars: None,
+            })
+        );
+        assert!(paragraph.effective_tab_stops_rel.is_empty());
+        assert_eq!(paragraph.literal_prefix_trailing_tab_stop_twips, Some(0));
+    }
+
+    #[test]
     fn resolve_selected_revisions_rejects_only_selected_substitution() {
         let rev1 = RevisionInfo {
             revision_id: 11,
@@ -12789,12 +14764,16 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
@@ -12849,12 +14828,16 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
@@ -12956,12 +14939,16 @@ mod tests {
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev),
                 },
@@ -13068,12 +15055,16 @@ mod tests {
                     HyperlinkRun {
                         text: "old".to_string(),
                         rpr_xml: None,
+                        additional_rpr_xml: Vec::new(),
+                        source_xml: None,
                         source_run_attrs: Vec::new(),
                         status: TrackingStatus::Deleted(rev(5)),
                     },
                     HyperlinkRun {
                         text: "new".to_string(),
                         rpr_xml: None,
+                        additional_rpr_xml: Vec::new(),
+                        source_xml: None,
                         source_run_attrs: Vec::new(),
                         status: TrackingStatus::Inserted(rev(6)),
                     },
@@ -13101,6 +15092,7 @@ mod tests {
             previous_literal_prefix_trailing_tab_stop_twips: None,
             previous_paragraph_mark_marks: vec![],
             previous_paragraph_mark_style_props: StyleProps::default(),
+            previous_paragraph_mark_rfonts: Default::default(),
             previous_paragraph_mark_rpr_off: Default::default(),
             previous_text_direction: None,
             previous_text_alignment: None,
@@ -13271,6 +15263,8 @@ mod tests {
                 },
                 wrapper_marks: vec![],
                 wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
                 raw_xml: Some(
                     br#"<w:drawing><wps:txbx><w:txbxContent><w:p><w:ins w:id="900" w:author="Vanessa" w:date="2016-11-24T18:36:00Z"><w:r><w:t>inside</w:t></w:r></w:ins></w:p></w:txbxContent></wps:txbx></w:drawing>"#.to_vec(),
                 ),
@@ -13444,6 +15438,18 @@ mod tests {
             "textbox interior revisions attributed to TextFrame, got {:?}",
             textbox_record.location
         );
+        // The anchor is the frame's document-order ordinal, NOT the drawing's
+        // node id: node ids embed a document-wide inline counter, so churn
+        // ABOVE the frame renames the story across a save/reopen while the
+        // revision itself did not move (wave-8 lifecycle 913). A record
+        // location is a durable surface.
+        assert_eq!(
+            textbox_record.location,
+            StoryScope::TextFrame {
+                anchor: NodeId::from("frame_0")
+            },
+            "the TextFrame anchor is positional among frames, not a node id"
+        );
         // The quarantined block stays the never-selectable sentinel.
         let quarantined = opaque
             .iter()
@@ -13498,6 +15504,8 @@ mod tests {
                 },
                 wrapper_marks: vec![],
                 wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
                 raw_xml: Some(
                     br#"<w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Fix </w:t></w:r><w:ins w:id="900" w:author="Vanessa"><w:r><w:t>this</w:t></w:r></w:ins></w:p></w:txbxContent></wps:txbx></w:drawing>"#.to_vec(),
                 ),
@@ -13628,6 +15636,8 @@ mod tests {
             },
             wrapper_marks: vec![],
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: Some(
                 format!(
                     "<w:drawing><wps:txbx><w:txbxContent><w:p>{txbx_paragraph_children}</w:p></w:txbxContent></wps:txbx></w:drawing>"
@@ -14034,6 +16044,312 @@ mod tests {
         ));
     }
 
+    /// A paragraph label may have shared its source run with the body before a
+    /// later edit wrapped that body in a tracked insertion. Rejecting an
+    /// inserted paragraph mark then moves the labeled paragraph into the
+    /// middle of its predecessor. The base label must become a separate Normal
+    /// run; it cannot cross into (or acquire) the body's tracked wrapper.
+    #[test]
+    fn paragraph_mark_merge_splits_prefix_source_run_before_tracked_body() {
+        let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Left ") else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(mut target) = make_paragraph("target", "Body") else {
+            unreachable!()
+        };
+        target.literal_prefix = Some("2.1.".to_string());
+        target.literal_prefix_trailing_ws = " ".to_string();
+        target.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "2.1. ".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: true,
+            }],
+        }));
+        target.segments = vec![tracked_text_segment(
+            "target_body",
+            "Body",
+            TrackingStatus::Inserted(RevisionInfo {
+                revision_id: 7,
+                identity: 7,
+                author: Some("Reviewer".to_string()),
+                date: None,
+                apply_op_id: None,
+            }),
+        )];
+
+        merge_paragraph_into_following(&mut donor, &mut target);
+
+        assert!(target.literal_prefix.is_none());
+        assert_eq!(target.segments.len(), 3);
+        assert!(matches!(target.segments[1].status, TrackingStatus::Normal));
+        assert_eq!(
+            target.segments[1]
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "2.1. "
+        );
+        assert!(matches!(
+            target.segments[2].status,
+            TrackingStatus::Inserted(_)
+        ));
+    }
+
+    /// When both the target's pilcrow and body are deleted, the hoisted prefix
+    /// came from that same deletion wrapper. Rejoining paragraphs must keep the
+    /// prefix in the deletion so accepting the deletion removes it as one unit.
+    #[test]
+    fn paragraph_mark_merge_keeps_whole_paragraph_prefix_tracked() {
+        let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Left ") else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(mut target) = make_paragraph("target", "Body") else {
+            unreachable!()
+        };
+        target.literal_prefix = Some("2.1.".to_string());
+        target.literal_prefix_trailing_ws = " ".to_string();
+        target.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "2.1. ".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: true,
+            }],
+        }));
+        let deleted = RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
+        target.segments = vec![tracked_text_segment(
+            "target_body",
+            "Body",
+            TrackingStatus::Deleted(deleted),
+        )];
+
+        merge_paragraph_into_following(&mut donor, &mut target);
+
+        assert!(target.literal_prefix.is_none());
+        assert_eq!(target.segments.len(), 2);
+        assert!(matches!(
+            target.segments[1].status,
+            TrackingStatus::Deleted(_)
+        ));
+        assert_eq!(
+            target.segments[1]
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "2.1. Body"
+        );
+    }
+
+    /// The donor's prefix has the same ownership rule as the target's. If a
+    /// wholly deleted donor merges into a surviving paragraph, its prefix must
+    /// remain in the deleted segment instead of becoming the survivor's label.
+    #[test]
+    fn paragraph_mark_merge_does_not_leak_deleted_donor_prefix() {
+        let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Body") else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(mut target) = make_paragraph("target", "Right") else {
+            unreachable!()
+        };
+        donor.literal_prefix = Some("(2)".to_string());
+        donor.literal_prefix_trailing_ws = "\t".to_string();
+        donor.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "(2)\t".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: true,
+            }],
+        }));
+        let deleted = RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        donor.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
+        donor.segments = vec![tracked_text_segment(
+            "donor_body",
+            "Body",
+            TrackingStatus::Deleted(deleted),
+        )];
+
+        merge_paragraph_into_following(&mut donor, &mut target);
+
+        assert!(target.literal_prefix.is_none());
+        assert!(matches!(
+            target.segments[0].status,
+            TrackingStatus::Deleted(_)
+        ));
+        assert_eq!(
+            target.segments[0]
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "(2)\tBody"
+        );
+        assert!(matches!(target.segments[1].status, TrackingStatus::Normal));
+    }
+
+    /// A tracked pilcrow alone does not own a literal prefix when the prefix's
+    /// first body fragment is Normal. A later tracked fragment must not attract
+    /// that base prefix merely because it has the same status as the pilcrow.
+    #[test]
+    fn paragraph_mark_merge_keeps_base_prefix_before_later_tracked_fragment() {
+        let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Left ") else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(mut target) = make_paragraph("target", "Body") else {
+            unreachable!()
+        };
+        target.literal_prefix = Some("1.".to_string());
+        target.literal_prefix_trailing_ws = "\t".to_string();
+        target.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "1.\t".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: true,
+            }],
+        }));
+        let deleted = RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
+        target.segments.push(tracked_text_segment(
+            "later_deleted",
+            "Removed",
+            TrackingStatus::Deleted(deleted),
+        ));
+
+        merge_paragraph_into_following(&mut donor, &mut target);
+
+        assert!(target.literal_prefix.is_none());
+        assert!(matches!(target.segments[1].status, TrackingStatus::Normal));
+        assert_eq!(
+            target.segments[1]
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "1.\tBody"
+        );
+        assert!(matches!(
+            target.segments[2].status,
+            TrackingStatus::Deleted(_)
+        ));
+    }
+
+    /// A prefix ending at a source-run boundary is not owned by the following
+    /// deletion, even when the paragraph mark is also deleted. This is the
+    /// mixed shape used when a base heading number precedes replaced text.
+    #[test]
+    fn paragraph_mark_merge_keeps_boundary_ended_prefix_outside_deletion() {
+        let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Left ") else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(mut target) = make_paragraph("target", "Body") else {
+            unreachable!()
+        };
+        target.literal_prefix = Some("1.".to_string());
+        target.literal_prefix_trailing_ws = "\t".to_string();
+        target.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "1.\t".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: crate::domain::RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: false,
+            }],
+        }));
+        let deleted = RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
+        target.segments = vec![tracked_text_segment(
+            "deleted_body",
+            "Body",
+            TrackingStatus::Deleted(deleted),
+        )];
+
+        merge_paragraph_into_following(&mut donor, &mut target);
+
+        assert!(target.literal_prefix.is_none());
+        assert!(matches!(target.segments[1].status, TrackingStatus::Normal));
+        assert_eq!(
+            target.segments[1]
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "1.\t"
+        );
+        assert!(matches!(
+            target.segments[2].status,
+            TrackingStatus::Deleted(_)
+        ));
+    }
+
     /// An identity diff has no numbering transition to express. A literal
     /// prefix therefore stays in its structural slot, including the imported
     /// source-run witness needed to reproduce its original w:r boundaries.
@@ -14223,6 +16539,355 @@ mod tests {
                     _ => true,
                 }),
             "projection must strip materialized prefix text even when zero-width markers precede it"
+        );
+    }
+
+    #[test]
+    fn normalize_projection_preserves_literal_prefix_tabs_verbatim() {
+        let mut paragraph = match make_paragraph("p1", "placeholder") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.segments = vec![TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: vec![InlineNode::from(TextNode {
+                id: NodeId::from("p1_text"),
+                text_role: None,
+                text: "\t(a)\tClause body".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                formatting_change: None,
+            })],
+        }];
+
+        normalize_paragraph_after_projection(&mut paragraph, false);
+
+        assert_eq!(paragraph.literal_prefix.as_deref(), Some("(a)"));
+        assert_eq!(paragraph.literal_prefix_leading_ws, "\t");
+        assert_eq!(paragraph.literal_prefix_trailing_ws, "\t");
+        assert_eq!(paragraph.literal_prefix_leading_tab_count, 1);
+        assert!(paragraph.literal_prefix_has_trailing_tab);
+        assert!(matches!(
+            paragraph.segments[0].inlines.as_slice(),
+            [InlineNode::Text(text)] if text.text == "Clause body"
+        ));
+    }
+
+    #[test]
+    fn full_resolution_preserves_every_authored_run_boundary() {
+        fn text(id: &str, value: &str) -> InlineNode {
+            InlineNode::from(TextNode {
+                id: NodeId::from(id),
+                text_role: None,
+                text: value.to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: Vec::new(),
+                formatting_change: None,
+            })
+        }
+
+        let mut paragraph = match make_paragraph("p1", "placeholder") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.segments = vec![
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![text("left", "left ")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Deleted(RevisionInfo {
+                    revision_id: 7,
+                    identity: 7,
+                    author: None,
+                    date: None,
+                    apply_op_id: None,
+                }),
+                inlines: vec![text("tracked", "middle")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![text("right", " right")],
+            },
+        ];
+
+        let mut block = BlockNode::Paragraph(paragraph);
+        project_block_inner(&mut block, false, false, ResolutionDefinitions::NONE);
+        let BlockNode::Paragraph(projected) = block else {
+            panic!("expected paragraph");
+        };
+        // ADJUDICATED against real Word: resolving a revision removes the
+        // revision and nothing else. The restored text keeps its own run, so
+        // all three authored runs survive as three.
+        let texts: Vec<&str> = projected.segments[0]
+            .inlines
+            .iter()
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["left ", "middle", " right"]);
+
+        let mut unrelated = match make_paragraph("p2", "placeholder") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        unrelated.segments = vec![
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![text("a", "authored ")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![text("b", "boundary")],
+            },
+        ];
+        let mut block = BlockNode::Paragraph(unrelated);
+        project_block_inner(&mut block, false, false, ResolutionDefinitions::NONE);
+        let BlockNode::Paragraph(projected) = block else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(projected.segments[0].inlines.len(), 2);
+    }
+
+    #[test]
+    fn full_resolution_preserves_distinct_authored_run_provenance() {
+        fn text(id: &str, value: &str, rsid: &str) -> InlineNode {
+            InlineNode::from(TextNode {
+                id: NodeId::from(id),
+                text_role: None,
+                text: value.to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
+                source_run_attrs: vec![("w:rsidR".to_string(), rsid.to_string())],
+                formatting_change: None,
+            })
+        }
+
+        let mut paragraph = match make_paragraph("p1", "placeholder") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.segments = vec![
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![text("left", "authored ", "00112233")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Inserted(RevisionInfo {
+                    revision_id: 7,
+                    identity: 7,
+                    author: None,
+                    date: None,
+                    apply_op_id: None,
+                }),
+                inlines: vec![text("right", "boundary", "00445566")],
+            },
+        ];
+
+        let mut block = BlockNode::Paragraph(paragraph);
+        project_block_inner(&mut block, true, false, ResolutionDefinitions::NONE);
+        let BlockNode::Paragraph(projected) = block else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(
+            projected.segments[0].inlines.len(),
+            2,
+            "Word's authored run provenance is a shaping boundary even when resolved formatting matches"
+        );
+    }
+
+    #[test]
+    fn restored_literal_prefix_reverses_import_tab_absorption() {
+        let mut paragraph = match make_paragraph("p1", "hello world") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        let authored = crate::domain::Indentation {
+            left: Some(2268),
+            right: Some(859),
+            effective_first_line_twips: Some(-850),
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        };
+        paragraph.has_direct_indent = true;
+        paragraph.authored_indent = Some(authored.clone());
+        paragraph.indent = Some(crate::domain::Indentation {
+            left: Some(1418),
+            right: Some(859),
+            effective_first_line_twips: None,
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+        paragraph.segments.insert(
+            0,
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![InlineNode::from(TextNode {
+                    id: materialized_prefix_node_id(
+                        &paragraph.id,
+                        MaterializedPrefixKind::LiteralDeleted,
+                    ),
+                    text_role: Some(TextRole::MaterializedPrefix(
+                        MaterializedPrefixKind::LiteralDeleted,
+                    )),
+                    text: "(1)\t".to_string(),
+                    marks: Vec::new(),
+                    style_props: StyleProps::default(),
+                    rpr_authored: RunRprAuthored::default(),
+                    source_run_attrs: Vec::new(),
+                    formatting_change: None,
+                })],
+            },
+        );
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                 <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                   <w:name w:val="Normal"/>
+                 </w:style>
+               </w:styles>"#,
+        )
+        .expect("minimal styles part must parse");
+
+        assert!(normalize_paragraph_after_projection(&mut paragraph, false));
+        reresolve_paragraph_indent(
+            &mut paragraph,
+            ResolutionDefinitions::styles_only(Some(&styles)),
+        );
+
+        assert_eq!(paragraph.literal_prefix.as_deref(), Some("(1)"));
+        assert_eq!(paragraph.indent, Some(authored));
+    }
+
+    #[test]
+    fn rejected_direct_indent_reapplies_inherited_hanging_tab_absorption() {
+        let mut paragraph = match make_paragraph("p1", "\thello world") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.style_id = Some("Footnotesection".into());
+        paragraph.has_direct_indent = true;
+        paragraph.authored_indent = Some(crate::domain::Indentation {
+            left: Some(0),
+            right: None,
+            effective_first_line_twips: None,
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+        // This is the stale live value produced when rejection restores the
+        // direct snapshot without rebuilding the style-derived projection.
+        paragraph.indent = paragraph.authored_indent.clone();
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                 <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                   <w:name w:val="Normal"/>
+                 </w:style>
+                 <w:style w:type="paragraph" w:styleId="Footnotesection">
+                   <w:name w:val="Footnote section"/>
+                   <w:basedOn w:val="Normal"/>
+                   <w:pPr><w:ind w:left="893" w:hanging="893"/></w:pPr>
+                 </w:style>
+               </w:styles>"#,
+        )
+        .expect("styles part must parse");
+
+        reresolve_paragraph_indent(
+            &mut paragraph,
+            ResolutionDefinitions::styles_only(Some(&styles)),
+        );
+
+        assert_eq!(
+            paragraph.indent,
+            Some(crate::domain::Indentation {
+                left: Some(-893),
+                right: None,
+                effective_first_line_twips: None,
+                start_chars: None,
+                end_chars: None,
+                first_line_chars: None,
+                hanging_chars: None,
+            })
+        );
+    }
+
+    #[test]
+    fn restored_literal_prefix_without_authored_indent_has_zero_effective_left() {
+        let mut paragraph = match make_paragraph("p1", "body") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.literal_prefix = Some("56.".to_string());
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                 <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                   <w:name w:val="Normal"/>
+                 </w:style>
+               </w:styles>"#,
+        )
+        .expect("styles part must parse");
+
+        reresolve_paragraph_indent(
+            &mut paragraph,
+            ResolutionDefinitions::styles_only(Some(&styles)),
+        );
+
+        assert_eq!(
+            paragraph.indent,
+            Some(crate::domain::Indentation {
+                left: Some(0),
+                right: None,
+                effective_first_line_twips: None,
+                start_chars: None,
+                end_chars: None,
+                first_line_chars: None,
+                hanging_chars: None,
+            })
+        );
+    }
+
+    #[test]
+    fn restored_literal_prefix_reresolves_direct_indent_without_styles_part() {
+        let mut paragraph = match make_paragraph("p1", "body") {
+            BlockNode::Paragraph(p) => p,
+            _ => panic!("expected paragraph"),
+        };
+        paragraph.literal_prefix = Some("42.".to_string());
+        paragraph.has_direct_indent = true;
+        paragraph.authored_indent = Some(crate::domain::Indentation {
+            left: None,
+            right: None,
+            effective_first_line_twips: Some(709),
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+
+        reresolve_paragraph_indent(&mut paragraph, ResolutionDefinitions::NONE);
+
+        assert_eq!(
+            paragraph.indent,
+            Some(crate::domain::Indentation {
+                left: Some(0),
+                right: None,
+                effective_first_line_twips: Some(709),
+                start_chars: None,
+                end_chars: None,
+                first_line_chars: None,
+                hanging_chars: None,
+            })
         );
     }
 
@@ -14843,6 +17508,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -16133,6 +18799,7 @@ mod tests {
             previous_literal_prefix_trailing_tab_stop_twips: None,
             previous_paragraph_mark_marks: vec![],
             previous_paragraph_mark_style_props: StyleProps::default(),
+            previous_paragraph_mark_rfonts: Default::default(),
             previous_paragraph_mark_rpr_off: Default::default(),
             previous_text_direction: None,
             previous_text_alignment: None,

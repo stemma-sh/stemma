@@ -56,6 +56,8 @@ fn make_field(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             br#"<w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>"#.to_vec(),
         ),
@@ -115,6 +117,7 @@ fn build_para(id: &str, inlines: Vec<InlineNode>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,

@@ -434,3 +434,100 @@ fn span_splice_with_label_on_unnumbered_paragraph_is_allowed() {
         result.err().map(|e| e.message)
     );
 }
+
+/// D5: the refusal carries the string that WOULD have been accepted.
+///
+/// Decided from trajectory evidence, not an authored scenario. Over 1,000
+/// modeled lifecycles this refusal fired 992 times — 59% of every refusal — and
+/// recurred at attempts 0 through 5 within single lifecycles. The message was
+/// already good: it names the paragraph, quotes the label, shows the current
+/// text and says to omit the label. Agents re-derived the fix and re-sent the
+/// same wrong string anyway.
+///
+/// The engine computes the label in order to detect the duplication, so it
+/// already knows the corrected content. Describing a fix it can simply hand
+/// over is a choice, not a limit. This does not relax the refusal — the edit is
+/// still refused with no mutation; it changes only what the refusal carries.
+#[test]
+fn the_refusal_carries_the_content_that_would_be_accepted() {
+    let doc = Document::parse(&numbered_heading_docx()).expect("parse");
+    let (block_id, guard) = first_block_id_and_guard(&doc);
+    assert_literal_prefix_present(&doc, &block_id);
+    let events_handle = handle_of_span(&doc, "Events");
+
+    let err = match apply_steps(
+        &doc,
+        vec![EditStep::ReplaceSpanText {
+            block_id: block_id.clone(),
+            guard,
+            expect: None,
+            span: ResolvedSpanSelector::Handle(events_handle),
+            content: text_content("1.\tEvents and matters"),
+            rationale: None,
+        }],
+    ) {
+        Ok(_) => panic!("duplicating the literal prefix must be refused"),
+        Err(err) => err,
+    };
+
+    assert_eq!(format!("{:?}", err.code), "PrefixDuplicatesLabel");
+    assert!(
+        err.message.contains("Events and matters"),
+        "the refusal must hand back the corrected content verbatim, got: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("send '1."),
+        "the corrected content must have the duplicated label removed: {}",
+        err.message
+    );
+}
+
+/// A completely deleted paragraph keeps its label in the body.
+///
+/// `literal_prefix` holds UNTRACKED source characters. Import used to exempt a
+/// COMPLETE paragraph deletion from that rule and hoist the label anyway, on
+/// the grounds that the outer block carries the deletion. The permission was
+/// harmless in isolation and wrong in company: an edit that deletes a paragraph
+/// later leaves the label inline, and nothing re-normalizes it, so the same
+/// document held two shapes depending on whether the deletion arrived by parse
+/// or by edit.
+///
+/// A deletion's excerpt is a revision-signature input, so the two shapes minted
+/// different identities for one proposal — the reopened document's deletion
+/// read `"08.03.25…"` where the live one read `"\t11.\t08.03.25…"`.
+#[test]
+fn a_completely_deleted_paragraph_keeps_its_label_inline() {
+    let body = concat!(
+        r#"<w:p><w:pPr><w:rPr><w:del w:id="5" w:author="R" w:date="2026-03-01T00:00:00Z"/></w:rPr></w:pPr>"#,
+        r#"<w:del w:id="6" w:author="R" w:date="2026-03-01T00:00:00Z">"#,
+        r#"<w:r><w:delText xml:space="preserve">11.&#9;</w:delText></w:r>"#,
+        r#"<w:r><w:delText xml:space="preserve">Deleted clause body</w:delText></w:r>"#,
+        r#"</w:del></w:p>"#,
+    );
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let canonical = doc.snapshot().canonical.clone();
+    let BlockNode::Paragraph(paragraph) = &canonical.blocks[0].block else {
+        panic!("fixture paragraph");
+    };
+
+    assert!(
+        paragraph.literal_prefix.is_none(),
+        "the label is tracked-deleted, so it must not be hoisted into \
+         literal_prefix (which holds untracked characters only); got {:?}",
+        paragraph.literal_prefix
+    );
+    let text: String = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.starts_with("11."),
+        "the deleted text must still include the label: {text:?}"
+    );
+}

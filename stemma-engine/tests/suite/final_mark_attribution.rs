@@ -12,6 +12,8 @@
 //! preceding mark tracked) and that our own accept/reject projections are
 //! unchanged (reject restores the original, accept keeps every insertion).
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use stemma::domain::*;
 use stemma::edit::*;
 use stemma::tracked_model::ResolveSelectionAction;
@@ -222,6 +224,77 @@ fn para_mark_of<'a>(blocks: &'a [TrackedBlock], id: &NodeId) -> &'a Option<Track
         .expect("paragraph present")
 }
 
+/// The proposals a reviewer can resolve, keyed by what each one proposes.
+///
+/// Block ids renumber across a reopen (`p_4__ins1` becomes `p_281`), so they
+/// cannot appear here; the grouping into identities is the whole point of the
+/// comparison and does appear.
+fn revision_groups(doc: &CanonDoc) -> BTreeSet<BTreeSet<String>> {
+    let mut by_identity: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    for record in stemma::enumerate_revisions(doc) {
+        by_identity
+            .entry(record.revision_id)
+            .or_default()
+            .insert(format!(
+                "{}|{}|{}",
+                record.kind.as_str(),
+                record.author.as_deref().unwrap_or(""),
+                record.excerpt
+            ));
+    }
+    by_identity.into_values().collect()
+}
+
+/// A document-tail append is ONE proposal, and stays one across save/reopen.
+///
+/// The final-mark rule spreads the append over three carriers: the anchor's
+/// now-inserted paragraph mark, the appended paragraph's inserted content, and
+/// the displaced-mark formatting record that lets reject restore the anchor's
+/// pilcrow properties. Rejecting the append removes the paragraph, so none of
+/// the three can be resolved apart from the others — they are one proposal and
+/// must enumerate under one identity, before and after persistence.
+///
+/// Regrouping them on reopen does not lose the proposal, which is what makes
+/// it easy to miss: the text is identical and the revision count is unchanged.
+/// What breaks is addressing. A selective resolution naming the append no
+/// longer names it once the document has been through Word.
+#[test]
+fn tail_append_is_one_identity_across_save_and_reopen() {
+    let fixture = import_body(&format!(
+        "{}{}",
+        para("First."),
+        // The anchor's pilcrow carries properties the appended paragraph does
+        // not, so displacing the final mark records them as the third carrier.
+        r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Second.</w:t></w:r></w:p>"#
+    ));
+    let anchor = fixture.para_ids.last().unwrap().clone();
+    let result = fixture
+        .runtime
+        .apply_edit(&fixture.handle, &insert_after(&anchor, &["Appended."]))
+        .expect("apply_edit");
+    let live = std::sync::Arc::unwrap_or_clone(result.canonical);
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("export_docx");
+    let reopened = SimpleRuntime::new()
+        .import_docx(&bytes)
+        .expect("reopen the exported redline")
+        .canonical;
+
+    let live_groups = revision_groups(&live);
+    assert_eq!(
+        live_groups.len(),
+        1,
+        "the append's carriers are one proposal in the producer model: {live_groups:?}"
+    );
+    assert_eq!(
+        live_groups,
+        revision_groups(&reopened),
+        "the append must enumerate as the same proposals, grouped the same way, after a round trip"
+    );
+}
+
 // ── (i) tracked InsertParagraphs after the LAST body paragraph ──────────────
 
 #[test]
@@ -264,6 +337,61 @@ fn insert_after_last_body_paragraph_leaves_final_mark_untracked() {
         accept, "First.\nSecond.\nInserted A.\nInserted B.",
         "accept-all keeps every inserted paragraph"
     );
+}
+
+#[test]
+fn body_range_marker_after_last_paragraph_does_not_hide_the_final_mark() {
+    // A body-level bookmark end is zero-width. It may legally follow the last
+    // paragraph, but that paragraph's pilcrow is still the document-final mark.
+    // The canonical model preserves the marker as an opaque block, so the
+    // normalizer must look through it without moving or consuming it.
+    let fixture = import_body(&format!(
+        "{}<w:p><w:bookmarkStart w:id=\"7\" w:name=\"tail\"/><w:r><w:t>Second.</w:t></w:r></w:p><w:bookmarkEnd w:id=\"7\"/>",
+        para("First.")
+    ));
+    let anchor = fixture.para_ids.last().unwrap().clone();
+    let tx = insert_after(&anchor, &["Inserted A.", "Inserted B."]);
+    let (canonical, root) = apply_and_export(&fixture, &tx);
+
+    assert!(
+        matches!(
+            canonical.blocks.last(),
+            Some(TrackedBlock {
+                block: BlockNode::OpaqueBlock(opaque),
+                ..
+            }) if opaque.range_marker.is_some()
+        ),
+        "fixture must exercise a trailing typed opaque range marker"
+    );
+
+    let final_paragraph = canonical
+        .blocks
+        .iter()
+        .rev()
+        .find(|block| matches!(block.block, BlockNode::Paragraph(_)))
+        .expect("final paragraph");
+    assert!(
+        matches!(
+            effective_final_mark(final_paragraph),
+            TrackingStatus::Normal
+        ),
+        "the zero-width trailing marker must not leave the final pilcrow tracked"
+    );
+    assert!(
+        !paragraph_mark_has(last_paragraph(&root), "ins"),
+        "serialized final pilcrow must remain untracked"
+    );
+
+    let body = body_element(&root);
+    assert!(
+        body.children.iter().any(
+            |child| matches!(child, xmltree::XMLNode::Element(el) if el.name == "bookmarkEnd")
+        ),
+        "the trailing range marker must remain present"
+    );
+    let (accept, reject) = accept_reject_text(&canonical);
+    assert_eq!(reject, "First.\nSecond.");
+    assert_eq!(accept, "First.\nSecond.\nInserted A.\nInserted B.");
 }
 
 // ── (ii) tracked DeleteBlockRange of the LAST paragraph ─────────────────────
@@ -1396,4 +1524,966 @@ fn move_selective_states_agree_wire_vs_model_on_accept_and_reject() {
             );
         }
     }
+}
+
+fn para_styled(style: &str, text: &str) -> String {
+    format!(
+        r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#
+    )
+}
+
+fn last_paragraph_style(doc: &CanonDoc) -> Option<String> {
+    doc.blocks.iter().rev().find_map(|tb| match &tb.block {
+        BlockNode::Paragraph(p) => Some(p.style_id.as_deref().unwrap_or("").to_string()),
+        _ => None,
+    })
+}
+
+/// A move landing at the END of the document displaces the original final
+/// paragraph mark onto the moved-in paragraph. That paragraph now stands where
+/// the original final paragraph stood, so on reject the anchor's content merges
+/// into ITS properties — and if the wire records only the moved content's own
+/// `pStyle`, the original final paragraph's style is unrecoverable by any
+/// consumer.
+///
+/// Word's encoding (observed by comparing a paragraph moved to the end of a
+/// document, Word 16.0): the surviving final paragraph keeps its own `pStyle`
+/// and carries a `w:pPrChange` whose inner `pPr` holds the anchor's. Accept
+/// therefore keeps the moved style and reject restores the displaced one. This
+/// pins both endpoints and the emitted record.
+#[test]
+fn move_to_document_end_records_the_displaced_final_paragraph_style() {
+    let fixture = import_body(&format!(
+        "{}{}{}",
+        para_styled("PlainBody", "Movable clause."),
+        para("Middle body."),
+        para_styled("CapsHead", "Omega final heading."),
+    ));
+    let from = fixture.para_ids[0].clone();
+    let anchor = fixture.para_ids[2].clone();
+    let tx = move_after(&from, &from, &anchor);
+    let (canonical, root) = apply_and_export(&fixture, &tx);
+
+    let last = last_paragraph(&root);
+    let ppr = last
+        .get_child("pPr")
+        .expect("displaced final paragraph keeps a pPr");
+    let ppr_change = ppr
+        .get_child("pPrChange")
+        .expect("the displaced final mark's previous properties must be recorded");
+    let previous_style = ppr_change
+        .get_child("pPr")
+        .and_then(|inner| inner.get_child("pStyle"))
+        .and_then(|style| {
+            style
+                .attributes
+                .iter()
+                .find(|(name, _)| name.local_name == "val")
+                .map(|(_, value)| value.clone())
+        });
+    assert_eq!(
+        previous_style.as_deref(),
+        Some("CapsHead"),
+        "pPrChange must record the anchor's style as the previous properties"
+    );
+
+    let mut accepted = canonical.clone();
+    accept_all(&mut accepted);
+    assert_eq!(
+        last_paragraph_style(&accepted).as_deref(),
+        Some("PlainBody"),
+        "accept keeps the moved content's own style"
+    );
+
+    let mut rejected = canonical.clone();
+    reject_all_with_styles(&mut rejected, None);
+    assert_eq!(
+        last_paragraph_style(&rejected).as_deref(),
+        Some("CapsHead"),
+        "reject restores the displaced final paragraph's style"
+    );
+}
+
+// ─── Accept across a range marker (Word-adjudicated) ─────────────────────────
+
+/// Accepting an insertion does not weld runs together across a range marker.
+///
+/// ADJUDICATED against real Word. Given a bookmark INSIDE a `w:ins` with runs
+/// either side, Word's accept drops the `w:ins` wrapper and leaves the two runs
+/// exactly as they were, with the bookmark between them:
+///
+/// ```xml
+/// <w:r><w:t>Application ex parte</w:t></w:r>
+/// <w:bookmarkStart w:id="0" w:name="probe"/><w:bookmarkEnd w:id="0"/>
+/// <w:r><w:t xml:space="preserve"> filed today</w:t></w:r>
+/// ```
+///
+/// Run boundaries are load-bearing — they are `w:r` boundaries and Word's line
+/// layout depends on them — so resolving a revision may remove the revision's
+/// own seam but must not merge text across a marker that was never part of it.
+#[test]
+fn accept_does_not_merge_runs_across_a_range_marker() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:ins w:id="101" w:author="Reviewer" w:date="2026-03-01T00:00:00Z">"#,
+        r#"<w:r><w:t xml:space="preserve">Application ex parte</w:t></w:r>"#,
+        r#"<w:bookmarkStart w:id="7" w:name="probe"/><w:bookmarkEnd w:id="7"/>"#,
+        r#"<w:r><w:t xml:space="preserve"> filed today</w:t></w:r>"#,
+        r#"</w:ins></w:p>"#,
+    ));
+    // A no-op transaction is the shortest way to read the imported canonical
+    // doc back out of the runtime handle.
+    let mut accepted = std::sync::Arc::unwrap_or_clone(
+        fixture
+            .runtime
+            .apply_edit(
+                &fixture.handle,
+                &EditTransaction {
+                    steps: vec![],
+                    summary: None,
+                    materialization_mode: MaterializationMode::TrackedChange,
+                    revision: test_revision(),
+                },
+            )
+            .expect("no-op apply")
+            .canonical,
+    );
+    accept_all(&mut accepted);
+
+    let BlockNode::Paragraph(paragraph) = &accepted.blocks[0].block else {
+        panic!("fixture paragraph");
+    };
+    let texts: Vec<&str> = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        texts,
+        vec!["Application ex parte", " filed today"],
+        "Word keeps these two runs apart across the bookmark; accept must not weld them"
+    );
+
+    // The same must hold on the persisted path. A reviewer who saves, reopens
+    // and then accepts is doing exactly what Word did above, so the two routes
+    // to an accepted document cannot disagree about run structure.
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("export_docx");
+    let mut reopened_accepted = std::sync::Arc::unwrap_or_clone(
+        SimpleRuntime::new()
+            .import_docx(&bytes)
+            .expect("reopen the exported redline")
+            .canonical,
+    );
+    accept_all(&mut reopened_accepted);
+
+    let BlockNode::Paragraph(reopened) = &reopened_accepted.blocks[0].block else {
+        panic!("fixture paragraph survives the round trip");
+    };
+    let reopened_texts: Vec<&str> = reopened
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        reopened_texts, texts,
+        "accepting after a save and reopen must give the same run structure as \
+         accepting directly"
+    );
+}
+
+/// Accepting a deletion between two runs leaves BOTH runs.
+///
+/// ADJUDICATED against real Word. Given `23 Apr 2013 p. ` + a tracked deletion
+/// + `1591 (disallowed)`, Word's accept removes the deletion and nothing else:
+///
+/// ```xml
+/// <w:r><w:t xml:space="preserve">23 Apr 2013 p. </w:t></w:r>
+/// <w:r><w:t>1591 (disallowed)</w:t></w:r>
+/// ```
+///
+/// The two runs end up adjacent with identical formatting and Word still keeps
+/// them apart — authored `w:r` boundaries are load-bearing for line layout, and
+/// resolving a revision may only remove the boundary the revision's own wrapper
+/// created, never one the author wrote.
+#[test]
+fn accept_does_not_weld_runs_across_a_resolved_deletion() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">23 Apr 2013 p. </w:t></w:r>"#,
+        r#"<w:del w:id="55" w:author="Reviewer" w:date="2026-03-01T00:00:00Z">"#,
+        r#"<w:r><w:delText xml:space="preserve">OLD </w:delText></w:r></w:del>"#,
+        r#"<w:r><w:t xml:space="preserve">1591 (disallowed)</w:t></w:r></w:p>"#,
+    ));
+    let mut accepted = std::sync::Arc::unwrap_or_clone(
+        fixture
+            .runtime
+            .apply_edit(
+                &fixture.handle,
+                &EditTransaction {
+                    steps: vec![],
+                    summary: None,
+                    materialization_mode: MaterializationMode::TrackedChange,
+                    revision: test_revision(),
+                },
+            )
+            .expect("no-op apply")
+            .canonical,
+    );
+    accept_all(&mut accepted);
+
+    let BlockNode::Paragraph(paragraph) = &accepted.blocks[0].block else {
+        panic!("fixture paragraph");
+    };
+    let texts: Vec<&str> = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        texts,
+        vec!["23 Apr 2013 p. ", "1591 (disallowed)"],
+        "Word leaves both authored runs when the deletion between them is accepted"
+    );
+}
+
+/// A proofing marker's seam rejoins; an accepted insertion's does not.
+///
+/// ADJUDICATED against real Word, one document, both rules at once:
+///
+/// ```xml
+/// <w:r>Alpha</w:r><w:proofErr w:type="gramStart"/><w:r>Beta</w:r>
+/// <w:ins><w:r>Gamma</w:r></w:ins>
+/// ```
+///
+/// accepts to `<w:r>AlphaBeta</w:r><w:r>Gamma</w:r>` — the proofing-split runs
+/// weld, the insertion boundary survives. Proofing ranges are ephemeral editor
+/// state Word discards on Accept All; a `w:ins` wrapper sat around an authored
+/// run boundary that was always there.
+#[test]
+fn proofing_seam_rejoins_but_an_accepted_insertion_seam_does_not() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">Alpha</w:t></w:r>"#,
+        r#"<w:proofErr w:type="gramStart"/>"#,
+        r#"<w:r><w:t xml:space="preserve">Beta</w:t></w:r>"#,
+        r#"<w:ins w:id="9" w:author="Reviewer" w:date="2026-03-01T00:00:00Z">"#,
+        r#"<w:r><w:t xml:space="preserve">Gamma</w:t></w:r></w:ins></w:p>"#,
+    ));
+    let mut accepted = std::sync::Arc::unwrap_or_clone(
+        fixture
+            .runtime
+            .apply_edit(
+                &fixture.handle,
+                &EditTransaction {
+                    steps: vec![],
+                    summary: None,
+                    materialization_mode: MaterializationMode::TrackedChange,
+                    revision: test_revision(),
+                },
+            )
+            .expect("no-op apply")
+            .canonical,
+    );
+    accept_all(&mut accepted);
+
+    let BlockNode::Paragraph(paragraph) = &accepted.blocks[0].block else {
+        panic!("fixture paragraph");
+    };
+    let texts: Vec<&str> = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        texts,
+        vec!["AlphaBeta", "Gamma"],
+        "the proofing seam welds; the accepted insertion's seam does not"
+    );
+}
+
+/// A tracked run-formatting change remembers what the run looked like BEFORE,
+/// across a save and reopen.
+///
+/// `w:rPrChange` carries the previous run properties (§17.13.5.32) — that is
+/// the entire point of the element: reject restores them. A persistence
+/// boundary must not empty it, or a reviewer who saves and reopens can no
+/// longer reject the change back to what the author wrote.
+///
+/// GUARD (not a regression): wave-8 lifecycle 437 shows the split-session path
+/// recording `previous_marks: []` for a run the single-session path records as
+/// `[Italic]`. This test reconstructs the shape hermetically — a pre-existing
+/// run change, a persistence boundary, then a later paragraph format — and
+/// PASSES, so it does not reproduce that defect. It is kept because both
+/// assertions are real contracts worth holding, and because it narrows 437:
+/// whatever loses `previous_marks` there needs more of the lifecycle than
+/// these two operations.
+#[test]
+fn tracked_run_formatting_remembers_previous_marks_across_save_and_reopen() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:rPr><w:i/></w:rPr>"#,
+        r#"<w:t xml:space="preserve">Italic clause text</w:t></w:r></w:p>"#,
+    ));
+    let target = fixture.para_ids[0].clone();
+    let transaction = EditTransaction {
+        steps: vec![EditStep::SetRunFormatting {
+            block_id: target,
+            expect: "Italic clause text".to_string(),
+            semantic_hash: None,
+            marks: InlineMarkSet {
+                bold: true,
+                ..InlineMarkSet::default()
+            },
+            style: RunStyleEdit::default(),
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
+    let live = std::sync::Arc::unwrap_or_clone(
+        fixture
+            .runtime
+            .apply_edit(&fixture.handle, &transaction)
+            .expect("apply tracked run formatting")
+            .canonical,
+    );
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("export_docx");
+    let reopened = std::sync::Arc::unwrap_or_clone(
+        SimpleRuntime::new()
+            .import_docx(&bytes)
+            .expect("reopen the exported redline")
+            .canonical,
+    );
+
+    let previous_marks = |doc: &CanonDoc| -> Vec<Vec<Mark>> {
+        let BlockNode::Paragraph(paragraph) = &doc.blocks[0].block else {
+            panic!("fixture paragraph");
+        };
+        paragraph
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => text
+                    .formatting_change
+                    .as_ref()
+                    .map(|change| change.previous_marks.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        previous_marks(&live),
+        vec![vec![Mark::Italic]],
+        "the live model records what the run was before the change"
+    );
+    assert_eq!(
+        previous_marks(&reopened),
+        previous_marks(&live),
+        "a save and reopen must not forget what reject has to restore"
+    );
+
+    // Lifecycle 437's actual shape: the run change is PRE-EXISTING, and a later
+    // round formats the paragraph it lives in. A session split puts that change
+    // through the persistence boundary before the paragraph op runs, so the two
+    // orders must still agree about what the run was.
+    let reopened_runtime = SimpleRuntime::new();
+    let reopened_import = reopened_runtime
+        .import_docx(&bytes)
+        .expect("reopen for the second round");
+    let BlockNode::Paragraph(reopened_paragraph) = &reopened_import.canonical.blocks[0].block
+    else {
+        panic!("fixture paragraph survives reopen");
+    };
+    let second_round = EditTransaction {
+        steps: vec![EditStep::SetParagraphFormatting {
+            block_id: reopened_paragraph.id.clone(),
+            semantic_hash: None,
+            patch: ParagraphFormattingPatch {
+                align: Some(Alignment::Center),
+                indent: None,
+                spacing: None,
+                borders: None,
+                shading: None,
+            },
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
+    let after_second = std::sync::Arc::unwrap_or_clone(
+        reopened_runtime
+            .apply_edit(&reopened_import.doc_handle, &second_round)
+            .expect("apply paragraph formatting in a later round")
+            .canonical,
+    );
+    assert_eq!(
+        previous_marks(&after_second),
+        previous_marks(&live),
+        "formatting the paragraph must not erase the run change's previous state"
+    );
+}
+
+/// Session split preserves a pre-existing run change's previous state.
+///
+/// The law: applying a program as ONE session must equal applying it as two
+/// sessions with a persistence boundary between them. Wave-8 lifecycle 437
+/// fails it on `formatting_change.previous_marks` — `[]` on the split path
+/// where the single session records `[Italic]`. This runs the same program
+/// shape both ways over a document that already carries a run change.
+///
+/// GUARD (not a regression): it PASSES, so it does not reproduce 437 either.
+/// Together with the save/reopen guard above it rules out the ops themselves —
+/// the loss needs something an earlier ROUND does, most likely a partial
+/// accept/reject before this program runs.
+#[test]
+fn session_split_keeps_a_pre_existing_run_change_intact() {
+    fn previous_marks(doc: &CanonDoc) -> Vec<Vec<Mark>> {
+        doc.blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .flat_map(|paragraph| paragraph.segments.iter())
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => text
+                    .formatting_change
+                    .as_ref()
+                    .map(|change| change.previous_marks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A document that already carries a tracked run change, as a later round
+    // would find it: italic run, bold proposed over it, saved.
+    let seed = import_body(concat!(
+        r#"<w:p><w:r><w:rPr><w:i/></w:rPr>"#,
+        r#"<w:t xml:space="preserve">Italic clause text</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Second clause.</w:t></w:r></w:p>"#,
+    ));
+    let first_para = seed.para_ids[0].clone();
+    seed.runtime
+        .apply_edit(
+            &seed.handle,
+            &EditTransaction {
+                steps: vec![EditStep::SetRunFormatting {
+                    block_id: first_para,
+                    expect: "Italic clause text".to_string(),
+                    semantic_hash: None,
+                    marks: InlineMarkSet {
+                        bold: true,
+                        ..InlineMarkSet::default()
+                    },
+                    style: RunStyleEdit::default(),
+                    rationale: None,
+                }],
+                summary: None,
+                materialization_mode: MaterializationMode::TrackedChange,
+                revision: test_revision(),
+            },
+        )
+        .expect("seed the pre-existing run change");
+    let carried = seed
+        .runtime
+        .export_docx(&seed.handle, ExportMode::Redline)
+        .expect("save the carried redline");
+
+    // The later round's program: format a paragraph, then insert a paragraph.
+    let format_step = |id: NodeId| EditStep::SetParagraphFormatting {
+        block_id: id,
+        semantic_hash: None,
+        patch: ParagraphFormattingPatch {
+            align: Some(Alignment::Center),
+            indent: None,
+            spacing: None,
+            borders: None,
+            shading: None,
+        },
+        rationale: None,
+    };
+    let insert_step = |id: NodeId| EditStep::InsertParagraphs {
+        anchor_block_id: id,
+        position: InsertPosition::After,
+        rationale: None,
+        blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            role: Some("body".to_string()),
+            content: parse_paragraph_markup("Wave 8 modeled insertion.").unwrap(),
+            restart_numbering: false,
+            list: None,
+        })],
+    };
+    let ids = |runtime: &SimpleRuntime, bytes: &[u8]| {
+        let import = runtime.import_docx(bytes).expect("reopen carried redline");
+        let ids: Vec<NodeId> = import
+            .canonical
+            .blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph.id.clone()),
+                _ => None,
+            })
+            .collect();
+        (import.doc_handle, ids)
+    };
+    let transaction = |steps: Vec<EditStep>| EditTransaction {
+        steps,
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
+
+    // Single session: both steps, one transaction.
+    let single_runtime = SimpleRuntime::new();
+    let (single_handle, single_ids) = ids(&single_runtime, &carried);
+    let single = std::sync::Arc::unwrap_or_clone(
+        single_runtime
+            .apply_edit(
+                &single_handle,
+                &transaction(vec![
+                    format_step(single_ids[0].clone()),
+                    insert_step(single_ids[1].clone()),
+                ]),
+            )
+            .expect("single-session apply")
+            .canonical,
+    );
+
+    // Split session: step one, persist, reopen, step two.
+    let split_runtime = SimpleRuntime::new();
+    let (split_handle, split_ids) = ids(&split_runtime, &carried);
+    split_runtime
+        .apply_edit(
+            &split_handle,
+            &transaction(vec![format_step(split_ids[0].clone())]),
+        )
+        .expect("split apply, first session");
+    let persisted = split_runtime
+        .export_docx(&split_handle, ExportMode::Redline)
+        .expect("persist between sessions");
+    let second_runtime = SimpleRuntime::new();
+    let (second_handle, second_ids) = ids(&second_runtime, &persisted);
+    let split = std::sync::Arc::unwrap_or_clone(
+        second_runtime
+            .apply_edit(
+                &second_handle,
+                &transaction(vec![insert_step(second_ids[1].clone())]),
+            )
+            .expect("split apply, second session")
+            .canonical,
+    );
+
+    assert_eq!(
+        previous_marks(&single),
+        vec![vec![Mark::Italic]],
+        "the single session records what the run was before the change"
+    );
+    assert_eq!(
+        previous_marks(&split),
+        previous_marks(&single),
+        "a persistence boundary must not empty the run change reject has to restore"
+    );
+}
+
+/// A partial resolution must not empty a SURVIVING run change.
+///
+/// The ingredient every earlier reconstruction of wave-8 lifecycle 437 omitted.
+/// A round ends with the counterparty accepting some proposals and rejecting
+/// others; the ones it did not name survive, and a survivor's `w:rPrChange`
+/// still has to remember what the run was — that is what makes it rejectable
+/// later. Resolving revision A must leave revision B exactly as it was.
+///
+/// GUARD (not a regression): it PASSES. Third reconstruction of 437 that does
+/// not reproduce it. What remains untried is the counterparty's FOREIGN edits —
+/// the modeled Word mutations wave-8 applies between rounds — which are now the
+/// only ingredient of that lifecycle no guard covers.
+#[test]
+fn a_partial_resolution_leaves_a_surviving_run_change_intact() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:rPr><w:i/></w:rPr>"#,
+        r#"<w:t xml:space="preserve">Italic clause text</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Second clause.</w:t></w:r></w:p>"#,
+    ));
+    let first = fixture.para_ids[0].clone();
+    let second = fixture.para_ids[1].clone();
+
+    // Two independent proposals: a run change on paragraph one, an unrelated
+    // insertion after paragraph two.
+    let applied = fixture
+        .runtime
+        .apply_edit(
+            &fixture.handle,
+            &EditTransaction {
+                steps: vec![
+                    EditStep::SetRunFormatting {
+                        block_id: first,
+                        expect: "Italic clause text".to_string(),
+                        semantic_hash: None,
+                        marks: InlineMarkSet {
+                            bold: true,
+                            ..InlineMarkSet::default()
+                        },
+                        style: RunStyleEdit::default(),
+                        rationale: None,
+                    },
+                    EditStep::InsertParagraphs {
+                        anchor_block_id: second,
+                        position: InsertPosition::After,
+                        rationale: None,
+                        blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                            role: Some("body".to_string()),
+                            content: parse_paragraph_markup("Wave 8 modeled insertion.").unwrap(),
+                            restart_numbering: false,
+                            list: None,
+                        })],
+                    },
+                ],
+                summary: None,
+                materialization_mode: MaterializationMode::TrackedChange,
+                revision: test_revision(),
+            },
+        )
+        .expect("apply both proposals");
+    let canonical = std::sync::Arc::unwrap_or_clone(applied.canonical);
+
+    let previous_marks = |doc: &CanonDoc| -> Vec<Vec<Mark>> {
+        doc.blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .flat_map(|paragraph| paragraph.segments.iter())
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => text
+                    .formatting_change
+                    .as_ref()
+                    .map(|change| change.previous_marks.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        previous_marks(&canonical),
+        vec![vec![Mark::Italic]],
+        "the run change records what the run was"
+    );
+
+    // Identify the run change, and resolve every OTHER revision around it.
+    let run_change_id = stemma::enumerate_revisions(&canonical)
+        .into_iter()
+        .find(|record| record.kind == stemma::RevisionKind::FormatRun)
+        .expect("a run-formatting revision")
+        .revision_id;
+    let others: std::collections::HashSet<u32> = stemma::enumerate_revisions(&canonical)
+        .into_iter()
+        .map(|record| record.revision_id)
+        .filter(|id| *id != run_change_id)
+        .collect();
+    assert!(
+        !others.is_empty(),
+        "the fixture has a second proposal to resolve"
+    );
+
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("export_docx");
+    let document = stemma::api::Document::parse(&bytes).expect("reopen");
+    let surviving_id = stemma::enumerate_revisions(document.snapshot().canonical.as_ref())
+        .into_iter()
+        .find(|record| record.kind == stemma::RevisionKind::FormatRun)
+        .expect("the run change survives the round trip")
+        .revision_id;
+    let to_resolve: std::collections::HashSet<u32> =
+        stemma::enumerate_revisions(document.snapshot().canonical.as_ref())
+            .into_iter()
+            .map(|record| record.revision_id)
+            .filter(|id| *id != surviving_id)
+            .collect();
+
+    for action in [
+        ResolveSelectionAction::Accept,
+        ResolveSelectionAction::Reject,
+    ] {
+        let resolved = document
+            .project(stemma::Resolution::Selective {
+                ids: to_resolve.clone(),
+                action,
+            })
+            .expect("partial resolution");
+        assert_eq!(
+            previous_marks(resolved.snapshot().canonical.as_ref()),
+            vec![vec![Mark::Italic]],
+            "{action:?} of an unrelated proposal emptied the surviving run change"
+        );
+    }
+}
+
+/// A second author formatting the same run must not erase what the first
+/// author's change remembers.
+///
+/// The last uncovered ingredient of wave-8 lifecycle 437: the counterparty's
+/// foreign edits include `run_format` (50% of the `format` family), which can
+/// land on a run that already carries a tracked `w:rPrChange` from an earlier
+/// round. Whatever the engine decides about stacking, the previous state of a
+/// change that SURVIVES has to remain what the run actually was — it is what
+/// reject restores.
+#[test]
+fn a_second_author_formatting_a_run_keeps_the_first_change_previous_state() {
+    fn previous_marks(doc: &CanonDoc) -> Vec<Vec<Mark>> {
+        doc.blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .flat_map(|paragraph| paragraph.segments.iter())
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => text
+                    .formatting_change
+                    .as_ref()
+                    .map(|change| change.previous_marks.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:rPr><w:i/></w:rPr>"#,
+        r#"<w:t xml:space="preserve">Italic clause text</w:t></w:r></w:p>"#,
+    ));
+    let target = fixture.para_ids[0].clone();
+    let format_by = |author: &str, block: NodeId, underline: bool| EditTransaction {
+        steps: vec![EditStep::SetRunFormatting {
+            block_id: block,
+            expect: "Italic clause text".to_string(),
+            semantic_hash: None,
+            marks: InlineMarkSet {
+                bold: !underline,
+                underline,
+                ..InlineMarkSet::default()
+            },
+            style: RunStyleEdit::default(),
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: RevisionInfo {
+            revision_id: 200,
+            identity: 0,
+            author: Some(author.to_string()),
+            date: Some("2026-03-01T00:00:00Z".to_string()),
+            apply_op_id: None,
+        },
+    };
+
+    fixture
+        .runtime
+        .apply_edit(&fixture.handle, &format_by("Author-A", target, false))
+        .expect("first author proposes bold");
+    let carried = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("save the round");
+
+    let counterparty = SimpleRuntime::new();
+    let reopened = counterparty
+        .import_docx(&carried)
+        .expect("counterparty opens the saved round");
+    assert_eq!(
+        previous_marks(&reopened.canonical),
+        vec![vec![Mark::Italic]],
+        "the carried change still remembers the run was italic"
+    );
+    let BlockNode::Paragraph(paragraph) = &reopened.canonical.blocks[0].block else {
+        panic!("fixture paragraph");
+    };
+    let reopened_id = paragraph.id.clone();
+
+    // The foreign edit: a different author formats the very same run.
+    let outcome = counterparty.apply_edit(
+        &reopened.doc_handle,
+        &format_by("Counterparty-B", reopened_id, true),
+    );
+    let Ok(applied) = outcome else {
+        // A typed refusal is a legitimate answer — the run already carries an
+        // unresolved proposal. What must not happen is silent data loss.
+        return;
+    };
+
+    assert_eq!(
+        previous_marks(&applied.canonical),
+        vec![vec![Mark::Italic]],
+        "a second author's formatting erased what the first change has to restore"
+    );
+}
+
+/// An `rPrChange` whose previous marks EQUAL the run's current marks still has
+/// to say so.
+///
+/// Root cause of wave-8 lifecycle 437. A foreign edit changed something about a
+/// run other than its marks — a colour, a size — so the tracked change records
+/// `previous_marks == marks`. Both are `[Italic]`; nothing about the italic
+/// changed. If persistence treats "same as current" as "nothing to record", the
+/// reopened change claims the run was previously UNMARKED, and rejecting it
+/// would strip an italic the author never touched.
+#[test]
+fn an_rpr_change_recording_unchanged_marks_survives_persistence() {
+    let fixture = import_body(concat!(
+        r#"<w:p><w:r><w:rPr><w:i/></w:rPr>"#,
+        r#"<w:t xml:space="preserve">\t[Form 6 inserted in Gazette 22 Sep</w:t></w:r></w:p>"#,
+    ));
+    let previous_marks = |doc: &CanonDoc| -> Vec<Vec<Mark>> {
+        doc.blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph),
+                _ => None,
+            })
+            .flat_map(|paragraph| paragraph.segments.iter())
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => text
+                    .formatting_change
+                    .as_ref()
+                    .map(|change| change.previous_marks.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A style-only change: the run stays italic, so the recorded previous marks
+    // equal the current ones.
+    let live = std::sync::Arc::unwrap_or_clone(
+        fixture
+            .runtime
+            .apply_edit(
+                &fixture.handle,
+                &EditTransaction {
+                    steps: vec![EditStep::SetRunFormatting {
+                        block_id: fixture.para_ids[0].clone(),
+                        expect: "Form".to_string(),
+                        semantic_hash: None,
+                        marks: InlineMarkSet::default(),
+                        style: RunStyleEdit {
+                            color: Some("FF0000".into()),
+                            ..RunStyleEdit::default()
+                        },
+                        rationale: None,
+                    }],
+                    summary: None,
+                    materialization_mode: MaterializationMode::TrackedChange,
+                    revision: test_revision(),
+                },
+            )
+            .expect("apply a style-only run format")
+            .canonical,
+    );
+    assert_eq!(
+        previous_marks(&live),
+        vec![vec![Mark::Italic]],
+        "the change records the run was italic before, unchanged though it is"
+    );
+
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .expect("export_docx");
+    let reopened = std::sync::Arc::unwrap_or_clone(
+        SimpleRuntime::new()
+            .import_docx(&bytes)
+            .expect("reopen")
+            .canonical,
+    );
+    assert_eq!(
+        previous_marks(&reopened),
+        previous_marks(&live),
+        "persistence dropped a previous mark that happened to match the current one"
+    );
+}
+
+/// An inserted EMPTY paragraph is one proposal, not two.
+///
+/// Ground truth is a real redline from the wild corpus, so no oracle is needed:
+/// Word expresses an inserted empty paragraph with a single paragraph-mark
+/// `w:ins` inside `<w:pPr><w:rPr>` and nothing else. There is no content to
+/// wrap, so there is no content-level `w:ins`.
+///
+/// We emitted that mark insertion PLUS a second `<w:ins>` around a run with no
+/// text. That phantom carries its own identity, and because an empty
+/// paragraph's carrier key falls back to the hash of its (empty) text plus a
+/// positional ordinal, the identity moved whenever the paragraph's position
+/// did — which is how the replay leg caught it:
+///
+///     left:  block p_2, excerpt "", identity 2456940684
+///     right: block p_1, excerpt "", identity 3861431814
+///
+/// GUARD (not a regression): it PASSES. `InsertParagraphs` with empty content
+/// already emits one envelope, so the replay's trigger is narrower — its
+/// inserted paragraph carries a run with formatting but no text, which this
+/// fixture does not produce. Kept because the contract is worth holding and it
+/// narrows the search to textless-but-formatted runs.
+#[test]
+fn an_inserted_empty_paragraph_emits_one_tracked_envelope() {
+    let fixture = import_body(&format!("{}{}", para("First."), para("Second.")));
+    let anchor = fixture.para_ids.last().unwrap().clone();
+    let tx = EditTransaction {
+        steps: vec![EditStep::InsertParagraphs {
+            anchor_block_id: anchor,
+            position: InsertPosition::After,
+            rationale: None,
+            blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                role: Some("body".to_string()),
+                content: parse_paragraph_markup("").unwrap(),
+                restart_numbering: false,
+                list: None,
+            })],
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
+    let (_, root) = apply_and_export(&fixture, &tx);
+    let xml = {
+        let mut buffer = Vec::new();
+        root.write(&mut buffer).expect("write xml");
+        String::from_utf8(buffer).expect("utf-8")
+    };
+
+    let envelopes = xml.matches("<w:ins ").count();
+    assert_eq!(
+        envelopes, 1,
+        "an inserted empty paragraph is one proposal — its paragraph mark. \
+         A second envelope around an empty run is a revision Word never writes: {xml}"
+    );
 }

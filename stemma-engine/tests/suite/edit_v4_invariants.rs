@@ -82,6 +82,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -131,6 +132,8 @@ fn make_opaque(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(b"<w:drawing/>".to_vec()),
         content_hash: None,
     })
@@ -643,6 +646,8 @@ fn doc_with_hyperlink(para_id: &str, hyperlink_id: &str, url: &str, text: &str) 
             runs: vec![HyperlinkRun {
                 text: text.to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
@@ -656,6 +661,8 @@ fn doc_with_hyperlink(para_id: &str, hyperlink_id: &str, url: &str, text: &str) 
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     });
@@ -923,6 +930,8 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
             runs: vec![HyperlinkRun {
                 text: "click".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
@@ -936,6 +945,8 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     });
@@ -989,6 +1000,8 @@ fn set_attr_hyperlink_target_not_a_hyperlink() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(b"<w:footnoteReference w:id=\"7\"/>".to_vec()),
         content_hash: None,
     });

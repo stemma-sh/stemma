@@ -320,6 +320,8 @@ fn synthesize_drawing_inline(id: &NodeId, drawing_xml: Vec<u8>) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(drawing_xml),
         content_hash: Some(content_hash),
     })

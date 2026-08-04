@@ -6,9 +6,13 @@
 //! domain-model.md §11: accept-all keeps the new formatting, reject-all restores
 //! the original.
 
+use std::collections::HashSet;
 use stemma::domain::*;
 use stemma::edit::*;
-use stemma::{accept_all, reject_all_with_styles};
+use stemma::{
+    ResolveSelectionAction, accept_all, enumerate_revisions, reject_all_with_styles,
+    resolve_selected_revisions_with_styles,
+};
 
 // ─── Helpers (minimal, mirrors tests/edit_basic.rs) ──────────────────────────
 
@@ -77,6 +81,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -381,6 +386,8 @@ fn span_crossing_an_opaque_is_not_matched() {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
                 raw_xml: Some(b"<w:drawing/>".to_vec()),
                 content_hash: None,
             }),
@@ -647,4 +654,465 @@ fn v4_set_format_empty_request_is_schema_rejected() {
         Err(SchemaError::EmptyFormatMarks { .. }) => {}
         other => panic!("expected EmptyFormatMarks, got {other:?}"),
     }
+}
+
+#[test]
+fn v4_object_marks_can_turn_bold_off_and_reject_restores_directness() {
+    use stemma::edit_v4::parse_transaction;
+
+    let mut text = match make_text("p1_t1", "Bold term") {
+        InlineNode::Text(text) => *text,
+        _ => unreachable!(),
+    };
+    text.marks.push(Mark::Bold);
+    text.rpr_authored.bold = true;
+    let para = make_para("p1", normal_segment(vec![InlineNode::from(text)]));
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let wire = r#"{
+        "ops": [{
+            "op": "set_format",
+            "target": "p1",
+            "expect": "Bold",
+            "marks": {"bold": false}
+        }],
+        "revision": {"author": "Agent"}
+    }"#;
+    let txn = parse_transaction(wire)
+        .expect("object-form marks parse")
+        .into_edit_transaction()
+        .expect("object-form marks translate");
+    let edited = apply_transaction(&base, &txn).expect("bold-off applies").0;
+    let current = run_with_text(get_para(&edited, "p1"), "Bold").expect("target run");
+    assert!(!current.marks.contains(&Mark::Bold));
+    assert!(current.rpr_authored.bold);
+    assert!(current.rpr_authored.bold_off);
+    assert!(current.formatting_change.is_some());
+
+    let mut accepted = edited.clone();
+    accept_all(&mut accepted);
+    let accepted_run = run_with_text(get_para(&accepted, "p1"), "Bold").unwrap();
+    assert!(!accepted_run.marks.contains(&Mark::Bold));
+    assert!(accepted_run.rpr_authored.bold_off);
+
+    let mut rejected = edited;
+    reject_all_with_styles(&mut rejected, None);
+    let rejected_run = run_with_text(get_para(&rejected, "p1"), "Bold").unwrap();
+    assert!(rejected_run.marks.contains(&Mark::Bold));
+    assert!(rejected_run.rpr_authored.bold);
+    assert!(!rejected_run.rpr_authored.bold_off);
+}
+
+#[test]
+fn v4_object_marks_cover_all_eight_tri_state_properties() {
+    use stemma::edit_v4::parse_transaction;
+
+    let wire = r#"{
+        "ops": [{
+            "op": "set_format",
+            "target": "p1",
+            "expect": "term",
+            "marks": {
+                "bold": false,
+                "italic": true,
+                "underline": false,
+                "strike": true,
+                "subscript": false,
+                "superscript": true,
+                "caps": false,
+                "small_caps": true
+            }
+        }],
+        "revision": {"author": "Agent"}
+    }"#;
+    let txn = parse_transaction(wire)
+        .expect("all object marks parse")
+        .into_edit_transaction()
+        .expect("all object marks translate");
+    let EditStep::SetRunFormatting { marks, .. } = &txn.steps[0] else {
+        panic!("expected run-format step")
+    };
+    assert!(marks.bold_off);
+    assert!(marks.italic);
+    assert!(marks.underline_off);
+    assert!(marks.strike);
+    assert!(marks.subscript_off);
+    assert!(marks.superscript);
+    assert!(marks.caps_off);
+    assert!(marks.small_caps);
+}
+
+#[test]
+fn v4_refuses_mixed_and_empty_object_mark_forms() {
+    use stemma::edit_v4::{SchemaError, parse_transaction};
+
+    let mixed = r#"{
+        "ops": [{
+            "op": "set_format",
+            "target": "p1",
+            "expect": "term",
+            "marks": {"bold": true},
+            "caps": false
+        }],
+        "revision": {"author": "Agent"}
+    }"#;
+    assert!(matches!(
+        parse_transaction(mixed),
+        Err(SchemaError::MixedFormatMarkForms { .. })
+    ));
+
+    let empty = r#"{
+        "ops": [{
+            "op": "set_format",
+            "target": "p1",
+            "expect": "term",
+            "marks": {}
+        }],
+        "revision": {"author": "Agent"}
+    }"#;
+    assert!(matches!(
+        parse_transaction(empty),
+        Err(SchemaError::EmptyFormatMarks { .. })
+    ));
+}
+
+#[test]
+fn duplicate_format_expect_refuses_without_mutation() {
+    let base = doc_one_run("term and term");
+    let error = apply_transaction(&base, &format_tx("p1", "term", bold()))
+        .expect_err("duplicate target must refuse");
+    assert!(matches!(
+        error,
+        EditError::AmbiguousFormatTarget { occurrences: 2, .. }
+    ));
+    assert_eq!(para_text(&base, "p1"), "term and term");
+    assert!(
+        runs(get_para(&base, "p1"))
+            .iter()
+            .all(|run| run.formatting_change.is_none())
+    );
+}
+
+#[test]
+fn no_effect_substring_refuses_without_splitting_the_run() {
+    let mut text = match make_text("p1_t1", "prefix target suffix") {
+        InlineNode::Text(text) => *text,
+        _ => unreachable!(),
+    };
+    text.marks.push(Mark::Bold);
+    text.rpr_authored.bold = true;
+    let para = make_para("p1", normal_segment(vec![InlineNode::from(text)]));
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let before = base.clone();
+
+    let error = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect_err("reasserting the exact direct format is a no-op");
+    assert!(matches!(error, EditError::NoFormattingChange { .. }));
+    assert_eq!(base, before, "a refused no-op leaves the source untouched");
+    assert_eq!(runs(get_para(&base, "p1")).len(), 1);
+}
+
+#[test]
+fn span_refuses_when_any_covered_run_has_an_independent_format_revision() {
+    let alpha = make_text("alpha", "Alpha ");
+    let mut beta = match make_text("beta", "Beta") {
+        InlineNode::Text(text) => *text,
+        _ => unreachable!(),
+    };
+    beta.formatting_change = Some(FormattingChange {
+        revision_id: 41,
+        identity: 4100,
+        previous_marks: Vec::new(),
+        previous_style_props: StyleProps::default(),
+        previous_rpr_authored: RunRprAuthored::default(),
+        author: "Earlier reviewer".to_string(),
+        date: None,
+    });
+    let para = make_para("p1", normal_segment(vec![alpha, InlineNode::from(beta)]));
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let transaction = EditTransaction {
+        steps: vec![
+            EditStep::SetRunFormatting {
+                block_id: NodeId::from("p1"),
+                expect: "Alpha".to_string(),
+                semantic_hash: None,
+                marks: bold(),
+                style: RunStyleEdit::default(),
+                rationale: None,
+            },
+            EditStep::SetRunFormatting {
+                block_id: NodeId::from("p1"),
+                expect: "Alpha Beta".to_string(),
+                semantic_hash: None,
+                marks: InlineMarkSet {
+                    italic: true,
+                    ..Default::default()
+                },
+                style: RunStyleEdit::default(),
+                rationale: None,
+            },
+        ],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
+
+    let error = apply_transaction(&base, &transaction)
+        .expect_err("one same-transaction run cannot mask a later conflict");
+    assert!(matches!(
+        error,
+        EditError::FormatRevisionConflict {
+            existing_revision,
+            ..
+        } if existing_revision.identity == 4100
+    ));
+    assert_eq!(
+        runs(get_para(&base, "p1"))[0].formatting_change,
+        None,
+        "the whole transaction rolls back"
+    );
+}
+
+#[test]
+fn unrelated_pending_segment_does_not_lock_normal_format_target() {
+    let inserted_revision = RevisionInfo {
+        revision_id: 7,
+        identity: 77,
+        author: Some("Other".to_string()),
+        date: None,
+        apply_op_id: None,
+    };
+    let para = make_para(
+        "p1",
+        vec![
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![make_text("normal", "target")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Inserted(inserted_revision.clone()),
+                inlines: vec![make_text("inserted", " unrelated")],
+            },
+        ],
+    );
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let mut direct = format_tx("p1", "target", bold());
+    direct.materialization_mode = MaterializationMode::Direct;
+    let direct_edited = apply_transaction(&base, &direct)
+        .expect("unrelated pending text does not lock a normal direct target")
+        .0;
+    assert!(
+        run_with_text(get_para(&direct_edited, "p1"), "target")
+            .unwrap()
+            .marks
+            .contains(&Mark::Bold)
+    );
+    assert_eq!(
+        get_para(&direct_edited, "p1").segments[1].status,
+        TrackingStatus::Inserted(inserted_revision.clone())
+    );
+
+    let edited = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect("normal target remains independently editable")
+        .0;
+    assert!(
+        run_with_text(get_para(&edited, "p1"), "target")
+            .unwrap()
+            .marks
+            .contains(&Mark::Bold)
+    );
+    assert_eq!(
+        get_para(&edited, "p1").segments[1].status,
+        TrackingStatus::Inserted(inserted_revision)
+    );
+}
+
+#[test]
+fn first_format_revision_on_pending_insertion_is_independently_resolvable() {
+    let insertion = RevisionInfo {
+        revision_id: 7,
+        identity: 70,
+        author: Some("Inserter".to_string()),
+        date: None,
+        apply_op_id: None,
+    };
+    let para = make_para(
+        "p1",
+        vec![TrackedSegment {
+            status: TrackingStatus::Inserted(insertion.clone()),
+            inlines: vec![make_text("target", "target")],
+        }],
+    );
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let edited = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect("Word-proven first format proposal on inserted text applies")
+        .0;
+
+    let records = enumerate_revisions(&edited);
+    let format_identity = records
+        .iter()
+        .find(|record| record.kind == stemma::RevisionKind::FormatRun)
+        .map(|record| record.revision_id)
+        .expect("format revision is independently enumerable");
+    assert_ne!(format_identity, insertion.identity);
+
+    let mut accepted = edited.clone();
+    resolve_selected_revisions_with_styles(
+        &mut accepted,
+        &HashSet::from([format_identity]),
+        ResolveSelectionAction::Accept,
+        None,
+    )
+    .expect("accept only format revision");
+    let accepted_segment = &get_para(&accepted, "p1").segments[0];
+    assert_eq!(
+        accepted_segment.status,
+        TrackingStatus::Inserted(insertion.clone())
+    );
+    let accepted_run = run_with_text(get_para(&accepted, "p1"), "target").unwrap();
+    assert!(accepted_run.marks.contains(&Mark::Bold));
+    assert!(accepted_run.formatting_change.is_none());
+
+    let mut rejected = edited;
+    resolve_selected_revisions_with_styles(
+        &mut rejected,
+        &HashSet::from([format_identity]),
+        ResolveSelectionAction::Reject,
+        None,
+    )
+    .expect("reject only format revision");
+    let rejected_segment = &get_para(&rejected, "p1").segments[0];
+    assert_eq!(rejected_segment.status, TrackingStatus::Inserted(insertion));
+    let rejected_run = run_with_text(get_para(&rejected, "p1"), "target").unwrap();
+    assert!(!rejected_run.marks.contains(&Mark::Bold));
+    assert!(rejected_run.formatting_change.is_none());
+}
+
+#[test]
+fn pending_deletion_format_target_has_a_specific_refusal() {
+    let deletion = RevisionInfo {
+        revision_id: 8,
+        identity: 80,
+        author: Some("Deleter".to_string()),
+        date: None,
+        apply_op_id: None,
+    };
+    let para = make_para(
+        "p1",
+        vec![TrackedSegment {
+            status: TrackingStatus::Deleted(deletion),
+            inlines: vec![make_text("target", "target")],
+        }],
+    );
+    let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
+    let error = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect_err("formatting deleted text remains outside the authoring contract");
+    assert!(matches!(
+        error,
+        EditError::FormatTargetNotEditable {
+            tracking_status,
+            ..
+        } if tracking_status == "deleted"
+    ));
+}
+
+#[test]
+fn detail_view_exposes_pending_format_revision_on_exact_span() {
+    let base = doc_one_run("target tail");
+    let edited = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect("format proposal applies")
+        .0;
+    let view = stemma::view::build_document_view_from_canon(&edited);
+    let target = view.blocks[0]
+        .segments
+        .iter()
+        .find_map(|segment| match segment {
+            stemma::view::SegmentView::Text {
+                text,
+                format_revision,
+                ..
+            } if text == "target" => format_revision.as_ref(),
+            _ => None,
+        })
+        .expect("target span carries format revision metadata");
+    assert_ne!(target.revision_id, 0, "read exposes stable identity");
+    assert_eq!(target.author.as_deref(), Some("Test Author"));
+}
+
+#[test]
+fn pending_insertion_with_format_revision_reports_both_identities() {
+    let base = doc_one_run("target");
+    let mut pending = apply_transaction(&base, &format_tx("p1", "target", bold()))
+        .expect("first format proposal applies")
+        .0;
+    let container = RevisionInfo {
+        revision_id: 40,
+        identity: 400,
+        author: Some("Inserter".to_string()),
+        date: None,
+        apply_op_id: None,
+    };
+    let BlockNode::Paragraph(paragraph) = &mut pending.blocks[0].block else {
+        unreachable!()
+    };
+    paragraph.segments[0].status = TrackingStatus::Inserted(container.clone());
+    let before = pending.clone();
+
+    let error = apply_transaction(
+        &pending,
+        &format_tx(
+            "p1",
+            "target",
+            InlineMarkSet {
+                italic: true,
+                ..Default::default()
+            },
+        ),
+    )
+    .expect_err("a second format proposal on inserted text refuses");
+    let EditError::FormatRevisionConflict {
+        existing_revision,
+        container_revision,
+        tracking_status,
+        ..
+    } = error
+    else {
+        panic!("expected typed format conflict")
+    };
+    assert_eq!(tracking_status, "inserted");
+    assert_ne!(existing_revision.identity, 0);
+    assert_eq!(*container_revision, Some(container));
+    assert_eq!(pending, before, "conflict refuses before mutation");
+}
+
+/// Marks are a set, so the model must hold exactly one representation of a
+/// given set. Import emits them in declaration order; applying formatting in a
+/// different order must reach the same vector, or an edited document stops
+/// comparing equal to its own reopened form.
+#[test]
+fn marks_reach_canonical_order_whatever_order_they_are_applied() {
+    use stemma::domain::Mark;
+
+    let ordered = vec![Mark::Bold, Mark::Italic, Mark::Underline];
+    let mut sorted = ordered.clone();
+    sorted.sort();
+    assert_eq!(
+        ordered, sorted,
+        "declaration order is the canonical order the model stores"
+    );
+
+    // Underline applied to an already bold+italic run, then italic applied to a
+    // bold+underline run: both are the same set and must be the same vector.
+    let mut applied_last = vec![Mark::Bold, Mark::Italic];
+    if let Err(at) = applied_last.binary_search(&Mark::Underline) {
+        applied_last.insert(at, Mark::Underline);
+    }
+    let mut applied_middle = vec![Mark::Bold, Mark::Underline];
+    if let Err(at) = applied_middle.binary_search(&Mark::Italic) {
+        applied_middle.insert(at, Mark::Italic);
+    }
+    assert_eq!(
+        applied_last, applied_middle,
+        "the same mark set must have one representation regardless of the order \
+         the marks were applied in"
+    );
 }

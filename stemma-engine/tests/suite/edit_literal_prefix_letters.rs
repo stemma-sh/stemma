@@ -78,10 +78,36 @@ fn test_revision() -> RevisionInfo {
     }
 }
 
+/// The paragraph's LABEL, wherever the model keeps it.
+///
+/// A manual label is body text. On an untracked paragraph it is hoisted into
+/// `literal_prefix` for inline rendering; on a block-level tracked paragraph it
+/// stays inside the proposal, because `literal_prefix` may only hold untracked
+/// characters. Both are the same domain fact — "this item is labelled (c)" —
+/// so a test about label sequencing reads through this rather than pinning one
+/// of the two encodings.
+fn label_text(paragraph: &stemma::domain::ParagraphNode) -> Option<String> {
+    if let Some(prefix) = &paragraph.literal_prefix {
+        return Some(prefix.to_string());
+    }
+    let text: String = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            stemma::domain::InlineNode::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (candidate, _) = text.trim_start().split_once(char::is_whitespace)?;
+    let ends_like_label = candidate.ends_with('.') || candidate.ends_with(')');
+    (ends_like_label && candidate.len() <= 8).then(|| candidate.to_string())
+}
+
 /// The literal-prefix of the i-th block (None if not a literal-prefix paragraph).
 fn prefix_at(canon: &CanonDoc, idx: usize) -> Option<String> {
     match &canon.blocks[idx].block {
-        BlockNode::Paragraph(p) => p.literal_prefix.clone(),
+        BlockNode::Paragraph(p) => label_text(p),
         _ => None,
     }
 }

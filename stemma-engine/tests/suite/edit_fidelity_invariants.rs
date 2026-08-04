@@ -3335,6 +3335,7 @@ fn table_fidelity_para(id: &str, text: &str) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -3525,6 +3526,8 @@ fn formatted_table_fidelity_doc() -> CanonDoc {
         right: Some(edge.clone()),
         inside_h: Some(edge.clone()),
         inside_v: Some(edge),
+        tl2br: None,
+        tr2bl: None,
     };
     let table = TableNode {
         id: NodeId::from("tf_t"),

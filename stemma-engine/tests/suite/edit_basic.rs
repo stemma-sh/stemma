@@ -62,6 +62,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -127,6 +128,8 @@ fn make_opaque(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(b"<w:drawing/>".to_vec()),
         content_hash: None,
     })
@@ -137,6 +140,12 @@ fn make_hard_break(id: &str) -> InlineNode {
     InlineNode::HardBreak(HardBreakNode {
         id: NodeId::from(id),
         break_type: BreakType::TextWrapping,
+        type_is_explicit: false,
+        clear: None,
+        wrapper_marks: Vec::new(),
+        wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
         joins_following_text_run: false,
     })
 }
@@ -153,6 +162,8 @@ fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
             runs: vec![HyperlinkRun {
                 text: text.to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
@@ -166,6 +177,8 @@ fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             b"<w:hyperlink r:id=\"rId1\"><w:r><w:t>link</w:t></w:r></w:hyperlink>".to_vec(),
         ),
@@ -191,6 +204,8 @@ fn make_field(id: &str, kind: FieldKind) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(b"<w:fldChar w:fldCharType=\"begin\"/>".to_vec()),
         content_hash: None,
     })
@@ -209,6 +224,8 @@ fn make_sdt(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             b"<w:sdt><w:sdtContent><w:r><w:t>content</w:t></w:r></w:sdtContent></w:sdt>".to_vec(),
         ),
@@ -3402,9 +3419,35 @@ fn make_literal_prefix_para(id: &str, prefix: &str, body: &str) -> ParagraphNode
     p
 }
 
+/// The paragraph's LABEL, wherever the model keeps it.
+///
+/// A manual label is body text. On an untracked paragraph it is hoisted into
+/// `literal_prefix` for inline rendering; on a block-level tracked paragraph it
+/// stays inside the proposal, because `literal_prefix` may only hold untracked
+/// characters. Both are the same domain fact — "this item is labelled (c)" —
+/// so a test about label sequencing reads through this rather than pinning one
+/// of the two encodings.
+fn label_text(paragraph: &stemma::domain::ParagraphNode) -> Option<String> {
+    if let Some(prefix) = &paragraph.literal_prefix {
+        return Some(prefix.to_string());
+    }
+    let text: String = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            stemma::domain::InlineNode::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (candidate, _) = text.trim_start().split_once(char::is_whitespace)?;
+    let ends_like_label = candidate.ends_with('.') || candidate.ends_with(')');
+    (ends_like_label && candidate.len() <= 8).then(|| candidate.to_string())
+}
+
 fn prefix_of(doc: &CanonDoc, block_id: &str) -> Option<String> {
     doc.blocks.iter().find_map(|tb| match &tb.block {
-        BlockNode::Paragraph(p) if p.id == NodeId::from(block_id) => p.literal_prefix.clone(),
+        BlockNode::Paragraph(p) if p.id == NodeId::from(block_id) => label_text(p),
         _ => None,
     })
 }
@@ -3447,7 +3490,10 @@ fn insert_literal_prefix_gets_anchor_plus_one_arabic() {
     };
 
     let result = apply_transaction(&doc, &tx).unwrap().0;
-    assert_eq!(all_para_texts(&result), vec!["alpha", "beta", "gamma"]);
+    // The inserted paragraph is a block-level proposal, so its label lives in
+    // the tracked body rather than hoisted beside it: a reviewer sees "3.
+    // gamma" inserted, and the label is removed with the text on reject.
+    assert_eq!(all_para_texts(&result), vec!["alpha", "beta", "3. gamma"]);
     assert_eq!(prefix_of(&result, "p1").as_deref(), Some("1."));
     assert_eq!(prefix_of(&result, "p2").as_deref(), Some("2."));
     let inserted_id = block_id_at(&result, 2);
@@ -3494,7 +3540,8 @@ fn insert_literal_prefix_in_middle_does_not_renumber_downstream() {
     let inserted_id = block_id_at(&result, 1);
     assert_eq!(
         all_para_texts(&result),
-        vec!["alpha", "bridge", "beta", "gamma"]
+        // Same rule: the inserted item carries its label inside the proposal.
+        vec!["alpha", "2. bridge", "beta", "gamma"],
     );
     assert_eq!(prefix_of(&result, "p1").as_deref(), Some("1."));
     assert_eq!(
@@ -4360,6 +4407,8 @@ fn replace_hyperlink_text_preserves_url_and_anchor() {
                 runs: vec![HyperlinkRun {
                     text: "See Section 5".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 }],
@@ -4373,6 +4422,8 @@ fn replace_hyperlink_text_preserves_url_and_anchor() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })]),
@@ -4493,12 +4544,16 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
             HyperlinkRun {
                 text: "click ".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
             HyperlinkRun {
                 text: "here".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Inserted(test_revision()),
             },
@@ -4521,6 +4576,8 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })]),
@@ -4601,12 +4658,16 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
             HyperlinkRun {
                 text: "click ".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
             HyperlinkRun {
                 text: "HERE".to_string(),
                 rpr_xml: Some(bold_rpr.clone()),
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             },
@@ -4628,6 +4689,8 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: None,
             content_hash: None,
         })]),
@@ -4758,8 +4821,9 @@ fn insert_after_section_break_exemplar_does_not_duplicate_sectpr() {
         "inserting paragraphs must not add section breaks"
     );
 
-    // Each inserted paragraph carries no position-bound state: no sectPr, and
-    // no cloned w14 identity (which would collide with p1's).
+    // Each inserted paragraph carries no position-bound state: no sectPr and
+    // no cloned w14 identity. It does receive a fresh durable paraId so later
+    // revision identities survive save/reopen.
     let inserted: Vec<&ParagraphNode> = result
         .blocks
         .iter()
@@ -4770,14 +4834,24 @@ fn insert_after_section_break_exemplar_does_not_duplicate_sectpr() {
         })
         .collect();
     assert_eq!(inserted.len(), 2, "two inserted paragraphs");
+    let para_ids: std::collections::HashSet<_> = inserted
+        .iter()
+        .map(|paragraph| {
+            paragraph
+                .para_id
+                .as_deref()
+                .expect("inserted paragraph must receive a durable w14:paraId")
+        })
+        .collect();
+    assert_eq!(para_ids.len(), 2, "inserted paraIds must be distinct");
+    assert!(
+        !para_ids.contains("11112222"),
+        "must not clone exemplar paraId"
+    );
     for p in inserted {
         assert!(
             p.section_properties.is_none(),
             "inserted paragraph must not carry a section break"
-        );
-        assert!(
-            p.para_id.is_none(),
-            "inserted paragraph must not clone the exemplar's w14:paraId"
         );
         assert!(
             p.text_id.is_none(),

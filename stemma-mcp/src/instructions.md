@@ -295,3 +295,11 @@ Both note verbs are enumerable via `list_revisions` (their `location` names the 
 ## Policy: layer beside, don't resolve, unless asked
 
 **By default, layer your tracked changes BESIDE the other authors' pending changes — do not accept or reject their changes.** Resolving (accepting/rejecting) someone else's pending change is allowed only when the user's instruction calls for it: a cleanup/tighten-class task ("tighten this redline", "clean up the noise", "strip the junk edits") authorizes you to reject changes you judge to be noise or errors. When you do resolve other authors' changes, **report it distinctly in your final summary** (which revisions you rejected/accepted and why), separately from the new tracked edits you authored. When in doubt, layer and flag the question for the user rather than resolving unilaterally.
+For `set_format`, `marks` is an object of optional booleans: `true` turns a
+mark on, `false` turns it off, and omission leaves it unchanged. The keys are
+`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `caps`,
+and `small_caps`. Use an exact, uniquely matching `expect`; ambiguous matches
+refuse without mutation. Inspect the target span's `status` and
+`format_revision` before writing. A pending formatting revision is a proposal,
+not debris: resolve it or comment on it instead of manufacturing an opposite
+revision.

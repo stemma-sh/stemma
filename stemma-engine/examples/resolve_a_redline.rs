@@ -30,8 +30,9 @@ fn main() {
     let doc = replace_tracked(&doc, "much longer sequence", "Bob's rewrite.", "Bob");
 
     // Enumerate the pending revisions the way a reviewer does — from the read
-    // view, which is authoritative NOW (ids are session handles, not durable
-    // file properties). Group them by author.
+    // view. Ids are content-derived identities (durable while a revision's own
+    // content is untouched), but the live view is always the authoritative
+    // census. Group them by author.
     println!("pending revisions:");
     for (rev_id, author) in revisions(&doc) {
         println!("  revision {rev_id} by {author}");

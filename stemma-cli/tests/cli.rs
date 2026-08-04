@@ -1302,6 +1302,108 @@ fn resolve_accept_author_keeps_that_authors_change() {
     );
 }
 
+/// A minimal package carrying one EMPTY-author insertion (Word anonymization
+/// writes `w:author=""`) alongside one named insertion.
+fn empty_author_redline_docx() -> Vec<u8> {
+    use std::io::Write as _;
+    use zip::write::FileOptions;
+
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let document_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Anonymous target: </w:t></w:r><w:ins w:id="10" w:author="" w:date="2026-07-01T10:00:00Z"><w:r><w:t>inserted by nobody</w:t></w:r></w:ins><w:r><w:t>.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Named target: </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-07-01T10:00:00Z"><w:r><w:t>inserted by Alice</w:t></w:r></w:ins><w:r><w:t>.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+
+    let mut bytes = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let options: FileOptions = FileOptions::default();
+        for (name, contents) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", rels),
+            ("word/_rels/document.xml.rels", document_rels),
+            ("word/document.xml", document),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    bytes
+}
+
+/// The empty string is a real, selectable author group (Word anonymization
+/// writes `w:author=""`): `--accept-author ""` resolves exactly that group and
+/// leaves other authors' changes pending. The docs advertise this selector on
+/// the CLI reference's empty-author note; this pins the contract.
+#[test]
+fn resolve_accept_author_empty_string_selects_the_anonymous_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let redlined = dir.path().join("anon-redline.docx");
+    std::fs::write(&redlined, empty_author_redline_docx()).unwrap();
+    let resolved = dir.path().join("resolved.docx");
+
+    let output = run(&[
+        "resolve",
+        redlined.to_str().unwrap(),
+        "-o",
+        resolved.to_str().unwrap(),
+        "--accept-author",
+        "",
+    ]);
+    assert!(
+        output.status.success(),
+        "resolve --accept-author \"\" must resolve the empty-author group: {output:?}"
+    );
+    assert!(
+        text_of(&resolved).contains("inserted by nobody"),
+        "the anonymous insertion is accepted"
+    );
+
+    // Exactly the named author's change remains pending.
+    let bytes = std::fs::read(&resolved).unwrap();
+    let doc = Document::parse(&bytes).unwrap();
+    let remaining = stemma::enumerate_revisions(&doc.snapshot().canonical);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only Alice's insertion stays pending: {remaining:?}"
+    );
+    assert_eq!(remaining[0].author.as_deref(), Some("Alice"));
+}
+
+/// Selector-matches-nothing stays a loud error for the empty author too, and
+/// the hint names the empty group by its actual selector token (`""`), never a
+/// placeholder the user would type verbatim and miss with.
+#[test]
+fn resolve_accept_author_empty_string_errors_when_no_anonymous_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let redlined = dir.path().join("named-redline.docx");
+    let resolved = dir.path().join("resolved.docx");
+    write_named_redline(&redlined, "Alice", "Alice's revised clause.");
+
+    let output = run(&[
+        "resolve",
+        redlined.to_str().unwrap(),
+        "-o",
+        resolved.to_str().unwrap(),
+        "--accept-author",
+        "",
+    ]);
+    assert!(
+        !output.status.success(),
+        "an empty-author selection over a document with no empty-author changes must refuse"
+    );
+    assert!(
+        !resolved.exists(),
+        "a refused selection writes no output file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no pending tracked changes by author"),
+        "the refusal names the failed selection: {stderr}"
+    );
+}
+
 #[test]
 fn extract_json_parses_and_carries_blocks_and_revisions() {
     let dir = tempfile::tempdir().unwrap();
@@ -1784,9 +1886,17 @@ fn inspect_is_a_compact_identity_bound_revision_aware_projection() {
     assert!(json_output.status.success());
     let payload: serde_json::Value =
         serde_json::from_slice(&json_output.stdout).expect("inspection JSON");
-    assert_eq!(payload["schema"], "stemma.inspect.v0");
+    assert_eq!(payload["schema"], "stemma.inspect.v1");
     assert_eq!(payload["input"]["sha256"], identity.identity().digest.hex);
     assert!(payload["projection"].as_str().unwrap().contains("foo bar"));
+    // v1 names the summary integers `*_count`: the read model's `blocks` is an
+    // array, and v0's reuse of that key for a count conflated the two shapes.
+    assert!(payload["block_count"].is_u64());
+    assert!(payload["pending_revision_count"].is_u64());
+    assert!(
+        payload.get("blocks").is_none() && payload.get("pending_revisions").is_none(),
+        "the v0 count keys are gone, not aliased"
+    );
 }
 
 #[test]
@@ -2299,4 +2409,481 @@ fn verify_task_projects_complete_partial_mismatch_and_schema_to_distinct_exit_co
     ]);
     assert_eq!(unknown.status.code(), Some(3), "{unknown:?}");
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown task manifest schema"));
+}
+
+// ---------------------------------------------------------------------------
+// machine-readable surfaces: read, receipts (compare/resolve/validate), plans
+// ---------------------------------------------------------------------------
+
+/// Seed a two-party redline on disk (the anonymous `""` group plus "Alice")
+/// and return its path. The machine-surface tests below share it because a
+/// mixed disposition needs at least two distinct author groups.
+fn write_two_party_redline(dir: &Path) -> PathBuf {
+    let path = dir.join("two-party-redline.docx");
+    std::fs::write(&path, empty_author_redline_docx()).unwrap();
+    path
+}
+
+#[test]
+fn read_emits_the_structured_read_model_in_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = dir.path().join("redline.docx");
+    assert!(
+        run(&[
+            "compare",
+            fixture("simple-text/before.docx").to_str().unwrap(),
+            fixture("simple-text/after.docx").to_str().unwrap(),
+            "-o",
+            redline.to_str().unwrap(),
+        ])
+        .status
+        .success()
+    );
+
+    let output = run(&["read", redline.to_str().unwrap()]);
+    assert!(output.status.success(), "read should succeed: {output:?}");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("read JSON on stdout");
+    assert_eq!(payload["schema"], "stemma.read.v0");
+
+    // The blocks are the engine's read model — an ARRAY of typed blocks whose
+    // segments carry per-run tracked status, enough to render a redline from
+    // this one call (the gap `extract`'s flattened text deliberately keeps).
+    let blocks = payload["blocks"].as_array().expect("blocks array");
+    assert!(!blocks.is_empty());
+    let segments = blocks[0]["segments"].as_array().expect("segments array");
+    let statuses: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.get("Text"))
+        .map(|t| match &t["status"] {
+            serde_json::Value::String(name) => name.clone(),
+            serde_json::Value::Object(map) => map.keys().next().expect("status variant").clone(),
+            other => panic!("unexpected status shape: {other}"),
+        })
+        .collect();
+    assert!(
+        statuses.iter().any(|s| s == "Inserted") && statuses.iter().any(|s| s == "Deleted"),
+        "a compare redline's segments carry tracked statuses: {statuses:?}"
+    );
+
+    // Segment revision ids and the census agree: what the view renders is what
+    // the resolve selectors address.
+    let census: Vec<u64> = payload["revisions"]
+        .as_array()
+        .expect("revisions array")
+        .iter()
+        .map(|r| r["revision_id"].as_u64().expect("numeric id"))
+        .collect();
+    assert!(!census.is_empty());
+    for segment in segments.iter().filter_map(|s| s.get("Text")) {
+        if let serde_json::Value::Object(map) = &segment["status"] {
+            let revision = &map.values().next().expect("status payload")["revision_id"];
+            assert!(
+                census.contains(&revision.as_u64().expect("numeric id")),
+                "segment revision {revision} appears in the census {census:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compare_format_json_emits_a_receipt_with_census_and_output_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("redline.docx");
+    let output = run(&[
+        "compare",
+        fixture("simple-text/before.docx").to_str().unwrap(),
+        fixture("simple-text/after.docx").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("receipt JSON on stdout");
+    assert_eq!(receipt["schema"], "stemma.compare_receipt.v0");
+    assert!(
+        receipt["author"].is_null(),
+        "an anonymous compare records author: null"
+    );
+    assert!(
+        receipt["revisions"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "the receipt enumerates the discovered revisions"
+    );
+
+    // The output identity in the receipt is the committed file's identity.
+    let committed = PathAuthority::explicit()
+        .unwrap()
+        .read_source(&out, "verification", None)
+        .unwrap();
+    assert_eq!(
+        receipt["output"]["identity"]["digest"]["hex"],
+        committed.identity().digest.hex
+    );
+    assert_eq!(
+        receipt["output"]["identity"]["bytes"],
+        serde_json::json!(committed.identity().bytes)
+    );
+    assert_eq!(receipt["output"]["collision_policy"], "create_new");
+    assert_eq!(receipt["output"]["disposition"], "created");
+}
+
+#[test]
+fn resolve_format_json_emits_a_receipt_partitioning_the_census() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--accept-author",
+        "Alice",
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("receipt JSON on stdout");
+    assert_eq!(receipt["schema"], "stemma.resolve_receipt.v0");
+    assert_eq!(receipt["dry_run"], false);
+
+    // Accepting Alice's change accepts exactly her row, rejects nothing, and
+    // leaves exactly the anonymous group pending — the receipt states all
+    // three from one invocation.
+    let accepted = receipt["accepted"].as_array().unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0]["author"], "Alice");
+    assert!(receipt["rejected"].as_array().unwrap().is_empty());
+    let remaining = receipt["remaining"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["author"], "");
+
+    let committed = PathAuthority::explicit()
+        .unwrap()
+        .read_source(&out, "verification", None)
+        .unwrap();
+    assert_eq!(
+        receipt["output"]["identity"]["digest"]["hex"],
+        committed.identity().digest.hex
+    );
+}
+
+#[test]
+fn resolve_dry_run_reports_the_outcome_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("would-be.docx");
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--accept-all",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!out.exists(), "a dry run must not write the output");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("receipt JSON on stdout");
+    assert_eq!(receipt["dry_run"], true);
+    assert!(receipt["output"].is_null(), "no output, no output identity");
+    assert_eq!(receipt["accepted"].as_array().unwrap().len(), 2);
+    assert!(receipt["remaining"].as_array().unwrap().is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("dry run") && stderr.contains("no output written"),
+        "the human summary says nothing was written: {stderr}"
+    );
+}
+
+/// The flagship mixed workflow in ONE call: accept one party, reject the rest.
+/// Domain rule: accepting Alice's insertion keeps her text; rejecting the
+/// anonymous insertion removes that text; nothing stays pending.
+#[test]
+fn resolve_plan_mixes_accept_and_reject_in_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+    let plan = dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.resolution_plan.v0",
+            "accept": { "authors": ["Alice"] },
+            "rest": "reject",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let text = text_of(&out);
+    assert!(
+        text.contains("inserted by Alice"),
+        "Alice's accepted insertion stays: {text}"
+    );
+    assert!(
+        !text.contains("inserted by nobody"),
+        "the rejected anonymous insertion is gone: {text}"
+    );
+
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["accepted"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["accepted"][0]["author"], "Alice");
+    assert_eq!(receipt["rejected"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["rejected"][0]["author"], "");
+    assert!(receipt["remaining"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn resolve_plan_refuses_a_contested_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+
+    // Read a live id, then select it on both sides.
+    let extract = run(&["extract", redline.to_str().unwrap(), "--format", "json"]);
+    let value: serde_json::Value = serde_json::from_slice(&extract.stdout).unwrap();
+    let id = value["revisions"][0]["revision_id"].as_u64().unwrap();
+
+    let plan = dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.resolution_plan.v0",
+            "accept": { "ids": [id] },
+            "reject": { "ids": [id] },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "a contradiction must refuse");
+    assert!(!out.exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&id.to_string()) && stderr.contains("both accept and reject"),
+        "the refusal names the contested id: {stderr}"
+    );
+}
+
+/// A misspelled plan field must refuse, never silently select nothing — the
+/// same `deny_unknown_fields` posture the worklist schema takes.
+#[test]
+fn resolve_plan_refuses_unknown_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+    let plan = dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.resolution_plan.v0",
+            "accept": { "authors": ["Alice"] },
+            "rset": "reject",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "an unknown field must refuse");
+    assert!(!out.exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("rset"),
+        "the refusal names the unknown field: {stderr}"
+    );
+}
+
+#[test]
+fn resolve_plan_that_selects_nothing_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+    let plan = dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.resolution_plan.v0",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a plan resolving nothing must refuse, not copy the input"
+    );
+    assert!(!out.exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("resolves nothing"),
+        "the refusal states the empty selection: {stderr}"
+    );
+}
+
+/// `apply --plan` takes a worklist; `resolve --plan` takes a resolution plan.
+/// Feeding one to the other must fail on the schema tag, loudly naming both.
+#[test]
+fn resolve_plan_refuses_a_wrong_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+    let plan = dir.path().join("plan.json");
+    std::fs::write(
+        &plan,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.worklist.v0",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "resolve",
+        redline.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("stemma.worklist.v0") && stderr.contains("stemma.resolution_plan.v0"),
+        "the refusal names the supplied and the expected schema: {stderr}"
+    );
+}
+
+/// Pins the id-durability contract at the CLI boundary: revision ids are the
+/// engine's content-derived identities (RFC-0004 §H7), so the ids of untouched
+/// revisions survive a resolve → write → re-read round-trip. A consumer may
+/// resolve by ids read before an earlier selective resolve, as long as the
+/// surviving revisions' content was untouched.
+#[test]
+fn revision_ids_of_untouched_changes_survive_a_resolve_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+    let out = dir.path().join("resolved.docx");
+
+    let before = run(&["extract", redline.to_str().unwrap(), "--format", "json"]);
+    let value: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    let rows = value["revisions"].as_array().unwrap();
+    let alice_id = rows
+        .iter()
+        .find(|r| r["author"] == "Alice")
+        .expect("Alice's revision")["revision_id"]
+        .as_u64()
+        .unwrap();
+    let anonymous_id = rows
+        .iter()
+        .find(|r| r["author"] == "")
+        .expect("anonymous revision")["revision_id"]
+        .as_u64()
+        .unwrap();
+
+    assert!(
+        run(&[
+            "resolve",
+            redline.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--accept-ids",
+            &alice_id.to_string(),
+        ])
+        .status
+        .success()
+    );
+
+    let after = run(&["extract", out.to_str().unwrap(), "--format", "json"]);
+    let value: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    let surviving: Vec<u64> = value["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["revision_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        surviving,
+        vec![anonymous_id],
+        "the untouched revision keeps its id across resolve → write → re-read"
+    );
+}
+
+#[test]
+fn validate_format_json_reports_ok_with_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let redline = write_two_party_redline(dir.path());
+
+    let output = run(&["validate", redline.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("validation JSON on stdout");
+    assert_eq!(payload["schema"], "stemma.validate.v0");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["pending_revision_count"], 2);
+    assert!(payload["block_count"].as_u64().unwrap() >= 1);
+    assert!(payload["issues"].as_array().unwrap().is_empty());
+}
+
+/// An invalid-but-parseable package is a structured `"invalid"` RESULT in JSON
+/// mode (issues enumerated, exit `1`), mirroring `verify`'s pass/fail shape —
+/// not an unstructured `error:` line a consumer would have to regex.
+#[test]
+fn validate_format_json_reports_invalid_with_structured_issues() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = dir.path().join("dangling-link.docx");
+    std::fs::write(&invalid, dangling_hyperlink_docx()).unwrap();
+
+    let output = run(&["validate", invalid.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1), "invalid still exits 1");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("validation JSON on stdout");
+    assert_eq!(payload["status"], "invalid");
+    let issues = payload["issues"].as_array().unwrap();
+    assert!(!issues.is_empty(), "the issues are enumerated");
+    assert!(issues[0]["code"].is_string() && issues[0]["message"].is_string());
 }

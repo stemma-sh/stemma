@@ -344,3 +344,51 @@ fn tcpr_hidemark_preserved_and_accepted() {
         "ISO 29500-1 §17.4.21 — hideMark changes row-height measurement; Word preserves it across save, so a passthrough re-serialization must retain the element rather than silently discarding an unmodeled-but-valid cell property; expected XML to contain hideMark, got:\n{xml}"
     );
 }
+
+/// `w:gridSpan` counts grid columns and a cell occupies at least one
+/// (§17.4.17), so a value below one is out of range. Wild documents carry
+/// `w:val="0"`, and Word lays those out as a single column.
+///
+/// Storing the zero verbatim could not round-trip: the serializer emits the
+/// element only above one, so a reopen read the schema default and the model
+/// disagreed with its own output about a table nothing had touched.
+#[test]
+fn an_out_of_range_grid_span_normalizes_to_one_column() {
+    let docx = make_docx(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val="0"/></w:tcPr><w:p><w:r><w:t>spanning cell</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>second</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+        &[],
+    );
+    let doc = Document::parse(&docx).expect("parse a table with an out-of-range span");
+    let span = doc
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|tracked| match &tracked.block {
+            stemma::domain::BlockNode::Table(table) => Some(table.rows[0].cells[0].grid_span),
+            _ => None,
+        })
+        .expect("the table imported");
+    assert_eq!(
+        span, 1,
+        "a span below one occupies a single column, so the model holds one"
+    );
+
+    // And it survives its own round trip, which the stored zero did not.
+    let bytes = doc.serialize(&ExportOptions::default()).expect("serialize");
+    let reopened = Document::parse(&bytes).expect("reopen");
+    let reopened_span = reopened
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|tracked| match &tracked.block {
+            stemma::domain::BlockNode::Table(table) => Some(table.rows[0].cells[0].grid_span),
+            _ => None,
+        })
+        .expect("the table reopened");
+    assert_eq!(
+        reopened_span, span,
+        "the span must survive a save and reopen"
+    );
+}

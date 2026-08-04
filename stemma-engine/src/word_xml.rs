@@ -1458,13 +1458,24 @@ fn find_w_child_mut<'a>(element: &'a mut Element, local: &str) -> Option<&'a mut
     })
 }
 
+fn set_revision_date(element: &mut Element, date: &str, include_utc: bool) {
+    // Revision dates are optional in OOXML. Preserve absence honestly instead
+    // of serializing a missing model value as the invalid token `w:date=""`.
+    if date.is_empty() {
+        return;
+    }
+    attr_set(element, "w:date", date);
+    if include_utc {
+        attr_set(element, "w16du:dateUtc", date);
+    }
+}
+
 /// Creates a `<w:del>` element with revision attributes
 pub fn w_del(revision_id: u32, author: &str, date: &str) -> Element {
     let mut del = w_el("del");
     attr_set(&mut del, "w:id", revision_id.to_string());
     attr_set(&mut del, "w:author", author);
-    attr_set(&mut del, "w:date", date);
-    attr_set(&mut del, "w16du:dateUtc", date);
+    set_revision_date(&mut del, date, true);
     del
 }
 
@@ -1473,8 +1484,7 @@ pub fn w_ins(revision_id: u32, author: &str, date: &str) -> Element {
     let mut ins = w_el("ins");
     attr_set(&mut ins, "w:id", revision_id.to_string());
     attr_set(&mut ins, "w:author", author);
-    attr_set(&mut ins, "w:date", date);
-    attr_set(&mut ins, "w16du:dateUtc", date);
+    set_revision_date(&mut ins, date, true);
     ins
 }
 
@@ -1483,8 +1493,7 @@ pub fn w_move_from(revision_id: u32, author: &str, date: &str) -> Element {
     let mut el = w_el("moveFrom");
     attr_set(&mut el, "w:id", revision_id.to_string());
     attr_set(&mut el, "w:author", author);
-    attr_set(&mut el, "w:date", date);
-    attr_set(&mut el, "w16du:dateUtc", date);
+    set_revision_date(&mut el, date, true);
     el
 }
 
@@ -1493,8 +1502,7 @@ pub fn w_move_to(revision_id: u32, author: &str, date: &str) -> Element {
     let mut el = w_el("moveTo");
     attr_set(&mut el, "w:id", revision_id.to_string());
     attr_set(&mut el, "w:author", author);
-    attr_set(&mut el, "w:date", date);
-    attr_set(&mut el, "w16du:dateUtc", date);
+    set_revision_date(&mut el, date, true);
     el
 }
 
@@ -1504,7 +1512,7 @@ pub fn w_move_from_range_start(bookmark_id: u32, name: &str, author: &str, date:
     attr_set(&mut el, "w:id", bookmark_id.to_string());
     attr_set(&mut el, "w:name", name);
     attr_set(&mut el, "w:author", author);
-    attr_set(&mut el, "w:date", date);
+    set_revision_date(&mut el, date, false);
     el
 }
 
@@ -1521,7 +1529,7 @@ pub fn w_move_to_range_start(bookmark_id: u32, name: &str, author: &str, date: &
     attr_set(&mut el, "w:id", bookmark_id.to_string());
     attr_set(&mut el, "w:name", name);
     attr_set(&mut el, "w:author", author);
-    attr_set(&mut el, "w:date", date);
+    set_revision_date(&mut el, date, false);
     el
 }
 
@@ -1537,8 +1545,7 @@ pub fn w_cell_ins(revision_id: u32, author: &str, date: &str) -> Element {
     let mut cell_ins = w_el("cellIns");
     attr_set(&mut cell_ins, "w:id", revision_id.to_string());
     attr_set(&mut cell_ins, "w:author", author);
-    attr_set(&mut cell_ins, "w:date", date);
-    attr_set(&mut cell_ins, "w16du:dateUtc", date);
+    set_revision_date(&mut cell_ins, date, true);
     cell_ins
 }
 
@@ -1547,8 +1554,7 @@ pub fn w_cell_del(revision_id: u32, author: &str, date: &str) -> Element {
     let mut cell_del = w_el("cellDel");
     attr_set(&mut cell_del, "w:id", revision_id.to_string());
     attr_set(&mut cell_del, "w:author", author);
-    attr_set(&mut cell_del, "w:date", date);
-    attr_set(&mut cell_del, "w16du:dateUtc", date);
+    set_revision_date(&mut cell_del, date, true);
     cell_del
 }
 
@@ -1650,6 +1656,14 @@ pub fn ensure_ppr_rpr_move_from(paragraph: &mut Element, rev_id: u32, author: &s
 mod tests {
     use super::*;
     use xmltree::ParserConfig;
+
+    #[test]
+    fn revision_helpers_omit_an_absent_date() {
+        for element in [w_ins(1, "Reviewer", ""), w_del(2, "Reviewer", "")] {
+            assert!(attr_get(&element, "w:date").is_none());
+            assert!(attr_get(&element, "w16du:dateUtc").is_none());
+        }
+    }
 
     #[test]
     fn empty_or_whitespace_xml_covers_only_contentless_bytes() {

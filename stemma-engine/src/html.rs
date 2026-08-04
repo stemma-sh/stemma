@@ -301,6 +301,7 @@ mod tests {
             text: text.to_string(),
             status: TrackStatus::Normal,
             marks,
+            format_revision: None,
             handle: None,
         }
     }
@@ -436,12 +437,14 @@ mod tests {
                     text: " added".to_string(),
                     status: TrackStatus::Inserted(rev(5, "Counsel")),
                     marks: vec![],
+                    format_revision: None,
                     handle: None,
                 },
                 SegmentView::Text {
                     text: " removed".to_string(),
                     status: TrackStatus::Deleted(rev(5, "Counsel")),
                     marks: vec![],
+                    format_revision: None,
                     handle: None,
                 },
             ],

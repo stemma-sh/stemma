@@ -67,3 +67,24 @@ Practical consequences, stated plainly:
 If your workflow contractually requires byte-identical untouched content,
 that requirement is not met today. Tell us about the use case rather than
 discovering the churn in production.
+
+## The text projection normalizes enumerator separators
+
+One deliberate normalization to know before diffing **projections** (as
+opposed to stored content): when a paragraph begins with an enumerator label,
+the plain-text and Markdown projections (`stemma extract --format text`,
+`stemma inspect`, `to_text()`) render the label, then a **tab**, then the
+body, regardless of the separator character in the stored runs.
+
+That covers both real list numbering (`w:numPr`, where the separator is
+render-time convention anyway) and a *literal* leading label the engine
+recognizes in plain paragraph text, such as `1. Term` written with an
+ordinary space. The stored content is untouched: the serialized `.docx`
+keeps the original space and gains no `w:tab` element. Only the projection
+normalizes, so enumerated paragraphs read uniformly whichever way the source
+document encoded its labels.
+
+Consequence for content verification: compare projections against
+projections (both sides normalize identically), never a projection against
+raw XML or another tool's text extraction. A `space -> tab` difference at a
+leading `N.`/`a)`/bullet label is this normalization, not corruption.

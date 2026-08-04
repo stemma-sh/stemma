@@ -132,6 +132,50 @@ fn reserialize(bytes: &[u8]) -> String {
     document_xml_of(&out)
 }
 
+/// Force the canonical model through merge and emission, matching compare's
+/// rebuild path instead of the pristine package-scaffold fast path.
+fn identity_rebuild(bytes: &[u8]) -> String {
+    let doc = Document::parse(bytes).expect("parse for identity rebuild");
+    let rebuilt = doc.diff(&doc).expect("identity diff");
+    let out = rebuilt
+        .serialize(&ExportOptions::default())
+        .expect("serialize identity rebuild");
+    document_xml_of(&out)
+}
+
+#[test]
+fn trailing_run_properties_keep_their_source_position() {
+    let body = r#"<w:p><w:r><w:t>compatibility text</w:t><w:rPr><w:sz w:val="18"/></w:rPr></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let xml = identity_rebuild(&b);
+    let text = xml.find("<w:t>compatibility text</w:t>").expect("run text");
+    let properties = xml
+        .find(r#"<w:rPr><w:sz w:val="18""#)
+        .expect("run properties");
+
+    assert!(
+        text < properties,
+        "Word tolerates and renders an rPr authored after run content. Canonical rebuild must preserve that source placement because moving it before the text changes Word's font selection and line height: {xml}"
+    );
+}
+
+#[test]
+fn val_absent_colored_underline_is_preserved_without_inventing_single() {
+    let body = r#"<w:p><w:pPr><w:rPr><w:u w:color="000000"/></w:rPr></w:pPr><w:r><w:rPr><w:u w:color="000000"/></w:rPr><w:t>compatibility text</w:t></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let xml = identity_rebuild(&b);
+
+    assert_eq!(
+        xml.matches(r#"w:color="000000""#).count(),
+        2,
+        "Word preserves the authored val-absent underline form on both paragraph marks and runs: {xml}"
+    );
+    assert!(
+        !xml.contains(r#"<w:u w:val="single""#),
+        "canonical rebuild must not replace a val-absent, attribute-bearing underline with an invented single underline; Word renders the forms differently: {xml}"
+    );
+}
+
 /// Assert `validate(bytes)` reports no errors. Renders the issue list in the
 /// panic message if it does.
 fn assert_opens_clean(bytes: &[u8], rule: &str) {
@@ -254,6 +298,43 @@ fn leading_break_keeps_its_following_text_run_carrier() {
 }
 
 #[test]
+fn break_only_run_keeps_its_load_bearing_run_properties() {
+    let b = make_docx(
+        r#"<w:p><w:r w:rsidRPr="00112233"><w:rPr><w:rFonts w:ascii="Calibri" w:eastAsia="Times New Roman"/><w:b/><w:sz w:val="24"/></w:rPr><w:br/></w:r><w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:br/></w:r><w:r><w:t>After two breaks</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+
+    let xml = identity_rebuild(&b);
+    let root = xmltree::Element::parse(xml.as_bytes()).expect("parse serialized document.xml");
+    fn collect_break_runs<'a>(element: &'a xmltree::Element, out: &mut Vec<&'a xmltree::Element>) {
+        if element.name == "r"
+            && element
+                .children
+                .iter()
+                .any(|child| child.as_element().is_some_and(|child| child.name == "br"))
+        {
+            out.push(element);
+        }
+        for child in &element.children {
+            if let Some(child) = child.as_element() {
+                collect_break_runs(child, out);
+            }
+        }
+    }
+    let mut break_runs = Vec::new();
+    collect_break_runs(&root, &mut break_runs);
+    assert_eq!(break_runs.len(), 2, "both hard breaks survive: {xml}");
+    assert!(
+        break_runs.iter().all(|run| run.get_child("rPr").is_some()),
+        "a break-only run's rPr sets the break line box and must survive a canonical rebuild: {xml}"
+    );
+    assert!(
+        xml.contains(r#"w:rsidRPr="00112233""#),
+        "break-only source run attributes must survive: {xml}"
+    );
+}
+
+#[test]
 fn clear_attr_ignored_on_page_break() {
     let b = make_docx(
         r#"<w:p><w:r><w:t>A</w:t><w:br w:type="page" w:clear="all"/><w:t>B</w:t></w:r></w:p><w:sectPr/>"#,
@@ -306,6 +387,21 @@ fn bare_clear_all_break_defaults_type_textwrapping() {
         accept_text(&b).trim(),
         "PQ",
         "a textWrapping break (even with clear=all) contributes no character and deletes no content; accepted text is 'PQ' (refs: §17.3.3.1, §17.18.3, §17.18.4)"
+    );
+}
+
+#[test]
+fn textwrapping_clear_all_survives_canonical_rebuild() {
+    let b = make_docx(
+        r#"<w:p><w:r><w:t>Before</w:t><w:br w:type="textWrapping" w:clear="all"/><w:t>After</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let xml = identity_rebuild(&b);
+    assert!(
+        xml.contains(r#"<w:br w:type="textWrapping" w:clear="all""#),
+        "clear=all is a layout instruction: following text must restart below all \
+         floating objects, and canonical rebuild must preserve both authored break \
+         attributes: {xml}"
     );
 }
 
@@ -418,7 +514,26 @@ fn tab_pos_at_word_max_boundary_preserved_opens_clean() {
 }
 
 #[test]
-fn nobreakhyphen_inside_hyperlink_survives_reserialize_as_u2011() {
+fn plain_nobreakhyphen_restores_its_authored_element_on_rebuild() {
+    let b = make_docx(
+        r#"<w:p><w:r><w:t>self</w:t><w:noBreakHyphen/><w:t>sufficient</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let xml = identity_rebuild(&b);
+    assert!(
+        xml.contains("<w:noBreakHyphen"),
+        "the semantic U+2011 projection must retain source-form provenance so Word \
+         rebuild layout receives the authored noBreakHyphen element: {xml}"
+    );
+    assert!(
+        !xml.contains('\u{2011}'),
+        "an imported noBreakHyphen must not be rewritten as literal U+2011; real Word \
+         can assign the two forms different metrics: {xml}"
+    );
+}
+
+#[test]
+fn nobreakhyphen_inside_hyperlink_preserves_its_authored_element() {
     // Regression: a `<w:noBreakHyphen/>` leaf inside a `<w:hyperlink>` was
     // dropped on IR reserialize because the hyperlink-run text harvester only
     // collected `w:t`/`w:delText` text and recursed past non-text leaves,
@@ -467,18 +582,21 @@ fn nobreakhyphen_inside_hyperlink_survives_reserialize_as_u2011() {
         .expect("export_docx");
     let xml = document_xml_of(&out);
 
-    // Reserialize must not drop the hyphen: it comes back as the equivalent
-    // U+2011 character carried inside the hyperlink-run text. Before the fix the
-    // hyphen was erased, turning visible "G‑S.1.2." into "GS.1.2.".
+    // Reserialize must not drop or rewrite the source element. Real Word can
+    // assign literal U+2011 and w:noBreakHyphen different metrics.
     assert!(
-        xml.contains('\u{2011}'),
-        "the noBreakHyphen inside the hyperlink must survive IR reserialization as U+2011 (§17.3.3.18); it was dropped (flat-String hyperlink harvester ignored the non-text leaf). reserialized document.xml was: {xml}"
+        xml.contains("<w:noBreakHyphen"),
+        "the noBreakHyphen inside the hyperlink must survive IR reserialization in its authored form (§17.3.3.18); reserialized document.xml was: {xml}"
     );
-    // The hyphen lands between the two text fragments, not appended/prepended:
-    // the harvester projects the leaf in source order, yielding "G‑S.1.2." as
-    // the single concatenated hyperlink-run text.
     assert!(
-        xml.contains("G\u{2011}S.1.2.") || xml.contains(">G\u{2011}S.1.2.<"),
-        "the projected U+2011 must sit in source order between 'G' and 'S.1.2.', preserving visible 'G‑S.1.2.' (§17.3.3.18); reserialized document.xml was: {xml}"
+        !xml.contains('\u{2011}'),
+        "an authored noBreakHyphen element must not be rewritten as literal U+2011: {xml}"
+    );
+    let first_text = xml.find("<w:t>G</w:t>").expect("first text fragment");
+    let hyphen = xml.find("<w:noBreakHyphen").expect("no-break hyphen");
+    let second_text = xml.find("<w:t>S.1.2.</w:t>").expect("second text fragment");
+    assert!(
+        first_text < hyphen && hyphen < second_text,
+        "the authored element must remain between 'G' and 'S.1.2.', preserving visible 'G‑S.1.2.': {xml}"
     );
 }

@@ -392,6 +392,22 @@ fn para_mark_inherits_style_bold_without_synthesizing_explicit_mark_rpr() {
 }
 
 #[test]
+fn para_mark_hansi_only_font_does_not_synthesize_ascii_slot() {
+    let body = r#"<w:p><w:pPr><w:rPr><w:rFonts w:hAnsi="標楷體"/><w:b/></w:rPr></w:pPr><w:r><w:drawing/></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let xml = reserialize(&b);
+
+    assert!(
+        xml.contains(r#"<w:rFonts w:hAnsi="標楷體"/>"#),
+        "ISO 29500-1 §17.3.2.26: the paragraph mark authored only the hAnsi font slot; rebuild must preserve that exact authored slot: {xml}"
+    );
+    assert!(
+        !xml.contains(r#"w:ascii="標楷體""#),
+        "ISO 29500-1 §17.3.2.26: ascii and hAnsi are independent CT_Fonts attributes. Materializing an absent ascii slot changes the paragraph-mark line box Word uses to position anchored drawings: {xml}"
+    );
+}
+
+#[test]
 fn para_mark_explicit_bold_off_overrides_bold_style_and_is_preserved() {
     let body = r#"<w:p><w:pPr><w:pStyle w:val="BoldPara"/><w:rPr><w:b w:val="0"/></w:rPr></w:pPr><w:r><w:t>direct off mark</w:t></w:r></w:p><w:sectPr/>"#;
     let extra = [(

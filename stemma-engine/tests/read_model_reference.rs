@@ -1344,7 +1344,7 @@ is documented in the [v4 operation reference](operations.md) and the
 | HTTP | `GET /api/documents/{{id}}` serves a reduced hand-projection of it | `GET /api/documents/{{id}}/rich` serializes it whole, stamping each block with the lean `guard` and attaching the lean table `cells` and `table` metadata by block id |
 | MCP | `inspect_docx` with `detail:\"formatting\"` serves a projection of it (block detail plus spans) | not exposed; cell interiors reach MCP through the lean view's `paragraphs`, which reuse the full view's segment shape |
 
-Two honest caveats a builder should know:
+Three honest caveats a builder should know:
 
 * The HTTP and MCP lean projections rename and trim fields; the engine types
   documented here are the model, and each transport page shows its own wire.
@@ -1353,6 +1353,13 @@ Two honest caveats a builder should know:
 * The full view result also carries `footnotes` and `endnotes` stories, but
   the HTTP `/rich` envelope does not currently include them; over HTTP, note
   TEXT is reachable only by resolving the inline reference anchors.
+* The shipped CLI does not emit either view. `stemma extract --format json`
+  is a flat projection (one `text` string per block, no `segments`), and
+  `stemma inspect --format json` wraps the extended-Markdown projection as a
+  single string with integer counts. Consuming the types on this page means
+  embedding the engine ([embedding](embedding.md)); the HTTP transport that
+  serves them runs from a source checkout only (`cargo run -p stemma-api`,
+  `stemma-api` is not on crates.io).
 
 ## Units
 

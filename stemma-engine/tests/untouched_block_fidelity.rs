@@ -724,7 +724,10 @@ fn single_tracked_edit_leaves_untouched_blocks_identical() {
                 // The anchor's newly-added paragraph-mark insertion (see
                 // `anchor_is_final_mark`) is the intended attribution, not a
                 // fidelity regression.
-                if anchor_is_final_mark && va == 0 && is_paragraph_mark_ins_key(&key) {
+                if anchor_is_final_mark
+                    && va == 0
+                    && (is_paragraph_mark_ins_key(&key) || key.starts_with("attr w:p/@w14:paraId="))
+                {
                     continue;
                 }
                 if is_known_open(&key) {

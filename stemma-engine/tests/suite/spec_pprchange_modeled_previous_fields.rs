@@ -16,7 +16,7 @@
 //! This file pins the fix: every inner-pPr child with a previous_* domain
 //! field is parsed into that field (and thus restored as MODEL state on
 //! reject), and only genuinely unmodeled children (w:suppressLineNumbers,
-//! w:numPr, …) remain in the preserved bag.
+//! …) remain in the preserved bag.
 //!
 //! Uses a hermetic in-memory `.docx` (no corpus fixtures) so this runs daily.
 
@@ -37,6 +37,7 @@ const CONTENT_TYPES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalo
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
 </Types>"#;
 
 const RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -46,7 +47,20 @@ const RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
 
 const WORD_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
 </Relationships>"#;
+
+const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="5">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="5"><w:abstractNumId w:val="5"/></w:num>
+</w:numbering>"#;
 
 fn build_docx(document_xml: &str) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
@@ -62,6 +76,8 @@ fn build_docx(document_xml: &str) -> Vec<u8> {
     zip.write_all(WORD_RELS_XML.as_bytes()).unwrap();
     zip.start_file("word/document.xml", options).unwrap();
     zip.write_all(document_xml.as_bytes()).unwrap();
+    zip.start_file("word/numbering.xml", options).unwrap();
+    zip.write_all(NUMBERING_XML.as_bytes()).unwrap();
 
     let cursor = zip.finish().unwrap();
     cursor.into_inner()
@@ -69,9 +85,9 @@ fn build_docx(document_xml: &str) -> Vec<u8> {
 
 /// A paragraph with a pre-existing `w:pPrChange` (as Word writes it) whose
 /// previous-pPr snapshot exercises EVERY inner-pPr child that has a
-/// `previous_*` field on `ParagraphFormattingChange`, plus two that do NOT
-/// (w:suppressLineNumbers, w:numPr) and must therefore stay in the preserved
-/// remainder. Children appear in CT_PPrBase schema order, as Word emits them.
+/// `previous_*` field on `ParagraphFormattingChange`, plus one that does NOT
+/// (w:suppressLineNumbers) and must therefore stay in the preserved remainder.
+/// Children appear in CT_PPrBase schema order, as Word emits them.
 fn snapshot_bearing_body() -> &'static str {
     r#"
     <w:p>
@@ -243,9 +259,16 @@ fn import_models_the_snapshot_fields_instead_of_hardcoding_them_absent() {
         "unmodeled w:suppressLineNumbers stays preserved verbatim: {bag_names:?}"
     );
     assert!(
-        bag_names.contains(&"w:numPr"),
-        "w:numPr (no previous_numbering synthesis at import) stays preserved verbatim: {bag_names:?}"
+        !bag_names.contains(&"w:numPr"),
+        "modeled w:numPr must not also stay preserved verbatim: {bag_names:?}"
     );
+    let numbering = fc
+        .previous_numbering
+        .as_ref()
+        .expect("valid previous numPr must be modeled");
+    assert_eq!(numbering.num_id, 5);
+    assert_eq!(numbering.ilvl, 0);
+    assert!(!numbering.is_bullet);
     for modeled in [
         "w:pStyle",
         "w:keepNext",

@@ -661,6 +661,19 @@ struct ApplyEditArgs {
     /// unknown style/pattern token is refused at the wire edge (no silent
     /// fallback).
     ///
+    /// `set_format` changes run-level boolean marks on one exact, uniquely
+    /// matching text span: `{ "op": "set_format", "target": "<para_id>",
+    /// "expect": "<exact unique text>", "marks": { "bold": true,
+    /// "italic": false } }`. Each of `bold`, `italic`, `underline`, `strike`,
+    /// `subscript`, `superscript`, `caps`, and `small_caps` is optional: true
+    /// turns it on, false turns it off, omission leaves it unchanged. Read the
+    /// span's `status` and `format_revision` first. A pending format revision
+    /// must be resolved or left pending; a new transaction never absorbs it,
+    /// and Direct mode never flattens it. Tracked mode may author the first
+    /// format revision on pending inserted text; a second still refuses.
+    /// Duplicate `expect` matches refuse with their occurrence count and no
+    /// mutation.
+    ///
     /// `set_cell_format` sets ONE table cell's formatting in place as a tracked
     /// `w:tcPrChange`: `{ "op": "set_cell_format", "target": "<table_block_id>",
     /// "row_index": <r>, "col_index": <c>, "borders"?, "shading"?, "width"?,
@@ -1624,6 +1637,109 @@ fn fail(code: &str, message: impl Into<String>) -> CallToolResult {
     fail_json(json!({ "code": code, "error": message.into() }))
 }
 
+/// Preserve the generic debug-details channel while projecting v0.5
+/// formatting refusals into their frozen, agent-consumable top-level shape.
+fn edit_failure(error: stemma::RuntimeError) -> CallToolResult {
+    if let Some(stemma::runtime::FormattingErrorDetails::Target(target)) =
+        error.details.formatting.as_deref()
+    {
+        let mut allowed_actions = Vec::new();
+        let revision_id = target
+            .existing_revision
+            .as_ref()
+            .map(|revision| revision.revision_id)
+            .or_else(|| {
+                target
+                    .container_revision
+                    .as_ref()
+                    .map(|revision| revision.revision_id)
+            });
+        if let Some(revision_id) = revision_id {
+            allowed_actions.push(json!({
+                "action": "reject_changes",
+                "selector": {"by": "by_ids", "revision_ids": [revision_id]},
+            }));
+        }
+        allowed_actions.push(json!({"action": "leave_pending"}));
+        if matches!(target.tracking_status.as_str(), "normal" | "inserted") {
+            allowed_actions.push(json!({
+                "action": "comment_create",
+                "target": target.block_id.to_string(),
+                "expect": target.text,
+            }));
+        }
+
+        let invariant = if target.existing_revision.is_some() {
+            "a second independently resolvable run-format revision cannot be preserved"
+        } else if target.tracking_status == "inserted" {
+            "direct formatting would mutate unresolved inserted text without a separately resolvable intention"
+        } else {
+            "editing text whose deletion is pending is an ambiguous workflow"
+        };
+        let code = if target.existing_revision.is_some() {
+            "format_revision_conflict"
+        } else {
+            "UnsupportedEdit"
+        };
+        let existing_revision = target.existing_revision.as_ref().map(|revision| {
+            json!({
+                "revision_id": revision.revision_id,
+                "kind": "format_run",
+                "author": revision.author,
+            })
+        });
+        let container_revision = target.container_revision.as_ref().map(|revision| {
+            json!({
+                "revision_id": revision.revision_id,
+                "kind": revision.kind,
+            })
+        });
+        let mut payload = json!({
+            "code": code,
+            "target": {
+                "block_id": target.block_id.to_string(),
+                "text": target.text,
+                "tracking_status": target.tracking_status,
+            },
+            "invariant": invariant,
+            "error": error.message,
+            "allowed_actions": allowed_actions,
+            "mutation": "none",
+            "details": format!("{:?}", error.details),
+        });
+        if let Some(existing_revision) = existing_revision {
+            payload["existing_revision"] = existing_revision;
+        }
+        if let Some(container_revision) = container_revision {
+            payload["container_revision"] = container_revision;
+        }
+        return fail_json(payload);
+    }
+
+    if let Some(stemma::runtime::FormattingErrorDetails::Ambiguous(target)) =
+        error.details.formatting.as_deref()
+    {
+        return fail_json(json!({
+            "code": "ambiguous_format_target",
+            "target": {
+                "block_id": target.block_id.to_string(),
+                "text": target.text,
+            },
+            "occurrences": target.occurrences,
+            "error": error.message,
+            "recovery": "supply a longer, uniquely matching expect",
+            "mutation": "none",
+            "details": format!("{:?}", error.details),
+        }));
+    }
+
+    fail_json(json!({
+        "code": format!("{:?}", error.code),
+        "error": error.message,
+        "details": format!("{:?}", error.details),
+    }))
+}
+
 fn artifact_error_code(error: &ArtifactError) -> &'static str {
     match error {
         ArtifactError::PathOutsideAuthority { .. } => "artifact_outside_workspace",
@@ -2147,6 +2263,7 @@ fn block_detail_json(block: &BlockView) -> Value {
                 text,
                 status,
                 marks,
+                format_revision,
                 handle,
             } => {
                 // The `s_<n>` handle is assigned by the engine's authoritative
@@ -2160,6 +2277,7 @@ fn block_detail_json(block: &BlockView) -> Value {
                     "text": text,
                     "status": track_status_json(status),
                     "marks": mark_strs(marks),
+                    "format_revision": format_revision,
                 }));
             }
             SegmentView::Opaque {
@@ -3967,14 +4085,7 @@ impl StemmaServer {
             }
             // The engine's RuntimeError carries an actionable message and a code
             // (e.g. StaleEdit, OpaqueDestroyed, AnchorNotFound, NoOpEdit).
-            Err(e) => (
-                fail_json(json!({
-                    "code": format!("{:?}", e.code),
-                    "error": e.message,
-                    "details": format!("{:?}", e.details),
-                })),
-                false,
-            ),
+            Err(e) => (edit_failure(e), false),
         }
     }
 
@@ -8354,6 +8465,95 @@ mod tests {
             "server instructions suspiciously short ({} bytes) — stub shipped?",
             INSTRUCTIONS.len()
         );
+    }
+
+    #[test]
+    fn format_conflict_error_uses_frozen_typed_wire_shape() {
+        let error = stemma::RuntimeError {
+            code: stemma::ErrorCode::FormatRevisionConflict,
+            message: "cannot add a second format proposal".to_string(),
+            details: stemma::ErrorDetails {
+                formatting: Some(Box::new(stemma::runtime::FormattingErrorDetails::Target(
+                    stemma::runtime::FormatTargetDetails {
+                        block_id: stemma::NodeId::from("p_6"),
+                        text: "$150".to_string(),
+                        tracking_status: "inserted".to_string(),
+                        existing_revision: Some(stemma::runtime::FormatRevisionDetails {
+                            revision_id: 880725669,
+                            author: "Round1Reviewer".to_string(),
+                        }),
+                        container_revision: Some(stemma::runtime::ContainerRevisionDetails {
+                            revision_id: 948020661,
+                            kind: "insert".to_string(),
+                        }),
+                    },
+                ))),
+                ..stemma::ErrorDetails::default()
+            },
+        };
+        let result = edit_failure(error);
+        assert_eq!(result.is_error, Some(true));
+        let payload = structured(&result);
+        assert_eq!(payload["code"], "format_revision_conflict");
+        assert_eq!(payload["target"]["block_id"], "p_6");
+        assert_eq!(payload["target"]["text"], "$150");
+        assert_eq!(payload["target"]["tracking_status"], "inserted");
+        assert_eq!(payload["existing_revision"]["revision_id"], 880725669);
+        assert_eq!(payload["existing_revision"]["kind"], "format_run");
+        assert_eq!(payload["existing_revision"]["author"], "Round1Reviewer");
+        assert_eq!(payload["container_revision"]["revision_id"], 948020661);
+        assert_eq!(payload["container_revision"]["kind"], "insert");
+        assert_eq!(payload["mutation"], "none");
+        assert_eq!(
+            payload["allowed_actions"],
+            json!([
+                {"action": "reject_changes", "selector": {"by": "by_ids", "revision_ids": [880725669]}},
+                {"action": "leave_pending"},
+                {"action": "comment_create", "target": "p_6", "expect": "$150"}
+            ])
+        );
+    }
+
+    #[test]
+    fn ambiguous_format_error_reports_count_and_no_mutation() {
+        let error = stemma::RuntimeError {
+            code: stemma::ErrorCode::AmbiguousFormatTarget,
+            message: "target occurs twice".to_string(),
+            details: stemma::ErrorDetails {
+                formatting: Some(Box::new(
+                    stemma::runtime::FormattingErrorDetails::Ambiguous(
+                        stemma::runtime::AmbiguousFormatTargetDetails {
+                            block_id: stemma::NodeId::from("p_2"),
+                            text: "term".to_string(),
+                            occurrences: 2,
+                        },
+                    ),
+                )),
+                ..stemma::ErrorDetails::default()
+            },
+        };
+        let payload = structured(&edit_failure(error));
+        assert_eq!(payload["code"], "ambiguous_format_target");
+        assert_eq!(payload["occurrences"], 2);
+        assert_eq!(payload["mutation"], "none");
+        assert!(payload["recovery"].as_str().unwrap().contains("unique"));
+    }
+
+    #[test]
+    fn block_detail_exposes_pending_run_format_identity_and_author() {
+        let bytes = make_docx(
+            r#"<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="9" w:author="Reviewer"><w:rPr/></w:rPrChange></w:rPr><w:t>term</w:t></w:r></w:p>"#,
+            false,
+        );
+        let document = Document::parse(&bytes).expect("parse synthetic format revision");
+        let detail = block_detail_json(&document.read().blocks[0]);
+        let format_revision = &detail["spans"][0]["format_revision"];
+        assert!(
+            format_revision["revision_id"]
+                .as_u64()
+                .is_some_and(|id| id > 0)
+        );
+        assert_eq!(format_revision["author"], "Reviewer");
     }
 
     /// A minimal DOCX (no styles part → Normal-styled paragraphs) whose body is
@@ -14814,9 +15014,10 @@ mod tests {
 /// test cannot see them, and a copy would itself drift. Checking against the real
 /// types is the whole point.
 ///
-/// The failure mode we prevent: a JSON example in `docs/reference/mcp.md` (which
-/// agents paste verbatim) that names a field the struct rejects — e.g. the
-/// `compare_docx {base,target,out}` vs. the real `{base_path,target_path,out_path}`.
+/// The failure mode we prevent: a JSON example in the core or advanced MCP
+/// reference (which agents paste verbatim) that names a field the struct
+/// rejects — e.g. `compare_docx {base,target,out}` vs. the real
+/// `{base_path,target_path,out_path}`.
 #[cfg(test)]
 mod public_contract_tests {
     use super::tests::{make_docx, structured};
@@ -15121,12 +15322,7 @@ mod public_contract_tests {
             checked >= 8,
             "expected to verify several literal MCP reference examples, only checked {checked}"
         );
-        for must in [
-            "compare_docx",
-            "accept_changes",
-            "save_docx",
-            "replace_text",
-        ] {
+        for must in ["open_docx", "compare_docx", "accept_changes", "save_docx"] {
             assert!(
                 names_seen.contains(must),
                 "expected a literal `{must}` example in the MCP references to be verified"

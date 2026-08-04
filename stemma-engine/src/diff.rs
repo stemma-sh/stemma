@@ -7420,6 +7420,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -7526,6 +7527,8 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: Some(format!(
                 "<w:fldChar xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" w:fldCharType=\"{}\"/>",
                 match kind {
@@ -9810,6 +9813,8 @@ mod tests {
             },
             wrapper_marks: vec![],
             wrapper_style_props: crate::domain::StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
             raw_xml: Some(br#"<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>y</m:t></m:r></m:oMath>"#.to_vec()),
             content_hash: None,
         };
@@ -11103,6 +11108,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,

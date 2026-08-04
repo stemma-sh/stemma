@@ -273,11 +273,12 @@ fn build_target(
                     step_index,
                 });
             }
-            let new_row = fresh_row_like(template, &t.id, cells.as_deref());
+            let mut new_row = fresh_row_like(template, &t.id, cells.as_deref());
             let at = match position {
                 TableInsertPosition::Before => *ref_row,
                 TableInsertPosition::After => *ref_row + 1,
             };
+            new_row.para_id = Some(stable_authored_row_para_id(&t, at, cells.as_deref()));
             t.rows.insert(at, new_row);
         }
         TableOp::DeleteRow { row_index } => {
@@ -352,6 +353,46 @@ fn build_target(
     }
     t.structure_hash = compute_table_structure_hash(&t.rows);
     Ok(t)
+}
+
+/// A newly authored row needs a carrier identity that survives save/reopen.
+/// `w14:paraId` is Word's persisted row identity; deriving it from the current
+/// table state and requested insertion makes replay deterministic and avoids
+/// using a shifting row index as revision identity evidence.
+fn stable_authored_row_para_id(
+    table: &TableNode,
+    insertion_index: usize,
+    cells: Option<&[String]>,
+) -> String {
+    let mut hash = 0x811c9dc5u32;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x01000193);
+        }
+    };
+    feed(table.id.0.as_bytes());
+    feed(&table.rows.len().to_be_bytes());
+    feed(&insertion_index.to_be_bytes());
+    if let Some(cells) = cells {
+        for cell in cells {
+            feed(&cell.len().to_be_bytes());
+            feed(cell.as_bytes());
+        }
+    }
+    let occupied: std::collections::HashSet<&str> = table
+        .rows
+        .iter()
+        .filter_map(|row| row.para_id.as_deref())
+        .collect();
+    hash &= 0x7fff_ffff;
+    loop {
+        let candidate = format!("{hash:08X}");
+        if !occupied.contains(candidate.as_str()) {
+            return candidate;
+        }
+        hash = hash.wrapping_add(1) & 0x7fff_ffff;
+    }
 }
 
 /// Materialize a TRACKED column insert/delete directly on a simple-grid table
@@ -756,6 +797,7 @@ fn minimal_paragraph(id: NodeId, segments: Vec<TrackedSegment>, text: &str) -> P
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: crate::domain::StyleProps::default(),
+        paragraph_mark_rfonts: crate::domain::AuthoredRFonts::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,

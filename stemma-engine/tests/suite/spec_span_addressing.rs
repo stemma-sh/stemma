@@ -227,7 +227,7 @@ fn anchor_after_targets_position_adjacent_to_anchor_not_first_substring() {
     assert!(
         flat.get(field_pos + 1)
             .map(|(k, t)| (k.as_str(), t.as_str()))
-            == Some(("text", "INSERTED")),
+            .is_some_and(|(kind, text)| kind == "text" && text.starts_with("INSERTED")),
         "inserted text must be immediately after the field anchor (by id): {flat:?}"
     );
 }

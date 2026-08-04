@@ -1072,3 +1072,120 @@ fn normalize_doc(paras: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// The deterministic replay of the motivating v0.5.0 shape (refusal-contract
+/// acceptance item 7): a pending insertion of "$150" that a LATER pending
+/// `rPrChange` made bold — two separately-attributed proposals on one run,
+/// exactly as Word 16.0.20131 authors them. The correct dispositions, each
+/// reached without a failed speculative mutation:
+///
+/// 1. Selective rejection of the BOLD proposal removes only it — the
+///    insertion stays pending, its text intact.
+/// 2. Leaving everything pending changes nothing across a save/reopen.
+/// 3. Commenting on the insertion target creates an annotation and changes
+///    no revision disposition.
+#[test]
+fn motivating_shape_replay_reaches_each_disposition_without_speculation() {
+    use stemma::api::Document;
+    let body = concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">The fee shall be </w:t></w:r>"#,
+        r#"<w:ins w:id="41" w:author="Alice" w:date="2026-06-01T00:00:00Z">"#,
+        r#"<w:r><w:rPr><w:b/>"#,
+        r#"<w:rPrChange w:id="42" w:author="Bob" w:date="2026-06-02T00:00:00Z"><w:rPr/></w:rPrChange>"#,
+        r#"</w:rPr><w:t>$150</w:t></w:r></w:ins>"#,
+        r#"<w:r><w:t xml:space="preserve"> per unit.</w:t></w:r></w:p>"#,
+    );
+    let doc = Document::parse(&build_docx(&wrap_body(body))).expect("parse motivating shape");
+    let records = stemma::tracked_model::enumerate_revisions(doc.snapshot().canonical.as_ref());
+    let insert = records
+        .iter()
+        .find(|r| r.kind == stemma::RevisionKind::Insert)
+        .expect("pending insertion enumerated");
+    let bold = records
+        .iter()
+        .find(|r| r.kind == stemma::RevisionKind::FormatRun)
+        .expect("pending format proposal enumerated");
+    assert_ne!(
+        insert.revision_id, bold.revision_id,
+        "two separately resolvable identities"
+    );
+
+    // Disposition 1: selectively reject ONLY the bold proposal.
+    let rejected = doc
+        .project(stemma::Resolution::Selective {
+            ids: std::collections::HashSet::from([bold.revision_id]),
+            action: stemma::ResolveSelectionAction::Reject,
+        })
+        .expect("selective reject of the format proposal");
+    let after = stemma::tracked_model::enumerate_revisions(rejected.snapshot().canonical.as_ref());
+    assert!(
+        after
+            .iter()
+            .any(|r| r.revision_id == insert.revision_id && r.kind == stemma::RevisionKind::Insert),
+        "the insertion survives, same identity"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|r| r.kind == stemma::RevisionKind::FormatRun),
+        "the bold proposal is gone"
+    );
+
+    // Disposition 2: leaving pending changes nothing across save/reopen.
+    let saved = doc
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize untouched");
+    let reopened = Document::parse(&saved).expect("reopen");
+    let re_records =
+        stemma::tracked_model::enumerate_revisions(reopened.snapshot().canonical.as_ref());
+    assert_eq!(
+        re_records.iter().map(|r| r.revision_id).collect::<Vec<_>>(),
+        records.iter().map(|r| r.revision_id).collect::<Vec<_>>(),
+        "identities stable when everything stays pending"
+    );
+
+    // Disposition 3: commenting is an annotation, not a counter-revision.
+    let canon = doc.snapshot().canonical.clone();
+    let stemma::BlockNode::Paragraph(p) = &canon.blocks[0].block else {
+        panic!("paragraph");
+    };
+    let commented = doc
+        .apply(&stemma::edit::EditTransaction {
+            steps: vec![stemma::edit::EditStep::CommentCreate {
+                block_id: p.id.clone(),
+                expect: "$150".to_string(),
+                semantic_hash: None,
+                body: "Please confirm this figure.".to_string(),
+                author: Some("Reviewer".to_string()),
+                rationale: None,
+            }],
+            summary: None,
+            materialization_mode: stemma::edit::MaterializationMode::TrackedChange,
+            revision: stemma::domain::RevisionInfo {
+                revision_id: 90,
+                identity: 0,
+                author: Some("Reviewer".to_string()),
+                date: Some("2026-06-03T00:00:00Z".to_string()),
+                apply_op_id: None,
+            },
+        })
+        .expect("comment on the insertion target");
+    let after_comment =
+        stemma::tracked_model::enumerate_revisions(commented.snapshot().canonical.as_ref());
+    assert_eq!(
+        after_comment
+            .iter()
+            .map(|r| (r.revision_id, r.kind))
+            .collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|r| (r.revision_id, r.kind))
+            .collect::<Vec<_>>(),
+        "no revision disposition changed; the comment is an annotation"
+    );
+    assert_eq!(
+        commented.snapshot().canonical.comments.len(),
+        1,
+        "and the annotation exists"
+    );
+}

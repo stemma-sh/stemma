@@ -616,6 +616,13 @@ fn synthesize_reference_inline(para_id: &NodeId, note_id: &str, kind: NoteKind) 
         NoteKind::Footnote => OpaqueKind::FootnoteReference(data),
         NoteKind::Endnote => OpaqueKind::EndnoteReference(data),
     };
+    let wrapper_style_props = StyleProps {
+        char_style_id: Some(match kind {
+            NoteKind::Footnote => "FootnoteReference".into(),
+            NoteKind::Endnote => "EndnoteReference".into(),
+        }),
+        ..StyleProps::default()
+    };
     InlineNode::from(OpaqueInlineNode {
         id: id.clone(),
         kind: opaque_kind,
@@ -626,7 +633,12 @@ fn synthesize_reference_inline(para_id: &NodeId, note_id: &str, kind: NoteKind) 
             docx_anchor: String::new(),
         },
         wrapper_marks: Vec::new(),
-        wrapper_style_props: StyleProps::default(),
+        // The serializer emits this style for engine-authored reference runs;
+        // carry it in the typed model too so a live snapshot and its reopened
+        // form expose the same effective wrapper formatting.
+        wrapper_style_props,
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     })
@@ -784,10 +796,13 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
     let deco = InlineNode::from(DecorationNode {
         id: NodeId::from(format!("{para_id}_ref")),
         // Footnote/endnote auto-number markers are not in DecorationType; they
-        // round-trip purely through raw_xml (the importer also classifies them
-        // as a non-specific decoration kind). Bookmark is the importer's
-        // fallback kind and is inert for serialization here.
-        kind: DecorationType::Bookmark,
+        // round-trip purely through raw_xml. The importer classifies them
+        // through `decoration_type_from_name`, whose fallback for an
+        // unrecognized element is ForeignElement — the SAME kind must be
+        // authored here, or the created note's decoration flips kind across a
+        // save/reopen (Bookmark was wrong: `footnoteRef` matches no importer
+        // arm, and range-marker logic keys on the Bookmark kind).
+        kind: DecorationType::ForeignElement,
         opaque_ref: format!("{para_id}_ref"),
         proof_ref: ProofRef {
             part: DocPart::DocumentXml,

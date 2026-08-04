@@ -232,6 +232,46 @@ fn hdrftr_refs_serialized_at_sectpr_head_in_authored_order() {
 }
 
 #[test]
+fn paragraph_sectpr_preserves_interleaved_story_reference_order() {
+    // Word itself emits this order when first-page stories are added after the
+    // even/default stories. EG_HdrFtrReferences is a repeatable choice, so a
+    // modeled mid-document sectPr must retain the authored interleaving. This
+    // is layout-significant in real Word: regrouping all headers before all
+    // footers can leave every story detached until Word performs a resave.
+    let body = r#"<w:p><w:pPr><w:sectPr><w:headerReference w:type="even" r:id="rH1"/><w:headerReference w:type="default" r:id="rH2"/><w:footerReference w:type="even" r:id="rF1"/><w:footerReference w:type="default" r:id="rF2"/><w:headerReference w:type="first" r:id="rH3"/><w:footerReference w:type="first" r:id="rF3"/><w:type w:val="continuous"/><w:titlePg/></w:sectPr></w:pPr></w:p><w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let projected = Document::parse(&b)
+        .expect("parse")
+        .project(stemma::Resolution::AcceptAll)
+        .expect("accept-all projection");
+    let xml = document_xml_of(
+        &projected
+            .serialize(&ExportOptions::default())
+            .expect("serialize projected document"),
+    );
+
+    let expected = [
+        ("w:headerReference", r#"w:type="even""#),
+        ("w:headerReference", r#"w:type="default""#),
+        ("w:footerReference", r#"w:type="even""#),
+        ("w:footerReference", r#"w:type="default""#),
+        ("w:headerReference", r#"w:type="first""#),
+        ("w:footerReference", r#"w:type="first""#),
+    ];
+    let positions: Vec<usize> = expected
+        .iter()
+        .map(|(tag, attr)| {
+            first_element_with_attr(&xml, tag, attr)
+                .unwrap_or_else(|| panic!("missing {tag} {attr} in XML: {xml}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "modeled paragraph sectPr changed authored EG_HdrFtrReferences order; positions={positions:?}\nXML: {xml}"
+    );
+}
+
+#[test]
 fn titlepg_section_without_refs_synthesizes_nothing_and_opens_clean() {
     // FINDING (was the premise of a synthesis test-bug): stemma does NOT
     // synthesize blank header/footer references for a first section that carries

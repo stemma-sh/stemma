@@ -113,7 +113,7 @@ fn resolving_a_tombstone_moves_the_v2_guard() {
     // removes a span from the enumeration, shifting later ordinals. v1
     // skipped Deleted segments entirely, so accept moved nothing.
     let doc = Document::parse(&make_docx_with_body(
-        r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r><w:del w:id="2" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone </w:delText></w:r></w:del><w:r><w:t>tail.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r><w:del w:id="2" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone </w:delText></w:r></w:del><w:r><w:rPr><w:b/></w:rPr><w:t>tail.</w:t></w:r></w:p>"#,
     ))
     .expect("parse");
     let accepted = doc.read_accepted().expect("accept");

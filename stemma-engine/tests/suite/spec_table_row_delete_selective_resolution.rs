@@ -182,6 +182,82 @@ fn inserted_row_doc() -> Document {
     doc.apply(&txn).expect("apply insert_row")
 }
 
+#[test]
+fn identical_blank_rows_authored_before_an_existing_insert_get_stable_identities() {
+    let doc = Document::parse(&two_row_table_docx()).expect("parse base");
+    let block_id = table_block_id(&doc);
+    let txn = EditTransaction {
+        steps: vec![
+            EditStep::TableStructureOp {
+                block_id: block_id.clone(),
+                semantic_hash: None,
+                op: TableOp::InsertRow {
+                    ref_row: 0,
+                    position: stemma::edit::TableInsertPosition::After,
+                    cells: None,
+                },
+                rationale: None,
+            },
+            EditStep::TableStructureOp {
+                block_id,
+                semantic_hash: None,
+                op: TableOp::InsertRow {
+                    // The first authored row is now row 1. Insert another
+                    // otherwise-identical blank row before it, shifting the
+                    // first row's document index without changing its identity.
+                    ref_row: 1,
+                    position: stemma::edit::TableInsertPosition::Before,
+                    cells: None,
+                },
+                rationale: None,
+            },
+        ],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: RevisionInfo {
+            revision_id: 1,
+            identity: 0,
+            author: Some(MUTATION_AUTHOR.to_string()),
+            date: Some("2026-06-01T00:00:00Z".to_string()),
+            apply_op_id: None,
+        },
+    };
+    let edited = doc
+        .apply(&txn)
+        .expect("both identical row insertions get distinct identities");
+    let before: std::collections::HashMap<_, _> = mutation_revisions(&edited)
+        .into_iter()
+        .filter(|(_, kind, excerpt)| {
+            *kind == RevisionKind::Insert && excerpt.starts_with("row[id:")
+        })
+        .map(|(revision_id, _, excerpt)| (excerpt, revision_id))
+        .collect();
+    assert_eq!(
+        before.len(),
+        2,
+        "expected two stable row carriers: {before:?}"
+    );
+    let ids: HashSet<_> = before.values().copied().collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "identical inserted rows must not share identity"
+    );
+
+    let saved = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize both rows");
+    let reopened = Document::parse(&saved).expect("reopen both rows");
+    let after: std::collections::HashMap<_, _> = mutation_revisions(&reopened)
+        .into_iter()
+        .filter(|(_, kind, excerpt)| {
+            *kind == RevisionKind::Insert && excerpt.starts_with("row[id:")
+        })
+        .map(|(revision_id, _, excerpt)| (excerpt, revision_id))
+        .collect();
+    assert_eq!(after, before, "both row identities survive save/reopen");
+}
+
 /// Every single-id subset × {Accept, Reject} must round-trip through the
 /// serializer AND the engine's own importer.
 fn assert_every_single_id_subset_importable(doc: &Document, label: &str) {

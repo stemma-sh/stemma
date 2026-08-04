@@ -13,7 +13,11 @@ fn local_name(name: &str) -> &str {
 }
 
 fn parse_settings_root(archive: &DocxArchive) -> Result<Option<xmltree::Element>, String> {
-    let Some(xml_bytes) = archive.get("word/settings.xml") else {
+    parse_settings_root_bytes(archive.get("word/settings.xml"))
+}
+
+fn parse_settings_root_bytes(xml_bytes: Option<&[u8]>) -> Result<Option<xmltree::Element>, String> {
+    let Some(xml_bytes) = xml_bytes else {
         return Ok(None);
     };
 
@@ -186,7 +190,17 @@ pub fn set_update_fields(root: &mut xmltree::Element, desired: Option<bool>) {
 ///
 /// Returns the interval in twips, or `None` if the file is missing or the element is absent.
 pub fn parse_default_tab_stop(archive: &DocxArchive) -> Result<Option<i32>, String> {
-    let Some(root) = parse_settings_root(archive)? else {
+    parse_default_tab_stop_bytes(archive.get("word/settings.xml"))
+}
+
+/// Package-backed twin of [`parse_default_tab_stop`]. Runtime projections hold
+/// an already-decoded [`crate::docx_package::DocxPackage`], not a
+/// [`DocxArchive`], but must use the same setting when re-deriving paragraph tab
+/// geometry after accept/reject.
+pub(crate) fn parse_default_tab_stop_bytes(
+    xml_bytes: Option<&[u8]>,
+) -> Result<Option<i32>, String> {
+    let Some(root) = parse_settings_root_bytes(xml_bytes)? else {
         return Ok(None);
     };
     for child in &root.children {

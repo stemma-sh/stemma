@@ -341,6 +341,10 @@ pub enum ErrorCode {
     /// anchor on the moved copy or a stable neighbor instead of guessing —
     /// see `EditError::AmbiguousAnchorAfterMove`.
     AmbiguousAnchorAfterMove,
+    /// The exact run already carries an independently resolvable rPrChange.
+    FormatRevisionConflict,
+    /// A set_format expect anchor matched multiple target spans.
+    AmbiguousFormatTarget,
     InvalidDocx,
     InvalidSnapshot,
     InternalError,
@@ -375,6 +379,43 @@ pub struct ErrorDetails {
     /// moveTo copy id without string-parsing the human message. Boxed for
     /// the same `result_large_err` reason as `opaque_preservation`.
     pub ambiguous_anchor: Option<Box<AmbiguousAnchorDetails>>,
+    /// Structured refusal context for run-format conflicts and unsupported
+    /// pending target states.
+    pub formatting: Option<Box<FormattingErrorDetails>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormattingErrorDetails {
+    Target(FormatTargetDetails),
+    Ambiguous(AmbiguousFormatTargetDetails),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatTargetDetails {
+    pub block_id: NodeId,
+    pub text: String,
+    pub tracking_status: String,
+    pub existing_revision: Option<FormatRevisionDetails>,
+    pub container_revision: Option<ContainerRevisionDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatRevisionDetails {
+    pub revision_id: u32,
+    pub author: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerRevisionDetails {
+    pub revision_id: u32,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AmbiguousFormatTargetDetails {
+    pub block_id: NodeId,
+    pub text: String,
+    pub occurrences: usize,
 }
 
 /// Structured details for `stale_edit` validation failures.
@@ -652,7 +693,11 @@ fn now_epoch_secs() -> u64 {
 // v11: HardBreakNode gained `joins_following_text_run` so a source run that
 // begins with w:br can retain its Word-visible table-pagination behavior.
 // Positional IR shape change — breaking blob change, fail-fast gated.
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 11;
+// v12: HardBreakNode gained its source run's formatting and rsid provenance.
+// Break-only run rPr controls the Word-visible line box, so dropping it during
+// canonical rebuild is a layout change. Positional IR shape change — breaking
+// blob change, fail-fast gated.
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 20;
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
 
@@ -4792,6 +4837,65 @@ fn apply_opaque_child_text_sets(
     Ok(())
 }
 
+/// The part path, relationship type and content type for the engine's
+/// revision-identity sidecar.
+pub(crate) const REVISION_IDS_PART: &str = "word/stemmaRevisionIds.xml";
+pub(crate) const REVISION_IDS_REL: &str = "http://stemma.sh/2026/relationships/revisionIds";
+pub(crate) const REVISION_IDS_CONTENT_TYPE: &str = "application/vnd.stemma.revisionids+xml";
+pub(crate) const REVISION_IDS_NS: &str = "http://stemma.sh/2026/revisionIds";
+
+/// Build the revision-identity sidecar: the engine identity for every revision
+/// this save emits, keyed by the wire id it was written with plus its author
+/// and date.
+///
+/// WHY THIS PART EXISTS. H7 requires an identity that is both derivable from
+/// the document (nothing on the wire carries it, so reopening must reconstruct
+/// it) and stable when the document changes (a revision surviving a resolution
+/// keeps the id a reviewer already saw). Those conflict whenever derivation
+/// depends on anything beyond the revision itself — and for revisions that are
+/// genuinely indistinguishable by content, it must. Recording the identity we
+/// minted removes the dependence for documents that carry the part.
+///
+/// A SIDECAR, not an attribute on `w:ins`. An unknown attribute on a revision
+/// element risks a Word repair dialog; an unknown PART is standard OPC
+/// extensibility. Adjudicated on the oracle: Word preserves this part, its
+/// content-type override and its relationship verbatim across open/edit/save.
+/// Microsoft use the same shape for durable comment ids (`word/commentsIds.xml`).
+///
+/// The reader adopts the whole part or none of it: the root names the carrier
+/// walk it describes (count + content digest), entries are positional (entry i
+/// names carrier i), and a document whose walk no longer matches — another
+/// editor changed it — falls through to derivation exactly as before, so no
+/// document gets worse. Wire ids are deliberately absent from both the digest
+/// and the entries: Word rewrites them freely, and a key built on them can
+/// silently swap lookalike revisions' identities.
+fn build_revision_ids_xml(doc: &CanonDoc) -> String {
+    // Collected through the SAME carrier walk the reader uses
+    // (`for_each_rev_carrier_mut`), so writer and reader agree on the walk by
+    // construction. Writing from `enumerate_revisions` instead looked
+    // equivalent and was not: it reports records, the reader visits carriers,
+    // and the two disagree on the population — so adoption silently never
+    // fired.
+    let mut probe = doc.clone();
+    let (count, walk) = crate::import::revision_walk_digest(&mut probe);
+    let mut entries: Vec<String> = Vec::with_capacity(count);
+    let mut zero = 0usize;
+    crate::import::for_each_rev_carrier_mut(&mut probe, &mut |carrier| {
+        if *carrier.identity == 0 {
+            zero += 1;
+        }
+        entries.push(format!("<rev identity=\"{}\"/>", *carrier.identity));
+    });
+    if std::env::var("STEMMA_DEBUG_IDENTITY").is_ok() {
+        eprintln!("SIDECAR WRITE carriers={count} zero_identity={zero} walk={walk}",);
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<stemmaRevisionIds xmlns=\"{REVISION_IDS_NS}\" carriers=\"{count}\" walk=\"{walk}\">{}</stemmaRevisionIds>",
+        entries.join("")
+    )
+}
+
 fn serialize_canonical_docx(
     base_bytes: &[u8],
     target_bytes: &[u8],
@@ -5213,6 +5317,24 @@ fn serialize_canonical_docx(
         w.end_tag("w:sdt").map_err(map_xml_write_error)?;
     }
 
+    // The story parts this save WRITES (every non-synthesized header and
+    // footer). The sectPr reference remap keeps a reference only when its
+    // target is in this set, so a projected-away (synthesized) story cannot
+    // resurrect from a stale package part on reopen — per TARGET, because a
+    // multi-section document holds several same-kind stories.
+    let written_story_parts: std::collections::HashSet<String> = doc
+        .headers
+        .iter()
+        .filter(|h| !h.synthesized)
+        .map(|h| relationship_target_to_part_path(&h.part_name))
+        .chain(
+            doc.footers
+                .iter()
+                .filter(|f| !f.synthesized)
+                .map(|f| relationship_target_to_part_path(&f.part_name)),
+        )
+        .collect();
+
     // Stream sectPr.
     // When section properties changed, rebuild sectPr from the target values
     // and append a sectPrChange child recording the previous (base) state.
@@ -5266,7 +5388,7 @@ fn serialize_canonical_docx(
                 if let XMLNode::Element(el) = node
                     && is_w_tag(el, "sectPr")
                 {
-                    remap_sect_pr_story_refs(el, &mut base_pkg, &target_pkg)?;
+                    remap_sect_pr_story_refs(el, &mut base_pkg, &target_pkg, &written_story_parts)?;
                 }
                 w.write_xml_node(node).map_err(map_xml_write_error)?;
             }
@@ -5279,7 +5401,7 @@ fn serialize_canonical_docx(
             if let XMLNode::Element(el) = node
                 && is_w_tag(el, "sectPr")
             {
-                remap_sect_pr_story_refs(el, &mut base_pkg, &target_pkg)?;
+                remap_sect_pr_story_refs(el, &mut base_pkg, &target_pkg, &written_story_parts)?;
             }
             w.write_xml_node(node).map_err(map_xml_write_error)?;
         }
@@ -5457,6 +5579,18 @@ fn serialize_canonical_docx(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.people+xml",
         );
     }
+
+    // Record the engine identity of every revision this save emits, so
+    // reopening adopts it instead of re-deriving it (see build_revision_ids_xml
+    // for why derivation alone cannot satisfy H7's two requirements).
+    let revision_ids_xml = build_revision_ids_xml(doc);
+    base_pkg.set_part(REVISION_IDS_PART, revision_ids_xml.into_bytes());
+    base_pkg
+        .document_rels
+        .add(REVISION_IDS_REL, "stemmaRevisionIds.xml");
+    base_pkg
+        .content_types
+        .add_override("/word/stemmaRevisionIds.xml", REVISION_IDS_CONTENT_TYPE);
 
     // Post-serialization bookmark-pairing guard (read-only). Imbalance the
     // INPUT already had passes through byte-faithfully; imbalance the
@@ -6871,9 +7005,11 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::StyleDefIdMismatch { .. }
         | EditError::DocDefaultsEmpty { .. } => ErrorCode::UnsupportedEdit,
         EditError::OpaqueDestroyed { .. } => ErrorCode::OpaqueDestroyed,
-        EditError::NoOpEdit { .. } => ErrorCode::NoOpEdit,
+        EditError::NoOpEdit { .. } | EditError::NoFormattingChange { .. } => ErrorCode::NoOpEdit,
         EditError::PrefixDuplicatesLabel { .. } => ErrorCode::PrefixDuplicatesLabel,
         EditError::AmbiguousAnchorAfterMove { .. } => ErrorCode::AmbiguousAnchorAfterMove,
+        EditError::FormatRevisionConflict { .. } => ErrorCode::FormatRevisionConflict,
+        EditError::AmbiguousFormatTarget { .. } => ErrorCode::AmbiguousFormatTarget,
 
         // ── Remaining "the addressed thing does not exist" variants ──────────
         // Same not-found class as the *NotFound family above.
@@ -6891,7 +7027,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         // materialized honestly (wrong block kind, malformed replacement
         // content, no-op, out-of-scope construct). Closest existing public
         // class is UnsupportedEdit.
-        EditError::NotAParagraph { .. }
+        EditError::RevisionIdentityCollision { .. }
+        | EditError::NotAParagraph { .. }
         | EditError::PreservedInlineNotFound { .. }
         | EditError::DuplicatePreservedInlineRef { .. }
         | EditError::PreservedInlineOrderChanged { .. }
@@ -6910,6 +7047,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::EmptyCellContent { .. }
         | EditError::TableHasFormattingNotInSpec { .. }
         | EditError::NoFormattingRequested { .. }
+        | EditError::ConflictingFormattingMarks { .. }
+        | EditError::FormatTargetNotEditable { .. }
         | EditError::InsertListNumIdUnknown { .. }
         | EditError::BlocksToTableNonParagraph { .. }
         | EditError::BlocksToTableOpaqueInline { .. }
@@ -6933,6 +7072,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             })),
             opaque_preservation: None,
             ambiguous_anchor: None,
+            ..ErrorDetails::default()
         },
         EditError::BlockSemanticHashMismatch {
             block_id,
@@ -6950,6 +7090,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             })),
             opaque_preservation: None,
             ambiguous_anchor: None,
+            ..ErrorDetails::default()
         },
         EditError::OpaqueDestroyed {
             step_index,
@@ -6972,6 +7113,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
                 original_text_preview: original_text_preview.clone(),
             })),
             ambiguous_anchor: None,
+            ..ErrorDetails::default()
         },
         EditError::NoOpEdit {
             block_id,
@@ -6984,6 +7126,20 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             stale_edit: None,
             opaque_preservation: None,
             ambiguous_anchor: None,
+            ..ErrorDetails::default()
+        },
+        EditError::NoFormattingChange {
+            block_id,
+            step_index,
+            current_formatting,
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            context: Some(format!(
+                "formatting patch has no visible or provenance effect; \
+                 target already reads {current_formatting}"
+            )),
+            ..ErrorDetails::default()
         },
         EditError::PrefixDuplicatesLabel {
             block_id,
@@ -6991,16 +7147,22 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             label,
             paragraph_label,
             current_text,
+            corrected_content,
         } => ErrorDetails {
             block_id: Some(block_id.clone()),
             step_index: Some(*step_index),
+            // D5: carry the string that WOULD be accepted, not only the
+            // diagnosis. The caller re-sending `corrected_content` verbatim is
+            // the whole recovery.
             context: Some(format!(
                 "content label {label:?} vs paragraph label {paragraph_label:?}; \
-                 paragraph already reads {current_text:?}"
+                 paragraph already reads {current_text:?}; \
+                 corrected_content {corrected_content:?}"
             )),
             stale_edit: None,
             opaque_preservation: None,
             ambiguous_anchor: None,
+            ..ErrorDetails::default()
         },
         EditError::AmbiguousAnchorAfterMove {
             anchor_id,
@@ -7018,6 +7180,88 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
                 moved_by_step_index: *moved_by_step_index,
                 moved_to_block_id: moved_to_block_id.clone(),
             })),
+            ..ErrorDetails::default()
+        },
+        EditError::FormatRevisionConflict {
+            block_id,
+            text,
+            tracking_status,
+            existing_revision,
+            container_revision,
+            step_index,
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            formatting: Some(Box::new(FormattingErrorDetails::Target(
+                FormatTargetDetails {
+                    block_id: block_id.clone(),
+                    text: text.clone(),
+                    tracking_status: (*tracking_status).to_string(),
+                    existing_revision: Some(FormatRevisionDetails {
+                        revision_id: existing_revision.identity,
+                        author: existing_revision.author.clone(),
+                    }),
+                    container_revision: container_revision.as_ref().as_ref().map(|revision| {
+                        ContainerRevisionDetails {
+                            revision_id: revision.identity,
+                            kind: match *tracking_status {
+                                "inserted" => "insert",
+                                "deleted" | "inserted_then_deleted" => "delete",
+                                _ => "unknown",
+                            }
+                            .to_string(),
+                        }
+                    }),
+                },
+            ))),
+            ..ErrorDetails::default()
+        },
+        EditError::FormatTargetNotEditable {
+            block_id,
+            text,
+            tracking_status,
+            container_revision,
+            step_index,
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            formatting: Some(Box::new(FormattingErrorDetails::Target(
+                FormatTargetDetails {
+                    block_id: block_id.clone(),
+                    text: text.clone(),
+                    tracking_status: (*tracking_status).to_string(),
+                    existing_revision: None,
+                    container_revision: container_revision.as_ref().as_ref().map(|revision| {
+                        ContainerRevisionDetails {
+                            revision_id: revision.identity,
+                            kind: match *tracking_status {
+                                "inserted" => "insert",
+                                "deleted" | "inserted_then_deleted" => "delete",
+                                _ => "unknown",
+                            }
+                            .to_string(),
+                        }
+                    }),
+                },
+            ))),
+            ..ErrorDetails::default()
+        },
+        EditError::AmbiguousFormatTarget {
+            block_id,
+            expected,
+            occurrences,
+            step_index,
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            formatting: Some(Box::new(FormattingErrorDetails::Ambiguous(
+                AmbiguousFormatTargetDetails {
+                    block_id: block_id.clone(),
+                    text: expected.clone(),
+                    occurrences: *occurrences,
+                },
+            ))),
+            ..ErrorDetails::default()
         },
         _ => ErrorDetails::default(),
     };
@@ -7091,11 +7335,25 @@ fn rebuild_snapshot(
     new_canonical.meta.docx_fingerprint = fp.clone();
     let archive = DocxArchive::read(serialized_bytes).map_err(map_docx_error)?;
     let package = DocxPackage::from_archive(&archive).map_err(map_package_error)?;
+    let numbering_defs = package
+        .get_part("word/numbering.xml")
+        .map(crate::numbering::NumberingDefinitions::parse)
+        .transpose()
+        .map_err(|message| invalid_docx(&format!("numbering.xml: {message}")))?;
+    if let Some(style_defs) = style_definitions_from_package(&package)? {
+        crate::tracked_model::reresolve_document_style_inherited_marks(
+            &mut new_canonical,
+            &style_defs,
+            numbering_defs.as_ref(),
+        );
+    }
+    let body_template =
+        reanchor_body_opaque_blocks(&mut new_canonical, &prev.scaffold.body_template, &archive)?;
     Ok(EditSnapshot {
         canonical: Arc::new(new_canonical),
         scaffold: PackageScaffold {
             package,
-            body_template: prev.scaffold.body_template.clone(),
+            body_template,
         },
         meta: SnapshotMeta {
             snapshot_schema_version: prev.meta.snapshot_schema_version,
@@ -7105,6 +7363,126 @@ fn rebuild_snapshot(
             origin_authors: prev.meta.origin_authors.clone(),
         },
     })
+}
+
+/// Reconcile body-level opaque proof anchors with the bytes just produced.
+///
+/// `body_index:N` addresses the serializer scaffold, not an immutable source
+/// position. Any projection or edit that adds/removes a preceding body child
+/// shifts it. Carrying the old index into the rebuilt snapshot makes the next
+/// serialization splice a different child (most dangerously, dropping a
+/// body-level bookmark end while its inline start survives). Re-anchor every
+/// retained opaque against the serialized body and build the next scaffold
+/// from that same tree, so the canonical and its byte backing cannot diverge.
+fn reanchor_body_opaque_blocks(
+    canonical: &mut CanonDoc,
+    previous: &BodyTemplate,
+    archive: &DocxArchive,
+) -> Result<BodyTemplate, RuntimeError> {
+    let main_part = crate::docx_package::resolve_main_document_part(archive)
+        .map_err(crate::import::map_package_error)?;
+    let document_xml = archive
+        .get(&main_part)
+        .ok_or_else(|| invalid_docx(&format!("main document part {main_part} is missing")))?;
+    let root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
+    let body = body_element(&root).map_err(map_word_xml_error)?;
+
+    let mut last_match = None;
+    let mut replacements = Vec::new();
+    for tracked in &canonical.blocks {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            continue;
+        };
+        let Some(old_index) = opaque
+            .proof_ref
+            .docx_anchor
+            .strip_prefix("body_index:")
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            // Target-origin opaque blocks are retained in the model for diff
+            // fixpoint evidence but deliberately are not emitted as tracked
+            // body blocks. They therefore have no output anchor to refresh.
+            if opaque
+                .proof_ref
+                .docx_anchor
+                .starts_with("target_body_index:")
+            {
+                continue;
+            }
+            return Err(RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "cannot rebuild snapshot with an unanchored body opaque block".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    context: Some(opaque.proof_ref.docx_anchor.clone()),
+                    ..ErrorDetails::default()
+                },
+            });
+        };
+        let previous_node = previous.opaque_children.get(&old_index);
+        let start = last_match.map_or(0, |index| index + 1);
+        let new_index = body
+            .children
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, candidate)| {
+                let exact_match = previous_node.is_some_and(|old| old == candidate);
+                let range_match = opaque.range_marker.as_ref().is_some_and(|marker| {
+                    let XMLNode::Element(element) = candidate else {
+                        return false;
+                    };
+                    body_range_marker_matches(element, marker)
+                });
+                // A body-SDT fill intentionally changes the preserved node's
+                // XML, so exact equality with the previous scaffold cannot
+                // hold. SDTs remain in opaque document order; matching the
+                // next direct body SDT is therefore the durable alignment.
+                let sdt_match = opaque.kind == OpaqueKind::Sdt
+                    && matches!(candidate, XMLNode::Element(element) if is_w_tag(element, "sdt"));
+                (exact_match || range_match || sdt_match).then_some(index)
+            })
+            .ok_or_else(|| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "serialized body no longer contains a retained opaque block".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    context: Some(format!(
+                        "old_anchor={} search_start={start}",
+                        opaque.proof_ref.docx_anchor
+                    )),
+                    ..ErrorDetails::default()
+                },
+            })?;
+        last_match = Some(new_index);
+        replacements.push((opaque.id.clone(), new_index));
+    }
+
+    for tracked in &mut canonical.blocks {
+        let BlockNode::OpaqueBlock(opaque) = &mut tracked.block else {
+            continue;
+        };
+        if let Some((_, index)) = replacements.iter().find(|(id, _)| id == &opaque.id) {
+            opaque.proof_ref.docx_anchor = format!("body_index:{index}");
+            opaque.opaque_ref = format!("body_item_{index}");
+        }
+    }
+
+    extract_body_template(root, canonical)
+}
+
+fn body_range_marker_matches(element: &Element, marker: &crate::domain::RangeMarkerMeta) -> bool {
+    use crate::domain::{RangeMarkerFamily, RangeMarkerRole};
+    let expected = match (&marker.family, &marker.role) {
+        (RangeMarkerFamily::Bookmark, RangeMarkerRole::Start) => "bookmarkStart",
+        (RangeMarkerFamily::Bookmark, RangeMarkerRole::End) => "bookmarkEnd",
+        (RangeMarkerFamily::CommentRange, RangeMarkerRole::Start) => "commentRangeStart",
+        (RangeMarkerFamily::CommentRange, RangeMarkerRole::End) => "commentRangeEnd",
+        (RangeMarkerFamily::Permission, RangeMarkerRole::Start) => "permStart",
+        (RangeMarkerFamily::Permission, RangeMarkerRole::End) => "permEnd",
+    };
+    is_w_tag(element, expected)
+        && attr_get(element, "id").is_some_and(|id| id == marker.id.as_str())
 }
 
 /// Word's built-in (latent) paragraph / character / table / numbering style
@@ -7244,6 +7622,24 @@ pub(crate) fn style_definitions_from_package(
         style_defs.set_theme_fonts(theme_fonts);
     }
     Ok(Some(style_defs))
+}
+
+fn numbering_definitions_from_package(
+    package: &DocxPackage,
+) -> Result<Option<crate::numbering::NumberingDefinitions>, RuntimeError> {
+    let Some(bytes) = package.get_part("word/numbering.xml") else {
+        return Ok(None);
+    };
+    crate::numbering::NumberingDefinitions::parse(bytes)
+        .map(Some)
+        .map_err(|message| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message,
+            details: ErrorDetails {
+                context: Some("numbering_definitions_from_package numbering.xml".to_string()),
+                ..Default::default()
+            },
+        })
 }
 
 /// Parse a DOCX's style table into an opaque [`crate::styles::StyleTable`], or
@@ -7397,6 +7793,37 @@ impl EditSnapshot {
             max_wid_in_opaque_children(&self.scaffold.body_template.opaque_children),
         )
         .map_err(map_edit_error)?;
+
+        // An authored paragraph inherits the geometry its style and numbering
+        // imply, exactly as importing the same bytes resolves it. The pure core
+        // cannot do this — it has no style table — so the paragraphs this
+        // transaction created would otherwise carry a zero effective indent
+        // where a reopen resolves a real one, and the model and the document
+        // would disagree about a paragraph nothing touched after the insert.
+        let existing_paragraph_ids: std::collections::HashSet<crate::domain::NodeId> = self
+            .canonical
+            .blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                crate::domain::BlockNode::Paragraph(p) => Some(p.id.clone()),
+                _ => None,
+            })
+            .collect();
+        let style_defs = self.style_definitions()?;
+        let numbering_defs = self.numbering_definitions()?;
+        let insert_defs = crate::tracked_model::ResolutionDefinitions {
+            styles: style_defs.as_ref(),
+            numbering: numbering_defs.as_ref(),
+            default_tab_stop: self.default_tab_stop()?,
+        };
+        for tracked in &mut edited.blocks {
+            if let crate::domain::BlockNode::Paragraph(paragraph) = &mut tracked.block
+                && !existing_paragraph_ids.contains(&paragraph.id)
+            {
+                crate::tracked_model::reresolve_paragraph_indent(paragraph, insert_defs);
+            }
+        }
+
         // Single-document edit: base and target are the same archive. This
         // re-zips the UNMODIFIED input scaffold as merge input — an internal
         // intermediate, not output (output is gated at `serialize`/`save`).
@@ -7408,22 +7835,12 @@ impl EditSnapshot {
             Some(self.scaffold.body_template.clone()),
             &pending,
         )?;
-        let mut next = rebuild_snapshot(self, edited, &redline_bytes)?;
-
-        // Staged block-SDT fills mutated the serialize-path CLONE of the body
-        // template (their bytes live in the scaffold, not the IR), so the
-        // serialized package above carries them — but `rebuild_snapshot`
-        // carries the PRE-FILL template forward. Re-apply the same fills to
-        // the next snapshot's template so cache == package: without this, the
-        // next apply re-streams the stale pre-fill node (silently reverting
-        // the fill) and `block_content_control_targets` reads pre-fill text.
-        // Deterministic re-application: same source node, same pre-minted ids.
-        if !pending.opaque_child_text_sets.is_empty() {
-            apply_opaque_child_text_sets(
-                &mut next.scaffold.body_template.opaque_children,
-                &pending.opaque_child_text_sets,
-            )?;
-        }
+        // Rebuild re-anchors every retained body opaque against `redline_bytes`
+        // and derives its template from those same bytes. Staged block-SDT
+        // fills are therefore already present in `next` exactly once; applying
+        // the pending set again would try to nest a second redline inside the
+        // first and correctly refuse with RegionHasTrackedChanges.
+        let next = rebuild_snapshot(self, edited, &redline_bytes)?;
 
         if inserts_toc {
             // Documented product default (see `edit/verbs/update_fields.rs`):
@@ -7652,6 +8069,27 @@ impl EditSnapshot {
         style_definitions_from_package(&self.scaffold.package)
     }
 
+    fn numbering_definitions(
+        &self,
+    ) -> Result<Option<crate::numbering::NumberingDefinitions>, RuntimeError> {
+        numbering_definitions_from_package(&self.scaffold.package)
+    }
+
+    fn default_tab_stop(&self) -> Result<i32, RuntimeError> {
+        crate::settings::parse_default_tab_stop_bytes(
+            self.scaffold.package.get_part("word/settings.xml"),
+        )
+        .map(|value| value.unwrap_or(720))
+        .map_err(|message| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message,
+            details: ErrorDetails {
+                context: Some("word/settings.xml defaultTabStop".to_string()),
+                ..ErrorDetails::default()
+            },
+        })
+    }
+
     /// This snapshot's own style table (from the scaffold's `word/styles.xml`),
     /// as the opaque [`StyleTable`] handle the audit / accept-reject re-resolution
     /// takes. `None` when the package has no styles part. This is the baseline
@@ -7690,12 +8128,6 @@ impl EditSnapshot {
         // interiors because they have no engine identity and leaves them
         // disclosed by preflight.
         let mut full_resolution: Option<bool> = None;
-        // Selectively resolving an atomic move changes which source/destination
-        // carrier exists in the package. Refresh the body scaffold for that
-        // narrow case so a later projection cannot replay the old move wrapper.
-        // Other projections retain the established scaffold behavior, which
-        // preserves authored SDTs and body-level range decorations.
-        let mut refresh_body_template = false;
         // Preflight (M0.1 fail-loud): the accept/reject descent resolves
         // revisions inside opaque `raw_xml` by reparsing the fragment. If a
         // fragment cannot be parsed yet its bytes carry a revision marker, the
@@ -7721,7 +8153,14 @@ impl EditSnapshot {
         match resolution {
             Resolution::AcceptAll => {
                 full_resolution = Some(true);
-                crate::tracked_model::accept_all(&mut resolved);
+                let style_defs = self.style_definitions()?;
+                let numbering_defs = self.numbering_definitions()?;
+                let defs = crate::tracked_model::ResolutionDefinitions {
+                    styles: style_defs.as_ref(),
+                    numbering: numbering_defs.as_ref(),
+                    default_tab_stop: self.default_tab_stop()?,
+                };
+                crate::tracked_model::accept_all_with_definitions(&mut resolved, defs);
                 if self.canonical.body_section_property_change.is_some() {
                     body_section_resolution = Some(true);
                 }
@@ -7732,10 +8171,13 @@ impl EditSnapshot {
                 // style; the runs' style-inherited marks must be re-resolved
                 // against it, which needs the document's style table.
                 let style_defs = self.style_definitions()?;
-                crate::tracked_model::reject_all_with_style_defs(
-                    &mut resolved,
-                    style_defs.as_ref(),
-                );
+                let numbering_defs = self.numbering_definitions()?;
+                let defs = crate::tracked_model::ResolutionDefinitions {
+                    styles: style_defs.as_ref(),
+                    numbering: numbering_defs.as_ref(),
+                    default_tab_stop: self.default_tab_stop()?,
+                };
+                crate::tracked_model::reject_all_with_definitions(&mut resolved, defs);
                 if self.canonical.body_section_property_change.is_some() {
                     body_section_resolution = Some(false);
                 }
@@ -7768,12 +8210,6 @@ impl EditSnapshot {
                         },
                     });
                 }
-                refresh_body_template = crate::tracked_model::enumerate_revisions(&self.canonical)
-                    .iter()
-                    .any(|revision| {
-                        ids.contains(&revision.revision_id)
-                            && revision.kind == crate::tracked_model::RevisionKind::Move
-                    });
                 // A quarantined block is a DISCIPLINED ISOLATION BOUNDARY,
                 // not a reason to refuse unrelated work. Selective
                 // resolution is provably disjoint from the quarantine:
@@ -7804,11 +8240,17 @@ impl EditSnapshot {
                 // A selectively rejected paragraph-style change needs the style
                 // table to re-resolve style-inherited run marks, same as RejectAll.
                 let style_defs = self.style_definitions()?;
-                match crate::tracked_model::resolve_selected_revisions_with_style_defs(
+                let numbering_defs = self.numbering_definitions()?;
+                let defs = crate::tracked_model::ResolutionDefinitions {
+                    styles: style_defs.as_ref(),
+                    numbering: numbering_defs.as_ref(),
+                    default_tab_stop: self.default_tab_stop()?,
+                };
+                match crate::tracked_model::resolve_selected_revisions_with_definitions(
                     &mut resolved,
                     &ids,
                     action,
-                    style_defs.as_ref(),
+                    defs,
                 ) {
                     Ok(result) => body_section_resolution = result,
                     Err(unresolved) => {
@@ -7841,6 +8283,29 @@ impl EditSnapshot {
         // they are the ONLY producer held to the final-mark rule (they must never
         // strand a tracked final pilcrow — see assert_resolution_body_invariants).
         crate::tracked_model::debug_assert_resolution_body_invariants(&resolved, "project");
+
+        // Same rule the producers apply: a block-level proposal carries its
+        // label inside the proposal, never hoisted beside it. A resolution can
+        // leave a paragraph block-tracked with its label still hoisted, which
+        // is a shape import does not rebuild, so the projected model and its
+        // own reopen disagreed about where the label lives.
+        crate::tracked_model::materialize_block_tracked_prefixes(&mut resolved.blocks);
+
+        // And the other rule both producers carry: a prefix this resolution
+        // splits across the tracking boundary is canonicalized, scoped to the
+        // ones it actually produced. A paragraph that arrived already split is
+        // the source document's own state, exactly as on the authoring paths.
+        let split_before =
+            crate::tracked_model::split_tracking_boundary_prefix_ids(&self.canonical);
+        let produced_splits: std::collections::HashSet<_> =
+            crate::tracked_model::split_tracking_boundary_prefix_ids(&resolved)
+                .difference(&split_before)
+                .cloned()
+                .collect();
+        crate::tracked_model::canonicalize_split_tracking_boundary_prefix_ids(
+            &mut resolved,
+            &produced_splits,
+        );
 
         // Clone the body template the serializer consumes, then resolve an
         // imported body `sectPrChange` in its verbatim `sectPr` cache so the
@@ -7882,13 +8347,7 @@ impl EditSnapshot {
         } else {
             redline_bytes
         };
-        let mut rebuilt = rebuild_snapshot(self, resolved, &projected_bytes)?;
-        if refresh_body_template {
-            let archive = DocxArchive::read(&projected_bytes).map_err(map_docx_error)?;
-            rebuilt.scaffold.body_template =
-                body_template_from_archive(&archive, &rebuilt.canonical)?;
-        }
-        Ok(rebuilt)
+        rebuild_snapshot(self, resolved, &projected_bytes)
     }
 
     /// Discover the deltas between this snapshot and `other` and materialize
@@ -8446,6 +8905,7 @@ fn import_and_anchor(
         footnotes,
         endnotes,
         comments,
+        Some(&archive),
     )?;
     // Empty-running-head tolerances were recorded while parsing the story parts
     // above, before the diagnostics sink existed; fold them in.
@@ -8510,19 +8970,6 @@ fn extract_body_template(
         sect_pr_nodes,
         body_children_len,
     })
-}
-
-fn body_template_from_archive(
-    archive: &DocxArchive,
-    canonical: &CanonDoc,
-) -> Result<BodyTemplate, RuntimeError> {
-    let main_part = crate::docx_package::resolve_main_document_part(archive)
-        .map_err(crate::import::map_package_error)?;
-    let document_xml = archive
-        .get(&main_part)
-        .ok_or_else(|| invalid_docx(&format!("main document part {main_part} is missing")))?;
-    let root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
-    extract_body_template(root, canonical)
 }
 
 /// Build a `w:sdt` element wrapping the given content children,
@@ -8654,7 +9101,47 @@ fn remap_sect_pr_story_refs(
     sect_pr: &mut Element,
     base_pkg: &mut DocxPackage,
     target_pkg: &DocxPackage,
+    written_story_parts: &std::collections::HashSet<String>,
 ) -> Result<(), RuntimeError> {
+    // A story the model holds as SYNTHESIZED-blank (§17.10.5) asserts "no
+    // real part backs this reference" — a projection can produce it by
+    // resolving away every block of a fully-tracked header. The package
+    // still contains the original part, so keeping the reference would
+    // RESURRECT the projected-away content on reopen (wave-8 replay lane:
+    // reject(replay) grew back a header reject had blanked). The survival
+    // rule is PER-TARGET, never per-kind: a multi-section document holds
+    // several same-kind stories, and one synthesized Default footer must
+    // not drop other sections' references to REAL Default footers (keying
+    // on kind lost footer3.xml while a blank Default existed — wave-8
+    // real-word g1 witness). A reference survives iff its resolved target
+    // is a part this save actually writes.
+    sect_pr.children.retain(|child| {
+        let XMLNode::Element(el) = child else {
+            return true;
+        };
+        if !is_w_tag(el, "headerReference") && !is_w_tag(el, "footerReference") {
+            return true;
+        }
+        let Some(rid) = attr_get(el, "r:id") else {
+            return true;
+        };
+        let target = base_pkg
+            .document_rels
+            .find_by_id(rid)
+            .map(|rel| rel.target.clone())
+            .or_else(|| {
+                target_pkg
+                    .document_rels
+                    .find_by_id(rid)
+                    .map(|rel| rel.target.clone())
+            });
+        let Some(target) = target else {
+            // Unresolvable rid: leave it for the remap below, which copies
+            // the part or repairs the relationship.
+            return true;
+        };
+        written_story_parts.contains(&relationship_target_to_part_path(&target))
+    });
     for child in &mut sect_pr.children {
         let XMLNode::Element(el) = child else {
             continue;
@@ -8945,17 +9432,37 @@ fn append_modeled_children(
     // Refs inherited via §17.10.2 resolution (or blank-synthesized per
     // §17.10.5) are render-time semantics, not authored markup — emitting
     // them would materialize inheritance onto every mid-document sectPr.
+    // EG_HdrFtrReferences is a repeatable choice: header and footer entries
+    // share one authored sequence. Keeping them in two domain collections is
+    // convenient for story lookup, but emitting those collections in groups
+    // changes that sequence. Real Word can leave all six stories detached on
+    // first render after such a regrouping, only restoring them after a Word
+    // resave. Rejoin imported refs by their parse-edge position. Newly-created
+    // refs have no source position and follow them deterministically (headers,
+    // then footers, in operation order).
+    let mut story_refs: Vec<(Option<u32>, usize, bool, &crate::domain::StoryRef)> = Vec::new();
     for href in sp.header_refs.iter().filter(|r| !r.synthesized) {
-        let mut el = w_el("headerReference");
-        attr_set(&mut el, "w:type", hf_kind_to_xml(&href.kind));
-        let rid = resolve(&href.part_path, HEADER_REL_TYPE);
-        attr_set(&mut el, "r:id", &rid);
-        sect_pr.children.push(XMLNode::Element(el));
+        story_refs.push((href.source_order, story_refs.len(), true, href));
     }
     for fref in sp.footer_refs.iter().filter(|r| !r.synthesized) {
-        let mut el = w_el("footerReference");
-        attr_set(&mut el, "w:type", hf_kind_to_xml(&fref.kind));
-        let rid = resolve(&fref.part_path, FOOTER_REL_TYPE);
+        story_refs.push((fref.source_order, story_refs.len(), false, fref));
+    }
+    story_refs.sort_by_key(|(source_order, fallback_order, _, _)| {
+        (
+            source_order.is_none(),
+            source_order.unwrap_or(0),
+            *fallback_order,
+        )
+    });
+    for (_, _, is_header, story_ref) in story_refs {
+        let (element_name, rel_type) = if is_header {
+            ("headerReference", HEADER_REL_TYPE)
+        } else {
+            ("footerReference", FOOTER_REL_TYPE)
+        };
+        let mut el = w_el(element_name);
+        attr_set(&mut el, "w:type", hf_kind_to_xml(&story_ref.kind));
+        let rid = resolve(&story_ref.part_path, rel_type);
         attr_set(&mut el, "r:id", &rid);
         sect_pr.children.push(XMLNode::Element(el));
     }
@@ -9306,6 +9813,9 @@ fn map_docx_error(err: DocxError) -> RuntimeError {
             "docx rejected: duplicate ZIP part name {name:?} (case-equivalent to {existing:?}); \
              part names must be unique (OPC §6.2, §7.3) — Word reports such packages as corrupt"
         ),
+        DocxError::InvalidWrittenZip(detail) => {
+            format!("docx write produced an invalid ZIP central directory: {detail}")
+        }
     };
     RuntimeError {
         code: ErrorCode::InvalidDocx,
@@ -10752,6 +11262,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -11596,6 +12107,8 @@ mod tests {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
                 raw_xml: Some(drawing_xml.into_bytes()),
                 content_hash: None,
             });
@@ -11641,6 +12154,8 @@ mod tests {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
                 raw_xml: Some(raw.to_vec()),
                 content_hash: None,
             });

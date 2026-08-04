@@ -93,10 +93,47 @@ fn serialized_tab_stops_for_previous_formatting(
 /// A bare run carrying a deferred literal-prefix separator VERBATIM (spaces and
 /// tabs in source order). Used when the run the separator would normally attach
 /// to is not a text run (hard break, opaque inline).
-fn build_separator_run(separator: &str) -> Element {
-    let mut run = w_el("r");
-    tabbed_text_children(&mut run, "", false, Some(separator));
-    run
+fn build_separator_run(separator: &str, deleted_text: bool) -> Element {
+    let mut next_id = 0;
+    build_text_run_with_leading_tabs(
+        "",
+        &[],
+        &StyleProps::default(),
+        RunDirectness::default(),
+        deleted_text,
+        None,
+        &mut next_id,
+        Some(separator),
+    )
+}
+
+/// Restore source-form text roles after the ordinary text-run builder has
+/// emitted their semantic string projection.
+fn apply_text_role(run: &mut Element, text: &TextNode) {
+    match text.text_role.as_ref() {
+        Some(crate::domain::TextRole::NoBreakHyphen) => {
+            assert_eq!(
+                text.text, "\u{2011}",
+                "NoBreakHyphen text role must carry exactly one U+2011 character"
+            );
+            let text_children: Vec<usize> = run
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    matches!(child, XMLNode::Element(element) if element.name == "t" || element.name == "delText")
+                        .then_some(index)
+                })
+                .collect();
+            assert_eq!(
+                text_children.len(),
+                1,
+                "NoBreakHyphen run must have exactly one emitted text child"
+            );
+            run.children[text_children[0]] = XMLNode::Element(w_el("noBreakHyphen"));
+        }
+        Some(crate::domain::TextRole::MaterializedPrefix(_)) | None => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +145,7 @@ fn append_literal_prefix_runs(
     has_trailing_tab: bool,
     embed_trailing_tab_in_prefix_run: bool,
     preserve_source_boundaries: bool,
+    body_has_text: bool,
     leading_rpr: Option<&crate::domain::PrefixLeadingRpr>,
     trailing_rpr: Option<&crate::domain::PrefixLeadingRpr>,
     marks: &[Mark],
@@ -122,7 +160,7 @@ fn append_literal_prefix_runs(
     {
         let mut pending_body_prefix = None;
         for source_run in &provenance.source_runs {
-            if source_run.joins_body {
+            if source_run.joins_body && body_has_text {
                 assert!(
                     pending_body_prefix.is_none(),
                     "a literal prefix can join at most one remaining body run"
@@ -342,7 +380,10 @@ type RunDirectness = crate::domain::RunRprAuthored;
 /// shading, …) pass through unchanged — the bug is scoped to the cascade-injected
 /// slots: fonts (literal + theme, all four script slots + hint), sizes (sz/szCs),
 /// color (literal + theme), and lang (val + eastAsia).
-fn direct_run_style_props(style_props: &StyleProps, directness: RunDirectness) -> StyleProps {
+pub(crate) fn direct_run_style_props(
+    style_props: &StyleProps,
+    directness: RunDirectness,
+) -> StyleProps {
     let mut props = style_props.clone();
     // ascii/hAnsi font slot: literal (w:ascii) and theme (w:asciiTheme) are
     // independent — a run authoring a literal font must NOT get a theme font
@@ -548,12 +589,23 @@ fn append_authored_off_toggles(rpr: &mut Element, marks: &[Mark], directness: Ru
         attr_set(&mut u, "w:val", "none");
         insert_ordered(rpr, u, "u");
     }
+    // `vertAlign` is an override rather than a toggle. Explicitly removing
+    // subscript/superscript must author `baseline`; omission would allow a
+    // style-level vertical alignment to bleed back in.
+    if directness.vert_align
+        && !marks.contains(&Mark::Subscript)
+        && !marks.contains(&Mark::Superscript)
+    {
+        let mut vert_align = w_el("vertAlign");
+        attr_set(&mut vert_align, "w:val", "baseline");
+        insert_ordered(rpr, vert_align, "vertAlign");
+    }
 }
 
 /// Project a run's resolved `marks` down to the AUTHORED ones (per the same
 /// [`RunRprAuthored`] provenance): a style-inherited Bold/Italic/Underline/
 /// vertAlign must not re-emit as direct rPr — see `direct_run_style_props`.
-fn direct_marks(marks: &[Mark], directness: RunDirectness) -> Vec<Mark> {
+pub(crate) fn direct_marks(marks: &[Mark], directness: RunDirectness) -> Vec<Mark> {
     marks
         .iter()
         .filter(|m| match m {
@@ -626,6 +678,14 @@ fn build_text_run_with_leading_tabs(
         run.children.push(XMLNode::Element(rpr));
     }
     tabbed_text_children(&mut run, text, deleted_text, leading_separator);
+    if directness.rpr_after_content
+        && run.children.first().is_some_and(
+            |child| matches!(child, XMLNode::Element(element) if local_element_name(element) == "rPr"),
+        )
+    {
+        let rpr = run.children.remove(0);
+        run.children.push(rpr);
+    }
     run
 }
 
@@ -666,6 +726,21 @@ fn append_inline_refs_to_container(
 ) -> Result<(), RuntimeError> {
     let mut index = 0;
     while index < inlines.len() {
+        if let (InlineNode::OpaqueInline(opaque), Some(InlineNode::Text(text))) =
+            (&inlines[index], inlines.get(index + 1))
+            && opaque.joins_following_text_run
+        {
+            append_joined_opaque_text_run(
+                parent,
+                opaque,
+                text,
+                deleted_text,
+                next_id,
+                pending_prefix_sep,
+            )?;
+            index += 2;
+            continue;
+        }
         if let (InlineNode::HardBreak(hard_break), Some(InlineNode::Text(text))) =
             (inlines[index], inlines.get(index + 1).copied())
             && hard_break.joins_following_text_run
@@ -717,6 +792,77 @@ fn append_inline_refs_to_container(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_joined_opaque_text_run(
+    parent: &mut Element,
+    opaque: &crate::domain::OpaqueInlineNode,
+    text: &TextNode,
+    deleted_text: bool,
+    next_id: &mut u32,
+    pending_prefix_sep: &mut Option<String>,
+) -> Result<(), RuntimeError> {
+    if let Some(separator) = pending_prefix_sep.take() {
+        parent.children.push(XMLNode::Element(build_separator_run(
+            &separator,
+            deleted_text,
+        )));
+    }
+    let raw_xml = opaque.raw_xml.as_ref().ok_or_else(|| RuntimeError {
+        code: ErrorCode::InternalError,
+        message: "opaque marked as joined to following text has no source XML".to_string(),
+        details: ErrorDetails {
+            block_id: Some(opaque.id.clone()),
+            context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+            ..ErrorDetails::default()
+        },
+    })?;
+    let mut element =
+        crate::word_xml::parse_raw_fragment(raw_xml.as_slice()).map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "failed to parse joined opaque inline XML".to_string(),
+            details: ErrorDetails {
+                context: Some(format!("opaque_ref={} err={source}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        })?;
+    coerce_opaque_run_text(&mut element, deleted_text);
+    if !opaque_raw_element_requires_run_wrapper(&element) {
+        return Err(RuntimeError {
+            code: ErrorCode::InternalError,
+            message: "non-run opaque marked as joined to following text".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        });
+    }
+
+    let mut run = build_text_run_with_leading_tabs(
+        &text.text,
+        &text.marks,
+        &text.style_props,
+        text.rpr_authored,
+        deleted_text,
+        text.formatting_change.as_ref(),
+        next_id,
+        None,
+    );
+    apply_text_role(&mut run, text);
+    let attrs = if text.source_run_attrs.is_empty() {
+        &opaque.source_run_attrs
+    } else {
+        &text.source_run_attrs
+    };
+    apply_source_run_attrs(&mut run, attrs);
+    let insert_at = usize::from(run.children.first().is_some_and(
+        |child| matches!(child, XMLNode::Element(el) if local_element_name(el) == "rPr"),
+    ));
+    run.children.insert(insert_at, XMLNode::Element(element));
+    parent.children.push(XMLNode::Element(run));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn append_inlines_to_container(
     parent: &mut Element,
@@ -730,6 +876,21 @@ fn append_inlines_to_container(
 ) -> Result<(), RuntimeError> {
     let mut index = 0;
     while index < inlines.len() {
+        if let (InlineNode::OpaqueInline(opaque), Some(InlineNode::Text(text))) =
+            (&inlines[index], inlines.get(index + 1))
+            && opaque.joins_following_text_run
+        {
+            append_joined_opaque_text_run(
+                parent,
+                opaque,
+                text,
+                deleted_text,
+                next_id,
+                pending_prefix_sep,
+            )?;
+            index += 2;
+            continue;
+        }
         if let (InlineNode::HardBreak(hard_break), Some(InlineNode::Text(text))) =
             (&inlines[index], inlines.get(index + 1))
             && hard_break.joins_following_text_run
@@ -781,12 +942,15 @@ fn append_inlines_to_container(
     Ok(())
 }
 
-fn build_break_element(break_type: &crate::domain::BreakType) -> Element {
+fn build_break_element(hard_break: &crate::domain::HardBreakNode) -> Element {
     let mut element = w_el("br");
-    match break_type {
-        crate::domain::BreakType::Page => attr_set(&mut element, "w:type", "page"),
-        crate::domain::BreakType::Column => attr_set(&mut element, "w:type", "column"),
-        crate::domain::BreakType::TextWrapping => {}
+    if hard_break.type_is_explicit
+        || hard_break.break_type != crate::domain::BreakType::TextWrapping
+    {
+        attr_set(&mut element, "w:type", hard_break.break_type.to_xml_str());
+    }
+    if let Some(clear) = &hard_break.clear {
+        attr_set(&mut element, "w:clear", clear.to_xml_str());
     }
     element
 }
@@ -801,9 +965,10 @@ fn append_joined_break_text_run(
     pending_prefix_sep: &mut Option<String>,
 ) {
     if let Some(separator) = pending_prefix_sep.take() {
-        parent
-            .children
-            .push(XMLNode::Element(build_separator_run(&separator)));
+        parent.children.push(XMLNode::Element(build_separator_run(
+            &separator,
+            deleted_text,
+        )));
     }
     let mut run = build_text_run_with_leading_tabs(
         &text.text,
@@ -815,14 +980,13 @@ fn append_joined_break_text_run(
         next_id,
         None,
     );
+    apply_text_role(&mut run, text);
     apply_source_run_attrs(&mut run, &text.source_run_attrs);
     let insert_at = usize::from(run.children.first().is_some_and(
         |child| matches!(child, XMLNode::Element(el) if local_element_name(el) == "rPr"),
     ));
-    run.children.insert(
-        insert_at,
-        XMLNode::Element(build_break_element(&hard_break.break_type)),
-    );
+    run.children
+        .insert(insert_at, XMLNode::Element(build_break_element(hard_break)));
     parent.children.push(XMLNode::Element(run));
 }
 
@@ -873,6 +1037,7 @@ fn append_joined_decoration_text_run(
         next_id,
         separator.as_deref(),
     );
+    apply_text_role(&mut run, text);
     apply_source_run_attrs(&mut run, &text.source_run_attrs);
     if emit_decoration {
         let insert_at = usize::from(run.children.first().is_some_and(
@@ -908,6 +1073,7 @@ fn append_single_inline(
                 next_id,
                 sep.as_deref(),
             );
+            apply_text_role(&mut run, text);
             apply_source_run_attrs(&mut run, &text.source_run_attrs);
             parent.children.push(XMLNode::Element(run));
         }
@@ -915,18 +1081,31 @@ fn append_single_inline(
             if let Some(sep) = pending_prefix_sep.take() {
                 parent
                     .children
-                    .push(XMLNode::Element(build_separator_run(&sep)));
+                    .push(XMLNode::Element(build_separator_run(&sep, deleted_text)));
             }
-            let mut run = w_el("r");
+            let mut run = build_text_run_with_leading_tabs(
+                "",
+                &hb.wrapper_marks,
+                &hb.wrapper_style_props,
+                hb.wrapper_rpr_authored,
+                deleted_text,
+                None,
+                next_id,
+                None,
+            );
+            apply_source_run_attrs(&mut run, &hb.source_run_attrs);
+            let insert_at = usize::from(run.children.first().is_some_and(
+                |child| matches!(child, XMLNode::Element(el) if local_element_name(el) == "rPr"),
+            ));
             run.children
-                .push(XMLNode::Element(build_break_element(&hb.break_type)));
+                .insert(insert_at, XMLNode::Element(build_break_element(hb)));
             parent.children.push(XMLNode::Element(run));
         }
         InlineNode::OpaqueInline(opaque) => {
             if let Some(sep) = pending_prefix_sep.take() {
                 parent
                     .children
-                    .push(XMLNode::Element(build_separator_run(&sep)));
+                    .push(XMLNode::Element(build_separator_run(&sep, deleted_text)));
             }
             if let Some(raw_xml) = &opaque.raw_xml {
                 let mut element =
@@ -954,6 +1133,7 @@ fn append_single_inline(
                 coerce_opaque_run_text(&mut element, deleted_text);
                 if opaque_raw_element_requires_run_wrapper(&element) {
                     let mut run = w_el("r");
+                    apply_source_run_attrs(&mut run, &opaque.source_run_attrs);
                     if let Some(rpr) = build_wrapper_rpr(
                         &opaque.wrapper_marks,
                         &opaque.wrapper_style_props,
@@ -1155,6 +1335,7 @@ fn paragraph_mark_formatting_changed(
 ) -> bool {
     paragraph.paragraph_mark_marks != fc.previous_paragraph_mark_marks
         || paragraph.paragraph_mark_style_props != fc.previous_paragraph_mark_style_props
+        || paragraph.paragraph_mark_rfonts != fc.previous_paragraph_mark_rfonts
         || paragraph.paragraph_mark_rpr_off != fc.previous_paragraph_mark_rpr_off
 }
 
@@ -1168,6 +1349,52 @@ fn para_mark_off_directness(off: crate::domain::ParaMarkRprOff) -> RunDirectness
         italic_off: off.italic_off,
         underline_off: off.underline_off,
         ..RunDirectness::default()
+    }
+}
+
+/// Replace the resolved/projection `rFonts` emitted by `build_rpr` with the
+/// paragraph mark's exact authored attribute map. The two representations are
+/// deliberately separate: consumers need one resolved font, while Word layout
+/// needs to know which OOXML script slots were actually present.
+fn apply_authored_rfonts(rpr: &mut Element, fonts: &crate::domain::AuthoredRFonts) {
+    if fonts.is_empty() {
+        // Compatibility for snapshots predating exact slot provenance: retain
+        // their historical projection-based emission.
+        return;
+    }
+
+    let mut rfonts = w_el("rFonts");
+    for (name, value) in [
+        ("w:ascii", &fonts.ascii),
+        ("w:hAnsi", &fonts.h_ansi),
+        ("w:asciiTheme", &fonts.ascii_theme),
+        ("w:hAnsiTheme", &fonts.h_ansi_theme),
+        ("w:eastAsia", &fonts.east_asia),
+        ("w:eastAsiaTheme", &fonts.east_asia_theme),
+        ("w:cs", &fonts.cs),
+        ("w:cstheme", &fonts.cs_theme),
+        ("w:hint", &fonts.hint),
+    ] {
+        if let Some(value) = value {
+            attr_set(&mut rfonts, name, value.clone());
+        }
+    }
+
+    if let Some(existing) = rpr
+        .children
+        .iter_mut()
+        .find(|child| matches!(child, XMLNode::Element(element) if element.name == "rFonts"))
+    {
+        *existing = XMLNode::Element(rfonts);
+    } else {
+        let after_rstyle = rpr
+            .children
+            .iter()
+            .position(
+                |child| matches!(child, XMLNode::Element(element) if element.name == "rStyle"),
+            )
+            .map_or(0, |index| index + 1);
+        rpr.children.insert(after_rstyle, XMLNode::Element(rfonts));
     }
 }
 
@@ -1189,6 +1416,7 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
         &paragraph.paragraph_mark_marks,
         &paragraph.paragraph_mark_style_props,
     );
+    apply_authored_rfonts(&mut rpr, &paragraph.paragraph_mark_rfonts);
     // The pilcrow's authored OFF toggles (`<w:b w:val="0"/>`, `<w:i w:val="0"/>`,
     // `<w:u w:val="none"/>`) that the presence-only `paragraph_mark_marks` cannot
     // carry — re-emitted at their Annex-A position, the same path runs use.
@@ -1216,6 +1444,7 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
             &fc.previous_paragraph_mark_marks,
             &fc.previous_paragraph_mark_style_props,
         );
+        apply_authored_rfonts(&mut prev_rpr, &fc.previous_paragraph_mark_rfonts);
         append_authored_off_toggles(
             &mut prev_rpr,
             &fc.previous_paragraph_mark_marks,
@@ -1503,6 +1732,7 @@ pub(crate) fn serialize_paragraph_node(
         para_mark_status: _,          // → here (rPr ins/del marker)
         paragraph_mark_marks: _,      // → pPr (rPr)
         paragraph_mark_style_props: _, // → pPr (rPr)
+        paragraph_mark_rfonts: _,     // → pPr (rPr exact font slots)
         paragraph_mark_rpr_off: _,    // → pPr (rPr) — authored OFF toggles
 
         para_split: _,              // internal — merge guard, not serialized directly
@@ -1569,6 +1799,11 @@ pub(crate) fn serialize_paragraph_node(
         .as_ref()
         .or(block_status)
         .filter(|status| !matches!(status, TrackingStatus::Normal));
+    // Content and pilcrow carriers with one canonical identity are one review
+    // proposal. Reuse the pilcrow's wire id for matching inline containers so
+    // import can recover that grouping directly instead of inferring it from
+    // mutable document structure.
+    let mut para_mark_wire: Option<(bool, u32, u32)> = None;
     // The pilcrow mark is part of the MOVE only when the BLOCK itself is the
     // matching move half — a moveTo DESTINATION (block Inserted + move_id) whose
     // mark is Inserted, or a moveFrom SOURCE (block Deleted + move_id) whose mark
@@ -1602,18 +1837,26 @@ pub(crate) fn serialize_paragraph_node(
                     rev.date.as_deref().unwrap_or(""),
                 )
             }
-            TrackingStatus::Inserted(rev) => crate::word_xml::ensure_ppr_rpr_ins(
-                &mut p,
-                next_annotation_id(next_id),
-                rev.author.as_deref().unwrap_or(""),
-                rev.date.as_deref().unwrap_or(""),
-            ),
-            TrackingStatus::Deleted(rev) => crate::word_xml::ensure_ppr_rpr_del(
-                &mut p,
-                next_annotation_id(next_id),
-                rev.author.as_deref().unwrap_or(""),
-                rev.date.as_deref().unwrap_or(""),
-            ),
+            TrackingStatus::Inserted(rev) => {
+                let wire_id = next_annotation_id(next_id);
+                para_mark_wire = Some((false, rev.identity, wire_id));
+                crate::word_xml::ensure_ppr_rpr_ins(
+                    &mut p,
+                    wire_id,
+                    rev.author.as_deref().unwrap_or(""),
+                    rev.date.as_deref().unwrap_or(""),
+                )
+            }
+            TrackingStatus::Deleted(rev) => {
+                let wire_id = next_annotation_id(next_id);
+                para_mark_wire = Some((true, rev.identity, wire_id));
+                crate::word_xml::ensure_ppr_rpr_del(
+                    &mut p,
+                    wire_id,
+                    rev.author.as_deref().unwrap_or(""),
+                    rev.date.as_deref().unwrap_or(""),
+                )
+            }
             TrackingStatus::InsertedThenDeleted(sr) => {
                 // The stacked paragraph mark: both markers, ins before del
                 // (CT_ParaRPr order; the same shape Word and the EBA corpus
@@ -1667,6 +1910,16 @@ pub(crate) fn serialize_paragraph_node(
     } else {
         None
     };
+    let paragraph_has_inline = paragraph
+        .segments
+        .iter()
+        .any(|segment| !segment.inlines.is_empty());
+    let paragraph_has_text = paragraph.segments.iter().any(|segment| {
+        segment
+            .inlines
+            .iter()
+            .any(|inline| matches!(inline, InlineNode::Text(_)))
+    });
 
     if let Some(TrackingStatus::Deleted(rev)) = block_status {
         // Use w:moveFrom instead of w:del when this block is a move source.
@@ -1692,6 +1945,7 @@ pub(crate) fn serialize_paragraph_node(
                 paragraph.literal_prefix_has_trailing_tab,
                 false,
                 false,
+                false,
                 paragraph.literal_prefix_leading_rpr.as_deref(),
                 paragraph.literal_prefix_trailing_rpr.as_deref(),
                 &pfx_marks,
@@ -1700,6 +1954,11 @@ pub(crate) fn serialize_paragraph_node(
                 !is_move, // w:delText only valid inside w:del, not w:moveFrom
                 next_id,
             );
+            if !paragraph_has_inline && let Some(separator) = pending_prefix_sep.take() {
+                prefix_container
+                    .children
+                    .push(XMLNode::Element(build_separator_run(&separator, !is_move)));
+            }
             p.children.push(XMLNode::Element(prefix_container));
         }
         let all: Vec<&InlineNode> = paragraph.all_inlines().collect();
@@ -1710,6 +1969,7 @@ pub(crate) fn serialize_paragraph_node(
             &container_kind,
             author,
             date,
+            None,
             next_id,
             None,
             bookmark_policy,
@@ -1749,6 +2009,7 @@ pub(crate) fn serialize_paragraph_node(
                 paragraph.literal_prefix_has_trailing_tab,
                 false,
                 false,
+                false,
                 paragraph.literal_prefix_leading_rpr.as_deref(),
                 paragraph.literal_prefix_trailing_rpr.as_deref(),
                 &pfx_marks,
@@ -1757,6 +2018,11 @@ pub(crate) fn serialize_paragraph_node(
                 false,
                 next_id,
             );
+            if !paragraph_has_inline && let Some(separator) = pending_prefix_sep.take() {
+                wrapper
+                    .children
+                    .push(XMLNode::Element(build_separator_run(&separator, false)));
+            }
             p.children.push(XMLNode::Element(wrapper));
         }
         let mut emitted_opaques = HashSet::new();
@@ -1776,6 +2042,7 @@ pub(crate) fn serialize_paragraph_node(
                         &seg_container,
                         rev_author,
                         rev_date,
+                        None,
                         next_id,
                         Some(&mut emitted_opaques),
                         bookmark_policy,
@@ -1803,6 +2070,7 @@ pub(crate) fn serialize_paragraph_node(
                         &seg_container,
                         seg_author,
                         seg_date,
+                        None,
                         next_id,
                         Some(&mut emitted_opaques),
                         bookmark_policy,
@@ -1825,6 +2093,7 @@ pub(crate) fn serialize_paragraph_node(
                         &TrackedContainer::Del,
                         seg_author,
                         seg_date,
+                        None,
                         next_id,
                         Some(&mut emitted_opaques),
                         bookmark_policy,
@@ -1854,6 +2123,7 @@ pub(crate) fn serialize_paragraph_node(
                         &TrackedContainer::Del,
                         sr.deleted.author.as_deref().unwrap_or(""),
                         sr.deleted.date.as_deref().unwrap_or(""),
+                        None,
                         next_id,
                         Some(&mut emitted_opaques),
                         bookmark_policy,
@@ -1896,6 +2166,7 @@ pub(crate) fn serialize_paragraph_node(
             paragraph.literal_prefix_has_trailing_tab,
             embed_prefix_trailing_tab,
             true,
+            paragraph_has_text,
             paragraph.literal_prefix_leading_rpr.as_deref(),
             paragraph.literal_prefix_trailing_rpr.as_deref(),
             &pfx_marks,
@@ -1954,11 +2225,25 @@ pub(crate) fn serialize_paragraph_node(
             }
         }
 
+        let shared_wire_id = match (&segment.status, para_mark_wire) {
+            (TrackingStatus::Inserted(revision), Some((false, identity, wire_id)))
+                if revision.identity == identity =>
+            {
+                Some(wire_id)
+            }
+            (TrackingStatus::Deleted(revision), Some((true, identity, wire_id)))
+                if revision.identity == identity =>
+            {
+                Some(wire_id)
+            }
+            _ => None,
+        };
         emit_segment(
             &mut p,
             segment,
             &mut emitted_opaques,
             next_id,
+            shared_wire_id,
             bookmark_policy,
             origin,
             match resolve_rel_rid.as_mut() {
@@ -1970,6 +2255,15 @@ pub(crate) fn serialize_paragraph_node(
         seg_idx += 1;
     }
 
+    // A projection may legitimately remove every body inline while leaving an
+    // untracked literal enumerator. Its captured separator is still known
+    // content, so emit it as a standalone run (the same representation used
+    // when a hard break or opaque inline follows the prefix). This is not a
+    // fallback: the exact separator bytes were parsed into the domain model.
+    if let Some(separator) = pending_prefix_sep.take() {
+        p.children
+            .push(XMLNode::Element(build_separator_run(&separator, false)));
+    }
     ensure_prefix_trailing_tab_consumed(pending_prefix_sep.is_some(), &paragraph.id)?;
     renest_inline_move_containers(&mut p);
     renest_inline_bidi_wrappers(&mut p);
@@ -2036,8 +2330,71 @@ fn renest_inline_move_containers(p: &mut Element) {
         p.children.remove(i + 1);
         if let XMLNode::Element(open_el) = &mut p.children[i] {
             open_el.children.extend(between);
+            unwrap_same_polarity_tracked_wrappers(open_el);
         }
         i += 1;
+    }
+}
+
+/// Fold serializer-synthesized same-polarity tracked wrappers inside a
+/// re-nested move container: `w:del` directly inside `w:moveFrom`, `w:ins`
+/// directly inside `w:moveTo`.
+///
+/// A move container already carries its half's tracked class (§17.13.5.21/.26:
+/// moveFrom content IS deletion-class, moveTo content insertion-class), so
+/// same-polarity nesting is redundant double-tracking that Word never writes
+/// and that import QUARANTINES as nested tracking — it is unrepresentable
+/// model state. It can only appear here because the segment emitter wraps a
+/// still-pending move-content segment by its bare status (Deleted → `w:del`,
+/// Inserted → `w:ins`) before this pass folds the stream back into the
+/// container pair; left nested, a document whose untouched move merely rode
+/// along through a serialize (e.g. a selective resolution of an UNRELATED
+/// revision) re-imports quarantined and its move can never be resolved again.
+///
+/// Unwrapping promotes the wrapper's children and restores the deleted-form
+/// run content (`w:delText` → `w:t`, `w:delInstrText` → `w:instrText`) that
+/// the `w:del` emission coerced — Word requires plain `w:t` inside
+/// `w:moveFrom` (see `emit_tracked_chunks`). The Word-reachable
+/// CROSS-polarity mixtures (`w:ins` in `w:moveFrom`, `w:del` in `w:moveTo`)
+/// are real model states and pass through untouched.
+fn unwrap_same_polarity_tracked_wrappers(container: &mut Element) {
+    let redundant = match local_element_name(container) {
+        "moveFrom" => "del",
+        "moveTo" => "ins",
+        _ => return,
+    };
+    let drained: Vec<XMLNode> = container.children.drain(..).collect();
+    for child in drained {
+        match child {
+            XMLNode::Element(mut el) if local_element_name(&el) == redundant => {
+                if redundant == "del" {
+                    restore_plain_run_content(&mut el);
+                }
+                container.children.extend(el.children);
+            }
+            other => container.children.push(other),
+        }
+    }
+}
+
+/// `w:delText` → `w:t` / `w:delInstrText` → `w:instrText` on every descendant,
+/// preserving the namespace prefix — the inverse of the `deleted_text`
+/// coercion in `emit_tracked_chunks`, via the single source of truth
+/// (`normalize::plain_run_content_name`).
+fn restore_plain_run_content(el: &mut Element) {
+    for child in el.children.iter_mut() {
+        if let XMLNode::Element(inner) = child {
+            if let Some(plain) = crate::normalize::plain_run_content_name(local_element_name(inner))
+            {
+                if let Some(colon) = inner.name.find(':') {
+                    inner.name = format!("{}:{plain}", &inner.name[..colon]);
+                } else {
+                    inner.name = plain.to_string();
+                }
+            } else {
+                restore_plain_run_content(inner);
+            }
+        }
     }
 }
 
@@ -3251,6 +3608,8 @@ fn append_tracked_hyperlink_paragraph_opaque(
         tracked.runs = vec![HyperlinkRun {
             text: tracked.text.clone(),
             rpr_xml: None,
+            additional_rpr_xml: Vec::new(),
+            source_xml: None,
             source_run_attrs: Vec::new(),
             status: status.clone(),
         }];
@@ -3460,6 +3819,7 @@ fn emit_tracked_chunks(
     container_kind: &TrackedContainer,
     author: &str,
     date: &str,
+    shared_wire_id: Option<u32>,
     next_id: &mut u32,
     mut emitted_opaques: Option<&mut HashSet<String>>,
     bookmark_policy: &BookmarkIdPolicy,
@@ -3474,15 +3834,14 @@ fn emit_tracked_chunks(
                 // inside w:moveFrom (confirmed by Word's own output and
                 // empirical validation against real Word).
                 let deleted_text = matches!(container_kind, TrackedContainer::Del);
+                let annotation_id = shared_wire_id.unwrap_or_else(|| next_annotation_id(next_id));
                 let mut container = match container_kind {
-                    TrackedContainer::Del => w_del(next_annotation_id(next_id), author, date),
-                    TrackedContainer::Ins => w_ins(next_annotation_id(next_id), author, date),
+                    TrackedContainer::Del => w_del(annotation_id, author, date),
+                    TrackedContainer::Ins => w_ins(annotation_id, author, date),
                     TrackedContainer::MoveFrom => {
-                        word_xml::w_move_from(next_annotation_id(next_id), author, date)
+                        word_xml::w_move_from(annotation_id, author, date)
                     }
-                    TrackedContainer::MoveTo => {
-                        word_xml::w_move_to(next_annotation_id(next_id), author, date)
-                    }
+                    TrackedContainer::MoveTo => word_xml::w_move_to(annotation_id, author, date),
                 };
                 append_inline_refs_to_container(
                     &mut container,
@@ -3659,6 +4018,7 @@ fn emit_segment(
     segment: &TrackedSegment,
     emitted_opaques: &mut HashSet<String>,
     next_id: &mut u32,
+    shared_wire_id: Option<u32>,
     bookmark_policy: &BookmarkIdPolicy,
     origin: &str,
     mut resolve_rel_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
@@ -3691,6 +4051,7 @@ fn emit_segment(
                 &TrackedContainer::Ins,
                 author,
                 date,
+                shared_wire_id,
                 next_id,
                 Some(emitted_opaques),
                 bookmark_policy,
@@ -3713,6 +4074,7 @@ fn emit_segment(
                 &TrackedContainer::Del,
                 author,
                 date,
+                shared_wire_id,
                 next_id,
                 Some(emitted_opaques),
                 bookmark_policy,
@@ -3745,6 +4107,7 @@ fn emit_segment(
                 &TrackedContainer::Del,
                 sr.deleted.author.as_deref().unwrap_or(""),
                 sr.deleted.date.as_deref().unwrap_or(""),
+                None,
                 next_id,
                 Some(emitted_opaques),
                 bookmark_policy,
@@ -4607,7 +4970,7 @@ fn emit_mark_value(parent: &mut Element, name: &str, value: &MarkValue) {
 ///        imprint(14) → vanish(17) → color(19) → spacing(20) → sz(24) → szCs(25) →
 ///        highlight(26) → u(27) → vertAlign(31) → rtl(32) → cs(33) → bdr(28) → lang(35) →
 ///        [rPrChange(40)]
-/// Re-insert preserved (unmodeled) property-container children — rPr's
+/// Re-insert source-form-preserved property-container children — rPr's
 /// `StyleProps::preserved` and pPr's `ParagraphNode::preserved_ppr` both use
 /// this — at their schema-correct position in `parent`, per `order_table`
 /// (`docx_validate_ordering::RPR_ORDER` / `PPR_ORDER`).
@@ -4989,16 +5352,27 @@ pub(crate) fn build_rpr(marks: &[Mark], style_props: &StyleProps) -> Element {
     // --- Position 39: oMath ---
     emit_mark_value(&mut rpr, "oMath", &style_props.o_math);
 
-    // --- Preserved remainder: unmodeled rPr children ---
+    // --- Preserved remainder: source-form rPr children ---
     //
     // Content this parser doesn't model (e.g. w:eastAsianLayout, or a
     // foreign-namespace extension like w14:glow) was captured verbatim at
-    // import (`word_ir::parse_rpr_element`) rather than dropped. Re-insert it
-    // here at its Annex-A position (`docx_validate_ordering::RPR_ORDER`) so an
-    // untouched run round-trips byte-faithful for content this engine has no
-    // typed model for — the `Atom::Widget` precedent, applied to rPr
-    // children. A name outside the ordering table (unrecognized even to
-    // Annex A) is appended at the end of rPr.
+    // import (`word_ir::parse_rpr_element`) rather than dropped. A modeled but
+    // intentionally lossy projection may also carry its exact source child:
+    // notably rFonts, where collapsing ascii/hAnsi into one effective family
+    // loses layout-observable authored-slot presence. Replace the normalized
+    // rFonts emission before inserting that source child; duplicate rFonts
+    // would be a different, invalid state rather than faithful preservation.
+    let preserves_exact_rfonts = style_props.preserved.iter().any(|prop| {
+        prop.name
+            .rsplit_once(':')
+            .map_or(prop.name.as_str(), |(_, local)| local)
+            == "rFonts"
+    });
+    if preserves_exact_rfonts {
+        rpr.children.retain(
+            |child| !matches!(child, XMLNode::Element(element) if element.name == "rFonts"),
+        );
+    }
     insert_preserved_children(
         &mut rpr,
         &style_props.preserved,
@@ -5197,6 +5571,14 @@ fn serialize_border_set(container_name: &str, borders: &BorderSet) -> Element {
     if let Some(ref b) = borders.inside_v {
         el.children
             .push(XMLNode::Element(serialize_border_edge("insideV", b)));
+    }
+    if let Some(ref b) = borders.tl2br {
+        el.children
+            .push(XMLNode::Element(serialize_border_edge("tl2br", b)));
+    }
+    if let Some(ref b) = borders.tr2bl {
+        el.children
+            .push(XMLNode::Element(serialize_border_edge("tr2bl", b)));
     }
     el
 }
@@ -6338,6 +6720,12 @@ pub(crate) fn build_hyperlink_element(data: &HyperlinkData) -> Element {
 /// of `<w:t>` (per ECMA-376 §17.4.20). Used when the surrounding container
 /// is `<w:del>`.
 fn build_hyperlink_run(run: &HyperlinkRun, deleted: bool) -> Element {
+    if let Some(source_xml) = &run.source_xml {
+        let mut source = crate::word_xml::parse_raw_fragment(source_xml.as_slice())
+            .expect("hyperlink source run bytes serialized during import must parse back");
+        coerce_opaque_run_text(&mut source, deleted);
+        return source;
+    }
     let mut r = w_el("r");
     apply_source_run_attrs(&mut r, &run.source_run_attrs);
 
@@ -6346,6 +6734,11 @@ fn build_hyperlink_run(run: &HyperlinkRun, deleted: bool) -> Element {
     if let Some(rpr_bytes) = &run.rpr_xml {
         let rpr_el = crate::word_xml::parse_raw_fragment(rpr_bytes.as_slice())
             .expect("hyperlink rPr bytes we serialized during import must parse back");
+        r.children.push(XMLNode::Element(rpr_el));
+    }
+    for rpr_bytes in &run.additional_rpr_xml {
+        let rpr_el = crate::word_xml::parse_raw_fragment(rpr_bytes.as_slice())
+            .expect("additional hyperlink rPr bytes serialized during import must parse back");
         r.children.push(XMLNode::Element(rpr_el));
     }
 
@@ -6770,6 +7163,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -7245,6 +7639,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             None,
             None,
             &[],
@@ -7273,6 +7668,95 @@ mod tests {
             collect_run_text(runs[1]),
             " ",
             "empty captured separator falls back to one space (legacy behavior)"
+        );
+    }
+
+    #[test]
+    fn prefix_only_paragraph_emits_captured_trailing_tab() {
+        let mut paragraph = minimal_paragraph_for_ppr_test();
+        paragraph.literal_prefix = Some("(a)".to_string());
+        paragraph.literal_prefix_trailing_ws = "\t".to_string();
+        paragraph.literal_prefix_has_trailing_tab = true;
+
+        let mut next_id = 1;
+        let serialized = serialize_paragraph_node(
+            &paragraph,
+            None,
+            false,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "base",
+            None,
+        )
+        .expect("a prefix-only paragraph has a complete, serializable model");
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&serialized))
+            .expect("serialized paragraph is utf-8");
+
+        assert!(
+            xml.contains(">(a)</w:t>"),
+            "prefix must remain present: {xml}"
+        );
+        assert!(
+            xml.contains("<w:tab"),
+            "captured separator tab must remain present: {xml}"
+        );
+    }
+
+    #[test]
+    fn source_run_prefix_boundary_becomes_its_own_run_when_body_is_resolved_away() {
+        let mut paragraph = minimal_paragraph_for_ppr_test();
+        paragraph.literal_prefix = Some("(a)".to_string());
+        paragraph.literal_prefix_trailing_ws = "\t".to_string();
+        paragraph.literal_prefix_has_trailing_tab = true;
+        paragraph.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: vec![Mark::Bold],
+            style_props: StyleProps::default(),
+            rpr_authored: RunDirectness {
+                bold: true,
+                ..RunDirectness::default()
+            },
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "(a)\t".to_string(),
+                marks: vec![Mark::Bold],
+                style_props: StyleProps::default(),
+                rpr_authored: RunDirectness {
+                    bold: true,
+                    ..RunDirectness::default()
+                },
+                source_run_attrs: vec![("w:rsidR".to_string(), "00112233".to_string())],
+                joins_body: true,
+            }],
+        }));
+
+        let mut next_id = 1;
+        let serialized = serialize_paragraph_node(
+            &paragraph,
+            None,
+            false,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "base",
+            None,
+        )
+        .expect("resolved-away body makes the known source fragment standalone");
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&serialized))
+            .expect("serialized paragraph is utf-8");
+
+        assert!(
+            xml.contains(">(a)</w:t>"),
+            "prefix source fragment must remain: {xml}"
+        );
+        assert!(
+            xml.contains("<w:tab"),
+            "source separator tab must remain: {xml}"
+        );
+        assert!(
+            xml.contains("<w:b"),
+            "source run formatting must remain: {xml}"
+        );
+        assert!(
+            xml.contains("w:rsidR=\"00112233\""),
+            "source run provenance must remain: {xml}"
         );
     }
 
@@ -7381,6 +7865,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,
@@ -7505,6 +7990,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,
@@ -7646,6 +8132,7 @@ mod tests {
                 color: Some("FF0000".into()),
                 ..StyleProps::default()
             },
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -7771,6 +8258,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -7871,24 +8359,32 @@ mod tests {
                 HyperlinkRun {
                     text: "before ".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 },
                 HyperlinkRun {
                     text: "old".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Deleted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: "new".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Inserted(rev.clone()),
                 },
                 HyperlinkRun {
                     text: " after".to_string(),
                     rpr_xml: None,
+                    additional_rpr_xml: Vec::new(),
+                    source_xml: None,
                     source_run_attrs: Vec::new(),
                     status: TrackingStatus::Normal,
                 },
@@ -7957,6 +8453,8 @@ mod tests {
             runs: vec![HyperlinkRun {
                 text: "click here".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
@@ -7984,6 +8482,8 @@ mod tests {
             runs: vec![HyperlinkRun {
                 text: "click".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: vec![
                     ("w:rsidR".to_string(), "00112233".to_string()),
                     ("w:rsidRPr".to_string(), "00445566".to_string()),

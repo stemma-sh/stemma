@@ -201,6 +201,89 @@ pub enum Mark {
     InlineRole { id: String },
 }
 
+/// Boolean marks accepted by `set_format`. The object form is the v0.5
+/// contract; the array form is retained only for wire compatibility.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FormatMarks {
+    Patch(FormatMarksPatch),
+    Legacy(Vec<Mark>),
+}
+
+impl FormatMarks {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Patch(patch) => patch.is_empty(),
+            Self::Legacy(marks) => marks.is_empty(),
+        }
+    }
+}
+
+/// Tri-state universal formatting marks. `None` means unchanged, `Some(true)`
+/// means on, and `Some(false)` means explicitly off.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatMarksPatch {
+    #[serde(default)]
+    pub bold: Option<bool>,
+    #[serde(default)]
+    pub italic: Option<bool>,
+    #[serde(default)]
+    pub underline: Option<bool>,
+    #[serde(default)]
+    pub strike: Option<bool>,
+    #[serde(default)]
+    pub subscript: Option<bool>,
+    #[serde(default)]
+    pub superscript: Option<bool>,
+    #[serde(default)]
+    pub caps: Option<bool>,
+    #[serde(default)]
+    pub small_caps: Option<bool>,
+}
+
+impl FormatMarksPatch {
+    fn is_empty(&self) -> bool {
+        self.bold.is_none()
+            && self.italic.is_none()
+            && self.underline.is_none()
+            && self.strike.is_none()
+            && self.subscript.is_none()
+            && self.superscript.is_none()
+            && self.caps.is_none()
+            && self.small_caps.is_none()
+    }
+
+    fn into_internal(self) -> InlineMarkSet {
+        let mut set = InlineMarkSet::default();
+        for (value, on, off) in [
+            (self.bold, &mut set.bold, &mut set.bold_off),
+            (self.italic, &mut set.italic, &mut set.italic_off),
+            (self.underline, &mut set.underline, &mut set.underline_off),
+            (self.strike, &mut set.strike, &mut set.strike_off),
+            (self.subscript, &mut set.subscript, &mut set.subscript_off),
+            (
+                self.superscript,
+                &mut set.superscript,
+                &mut set.superscript_off,
+            ),
+            (self.caps, &mut set.caps, &mut set.caps_off),
+            (
+                self.small_caps,
+                &mut set.small_caps,
+                &mut set.small_caps_off,
+            ),
+        ] {
+            match value {
+                Some(true) => *on = true,
+                Some(false) => *off = true,
+                None => {}
+            }
+        }
+        set
+    }
+}
+
 // ─── Attrs (per-kind) ────────────────────────────────────────────────────────
 //
 // Each kind has its own attrs struct so a `set_attr` payload's allowed fields
@@ -532,14 +615,15 @@ pub enum Op {
         rationale: Option<String>,
     },
     /// Apply run-level formatting to the text matched by `expect`, as a tracked
-    /// `w:rPrChange`. `marks` are the universal marks to turn on; `inline_role`
-    /// is not a formatting toggle and is rejected here.
+    /// `w:rPrChange`. The advertised `marks` object is tri-state: omitted leaves
+    /// a property unchanged, true turns it on, and false turns it off. The old
+    /// on-only mark array remains accepted as a compatibility form.
     SetFormat {
         target: NodeId,
         expect: String,
         #[serde(default)]
         semantic_hash: Option<String>,
-        marks: Vec<Mark>,
+        marks: FormatMarks,
         /// Literal text color: 6-hex-digit RGB (e.g. `"FF0000"`) or `"auto"`.
         #[serde(default)]
         color: Option<String>,
@@ -555,10 +639,10 @@ pub enum Op {
         /// Turn on all-caps display (`w:caps`, §17.3.2.5). A `StyleProps`
         /// tri-state, not a universal `Mark`, so it rides here, not in `marks`.
         #[serde(default)]
-        caps: bool,
+        caps: Option<bool>,
         /// Turn on small-caps display (`w:smallCaps`, §17.3.2.33).
         #[serde(default)]
-        small_caps: bool,
+        small_caps: Option<bool>,
         /// Character spacing in twips (`w:spacing` @w:val, §17.3.2.35).
         /// Positive expands, negative condenses; `0` resets to default tracking.
         #[serde(default)]
@@ -1785,6 +1869,10 @@ pub struct BorderSetPatch {
     pub inside_h: Option<BorderPatch>,
     #[serde(default)]
     pub inside_v: Option<BorderPatch>,
+    #[serde(default)]
+    pub tl2br: Option<BorderPatch>,
+    #[serde(default)]
+    pub tr2bl: Option<BorderPatch>,
 }
 
 impl BorderSetPatch {
@@ -1795,6 +1883,8 @@ impl BorderSetPatch {
             && self.right.is_none()
             && self.inside_h.is_none()
             && self.inside_v.is_none()
+            && self.tl2br.is_none()
+            && self.tr2bl.is_none()
     }
 }
 
@@ -2600,6 +2690,8 @@ pub enum SchemaError {
     EmptyAttrPatch { op_index: usize },
     /// A `set_format` op supplied no marks.
     EmptyFormatMarks { op_index: usize },
+    /// The new object-form marks were mixed with legacy top-level toggles.
+    MixedFormatMarkForms { op_index: usize },
     /// A `set_para_format` op set no alignment, indentation, spacing, borders,
     /// or shading.
     EmptyParaFormat { op_index: usize },
@@ -2848,6 +2940,10 @@ impl std::fmt::Display for SchemaError {
             SchemaError::EmptyFormatMarks { op_index } => {
                 write!(f, "ops[{op_index}]: set_format.marks is empty")
             }
+            SchemaError::MixedFormatMarkForms { op_index } => write!(
+                f,
+                "ops[{op_index}]: set_format mixes object-form marks with legacy top-level toggles"
+            ),
             SchemaError::EmptyParaFormat { op_index } => write!(
                 f,
                 "ops[{op_index}]: set_para_format sets no alignment, indentation, \
@@ -3312,13 +3408,18 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 char_spacing,
                 ..
             } => {
+                if matches!(marks, FormatMarks::Patch(_))
+                    && (caps.is_some() || small_caps.is_some())
+                {
+                    return Err(SchemaError::MixedFormatMarkForms { op_index });
+                }
                 if marks.is_empty()
                     && color.is_none()
                     && highlight.is_none()
                     && font_family.is_none()
                     && font_size_half_points.is_none()
-                    && !*caps
-                    && !*small_caps
+                    && caps.is_none()
+                    && small_caps.is_none()
                     && char_spacing.is_none()
                 {
                     return Err(SchemaError::EmptyFormatMarks { op_index });
@@ -4409,27 +4510,40 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             char_spacing,
             rationale,
         } => {
-            let mut set = InlineMarkSet::default();
-            for mark in marks {
-                match mark {
-                    Mark::Bold => set.bold = true,
-                    Mark::Italic => set.italic = true,
-                    Mark::Underline => set.underline = true,
-                    Mark::Strike => set.strike = true,
-                    Mark::Subscript => set.subscript = true,
-                    Mark::Superscript => set.superscript = true,
-                    Mark::InlineRole { id } => {
-                        return Err(AdapterError::InlineRoleMarkNotSupported {
-                            op_index,
-                            role_id: id,
-                        });
+            let mut set = match marks {
+                FormatMarks::Patch(patch) => patch.into_internal(),
+                FormatMarks::Legacy(marks) => {
+                    let mut set = InlineMarkSet::default();
+                    for mark in marks {
+                        match mark {
+                            Mark::Bold => set.bold = true,
+                            Mark::Italic => set.italic = true,
+                            Mark::Underline => set.underline = true,
+                            Mark::Strike => set.strike = true,
+                            Mark::Subscript => set.subscript = true,
+                            Mark::Superscript => set.superscript = true,
+                            Mark::InlineRole { id } => {
+                                return Err(AdapterError::InlineRoleMarkNotSupported {
+                                    op_index,
+                                    role_id: id,
+                                });
+                            }
+                        }
                     }
+                    set
                 }
+            };
+            // Legacy top-level toggles remain accepted with the array form.
+            match caps {
+                Some(true) => set.caps = true,
+                Some(false) => set.caps_off = true,
+                None => {}
             }
-            // caps / smallCaps are tri-state StyleProps, carried as their own
-            // wire booleans (not in `marks`); fold them onto the same set.
-            set.caps = caps;
-            set.small_caps = small_caps;
+            match small_caps {
+                Some(true) => set.small_caps = true,
+                Some(false) => set.small_caps_off = true,
+                None => {}
+            }
 
             // Validate/map the value-bearing properties at the wire edge so a
             // bad request fails loud here rather than being coerced downstream.
@@ -5770,6 +5884,8 @@ fn parse_border_set(
         right: edge(&p.right)?,
         inside_h: edge(&p.inside_h)?,
         inside_v: edge(&p.inside_v)?,
+        tl2br: edge(&p.tl2br)?,
+        tr2bl: edge(&p.tr2bl)?,
     }))
 }
 

@@ -171,3 +171,11 @@ pub struct EmbeddingPageSnippets;
 #[cfg(doctest)]
 #[doc = include_str!("../../docs/guide/persistence.md")]
 pub struct PersistencePageSnippets;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/guide/concepts.md")]
+pub struct ConceptsPageSnippets;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/guide/revisions.md")]
+pub struct RevisionsPageSnippets;

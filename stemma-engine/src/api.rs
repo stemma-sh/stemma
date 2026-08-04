@@ -11,15 +11,25 @@
 
 use std::sync::Arc;
 
-use crate::audit::{AuditReport, audit_documents};
+pub use crate::audit::AuditReport;
+use crate::audit::audit_documents;
 use crate::domain::CanonDoc;
 pub use crate::domain::{DocProtectEdit, DocumentProtection};
-use crate::edit::EditTransaction;
+pub use crate::edit::EditTransaction;
 use crate::runtime::{
-    EditSnapshot, ExportOptions, Resolution, RuntimeError, ValidationIssue, ValidationIssueCode,
-    ValidationReport, serialize_snapshot, snapshot_from_docx_bytes, style_table_from_docx,
-    validate_docx_report,
+    serialize_snapshot, snapshot_from_docx_bytes, style_table_from_docx, validate_docx_report,
 };
+// Everything a `Document` signature names is importable from HERE, next to
+// `Document` itself — an embedder writes `use stemma::api::{Document,
+// Resolution, ...}` and never has to know which internal module defines what.
+// These MUST be `pub use`: a plain `use` would still create `api::Resolution`,
+// but as a PRIVATE alias whose `E0603` error reads as "selective resolution is
+// not public" to anyone importing from where `Document` lives.
+pub use crate::runtime::{
+    EditSnapshot, ExportOptions, Resolution, RuntimeError, ValidationIssue, ValidationIssueCode,
+    ValidationReport,
+};
+pub use crate::tracked_model::{ResolveSelectionAction, RevisionKind, RevisionRecord};
 use crate::view::build_document_view;
 
 // The designed read projection (`docs/domain-model.md` §4, §9). Re-exported
@@ -273,8 +283,7 @@ impl Document {
     /// Resolve tracked deltas: accept-all, reject-all, or a selective set.
     ///
     /// ```
-    /// # use stemma::api::Document;
-    /// # use stemma::Resolution;
+    /// # use stemma::api::{Document, Resolution};
     /// let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simple-text/before.docx"));
     /// let doc = Document::parse(bytes).unwrap();
     /// // A pristine document has no pending deltas, so accept-all projects to
@@ -440,7 +449,7 @@ impl Document {
     /// document's pending state (a formatting-only document reads as
     /// revision-free, and author-scoped resolution misses that author's
     /// formatting changes).
-    pub fn revisions(&self) -> Vec<crate::tracked_model::RevisionRecord> {
+    pub fn revisions(&self) -> Vec<RevisionRecord> {
         crate::tracked_model::enumerate_revisions(&self.snapshot.canonical)
     }
 

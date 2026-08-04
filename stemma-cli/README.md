@@ -7,7 +7,7 @@ serialized candidate, and creates a native Word redline with complete item
 outcomes. The standalone `verify` command remains a producer-neutral audit; it
 is not required after a successful `execute`. `verify-task` checks an MCP task
 manifest and its files without session state. The CLI also exposes compare,
-extract, resolve, and validate as maintenance verbs.
+extract, read, resolve, and validate as maintenance verbs.
 
 The binary is named `stemma`. General-purpose verbs drive the engine's stable
 `stemma::api::Document` facade. The experimental worklist command uses the
@@ -63,11 +63,14 @@ stemma execute  <input.docx> --plan <changes.json> -o <redline.docx>
 stemma verify   <before.docx> <after.docx> [--policy tracked-delivery-v0]
 stemma verify-task <manifest.json> [--root <artifact-dir>]
 stemma compare  <base.docx> <target.docx> -o <redline.docx> [--author NAME]
+                [--format text|json]
 stemma extract  <file.docx> [--format text|json]
+stemma read     <file.docx>
 stemma resolve  <file.docx> -o <out.docx> (--accept-all | --reject-all
                 | --accept-author NAME | --reject-author NAME
-                | --accept-ids a,b | --reject-ids a,b)
-stemma validate <file.docx>
+                | --accept-ids a,b | --reject-ids a,b | --plan <plan.json>)
+                [--dry-run] [--format text|json]
+stemma validate <file.docx> [--format text|json]
 ```
 
 - `apply` consumes an exact-input-bound experimental `stemma.worklist.v0` and
@@ -95,9 +98,17 @@ stemma validate <file.docx>
   manifest is unsigned evidence and cannot prove undeclared intent.
 - `extract --format json` gives blocks plus a `revisions` array (pending tracked
   changes with `revision_id` / `kind` / `author` / `block_id` / `excerpt`).
+- `read` emits the full structured read model (`stemma.read.v0`) in one call:
+  typed blocks with per-segment tracked status, plus the complete revision
+  census — the machine surface for rendering a redline.
 - `resolve` requires exactly one disposition; a selection that matches nothing
   (unknown id, author with no changes) fails loudly instead of writing an
-  unchanged file.
+  unchanged file. `--plan` takes a `stemma.resolution_plan.v0` mixed
+  disposition (accept and reject in one call); `--dry-run` reports without
+  writing; `--format json` emits a `stemma.resolve_receipt.v0` on stdout.
+- `compare --format json` and `validate --format json` likewise emit
+  schema-tagged results on stdout (`stemma.compare_receipt.v0`,
+  `stemma.validate.v0` — structured for invalid packages too).
 - `validate` exits `0` with an `OK` line, nonzero with the structured reason.
 
 stdout carries data, stderr carries diagnostics; every failure exits nonzero

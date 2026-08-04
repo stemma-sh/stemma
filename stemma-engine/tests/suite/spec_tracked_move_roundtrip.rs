@@ -160,15 +160,6 @@ fn move_container_count(xml: &str, tag: &str) -> usize {
     move_container_tags(xml, tag).len()
 }
 
-/// Number of `<w:moveFrom>`/`<w:moveTo>` containers that nest content
-/// (not self-closed).
-fn nested_move_containers(xml: &str, tag: &str) -> usize {
-    move_container_tags(xml, tag)
-        .iter()
-        .filter(|&&sc| !sc)
-        .count()
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // (a) parse → re-materialize → serialize SUCCEEDS (no UnsupportedEdit).
 // ════════════════════════════════════════════════════════════════════════════
@@ -205,13 +196,20 @@ fn spec_move_roundtrip_serialize_succeeds_after_rematerialize() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// (b) The serialized output is structurally faithful: all four range markers
-//     survive, and the surviving move content nests INSIDE its container (no
-//     orphaned/empty container with a sibling run, no double-wrapping).
+// (b) A full resolution settles the move AS A UNIT (§17.13.5.21–.28): the
+//     content lands per the disposition and EVERY piece of move markup — the
+//     moveFrom/moveTo containers and the range bookmarks that pair them —
+//     leaves the document. Word writes no tracked-change markup into a
+//     resolved document; leaving the bookmarks would re-import as a pending
+//     half-move that no further resolution can clear.
+//
+//     NOTE: an earlier revision of this test asserted the OPPOSITE (markers
+//     survive both projections) — that was a characterization of the
+//     half-resolution bug, not the domain rule.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn spec_move_roundtrip_preserves_range_markers_and_nesting() {
+fn spec_move_roundtrip_projections_clear_all_move_markup() {
     let docx = build_docx(&wrap_body(move_bearing_body()));
     let doc = Document::parse(&docx).expect("parse");
 
@@ -219,78 +217,51 @@ fn spec_move_roundtrip_preserves_range_markers_and_nesting() {
     let accepted = doc.read_accepted().expect("accept");
     let acc_xml = document_xml_of(&accepted.serialize(&ExportOptions::default()).unwrap());
 
-    // All four range markers must be present in BOTH projections — the
-    // bookmark pair is what binds moveFrom to moveTo and must never be dropped.
-    for marker in [
-        "moveFromRangeStart",
-        "moveFromRangeEnd",
-        "moveToRangeStart",
-        "moveToRangeEnd",
-    ] {
-        assert_eq!(
-            count(&acc_xml, marker),
-            1,
-            "accept-all output must contain exactly one <w:{marker}> (got body:\n{acc_xml})"
-        );
-    }
-
-    // On accept the destination container keeps its run nested inside it…
-    assert_eq!(
-        nested_move_containers(&acc_xml, "w:moveTo"),
-        1,
-        "accept-all: the moveTo container must nest the moved run (body:\n{acc_xml})"
-    );
-    // …and the run text must live INSIDE the container, never as a bare
-    // sibling between two empty markers.
     assert!(
         acc_xml.contains("the indemnity clause"),
-        "accept-all must keep the moved text (body:\n{acc_xml})"
+        "accept-all must keep the moved text at the destination (body:\n{acc_xml})"
     );
 
     // reject-all = the move is undone: source kept, destination removed.
     let rejected = doc.read_rejected().expect("reject");
     let rej_xml = document_xml_of(&rejected.serialize(&ExportOptions::default()).unwrap());
-    for marker in [
-        "moveFromRangeStart",
-        "moveFromRangeEnd",
-        "moveToRangeStart",
-        "moveToRangeEnd",
-    ] {
-        assert_eq!(
-            count(&rej_xml, marker),
-            1,
-            "reject-all output must contain exactly one <w:{marker}> (body:\n{rej_xml})"
-        );
-    }
-    assert_eq!(
-        nested_move_containers(&rej_xml, "w:moveFrom"),
-        1,
-        "reject-all: the moveFrom container must nest the moved run (body:\n{rej_xml})"
+    assert!(
+        rej_xml.contains("the indemnity clause"),
+        "reject-all must keep the moved text at the source (body:\n{rej_xml})"
     );
 
-    // No double-wrapping: each projection emits exactly one moveFrom and one
-    // moveTo container element (self-closed OR nested), never the duplicated
-    // pair that the unfixed start/end bracket markers would leave behind.
-    assert_eq!(
-        move_container_count(&acc_xml, "w:moveFrom"),
-        1,
-        "accept-all must emit exactly one moveFrom container (no double-wrap):\n{acc_xml}"
-    );
-    assert_eq!(
-        move_container_count(&acc_xml, "w:moveTo"),
-        1,
-        "accept-all must emit exactly one moveTo container (no double-wrap):\n{acc_xml}"
-    );
-    assert_eq!(
-        move_container_count(&rej_xml, "w:moveFrom"),
-        1,
-        "reject-all must emit exactly one moveFrom container (no double-wrap):\n{rej_xml}"
-    );
-    assert_eq!(
-        move_container_count(&rej_xml, "w:moveTo"),
-        1,
-        "reject-all must emit exactly one moveTo container (no double-wrap):\n{rej_xml}"
-    );
+    for xml in [&acc_xml, &rej_xml] {
+        for marker in [
+            "moveFromRangeStart",
+            "moveFromRangeEnd",
+            "moveToRangeStart",
+            "moveToRangeEnd",
+        ] {
+            assert_eq!(
+                count(xml, marker),
+                0,
+                "a full resolution removes every move range bookmark; <w:{marker}> must not \
+                 survive (body:\n{xml})"
+            );
+        }
+        assert_eq!(
+            move_container_count(xml, "w:moveFrom") + move_container_count(xml, "w:moveTo"),
+            0,
+            "a full resolution removes every moveFrom/moveTo container (body:\n{xml})"
+        );
+    }
+
+    // The resolved outputs re-import with nothing pending — the observable
+    // contract ("after resolution, every marker is gone").
+    for projected in [&accepted, &rejected] {
+        let bytes = projected.serialize(&ExportOptions::default()).unwrap();
+        let reparsed = Document::parse(&bytes).expect("re-parse resolved output");
+        assert_eq!(
+            stemma::enumerate_revisions(&reparsed.snapshot().canonical).len(),
+            0,
+            "a fully-resolved document must re-import with zero pending revisions"
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -330,8 +301,8 @@ fn spec_move_roundtrip_reparses_stably() {
 
 // ════════════════════════════════════════════════════════════════════════════
 // (d) Fidelity invariants: reject reads like the pre-move baseline, accept
-//     reads like the post-move target, and the move's content/range inventory
-//     does not shrink across the round-trip.
+//     reads like the post-move target, and full resolution removes the move
+//     operation's now-settled range inventory.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -361,10 +332,10 @@ fn spec_move_roundtrip_fidelity_invariants() {
         "accept-all must read like the post-move target (source emptied, destination kept)"
     );
 
-    // Non-shrinking range inventory: the four move range markers present on
-    // import must still be present in BOTH serialized projections — accepting
-    // or rejecting a move resolves its CONTENT, never deletes the range
-    // bookmarks that pair the two halves.
+    // A full resolution settles the move as a unit: no move markup survives
+    // either projection (see spec_move_roundtrip_projections_clear_all_move_markup
+    // for the full inventory assertions). An earlier revision of this test
+    // asserted the markers survive — that encoded the half-resolution bug.
     let acc_xml = document_xml_of(
         &doc.read_accepted()
             .unwrap()
@@ -384,8 +355,8 @@ fn spec_move_roundtrip_fidelity_invariants() {
         "moveToRangeEnd",
     ] {
         assert!(
-            count(&acc_xml, marker) >= 1 && count(&rej_xml, marker) >= 1,
-            "range marker <w:{marker}> must survive both projections (decoration inventory must not shrink)"
+            count(&acc_xml, marker) == 0 && count(&rej_xml, marker) == 0,
+            "range marker <w:{marker}> must be resolved away by both projections"
         );
     }
 }

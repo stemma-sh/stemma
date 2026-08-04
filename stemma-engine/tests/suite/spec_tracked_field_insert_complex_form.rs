@@ -78,8 +78,8 @@ fn crossref_txn(block_id: stemma::domain::NodeId) -> EditTransaction {
 fn body_paragraph(out: &[u8]) -> String {
     let a = stemma::docx::DocxArchive::read(out).expect("archive");
     let xml = String::from_utf8(a.get("word/document.xml").unwrap().to_vec()).unwrap();
-    let i = xml.find("<w:p>").unwrap();
-    let j = xml.find("</w:p>").unwrap();
+    let i = xml.find("<w:p").expect("body paragraph start");
+    let j = xml[i..].find("</w:p>").expect("body paragraph end") + i;
     xml[i..j + 6].to_string()
 }
 

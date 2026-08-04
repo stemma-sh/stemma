@@ -106,9 +106,10 @@ fn cue_of(op: &str) -> &'static str {
              expect_href guards an href retarget."
         }
         "set_format" => {
-            "Tracked character formatting on a guarded text span; marks is the \
-             complete replacement mark set as an array of tagged objects, and \
-             the value-carrying fields (color, font, size) ride alongside it."
+            "Tracked character formatting on a guarded text span; marks is a \
+             tri-state object where an omitted property is unchanged, true \
+             turns it on and false turns it off, and the value-carrying fields \
+             (color, font, size) ride alongside it."
         }
         "set_para_format" => {
             "Tracked paragraph formatting: alignment, indentation, spacing, borders, shading."
@@ -266,7 +267,7 @@ fn shapes_of(op: &str) -> &'static [&'static str] {
         // Delete a note and its body-side reference run, by `note_id`.
         "delete_note" => &[r#"{"op":"delete_note","note_id":"<note_id>","note_kind":"footnote"}"#],
         "set_format" => &[
-            r#"{"op":"set_format","target":"<block_id>","expect":"<exact unique text>","marks":[{"type":"bold"}]}"#,
+            r#"{"op":"set_format","target":"<block_id>","expect":"<exact unique text>","marks":{"bold":true}}"#,
         ],
         "set_para_format" => &[
             r#"{"op":"set_para_format","target":"<block_id>","align":"center","spacing":{"after":120}}"#,

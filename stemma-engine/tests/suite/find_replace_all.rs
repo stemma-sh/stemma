@@ -47,6 +47,8 @@ fn make_hyperlink(id: &str) -> InlineNode {
             runs: vec![HyperlinkRun {
                 text: "example".to_string(),
                 rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
                 source_run_attrs: Vec::new(),
                 status: TrackingStatus::Normal,
             }],
@@ -60,6 +62,8 @@ fn make_hyperlink(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             b"<w:hyperlink r:id=\"rId1\"><w:r><w:t>example</w:t></w:r></w:hyperlink>".to_vec(),
         ),
@@ -119,6 +123,7 @@ fn build_paragraph(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,

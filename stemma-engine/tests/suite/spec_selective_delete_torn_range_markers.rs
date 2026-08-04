@@ -34,13 +34,13 @@ use stemma::ExportOptions;
 use stemma::api::Document;
 use stemma::domain::{BlockNode, NodeId, RevisionInfo};
 use stemma::edit::{EditStep, EditTransaction, MaterializationMode};
-use stemma::tracked_model::{ResolveSelectionAction, enumerate_revisions};
+use stemma::tracked_model::{ResolveSelectionAction, RevisionKind, enumerate_revisions};
 use zip::ZipArchive;
 
 fn pack(body_inner_xml: &str) -> Vec<u8> {
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_inner_xml}<w:sectPr/></w:body></w:document>"#
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>{body_inner_xml}<w:sectPr/></w:body></w:document>"#
     );
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -212,6 +212,66 @@ fn bodylevel_bookmark_end_partner_deleted_all_resolutions_clean() {
         1,
         "beta",
     );
+}
+
+/// A first projection can remove a body child before several body-level opaque
+/// bookmark ends. The rebuilt live snapshot must re-anchor those ends to the
+/// serialized body before a second, unrelated projection. Keeping their old
+/// `body_index:N` values made the second projection splice neighboring
+/// paragraphs instead and refuse with orphaned bookmark starts; save/reopen in
+/// between happened to hide the defect by importing fresh indices.
+#[test]
+fn consecutive_live_projections_reanchor_body_level_bookmark_ends() {
+    let doc = Document::parse(&pack(
+        r#"<w:ins w:id="1" w:author="First" w:date="2026-07-10T00:00:00Z">
+               <w:p w14:paraId="10000001"><w:r><w:t>remove first</w:t></w:r></w:p>
+           </w:ins>
+           <w:p w14:paraId="10000002"><w:bookmarkStart w:id="2" w:name="span2"/><w:r><w:t>two</w:t></w:r></w:p>
+           <w:bookmarkEnd w:id="2"/>
+           <w:p w14:paraId="10000003"><w:bookmarkStart w:id="3" w:name="span3"/><w:r><w:t>three</w:t></w:r></w:p>
+           <w:bookmarkEnd w:id="3"/>
+           <w:p w14:paraId="10000004">
+             <w:pPr><w:jc w:val="center"/><w:pPrChange w:id="4" w:author="Second" w:date="2026-07-10T00:00:00Z"><w:pPr/></w:pPrChange></w:pPr>
+             <w:bookmarkStart w:id="5" w:name="span5"/><w:r><w:t>format later</w:t></w:r>
+           </w:p>
+           <w:bookmarkEnd w:id="5"/>"#,
+    ))
+    .expect("parse tracked body with direct bookmark ends");
+    let revisions = enumerate_revisions(&doc.snapshot().canonical);
+    let insert_id = revisions
+        .iter()
+        .find(|revision| revision.kind == RevisionKind::Insert)
+        .expect("block insertion revision")
+        .revision_id;
+    let format_before = revisions
+        .iter()
+        .find(|revision| revision.kind == RevisionKind::FormatParagraph)
+        .expect("paragraph formatting revision")
+        .revision_id;
+
+    let first = doc
+        .project(stemma::Resolution::Selective {
+            ids: HashSet::from([insert_id]),
+            action: ResolveSelectionAction::Reject,
+        })
+        .expect("first projection removes the preceding body child");
+    let format_after = enumerate_revisions(&first.snapshot().canonical)
+        .into_iter()
+        .find(|revision| revision.kind == RevisionKind::FormatParagraph)
+        .expect("formatting revision remains after first projection")
+        .revision_id;
+    assert_eq!(
+        format_after, format_before,
+        "durable paragraph carrier keeps the pending identity stable"
+    );
+
+    let second = first
+        .project(stemma::Resolution::Selective {
+            ids: HashSet::from([format_after]),
+            action: ResolveSelectionAction::Reject,
+        })
+        .expect("second live projection uses refreshed opaque anchors");
+    assert_clean(&second, "consecutive-live-projections");
 }
 
 // ── permission range twin ────────────────────────────────────────────────────

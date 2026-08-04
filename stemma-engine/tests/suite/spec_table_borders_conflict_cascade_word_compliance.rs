@@ -104,6 +104,18 @@ fn reserialize(bytes: &[u8]) -> String {
     document_xml_of(&out)
 }
 
+/// Force the canonical model through merge and emission. Unlike `reserialize`,
+/// this exercises the typed table model instead of the pristine package fast
+/// path, so a property absent from `BorderSet` cannot pass by accident.
+fn identity_rebuild(bytes: &[u8]) -> String {
+    let doc = Document::parse(bytes).expect("parse for identity rebuild");
+    let rebuilt = doc.diff(&doc).expect("identity diff");
+    let out = rebuilt
+        .serialize(&ExportOptions::default())
+        .expect("serialize identity rebuild");
+    document_xml_of(&out)
+}
+
 /// Translation of an `xmlRegex` of the simple shape `A ... B` (ordering, with
 /// optional intervening markup) into a no-regex check: returns true iff `a`
 /// occurs and `b` occurs at a later byte offset. Used because the `regex` crate
@@ -133,7 +145,7 @@ fn assert_opens_clean(bytes: &[u8], rule: &str) {
 fn tl2br_diagonal_cell_border_survives_roundtrip() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tr><w:tc><w:tcPr><w:tcW w:w="5000" w:type="dxa"/><w:tcBorders><w:tl2br w:val="double" w:sz="4" w:space="0" w:color="FF0000"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>diag</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    let xml = reserialize(&b);
+    let xml = identity_rebuild(&b);
     assert!(
         xml.contains("w:tl2br"),
         "ISO 29500-1 §17.4.73 / §17.4.66: tl2br is an explicit cell diagonal border (one of CT_TcBorders' eight edges); a faithful engine must re-emit it. Its absence after roundtrip is content loss Word never performs. Reserialized XML: {xml}"
@@ -276,7 +288,7 @@ fn adjacent_shared_edge_dotdash_uses_ms_border_number_eight() {
 fn cell_diagonal_tl2br_border_preserved_on_roundtrip() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="2500" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="2500"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/><w:tcBorders><w:tl2br w:val="double" w:sz="4" w:space="0" w:color="FF0000"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>X</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    let xml = reserialize(&b);
+    let xml = identity_rebuild(&b);
     assert!(
         xml.contains("<w:tl2br"),
         "ISO 29500-1 §17.4.73: the diagonal exists only if tl2br is present; Word preserves it on save, so the re-serialized cell tcBorders must still contain a tl2br element. Reserialized XML: {xml}"
@@ -299,7 +311,7 @@ fn cell_diagonal_tl2br_border_preserved_on_roundtrip() {
 fn cell_diagonal_tr2bl_border_preserved_on_roundtrip() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:tcBorders><w:tr2bl w:val="single" w:sz="12" w:space="0" w:color="0000FF"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>R1C1</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    let xml = reserialize(&b);
+    let xml = identity_rebuild(&b);
     assert!(
         xml.contains("w:tr2bl"),
         "ECMA-376 §17.4.74 / CT_TcBorders: the anti-diagonal cell border is preserved by Word; re-serialization must still contain tr2bl. Reserialized XML: {xml}"

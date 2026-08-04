@@ -180,6 +180,8 @@ fn synthesize_equation_inline(id: &NodeId, kind: OpaqueKind, omml: &[u8]) -> Inl
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(omml.to_vec()),
         content_hash: Some(sha256_hex(omml)),
     })

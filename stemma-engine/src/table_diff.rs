@@ -91,9 +91,38 @@ pub fn diff_canonical_tables(old_table: CanonicalTable, new_table: CanonicalTabl
 
 /// Align rows between two tables using patience diff on signatures.
 pub fn align_rows(old: &CanonicalTable, new: &CanonicalTable) -> Vec<RowAlignment> {
-    // Compute row signatures
-    let old_sigs: Vec<String> = (0..old.n_rows).map(|r| old.row_signature(r)).collect();
-    let new_sigs: Vec<String> = (0..new.n_rows).map(|r| new.row_signature(r)).collect();
+    // Prefer a persisted row identity only when it is unambiguous and appears
+    // on both sides. An identity present on just one side must not prevent a
+    // normal content match (for example, a caller-authored replacement target
+    // that omits imported paraIds). A shared identity, however, prevents a new
+    // otherwise-identical blank row from stealing the match of the existing
+    // row whose document index shifted.
+    let mut old_id_counts = std::collections::HashMap::<&str, usize>::new();
+    let mut new_id_counts = std::collections::HashMap::<&str, usize>::new();
+    for id in old.row_para_ids.iter().filter_map(Option::as_deref) {
+        *old_id_counts.entry(id).or_default() += 1;
+    }
+    for id in new.row_para_ids.iter().filter_map(Option::as_deref) {
+        *new_id_counts.entry(id).or_default() += 1;
+    }
+    let signature = |table: &CanonicalTable,
+                     row: usize,
+                     own_counts: &std::collections::HashMap<&str, usize>,
+                     other_counts: &std::collections::HashMap<&str, usize>| {
+        table.row_para_ids[row]
+            .as_deref()
+            .filter(|id| own_counts.get(id) == Some(&1) && other_counts.get(id) == Some(&1))
+            .map_or_else(
+                || table.row_signature(row),
+                |id| format!("\0row-identity:{id}"),
+            )
+    };
+    let old_sigs: Vec<String> = (0..old.n_rows)
+        .map(|row| signature(old, row, &old_id_counts, &new_id_counts))
+        .collect();
+    let new_sigs: Vec<String> = (0..new.n_rows)
+        .map(|row| signature(new, row, &new_id_counts, &old_id_counts))
+        .collect();
 
     // Use similar's diff with patience algorithm
     let old_refs: Vec<&str> = old_sigs.iter().map(|s| s.as_str()).collect();
@@ -907,6 +936,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,
@@ -1395,6 +1425,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,

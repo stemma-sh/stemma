@@ -1,7 +1,8 @@
 //! `stemma` — a thin command-line interface to the DOCX engine.
 //!
 //! The focused path applies an approved worklist to an existing DOCX as native
-//! tracked changes. Maintenance verbs compare, extract, resolve, and validate.
+//! tracked changes. Maintenance verbs compare, extract, read, resolve, and
+//! validate.
 //!
 //! Design contract (CLAUDE.md): parse at the edges, no silent fallbacks. Every
 //! failure exits nonzero with a one-line actionable message on stderr naming
@@ -115,6 +116,10 @@ enum Command {
         /// anonymous redline. An empty NAME is refused — omit the flag instead.
         #[arg(long, value_name = "NAME")]
         author: Option<String>,
+        /// Output format: text (human summary on stderr, empty stdout) or json
+        /// (a stemma.compare_receipt.v0 on stdout; the summary stays on stderr).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 
     /// Read a document's body: plain text, or structured JSON with blocks and
@@ -125,6 +130,14 @@ enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = ExtractFormat::Text)]
         format: ExtractFormat,
+    },
+
+    /// Emit the full structured read model in one call: every block with its
+    /// per-segment tracked status (the redline, machine-readable), plus the
+    /// complete pending-revision census. JSON on stdout; stemma.read.v0.
+    Read {
+        /// The document to read.
+        file: PathBuf,
     },
 
     /// Resolve tracked changes and write the result. Exactly one disposition is
@@ -155,12 +168,28 @@ enum Command {
         /// Reject the changes with these revision ids (comma-separated).
         #[arg(long, value_name = "IDS", value_delimiter = ',', group = "disposition")]
         reject_ids: Vec<u32>,
+        /// Resolve per a stemma.resolution_plan.v0 JSON file: mixed
+        /// accept/reject (authors, ids, and a `rest` disposition) in one call.
+        #[arg(long, value_name = "FILE", group = "disposition")]
+        plan: Option<PathBuf>,
+
+        /// Plan and report the full outcome without writing any output.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output format: text (human summary on stderr, empty stdout) or json
+        /// (a stemma.resolve_receipt.v0 on stdout; the summary stays on stderr).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 
     /// Parse and validate a document; print block/revision counts on success.
     Validate {
         /// The document to validate.
         file: PathBuf,
+        /// Output format: text (an OK line on stdout) or json (a
+        /// stemma.validate.v0 result on stdout, for valid and invalid alike).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 }
 
@@ -179,6 +208,16 @@ enum InspectFormat {
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum VerifyPolicy {
     TrackedDeliveryV0,
+}
+
+/// The machine-output switch the receipt-emitting verbs (`compare`, `resolve`,
+/// `validate`) share. Text keeps stdout for data the verb already prints (or
+/// empty) and the human summary on stderr; Json puts a schema-tagged receipt on
+/// stdout. The summary stays on stderr either way: stdout carries data.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 fn main() -> ExitCode {
@@ -232,8 +271,10 @@ fn run(command: Command) -> Result<ExitCode, String> {
             target,
             out,
             author,
-        } => compare(&artifacts, &base, &target, &out, author.as_deref()),
+            format,
+        } => compare(&artifacts, &base, &target, &out, author.as_deref(), format),
         Command::Extract { file, format } => extract(&artifacts, &file, format),
+        Command::Read { file } => read_cmd(&artifacts, &file),
         Command::Resolve {
             file,
             out,
@@ -243,6 +284,9 @@ fn run(command: Command) -> Result<ExitCode, String> {
             reject_author,
             accept_ids,
             reject_ids,
+            plan,
+            dry_run,
+            format,
         } => resolve(
             &artifacts,
             &file,
@@ -254,9 +298,12 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 reject_author,
                 accept_ids,
                 reject_ids,
+                plan,
             )?,
+            dry_run,
+            format,
         ),
-        Command::Validate { file } => validate_cmd(&artifacts, &file),
+        Command::Validate { file, format } => return validate_cmd(&artifacts, &file, format),
     };
     result.map(|()| ExitCode::SUCCESS)
 }
@@ -265,12 +312,17 @@ fn run(command: Command) -> Result<ExitCode, String> {
 // compact inspect / verify
 // ---------------------------------------------------------------------------
 
+/// The `inspect --format json` envelope. v1 renamed the summary integers from
+/// v0's `blocks`/`pending_revisions` to `*_count`: the read model's `blocks` is
+/// an ARRAY, and reusing that key for a count invited consumers to conflate the
+/// two shapes. The extended-Markdown projection (and its `@stemma inspect.v0`
+/// header line) is unchanged — only this JSON wrapper is versioned here.
 #[derive(Serialize)]
 struct InspectJson {
     schema: &'static str,
     input: CompactIdentity,
-    blocks: usize,
-    pending_revisions: usize,
+    block_count: usize,
+    pending_revision_count: usize,
     projection: String,
 }
 
@@ -309,10 +361,10 @@ fn inspect(artifacts: &PathAuthority, file: &Path, format: InspectFormat) -> Res
         }
         InspectFormat::Json => {
             let payload = InspectJson {
-                schema: "stemma.inspect.v0",
+                schema: "stemma.inspect.v1",
                 input: CompactIdentity::from(&input),
-                blocks,
-                pending_revisions: revisions,
+                block_count: blocks,
+                pending_revision_count: revisions,
                 projection,
             };
             let encoded = serde_json::to_string_pretty(&payload)
@@ -449,12 +501,29 @@ fn digest_payload(bytes: &[u8]) -> serde_json::Value {
 // compare
 // ---------------------------------------------------------------------------
 
+/// The `compare --format json` receipt: exact input identities, the committed
+/// output, and the full census of discovered revisions (the same rows `extract
+/// --format json` would enumerate on the output, ids included — so a consumer
+/// can drive `resolve` without a second read).
+#[derive(Serialize)]
+struct CompareReceipt {
+    schema: &'static str,
+    base: ArtifactIdentity,
+    target: ArtifactIdentity,
+    /// The attribution requested via `--author`; `null` for an anonymous
+    /// redline (whose revisions then carry the empty author group `""`).
+    author: Option<String>,
+    revisions: Vec<RevisionJson>,
+    output: OutputArtifact,
+}
+
 fn compare(
     artifacts: &PathAuthority,
     base: &Path,
     target: &Path,
     out: &Path,
     author: Option<&str>,
+    format: OutputFormat,
 ) -> Result<(), String> {
     let (base_doc, base_artifact) = parse_doc(artifacts, base, "base_docx")?;
     let (target_doc, target_artifact) = parse_doc(artifacts, target, "target_docx")?;
@@ -479,16 +548,30 @@ fn compare(
         out,
         "output_redline",
         &bytes,
-        &[base_artifact, target_artifact],
+        &[base_artifact.clone(), target_artifact.clone()],
     )?;
 
-    let count = pending_revisions(&redline).len();
+    let revisions = pending_revisions(&redline);
+    let count = revisions.len();
     eprintln!(
         "wrote redline to {} ({count} tracked revision{}); {}",
         out.display(),
         if count == 1 { "" } else { "s" },
         output_summary(&output),
     );
+    if format == OutputFormat::Json {
+        let receipt = CompareReceipt {
+            schema: "stemma.compare_receipt.v0",
+            base: base_artifact,
+            target: target_artifact,
+            author: author.map(str::to_string),
+            revisions: revisions.into_iter().map(RevisionJson::from).collect(),
+            output,
+        };
+        let encoded = serde_json::to_string_pretty(&receipt)
+            .map_err(|e| format!("cannot encode compare receipt for {}: {e}", out.display()))?;
+        print_line(&encoded)?;
+    }
     Ok(())
 }
 
@@ -555,6 +638,10 @@ struct RevisionJson {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     author: Option<String>,
+    /// The change's `w:date` (ISO-8601), omitted when the source markup
+    /// carries none — same absent-field convention as `author`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date: Option<String>,
     block_id: String,
     excerpt: String,
 }
@@ -565,6 +652,7 @@ impl From<PendingRevision> for RevisionJson {
             revision_id: r.id,
             kind: r.kind.as_str(),
             author: r.author,
+            date: r.date,
             block_id: r.block_id,
             excerpt: r.excerpt,
         }
@@ -578,6 +666,42 @@ fn role_label(role: &BlockRole) -> &'static str {
         BlockRole::Table => "table",
         BlockRole::Opaque => "opaque",
     }
+}
+
+// ---------------------------------------------------------------------------
+// read
+// ---------------------------------------------------------------------------
+
+/// The `read` payload: the engine's read model serialized whole. `blocks` is
+/// [`stemma::api::DocumentView::blocks`] verbatim — per-segment tracked status
+/// (`Inserted`/`Deleted` with their `RevisionView`), marks, span handles,
+/// guards, cells — the same typed view `docs/reference/read-model.md`
+/// documents. `revisions` is the canonical census (identical rows to `extract
+/// --format json`), carried alongside because the segment view alone omits
+/// formatting-change records.
+#[derive(Serialize)]
+struct ReadJson {
+    schema: &'static str,
+    input: ArtifactIdentity,
+    blocks: Vec<stemma::api::BlockView>,
+    revisions: Vec<RevisionJson>,
+}
+
+fn read_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
+    let (doc, input) = parse_doc(artifacts, file, "input_docx")?;
+    let view = doc.read();
+    let payload = ReadJson {
+        schema: "stemma.read.v0",
+        input,
+        blocks: view.blocks,
+        revisions: pending_revisions(&doc)
+            .into_iter()
+            .map(RevisionJson::from)
+            .collect(),
+    };
+    let encoded = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("cannot encode read model for {}: {e}", file.display()))?;
+    print_line(&encoded)
 }
 
 // ---------------------------------------------------------------------------
@@ -595,9 +719,13 @@ enum Disposition {
     RejectAuthor(String),
     AcceptIds(Vec<u32>),
     RejectIds(Vec<u32>),
+    /// A `stemma.resolution_plan.v0` file, read and validated inside `resolve`
+    /// (the path is in the same ArgGroup as every other disposition flag).
+    PlanFile(PathBuf),
 }
 
 impl Disposition {
+    #[allow(clippy::too_many_arguments)]
     fn from_flags(
         accept_all: bool,
         reject_all: bool,
@@ -605,6 +733,7 @@ impl Disposition {
         reject_author: Option<String>,
         accept_ids: Vec<u32>,
         reject_ids: Vec<u32>,
+        plan: Option<PathBuf>,
     ) -> Result<Disposition, String> {
         if accept_all {
             Ok(Disposition::AcceptAll)
@@ -618,16 +747,91 @@ impl Disposition {
             Ok(Disposition::AcceptIds(accept_ids))
         } else if !reject_ids.is_empty() {
             Ok(Disposition::RejectIds(reject_ids))
+        } else if let Some(path) = plan {
+            Ok(Disposition::PlanFile(path))
         } else {
             // clap's `required` ArgGroup makes this unreachable via the CLI; kept
             // as an explicit error rather than a panic (no silent fallbacks).
             Err(
                 "no disposition given: pass one of --accept-all, --reject-all, \
-                 --accept-author, --reject-author, --accept-ids, or --reject-ids"
+                 --accept-author, --reject-author, --accept-ids, --reject-ids, \
+                 or --plan"
                     .to_string(),
             )
         }
     }
+}
+
+const RESOLUTION_PLAN_SCHEMA: &str = "stemma.resolution_plan.v0";
+
+/// A `stemma.resolution_plan.v0` file: a mixed disposition in one invocation.
+/// Selectors address the SELECTABLE census (revision id != 0) exactly like the
+/// author/id flags; census-only records (id 0) are outside plan scope and stay
+/// pending. Unknown fields are refused (`deny_unknown_fields`) — a misspelled
+/// selector must never silently select nothing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolutionPlanFile {
+    schema: String,
+    #[serde(default)]
+    accept: PlanSelectors,
+    #[serde(default)]
+    reject: PlanSelectors,
+    /// What happens to every selectable pending revision no selector matched.
+    /// The product-approved default is `leave` (documented in the CLI
+    /// reference): a plan only resolves what it names unless told otherwise.
+    #[serde(default)]
+    rest: RestDisposition,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanSelectors {
+    /// Author groups, matched exactly; `""` is the empty-author group. Every
+    /// named author must have at least one pending change (fail loud).
+    #[serde(default)]
+    authors: Vec<String>,
+    /// Revision ids; every id must be pending and selectable (fail loud).
+    #[serde(default)]
+    ids: Vec<u32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RestDisposition {
+    #[default]
+    Leave,
+    Accept,
+    Reject,
+}
+
+/// What a `resolve` invocation will actually execute, planned entirely against
+/// the input's live census before any projection runs. The two total forms are
+/// kept distinct from the selective form because they are the engine's total
+/// resolutions: they also resolve census-only records (id 0), which no
+/// selective set can address.
+enum Execution {
+    AcceptAll,
+    RejectAll,
+    Selective {
+        accept: HashSet<u32>,
+        reject: HashSet<u32>,
+    },
+}
+
+/// The `resolve --format json` receipt: which pending revisions this call
+/// accepted and rejected (full census rows from the INPUT document), what is
+/// still pending in the result, and the committed output. `output` is `null`
+/// exactly when `--dry-run` skipped the write.
+#[derive(Serialize)]
+struct ResolveReceipt {
+    schema: &'static str,
+    input: ArtifactIdentity,
+    dry_run: bool,
+    accepted: Vec<RevisionJson>,
+    rejected: Vec<RevisionJson>,
+    remaining: Vec<RevisionJson>,
+    output: Option<OutputArtifact>,
 }
 
 fn resolve(
@@ -635,70 +839,282 @@ fn resolve(
     file: &Path,
     out: &Path,
     disposition: Disposition,
+    dry_run: bool,
+    format: OutputFormat,
 ) -> Result<(), String> {
     let (doc, input_artifact) = parse_doc(artifacts, file, "input_docx")?;
 
     let pending = pending_revisions(&doc);
-    let resolution = plan_resolution(&disposition, &pending, file)?;
+    // The output must never clobber any artifact the resolution read — the
+    // input always, and the plan file when the disposition came from one.
+    let mut protected = vec![input_artifact.clone()];
+    let execution = match &disposition {
+        Disposition::PlanFile(path) => {
+            let (plan, plan_artifact) = read_resolution_plan(artifacts, path)?;
+            protected.push(plan_artifact);
+            plan_selective_sets(&plan, &pending, file, path)?
+        }
+        flag => plan_flag_execution(flag, &pending, file)?,
+    };
 
-    let resolved = doc
-        .project(resolution)
-        .map_err(|e| format!("cannot resolve tracked changes in {}: {e}", file.display()))?;
+    let resolved = execute_resolution(&doc, &execution, file)?;
 
-    let bytes = serialize(&resolved, out)?;
-    let output = write_output(
-        artifacts,
-        out,
-        "output_resolved_docx",
-        &bytes,
-        &[input_artifact],
-    )?;
+    // Receipt rows partition the INPUT census: the total resolutions cover
+    // every pending row (census-only id-0 records included); a selective
+    // execution covers exactly its id sets.
+    let (accepted, rejected): (Vec<RevisionJson>, Vec<RevisionJson>) = match &execution {
+        Execution::AcceptAll => (
+            pending.into_iter().map(RevisionJson::from).collect(),
+            vec![],
+        ),
+        Execution::RejectAll => (
+            vec![],
+            pending.into_iter().map(RevisionJson::from).collect(),
+        ),
+        Execution::Selective { accept, reject } => {
+            let mut accepted = Vec::new();
+            let mut rejected = Vec::new();
+            for row in pending {
+                if accept.contains(&row.id) {
+                    accepted.push(RevisionJson::from(row));
+                } else if reject.contains(&row.id) {
+                    rejected.push(RevisionJson::from(row));
+                }
+            }
+            (accepted, rejected)
+        }
+    };
+    let remaining: Vec<RevisionJson> = pending_revisions(&resolved)
+        .into_iter()
+        .map(RevisionJson::from)
+        .collect();
 
-    eprintln!(
-        "wrote resolved document to {}; {}",
-        out.display(),
-        output_summary(&output)
-    );
+    let output = if dry_run {
+        eprintln!(
+            "dry run: would write resolved document to {}; {} accepted, {} rejected, {} remaining pending; no output written",
+            out.display(),
+            accepted.len(),
+            rejected.len(),
+            remaining.len(),
+        );
+        None
+    } else {
+        let bytes = serialize(&resolved, out)?;
+        let output = write_output(artifacts, out, "output_resolved_docx", &bytes, &protected)?;
+        eprintln!(
+            "wrote resolved document to {}; {}",
+            out.display(),
+            output_summary(&output)
+        );
+        Some(output)
+    };
+
+    if format == OutputFormat::Json {
+        let receipt = ResolveReceipt {
+            schema: "stemma.resolve_receipt.v0",
+            input: input_artifact,
+            dry_run,
+            accepted,
+            rejected,
+            remaining,
+            output,
+        };
+        let encoded = serde_json::to_string_pretty(&receipt)
+            .map_err(|e| format!("cannot encode resolve receipt for {}: {e}", file.display()))?;
+        print_line(&encoded)?;
+    }
     Ok(())
 }
 
-/// Turn a validated [`Disposition`] plus the document's live pending revisions
-/// into an engine [`Resolution`], failing loud when the selection would match
-/// nothing (an unknown id or an author with no changes) — never a silent no-op.
-fn plan_resolution(
+/// Turn a flag disposition plus the document's live pending revisions into an
+/// [`Execution`], failing loud when the selection would match nothing (an
+/// unknown id or an author with no changes) — never a silent no-op.
+fn plan_flag_execution(
     disposition: &Disposition,
     pending: &[PendingRevision],
     file: &Path,
-) -> Result<Resolution, String> {
+) -> Result<Execution, String> {
     // id 0 is the census-only sentinel (reported, never selectable) — it must
     // not satisfy the non-empty check nor be offered to the selective resolver.
     let known: HashSet<u32> = pending.iter().map(|r| r.id).filter(|id| *id != 0).collect();
 
+    let selective =
+        |accept: HashSet<u32>, reject: HashSet<u32>| Execution::Selective { accept, reject };
     match disposition {
         Disposition::AcceptAll => {
             require_nonempty(&known, file)?;
-            Ok(Resolution::AcceptAll)
+            Ok(Execution::AcceptAll)
         }
         Disposition::RejectAll => {
             require_nonempty(&known, file)?;
-            Ok(Resolution::RejectAll)
+            Ok(Execution::RejectAll)
         }
-        Disposition::AcceptAuthor(name) => Ok(Resolution::Selective {
-            ids: ids_by_author(pending, name, file)?,
-            action: ResolveSelectionAction::Accept,
-        }),
-        Disposition::RejectAuthor(name) => Ok(Resolution::Selective {
-            ids: ids_by_author(pending, name, file)?,
-            action: ResolveSelectionAction::Reject,
-        }),
-        Disposition::AcceptIds(ids) => Ok(Resolution::Selective {
-            ids: check_ids(ids, &known, file)?,
-            action: ResolveSelectionAction::Accept,
-        }),
-        Disposition::RejectIds(ids) => Ok(Resolution::Selective {
-            ids: check_ids(ids, &known, file)?,
-            action: ResolveSelectionAction::Reject,
-        }),
+        Disposition::AcceptAuthor(name) => Ok(selective(
+            ids_by_author(pending, name, file)?,
+            HashSet::new(),
+        )),
+        Disposition::RejectAuthor(name) => Ok(selective(
+            HashSet::new(),
+            ids_by_author(pending, name, file)?,
+        )),
+        Disposition::AcceptIds(ids) => Ok(selective(check_ids(ids, &known, file)?, HashSet::new())),
+        Disposition::RejectIds(ids) => Ok(selective(HashSet::new(), check_ids(ids, &known, file)?)),
+        Disposition::PlanFile(_) => Err(
+            "internal: a plan-file disposition reached the flag planner (programmer bug)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Read and schema-check a resolution plan through the artifact authority, so
+/// the plan file joins the protected sources the output must not alias.
+fn read_resolution_plan(
+    artifacts: &PathAuthority,
+    path: &Path,
+) -> Result<(ResolutionPlanFile, ArtifactIdentity), String> {
+    let source = artifacts
+        .read_source(path, "resolution_plan", None)
+        .map_err(|e| e.to_string())?;
+    let plan: ResolutionPlanFile = serde_json::from_slice(source.bytes()).map_err(|e| {
+        format!(
+            "{}: not a valid {RESOLUTION_PLAN_SCHEMA} document: {e}",
+            path.display()
+        )
+    })?;
+    if plan.schema != RESOLUTION_PLAN_SCHEMA {
+        return Err(format!(
+            "{}: unsupported plan schema {:?} (expected {RESOLUTION_PLAN_SCHEMA:?})",
+            path.display(),
+            plan.schema
+        ));
+    }
+    Ok((plan, source.identity().clone()))
+}
+
+/// Expand a validated plan into disjoint accept/reject id sets against the
+/// live census. Every selector must match (fail loud), an id selected by both
+/// sides is a contradiction (fail loud), and a plan that resolves nothing is
+/// an error — never a silent unchanged copy.
+fn plan_selective_sets(
+    plan: &ResolutionPlanFile,
+    pending: &[PendingRevision],
+    file: &Path,
+    plan_path: &Path,
+) -> Result<Execution, String> {
+    let known: HashSet<u32> = pending.iter().map(|r| r.id).filter(|id| *id != 0).collect();
+
+    let expand = |selectors: &PlanSelectors| -> Result<HashSet<u32>, String> {
+        let mut ids = HashSet::new();
+        for author in &selectors.authors {
+            ids.extend(ids_by_author(pending, author, file)?);
+        }
+        ids.extend(check_ids(&selectors.ids, &known, file)?);
+        Ok(ids)
+    };
+    let mut accept = expand(&plan.accept)?;
+    let mut reject = expand(&plan.reject)?;
+
+    let mut contested: Vec<u32> = accept.intersection(&reject).copied().collect();
+    if !contested.is_empty() {
+        contested.sort_unstable();
+        return Err(format!(
+            "{}: revision id(s) {} are selected by both accept and reject",
+            plan_path.display(),
+            contested
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+
+    let rest: Vec<u32> = known
+        .iter()
+        .copied()
+        .filter(|id| !accept.contains(id) && !reject.contains(id))
+        .collect();
+    match plan.rest {
+        RestDisposition::Leave => {}
+        RestDisposition::Accept => accept.extend(rest),
+        RestDisposition::Reject => reject.extend(rest),
+    }
+
+    if accept.is_empty() && reject.is_empty() {
+        return Err(format!(
+            "{}: plan resolves nothing in {} (no selector matched and rest is \"leave\")",
+            plan_path.display(),
+            file.display(),
+        ));
+    }
+    Ok(Execution::Selective { accept, reject })
+}
+
+/// Run the planned execution. A mixed selective plan is two engine
+/// projections — accepts first, then rejects — with an explicit id-durability
+/// check at the phase boundary: revision identities are content-derived and
+/// survive a projection (see the CLI reference's id-durability contract), but
+/// if accepting a change re-keyed a survivor selected for rejection, this
+/// fails loud rather than rejecting the wrong revision.
+fn execute_resolution(
+    doc: &Document,
+    execution: &Execution,
+    file: &Path,
+) -> Result<Document, String> {
+    let cannot = |e| format!("cannot resolve tracked changes in {}: {e}", file.display());
+    match execution {
+        Execution::AcceptAll => doc.project(Resolution::AcceptAll).map_err(cannot),
+        Execution::RejectAll => doc.project(Resolution::RejectAll).map_err(cannot),
+        Execution::Selective { accept, reject } => {
+            let mut current: Option<Document> = None;
+            if !accept.is_empty() {
+                current = Some(
+                    doc.project(Resolution::Selective {
+                        ids: accept.clone(),
+                        action: ResolveSelectionAction::Accept,
+                    })
+                    .map_err(cannot)?,
+                );
+            }
+            if !reject.is_empty() {
+                let base = current.as_ref().unwrap_or(doc);
+                if !accept.is_empty() {
+                    let still: HashSet<u32> =
+                        pending_revisions(base).iter().map(|r| r.id).collect();
+                    let mut missing: Vec<u32> = reject
+                        .iter()
+                        .copied()
+                        .filter(|id| !still.contains(id))
+                        .collect();
+                    if !missing.is_empty() {
+                        missing.sort_unstable();
+                        return Err(format!(
+                            "revision id(s) {} selected for reject are no longer pending after \
+                             the accept phase in {} (an accepted change re-keyed them); re-read \
+                             the ids and re-plan",
+                            missing
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            file.display(),
+                        ));
+                    }
+                }
+                current = Some(
+                    base.project(Resolution::Selective {
+                        ids: reject.clone(),
+                        action: ResolveSelectionAction::Reject,
+                    })
+                    .map_err(cannot)?,
+                );
+            }
+            // Planning guarantees at least one non-empty side; reaching here
+            // with neither is a programmer bug, reported rather than unwrapped.
+            current.ok_or_else(|| {
+                "internal: selective execution with empty accept and reject sets (programmer bug)"
+                    .to_string()
+            })
+        }
     }
 }
 
@@ -734,14 +1150,18 @@ fn ids_by_author(
 }
 
 fn known_authors_hint(pending: &[PendingRevision]) -> String {
-    // A tracked change with no `w:author`, or a blank one (Word anonymization,
-    // and the attribution `diff` stamps), reads as `<anonymous>` rather than an
-    // empty token.
+    // A blank `w:author` (Word anonymization, and the attribution `diff`
+    // stamps) is a real, selectable author group — its selector token is the
+    // empty string, so the hint shows `"" (empty author)` rather than a
+    // made-up placeholder the user would type verbatim and miss with.
+    // Census-only records (id 0) carry no author and are not selectable, so
+    // they stay out of the hint.
     let mut authors: Vec<&str> = pending
         .iter()
+        .filter(|r| r.id != 0)
         .map(|r| match r.author.as_deref() {
             Some(name) if !name.is_empty() => name,
-            _ => "<anonymous>",
+            _ => "\"\" (empty author)",
         })
         .collect();
     authors.sort_unstable();
@@ -788,7 +1208,33 @@ fn check_ids(requested: &[u32], known: &HashSet<u32>, file: &Path) -> Result<Has
 // validate
 // ---------------------------------------------------------------------------
 
-fn validate_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
+/// The `validate --format json` result. Valid and invalid are BOTH structured
+/// results on stdout (mirroring `verify`'s pass/fail contract): `status` is
+/// `"ok"` or `"invalid"`, `issues` is empty exactly when `ok`, and the process
+/// still exits `1` on `"invalid"`. Only an operational failure (unreadable
+/// file, not a DOCX at all) stays on the `error:` stderr path.
+#[derive(Serialize)]
+struct ValidateJson {
+    schema: &'static str,
+    status: &'static str,
+    input: ArtifactIdentity,
+    block_count: usize,
+    pending_revision_count: usize,
+    issues: Vec<ValidateIssueJson>,
+}
+
+#[derive(Serialize)]
+struct ValidateIssueJson {
+    code: String,
+    message: String,
+    context: Option<String>,
+}
+
+fn validate_cmd(
+    artifacts: &PathAuthority,
+    file: &Path,
+    format: OutputFormat,
+) -> Result<ExitCode, String> {
     let input = artifacts
         .read_source(file, "input_docx", None)
         .map_err(|e| e.to_string())?;
@@ -796,30 +1242,65 @@ fn validate_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: not a valid DOCX ({e})", file.display()))?;
 
     let report = validate(input.bytes());
-    if !report.ok {
-        let details = report
-            .issues
-            .iter()
-            .map(|issue| match &issue.context {
-                Some(ctx) => format!("{:?}: {} [{ctx}]", issue.code, issue.message),
-                None => format!("{:?}: {}", issue.code, issue.message),
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("{}: invalid DOCX — {details}", file.display()));
-    }
-
     let view = doc.read();
     let blocks = view.blocks.len();
     let revisions = pending_revisions(&doc).len();
-    print_line(&format!(
-        "OK: {} — {blocks} block{}, {revisions} pending revision{}; bytes={} sha256={}",
-        file.display(),
-        if blocks == 1 { "" } else { "s" },
-        if revisions == 1 { "" } else { "s" },
-        input.identity().bytes,
-        input.identity().digest.hex,
-    ))
+
+    match format {
+        OutputFormat::Text => {
+            if !report.ok {
+                let details = report
+                    .issues
+                    .iter()
+                    .map(|issue| match &issue.context {
+                        Some(ctx) => format!("{:?}: {} [{ctx}]", issue.code, issue.message),
+                        None => format!("{:?}: {}", issue.code, issue.message),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!("{}: invalid DOCX — {details}", file.display()));
+            }
+            print_line(&format!(
+                "OK: {} — {blocks} block{}, {revisions} pending revision{}; bytes={} sha256={}",
+                file.display(),
+                if blocks == 1 { "" } else { "s" },
+                if revisions == 1 { "" } else { "s" },
+                input.identity().bytes,
+                input.identity().digest.hex,
+            ))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        OutputFormat::Json => {
+            let payload = ValidateJson {
+                schema: "stemma.validate.v0",
+                status: if report.ok { "ok" } else { "invalid" },
+                input: input.identity().clone(),
+                block_count: blocks,
+                pending_revision_count: revisions,
+                issues: report
+                    .issues
+                    .iter()
+                    .map(|issue| ValidateIssueJson {
+                        code: format!("{:?}", issue.code),
+                        message: issue.message.clone(),
+                        context: issue.context.clone(),
+                    })
+                    .collect(),
+            };
+            let encoded = serde_json::to_string_pretty(&payload).map_err(|e| {
+                format!(
+                    "cannot encode validation result for {}: {e}",
+                    file.display()
+                )
+            })?;
+            print_line(&encoded)?;
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1315,7 @@ fn validate_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
 struct PendingRevision {
     id: u32,
     author: Option<String>,
+    date: Option<String>,
     kind: RevisionKind,
     block_id: String,
     excerpt: String,
@@ -857,6 +1339,7 @@ fn pending_revisions(doc: &Document) -> Vec<PendingRevision> {
         out.push(PendingRevision {
             id: r.revision_id,
             author: r.author,
+            date: r.date,
             kind: r.kind,
             block_id: r.block_id.to_string(),
             excerpt: excerpt(&r.excerpt),

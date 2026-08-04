@@ -34,10 +34,19 @@ fn spec_audit_widow_control_from_style() {
         paras.len()
     );
 
-    // Para 0: no style override — widow_control should be None (spec default = true)
+    // Para 0: no style override — the EFFECTIVE value is the §17.3.1.44 spec
+    // default, ON. The value field holds the effective state (Word freely
+    // rewrites explicit-true into absent on resave, so representing the
+    // default as None gave one rendered state two spellings);
+    // `has_direct_widow_control` carries the wire provenance.
     assert_eq!(
-        paras[0].widow_control, None,
-        "para 0 (default) should have widow_control=None"
+        paras[0].widow_control,
+        Some(true),
+        "para 0 (default) resolves to the spec-default ON"
+    );
+    assert!(
+        !paras[0].has_direct_widow_control,
+        "and stays unauthored on the wire"
     );
 
     // Para 1: NoWidow style — should inherit widow_control=Some(false) from style

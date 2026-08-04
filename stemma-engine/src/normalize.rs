@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use quick_xml::name::QName;
@@ -231,6 +233,134 @@ fn collect_normalizable_part_paths(archive: &DocxArchive) -> Result<Vec<String>,
     }
 
     Ok(paths)
+}
+
+#[derive(Clone, Copy)]
+enum NoteKind {
+    Footnote,
+    Endnote,
+}
+
+impl NoteKind {
+    fn relationship_type(self) -> &'static str {
+        match self {
+            Self::Footnote => FOOTNOTES_REL_TYPE,
+            Self::Endnote => ENDNOTES_REL_TYPE,
+        }
+    }
+
+    fn reference_tag(self) -> &'static str {
+        match self {
+            Self::Footnote => "footnoteReference",
+            Self::Endnote => "endnoteReference",
+        }
+    }
+
+    fn definition_tag(self) -> &'static str {
+        match self {
+            Self::Footnote => "footnote",
+            Self::Endnote => "endnote",
+        }
+    }
+}
+
+fn collect_note_part_path(
+    archive: &DocxArchive,
+    kind: NoteKind,
+) -> Result<Option<String>, NormalizeError> {
+    let (_, rels_path) = main_part_and_rels(archive)?;
+    let Some(rels_xml) = archive.get(&rels_path) else {
+        return Ok(None);
+    };
+    let root = parse_xml(rels_xml)?;
+    for child in &root.children {
+        let XMLNode::Element(relationship) = child else {
+            continue;
+        };
+        if local_element_name(relationship) != "Relationship"
+            || get_attr(relationship, "Type") != Some(kind.relationship_type())
+        {
+            continue;
+        }
+        let Some(target) = get_attr(relationship, "Target") else {
+            continue;
+        };
+        return Ok(Some(relationship_target_to_part_path(target)));
+    }
+    Ok(None)
+}
+
+fn collect_note_reference_ids(element: &Element, kind: NoteKind, ids: &mut HashSet<String>) {
+    if local_element_name(element) == kind.reference_tag()
+        && let Some(id) = get_attr(element, "id")
+    {
+        ids.insert(id.to_string());
+    }
+    for child in &element.children {
+        if let XMLNode::Element(child) = child {
+            collect_note_reference_ids(child, kind, ids);
+        }
+    }
+}
+
+fn is_reserved_note_definition(element: &Element) -> bool {
+    matches!(
+        get_attr(element, "type"),
+        Some("separator") | Some("continuationSeparator")
+    )
+}
+
+/// Reconcile note definitions with the references that survive accept/reject.
+///
+/// A tracked InsertNote wraps the body reference in `w:ins`, while its backing
+/// `w:footnote`/`w:endnote` definition is ordinary story content. Rejecting the
+/// insertion therefore removes the reference but cannot remove the definition
+/// through revision-element descent alone. The inverse shape occurs when a
+/// tracked note deletion is accepted. Leaving either orphan makes the archive
+/// resolver disagree with the typed projection and can trigger a Word repair.
+fn prune_unreferenced_note_definitions(
+    archive: &mut DocxArchive,
+    story_part_paths: &[String],
+) -> Result<Vec<String>, NormalizeError> {
+    let mut changed_parts = Vec::new();
+    for kind in [NoteKind::Footnote, NoteKind::Endnote] {
+        let Some(note_part_path) = collect_note_part_path(archive, kind)? else {
+            continue;
+        };
+        let mut referenced_ids = HashSet::new();
+        for story_path in story_part_paths {
+            let Some(bytes) = archive.get(story_path) else {
+                continue;
+            };
+            let root = parse_xml(bytes)?;
+            collect_note_reference_ids(&root, kind, &mut referenced_ids);
+        }
+
+        let Some(note_bytes) = archive.get(&note_part_path) else {
+            continue;
+        };
+        let mut root = parse_xml(note_bytes)?;
+        let before = root.children.len();
+        root.children.retain(|child| {
+            let XMLNode::Element(note) = child else {
+                return true;
+            };
+            if local_element_name(note) != kind.definition_tag()
+                || is_reserved_note_definition(note)
+            {
+                return true;
+            }
+            let Some(id) = get_attr(note, "id") else {
+                return true;
+            };
+            referenced_ids.contains(id)
+        });
+        if root.children.len() != before {
+            archive.upsert(&note_part_path, write_xml(&root)?);
+            changed_parts.push(note_part_path);
+        }
+    }
+    Ok(changed_parts)
 }
 
 /// Collect the glossary story part path(s) from the document relationships — the
@@ -877,6 +1007,12 @@ pub fn normalize_docx(
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
     }
 
+    for part in prune_unreferenced_note_definitions(&mut output, &part_paths)? {
+        if !result.parts_normalized.contains(&part) {
+            result.parts_normalized.push(part);
+        }
+    }
+
     result.unresolved_glossary_revisions = 0;
 
     Ok((output, result))
@@ -923,6 +1059,12 @@ pub fn reject_all_docx(
         }
         result.revisions_resolved += stats.revisions_resolved;
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
+    }
+
+    for part in prune_unreferenced_note_definitions(&mut output, &part_paths)? {
+        if !result.parts_normalized.contains(&part) {
+            result.parts_normalized.push(part);
+        }
     }
 
     result.unresolved_glossary_revisions = 0;
@@ -2875,6 +3017,73 @@ mod tests {
     // -----------------------------------------------------------------------
     // Reject all tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn reject_inserted_footnote_prunes_only_its_orphaned_definition() {
+        let document = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p>
+    <w:r><w:footnoteReference w:id="1"/></w:r>
+    <w:ins w:id="7" w:author="A"><w:r><w:footnoteReference w:id="2"/></w:r></w:ins>
+  </w:p></w:body>
+</w:document>"#;
+        let footnotes = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:type="separator" w:id="-1"><w:p/></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:t>Existing note.</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="2"><w:p><w:r><w:t>Inserted note.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>
+</Relationships>"#;
+        let archive = archive_with_parts(vec![
+            ("word/document.xml", document),
+            ("word/footnotes.xml", footnotes),
+            ("word/_rels/document.xml.rels", relationships),
+        ]);
+
+        let (rejected, _) = reject_all_docx(&archive).expect("reject inserted footnote");
+        let rejected_main =
+            std::str::from_utf8(rejected.get("word/document.xml").unwrap()).unwrap();
+        let rejected_notes =
+            std::str::from_utf8(rejected.get("word/footnotes.xml").unwrap()).unwrap();
+        assert!(rejected_main.contains("w:id=\"1\""));
+        assert!(!rejected_main.contains("w:id=\"2\""));
+        assert!(rejected_notes.contains("Existing note."));
+        assert!(!rejected_notes.contains("Inserted note."));
+        assert!(rejected_notes.contains("separator"));
+    }
+
+    #[test]
+    fn accept_deleted_endnote_prunes_its_orphaned_definition() {
+        let document = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p>
+    <w:del w:id="8" w:author="A"><w:r><w:endnoteReference w:id="3"/></w:r></w:del>
+  </w:p></w:body>
+</w:document>"#;
+        let endnotes = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:endnote w:type="continuationSeparator" w:id="0"><w:p/></w:endnote>
+  <w:endnote w:id="3"><w:p><w:r><w:t>Deleted note.</w:t></w:r></w:p></w:endnote>
+</w:endnotes>"#;
+        let relationships = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes" Target="endnotes.xml"/>
+</Relationships>"#;
+        let archive = archive_with_parts(vec![
+            ("word/document.xml", document),
+            ("word/endnotes.xml", endnotes),
+            ("word/_rels/document.xml.rels", relationships),
+        ]);
+
+        let (accepted, _) = normalize_docx(&archive).expect("accept deleted endnote");
+        let accepted_notes =
+            std::str::from_utf8(accepted.get("word/endnotes.xml").unwrap()).unwrap();
+        assert!(!accepted_notes.contains("Deleted note."));
+        assert!(accepted_notes.contains("continuationSeparator"));
+    }
 
     #[test]
     fn reject_restores_deleted_text_and_drops_insertions() {

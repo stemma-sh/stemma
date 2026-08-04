@@ -145,6 +145,40 @@ input. Only the host operator should raise process-wide limits.
 | `ParagraphContainsTrackedSegments` | The requested span operation lacks a safe coordinate space. | Resolve the paragraph or use `replace_text`. |
 | `StyleNotFound` | A requested style does not exist. | Read current styles or create the style in the same transaction. |
 | `InvalidRange` | A revision selector matched nothing. | Re-read revisions and correct the selector. |
+| `FormatRevisionConflict` | The target already carries a pending formatting revision from another proposal. | Resolve that revision, leave it pending, or comment; the refusal names which. |
+| `AmbiguousFormatTarget` | `expect` matched more than one eligible span in the block. | Lengthen `expect` until it matches one span. |
+
+### Typed formatting refusals
+
+`FormatRevisionConflict` and `AmbiguousFormatTarget` answer with data, not
+prose. The response names the target and its tracking state, the invariant that
+would break, the conflicting revision and its author when one exists, and
+`mutation`, which is `none` for every refused transaction: nothing was written,
+so no retry is needed to undo anything.
+
+`allowed_actions` carries filled-in action templates rather than vocabulary
+words: every field the engine can determine is already populated, so the caller
+supplies only the session envelope, the acting author, and free content such as
+a comment body.
+
+```json
+{
+  "code": "format_revision_conflict",
+  "target": {"block_id": "p_6", "text": "$150", "tracking_status": "inserted"},
+  "existing_revision": {"revision_id": 880725669, "kind": "format_run", "author": "Round1Reviewer"},
+  "invariant": "a second independently resolvable run-format revision cannot be preserved",
+  "allowed_actions": [
+    {"action": "reject_changes", "selector": {"by": "by_ids", "revision_ids": [880725669]}},
+    {"action": "leave_pending"},
+    {"action": "comment_create", "target": "p_6", "expect": "$150"}
+  ],
+  "mutation": "none"
+}
+```
+
+`allowed_actions` is guidance, not permission. Stemma never resolves a
+revision, converts a tracked edit to direct formatting, or creates a comment on
+its own; choosing among them stays the caller's decision.
 
 The `AuthorImpersonation` override is the `allow_existing_author` argument on
 the mutating tools, a per-call assertion that deliberately continues that
@@ -157,11 +191,21 @@ apply_edit  {"doc_id": ...,
              "allow_existing_author": true}
 ```
 
-Every `marks` field takes an array of tagged objects such as
-`[{"type":"bold"}]`, never bare strings, on text nodes and on `set_format`
-alike; the grammar is specified under
-[content nodes](operations.md#content-nodes). Span replacement takes plain
-text; use a whole-paragraph replacement for mark changes.
+On text nodes, `marks` takes an array of tagged objects such as
+`[{"type":"bold"}]`, never bare strings; the grammar is specified under
+[content nodes](operations.md#content-nodes). On `set_format`, `marks` is a
+tri-state patch object. An omitted property is left unchanged, `true` turns it
+on, and `false` turns it off, so `{"bold": false}` is how formatting is removed:
+
+```json
+{"op": "set_format", "target": "p_6", "expect": "the fee", "marks": {"bold": true, "italic": false}}
+```
+
+The older on-only array form is still accepted on `set_format` for
+compatibility, but a request carrying both forms is refused, and an empty or
+no-effect patch fails loudly rather than reporting a write that changed
+nothing. Span replacement takes plain text; use a whole-paragraph replacement
+for mark changes.
 
 ## Recipes
 

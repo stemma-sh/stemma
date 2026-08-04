@@ -1,10 +1,8 @@
-//! B6: stacking two tracked formatting changes on the same run.
+//! Same-transaction run-formatting composition.
 //!
-//! Before the fix, a SECOND value-format on a run that already carried a tracked
-//! formatting change (e.g. "make it bigger" then "recolor it") was rejected with
-//! UnsupportedParagraphStructure. Now apply_marks merges the new properties onto
-//! the live run while keeping the FIRST change's snapshot as the reject-all
-//! baseline, so the two compose into one w:rPrChange.
+//! Several format steps in one atomic transaction are one logical proposal and
+//! compose into one rPrChange. A later transaction is a distinct proposal and
+//! must refuse instead of absorbing the pending revision.
 //!
 //! The load-bearing post-condition (per house style: assert the domain rule, not
 //! the current output): reject-all of a stacked format must restore the ORIGINAL
@@ -122,7 +120,7 @@ fn any_bold_or_color(canon: &CanonDoc) -> bool {
 }
 
 #[test]
-fn stack_two_tracked_formats_then_reject_restores_original() {
+fn same_transaction_formats_compose_and_reject_restores_original() {
     let (base, ids) = doc_and_ids(&["Format me"]);
     let id = ids[0].clone();
     let bold = InlineMarkSet {
@@ -134,20 +132,14 @@ fn stack_two_tracked_formats_then_reject_restores_original() {
         ..RunStyleEdit::default()
     };
 
-    // Edit 1 (tracked): bold "Format".
-    let (e1, _) = apply_transaction(
-        &base,
-        &txn(vec![fmt_step(&id, bold, RunStyleEdit::default())]),
-    )
-    .expect("first tracked format (bold) applies");
-
-    // Edit 2 (tracked): recolor the SAME (now-tracked-formatted) run red. Before
-    // the fix this was rejected with UnsupportedParagraphStructure (B6).
     let (e2, _) = apply_transaction(
-        &e1,
-        &txn(vec![fmt_step(&id, InlineMarkSet::default(), red)]),
+        &base,
+        &txn(vec![
+            fmt_step(&id, bold, RunStyleEdit::default()),
+            fmt_step(&id, InlineMarkSet::default(), red),
+        ]),
     )
-    .expect("second tracked format on an already-formatted run must apply (B6)");
+    .expect("format steps in one transaction compose");
 
     // accept-all: the run carries BOTH bold and red.
     let mut acc = e2.clone();
@@ -167,5 +159,75 @@ fn stack_two_tracked_formats_then_reject_restores_original() {
     assert!(
         !any_bold_or_color(&rej),
         "reject-all restores the original run (no bold, no color), not the intermediate"
+    );
+}
+
+#[test]
+fn later_transaction_refuses_to_absorb_pending_format_revision() {
+    let (base, ids) = doc_and_ids(&["Format me"]);
+    let id = ids[0].clone();
+    let bold = InlineMarkSet {
+        bold: true,
+        ..InlineMarkSet::default()
+    };
+    let red = RunStyleEdit {
+        color: Some("FF0000".into()),
+        ..RunStyleEdit::default()
+    };
+    let (first, _) = apply_transaction(
+        &base,
+        &txn(vec![fmt_step(&id, bold, RunStyleEdit::default())]),
+    )
+    .expect("first proposal applies");
+
+    let before_refusal = first.clone();
+    let error = apply_transaction(
+        &first,
+        &txn(vec![fmt_step(&id, InlineMarkSet::default(), red)]),
+    )
+    .expect_err("a later transaction is an independent proposal");
+    assert!(
+        matches!(
+            error,
+            stemma::edit::EditError::FormatRevisionConflict { .. }
+        ),
+        "refusal names the existing format revision: {error:?}"
+    );
+    assert_eq!(first, before_refusal, "a refusal does not mutate its input");
+}
+
+#[test]
+fn direct_mode_refuses_to_flatten_pending_format_revision() {
+    let (base, ids) = doc_and_ids(&["Format me"]);
+    let id = ids[0].clone();
+    let bold = InlineMarkSet {
+        bold: true,
+        ..InlineMarkSet::default()
+    };
+    let (pending, _) = apply_transaction(
+        &base,
+        &txn(vec![fmt_step(&id, bold, RunStyleEdit::default())]),
+    )
+    .expect("tracked proposal applies");
+    let before = pending.clone();
+    let mut direct = txn(vec![fmt_step(
+        &id,
+        InlineMarkSet {
+            italic: true,
+            ..InlineMarkSet::default()
+        },
+        RunStyleEdit::default(),
+    )]);
+    direct.materialization_mode = MaterializationMode::Direct;
+
+    let error = apply_transaction(&pending, &direct)
+        .expect_err("direct mode cannot erase pending revision metadata");
+    assert!(matches!(
+        error,
+        stemma::edit::EditError::FormatRevisionConflict { .. }
+    ));
+    assert_eq!(
+        pending, before,
+        "direct refusal leaves the document unchanged"
     );
 }

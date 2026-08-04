@@ -96,6 +96,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -147,6 +148,8 @@ fn single_borders() -> BorderSet {
         right: Some(edge.clone()),
         inside_h: Some(edge.clone()),
         inside_v: Some(edge),
+        tl2br: None,
+        tr2bl: None,
     }
 }
 
@@ -585,6 +588,8 @@ fn set_cell_text_dropping_a_cell_opaque_is_refused() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             br#"<w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>"#.to_vec(),
         ),

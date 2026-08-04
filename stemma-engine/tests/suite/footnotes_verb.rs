@@ -25,6 +25,8 @@
 //!
 //! Daily tier, corpus-free (synthesized in-memory DOCX).
 
+use std::collections::HashSet;
+
 use stemma::api::Document;
 use stemma::docx::DocxArchive;
 use stemma::domain::{BlockNode, CanonDoc, InlineNode, NodeId, OpaqueKind, RevisionInfo};
@@ -302,6 +304,63 @@ fn first_footnote_synthesizes_part_and_round_trips() {
         footnote_story_ids(canon2).len(),
         1,
         "authored footnote survives round-trip"
+    );
+}
+
+#[test]
+fn tracked_insert_note_rejects_to_identity_after_save_and_reopen() {
+    let base = Document::parse(&make_docx("A clause needing a footnote here.")).expect("parse");
+    let block_id = first_block_id(&base.snapshot().canonical);
+    let edited = base
+        .apply(&txn(vec![insert_footnote(
+            block_id,
+            "footnote",
+            "Footnote body.",
+        )]))
+        .expect("apply");
+
+    let bytes = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let archive = DocxArchive::read(&bytes).expect("read exported");
+    let main = String::from_utf8_lossy(archive.get("word/document.xml").unwrap());
+    assert!(
+        main.contains("<w:ins") && main.contains("footnoteReference"),
+        "the body reference must serialize as tracked inserted content: {main}"
+    );
+
+    let reopened = Document::parse(&bytes).expect("reopen");
+    let identities: HashSet<u32> = stemma::enumerate_revisions(&reopened.snapshot().canonical)
+        .into_iter()
+        .map(|record| record.revision_id)
+        .collect();
+    assert_eq!(
+        identities.len(),
+        1,
+        "the body reference and note story are one selectable insertion"
+    );
+    let note_id = footnote_story_ids(&reopened.snapshot().canonical)
+        .into_iter()
+        .next()
+        .expect("authored note survives reopen");
+    let rejected = reopened
+        .project(Resolution::Selective {
+            ids: identities,
+            action: ResolveSelectionAction::Reject,
+        })
+        .expect("selectively reject note insertion");
+    let rejected_canon = rejected.snapshot().canonical.clone();
+    assert_eq!(
+        footnote_ref_count(&rejected_canon, &note_id),
+        0,
+        "reject after persistence removes the inserted reference"
+    );
+    assert!(
+        !rejected_canon
+            .footnotes
+            .iter()
+            .any(|story| story.id == note_id),
+        "reject after persistence removes the inserted story"
     );
 }
 
@@ -978,4 +1037,94 @@ fn delete_note_missing_reference_fails_loud() {
     }
     // No half-delete: the story is untouched.
     assert!(canon.footnotes.iter().any(|f| f.id == note_id));
+}
+
+/// An authored tracked note reopens in the shape it was authored in: the
+/// story's paragraph is a block-level `Inserted` with an untracked pilcrow,
+/// before AND after a save/reopen.
+///
+/// The persisted form is different by necessity — the serializer hoists the
+/// auto-number glyph run out of `w:ins`, so the wire carries an untracked
+/// ref run, inserted content, and an inserted paragraph mark. Import must
+/// recognize that trio as the one whole-paragraph insertion it was. When it
+/// does not (the glyph run blocked the lift), the SAME document holds one
+/// revision-carrier walk in memory and a different one after reopen, so
+/// every downstream consumer of the walk — enumeration, selective
+/// resolution, recorded identities — disagrees with what the author saw
+/// (wave-8 lifecycle 152).
+#[test]
+fn a_tracked_note_story_reopens_in_its_authored_block_shape() {
+    let base = Document::parse(&make_docx("A clause needing a footnote here.")).expect("parse");
+    let block_id = first_block_id(&base.snapshot().canonical);
+    let edited = base
+        .apply(&txn(vec![insert_footnote(
+            block_id,
+            "footnote",
+            "Footnote body.",
+        )]))
+        .expect("apply");
+    let authored = edited.snapshot().canonical.clone();
+    let note_id = footnote_story_ids(&authored)
+        .into_iter()
+        .next()
+        .expect("note story authored");
+    assert!(
+        matches!(
+            footnote_story_status(&authored, &note_id),
+            TrackingStatus::Inserted(_)
+        ),
+        "authored story is a block-level insertion"
+    );
+    let authored_records = stemma::enumerate_revisions(&authored).len();
+
+    let bytes = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let reopened = Document::parse(&bytes).expect("reopen");
+    let reopened_canon = reopened.snapshot().canonical.clone();
+    assert!(
+        matches!(
+            footnote_story_status(&reopened_canon, &note_id),
+            TrackingStatus::Inserted(_)
+        ),
+        "reopened story is the same block-level insertion, not a loose \
+         content-plus-pilcrow pair: {:?}",
+        footnote_story_status(&reopened_canon, &note_id)
+    );
+    let story_para = footnote_story_paragraph(&reopened_canon, &note_id);
+    assert!(
+        story_para.para_mark_status.is_none(),
+        "the lifted block subsumes the pilcrow"
+    );
+    // The auto-number decoration keeps ONE kind across authoring and reopen:
+    // the importer's `decoration_type_from_name` fallback (ForeignElement).
+    // Authoring it as any other kind makes the same note flip kind across a
+    // save, which is a canonical-tree difference every roundtrip law trips on.
+    let authored_kind = footnote_story_paragraph(&authored, &note_id)
+        .segments
+        .iter()
+        .flat_map(|segment| segment.inlines.clone())
+        .find_map(|inline| match inline {
+            stemma::domain::InlineNode::Decoration(decoration) => Some(decoration.kind),
+            _ => None,
+        })
+        .expect("authored note carries its auto-number decoration");
+    let reopened_kind = story_para
+        .segments
+        .iter()
+        .flat_map(|segment| segment.inlines.clone())
+        .find_map(|inline| match inline {
+            stemma::domain::InlineNode::Decoration(decoration) => Some(decoration.kind),
+            _ => None,
+        })
+        .expect("reopened note carries its auto-number decoration");
+    assert_eq!(
+        authored_kind, reopened_kind,
+        "the note auto-number decoration's kind survives the save/reopen"
+    );
+    assert_eq!(
+        stemma::enumerate_revisions(&reopened_canon).len(),
+        authored_records,
+        "the revision walk is the same length on both sides of the save"
+    );
 }

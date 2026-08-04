@@ -6,8 +6,8 @@ contracts. For a first successful workflow, start with
 
 `stemma` is the canonical local process contract for Stemma's focused workflow:
 apply an explicit approved worklist to an existing DOCX and create a native
-tracked-changes redline. It also exposes the engine's existing compare, read,
-resolve, and validate verbs. Install/build instructions live in
+tracked-changes redline. It also exposes the engine's existing compare,
+extract, read, resolve, and validate verbs. Install/build instructions live in
 [stemma-cli/README.md](https://github.com/stemma-sh/stemma/blob/main/stemma-cli/README.md).
 
 The compact product path is `inspect -> execute`: successful execution includes
@@ -64,10 +64,11 @@ durability promise.
 | `stemma verify <before> <after> [--policy tracked-delivery-v0]` | Certify any producer's result; exit `3` when policy fails. |
 | `stemma verify-task <manifest.json> [--root <dir>]` | Verify an MCP task delivery from its manifest and artifact files. |
 | `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. |
-| `stemma compare <base> <target> -o <out> [--author NAME]` | Diff two files into a redline (`reject-all == base`, `accept-all == target`); `--author` attributes the revisions. |
+| `stemma compare <base> <target> -o <out> [--author NAME] [--format text\|json]` | Diff two files into a redline (`reject-all == base`, `accept-all == target`); `--author` attributes the revisions; `--format json` emits a `stemma.compare_receipt.v0`. |
 | `stemma extract <file> [--format text\|json]` | Read the body as plain text (default) or structured JSON. |
-| `stemma resolve <file> -o <out> <disposition>` | Accept/reject tracked changes; write the result. |
-| `stemma validate <file>` | Parse + validate; print block/revision counts. |
+| `stemma read <file>` | Emit the full structured read model (`stemma.read.v0`): typed blocks with per-segment tracked status, plus the complete revision census. |
+| `stemma resolve <file> -o <out> <disposition> [--dry-run] [--format text\|json]` | Accept/reject tracked changes; write the result; `--format json` emits a `stemma.resolve_receipt.v0`. |
+| `stemma validate <file> [--format text\|json]` | Parse + validate; print block/revision counts, or a structured `stemma.validate.v0` result. |
 
 Exit codes: `0` complete success or verification pass, `1` an operational failure (bad file,
 invalid worklist, refused destination), `2` a usage error (clap), and `3` an
@@ -87,7 +88,37 @@ an incomplete task; it is not the same state as a verification mismatch.
 binds the projection to the input SHA-256, byte count, block count, and pending-
 revision count; the following addressable blocks retain revision and opaque-
 object annotations. `--format json` wraps the same projection in
-`stemma.inspect.v0`.
+`stemma.inspect.v1`: `{schema, input, block_count, pending_revision_count,
+projection}`, where the two `*_count` fields are integers and `projection` is
+the extended-Markdown text as one string. (v0 named the counts
+`blocks`/`pending_revisions`, colliding with the read model's `blocks`
+**array**; v1 renamed them so the two shapes cannot be conflated. The
+extended-Markdown projection and its `@stemma inspect.v0` header line are
+unchanged.) This wrapper is deliberately not structured render data; for the
+[read model](read-model.md)'s block array in one call, use
+[`read`](#read).
+
+### Extended-Markdown projection grammar
+
+The projection's inline annotations, for consumers that parse it:
+
+| Markup | Meaning |
+|---|---|
+| `<ins id=N by="Author">…</ins>` | Pending tracked insertion (`id` = the `revision_id` that `resolve --accept-ids` takes; `by` = author, `""` for the empty author group). |
+| `<del id=N by="Author">…</del>` | Pending tracked deletion. |
+| `<del id=N …>` + `<ins id=N …>` sharing one id | The two halves of ONE tracked move: the source's leaving text and the destination's arriving text. |
+| `<b>…</b>`, `<i>…</i>`, … | Formatting marks of the CURRENT state, not revision markers. |
+| `<obj id=… kind=table/>`, `<obj id=… kind=opaque …/>` | Non-text block anchors. |
+
+Two pending revision kinds deliberately carry **no inline marker** in this
+projection: a formatting change (`format_run` renders as its current marks,
+e.g. plain `<b>bold</b>`; `format_paragraph` as ordinary text) and a pending
+paragraph-mark insertion/deletion. The projection shows the current *reading*;
+it is not a complete revision inventory. To enumerate every pending revision
+(including formatting and paragraph-mark changes, with author, kind, block
+id, and a locating excerpt), pair the projection with
+[`extract --format json`](#extract), whose `revisions` array is complete by
+construction.
 
 `execute` is a visible alias for `apply`, and `--plan` is the corresponding
 alias for `--worklist`. Both routes execute `stemma.worklist.v0` through the
@@ -274,8 +305,16 @@ $ stemma compare memo.docx memo-v2.docx -o redline.docx
 wrote redline to redline.docx (2 tracked revisions); bytes=<n> sha256=<hex> collision_policy=create_new disposition=created
 ```
 
-The receipt goes to stderr; nothing goes to stdout. The output path must not
-exist. A destination equal to or aliasing either input is also refused.
+The human summary goes to stderr; stdout stays empty by default. The output
+path must not exist. A destination equal to or aliasing either input is also
+refused.
+
+`--format json` additionally emits a `stemma.compare_receipt.v0` on stdout:
+the exact `base`/`target` input identities, the requested `author` (`null`
+for an anonymous redline), the committed `output` identity (bytes, SHA-256,
+collision policy, disposition), and `revisions`: the full census of
+discovered revisions, same rows and ids as `extract --format json` on the
+output, so a consumer can drive `resolve` without a second read.
 
 > **Attribution.** By default the redline's tracked changes carry the engine's
 > own blank authorship because discovery has no authoring identity. Pass
@@ -306,7 +345,7 @@ deleted and `what are the chances` inserted). To read one side, resolve first.
 
 `--format json` gives blocks plus a `revisions` array of pending tracked
 changes. Each entry has its `revision_id` (the id `resolve --accept-ids`/`--reject-ids`
-takes), `kind`, `author`, `block_id`, and a short `excerpt`:
+takes), `kind`, `author`, `date`, `block_id`, and a short `excerpt`:
 
 ```
 $ stemma extract redline.docx --format json
@@ -323,6 +362,7 @@ $ stemma extract redline.docx --format json
       "revision_id": 3,
       "kind": "delete",
       "author": "",
+      "date": "",
       "block_id": "p_1",
       "excerpt": "now foo bar baz"
     },
@@ -330,12 +370,25 @@ $ stemma extract redline.docx --format json
       "revision_id": 4,
       "kind": "insert",
       "author": "",
+      "date": "",
       "block_id": "p_1",
       "excerpt": "what are the chances"
     }
   ]
 }
 ```
+
+`kind` is the engine's full revision vocabulary (the same closed set the
+[read model reference](read-model.md) documents), not just insert/delete:
+`insert`, `delete`, `move` (a source/destination pair enumerates as ONE
+atomic record), `format_run`, `format_paragraph`, `format_table`,
+`format_row`, `format_cell`, `format_section`, and `opaque_interior` (a
+change inside opaque content such as a textbox; individually resolvable only
+when it carries a nonzero `revision_id`; a census-only interior reports
+`revision_id: 0` and is never selectable). A consumer switching on `kind`
+must handle, or explicitly refuse, all ten: a real multi-party redline
+routinely carries moves and formatting changes alongside inserts and
+deletes.
 
 Fields are a projection of the engine's read view: `role` is one of `paragraph`,
 `heading` (with a `heading_level`), `table`, `opaque`; `style_id` and
@@ -348,11 +401,62 @@ addressing live in the richer reads, see the
 [read model reference](read-model.md)). For an
 `opaque` block, `text` is the empty string: an opaque block has no readable
 text, and this command emits no placeholder label for it.
-`author` is empty when the source change
-carried no `w:author` (Word anonymization, third-party tools, or a `compare`
-redline produced without `--author`). Revision ids are session handles read
-live from the document. Always re-run `extract` to get current ids. Never reuse
-ids from a previous run or from raw XML.
+`author` is the empty string when the source change carries a blank
+`w:author=""` (Word anonymization, third-party tools, or a `compare` redline
+produced without `--author`); the empty string is a real, selectable author
+group: `resolve --accept-author ""` / `--reject-author ""` target exactly
+those changes. A tracked change whose `w:author` attribute is entirely
+absent is refused at import (`InvalidDocx: missing required tracked change
+attribute: author`), so an extracted revision always has an `author` value.
+`date` is the change's `w:date` timestamp (ISO-8601), the same value the
+read model's `RevisionRecord.date` carries: empty when the source stamps a
+blank date (a `compare` redline does), omitted when the source carries no
+`w:date` at all.
+
+> **Id durability.** A `revision_id` is the engine's content-derived identity:
+> a hash of the change's kind, story, author, date, and content, plus a
+> disambiguating ordinal among identical duplicates. It is **not** the wire
+> `w:id`, and it is not a parse-order counter. The contract: the id of a
+> revision whose own content is untouched survives serialize/reopen and
+> survives a `resolve` of *other* revisions, so ids read before a selective
+> resolve remain valid against its output. The one edge: if resolving a change
+> alters a *surviving* revision's content (or removes an identical-signature
+> duplicate ahead of it), that survivor is re-keyed; a mixed `resolve --plan`
+> detects this at its internal phase boundary and refuses rather than
+> resolving the wrong revision. Ids never come from raw XML; always read
+> them from `extract`, `read`, or a receipt.
+
+## read
+
+Emit the engine's full structured [read model](read-model.md) in one call, as
+`stemma.read.v0` JSON on stdout:
+
+```
+$ stemma read redline.docx
+{
+  "schema": "stemma.read.v0",
+  "input": { "role": "input_docx", "supplied_path": "…", "digest": { … }, "bytes": … },
+  "blocks": [ … ],
+  "revisions": [ … ]
+}
+```
+
+`blocks` is the typed block array the read-model reference documents,
+serialized whole: every text segment carries its tracked `status` (`Normal`,
+or `Inserted`/`Deleted` with the revision's id, author, and date), its
+`marks`, and its span `handle`; blocks carry their `guard`, list membership,
+literal prefix, and (for tables) the cell grid. This is enough to render a
+redline view from one invocation. `revisions` is the same complete census as
+`extract --format json` (the segment view alone omits formatting-change
+records), so the ids that `resolve` selects on arrive in the same call.
+`extract` remains the compact body reading; `read` is the full-fidelity
+machine surface.
+
+Stability, same statement as the read-model reference: the envelope
+(`schema`, `input`, the presence of `blocks`/`revisions`) is the v0 contract,
+but the block shapes inside are the engine-version-bound read model. Fields
+are added between releases; render from it live, tolerate unknown fields, and
+never persist it (durability is DOCX bytes).
 
 ## resolve
 
@@ -364,6 +468,7 @@ disposition is required (clap enforces it):
 | `--accept-all` / `--reject-all` | Every pending change. |
 | `--accept-author <NAME>` / `--reject-author <NAME>` | Every change by that author. |
 | `--accept-ids <a,b,…>` / `--reject-ids <a,b,…>` | The named revision ids. |
+| `--plan <file.json>` | A `stemma.resolution_plan.v0` mixed disposition (below). |
 
 ```
 $ stemma resolve redline.docx -o final.docx --accept-all
@@ -372,16 +477,83 @@ $ stemma extract final.docx --format text
 This is a test what are the chances
 ```
 
-Accept keeps the new state; reject restores the prior state exactly. Marker
+Accept keeps the new state; reject restores the prior state exactly. This is
+total over the whole revision vocabulary, moves included: a `move` is one
+atomic revision (accepting lands the text at its destination, rejecting
+restores the source), and after `--accept-all` or `--reject-all` the output
+reports **zero** pending revisions; `stemma validate <out>` is the cheap
+post-condition check. Marker
 absence alone proves nothing, so verify by content. A selection that matches
 nothing fails loudly rather than writing an unchanged file: an unknown id, an
-author with no changes, or an accept/reject-all on a document with no pending
+author with no changes (the empty author group `--accept-author ""` included),
+or an accept/reject-all on a document with no pending
 changes are all errors, and no output is written.
 
 ```
 $ stemma resolve redline.docx -o out.docx --accept-ids 42
 error: revision id(s) 42 not found in redline.docx (pending ids: 3, 4)
 ```
+
+### Resolution plan v0
+
+`--plan <file.json>` expresses a mixed disposition. The flag selectors can
+only accept *or* reject per invocation; a plan does both in one call, one
+output, one receipt:
+
+```json
+{
+  "schema": "stemma.resolution_plan.v0",
+  "accept": { "authors": ["L. Marsh"], "ids": [17] },
+  "reject": { "authors": [""] },
+  "rest": "reject"
+}
+```
+
+- `accept` / `reject` each take `authors` (exact author groups; `""` is the
+  empty-author group) and/or `ids`. Both objects are optional, as is either
+  field within them.
+- `rest` disposes of every *selectable* pending revision no selector matched:
+  `"accept"`, `"reject"`, or `"leave"` (the default: a plan only resolves
+  what it names; this default is part of the contract).
+- Fail-loud, like the flags: an author with no pending changes, an unknown
+  id, an id selected by both sides, an unknown field (a misspelled selector
+  never silently selects nothing), a wrong `schema`, and a plan that resolves
+  nothing are all refused before anything is written.
+- Plans address the selectable census (`revision_id != 0`). Census-only
+  records (id `0`, e.g. some opaque-interior changes) are outside plan scope
+  and stay pending; only the total `--accept-all`/`--reject-all` resolve
+  those.
+- A mixed plan executes accepts before rejects internally. Revision ids are
+  content-derived and survive the internal phase (see **Id durability**
+  above); in the rare case an accepted change re-keys a survivor selected
+  for rejection, the command refuses with the affected ids rather than
+  resolving the wrong revision.
+
+The plan file is a protected source: the output path may not alias it.
+
+### Receipt and dry-run
+
+The human summary goes to stderr; stdout stays empty by default. `--format
+json` emits a `stemma.resolve_receipt.v0` on stdout:
+
+```json
+{
+  "schema": "stemma.resolve_receipt.v0",
+  "input": { "role": "input_docx", "supplied_path": "…", "digest": { … }, "bytes": … },
+  "dry_run": false,
+  "accepted": [ { "revision_id": 3, "kind": "delete", "author": "…", "block_id": "p_1", "excerpt": "…" } ],
+  "rejected": [ … ],
+  "remaining": [ … ],
+  "output": { "identity": { … }, "collision_policy": "create_new", "disposition": "created" }
+}
+```
+
+`accepted`/`rejected` partition the **input** document's census rows this call
+resolved; `remaining` enumerates what is still pending in the output (same row
+shape as `extract --format json`). `--dry-run` plans and reports the full
+outcome, receipt included, without writing anything: `output` is `null`,
+`dry_run` is `true`, and the destination is untouched (its create-new check
+runs only on a real write).
 
 ## validate
 
@@ -399,6 +571,22 @@ On failure, exit nonzero with the structured reason on stderr:
 $ stemma validate broken.docx
 error: broken.docx: not a valid DOCX (InvalidDocx: docx read failed: invalid Zip archive: Invalid zip header)
 ```
+
+`--format json` emits a `stemma.validate.v0` result on stdout, for valid
+**and** invalid packages alike (mirroring `verify`'s pass/fail contract):
+`{schema, status, input, block_count, pending_revision_count, issues}`, where
+`status` is `"ok"` or `"invalid"` and `issues` enumerates each validator
+finding (`code`, `message`, `context`), empty exactly when `ok`. An invalid
+package still exits `1`. Only an operational failure (unreadable file, not a
+parseable DOCX at all) stays on the `error:` stderr path in both formats.
+
+> **What import requires of a package.** Every command that reads a `.docx`
+> shares one fail-loud import: the package must carry `[Content_Types].xml`,
+> `_rels/.rels`, `word/document.xml`, **and** `word/_rels/document.xml.rels`.
+> The document-part relationships file is required even when it declares no
+> relationships; a structurally minimal package without it is refused
+> (`InvalidDocx: missing word/_rels/document.xml.rels`), not repaired. Tools
+> that generate fixture or test inputs must include all four parts.
 
 ## Recipes
 
@@ -428,3 +616,23 @@ stemma resolve markup.docx -o round2.docx --accept-author "L. Marsh"
 
 The output still carries every other author's changes, untouched; run
 `stemma extract round2.docx --format json` to confirm what remains pending.
+
+**Mixed outcome (accept one party, reject the rest).** One call, one plan,
+one receipt:
+
+```
+cat > plan.json <<'PLAN'
+{ "schema": "stemma.resolution_plan.v0",
+  "accept": { "authors": ["L. Marsh"] },
+  "rest": "reject" }
+PLAN
+stemma resolve markup.docx -o final.docx --plan plan.json --format json
+stemma validate final.docx        # expect: OK, 0 pending revisions
+```
+
+Preview the same plan without writing: add `--dry-run` and read the receipt's
+`accepted`/`rejected`/`remaining` partition. The multi-pass composition
+(`--accept-author` then `--reject-all` through an intermediate file) still
+works, and because revision ids are durable (see **Id durability**), ids
+read before the first pass remain valid for the second when their revisions
+were untouched.

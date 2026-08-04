@@ -2,7 +2,7 @@
 
 Everything stemma does is one pipeline:
 
-```
+```text
 DOCX bytes -> import -> CanonDoc -> edit / diff -> apply -> serialize -> DOCX bytes
 ```
 
@@ -25,18 +25,33 @@ reads, edits, and tracked-change resolution all reach.
 
 A document carrying tracked changes is really three documents at once: the
 text **as it stands** (changes pending), the text **if everything is
-accepted**, and the text **if everything is rejected**. Stemma exposes each
-as a read-only **projection** (`to_text` for the redline, `read_accepted`,
-`read_rejected`). Projections never mutate the stored document. They show what
-a reviewer will actually receive before you commit to it.
+accepted**, and the text **if everything is rejected**. Stemma exposes the
+resolved readings as **projections** (`read_accepted`, `read_rejected`; the
+redline itself is `to_text`). Projecting never mutates the source (every
+verb returns a new value), but the result is not a text view: a projection
+is a **full `Document`**, so you can read it, project it again, or serialize
+it as the resolved `.docx` a reviewer will actually receive.
 
-```rust
-// One file, three readings. `to_text()` is the redline (deletion AND insertion
-// visible); `read_accepted()` resolves as accepted; `read_rejected()` as rejected.
-let redline = edited.to_text();
-let accepted = edited.read_accepted().expect("accept-all").to_text();
-let rejected = edited.read_rejected().expect("reject-all").to_text();
-assert_ne!(accepted, rejected, "the two resolutions genuinely differ");
+```rust,no_run
+use stemma::api::{Document, ExportOptions, RuntimeError};
+
+fn three_readings(edited: &Document) -> Result<(), RuntimeError> {
+    // One file, three readings. `to_text()` is the redline (deletion AND
+    // insertion visible); `read_accepted()` resolves everything as accepted;
+    // `read_rejected()` as rejected.
+    let _redline = edited.to_text();
+    let accepted = edited.read_accepted()?;
+    let rejected = edited.read_rejected()?;
+    assert_ne!(
+        accepted.to_text(),
+        rejected.to_text(),
+        "the two resolutions genuinely differ"
+    );
+    // A projection is a full Document: serializing the accept-all projection
+    // writes the `.docx` a counterparty's "accept all" button would produce.
+    let _resolved_docx: Vec<u8> = accepted.serialize(&ExportOptions::default())?;
+    Ok(())
+}
 ```
 
 Runnable: `cargo run -p stemma --example walk_the_document`.
@@ -60,7 +75,10 @@ loudly instead of changing the wrong thing.
 ## Nothing leaves unvalidated
 
 Serialization runs a post-serialization OOXML linker before bytes are written.
-This structural validation pass checks the emitted package.
+This structural validation pass checks the emitted package, and it guards
+**every** exit: `Document::serialize` runs it by default
+(`ExportOptions::default()` gates at the blocking level; opting out is the
+explicit, engine-internal `ExportOptions::unchecked`), and
 `save_docx` refuses to persist a structurally corrupt file. Transport output
 commits are create-new: inputs and every existing destination are refused.
 Bytes are staged beside the destination, committed without clobbering, and

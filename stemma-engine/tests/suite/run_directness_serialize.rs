@@ -41,7 +41,7 @@ use stemma::runtime::ExportOptions;
 ///    subject).
 fn make_cascade_docx() -> Vec<u8> {
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:t>Inherited</w:t></w:r><w:r><w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/></w:rPr><w:t>Direct</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Normal"/></w:pPr><w:r><w:t>Inherited</w:t></w:r><w:r><w:rPr><w:rFonts w:ascii="Courier New"/></w:rPr><w:t>Direct</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
 
     let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Cambria" w:hAnsi="Cambria"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="FancyBody"><w:name w:val="Fancy Body"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/></w:rPr></w:style></w:styles>"#;
@@ -246,6 +246,10 @@ fn authored_direct_font_is_preserved() {
     assert!(
         xml.contains(r#"w:ascii="Courier New""#),
         "an authored direct font must survive re-serialization: {xml}"
+    );
+    assert!(
+        !xml.contains(r#"w:hAnsi="Courier New""#),
+        "an absent hAnsi slot is authored state, not permission to synthesize it: {xml}"
     );
 }
 

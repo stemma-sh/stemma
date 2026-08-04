@@ -645,6 +645,7 @@ fn compare_paragraphs(
         para_mark_status,
         paragraph_mark_marks,
         paragraph_mark_style_props,
+        paragraph_mark_rfonts,
         paragraph_mark_rpr_off,
         para_split,
         section_property_change,
@@ -719,6 +720,7 @@ fn compare_paragraphs(
         para_mark_status: b_para_mark_status,
         paragraph_mark_marks: b_paragraph_mark_marks,
         paragraph_mark_style_props: b_paragraph_mark_style_props,
+        paragraph_mark_rfonts: b_paragraph_mark_rfonts,
         paragraph_mark_rpr_off: b_paragraph_mark_rpr_off,
         para_split: b_para_split,
         section_property_change: b_section_property_change,
@@ -883,6 +885,12 @@ fn compare_paragraphs(
         &format!("{path}.paragraph_mark_style_props"),
         paragraph_mark_style_props,
         b_paragraph_mark_style_props,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.paragraph_mark_rfonts"),
+        paragraph_mark_rfonts,
+        b_paragraph_mark_rfonts,
     );
     compare_val(
         diffs,
@@ -1072,6 +1080,12 @@ fn compare_opt_formatting_change(
             );
             compare_val(
                 diffs,
+                &format!("{path}.previous_paragraph_mark_rfonts"),
+                &fa.previous_paragraph_mark_rfonts,
+                &fb.previous_paragraph_mark_rfonts,
+            );
+            compare_val(
+                diffs,
                 &format!("{path}.previous_paragraph_mark_rpr_off"),
                 &fa.previous_paragraph_mark_rpr_off,
                 &fb.previous_paragraph_mark_rpr_off,
@@ -1100,18 +1114,69 @@ fn compare_tracked_segments(
     // a rebuild folds back into its neighbor. Same status, same inline
     // sequence ⇒ same content. Statuses compare by full value, so segments
     // of DIFFERENT revisions (or different kinds) never merge.
-    fn coalesce(segs: &[TrackedSegment]) -> Vec<(&TrackingStatus, Vec<&InlineNode>)> {
-        let mut out: Vec<(&TrackingStatus, Vec<&InlineNode>)> = Vec::new();
+    fn coalesce(segs: &[TrackedSegment]) -> Vec<(&TrackingStatus, Vec<InlineNode>)> {
+        // `w:lastRenderedPageBreak` (§17.3.3.16) is the pagination CACHE —
+        // "as of the last time the document was repaginated" — and every
+        // producer recomputes, moves or drops it on save (real Word does;
+        // wave-8 real-word run-partition family). It round-trips faithfully
+        // through serialization for untouched content, but its presence is
+        // render state, not document state, so it does not participate in
+        // canonical equality.
+        fn is_pagination_cache(inline: &InlineNode) -> bool {
+            matches!(inline, InlineNode::Decoration(decoration)
+            if decoration.raw_xml.as_deref().is_some_and(|raw| {
+                let raw = String::from_utf8_lossy(raw);
+                raw.contains("lastRenderedPageBreak")
+            }))
+        }
+        fn text_can_join(left: &TextNode, right: &TextNode) -> bool {
+            left.text_role == right.text_role
+                && left.marks == right.marks
+                && left.style_props == right.style_props
+                && left.source_run_attrs == right.source_run_attrs
+                && left.formatting_change == right.formatting_change
+        }
+
+        let mut out: Vec<(&TrackingStatus, Vec<InlineNode>)> = Vec::new();
+        let mut cache_since_content = false;
         for seg in segs {
             // Exhaustive destructure: a new TrackedSegment field must be handled.
             let TrackedSegment { status, inlines } = seg;
-            if let Some((last_status, last_inlines)) = out.last_mut()
-                && *last_status == status
-            {
-                last_inlines.extend(inlines.iter());
+            if inlines.is_empty() {
+                cache_since_content = false;
+                if out
+                    .last()
+                    .is_none_or(|(last_status, _)| *last_status != status)
+                {
+                    out.push((status, Vec::new()));
+                }
                 continue;
             }
-            out.push((status, inlines.iter().collect()));
+            for inline in inlines {
+                if is_pagination_cache(inline) {
+                    cache_since_content = true;
+                    continue;
+                }
+                if out
+                    .last()
+                    .is_none_or(|(last_status, _)| *last_status != status)
+                {
+                    out.push((status, Vec::new()));
+                    cache_since_content = false;
+                }
+                let output_inlines = &mut out.last_mut().expect("group was created").1;
+                if cache_since_content
+                    && let (Some(InlineNode::Text(left)), InlineNode::Text(right)) =
+                        (output_inlines.last_mut(), inline)
+                    && text_can_join(left, right)
+                {
+                    left.text.push_str(&right.text);
+                    cache_since_content = false;
+                    continue;
+                }
+                output_inlines.push(inline.clone());
+                cache_since_content = false;
+            }
         }
         out
     }
@@ -1196,11 +1261,23 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
             let HardBreakNode {
                 id: _, // ephemeral NodeId
                 break_type,
+                type_is_explicit,
+                clear,
+                wrapper_marks,
+                wrapper_style_props,
+                wrapper_rpr_authored,
+                source_run_attrs,
                 joins_following_text_run,
             } = ha;
             let HardBreakNode {
                 id: _,
                 break_type: b_break_type,
+                type_is_explicit: b_type_is_explicit,
+                clear: b_clear,
+                wrapper_marks: b_wrapper_marks,
+                wrapper_style_props: b_wrapper_style_props,
+                wrapper_rpr_authored: b_wrapper_rpr_authored,
+                source_run_attrs: b_source_run_attrs,
                 joins_following_text_run: b_joins_following_text_run,
             } = hb;
             compare_val(
@@ -1208,6 +1285,37 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 &format!("{path}.break_type"),
                 break_type,
                 b_break_type,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.type_is_explicit"),
+                type_is_explicit,
+                b_type_is_explicit,
+            );
+            compare_val(diffs, &format!("{path}.clear"), clear, b_clear);
+            compare_val(
+                diffs,
+                &format!("{path}.wrapper_marks"),
+                wrapper_marks,
+                b_wrapper_marks,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.wrapper_style_props"),
+                wrapper_style_props,
+                b_wrapper_style_props,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.wrapper_rpr_authored"),
+                wrapper_rpr_authored,
+                b_wrapper_rpr_authored,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.source_run_attrs"),
+                source_run_attrs,
+                b_source_run_attrs,
             );
             compare_val(
                 diffs,
@@ -1299,6 +1407,8 @@ fn compare_opaque_inlines(
         proof_ref: _,  // ephemeral proof bookkeeping
         wrapper_marks,
         wrapper_style_props,
+        source_run_attrs,
+        joins_following_text_run,
         // raw_xml carries the verbatim bytes; its identity is summarized by
         // content_hash, which we DO compare. Comparing raw bytes directly would
         // be redundant and noisier (equal hash ⇒ equal bytes).
@@ -1312,6 +1422,8 @@ fn compare_opaque_inlines(
         proof_ref: _,
         wrapper_marks: b_wrapper_marks,
         wrapper_style_props: b_wrapper_style_props,
+        source_run_attrs: b_source_run_attrs,
+        joins_following_text_run: b_joins_following_text_run,
         raw_xml: _,
         content_hash: b_content_hash,
     } = b;
@@ -1327,6 +1439,18 @@ fn compare_opaque_inlines(
         &format!("{path}.wrapper_style_props"),
         wrapper_style_props,
         b_wrapper_style_props,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.source_run_attrs"),
+        source_run_attrs,
+        b_source_run_attrs,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.joins_following_text_run"),
+        joins_following_text_run,
+        b_joins_following_text_run,
     );
     compare_opt(
         diffs,
@@ -1991,6 +2115,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,
@@ -2076,6 +2201,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,
@@ -2294,6 +2420,7 @@ mod tests {
                 para_mark_status: None,
                 paragraph_mark_marks: vec![],
                 paragraph_mark_style_props: StyleProps::default(),
+                paragraph_mark_rfonts: Default::default(),
                 paragraph_mark_rpr_off: Default::default(),
                 para_split: false,
                 section_property_change: None,

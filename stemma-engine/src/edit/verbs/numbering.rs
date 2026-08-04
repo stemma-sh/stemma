@@ -357,11 +357,18 @@ fn apply_to_paragraph(
                 // Snapshot AUTHORED-direct indent/spacing (the previous DIRECT
                 // pPr), not the resolved effective value — see
                 // snapshot_paragraph_formatting.
-                previous_indentation: para.authored_indent.clone().or_else(|| para.indent.clone()),
+                previous_indentation: para
+                    .has_direct_indent
+                    .then(|| para.authored_indent.clone().or_else(|| para.indent.clone()))
+                    .flatten(),
                 previous_spacing: para
-                    .authored_spacing
-                    .clone()
-                    .or_else(|| para.spacing.clone()),
+                    .has_direct_spacing
+                    .then(|| {
+                        para.authored_spacing
+                            .clone()
+                            .or_else(|| para.spacing.clone())
+                    })
+                    .flatten(),
                 previous_numbering,
                 previous_numbering_explicitly_absent,
                 previous_style_id: para.style_id.clone(),
@@ -378,6 +385,7 @@ fn apply_to_paragraph(
                     .literal_prefix_trailing_tab_stop_twips,
                 previous_paragraph_mark_marks: para.paragraph_mark_marks.clone(),
                 previous_paragraph_mark_style_props: para.paragraph_mark_style_props.clone(),
+                previous_paragraph_mark_rfonts: para.paragraph_mark_rfonts.clone(),
                 previous_paragraph_mark_rpr_off: para.paragraph_mark_rpr_off,
                 previous_text_direction: para.text_direction.clone(),
                 previous_text_alignment: para.text_alignment.clone(),
@@ -711,6 +719,7 @@ mod tests {
             para_mark_status: None,
             paragraph_mark_marks: vec![],
             paragraph_mark_style_props: StyleProps::default(),
+            paragraph_mark_rfonts: Default::default(),
             paragraph_mark_rpr_off: Default::default(),
             para_split: false,
             section_property_change: None,

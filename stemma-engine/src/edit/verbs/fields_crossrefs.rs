@@ -325,6 +325,8 @@ fn synthesize_new_field_inline(id: &NodeId, spec: &RefFieldSpec) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: None,
         content_hash: None,
     })

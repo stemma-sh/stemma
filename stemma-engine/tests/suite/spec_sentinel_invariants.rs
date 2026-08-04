@@ -1437,3 +1437,104 @@ fn extract_part(docx_bytes: &[u8], part: &str) -> String {
     file.read_to_string(&mut s).expect("read part as UTF-8");
     s
 }
+
+// A row deletion must compose with revisions already present inside that row.
+// The superscript "7" is a pending insertion in the source, so rejecting ALL
+// changes must still remove it; rejecting the later row deletion cannot erase
+// the insertion's independent provenance.
+fn table_row_with_preexisting_inline_insertion() -> Vec<u8> {
+    pack(&document(
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>s. 12(1)</w:t></w:r><w:ins w:id="195" w:author="source" w:date="2015-12-11T06:20:00Z"><w:r><w:t xml:space="preserve"> </w:t></w:r><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>7</w:t></w:r></w:ins></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>keep</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+    ))
+}
+
+fn archive_reject_text(bytes: &[u8]) -> String {
+    let archive = stemma::docx::DocxArchive::read(bytes).expect("read sentinel archive");
+    let (rejected, _) =
+        stemma::normalize::reject_all_docx(&archive).expect("archive reject sentinel");
+    let rejected_bytes = rejected.write().expect("write rejected sentinel");
+    let rejected_doc =
+        stemma::api::Document::parse(&rejected_bytes).expect("parse rejected sentinel");
+    rejected_doc.to_text()
+}
+
+#[test]
+fn sentinel_partial_paragraph_insert_does_not_capture_normal_literal_prefix() {
+    let class = "partial-paragraph-insert-with-normal-literal-prefix";
+    let source = pack(&document(
+        r#"<w:p><w:pPr><w:rPr><w:ins w:id="1" w:author="source" w:date="2026-01-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:tab/><w:t>(b)</w:t></w:r><w:r><w:tab/></w:r><w:ins w:id="2" w:author="source" w:date="2026-01-01T00:00:00Z"><w:r><w:t>replacement branch</w:t></w:r></w:ins></w:p><w:p><w:r><w:t>baseline branch</w:t></w:r></w:p>"#,
+    ));
+    let expected = archive_reject_text(&source);
+    assert!(
+        expected.contains("(b)"),
+        "[{class}] the source label is outside w:ins and belongs to the reject baseline"
+    );
+
+    let rebuilt = stemma::api::Document::parse(&source)
+        .expect("parse partial-insert sentinel")
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize partial-insert sentinel");
+    assert_validator_clean(class, &rebuilt);
+    assert_eq!(
+        archive_reject_text(&rebuilt),
+        expected,
+        "[{class}] identity rebuild must not pull an untracked literal prefix into the paragraph insertion"
+    );
+}
+
+#[test]
+fn sentinel_row_delete_preserves_nested_revision_reject_fixpoint() {
+    let class = "row-delete-over-preexisting-inline-insertion";
+    let source = table_row_with_preexisting_inline_insertion();
+    let doc = stemma::api::Document::parse(&source).expect("parse row-delete sentinel");
+    let table_id = doc
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|tracked| match &tracked.block {
+            BlockNode::Table(table) => Some(table.id.to_string()),
+            _ => None,
+        })
+        .expect("sentinel table id");
+    let json = format!(
+        r#"{{"ops":[{{"op":"table_op","target":"{table_id}","table_op":{{"kind":"delete_row","row_index":0}}}}],"revision":{{"author":"later"}}}}"#
+    );
+    let transaction = stemma::edit_v4::parse_transaction(&json)
+        .expect("parse row-delete transaction")
+        .into_edit_transaction()
+        .expect("translate row-delete transaction");
+    let baseline_text = all_text(
+        &doc.project(stemma::Resolution::RejectAll)
+            .expect("resolve source baseline")
+            .snapshot()
+            .canonical,
+    );
+    let edited = doc.apply(&transaction).expect("apply row deletion");
+
+    let redline = edited
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize composed row deletion");
+    assert_validator_clean(class, &redline);
+
+    // Reparse the emitted OOXML before resolving: this catches a serializer
+    // that flattened the inner insertion even if the in-memory model was sound.
+    let reparsed = stemma::api::Document::parse(&redline).expect("reparse composed redline");
+    let rejected = reparsed
+        .project(stemma::Resolution::RejectAll)
+        .expect("reject all composed revisions");
+    assert_eq!(
+        all_text(&rejected.snapshot().canonical),
+        baseline_text,
+        "[{class}] reject-all must equal the source baseline; the pending inserted 7 must not survive"
+    );
+
+    let accepted = reparsed
+        .project(stemma::Resolution::AcceptAll)
+        .expect("accept all composed revisions");
+    assert_eq!(
+        all_text(&accepted.snapshot().canonical).trim(),
+        "keep",
+        "[{class}] accept-all must remove the deleted row"
+    );
+}

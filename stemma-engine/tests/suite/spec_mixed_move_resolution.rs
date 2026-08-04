@@ -145,6 +145,78 @@ fn accepting_move_keeps_later_edit_at_destination() {
     );
 }
 
+#[test]
+fn full_resolution_removes_every_imported_move_carrier() {
+    let source = make_docx_with_body(MOVE_THEN_INSERT);
+    for resolution in [Resolution::AcceptAll, Resolution::RejectAll] {
+        let resolved = Document::parse(&source)
+            .unwrap()
+            .project(resolution)
+            .unwrap();
+        assert!(stemma::enumerate_revisions(&resolved.snapshot().canonical).is_empty());
+
+        let bytes = resolved.serialize(&ExportOptions::default()).unwrap();
+        let archive = stemma::docx::DocxArchive::read(&bytes).unwrap();
+        let xml = String::from_utf8(archive.get("word/document.xml").unwrap().to_vec()).unwrap();
+        assert!(
+            !xml.contains("<w:moveFrom") && !xml.contains("<w:moveTo"),
+            "full projection left imported move markup: {xml}"
+        );
+    }
+}
+
+/// DOMAIN RULE (real Word): proofing-error ranges are ephemeral editor state.
+/// Identity rebuild preserves them, but full Accept All / Reject All clears
+/// them along with the revision operation. Leaving them behind makes Word's
+/// next save perform a proofing rewrite and changes run shaping.
+///
+/// The runs a proofErr split rejoin; the run boundary the accepted INSERTION
+/// contributed does not. Adjudicated against real Word on the same shape
+/// (`Alpha <proofErr/> Beta <w:ins>Gamma</w:ins>` accepts to `AlphaBeta` plus a
+/// separate `Gamma`). This test previously expected one welded run across the
+/// insertion boundary, which Word does not produce.
+#[test]
+fn full_resolution_clears_proofing_ranges_but_identity_preserves_them() {
+    let source = make_docx_with_body(
+        r#"<w:p><w:r><w:t>Stem</w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t>m</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r><w:t>a</w:t></w:r><w:ins w:id="1" w:author="Editor" w:date="2026-01-01T00:00:00Z"><w:r><w:t> works</w:t></w:r></w:ins></w:p>"#,
+    );
+
+    let identity = Document::parse(&source)
+        .unwrap()
+        .serialize(&ExportOptions::default())
+        .unwrap();
+    let identity_archive = stemma::docx::DocxArchive::read(&identity).unwrap();
+    let identity_xml =
+        String::from_utf8(identity_archive.get("word/document.xml").unwrap().to_vec()).unwrap();
+    assert_eq!(identity_xml.matches("<w:proofErr").count(), 2);
+
+    for (resolution, expected_runs) in [
+        (Resolution::AcceptAll, vec!["Stemma", " works"]),
+        (Resolution::RejectAll, vec!["Stemma"]),
+    ] {
+        let bytes = Document::parse(&source)
+            .unwrap()
+            .project(resolution)
+            .unwrap()
+            .serialize(&ExportOptions::default())
+            .unwrap();
+        let archive = stemma::docx::DocxArchive::read(&bytes).unwrap();
+        let xml = String::from_utf8(archive.get("word/document.xml").unwrap().to_vec()).unwrap();
+        assert!(
+            !xml.contains("<w:proofErr"),
+            "full resolution left ephemeral proofing markup: {xml}"
+        );
+        for expected in &expected_runs {
+            let literal = format!("<w:t>{expected}</w:t>");
+            let preserved = format!("<w:t xml:space=\"preserve\">{expected}</w:t>");
+            assert!(
+                xml.contains(&literal) || xml.contains(&preserved),
+                "expected run {expected:?} after full resolution: {xml}"
+            );
+        }
+    }
+}
+
 const INSERT_THEN_MOVE: &str = concat!(
     r#"<w:p><w:pPr><w:rPr><w:ins w:id="0" w:author="Origin" w:date="2026-01-01T00:00:00Z"/><w:moveFrom w:id="1" w:author="Mover" w:date="2026-01-02T00:00:00Z"/></w:rPr></w:pPr>"#,
     r#"<w:moveFromRangeStart w:id="2" w:author="Mover" w:date="2026-01-02T00:00:00Z" w:name="move2"/>"#,

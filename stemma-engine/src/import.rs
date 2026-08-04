@@ -21,11 +21,12 @@ use crate::domain::{
     MarkValue, NodeId, NoteReferenceData, NoteType, OpaqueBlockNode, OpaqueKind, ParagraphBorders,
     ParagraphFormattingChange, ParagraphNode, ParagraphSpacing, ProofRef, RangeMarkerMeta,
     RevisionInfo, RowFormattingChange, RunRprAuthored, SCHEMA_VERSION_V0, SdtWrapper,
-    SectionPropertyChange, SectionType, Shading, ShadingPattern, StoryPayload, StyleProps, SymData,
-    TableCellNode, TableFormatting, TableFormattingChange, TableLayout, TableMeasurement,
-    TableNode, TableOverlap, TablePositioning, TableRowNode, TblLook, TextDirection, TextEffect,
-    TextNode, TrackedBlock, TrackedSegment, TrackingStatus, UnderlineStyle, VAnchor,
-    VerticalAlignment, VerticalMerge, WidthType, XAlign, YAlign, normal_tracked_block,
+    SectionPropertyChange, SectionType, Shading, ShadingPattern, StoryPayload, StoryScope,
+    StyleProps, SymData, TableCellNode, TableFormatting, TableFormattingChange, TableLayout,
+    TableMeasurement, TableNode, TableOverlap, TablePositioning, TableRowNode, TblLook,
+    TextDirection, TextEffect, TextNode, TrackedBlock, TrackedSegment, TrackingStatus,
+    UnderlineStyle, VAnchor, VerticalAlignment, VerticalMerge, WidthType, XAlign, YAlign,
+    normal_tracked_block,
 };
 use crate::runtime::{
     COMMENTS_EXTENDED_REL_TYPE, COMMENTS_REL_TYPE, CUSTOM_XML_REL_TYPE, Diagnostic,
@@ -103,6 +104,9 @@ fn map_docx_error(err: DocxError) -> RuntimeError {
             "docx rejected: duplicate ZIP part name {name:?} (case-equivalent to {existing:?}); \
              part names must be unique (OPC §6.2, §7.3) — Word reports such packages as corrupt"
         ),
+        DocxError::InvalidWrittenZip(detail) => {
+            format!("docx write produced an invalid ZIP central directory: {detail}")
+        }
     };
     RuntimeError {
         code: ErrorCode::InvalidDocx,
@@ -302,6 +306,29 @@ fn capture_unmodeled_children(
         });
     }
     out
+}
+
+/// The paragraph mark's `StyleProps` without a verbatim `w:rFonts` remainder.
+///
+/// `paragraph_mark_rfonts` is the exact record of that element — every
+/// attribute it can carry, `w:hint` included — and the serializer re-emits the
+/// mark's fonts from it. A verbatim copy beside it is the same fact stored
+/// twice, and only the copy carries attribute ORDER, which the emitter writes
+/// in its own fixed slot order. A save and reopen therefore returned a mark
+/// whose preserved copy no longer matched the one in memory even though every
+/// attribute was identical. Runs keep their copy: there `font_family` is a
+/// lossy projection and the remainder is the only record of an independently
+/// authored slot.
+fn paragraph_mark_props_without_rfonts(marks: &TextMarks) -> Result<StyleProps, RuntimeError> {
+    let mut props = convert_text_marks_to_style_props(marks)?;
+    props.preserved.retain(|prop| {
+        !prop
+            .name
+            .split(':')
+            .next_back()
+            .is_some_and(|local| local == "rFonts")
+    });
+    Ok(props)
 }
 
 /// Build a canonical from a DOCX, normalizing (accepting) any pre-existing
@@ -603,9 +630,9 @@ pub(crate) fn for_each_revision_id_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(&mu
 pub(crate) struct RevCarrierMut<'a> {
     /// The minted-identity slot. `0` = not yet minted.
     pub identity: &'a mut u32,
-    /// The wire `w:id`. Grouping key for a non-move carrier (Word keeps it
-    /// constant across the several carriers of ONE `w:ins`/`w:del`, e.g. an
-    /// inserted paragraph's content segment and its paragraph mark).
+    /// The wire `w:id`. Grouping key for a non-move carrier. Separate OOXML
+    /// envelopes normally have separate annotation ids; structurally proven
+    /// multi-envelope intentions are reunited before canonical minting.
     pub wire_id: u32,
     /// Author (`""` when absent) — part of the non-move grouping key, so two
     /// unrelated carriers that merely collide on a reused wire `w:id` but carry
@@ -619,6 +646,12 @@ pub(crate) struct RevCarrierMut<'a> {
     /// move enumerates as one record and resolves atomically. `None` for
     /// formatting changes (always their own revision) and non-move content.
     pub move_group: Option<String>,
+    /// Formatting-change elements are independent OOXML annotations even when
+    /// they happen to reuse the same wire id/author/date. The serializer must
+    /// give sibling `rPrChange` elements distinct annotation ids, so folding
+    /// them through the ordinary wire group here would split one in-memory
+    /// identity into several identities on reopen.
+    pub force_distinct: bool,
 }
 
 /// Visit every tracked-change carrier mutably WITH its identity-grouping
@@ -648,6 +681,7 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                 author: r.author.clone().unwrap_or_default(),
                 date: r.date.clone(),
                 move_group: carrier_move_group,
+                force_distinct: false,
                 identity: &mut r.identity,
             });
         };
@@ -684,6 +718,7 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
             author: author.to_string(),
             date: date.clone(),
             move_group: None,
+            force_distinct: true,
             identity,
         });
     }
@@ -856,11 +891,13 @@ fn move_signature_from_block(block: &BlockNode) -> Option<(String, Option<String
 /// witness ever appears.
 ///
 /// The identity is a deterministic digest of the canonical revision record,
-/// including grouped components, semantic payload, story, attribution, and a
-/// duplicate ordinal. Raw OOXML `w:id` and importer-assigned block ids are
-/// deliberately absent. Consequently an unchanged revision receives the same
-/// identity when a Stemma-produced artifact is saved and reopened even though
-/// serialization is free to replace every wire id.
+/// including grouped components, semantic payload, story, and attribution.
+/// When every record in a group has only a generic/empty excerpt, its carrier
+/// block is also part of the signature: otherwise several same-author
+/// paragraph-format changes are indistinguishable and a document-order
+/// duplicate ordinal changes meaning when a new proposal is authored before an
+/// existing one. Content-bearing groups remain independent of importer block
+/// ids. Raw OOXML `w:id` is transport metadata and remains deliberately absent.
 ///
 /// Idempotent-additive: carriers already carrying a non-zero identity keep it
 /// (identity is STABLE across an instance's lineage). Newly-authored groups are
@@ -869,7 +906,147 @@ fn move_signature_from_block(block: &BlockNode) -> Option<(String, Option<String
 /// on reopen. Called at the end of import AND after every `apply_transaction`;
 /// NOT called on the projection path, where identities ride forward
 /// structurally rather than being re-derived.
-pub(crate) fn mint_identities(doc: &mut CanonDoc) {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RevisionIdentityCollision {
+    pub candidate: u32,
+    pub records: String,
+}
+
+impl std::fmt::Display for RevisionIdentityCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canonical revision identity digest prefix {} is already occupied for {}",
+            self.candidate, self.records
+        )
+    }
+}
+
+/// Count and content digest of the ordered revision-carrier walk.
+///
+/// The digest deliberately EXCLUDES wire ids: Word re-mints them freely — the
+/// fact H7 exists to survive — so a key built on them can silently swap the
+/// identities of lookalike revisions, or collapse two lookalikes that collide
+/// on a reused id. Author and date per carrier, in walk order, plus the
+/// count, pin the walk tightly enough that any carrier another editor adds,
+/// removes or reorders changes the digest — while a save/reopen of our own
+/// emission reproduces it exactly. An untracked in-place edit inside an
+/// existing revision leaves the digest intact, and adoption is correct there:
+/// the proposal was amended, not replaced.
+pub(crate) fn revision_walk_digest(doc: &mut CanonDoc) -> (usize, String) {
+    let mut input: Vec<u8> = b"stemma.revision_walk.v1\0".to_vec();
+    let mut count = 0usize;
+    for_each_rev_carrier_mut(doc, &mut |carrier| {
+        count += 1;
+        input.extend_from_slice(&(carrier.author.len() as u32).to_le_bytes());
+        input.extend_from_slice(carrier.author.as_bytes());
+        match &carrier.date {
+            Some(date) => {
+                input.push(1);
+                input.extend_from_slice(&(date.len() as u32).to_le_bytes());
+                input.extend_from_slice(date.as_bytes());
+            }
+            None => input.push(0),
+        }
+    });
+    (count, sha256_hex(&input))
+}
+
+/// Adopt the engine identities a previous save recorded in
+/// `word/stemmaRevisionIds.xml`, so reopening does not re-derive them.
+///
+/// The whole part is a HINT that must corroborate: it names the carrier walk
+/// it describes (count + [`revision_walk_digest`]), and it is adopted only
+/// when this document's walk matches — all or nothing, POSITIONALLY (entry i
+/// names carrier i of the walk). Anything else — a document another editor
+/// changed, a foreign document, a stale or malformed part — is ignored and
+/// falls through to derivation exactly as before. That keeps derivation as
+/// the floor: a document without the part, or with a part that no longer
+/// describes it, behaves precisely as it did. This is a named isolation
+/// boundary, observable under `STEMMA_DEBUG_IDENTITY`.
+///
+/// Positional-under-digest rather than keyed on per-carrier attributes: a key
+/// that includes the wire id trusts the one attribute Word rewrites freely
+/// (a rewrite that happens to land every carrier on some recorded triple
+/// silently SWAPS lookalikes' identities), and no per-carrier key can
+/// separate genuinely indistinguishable carriers at all. Once the digest has
+/// pinned the walk, position is exact.
+///
+/// Runs AFTER minting and the whole-paragraph lifts, OVERWRITING the derived
+/// identities wholesale. It cannot run earlier: the lifts fold an inserted
+/// paragraph's content and pilcrow carriers into one block carrier, and the
+/// writer digests that post-lift walk — a pre-lift reader counts two carriers
+/// where the writer counted one and the digest never matches. Overwriting
+/// whole keeps the two id regimes from ever mixing: the document leaves this
+/// function either entirely on its recorded identities or entirely on the
+/// derived ones.
+fn adopt_persisted_revision_identities(archive: &DocxArchive, doc: &mut CanonDoc) {
+    let debug = std::env::var("STEMMA_DEBUG_IDENTITY").is_ok();
+    let decline = |reason: &str| {
+        if debug {
+            eprintln!("SIDECAR DECLINED: {reason}");
+        }
+    };
+    let Some(bytes) = archive.get(crate::runtime::REVISION_IDS_PART) else {
+        return;
+    };
+    let Ok(root) = Element::parse(std::io::Cursor::new(bytes.to_vec())) else {
+        // A malformed sidecar is not worth failing an import over: it is an
+        // optimization, and derivation still produces a correct document. It
+        // IS worth not trusting.
+        decline("part is not well-formed XML");
+        return;
+    };
+    let (Some(recorded_count), Some(recorded_walk)) = (
+        crate::xml_attrs::attr_get(&root, "carriers").and_then(|v| v.parse::<usize>().ok()),
+        crate::xml_attrs::attr_get(&root, "walk").cloned(),
+    ) else {
+        decline("root lacks carriers/walk attributes (older or foreign writer)");
+        return;
+    };
+    let mut identities: Vec<u32> = Vec::new();
+    for child in &root.children {
+        let XMLNode::Element(entry) = child else {
+            continue;
+        };
+        let Some(identity) =
+            crate::xml_attrs::attr_get(entry, "identity").and_then(|v| v.parse().ok())
+        else {
+            decline("an entry lacks a parseable identity");
+            return;
+        };
+        identities.push(identity);
+    }
+    if identities.len() != recorded_count {
+        decline("entry count disagrees with the carriers attribute");
+        return;
+    }
+
+    let (count, walk) = revision_walk_digest(doc);
+    if count != recorded_count || walk != recorded_walk {
+        decline(&format!(
+            "walk mismatch: recorded {recorded_count} carriers/{recorded_walk}, \
+             document has {count} carriers/{walk}"
+        ));
+        return;
+    }
+
+    let mut index = 0usize;
+    for_each_rev_carrier_mut(doc, &mut |carrier| {
+        let identity = identities[index];
+        index += 1;
+        // A recorded zero is a carrier the writer had not minted; leave the
+        // derived value rather than un-minting it.
+        if identity != 0 {
+            *carrier.identity = identity;
+        }
+    });
+    if debug {
+        eprintln!("SIDECAR ADOPTED {count} carriers (walk {walk})");
+    }
+}
+
+pub(crate) fn try_mint_identities(doc: &mut CanonDoc) -> Result<(), RevisionIdentityCollision> {
     fn allocate_temporary_identity(next: &mut u32, occupied: &mut HashSet<u32>) -> u32 {
         while occupied.contains(next) || *next == 0 {
             *next = next
@@ -897,11 +1074,12 @@ pub(crate) fn mint_identities(doc: &mut CanonDoc) {
                 Some(m) => {
                     move_groups.entry(m.clone()).or_insert(*c.identity);
                 }
-                None => {
+                None if !c.force_distinct => {
                     wire_groups
                         .entry((c.wire_id, c.author.clone(), c.date.clone()))
                         .or_insert(*c.identity);
                 }
+                None => {}
             }
         }
     });
@@ -918,6 +1096,7 @@ pub(crate) fn mint_identities(doc: &mut CanonDoc) {
             Some(m) => *move_groups
                 .entry(m.clone())
                 .or_insert_with(|| allocate_temporary_identity(&mut next, &mut occupied)),
+            None if c.force_distinct => allocate_temporary_identity(&mut next, &mut occupied),
             None => *wire_groups
                 .entry((c.wire_id, c.author.clone(), c.date.clone()))
                 .or_insert_with(|| allocate_temporary_identity(&mut next, &mut occupied)),
@@ -928,6 +1107,17 @@ pub(crate) fn mint_identities(doc: &mut CanonDoc) {
         }
     });
     unify_inserted_move_origin_identities(doc);
+    unify_whole_paragraph_insert_identities(doc);
+    unify_inserted_note_identities(doc);
+    unify_created_header_footer_identities(doc);
+    unify_tail_paragraph_insert_identities(doc);
+    unify_whole_paragraph_delete_identities(doc);
+    unify_decoration_split_content_identities(doc);
+    unify_displaced_final_mark_format_identities(doc);
+    // Runs here, on the unified TEMPORARY identities, so the canonical
+    // signature below sees the merged carrier — after canonical assignment the
+    // partition difference would already have moved the identity.
+    absorb_marker_split_tracked_segments(doc);
 
     // The move-origin unifier can fold a newly-minted group into another one;
     // retain only temporary ids still present after that normalization.
@@ -936,18 +1126,697 @@ pub(crate) fn mint_identities(doc: &mut CanonDoc) {
         present_identities.insert(*carrier.identity);
     });
     newly_minted_groups.retain(|identity| present_identities.contains(identity));
-    assign_canonical_revision_identities(doc, &newly_minted_groups);
+    assign_canonical_revision_identities(doc, &newly_minted_groups)?;
+    Ok(())
+}
+
+/// Give the two carriers of one inserted note a shared review identity.
+///
+/// `InsertNote` is one domain operation represented in OOXML by an inserted
+/// body reference plus an inserted footnote/endnote story. Separate wire ids
+/// are required for the two envelopes, but exposing them as independently
+/// selectable proposals permits a partial resolution to keep the reference
+/// while rejecting its definition (or vice versa). The shared note id plus
+/// matching attribution is the structural proof that the carriers belong to
+/// one intention.
+fn unify_inserted_note_identities(doc: &mut CanonDoc) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NoteKind {
+        Footnote,
+        Endnote,
+    }
+
+    struct NoteInsertion {
+        kind: NoteKind,
+        note_id: String,
+        identity: u32,
+        author: Option<String>,
+        date: Option<String>,
+    }
+
+    fn inserted_revision(blocks: &[TrackedBlock]) -> Option<&RevisionInfo> {
+        let first = blocks.first()?;
+        if let TrackingStatus::Inserted(revision) = &first.status {
+            return Some(revision);
+        }
+        let BlockNode::Paragraph(paragraph) = &first.block else {
+            return None;
+        };
+        let mark = match &paragraph.para_mark_status {
+            Some(TrackingStatus::Inserted(revision)) => revision,
+            _ => return None,
+        };
+        paragraph
+            .segments
+            .iter()
+            .find_map(|segment| match &segment.status {
+                TrackingStatus::Inserted(revision)
+                    if revision.identity == mark.identity
+                        && revision.author == mark.author
+                        && revision.date == mark.date =>
+                {
+                    Some(revision)
+                }
+                _ => None,
+            })
+    }
+
+    fn visit_block(block: &mut BlockNode, insertions: &[NoteInsertion]) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    let TrackingStatus::Inserted(reference_revision) = &mut segment.status else {
+                        continue;
+                    };
+                    let matching = segment.inlines.iter().find_map(|inline| {
+                        let InlineNode::OpaqueInline(opaque) = inline else {
+                            return None;
+                        };
+                        let (kind, note_id) = match &opaque.kind {
+                            OpaqueKind::FootnoteReference(data) => {
+                                (NoteKind::Footnote, data.reference_id.as_str())
+                            }
+                            OpaqueKind::EndnoteReference(data) => {
+                                (NoteKind::Endnote, data.reference_id.as_str())
+                            }
+                            _ => return None,
+                        };
+                        insertions.iter().find(|insertion| {
+                            insertion.kind == kind
+                                && insertion.note_id == note_id
+                                && insertion.author == reference_revision.author
+                                && insertion.date == reference_revision.date
+                        })
+                    });
+                    if let Some(insertion) = matching {
+                        reference_revision.identity = insertion.identity;
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested, insertions);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    let mut insertions = Vec::new();
+    for story in &doc.footnotes {
+        if let Some(revision) = inserted_revision(&story.blocks) {
+            insertions.push(NoteInsertion {
+                kind: NoteKind::Footnote,
+                note_id: story.id.clone(),
+                identity: revision.identity,
+                author: revision.author.clone(),
+                date: revision.date.clone(),
+            });
+        }
+    }
+    for story in &doc.endnotes {
+        if let Some(revision) = inserted_revision(&story.blocks) {
+            insertions.push(NoteInsertion {
+                kind: NoteKind::Endnote,
+                note_id: story.id.clone(),
+                identity: revision.identity,
+                author: revision.author.clone(),
+                date: revision.date.clone(),
+            });
+        }
+    }
+    for tracked in &mut doc.blocks {
+        visit_block(&mut tracked.block, &insertions);
+    }
+}
+
+/// Group a created header/footer story with the section change that references
+/// it. `CreateHeader`/`CreateFooter` is one domain operation with two wire
+/// carriers: an inserted blank story paragraph and a `sectPrChange` that adds
+/// the reference. Exposing those as separate identities permits a partial
+/// resolution to leave an orphan story or a dangling section reference.
+fn unify_created_header_footer_identities(doc: &mut CanonDoc) {
+    let Some(section_change) = &doc.body_section_property_change else {
+        return;
+    };
+    let section_identity = section_change.revision.identity;
+    let section_author = section_change.revision.author.clone();
+    let section_date = section_change.revision.date.clone();
+    let Some(section) = &doc.body_section_properties else {
+        return;
+    };
+    let referenced_parts: HashSet<&str> = section
+        .header_refs
+        .iter()
+        .chain(&section.footer_refs)
+        .map(|reference| reference.part_path.as_str())
+        .collect();
+
+    fn inserted_revision(blocks: &[TrackedBlock]) -> Option<&RevisionInfo> {
+        let first = blocks.first()?;
+        if let TrackingStatus::Inserted(revision) = &first.status {
+            return Some(revision);
+        }
+        let BlockNode::Paragraph(paragraph) = &first.block else {
+            return None;
+        };
+        match &paragraph.para_mark_status {
+            Some(TrackingStatus::Inserted(revision)) => Some(revision),
+            _ => None,
+        }
+    }
+
+    fn is_blank(blocks: &[TrackedBlock]) -> bool {
+        blocks.iter().all(|tracked| match &tracked.block {
+            BlockNode::Paragraph(paragraph) => paragraph.all_inlines().all(|inline| match inline {
+                InlineNode::Text(text) => text.text.is_empty(),
+                InlineNode::Decoration(_)
+                | InlineNode::CommentRangeStart { .. }
+                | InlineNode::CommentRangeEnd { .. }
+                | InlineNode::CommentReference { .. } => true,
+                InlineNode::OpaqueInline(_) | InlineNode::HardBreak(_) => false,
+            }),
+            BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => false,
+        })
+    }
+
+    enum StorySlot {
+        Header(usize),
+        Footer(usize),
+    }
+
+    let mut candidates = Vec::new();
+    for (index, story) in doc.headers.iter().enumerate() {
+        if referenced_parts.contains(story.part_name.as_str())
+            && is_blank(&story.blocks)
+            && inserted_revision(&story.blocks).is_some_and(|revision| {
+                revision.author == section_author && revision.date == section_date
+            })
+        {
+            candidates.push(StorySlot::Header(index));
+        }
+    }
+    for (index, story) in doc.footers.iter().enumerate() {
+        if referenced_parts.contains(story.part_name.as_str())
+            && is_blank(&story.blocks)
+            && inserted_revision(&story.blocks).is_some_and(|revision| {
+                revision.author == section_author && revision.date == section_date
+            })
+        {
+            candidates.push(StorySlot::Footer(index));
+        }
+    }
+    let [candidate] = candidates.as_slice() else {
+        return;
+    };
+
+    fn assign_inserted_identity(blocks: &mut [TrackedBlock], identity: u32) {
+        for tracked in blocks {
+            if let TrackingStatus::Inserted(revision) = &mut tracked.status {
+                revision.identity = identity;
+            }
+            let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+                continue;
+            };
+            if let Some(TrackingStatus::Inserted(revision)) = &mut paragraph.para_mark_status {
+                revision.identity = identity;
+            }
+            for segment in &mut paragraph.segments {
+                if let TrackingStatus::Inserted(revision) = &mut segment.status {
+                    revision.identity = identity;
+                }
+            }
+        }
+    }
+
+    match *candidate {
+        StorySlot::Header(index) => {
+            assign_inserted_identity(&mut doc.headers[index].blocks, section_identity)
+        }
+        StorySlot::Footer(index) => {
+            assign_inserted_identity(&mut doc.footers[index].blocks, section_identity)
+        }
+    }
+}
+
+/// Restore the public whole-block deletion shape after OOXML import.
+///
+/// The authoring model represents deleting a complete top-level paragraph as
+/// `TrackedBlock::Deleted`, with ordinary paragraph content plus a deleted
+/// pilcrow. WordprocessingML persists the same intention as deleted runs and a
+/// deleted pilcrow inside an otherwise normal `w:p`. Once identity minting has
+/// proved complete coverage belongs to one proposal, lift that wire shape back
+/// to the outer block and make the content ordinary again. This keeps
+/// serialize/reimport stable without changing the established public model.
+fn lift_whole_paragraph_deletions(doc: &mut CanonDoc) {
+    fn lift_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            if !matches!(tracked.status, TrackingStatus::Normal) || tracked.move_id.is_some() {
+                continue;
+            }
+            let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+                continue;
+            };
+            // A hoisted label does NOT disprove a complete deletion. Prefix
+            // stripping hoists a label out of a wholly-deleted paragraph on
+            // purpose (`is_complete_wire_paragraph_deletion`), precisely so the
+            // outer block can carry the deletion after minting — which is this
+            // lift. In the block-level form nothing inside the paragraph is
+            // tracked: the body sits in Normal segments and the block status
+            // carries the proposal, so a hoisted label is exactly as untracked
+            // as the body beside it. The completeness test below is what
+            // decides, and it is evaluated on the segments themselves.
+            let Some(TrackingStatus::Deleted(mark)) = &paragraph.para_mark_status else {
+                continue;
+            };
+            let mark_identity = mark.identity;
+            let mut block_revision = None;
+            let complete = paragraph
+                .segments
+                .iter()
+                .all(|segment| match &segment.status {
+                    TrackingStatus::Deleted(revision) if revision.identity == mark_identity => {
+                        block_revision.get_or_insert_with(|| revision.clone());
+                        true
+                    }
+                    TrackingStatus::Normal
+                        if segment
+                            .inlines
+                            .iter()
+                            .all(|inline| matches!(inline, InlineNode::Decoration(_))) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                });
+            let Some(block_revision) = complete.then_some(block_revision).flatten() else {
+                continue;
+            };
+            for segment in &mut paragraph.segments {
+                if matches!(segment.status, TrackingStatus::Deleted(_)) {
+                    segment.status = TrackingStatus::Normal;
+                }
+            }
+            tracked.status = TrackingStatus::Deleted(block_revision);
+        }
+    }
+
+    lift_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        lift_blocks(&mut story.blocks);
+    }
+}
+
+/// Restore the public whole-block insertion shape after OOXML import.
+///
+/// The serializer persists an inserted paragraph as inserted content plus an
+/// inserted pilcrow inside an otherwise ordinary `w:p`. Once identity minting
+/// has proved that both carriers cover the complete paragraph and belong to
+/// one proposal, lift that wire shape back to `TrackedBlock::Inserted`. This
+/// keeps an authored structural insertion stable across save/reopen.
+fn lift_whole_paragraph_insertions(doc: &mut CanonDoc) {
+    fn lift_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            if !matches!(tracked.status, TrackingStatus::Normal) {
+                continue;
+            }
+            let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+                continue;
+            };
+            // `literal_prefix` can only hold UNTRACKED source characters:
+            // strip_literal_prefix_with_tracked_flags refuses to hoist a
+            // tracked label. Its presence proves this insertion covers the
+            // pilcrow and body but not the whole paragraph. Lifting it to the
+            // block would wrongly pull the normal label into w:ins, so
+            // reject-all would lose source text.
+            if paragraph.literal_prefix.is_some() {
+                continue;
+            }
+            let Some(TrackingStatus::Inserted(mark)) = &paragraph.para_mark_status else {
+                continue;
+            };
+            // An empty pre-existing paragraph whose pilcrow became inserted is
+            // the source side of an append, not an inserted empty paragraph.
+            // Engine-authored empty blocks always carry their fresh paraId.
+            if paragraph.segments.is_empty() && paragraph.para_id.is_none() {
+                continue;
+            }
+            let mark_identity = mark.identity;
+            let block_revision = mark.clone();
+            let complete = paragraph
+                .segments
+                .iter()
+                .all(|segment| match &segment.status {
+                    TrackingStatus::Inserted(revision) if revision.identity == mark_identity => {
+                        true
+                    }
+                    TrackingStatus::Normal
+                        if segment.inlines.iter().all(|inline| {
+                            matches!(inline, InlineNode::Decoration(decoration)
+                                if decoration.origin.is_some()
+                                    || decoration_is_self_contained_run(decoration))
+                        }) =>
+                    {
+                        // The serializer hoists decoration runs out of `w:ins`,
+                        // so an authored inserted paragraph legitimately reopens
+                        // with an untracked decoration-only segment — a note
+                        // story's auto-number marker is the canonical case
+                        // (wave-8 lifecycle 152). A self-contained glyph run is
+                        // paragraph CONTENT and is subsumed by the block. A
+                        // range marker is not: its other half can live outside
+                        // the paragraph, and rejecting the lifted block would
+                        // delete it out from under the torn-marker repair path
+                        // (`bug_b_selective_reject_all_collapses_wild_torn_bookmark`
+                        // and the mixed-move suite pin this boundary).
+                        true
+                    }
+                    _ => false,
+                });
+            if !complete {
+                continue;
+            }
+            for segment in &mut paragraph.segments {
+                if matches!(segment.status, TrackingStatus::Inserted(_)) {
+                    segment.status = TrackingStatus::Normal;
+                }
+            }
+            paragraph.para_mark_status = None;
+            tracked.status = TrackingStatus::Inserted(block_revision);
+        }
+    }
+
+    lift_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        lift_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        lift_blocks(&mut story.blocks);
+    }
+}
+
+/// Rejoin content carriers split only by paragraph-level decorations.
+///
+/// OOXML forbids markers such as comment/bookmark range boundaries inside a
+/// `w:ins` or `w:del`. The serializer must therefore close the tracked
+/// envelope, emit the zero-width marker, and open a fresh envelope with a
+/// unique annotation id. On import that syntax initially looks like two
+/// proposals. Same kind and attribution on both sides of an otherwise-empty
+/// decoration segment is the structural locality evidence that they are the
+/// two halves of one content intention.
+///
+/// Ordinary text, a different tracking kind/attribution, or any non-decoration
+/// inline ends the candidate chain, so unrelated neighboring revisions remain
+/// independently selectable.
+/// Splice a zero-width range-marker segment back into the one tracked run it
+/// split, converging the two wire forms of the same state on one model shape.
+///
+/// Word writes range markers (bookmarkEnd, permEnd, …) INSIDE a `w:ins`/`w:del`
+/// envelope; our serializer hoists them OUT (oracle-settled: a marker left
+/// inside a resolved revision is deleted with it), which splits the tracked
+/// content into two envelopes around an untracked marker run. Without this
+/// pass the same proposal therefore imports as ONE content carrier from Word's
+/// form and TWO from ours — `unify_decoration_split_content_identities` (below)
+/// already declares them one identity, but the per-carrier excerpts still
+/// partition differently ("…nisi " vs "…nisi"+" "), and a carrier excerpt is a
+/// revision-signature input, so the identity moves across our own save/reopen
+/// (wave-8 lifecycle 257).
+///
+/// Only zero-width range markers are absorbed, and only when BOTH flanks carry
+/// the SAME settled identity — the markers then sit inside one proposal's
+/// content, where their segment placement is purely representational (the
+/// resolution paths preserve range markers regardless of the enclosing
+/// segment's status). A marker-only segment at a proposal's edge, or between
+/// two different proposals, is genuinely independent base content and is left
+/// alone. Runs inside `try_mint_identities`, after the unifiers have settled
+/// the (temporary) grouped identities and BEFORE canonical assignment — the
+/// carrier excerpts feed the canonical signature, so absorbing any later
+/// would leave the identity already moved.
+fn absorb_marker_split_tracked_segments(doc: &mut CanonDoc) {
+    fn is_zero_width_range_marker(inline: &InlineNode) -> bool {
+        matches!(inline, InlineNode::Decoration(decoration)
+            if !decoration_is_self_contained_run(decoration))
+    }
+    fn same_settled_revision(a: &TrackingStatus, b: &TrackingStatus) -> bool {
+        match (a, b) {
+            (TrackingStatus::Inserted(x), TrackingStatus::Inserted(y))
+            | (TrackingStatus::Deleted(x), TrackingStatus::Deleted(y)) => {
+                x.identity != 0 && x.identity == y.identity
+            }
+            _ => false,
+        }
+    }
+    fn visit_paragraph(paragraph: &mut ParagraphNode) {
+        let mut index = 1;
+        while index + 1 < paragraph.segments.len() {
+            let markers_only = {
+                let segment = &paragraph.segments[index];
+                matches!(segment.status, TrackingStatus::Normal)
+                    && !segment.inlines.is_empty()
+                    && segment.inlines.iter().all(is_zero_width_range_marker)
+            };
+            if markers_only
+                && same_settled_revision(
+                    &paragraph.segments[index - 1].status,
+                    &paragraph.segments[index + 1].status,
+                )
+            {
+                let tail = paragraph.segments.remove(index + 1);
+                let markers = paragraph.segments.remove(index);
+                let head = &mut paragraph.segments[index - 1];
+                head.inlines.extend(markers.inlines);
+                head.inlines.extend(tail.inlines);
+                // Do not advance: the merged segment may now flank another
+                // marker-only segment.
+            } else {
+                index += 1;
+            }
+        }
+    }
+    fn visit_block(block: &mut BlockNode) {
+        match block {
+            BlockNode::Paragraph(paragraph) => visit_paragraph(paragraph),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    fn visit_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            visit_block(&mut tracked.block);
+        }
+    }
+    visit_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        visit_blocks(&mut story.blocks);
+    }
+}
+
+fn unify_decoration_split_content_identities(doc: &mut CanonDoc) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ContentKind {
+        Insert,
+        Delete,
+    }
+
+    struct ContentCarrier {
+        kind: ContentKind,
+        author: Option<String>,
+        date: Option<String>,
+        identity: u32,
+        ends_with_marker: bool,
+    }
+
+    fn is_direct_marker(inline: &InlineNode) -> bool {
+        match inline {
+            InlineNode::Decoration(_)
+            | InlineNode::CommentRangeStart { .. }
+            | InlineNode::CommentRangeEnd { .. }
+            | InlineNode::CommentReference { .. } => true,
+            InlineNode::OpaqueInline(opaque) => matches!(
+                &opaque.kind,
+                OpaqueKind::Hyperlink(_)
+                    | OpaqueKind::Field(FieldData {
+                        field_kind: FieldKind::Simple,
+                        ..
+                    })
+                    | OpaqueKind::OmmlBlock
+            ),
+            InlineNode::Text(_) | InlineNode::HardBreak(_) => false,
+        }
+    }
+
+    fn visit_paragraph(paragraph: &mut ParagraphNode) {
+        let mut previous: Option<ContentCarrier> = None;
+        let mut marker_between = false;
+
+        for segment in &mut paragraph.segments {
+            let starts_with_marker = segment.inlines.first().is_some_and(is_direct_marker);
+            let ends_with_marker = segment.inlines.last().is_some_and(is_direct_marker);
+            match &mut segment.status {
+                TrackingStatus::Inserted(revision) => {
+                    let key = (
+                        ContentKind::Insert,
+                        revision.author.clone(),
+                        revision.date.clone(),
+                    );
+                    if let Some(previous) = &previous
+                        && (
+                            previous.kind,
+                            previous.author.clone(),
+                            previous.date.clone(),
+                        ) == key
+                        && (marker_between || previous.ends_with_marker || starts_with_marker)
+                    {
+                        revision.identity = previous.identity;
+                    }
+                    previous = Some(ContentCarrier {
+                        kind: key.0,
+                        author: key.1,
+                        date: key.2,
+                        identity: revision.identity,
+                        ends_with_marker,
+                    });
+                    marker_between = false;
+                }
+                TrackingStatus::Deleted(revision) => {
+                    let key = (
+                        ContentKind::Delete,
+                        revision.author.clone(),
+                        revision.date.clone(),
+                    );
+                    if let Some(previous) = &previous
+                        && (
+                            previous.kind,
+                            previous.author.clone(),
+                            previous.date.clone(),
+                        ) == key
+                        && (marker_between || previous.ends_with_marker || starts_with_marker)
+                    {
+                        revision.identity = previous.identity;
+                    }
+                    previous = Some(ContentCarrier {
+                        kind: key.0,
+                        author: key.1,
+                        date: key.2,
+                        identity: revision.identity,
+                        ends_with_marker,
+                    });
+                    marker_between = false;
+                }
+                TrackingStatus::Normal
+                    if !segment.inlines.is_empty()
+                        && segment.inlines.iter().all(is_direct_marker) =>
+                {
+                    // A zero-width paragraph marker is precisely the boundary
+                    // that forced the tracked envelope to split. Keep the
+                    // candidate alive across it.
+                    marker_between = previous.is_some();
+                }
+                TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => {
+                    previous = None;
+                    marker_between = false;
+                }
+            }
+        }
+    }
+
+    fn visit_block(block: &mut BlockNode) {
+        match block {
+            BlockNode::Paragraph(paragraph) => visit_paragraph(paragraph),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn visit_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            visit_block(&mut tracked.block);
+        }
+    }
+
+    visit_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        visit_blocks(&mut story.blocks);
+    }
 }
 
 /// Replace temporary group ids with deterministic identities derived from the
 /// canonical census. `RevisionRecord` is the model boundary shared by listing,
 /// selectors, receipts, and audit; deriving here makes all those consumers use
 /// the same semantic identity without teaching the serializer about it.
-fn assign_canonical_revision_identities(doc: &mut CanonDoc, temporary_ids: &HashSet<u32>) {
+fn assign_canonical_revision_identities(
+    doc: &mut CanonDoc,
+    temporary_ids: &HashSet<u32>,
+) -> Result<(), RevisionIdentityCollision> {
     if temporary_ids.is_empty() {
-        return;
+        return Ok(());
     }
 
+    let carrier_keys = durable_paragraph_carrier_keys(doc);
     let records = crate::tracked_model::enumerate_revisions(doc);
     let mut groups: Vec<(u32, Vec<crate::tracked_model::RevisionRecord>)> = Vec::new();
     let mut group_indexes = HashMap::new();
@@ -981,10 +1850,10 @@ fn assign_canonical_revision_identities(doc: &mut CanonDoc, temporary_ids: &Hash
     let mut duplicate_ordinals: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut replacements = HashMap::new();
     for (temporary, records) in &groups {
-        let signature = canonical_revision_group_signature(records);
+        let signature = canonical_revision_group_signature(records, &carrier_keys);
         let ordinal = duplicate_ordinals.entry(signature.clone()).or_default();
         let mut hasher = Sha256::new();
-        hasher.update(b"stemma.revision_identity.v1\0");
+        hasher.update(b"stemma.revision_identity.v2\0");
         hasher.update(&signature);
         hasher.update(ordinal.to_be_bytes());
         *ordinal += 1;
@@ -1001,10 +1870,12 @@ fn assign_canonical_revision_identities(doc: &mut CanonDoc, temporary_ids: &Hash
         // digest collision behind probing: that could assign a different value
         // after save/reopen when document order changes. Fail at the model
         // boundary instead of manufacturing unstable semantic evidence.
-        assert!(
-            !used.contains(&candidate),
-            "canonical revision identity collision for digest prefix {candidate}: records={records:?}"
-        );
+        if used.contains(&candidate) {
+            return Err(RevisionIdentityCollision {
+                candidate,
+                records: format!("{records:?}"),
+            });
+        }
         used.insert(candidate);
         replacements.insert(*temporary, candidate);
     }
@@ -1019,23 +1890,639 @@ fn assign_canonical_revision_identities(doc: &mut CanonDoc, temporary_ids: &Hash
             *carrier.identity = *identity;
         }
     });
+    Ok(())
 }
 
-fn canonical_revision_group_signature(records: &[crate::tracked_model::RevisionRecord]) -> Vec<u8> {
+pub(crate) fn mint_identities(doc: &mut CanonDoc) {
+    try_mint_identities(doc).expect("canonical revision identities must fit the public u32 domain");
+}
+
+fn canonical_revision_group_signature(
+    records: &[crate::tracked_model::RevisionRecord],
+    carrier_keys: &HashMap<(StoryScope, NodeId), String>,
+) -> Vec<u8> {
     fn field(out: &mut Vec<u8>, value: &[u8]) {
         out.extend_from_slice(&(value.len() as u64).to_be_bytes());
         out.extend_from_slice(value);
     }
 
-    let mut out = Vec::new();
+    let whole_paragraph_delete = records.iter().any(|record| {
+        record.kind == crate::tracked_model::RevisionKind::Delete
+            && (record.excerpt == "paragraph" || record.excerpt.starts_with("¶ paragraph mark"))
+    });
+    let insert_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == crate::tracked_model::RevisionKind::Insert)
+        .collect();
+    let whole_paragraph_insert = !insert_records.is_empty()
+        && insert_records.iter().all(|record| {
+            record.excerpt.trim().is_empty()
+                || record.excerpt == "paragraph"
+                || record.excerpt.starts_with("¶ paragraph mark")
+        });
+
+    // A whole inserted paragraph has one block-level carrier in the live
+    // authoring model, but save/reopen expands it into inserted content plus
+    // an inserted paragraph-mark carrier. Once those carriers have been
+    // unified onto one identity, omit the redundant pilcrow row from the
+    // digest so the semantic proposal hashes exactly like its block-level
+    // producer form.
+    let records: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            if !matches!(
+                record.kind,
+                crate::tracked_model::RevisionKind::Insert
+                    | crate::tracked_model::RevisionKind::Delete
+            ) {
+                return true;
+            }
+            let Some(mark_text) = record
+                .excerpt
+                .strip_prefix("¶ paragraph mark: ")
+                .or_else(|| (record.excerpt == "¶ paragraph mark").then_some(""))
+            else {
+                return true;
+            };
+            !records.iter().any(|candidate| {
+                !std::ptr::eq(*record, candidate)
+                    && candidate.kind == record.kind
+                    && candidate.location == record.location
+                    && candidate.block_id == record.block_id
+                    && candidate.author == record.author
+                    && candidate.date == record.date
+                    && (mark_text.is_empty() || candidate.excerpt == mark_text)
+            })
+        })
+        .collect();
+
+    // A paragraph-level structural marker cannot live inside `w:ins`/`w:del`.
+    // Serialization therefore splits one carrier into same-id envelopes around
+    // markers such as proofing/bookmark ranges, and import enumerates the text
+    // fragments as adjacent records. The boundary is OOXML syntax, not proposal
+    // semantics: hash the concatenated content exactly as the pre-save producer
+    // did. Paragraph-mark rows stay distinct for the whole-paragraph rules
+    // above, and formatting/move records are never content-folded.
+    let mut normalized_records: Vec<crate::tracked_model::RevisionRecord> = Vec::new();
     for record in records {
+        let content_record = matches!(
+            record.kind,
+            crate::tracked_model::RevisionKind::Insert | crate::tracked_model::RevisionKind::Delete
+        ) && !record.excerpt.starts_with("¶ paragraph mark");
+        let same_content_carrier = normalized_records.last().is_some_and(|previous| {
+            content_record
+                && previous.kind == record.kind
+                && previous.location == record.location
+                && previous.block_id == record.block_id
+                && previous.author == record.author
+                && previous.date == record.date
+                && !previous.excerpt.starts_with("¶ paragraph mark")
+        });
+        if same_content_carrier {
+            normalized_records
+                .last_mut()
+                .expect("same_content_carrier proved a preceding record")
+                .excerpt
+                .push_str(&record.excerpt);
+        } else {
+            normalized_records.push(record.clone());
+        }
+    }
+    let records = normalized_records;
+
+    let mut out = Vec::new();
+    let carrier_needs_discriminator = !records
+        .iter()
+        .any(|record| record.kind == crate::tracked_model::RevisionKind::Move)
+        && records.iter().all(|record| {
+            record.kind != crate::tracked_model::RevisionKind::Insert
+                || record.excerpt.trim().is_empty()
+                || record.excerpt.starts_with("¶ paragraph mark")
+        });
+    if carrier_needs_discriminator && let Some(record) = records.first() {
+        // NodeIds are positional import handles (`p_50` can become `p_52`
+        // after a preceding projection). Prefer Word's persisted paragraph
+        // identity whenever the carrier has one; retain the NodeId fallback for
+        // old/minimal documents where w14:paraId is absent.
+        let carrier = carrier_keys
+            .get(&(record.location.clone(), record.block_id.clone()))
+            .map(String::as_str)
+            .unwrap_or(&record.block_id.0);
+        field(&mut out, carrier.as_bytes());
+    }
+    for record in &records {
         field(&mut out, record.kind.as_str().as_bytes());
         let story = serde_json::to_vec(&record.location)
             .expect("StoryScope serialization is infallible for revision identity");
         field(&mut out, &story);
         field(&mut out, record.author.as_deref().unwrap_or("").as_bytes());
         field(&mut out, record.date.as_deref().unwrap_or("").as_bytes());
-        field(&mut out, record.excerpt.as_bytes());
+        if (whole_paragraph_delete && record.kind == crate::tracked_model::RevisionKind::Delete)
+            || (whole_paragraph_insert && record.kind == crate::tracked_model::RevisionKind::Insert)
+        {
+            // Whole-block deletion has three equivalent carrier shapes across
+            // the live model and OOXML (outer block, tracked content, tracked
+            // pilcrow). An empty whole-block insertion similarly has only its
+            // inserted pilcrow on the wire. The durable paragraph key above
+            // identifies the target; hashing a shape-specific excerpt would
+            // give the same proposal a different identity after reopening.
+            field(&mut out, b"");
+        } else {
+            field(&mut out, record.excerpt.as_bytes());
+        }
+    }
+    out
+}
+
+/// Normalize the two serialized carriers of one whole-paragraph insertion
+/// onto the identity of its content proposal. The live producer represents
+/// the same state as `TrackedBlock::Inserted`; OOXML reopens it as a Normal
+/// block whose complete content and paragraph mark are both inserted. Author,
+/// date, and complete coverage make this grouping structural rather than a
+/// same-author guess.
+/// Fold a displaced-final-mark `pPrChange` into the proposal that displaced the
+/// mark.
+///
+/// When a move or insertion lands at the end of the document, the final-mark
+/// rule hands the document-final pilcrow to the incoming paragraph and records
+/// the anchor's paragraph properties there so reject can restore them
+/// (`tracked_model::record_displaced_final_mark_properties`). That record is
+/// part of the SAME intention as the block insertion carrying it — Word writes
+/// both under one author and date — so it must not enumerate as an independent
+/// proposal. A second identity here would let a selective resolution that named
+/// the insertion silently take a revision it never selected.
+fn unify_displaced_final_mark_format_identities(doc: &mut CanonDoc) {
+    for tracked in &mut doc.blocks {
+        let TrackingStatus::Inserted(carrier) = &tracked.status else {
+            continue;
+        };
+        let carrier_identity = carrier.identity;
+        let carrier_author = carrier.author.clone();
+        let carrier_date = carrier.date.clone();
+        let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+            continue;
+        };
+        // Only the suppressed-mark shape the final-mark rule produces: the
+        // block is an insertion but its pilcrow was deliberately untracked.
+        if !matches!(paragraph.para_mark_status, Some(TrackingStatus::Normal)) {
+            continue;
+        }
+        if let Some(change) = &mut paragraph.formatting_change
+            && change.author == carrier_author.clone().unwrap_or_default()
+            && change.date == carrier_date
+        {
+            change.identity = carrier_identity;
+        }
+    }
+}
+
+fn unify_whole_paragraph_insert_identities(doc: &mut CanonDoc) {
+    fn visit_paragraph(paragraph: &mut ParagraphNode) {
+        let Some(TrackingStatus::Inserted(mark)) = &paragraph.para_mark_status else {
+            return;
+        };
+        let mark_author = mark.author.clone();
+        let mark_date = mark.date.clone();
+        let mut content_identity = None;
+        for segment in &paragraph.segments {
+            match &segment.status {
+                TrackingStatus::Inserted(revision)
+                    if revision.author == mark_author && revision.date == mark_date =>
+                {
+                    content_identity.get_or_insert(revision.identity);
+                }
+                TrackingStatus::Normal
+                    if segment
+                        .inlines
+                        .iter()
+                        .all(|inline| matches!(inline, InlineNode::Decoration(_))) =>
+                {
+                    // Note stories start with an untracked footnoteRef/endnoteRef
+                    // auto-number marker. It is structural decoration, not base
+                    // text, and does not make the surrounding inserted paragraph
+                    // a partial-content insertion.
+                }
+                _ => return,
+            }
+        }
+        let Some(content_identity) = content_identity else {
+            return;
+        };
+        if let Some(TrackingStatus::Inserted(mark)) = &mut paragraph.para_mark_status {
+            mark.identity = content_identity;
+        }
+        for segment in &mut paragraph.segments {
+            if let TrackingStatus::Inserted(revision) = &mut segment.status {
+                revision.identity = content_identity;
+            }
+        }
+    }
+
+    fn visit_block(block: &mut BlockNode) {
+        match block {
+            BlockNode::Paragraph(paragraph) => visit_paragraph(paragraph),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn visit_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            // A live engine-authored note/body insertion is represented by the
+            // outer TrackedBlock. OOXML may reopen the same proposal with an
+            // additional inserted paragraph-mark carrier. When attribution
+            // matches, the pilcrow is part of that whole-paragraph intention,
+            // not a second selectable proposal.
+            if let (TrackingStatus::Inserted(block_revision), BlockNode::Paragraph(paragraph)) =
+                (&tracked.status, &mut tracked.block)
+                && let Some(TrackingStatus::Inserted(mark_revision)) =
+                    &mut paragraph.para_mark_status
+                && mark_revision.author == block_revision.author
+                && mark_revision.date == block_revision.date
+            {
+                mark_revision.identity = block_revision.identity;
+            }
+            visit_block(&mut tracked.block);
+        }
+    }
+
+    visit_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        visit_blocks(&mut story.blocks);
+    }
+}
+
+/// Give a document-tail append one identity across all three of its carriers.
+///
+/// Final-mark normalization shifts the new break onto the preceding paragraph,
+/// so an append at the end of a document is carried by the anchor's inserted
+/// paragraph mark, the tail paragraph's inserted content, and the tail's
+/// displaced-mark formatting record. Those are one intention, and they must
+/// enumerate as one proposal in BOTH of the shapes the append exists in:
+///
+/// - the producer shape, where the tail is a block-level `Inserted` paragraph
+///   whose own pilcrow the final-mark rule deliberately untracked;
+/// - the persisted shape, where it reopens as a `Normal` block whose complete
+///   content is inserted and whose final mark is plainly untracked.
+///
+/// The carriers serialize with distinct `w:id` values, and the two shapes group
+/// them differently, so recognizing only one shape makes an append's identity
+/// change across a save and reopen — the proposal survives, but a selective
+/// resolution naming it no longer addresses it.
+fn unify_tail_paragraph_insert_identities(doc: &mut CanonDoc) {
+    if doc.blocks.len() < 2 {
+        return;
+    }
+    let tail_idx = doc.blocks.len() - 1;
+    if doc.blocks[tail_idx].move_id.is_some() {
+        return;
+    }
+    let BlockNode::Paragraph(tail) = &doc.blocks[tail_idx].block else {
+        return;
+    };
+    let (content_identity, author, date) = match &doc.blocks[tail_idx].status {
+        TrackingStatus::Inserted(revision) => {
+            // Producer shape. `Some(Normal)` is the explicit suppression the
+            // final-mark rule leaves behind; without it this is an ordinary
+            // inserted paragraph that happens to be last, not an adopted mark.
+            if !matches!(tail.para_mark_status, Some(TrackingStatus::Normal)) {
+                return;
+            }
+            (
+                revision.identity,
+                revision.author.clone(),
+                revision.date.clone(),
+            )
+        }
+        TrackingStatus::Normal => {
+            // Persisted shape.
+            if tail.para_mark_status.is_some() || tail.segments.is_empty() {
+                return;
+            }
+            let mut content_identity = None;
+            let mut attribution = None;
+            for segment in &tail.segments {
+                let TrackingStatus::Inserted(revision) = &segment.status else {
+                    return;
+                };
+                if attribution
+                    .as_ref()
+                    .is_some_and(|value: &(Option<String>, Option<String>)| {
+                        value != &(revision.author.clone(), revision.date.clone())
+                    })
+                {
+                    return;
+                }
+                attribution.get_or_insert((revision.author.clone(), revision.date.clone()));
+                content_identity.get_or_insert(revision.identity);
+            }
+            let (Some(content_identity), Some(attribution)) = (content_identity, attribution)
+            else {
+                return;
+            };
+            (content_identity, attribution.0, attribution.1)
+        }
+        _ => return,
+    };
+
+    // The displaced-mark formatting record belongs to the append that displaced
+    // the mark — `tracked_model::record_displaced_final_mark_properties` stamps
+    // it with the insertion's identity on the producer side, and this restores
+    // that after a reopen. Rejecting the insertion removes the paragraph, so a
+    // separate identity on its own formatting record could never be resolved
+    // apart from it; matching attribution is what makes the grouping structural.
+    if let BlockNode::Paragraph(tail) = &mut doc.blocks[tail_idx].block
+        && let Some(change) = &mut tail.formatting_change
+        && change.author == author.clone().unwrap_or_default()
+        && change.date == date
+    {
+        change.identity = content_identity;
+    }
+
+    let anchor_idx = tail_idx - 1;
+    let BlockNode::Paragraph(anchor) = &mut doc.blocks[anchor_idx].block else {
+        return;
+    };
+    let Some(TrackingStatus::Inserted(mark)) = &mut anchor.para_mark_status else {
+        return;
+    };
+    if mark.author == author && mark.date == date {
+        mark.identity = content_identity;
+    }
+}
+
+/// Deletion counterpart to [`unify_whole_paragraph_insert_identities`]. A live
+/// whole-block delete is one outer carrier; OOXML can reopen it as deleted
+/// content plus a deleted pilcrow (or as an outer delete plus that pilcrow).
+/// Complete coverage and matching attribution prove these are one proposal.
+fn unify_whole_paragraph_delete_identities(doc: &mut CanonDoc) {
+    fn visit_paragraph(paragraph: &mut ParagraphNode) {
+        let Some(TrackingStatus::Deleted(mark)) = &paragraph.para_mark_status else {
+            return;
+        };
+        let mark_author = mark.author.clone();
+        let mark_date = mark.date.clone();
+        let mut content_identity = None;
+        for segment in &paragraph.segments {
+            match &segment.status {
+                TrackingStatus::Deleted(revision)
+                    if revision.author == mark_author && revision.date == mark_date =>
+                {
+                    content_identity.get_or_insert(revision.identity);
+                }
+                TrackingStatus::Normal
+                    if segment
+                        .inlines
+                        .iter()
+                        .all(|inline| matches!(inline, InlineNode::Decoration(_))) => {}
+                _ => return,
+            }
+        }
+        let Some(content_identity) = content_identity else {
+            return;
+        };
+        if let Some(TrackingStatus::Deleted(mark)) = &mut paragraph.para_mark_status {
+            mark.identity = content_identity;
+        }
+        for segment in &mut paragraph.segments {
+            if let TrackingStatus::Deleted(revision) = &mut segment.status {
+                revision.identity = content_identity;
+            }
+        }
+    }
+
+    fn visit_block(block: &mut BlockNode) {
+        match block {
+            BlockNode::Paragraph(paragraph) => visit_paragraph(paragraph),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn visit_blocks(blocks: &mut [TrackedBlock]) {
+        for tracked in blocks {
+            if let (TrackingStatus::Deleted(block_revision), BlockNode::Paragraph(paragraph)) =
+                (&tracked.status, &mut tracked.block)
+                && let Some(TrackingStatus::Deleted(mark_revision)) =
+                    &mut paragraph.para_mark_status
+                && mark_revision.author == block_revision.author
+                && mark_revision.date == block_revision.date
+            {
+                mark_revision.identity = block_revision.identity;
+            }
+            visit_block(&mut tracked.block);
+        }
+    }
+
+    visit_blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        visit_blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        visit_blocks(&mut story.blocks);
+    }
+}
+
+/// Map an enumerable paragraph carrier to Word's persisted `w14:paraId`.
+/// Revision identities must survive structural projections that renumber the
+/// importer's positional `p_N` handles; paraId is the durable on-wire identity
+/// intended for exactly this purpose.
+///
+/// A paraId is only usable when it actually identifies a paragraph. Real
+/// documents repeat them — copy/paste and some producers duplicate the value
+/// across hundreds of paragraphs — and a key shared by hundreds of carriers is
+/// worse than no key at all: it collapses their revision signatures onto one
+/// value that only a document-order ordinal can then tell apart, which is
+/// exactly the durability the key exists to provide. A repeated paraId is
+/// therefore treated as absent.
+fn durable_paragraph_carrier_keys(doc: &CanonDoc) -> HashMap<(StoryScope, NodeId), String> {
+    fn count_para_ids(block: &BlockNode, counts: &mut HashMap<String, u32>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                if let Some(para_id) = &paragraph.para_id {
+                    *counts.entry(para_id.clone()).or_default() += 1;
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            count_para_ids(nested, counts);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn visit_block(
+        block: &BlockNode,
+        scope: &StoryScope,
+        out: &mut HashMap<(StoryScope, NodeId), String>,
+        fallback_ordinals: &mut HashMap<String, u32>,
+        para_id_counts: &HashMap<String, u32>,
+    ) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                let unique_para_id = paragraph
+                    .para_id
+                    .as_ref()
+                    .filter(|para_id| para_id_counts.get(*para_id).copied() == Some(1));
+                let carrier = if let Some(para_id) = unique_para_id {
+                    para_id.clone()
+                } else {
+                    // Legacy/minimal producers may omit w14:paraId, and a
+                    // repeated one is treated as absent. Positional
+                    // NodeIds are not durable when an earlier paragraph is
+                    // inserted or removed. A general block semantic hash also
+                    // includes formatting/run-shape details that legitimately
+                    // normalize on save, so it is not a durable carrier key.
+                    // Hash only the visible text stream (plus any hoisted
+                    // literal prefix), then disambiguate textual duplicates by
+                    // their ordinal within this story.
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"stemma.paragraph_carrier_text.v1\0");
+                    hasher.update(paragraph.literal_prefix.as_deref().unwrap_or("").as_bytes());
+                    hasher.update(b"\0");
+                    hasher.update(
+                        crate::tracked_model::extract_block_text_for_hash(&BlockNode::Paragraph(
+                            paragraph.clone(),
+                        ))
+                        .as_bytes(),
+                    );
+                    let digest = hasher.finalize();
+                    let mut hash = String::with_capacity(digest.len() * 2);
+                    for byte in digest {
+                        hash.push_str(&format!("{byte:02x}"));
+                    }
+                    let ordinal = fallback_ordinals.entry(hash.clone()).or_default();
+                    let carrier = format!("text:{hash}:{ordinal}");
+                    *ordinal += 1;
+                    carrier
+                };
+                out.insert((scope.clone(), paragraph.id.clone()), carrier);
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            visit_block(nested, scope, out, fallback_ordinals, para_id_counts);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    fn visit_blocks(
+        blocks: &[TrackedBlock],
+        scope: &StoryScope,
+        out: &mut HashMap<(StoryScope, NodeId), String>,
+    ) {
+        // Uniqueness is judged within the story: that is the scope a carrier
+        // key addresses, and the scope the textual fallback's ordinal counts in.
+        let mut para_id_counts = HashMap::new();
+        for tracked in blocks {
+            count_para_ids(&tracked.block, &mut para_id_counts);
+        }
+        let mut fallback_ordinals = HashMap::new();
+        for tracked in blocks {
+            visit_block(
+                &tracked.block,
+                scope,
+                out,
+                &mut fallback_ordinals,
+                &para_id_counts,
+            );
+        }
+    }
+
+    let mut out = HashMap::new();
+    visit_blocks(&doc.blocks, &StoryScope::Body, &mut out);
+    for story in &doc.headers {
+        visit_blocks(
+            &story.blocks,
+            &StoryScope::Header {
+                part_path: story.part_name.clone(),
+                kind: story.kind.clone(),
+            },
+            &mut out,
+        );
+    }
+    for story in &doc.footers {
+        visit_blocks(
+            &story.blocks,
+            &StoryScope::Footer {
+                part_path: story.part_name.clone(),
+                kind: story.kind.clone(),
+            },
+            &mut out,
+        );
+    }
+    for story in &doc.footnotes {
+        visit_blocks(
+            &story.blocks,
+            &StoryScope::Footnote {
+                id: story.id.clone(),
+            },
+            &mut out,
+        );
+    }
+    for story in &doc.endnotes {
+        visit_blocks(
+            &story.blocks,
+            &StoryScope::Endnote {
+                id: story.id.clone(),
+            },
+            &mut out,
+        );
+    }
+    for story in &doc.comments {
+        visit_blocks(
+            &story.blocks,
+            &StoryScope::Comment {
+                id: story.id.clone(),
+            },
+            &mut out,
+        );
     }
     out
 }
@@ -1301,8 +2788,18 @@ fn build_canonical_from_archive(
 
     mint_wire_zero_revision_ids(&mut doc);
     ensure_unique_formatting_change_ids(&mut doc);
+    crate::tracked_model::canonicalize_imported_split_tracking_boundary_prefixes(&mut doc);
     // H7: engine-mint stable revision identities once wire ids are settled.
+    // Minting also absorbs marker-split tracked segments, so the shape below
+    // is already converged.
     mint_identities(&mut doc);
+    lift_whole_paragraph_insertions(&mut doc);
+    lift_whole_paragraph_deletions(&mut doc);
+    // Adopt identities a previous save recorded — LAST, so the walk this
+    // document presents is the same post-lift canonical walk the writer
+    // digested. Before the lifts, a whole-paragraph insertion counts two
+    // carriers where the writer counted one, and the digest can never match.
+    adopt_persisted_revision_identities(archive, &mut doc);
 
     Ok((doc, diagnostics))
 }
@@ -1335,6 +2832,10 @@ pub(crate) fn build_canonical_from_root_with_stories(
     footnotes: Vec<FootnoteStory>,
     endnotes: Vec<EndnoteStory>,
     comments: Vec<CommentStory>,
+    // The package this document came from, when there is one. Used only to
+    // adopt engine identities a previous save recorded; `None` for callers
+    // that build from a bare root (fragments, tests), which simply derive.
+    package: Option<&DocxArchive>,
 ) -> Result<(CanonDoc, Vec<Diagnostic>), RuntimeError> {
     let body = body_element(root).map_err(map_word_xml_error)?;
 
@@ -1412,8 +2913,19 @@ pub(crate) fn build_canonical_from_root_with_stories(
 
     mint_wire_zero_revision_ids(&mut doc);
     ensure_unique_formatting_change_ids(&mut doc);
+    crate::tracked_model::canonicalize_imported_split_tracking_boundary_prefixes(&mut doc);
     // H7: engine-mint stable revision identities once wire ids are settled.
+    // Minting also absorbs marker-split tracked segments, so the shape below
+    // is already converged.
     mint_identities(&mut doc);
+    lift_whole_paragraph_insertions(&mut doc);
+    lift_whole_paragraph_deletions(&mut doc);
+    // Adopt identities a previous save recorded — LAST, so the walk this
+    // document presents is the same post-lift canonical walk the writer
+    // digested (see the body-import pipeline for the full rationale).
+    if let Some(package) = package {
+        adopt_persisted_revision_identities(package, &mut doc);
+    }
 
     Ok((doc, diagnostics))
 }
@@ -1938,6 +3450,7 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
         let story_ref = StoryRef {
             kind: kind.clone(),
             part_path: part_name,
+            source_order: None,
             // §17.10.5 blank synthesis — render semantics, never markup.
             synthesized: true,
         };
@@ -2012,6 +3525,7 @@ fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: crate::domain::AuthoredRFonts::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -2139,6 +3653,7 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
         let story_ref = StoryRef {
             kind: kind.clone(),
             part_path: part_name,
+            source_order: None,
             // §17.10.5 blank synthesis — render semantics, never markup.
             synthesized: true,
         };
@@ -3599,7 +5114,18 @@ fn table_cell_from_element(
     let mut pending_markers: Vec<(usize, InlineNode)> = Vec::new();
     let mut grid_span: u32 = 1;
     let mut v_merge = VerticalMerge::None;
-    let mut formatting = CellFormatting::default();
+    // `CellFormatting::default()` assumes present == authored, which is right
+    // where the model is constructed and wrong at the parse edge: this cell has
+    // authored nothing until its own `w:tcPr` says so, and a cell may have no
+    // `tcPr` at all. Leaving the construction default in place makes such a
+    // cell claim authorship of the borders that border-conflict resolution
+    // later fills in below, and the next save bakes those style-inherited edges
+    // into the wire as direct markup.
+    let mut formatting = CellFormatting {
+        has_direct_borders: false,
+        has_direct_shading: false,
+        ..CellFormatting::default()
+    };
     let mut formatting_change: Option<CellFormattingChange> = None;
     let mut tracking_status: Option<TrackingStatus> = None;
     let mut cell_ins: Option<RevisionInfo> = None;
@@ -3637,13 +5163,23 @@ fn table_cell_from_element(
                     if is_w_tag(prop_el, "gridSpan")
                         && let Some(val) = attr_get(prop_el, "w:val")
                     {
-                        grid_span = val.parse().map_err(|_| RuntimeError {
+                        let parsed: u32 = val.parse().map_err(|_| RuntimeError {
                             code: ErrorCode::InvalidDocx,
                             message: format!(
                                 "invalid gridSpan value '{val}' in cell tbl_{table_id}_r{row_index}_c{cell_index}"
                             ),
                             details: ErrorDetails::default(),
                         })?;
+                        // A span below one is out of range: ST_DecimalNumber on
+                        // `w:gridSpan` counts grid columns and a cell occupies
+                        // at least one (§17.4.17). Wild documents do carry
+                        // `w:val="0"`, and Word lays those out as a single
+                        // column, so this normalizes rather than refuses —
+                        // a documented contract decision, not a silent repair.
+                        // Storing the zero verbatim was worse than either: the
+                        // serializer emits the element only above one, so the
+                        // value could not survive its own round trip.
+                        grid_span = parsed.max(1);
                     }
                     // Parse vMerge (vertical merge)
                     if is_w_tag(prop_el, "vMerge") {
@@ -4136,7 +5672,7 @@ fn parse_band_size(tbl_pr: &Element, tag: &str) -> Option<u32> {
 /// Parse a border set from a parent element (e.g., tblBorders or tcBorders).
 ///
 /// Looks for a child element matching `border_element_name` and extracts
-/// top/bottom/left/right/insideH/insideV borders from it.
+/// top/bottom/left/right/insideH/insideV and cell-diagonal borders from it.
 fn parse_border_set(
     parent: &Element,
     border_element_name: &str,
@@ -4160,6 +5696,8 @@ fn parse_border_set(
                 right,
                 inside_h: parse_border_edge(el, "insideH")?,
                 inside_v: parse_border_edge(el, "insideV")?,
+                tl2br: parse_border_edge(el, "tl2br")?,
+                tr2bl: parse_border_edge(el, "tr2bl")?,
             }));
         }
     }
@@ -4251,7 +5789,7 @@ fn border_edge_to_domain(edge: crate::word_ir::BorderEdge) -> Result<Border, Run
     })
 }
 /// Convert resolved paragraph border edges to domain ParagraphBorders.
-fn convert_paragraph_borders_from_edges(
+pub(crate) fn convert_paragraph_borders_from_edges(
     resolved_borders: Option<crate::word_ir::ParagraphBorderProps>,
 ) -> Result<Option<ParagraphBorders>, RuntimeError> {
     match resolved_borders {
@@ -5168,6 +6706,9 @@ fn border_weight(border: &Border) -> u32 {
         BorderStyle::ThreeDEngrave => 25,
         BorderStyle::Outset => 26,
         BorderStyle::Inset => 27,
+        BorderStyle::Art(_) => {
+            unreachable!("art border styles are restricted to page borders at the parse edge")
+        }
         // None, Nil, Dotted, Dashed handled above with early returns
         BorderStyle::None | BorderStyle::Nil | BorderStyle::Dotted | BorderStyle::Dashed => {
             unreachable!()
@@ -5318,7 +6859,7 @@ fn resolve_table_vs_cell_border(
 /// After conditional formatting has been applied, this function compares each
 /// cell's borders against the table's borders. For each edge, the border with
 /// higher weight wins.
-fn resolve_table_cell_border_conflicts(
+pub(crate) fn resolve_table_cell_border_conflicts(
     rows: &mut [TableRowNode],
     table_borders: &Option<BorderSet>,
 ) {
@@ -5392,6 +6933,8 @@ fn resolve_table_cell_border_conflicts(
                 right: resolved_right,
                 inside_h: cell_borders.inside_h.clone(),
                 inside_v: cell_borders.inside_v.clone(),
+                tl2br: cell_borders.tl2br.clone(),
+                tr2bl: cell_borders.tr2bl.clone(),
             });
 
             grid_col += cell_grid_span;
@@ -5408,7 +6951,7 @@ fn resolve_table_cell_border_conflicts(
 ///
 /// Horizontal shared edges: bottom of row N vs top of row N+1.
 /// Vertical shared edges: right of cell at col C vs left of cell at col C+1.
-fn resolve_adjacent_cell_border_conflicts(rows: &mut [TableRowNode]) {
+pub(crate) fn resolve_adjacent_cell_border_conflicts(rows: &mut [TableRowNode]) {
     let total_rows = rows.len();
 
     // --- Vertical shared edges (right of cell C vs left of cell C+1) ---
@@ -6478,6 +8021,39 @@ fn derive_heading_level_number(
         })
 }
 
+/// Whether this paragraph is the wire expansion of one whole-block deletion.
+/// Used while importing prefixes: a label inside that complete deletion is
+/// safe to hoist because the outer block will carry the deletion after minting;
+/// a partially tracked label must remain inline and selectable on its own.
+fn is_complete_wire_paragraph_deletion(view: &ParagraphView) -> bool {
+    let Some(TrackingStatus::Deleted(mark)) = &view.para_mark_status else {
+        return false;
+    };
+    let mut has_deleted_content = false;
+    let complete = view.atoms.iter().all(|atom| match &atom.tracking {
+        Some(tracking)
+            if !tracking.is_insertion
+                && tracking.stacked_deletion.is_none()
+                && mark.author.as_deref() == Some(tracking.author.as_str())
+                && mark.date == tracking.date =>
+        {
+            has_deleted_content = true;
+            true
+        }
+        None if matches!(
+            atom.kind,
+            crate::word_ir::AtomKind::Decoration { .. }
+                | crate::word_ir::AtomKind::CommentRangeStart { .. }
+                | crate::word_ir::AtomKind::CommentRangeEnd { .. }
+        ) =>
+        {
+            true
+        }
+        _ => false,
+    });
+    complete && has_deleted_content
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_from_element(
     paragraph: &Element,
@@ -6570,7 +8146,23 @@ fn paragraph_from_element(
     // paragraph) — unless the label text is tracked (then it must stay in
     // the body as a tracked segment so accept/reject can resolve it), or the
     // paragraph already carries structural numbering (see MODEL note above).
-    let tracked_flags: Vec<bool> = view.atoms.iter().map(|a| a.tracking.is_some()).collect();
+    // A tracked label stays inline, INCLUDING inside a complete paragraph
+    // deletion. Hoisting there was permitted on the grounds that the outer
+    // block carries the deletion anyway — but it makes import disagree with
+    // every other producer of the same state: an edit that deletes a paragraph
+    // later leaves the label inline, and nothing re-normalizes it. The two
+    // shapes then disagree about what the deletion's TEXT is, and a deletion's
+    // excerpt is a revision-signature input, so the identity moves across a
+    // round trip (wave-8 lifecycles 49, 114, 177).
+    //
+    // `literal_prefix` holds UNTRACKED source characters (see
+    // `lift_whole_paragraph_insertions`); a completely deleted paragraph's
+    // label is tracked by its block, so it does not belong there.
+    let tracked_flags: Vec<bool> = view
+        .atoms
+        .iter()
+        .map(|atom| atom.tracking.is_some())
+        .collect();
     let mut source_run_indices: Vec<Option<usize>> = view
         .atoms
         .iter()
@@ -6726,7 +8318,8 @@ fn paragraph_from_element(
     let widow_control = if let Some(sd) = style_defs {
         sd.resolve_effective_widow_control(effective_style_id, view.widow_control)
     } else {
-        view.widow_control
+        // Same §17.3.1.44 spec-default the styled path applies: absent means ON.
+        view.widow_control.or(Some(true))
     };
 
     // Resolve keepNext through style chain (§17.3.1.15)
@@ -7059,7 +8652,7 @@ fn paragraph_from_element(
         effective_tab_stops_rel,
         segments: segments_from_tracked_atoms(&view.atoms[prefix_len..], inlines),
         block_text_hash,
-        numbering,
+        numbering: numbering.clone(),
         // Emit a direct w:numPr only when the paragraph's OWN pPr authored it.
         // Numbering resolved from a style (§17.7.4.14) or bound via the
         // abstractNum's pStyle reverse link (§17.9.23) is inherited, not direct,
@@ -7084,14 +8677,22 @@ fn paragraph_from_element(
         heading_level: heading_level.map(HeadingLevel::from_number),
         para_mark_status: view.para_mark_status,
         paragraph_mark_marks: convert_text_marks_to_marks(&view.paragraph_mark_rpr),
-        paragraph_mark_style_props: convert_text_marks_to_style_props(&view.paragraph_mark_rpr)?,
+        paragraph_mark_style_props: paragraph_mark_props_without_rfonts(&view.paragraph_mark_rpr)?,
+        paragraph_mark_rfonts: view.paragraph_mark_rpr.authored_rfonts.clone(),
         paragraph_mark_rpr_off: convert_text_marks_to_para_mark_off(&view.paragraph_mark_rpr),
         para_split: false,
         section_property_change: view.section_property_change,
         formatting_change: view
             .ppr_change
             .as_ref()
-            .map(convert_ppr_change)
+            .map(|change| {
+                convert_ppr_change(
+                    change,
+                    numbering.as_ref(),
+                    numbering_defs,
+                    &view.paragraph_mark_rpr,
+                )
+            })
             .transpose()?,
         section_properties: view.section_properties,
         mirror_indents: view.mirror_indents,
@@ -7190,6 +8791,7 @@ fn authored_paragraph_spacing(
 /// theme attribute onto a run that authored a literal font (and vice versa).
 fn run_rpr_authored(marks: &TextMarks) -> crate::domain::RunRprAuthored {
     crate::domain::RunRprAuthored {
+        rpr_after_content: marks.rpr_after_content,
         font_family: marks.font_family.is_some(),
         font_family_theme: marks.font_family_theme.is_some(),
         font_east_asia: marks.font_east_asia.is_some(),
@@ -7255,7 +8857,7 @@ fn convert_text_marks_to_marks(text_marks: &TextMarks) -> Vec<Mark> {
     if text_marks.italic == WordMarkValue::On {
         marks.push(Mark::Italic);
     }
-    if text_marks.underline == WordMarkValue::On {
+    if text_marks.underline == WordMarkValue::On && !text_marks.preserve_val_absent_underline {
         marks.push(Mark::Underline);
     }
     if text_marks.subscript == WordMarkValue::On {
@@ -7290,7 +8892,9 @@ fn convert_mark_value(mv: &crate::word_ir::MarkValue) -> crate::domain::MarkValu
 }
 
 /// Extract value-carrying style properties from TextMarks.
-fn convert_text_marks_to_style_props(text_marks: &TextMarks) -> Result<StyleProps, RuntimeError> {
+pub(crate) fn convert_text_marks_to_style_props(
+    text_marks: &TextMarks,
+) -> Result<StyleProps, RuntimeError> {
     // Build RunBorder from individual fields if a border style is present.
     let run_border = text_marks
         .run_border_style
@@ -7444,7 +9048,67 @@ pub(crate) fn reresolve_run_style_props(
 /// serializer re-emits it as-is.
 fn convert_ppr_change(
     ppr_change: &crate::word_ir::PprChange,
+    current_numbering: Option<&crate::domain::NumberingInfo>,
+    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
+    live_mark_rpr: &crate::word_ir::TextMarks,
 ) -> Result<ParagraphFormattingChange, RuntimeError> {
+    let previous_num_props = ppr_change
+        .preserved
+        .iter()
+        .find(|prop| prop.name == "numPr" || prop.name == "w:numPr")
+        .map(|prop| {
+            let element = crate::word_xml::parse_raw_fragment(prop.raw_xml.as_bytes())
+                .map_err(|error| invalid_docx(&format!("pPrChange numPr: {error}")))?;
+            let value = |name: &str| {
+                element.children.iter().find_map(|child| {
+                    let xmltree::XMLNode::Element(child) = child else {
+                        return None;
+                    };
+                    is_w_tag(child, name)
+                        .then(|| attr_get(child, "w:val"))
+                        .flatten()
+                        .and_then(|value| value.parse::<u32>().ok())
+                })
+            };
+            Ok::<_, RuntimeError>((value("numId").unwrap_or(0), value("ilvl").unwrap_or(0)))
+        })
+        .transpose()?;
+    let previous_numbering_explicitly_absent =
+        previous_num_props.is_some_and(|(num_id, _)| num_id == 0);
+    let previous_numbering = previous_num_props.and_then(|(num_id, ilvl)| {
+        if num_id == 0 {
+            return None;
+        }
+        if let Some(current) = current_numbering
+            && current.num_id == num_id
+            && current.ilvl == ilvl
+        {
+            return Some(current.clone());
+        }
+        let level = numbering_defs?.get_level(num_id, ilvl)?;
+        Some(crate::domain::NumberingInfo {
+            num_id,
+            ilvl,
+            // A bullet's lvlText is position-independent. For a numeric list
+            // whose previous numPr differs from the live paragraph, the exact
+            // counter requires the alternate document-order state; keep the
+            // structural numbering typed and let the render projection derive
+            // its label rather than inventing a counter.
+            synthesized_text: if level.num_fmt == crate::numbering::NumFormat::Bullet {
+                level.lvl_text.clone()
+            } else {
+                String::new()
+            },
+            is_bullet: level.num_fmt == crate::numbering::NumFormat::Bullet,
+            restart_numbering: false,
+        })
+    });
+    // Only consume the raw numPr when it has an honest typed representation.
+    // A nonzero reference with no matching numbering definition cannot supply
+    // NumberingInfo's presentation fields; preserve that XML verbatim rather
+    // than silently dropping it or inventing resolved numbering metadata.
+    let previous_num_pr_is_modeled =
+        previous_numbering_explicitly_absent || previous_numbering.is_some();
     let previous_alignment =
         ppr_change
             .previous_alignment
@@ -7512,13 +9176,8 @@ fn convert_ppr_change(
         previous_alignment,
         previous_indentation,
         previous_spacing,
-        // `previous_numbering` needs `NumberingInfo` (synthesized text +
-        // bullet flag), which requires the document-order numbering counter
-        // state — not available here. The snapshot's numPr instead stays in
-        // `previous_preserved_ppr` and round-trips/restores verbatim (see
-        // `PPR_CHANGE_MODELED_CHILDREN`).
-        previous_numbering: None,
-        previous_numbering_explicitly_absent: false,
+        previous_numbering,
+        previous_numbering_explicitly_absent,
         previous_style_id: ppr_change.previous_style_id.clone(),
         previous_keep_next: ppr_change.previous_keep_next,
         previous_keep_lines: ppr_change.previous_keep_lines,
@@ -7534,15 +9193,42 @@ fn convert_ppr_change(
         // Internal literal-prefix synthesis state — never present in Word XML.
         previous_literal_prefix_leading_tab_twips: None,
         previous_literal_prefix_trailing_tab_stop_twips: None,
-        previous_paragraph_mark_marks: convert_text_marks_to_marks(
-            &ppr_change.previous_paragraph_mark_rpr,
-        ),
-        previous_paragraph_mark_style_props: convert_text_marks_to_style_props(
-            &ppr_change.previous_paragraph_mark_rpr,
-        )
-        .expect("paragraph mark rPr in pPrChange should convert"),
+        // The snapshot mark fields go through the SAME converters as the live
+        // mark (`paragraph_mark_props_without_rfonts` strips the preserved
+        // rFonts double-representation), and an ABSENT inner rPr reads as
+        // "the mark formatting did not change" — the live values — because
+        // that is what this serializer's emission gate persists for the
+        // unchanged case. Reading it as "no formatting" made the reopened
+        // snapshot differ from the authored one on every pPrChange whose mark
+        // was untouched.
+        //
+        // KNOWN BOUNDARY: when the mark formatting DID change, the previous
+        // values travel in the mark's own `w:rPrChange` (not the inner pPr),
+        // and this fallback records the live (post-change) values instead of
+        // recovering them from there — the same information the pre-existing
+        // code lost by recording nothing. Recovering from the mark rPrChange
+        // is a separate, currently unwitnessed repair.
+        previous_paragraph_mark_marks: match &ppr_change.previous_paragraph_mark_rpr {
+            Some(rpr) => convert_text_marks_to_marks(rpr),
+            None => convert_text_marks_to_marks(live_mark_rpr),
+        },
+        previous_paragraph_mark_style_props: paragraph_mark_props_without_rfonts(
+            ppr_change
+                .previous_paragraph_mark_rpr
+                .as_ref()
+                .unwrap_or(live_mark_rpr),
+        )?,
+        previous_paragraph_mark_rfonts: ppr_change
+            .previous_paragraph_mark_rpr
+            .as_ref()
+            .unwrap_or(live_mark_rpr)
+            .authored_rfonts
+            .clone(),
         previous_paragraph_mark_rpr_off: convert_text_marks_to_para_mark_off(
-            &ppr_change.previous_paragraph_mark_rpr,
+            ppr_change
+                .previous_paragraph_mark_rpr
+                .as_ref()
+                .unwrap_or(live_mark_rpr),
         ),
         previous_text_direction: ppr_change.previous_text_direction.clone(),
         previous_text_alignment: ppr_change.previous_text_alignment.clone(),
@@ -7572,7 +9258,14 @@ fn convert_ppr_change(
                 extra_attrs: fp.extra_attrs.clone(),
             }
         }),
-        previous_preserved_ppr: ppr_change.preserved.clone(),
+        previous_preserved_ppr: ppr_change
+            .preserved
+            .iter()
+            .filter(|prop| {
+                !previous_num_pr_is_modeled || (prop.name != "numPr" && prop.name != "w:numPr")
+            })
+            .cloned()
+            .collect(),
         revision_id: ppr_change.revision_id,
         identity: 0,
         author: ppr_change.author.clone(),
@@ -7657,17 +9350,17 @@ fn inline_nodes_from_atoms(
                     formatting_change: convert_rpr_change(&atom.marks)?,
                 }));
             }
-            // §17.3.3.18: a non-breaking hyphen is a visible character. On the
-            // rebuild path it becomes a literal U+2011 in text (Word reads U+2011
-            // identically to <w:noBreakHyphen/>); untouched runs round-trip the
-            // element verbatim. Mirrors the Tab arm above.
+            // §17.3.3.18: a non-breaking hyphen is a visible character whose
+            // semantic projection is U+2011. Keep its authored element role as
+            // provenance: real Word can lay out literal U+2011 differently from
+            // `<w:noBreakHyphen/>`, even though both read as the same character.
             AtomKind::NoBreakHyphen => {
                 let local_index = *inline_counter;
                 *inline_counter += 1;
                 let id = NodeId::from(format!("{}_t{}", block_id.0, local_index));
                 out.push(InlineNode::from(TextNode {
                     id,
-                    text_role: None,
+                    text_role: Some(crate::domain::TextRole::NoBreakHyphen),
                     text: "\u{2011}".to_string(),
                     marks: convert_text_marks_to_marks(&resolved_marks),
                     style_props: convert_text_marks_to_style_props(&resolved_marks)?,
@@ -7676,7 +9369,11 @@ fn inline_nodes_from_atoms(
                     formatting_change: convert_rpr_change(&atom.marks)?,
                 }));
             }
-            AtomKind::Break(break_type) => {
+            AtomKind::Break {
+                break_type,
+                type_is_explicit,
+                clear,
+            } => {
                 let local_index = *inline_counter;
                 *inline_counter += 1;
                 let id = NodeId::from(format!("{}_br{}", block_id.0, local_index));
@@ -7691,6 +9388,12 @@ fn inline_nodes_from_atoms(
                 out.push(InlineNode::HardBreak(crate::domain::HardBreakNode {
                     id,
                     break_type: break_type.clone(),
+                    type_is_explicit: *type_is_explicit,
+                    clear: clear.clone(),
+                    wrapper_marks: convert_text_marks_to_marks(&resolved_marks),
+                    wrapper_style_props: convert_text_marks_to_style_props(&resolved_marks)?,
+                    wrapper_rpr_authored: run_rpr_authored(&atom.marks),
+                    source_run_attrs: atom.source_run_attrs.clone(),
                     joins_following_text_run,
                 }));
             }
@@ -7728,7 +9431,24 @@ fn inline_nodes_from_atoms(
                     "customXml" => OpaqueKind::CustomXml,
                     _ => OpaqueKind::Unknown(name.clone()),
                 };
-                let content_hash = Some(sha256_hex(raw_xml));
+                // Note/comment references have a complete typed identity
+                // (kind + reference_id). Their raw element bytes are merely an
+                // alternate transport representation: an engine-authored
+                // reference starts typed with no raw XML, while reopening
+                // supplies raw XML. Hashing that representation would make an
+                // unchanged reference appear semantically different solely
+                // because a persistence boundary occurred.
+                let content_hash = match &kind {
+                    OpaqueKind::CommentReference(_)
+                    | OpaqueKind::FootnoteReference(_)
+                    | OpaqueKind::EndnoteReference(_) => None,
+                    _ => Some(sha256_hex(raw_xml)),
+                };
+                let joins_following_text_run = atom.origin.run_index.is_some()
+                    && atoms.get(atom_index + 1).is_some_and(|next| {
+                        next.origin.run_index == atom.origin.run_index
+                            && matches!(next.kind, AtomKind::Text(_))
+                    });
                 out.push(InlineNode::from(crate::domain::OpaqueInlineNode {
                     id,
                     kind,
@@ -7736,6 +9456,8 @@ fn inline_nodes_from_atoms(
                     proof_ref,
                     wrapper_marks: convert_text_marks_to_marks(&atom.marks),
                     wrapper_style_props: convert_text_marks_to_style_props(&atom.marks)?,
+                    source_run_attrs: atom.source_run_attrs.clone(),
+                    joins_following_text_run,
                     raw_xml: Some(raw_xml.clone()),
                     content_hash,
                 }));
@@ -7756,6 +9478,8 @@ fn inline_nodes_from_atoms(
                     proof_ref,
                     wrapper_marks: convert_text_marks_to_marks(&atom.marks),
                     wrapper_style_props: convert_text_marks_to_style_props(&atom.marks)?,
+                    source_run_attrs: Vec::new(),
+                    joins_following_text_run: false,
                     raw_xml: None, // Hyperlinks use HyperlinkData for serialization
                     content_hash: None,
                 }));
@@ -9120,26 +10844,32 @@ fn parse_story_block(
         let view = ParagraphView::from_paragraph(element, ctx.rel_lookup)
             .map_err(|e| invalid_docx(&format!("story paragraph {}: {}", block_id.0, e)))?;
 
+        // ISO 29500-1 §17.7.4.17: an unstyled paragraph implicitly references
+        // the default paragraph style. The SAME effective id the body path
+        // computes — the story path passing the bare `view.style_id` here made
+        // story runs import WITHOUT the default style's rPr contribution while
+        // the post-apply rebuild re-resolved WITH it, so a body-only edit
+        // visibly changed a header run's effective fonts in memory (wave-8
+        // lifecycle 385's round-0 origin).
+        let effective_style_id: Option<&str> = view
+            .style_id
+            .as_deref()
+            .or_else(|| ctx.style_defs.and_then(|sd| sd.default_para_style_id()));
+
         let block_text = view.block_text();
         let mut inlines = inline_nodes_from_atoms(
             &block_id,
             &view.atoms,
             ctx.inline_counter,
             ctx.style_defs,
-            view.style_id.as_deref(),
+            effective_style_id,
         )
         .map_err(|e| invalid_docx(&format!("story paragraph {}: {}", block_id.0, e.message)))?;
 
         // Heading level: derived the ONE shared way (see derive_heading_level_number)
         // so the story path can never re-drift from the body. Computed here before
-        // any field of `view` is moved out below. Unstyled paragraphs implicitly
-        // reference the default paragraph style for outline resolution (§17.7.4.17).
-        let effective_heading_style_id: Option<&str> = view
-            .style_id
-            .as_deref()
-            .or_else(|| ctx.style_defs.and_then(|sd| sd.default_para_style_id()));
-        let heading_level =
-            derive_heading_level_number(&view, effective_heading_style_id, ctx.style_defs);
+        // any field of `view` is moved out below.
+        let heading_level = derive_heading_level_number(&view, effective_style_id, ctx.style_defs);
 
         // Capture the inline count before prefix stripping so we can offset into
         // `view.atoms` when building tracked segments below (atoms and inlines
@@ -9149,7 +10879,12 @@ fn parse_story_block(
         // Strip typed numbering prefix from inlines — unless the label text
         // is tracked (then it must stay in the body as a tracked segment so
         // accept/reject can resolve it).
-        let tracked_flags: Vec<bool> = view.atoms.iter().map(|a| a.tracking.is_some()).collect();
+        let complete_paragraph_deletion = is_complete_wire_paragraph_deletion(&view);
+        let tracked_flags: Vec<bool> = view
+            .atoms
+            .iter()
+            .map(|atom| atom.tracking.is_some() && !complete_paragraph_deletion)
+            .collect();
         let mut source_run_indices: Vec<Option<usize>> = view
             .atoms
             .iter()
@@ -9289,9 +11024,20 @@ fn parse_story_block(
             }
         };
 
-        // Resolve alignment and indentation through style chain for story paragraphs
+        // Resolve alignment and indentation through style chain for story paragraphs.
+        // §17.7.4.17: a paragraph without an explicit pStyle uses the DEFAULT
+        // paragraph style — the same fallback the body path applies (its
+        // `effective_style_id`). Story paragraphs resolved against a bare None
+        // skipped the default style's chain entirely, so a footnote paragraph
+        // spelled effective spacing None where the body rule (and the
+        // projection's re-resolvers, and a reopened Word save) spell the
+        // resolved value.
+        let effective_style_id: Option<&str> = view
+            .style_id
+            .as_deref()
+            .or_else(|| ctx.style_defs.and_then(|sd| sd.default_para_style_id()));
         let resolved_alignment = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_alignment(view.style_id.as_deref(), view.alignment.as_deref())
+            sd.resolve_effective_alignment(effective_style_id, view.alignment.as_deref())
         } else {
             view.alignment.clone()
         };
@@ -9301,7 +11047,7 @@ fn parse_story_block(
             .and_then(|level| level.indent.as_ref());
         let resolved_indent = if let Some(sd) = ctx.style_defs {
             sd.resolve_effective_indent(
-                view.style_id.as_deref(),
+                effective_style_id,
                 view.indentation.as_ref(),
                 numbering_level_indent,
             )
@@ -9350,40 +11096,38 @@ fn parse_story_block(
             }
         };
         let resolved_spacing = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_spacing(view.style_id.as_deref(), view.spacing.as_ref())
+            sd.resolve_effective_spacing(effective_style_id, view.spacing.as_ref())
         } else {
             view.spacing.clone()
         };
         let resolved_borders = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_borders(view.style_id.as_deref(), view.borders.as_ref())
+            sd.resolve_effective_borders(effective_style_id, view.borders.as_ref())
         } else {
             view.borders.clone()
         };
         let contextual_spacing = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_contextual_spacing(
-                view.style_id.as_deref(),
-                view.contextual_spacing,
-            )
+            sd.resolve_effective_contextual_spacing(effective_style_id, view.contextual_spacing)
         } else {
             view.contextual_spacing
         };
         let widow_control = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_widow_control(view.style_id.as_deref(), view.widow_control)
+            sd.resolve_effective_widow_control(effective_style_id, view.widow_control)
         } else {
-            view.widow_control
+            // Same §17.3.1.44 spec-default the styled path applies.
+            view.widow_control.or(Some(true))
         };
         let keep_next = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_keep_next(view.style_id.as_deref(), view.keep_next)
+            sd.resolve_effective_keep_next(effective_style_id, view.keep_next)
         } else {
             view.keep_next
         };
         let keep_lines = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_keep_lines(view.style_id.as_deref(), view.keep_lines)
+            sd.resolve_effective_keep_lines(effective_style_id, view.keep_lines)
         } else {
             view.keep_lines
         };
         let page_break_before = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_page_break_before(view.style_id.as_deref(), view.page_break_before)
+            sd.resolve_effective_page_break_before(effective_style_id, view.page_break_before)
         } else {
             view.page_break_before
         }
@@ -9415,7 +11159,7 @@ fn parse_story_block(
 
         // Resolve and synthesize tab stops for story paragraphs
         let resolved_stops = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_tabs(view.style_id.as_deref(), view.tab_stops.as_deref())
+            sd.resolve_effective_tabs(effective_style_id, view.tab_stops.as_deref())
         } else {
             view.tab_stops
                 .as_deref()
@@ -9553,7 +11297,7 @@ fn parse_story_block(
 
         // Resolve shading through style chain (§17.3.1.31)
         let shading = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_para_shading(view.style_id.as_deref(), direct_shading.as_ref())
+            sd.resolve_effective_para_shading(effective_style_id, direct_shading.as_ref())
         } else {
             direct_shading
         };
@@ -9593,7 +11337,7 @@ fn parse_story_block(
             // builds segments the same way (see paragraph_from_element).
             segments: segments_from_tracked_atoms(&view.atoms[prefix_len..], inlines),
             block_text_hash: Some(sha256_hex(block_text.as_bytes())),
-            numbering,
+            numbering: numbering.clone(),
             // See paragraph_from_element: emit direct numPr only when authored.
             has_direct_numbering: matches!(view.num_props, crate::word_ir::DirectNumPr::Active(_)),
             numbering_suppressed: matches!(view.num_props, crate::word_ir::DirectNumPr::Suppressed),
@@ -9618,13 +11362,21 @@ fn parse_story_block(
             paragraph_mark_style_props: convert_text_marks_to_style_props(
                 &view.paragraph_mark_rpr,
             )?,
+            paragraph_mark_rfonts: view.paragraph_mark_rpr.authored_rfonts.clone(),
             paragraph_mark_rpr_off: convert_text_marks_to_para_mark_off(&view.paragraph_mark_rpr),
             para_split: false,
             section_property_change: view.section_property_change,
             formatting_change: view
                 .ppr_change
                 .as_ref()
-                .map(convert_ppr_change)
+                .map(|change| {
+                    convert_ppr_change(
+                        change,
+                        numbering.as_ref(),
+                        ctx.numbering_defs,
+                        &view.paragraph_mark_rpr,
+                    )
+                })
                 .transpose()?,
             section_properties: view.section_properties,
             mirror_indents: view.mirror_indents,
@@ -10329,6 +12081,42 @@ fn decoration_type_from_name(name: &str) -> DecorationType {
 /// adjacent text; the atom model splits each into its own run, so re-emitting
 /// the host run's rPr onto the split marker run would merely duplicate the
 /// formatting the neighbouring text run already carries — churn, not fidelity.
+/// True when a decoration is a SELF-CONTAINED run-level glyph mark — the note
+/// auto-number (`w:footnoteRef`/`w:endnoteRef`), the note separators, the
+/// annotation reference mark, a pagination hint, or a soft hyphen — rather
+/// than one half of a range-marker pair (bookmark, permission, move,
+/// comment-range, proofing, custom-XML, foreign placeholders). A glyph run
+/// has no other half anywhere in the document, so it is ordinary paragraph
+/// content that a whole-paragraph insertion subsumes; a range marker can pair
+/// with a marker OUTSIDE the paragraph and must stay independently addressable
+/// for the torn-marker repair path. Classified from the raw wire bytes because
+/// `DecorationType` does not encode the distinction (note refs import under
+/// the foreign-element fallback).
+fn decoration_is_self_contained_run(decoration: &DecorationNode) -> bool {
+    let Some(raw) = &decoration.raw_xml else {
+        return false;
+    };
+    let raw = String::from_utf8_lossy(raw);
+    let Some(after_angle) = raw.find('<').map(|index| index + 1) else {
+        return false;
+    };
+    let name: String = raw[after_angle..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
+        .collect();
+    let local = name.rsplit(':').next().unwrap_or(&name);
+    matches!(
+        local,
+        "footnoteRef"
+            | "endnoteRef"
+            | "separator"
+            | "continuationSeparator"
+            | "annotationRef"
+            | "lastRenderedPageBreak"
+            | "softHyphen"
+    )
+}
+
 fn decoration_wrapper_rpr_is_load_bearing(name: &str) -> bool {
     let local = name.rsplit(':').next().unwrap_or(name);
     matches!(
@@ -10447,6 +12235,7 @@ mod tests {
             footnotes,
             endnotes,
             comments,
+            None,
         )?;
         diagnostics.extend(story_diagnostics);
         doc.compat_settings = compat_settings;
@@ -12056,5 +13845,105 @@ mod tests {
             para.heading_level, None,
             "a non-heading footnote paragraph must have no heading level"
         );
+    }
+
+    #[test]
+    fn revision_identity_ignores_ooxml_envelope_splits_inside_content() {
+        // Domain rule: a paragraph-level marker cannot live inside w:del, so
+        // one deletion may persist as `<w:del>wi</w:del> marker
+        // <w:del>sps</w:del>`. That syntax boundary does not create a second
+        // proposal or change the stable identity of deleting "wisps".
+        let record = |excerpt: &str| crate::tracked_model::RevisionRecord {
+            revision_id: 1,
+            wire_id: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            kind: crate::tracked_model::RevisionKind::Delete,
+            block_id: NodeId::from("p_1"),
+            location: StoryScope::Body,
+            excerpt: excerpt.to_string(),
+        };
+        let carrier_keys = HashMap::new();
+        let unsplit = canonical_revision_group_signature(&[record("wisps")], &carrier_keys);
+        let split =
+            canonical_revision_group_signature(&[record("wi"), record("sps")], &carrier_keys);
+        assert_eq!(
+            split, unsplit,
+            "serialization-only tracked-envelope partitions must not affect identity"
+        );
+    }
+
+    #[test]
+    fn distinct_wire_envelopes_around_comment_marker_reopen_as_one_identity() {
+        use crate::ExportOptions;
+        use crate::api::Document;
+
+        let bytes = docx_with_body(
+            r#"<w:p>
+                <w:del w:id="7" w:author="Reviewer">
+                    <w:r><w:delText>wi</w:delText></w:r>
+                </w:del>
+                <w:commentRangeStart w:id="4"/>
+                <w:del w:id="8" w:author="Reviewer">
+                    <w:r><w:delText>sps</w:delText></w:r>
+                </w:del>
+                <w:commentRangeEnd w:id="4"/>
+            </w:p>"#,
+        );
+        let document = Document::parse(&bytes).expect("split-envelope input must parse");
+        let records =
+            crate::tracked_model::enumerate_revisions(document.snapshot().canonical.as_ref());
+        assert_eq!(records.len(), 2, "both syntax envelopes remain observable");
+        assert_eq!(records[0].excerpt, "wi");
+        assert_eq!(records[1].excerpt, "sps");
+        assert_eq!(
+            records[0].revision_id, records[1].revision_id,
+            "a direct paragraph marker is an OOXML boundary, not a second proposal"
+        );
+
+        let serialized = document
+            .serialize(&ExportOptions::default())
+            .expect("unique output annotation ids must pass validation");
+        let reopened = Document::parse(&serialized).expect("serialized output must reopen");
+        let reopened_records =
+            crate::tracked_model::enumerate_revisions(reopened.snapshot().canonical.as_ref());
+        assert!(
+            reopened_records
+                .iter()
+                .all(|record| record.revision_id == records[0].revision_id),
+            "the logical identity must survive another unique-wire-id save/reopen"
+        );
+    }
+
+    #[test]
+    fn semantic_identity_collision_is_an_explicit_error_not_a_probe() {
+        let bytes = docx_with_body(
+            r#"<w:p>
+                <w:del w:id="7" w:author="Reviewer">
+                    <w:r><w:delText>alpha</w:delText></w:r>
+                </w:del>
+                <w:r><w:t> gap </w:t></w:r>
+                <w:del w:id="8" w:author="Reviewer">
+                    <w:r><w:delText>beta</w:delText></w:r>
+                </w:del>
+            </w:p>"#,
+        );
+        let (mut doc, _) = import_with_diagnostics(&bytes);
+        let records = crate::tracked_model::enumerate_revisions(&doc);
+        let beta_identity = records
+            .iter()
+            .find(|record| record.excerpt == "beta")
+            .expect("beta revision")
+            .revision_id;
+        for_each_rev_carrier_mut(&mut doc, &mut |carrier| match carrier.wire_id {
+            7 => *carrier.identity = beta_identity,
+            8 => *carrier.identity = 0,
+            _ => {}
+        });
+
+        let error = try_mint_identities(&mut doc)
+            .expect_err("a preoccupied semantic digest must refuse instead of probing");
+        assert_eq!(error.candidate, beta_identity);
+        assert!(error.records.contains("beta"));
     }
 }

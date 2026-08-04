@@ -199,12 +199,12 @@ Fields: `target`, `attrs`, `expect_href`, `expect_anchor`, `rationale`.
 
 ### `set_format`
 
-Tracked character formatting on a guarded text span; marks is the complete replacement mark set as an array of tagged objects, and the value-carrying fields (color, font, size) ride alongside it.
+Tracked character formatting on a guarded text span; marks is a tri-state object where an omitted property is unchanged, true turns it on and false turns it off, and the value-carrying fields (color, font, size) ride alongside it.
 
 Fields: `target`, `expect`, `semantic_hash`, `marks`, `color`, `highlight`, `font_family`, `font_size_half_points`, `caps`, `small_caps`, `char_spacing`, `rationale`.
 
 ```json
-{"op":"set_format","target":"<block_id>","expect":"<exact unique text>","marks":[{"type":"bold"}]}
+{"op":"set_format","target":"<block_id>","expect":"<exact unique text>","marks":{"bold":true}}
 ```
 
 ### `set_para_format`

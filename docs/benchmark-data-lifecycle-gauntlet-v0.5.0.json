@@ -1,0 +1,56 @@
+{
+  "consumer_load": {
+    "backend": "libreoffice-headless",
+    "engine_attributable_failures": 0,
+    "external_consumer_limitations": 3,
+    "inherited_source_unloadable": 23,
+    "rounds_checked": 5924,
+    "rounds_loaded": 5898
+  },
+  "engine_version": "0.5.0",
+  "modeled": {
+    "authors_min": 3,
+    "completed": 1000,
+    "law_violations": {},
+    "lifecycles": 1000,
+    "refusal_contract_passed": 1000,
+    "rounds_histogram": {
+      "5": 384,
+      "6": 308,
+      "7": 308
+    },
+    "rounds_total": 5924
+  },
+  "real_word": {
+    "authors_min": 8,
+    "completed": 100,
+    "law_violations": {},
+    "lifecycles": 100,
+    "refusal_contract_passed": 100,
+    "repair_dialogs": 0,
+    "rounds_histogram": {
+      "5": 37,
+      "6": 36,
+      "7": 27
+    },
+    "rounds_total": 590,
+    "sampling_rate": 0.1
+  },
+  "replay": {
+    "agent": {
+      "dnf": 2,
+      "expected_proposals": 599,
+      "fully_equivalent": 1,
+      "macro_reproduction_rate": 0.3443,
+      "matched_proposals": 58,
+      "micro_reproduction_rate": 0.0968,
+      "n": 10,
+      "scored": 8
+    },
+    "endpoint_preserved": 55,
+    "failed_admissions": 0,
+    "lanes": 55,
+    "literal_delta_reproduction_rate": 0.1464
+  },
+  "schema": "stemma.lifecycle_gauntlet.aggregate.v1"
+}

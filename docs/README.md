@@ -19,7 +19,7 @@ two Word documents and produces one native tracked-changes comparison.
 | Fix an error or refusal | [Troubleshooting](help/troubleshooting.md) |
 | Read working code for a common flow | [Examples](examples.md) |
 | Embed the Rust engine | [`stemma-engine` README](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/README.md) |
-| Build a viewer, renderer, or service | [Embed the engine](reference/embedding.md); render from the [read model reference](reference/read-model.md) |
+| Build a viewer, renderer, or service | [Embed the engine](reference/embedding.md); render from the [read model reference](reference/read-model.md). The read model is an embedding surface; no CLI command emits it |
 | Store documents and edits durably | [Persist and replay](guide/persistence.md) |
 
 ## Understand the model

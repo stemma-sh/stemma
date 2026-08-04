@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "stemma"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-api"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "serde",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-artifacts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "same-file",
  "serde",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "serde",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",

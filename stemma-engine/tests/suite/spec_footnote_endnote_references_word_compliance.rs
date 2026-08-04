@@ -114,20 +114,68 @@ fn reserialize(bytes: &[u8]) -> String {
     document_xml_of(&out)
 }
 
+/// Parse → identity diff → canonical rebuild → emitted document.xml.
+fn identity_rebuild_xml(bytes: &[u8]) -> String {
+    let doc = stemma::api::Document::parse(bytes).expect("parse");
+    let rebuilt = doc.diff(&doc).expect("identity diff");
+    let out = rebuilt
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize canonical rebuild");
+    document_xml_of(&out)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[test]
 fn footnote_reference_run_preserves_rstyle_and_id_through_roundtrip() {
     let body = r#"<w:p><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="1"/></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    let xml = reserialize(&b);
+    let xml = identity_rebuild_xml(&b);
+    let reference_start = xml
+        .find("<w:footnoteReference")
+        .expect("footnoteReference element");
+    let reference_end = reference_start
+        + xml[reference_start..]
+            .find('>')
+            .expect("footnoteReference end");
+    let reference_tag = &xml[reference_start..=reference_end];
     assert!(
-        xml.contains(r#"<w:footnoteReference w:id="1""#),
+        reference_tag.contains(r#"w:id="1""#),
         "ECMA-376 §17.11.14 / ISO 29500-1 §17.11.14 — refs: the footnoteReference w:id linkage is load-bearing and stemma preserves untouched opaque content verbatim, so the id must survive the roundtrip; got XML:\n{xml}"
     );
     assert!(
         xml.contains(r#"w:val="FootnoteReference""#),
         "ECMA-376 §17.11.14 / ISO 29500-1 §17.11.14 — refs: canonical markup binds the reference run to the FootnoteReference character style; a verbatim roundtrip must retain it; got XML:\n{xml}"
+    );
+}
+
+#[test]
+fn custom_footnote_mark_stays_in_reference_source_run() {
+    let body = r#"<w:p><w:r w:rsidR="12345678"><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:customMarkFollows="1" w:id="1"/><w:t>*</w:t></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+    let parsed = stemma::api::Document::parse(&b).expect("parse source");
+    let stemma::BlockNode::Paragraph(paragraph) = &parsed.snapshot().canonical.blocks[0].block
+    else {
+        panic!("expected paragraph");
+    };
+    let joined = paragraph.all_inlines().any(|inline| {
+        matches!(inline, stemma::InlineNode::OpaqueInline(opaque) if opaque.joins_following_text_run)
+    });
+    assert!(joined, "import must retain the shared source-run boundary");
+    let xml = identity_rebuild_xml(&b);
+
+    let reference = xml.find("<w:footnoteReference").expect("reference element");
+    let custom_mark = xml[reference..]
+        .find("<w:t>*</w:t>")
+        .map(|offset| reference + offset)
+        .expect("custom mark text");
+    assert!(
+        !xml[reference..custom_mark].contains("</w:r>"),
+        "ISO 29500-1 §17.11.14: a custom mark following its footnoteReference in the same source run must remain in that run. Splitting the pair changes Word's footnote pagination and line layout: {xml}"
+    );
+    assert!(
+        xml.contains(r#"<w:r w:rsidR="12345678">"#),
+        "the joined reference/custom-mark run must preserve its source run attributes: {xml}"
     );
 }
 

@@ -15,6 +15,8 @@
 //! materializes a blank `Default` header/footer reference per §17.10.2, so a
 //! `Default` create is refused in favor of `EditHeader`.
 
+use std::collections::HashSet;
+
 use stemma::api::Document;
 use stemma::domain::{HeaderFooterKind, RevisionInfo};
 use stemma::edit::{
@@ -376,14 +378,35 @@ fn create_footer_tracked_redline_validates_and_projects() {
         .expect("serialize redline");
     assert_validator_clean("create_footer tracked redline", &redline);
 
-    let accepted = edited.project(Resolution::AcceptAll).expect("accept all");
+    let reopened = Document::parse(&redline).expect("reopen tracked footer creation");
+    let identities: HashSet<u32> = stemma::enumerate_revisions(&reopened.snapshot().canonical)
+        .into_iter()
+        .map(|record| record.revision_id)
+        .collect();
+    assert_eq!(
+        identities.len(),
+        1,
+        "the new footer story and its section reference are one selectable creation"
+    );
+
+    let accepted = reopened
+        .project(Resolution::Selective {
+            ids: identities.clone(),
+            action: stemma::ResolveSelectionAction::Accept,
+        })
+        .expect("selectively accept footer creation");
     assert_eq!(
         accepted.snapshot().canonical.footers.len(),
         base_footer_count + 1,
         "accept keeps the net-new footer story"
     );
 
-    let rejected = edited.project(Resolution::RejectAll).expect("reject all");
+    let rejected = reopened
+        .project(Resolution::Selective {
+            ids: identities,
+            action: stemma::ResolveSelectionAction::Reject,
+        })
+        .expect("selectively reject footer creation");
     assert_eq!(
         rejected.snapshot().canonical.footers.len(),
         base_footer_count,

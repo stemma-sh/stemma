@@ -74,6 +74,74 @@ transaction accepts) is the [operation reference](operations.md). Runnable
 versions: `cargo run -p stemma --example my_first_edit` and
 `--example review_before_save`.
 
+One import rule covers the whole facade: **every type a `Document` signature
+names is importable from `stemma::api`**, next to `Document` itself:
+`Resolution`, `ResolveSelectionAction`, `ExportOptions`, `RuntimeError`,
+`RevisionRecord`, and the rest. (Most are also re-exported at the crate
+root; `stemma::ExportOptions` and `stemma::api::ExportOptions` are the same
+type.) Nothing on this page requires knowing which internal module defines
+what.
+
+## Resolving a redline (Tier 1)
+
+The other half of a document lifecycle: the redline arrives from outside,
+and your product's job is to enumerate it, resolve it, and save the result.
+Three facts carry the whole flow:
+
+- **`Document::revisions()` is the census.** One enumeration across every
+  story and every revision kind, formatting changes included. Each
+  `RevisionRecord` carries `revision_id: u32` (the engine-minted identity
+  selective resolution addresses; `0` marks the rare census-only record that
+  is reported but never selectable), `author`, `date`, `kind`, the hosting
+  `block_id`, and an excerpt.
+- **A projection is a full `Document`.** `project`, `read_accepted`, and
+  `read_rejected` return the resolved document, not a text view: read it,
+  enumerate it, project it again, serialize it. Passes chain in memory with
+  no re-parse between them, and ids enumerated from one pass stay valid on
+  the next (content-derived identity).
+- **`serialize` validates.** `ExportOptions::default()` runs the same
+  blocking structural gate `save_docx` uses, so bytes that reach your
+  storage are bytes Word will open without flagging repairs.
+
+Compile-checked, like everything on this page:
+
+```rust,no_run
+use std::collections::HashSet;
+use stemma::api::{Document, Resolution, ResolveSelectionAction};
+
+fn resolve_and_save(source: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let doc = Document::parse(source)?;
+
+    // Triage by author: accept everything opposing counsel proposed...
+    let theirs: HashSet<u32> = doc
+        .revisions()
+        .into_iter()
+        .filter(|r| r.author.as_deref() == Some("Opposing Counsel"))
+        .map(|r| r.revision_id)
+        .collect();
+    let after_accept = doc.project(Resolution::Selective {
+        ids: theirs,
+        action: ResolveSelectionAction::Accept,
+    })?;
+
+    // ...then, on the projection, reject everything still pending. Re-reading
+    // the census from the value you are about to resolve is the discipline;
+    // rejecting the full remainder could equally be `read_rejected()`.
+    let rest: HashSet<u32> = after_accept.revisions().iter().map(|r| r.revision_id).collect();
+    let resolved = after_accept.project(Resolution::Selective {
+        ids: rest,
+        action: ResolveSelectionAction::Reject,
+    })?;
+
+    // Nothing pending in memory, and validated resolved bytes out.
+    assert!(resolved.revisions().is_empty(), "mixed triage fully resolved");
+    Ok(resolved.serialize(&stemma::ExportOptions::default())?)
+}
+```
+
+Runnable, with content-level verification of each resolution:
+`cargo run -p stemma --example resolve_a_redline`.
+
 ## Hosting sessions (Tier 3: `SimpleRuntime`)
 
 A server needs what the facade deliberately does not carry: session identity,

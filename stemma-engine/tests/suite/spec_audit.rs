@@ -13,8 +13,9 @@ use stemma::api::Document;
 use stemma::audit::{DirectChangeKind, RevisionDisposition, UntouchedViolationKind};
 use stemma::edit::{
     ContentFragment, EditStep, EditTransaction, MaterializationMode, ParagraphContent,
+    ParagraphFormattingPatch,
 };
-use stemma::{RevisionInfo, RevisionKind, StoryScope};
+use stemma::{Alignment, RevisionInfo, RevisionKind, StoryScope};
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -468,6 +469,59 @@ fn prior_revision_identity_is_stable_across_save_and_reopen() {
     }
 }
 
+#[test]
+fn identical_format_proposals_authored_before_an_existing_one_get_distinct_stable_identities() {
+    let base = Document::parse(&make_docx_with_body(THREE_PARAS)).expect("parse");
+    let blocks = base.read().blocks;
+    let format = |block_id, revision_id| EditTransaction {
+        steps: vec![EditStep::SetParagraphFormatting {
+            block_id,
+            semantic_hash: None,
+            patch: ParagraphFormattingPatch {
+                align: Some(Alignment::Center),
+                indent: None,
+                spacing: None,
+                borders: None,
+                shading: None,
+            },
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: revision(revision_id, "Same reviewer"),
+    };
+
+    // Author the later paragraph first, then an otherwise-identical proposal
+    // earlier in document order. A duplicate-ordinal identity scheme assigns
+    // the new proposal the existing proposal's ordinal and panics here.
+    let later = base
+        .apply(&format(blocks[1].id.clone(), 1))
+        .expect("first format proposal applies");
+    let both = later
+        .apply(&format(blocks[0].id.clone(), 2))
+        .expect("second identical proposal gets its own identity");
+    let before: std::collections::HashMap<_, _> = both
+        .revisions()
+        .into_iter()
+        .filter(|row| row.kind == RevisionKind::FormatParagraph)
+        .map(|row| (row.block_id, row.revision_id))
+        .collect();
+    assert_eq!(before.len(), 2);
+    assert_ne!(before[&blocks[0].id], before[&blocks[1].id]);
+
+    let saved = both
+        .serialize(&stemma::ExportOptions::default())
+        .expect("save");
+    let reopened = Document::parse(&saved).expect("reopen");
+    let after: std::collections::HashMap<_, _> = reopened
+        .revisions()
+        .into_iter()
+        .filter(|row| row.kind == RevisionKind::FormatParagraph)
+        .map(|row| (row.block_id, row.revision_id))
+        .collect();
+    assert_eq!(after, before, "both identities survive save/reopen");
+}
+
 /// Receipt/audit agreement is an invariant over the representative synthetic
 /// fixture shapes, not a one-off example. The session and delivery paths must
 /// assign the same disposition to every prior revision after an unrelated edit.
@@ -793,4 +847,327 @@ fn tracked_edit_does_not_indict_untouched_hyperlink_paragraph() {
         "an untouched hyperlink paragraph is not a direct change: {report:?}"
     );
     assert!(report.untouched.violations.is_empty(), "{report:?}");
+}
+
+// ─── Carrier keys: a repeated w14:paraId identifies nothing ──────────────────
+
+/// A body with the `w14` namespace available, so paragraphs can carry paraIds.
+fn make_docx_with_para_ids(body_inner: &str) -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
+    );
+    zip_docx(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+        ),
+        ("word/document.xml", &document_xml),
+    ])
+}
+
+/// A paragraph carrying the SHARED paraId, optionally with a tracked
+/// paragraph-formatting change by one author on one date.
+fn para_with_shared_id(text: &str, tracked: bool) -> String {
+    let change = if tracked {
+        r#"<w:pPrChange w:id="90" w:author="Reviewer" w:date="2026-03-01T00:00:00Z"><w:pPr/></w:pPrChange>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<w:p w14:paraId="150FFAD2"><w:pPr><w:jc w:val="center"/>{change}</w:pPr><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#
+    )
+}
+
+/// A revision's identity must depend on ITS carrier, not on how many other
+/// carriers happen to look like it.
+///
+/// `w14:paraId` is the durable on-wire paragraph identity, and the carrier key
+/// prefers it so identities survive the projections that renumber positional
+/// `p_N` handles. But Word does not guarantee it is unique — copy/paste and
+/// some producers repeat one value across hundreds of paragraphs. A key shared
+/// by hundreds of carriers gives their revision signatures one value, leaving
+/// only a document-order ordinal to separate them, which is precisely the
+/// durability the key exists to provide.
+///
+/// The observable rule: removing an UNRELATED paragraph's revision must not
+/// change the identity of the revision that remains.
+#[test]
+fn a_repeated_para_id_does_not_key_a_revision_to_its_neighbours() {
+    let both = make_docx_with_para_ids(&format!(
+        "{}{}",
+        para_with_shared_id("First clause.", true),
+        para_with_shared_id("Second clause.", true)
+    ));
+    let one = make_docx_with_para_ids(&format!(
+        "{}{}",
+        para_with_shared_id("First clause.", false),
+        para_with_shared_id("Second clause.", true)
+    ));
+
+    let identity_of_second = |bytes: &[u8]| -> u32 {
+        let doc = Document::parse(bytes).expect("parse shared-paraId fixture");
+        let rows = stemma::tracked_model::enumerate_revisions(&doc.snapshot().canonical);
+        let matched: Vec<_> = rows
+            .iter()
+            .filter(|row| row.kind == RevisionKind::FormatParagraph)
+            .collect();
+        assert!(
+            !matched.is_empty(),
+            "fixture must carry a tracked paragraph-formatting change: {rows:?}"
+        );
+        let second = matched.last().expect("at least one formatting revision");
+        second.revision_id
+    };
+
+    assert_eq!(
+        identity_of_second(&both),
+        identity_of_second(&one),
+        "the second paragraph's revision is the same revision either way; its \
+         identity must not move because a neighbour sharing its paraId lost one"
+    );
+}
+
+/// The engine records its revision identities, and reopening adopts them.
+///
+/// H7 needs identity to be BOTH derivable from the document and stable when
+/// the document changes; derivation alone cannot satisfy both, because two
+/// revisions that are indistinguishable by content can only be told apart by
+/// something outside themselves. So a save records what it minted.
+///
+/// Adjudicated: Word preserves this part, its content-type override and its
+/// relationship verbatim across open/edit/save.
+#[test]
+fn a_save_records_its_revision_identities_and_a_reopen_adopts_them() {
+    let before = stemma_produced_revision_heavy_docx();
+    let doc = Document::parse(&before).expect("parse revision-heavy input");
+    let saved = doc
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+
+    let archive = stemma::docx::DocxArchive::read(&saved).expect("read package");
+    let part = archive
+        .get("word/stemmaRevisionIds.xml")
+        .expect("the save records its revision identities");
+    let part_xml = String::from_utf8_lossy(part).to_string();
+    assert!(
+        part_xml.contains("<rev "),
+        "the sidecar must carry an entry per revision: {part_xml}"
+    );
+
+    let before_ids: Vec<u32> =
+        stemma::tracked_model::enumerate_revisions(doc.snapshot().canonical.as_ref())
+            .into_iter()
+            .map(|record| record.revision_id)
+            .collect();
+    let reopened = Document::parse(&saved).expect("reopen");
+    let after_ids: Vec<u32> =
+        stemma::tracked_model::enumerate_revisions(reopened.snapshot().canonical.as_ref())
+            .into_iter()
+            .map(|record| record.revision_id)
+            .collect();
+
+    assert_eq!(
+        after_ids, before_ids,
+        "reopening must adopt the recorded identities, not re-derive them"
+    );
+}
+
+// ─── The identity-stability contract (D-2026-07-29) ─────────────────────────
+//
+// Tiered guarantee. T1: identities are content-derived; a revision untouched
+// in its signature inputs and its lookalike population keeps its number
+// through everything. T2: across our own save→reopen with an unchanged
+// carrier walk, numbers are EXACTLY stable — the sidecar's job. T3: across a
+// boundary where the walk changed (another editor), lookalike numbers may
+// drift, and a citation that no longer resolves is refused loudly — never
+// silently remapped.
+
+/// Three deletions that are GENUINELY indistinguishable — same author, date,
+/// text and paragraph. Only position among lookalikes separates them, and
+/// position is exactly what resolution mutates.
+fn docx_with_three_lookalike_deletions() -> Vec<u8> {
+    make_docx_with_body(concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r>"#,
+        r#"<w:del w:id="101" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">"#,
+        r#"<w:r><w:delText xml:space="preserve">Lomnice </w:delText></w:r></w:del>"#,
+        r#"<w:r><w:t xml:space="preserve">alpha </w:t></w:r>"#,
+        r#"<w:del w:id="102" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">"#,
+        r#"<w:r><w:delText xml:space="preserve">Lomnice </w:delText></w:r></w:del>"#,
+        r#"<w:r><w:t xml:space="preserve">beta </w:t></w:r>"#,
+        r#"<w:del w:id="103" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">"#,
+        r#"<w:r><w:delText xml:space="preserve">Lomnice </w:delText></w:r></w:del>"#,
+        r#"<w:r><w:t>tail.</w:t></w:r></w:p>"#,
+    ))
+}
+
+fn revision_ids(doc: &Document) -> Vec<u32> {
+    stemma::tracked_model::enumerate_revisions(doc.snapshot().canonical.as_ref())
+        .into_iter()
+        .map(|record| record.revision_id)
+        .collect()
+}
+
+/// T2: a lookalike surviving a resolution keeps the number the reviewer saw,
+/// across a save and reopen.
+///
+/// This is the case derivation alone gets silently WRONG: the survivors'
+/// lookalike population shrank, so re-derivation renumbers them — and hands
+/// the first survivor an identity derived from the slot the resolved revision
+/// vacated. That is misattribution, not renaming. The companion test below
+/// corrupts the record and observes the renumbering, which proves this test's
+/// equality comes from adoption and not vacuously from derivation.
+#[test]
+fn a_lookalike_surviving_resolution_keeps_its_identity_across_save_and_reopen() {
+    let doc = Document::parse(&docx_with_three_lookalike_deletions()).expect("parse");
+    let ids = revision_ids(&doc);
+    assert_eq!(ids.len(), 3, "three lookalike deletions enumerate: {ids:?}");
+    assert!(
+        ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+        "indistinguishable revisions still get distinct identities: {ids:?}"
+    );
+
+    let rejected = doc
+        .project(stemma::Resolution::Selective {
+            ids: std::collections::HashSet::from([ids[0]]),
+            action: stemma::ResolveSelectionAction::Reject,
+        })
+        .expect("reject the first lookalike");
+    let survivors = revision_ids(&rejected);
+    assert_eq!(
+        survivors,
+        vec![ids[1], ids[2]],
+        "in memory, the two survivors keep their identities"
+    );
+
+    let saved = rejected
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+    let reopened = Document::parse(&saved).expect("reopen");
+    assert_eq!(
+        revision_ids(&reopened),
+        survivors,
+        "across our own save and reopen the survivors keep the numbers the \
+         reviewer already saw (contract tier T2)"
+    );
+}
+
+/// The sidecar must not trust wire ids: Word re-mints `w:id` freely (the fact
+/// the engine's identity layer exists to survive). Rewriting every revision
+/// wire id in the saved package must not disturb adoption — identities follow
+/// the carrier walk, not the one attribute Word rewrites.
+#[test]
+fn adoption_survives_a_word_style_wire_id_rewrite() {
+    fn bump_revision_wire_ids(xml: &str) -> String {
+        let mut out = String::with_capacity(xml.len());
+        let mut segments = xml.split("w:id=\"");
+        let mut prev = segments.next().expect("split yields a head");
+        out.push_str(prev);
+        for seg in segments {
+            let tail = prev.trim_end();
+            let is_revision = tail.ends_with("<w:del") || tail.ends_with("<w:ins");
+            out.push_str("w:id=\"");
+            if is_revision {
+                let end = seg.find('"').expect("id attribute closes");
+                let id: u32 = seg[..end].parse().expect("numeric wire id");
+                out.push_str(&(id + 1000).to_string());
+                out.push_str(&seg[end..]);
+            } else {
+                out.push_str(seg);
+            }
+            prev = seg;
+        }
+        out
+    }
+
+    let doc = Document::parse(&docx_with_three_lookalike_deletions()).expect("parse");
+    let ids = revision_ids(&doc);
+    let rejected = doc
+        .project(stemma::Resolution::Selective {
+            ids: std::collections::HashSet::from([ids[0]]),
+            action: stemma::ResolveSelectionAction::Reject,
+        })
+        .expect("reject the first lookalike");
+    let survivors = revision_ids(&rejected);
+    let saved = rejected
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+
+    let mut archive = stemma::docx::DocxArchive::read(&saved).expect("read package");
+    let document_xml = String::from_utf8(
+        archive
+            .get("word/document.xml")
+            .expect("body part")
+            .to_vec(),
+    )
+    .expect("utf8 body");
+    let tampered = bump_revision_wire_ids(&document_xml);
+    assert_ne!(tampered, document_xml, "the rewrite touched the wire ids");
+    archive
+        .set("word/document.xml", tampered.into_bytes())
+        .expect("replace body");
+    let rewritten = archive.write().expect("repack");
+
+    let reopened = Document::parse(&rewritten).expect("reopen after id rewrite");
+    assert_eq!(
+        revision_ids(&reopened),
+        survivors,
+        "identities land on the right carriers by walk position, untouched by \
+         the wire-id rewrite"
+    );
+}
+
+/// T3's floor: a record describing a walk this document no longer has —
+/// another editor changed the document, the record went stale — is declined
+/// whole, and derivation runs as if the part were absent. Declining is
+/// observable here as the renumbering derivation produces; it is what proves
+/// the T2 test above is not passing vacuously through derivation.
+#[test]
+fn a_changed_walk_declines_adoption_rather_than_trusting_a_stale_record() {
+    let doc = Document::parse(&docx_with_three_lookalike_deletions()).expect("parse");
+    let ids = revision_ids(&doc);
+    let rejected = doc
+        .project(stemma::Resolution::Selective {
+            ids: std::collections::HashSet::from([ids[0]]),
+            action: stemma::ResolveSelectionAction::Reject,
+        })
+        .expect("reject the first lookalike");
+    let survivors = revision_ids(&rejected);
+    let saved = rejected
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+
+    let mut archive = stemma::docx::DocxArchive::read(&saved).expect("read package");
+    let sidecar = String::from_utf8(
+        archive
+            .get("word/stemmaRevisionIds.xml")
+            .expect("the save records identities")
+            .to_vec(),
+    )
+    .expect("utf8 sidecar");
+    let stale = sidecar.replace("walk=\"", "walk=\"dead");
+    assert_ne!(stale, sidecar, "the corruption touched the walk digest");
+    archive
+        .set("word/stemmaRevisionIds.xml", stale.into_bytes())
+        .expect("replace sidecar");
+    let foreign = archive.write().expect("repack");
+
+    let reopened = Document::parse(&foreign).expect("a stale record must not fail the import");
+    let derived = revision_ids(&reopened);
+    assert_eq!(derived.len(), 2, "both survivors still enumerate");
+    assert_ne!(
+        derived, survivors,
+        "with the record declined, derivation renumbers the lookalike \
+         survivors — the gate actually gates"
+    );
 }

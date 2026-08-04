@@ -81,6 +81,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -555,5 +556,62 @@ fn replace_with_literal_number_on_unnumbered_paragraph_is_a_real_edit() {
         text.contains("1.") && text.contains("Events"),
         "the literal '1.\\tEvents' must be applied as real content (in runs or literal_prefix), \
          got {text:?}"
+    );
+}
+
+/// D5: a no-op formatting refusal names what the target ALREADY reads.
+///
+/// Decided from trajectory evidence. Over 1,000 modeled lifecycles this
+/// refusal fired 614 times — 36% of every refusal recorded — because callers
+/// cannot tell in advance that a patch is already satisfied. "No visible or
+/// provenance effect" is true and unhelpful: it leaves the caller to guess
+/// which half of the patch was already the case.
+///
+/// The refusal stands (no mutation); it just stops withholding the state the
+/// engine had to read in order to decide.
+#[test]
+fn a_no_op_formatting_refusal_names_the_current_formatting() {
+    let doc = make_doc(vec![stemma::domain::normal_tracked_block(BlockNode::from(
+        make_para(
+            "p1",
+            vec![TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![{
+                    // The bold must be AUTHORED, not inherited: setting an
+                    // inherited mark directly flips provenance, which is a
+                    // real change (see `run_formatting`'s directness rule).
+                    let mut inline = make_text_with_marks("t1", "Already bold", vec![Mark::Bold]);
+                    if let InlineNode::Text(text) = &mut inline {
+                        text.rpr_authored.bold = true;
+                    }
+                    inline
+                }],
+            }],
+        ),
+    ))]);
+
+    let error = apply_transaction(
+        &doc,
+        &transaction(
+            vec![EditStep::SetRunFormatting {
+                block_id: NodeId::from("p1"),
+                expect: "Already bold".to_string(),
+                semantic_hash: None,
+                marks: InlineMarkSet {
+                    bold: true,
+                    ..InlineMarkSet::default()
+                },
+                style: RunStyleEdit::default(),
+                rationale: None,
+            }],
+            MaterializationMode::TrackedChange,
+        ),
+    )
+    .expect_err("bolding already-bold text is a no-op and must refuse");
+
+    let message = format!("{error}");
+    assert!(
+        message.contains("bold"),
+        "the refusal must name the formatting the target already carries, got: {message}"
     );
 }

@@ -89,6 +89,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         para_mark_status: None,
         paragraph_mark_marks: vec![],
         paragraph_mark_style_props: StyleProps::default(),
+        paragraph_mark_rfonts: Default::default(),
         paragraph_mark_rpr_off: Default::default(),
         para_split: false,
         section_property_change: None,
@@ -137,6 +138,8 @@ fn single_borders() -> BorderSet {
         right: Some(edge.clone()),
         inside_h: Some(edge.clone()),
         inside_v: Some(edge),
+        tl2br: None,
+        tr2bl: None,
     }
 }
 
@@ -657,6 +660,8 @@ fn set_cell_format_preserves_a_cell_opaque_inline() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
         raw_xml: Some(
             br#"<w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>"#.to_vec(),
         ),
@@ -738,6 +743,75 @@ fn make_table_docx() -> Vec<u8> {
     buf
 }
 
+/// The same 1×2 table, but the cells carry no `w:tcPr` at all — the shape a
+/// cell takes when the author never set a single cell-level property. Table
+/// borders are still authored at `tblPr`, so border resolution has something
+/// to push down into the cells.
+fn make_table_docx_without_cell_properties() -> Vec<u8> {
+    let base = make_table_docx();
+    let mut archive = DocxArchive::read(&base).expect("read fixture");
+    let xml = String::from_utf8(archive.get("word/document.xml").unwrap().to_vec())
+        .expect("utf-8 document part")
+        .replace(r#"<w:tcPr><w:tcW w:w="2400" w:type="dxa"/></w:tcPr>"#, "");
+    assert!(
+        !xml.contains("<w:tcPr>"),
+        "fixture must have no cell properties"
+    );
+    archive
+        .set("word/document.xml", xml.into_bytes())
+        .expect("replace document part");
+    archive.write().expect("rewrite fixture")
+}
+
+/// A cell that authored no properties authored no borders.
+///
+/// Border-conflict resolution fills a cell's `borders` with the EFFECTIVE set
+/// so projections can read it, and the provenance flag is what keeps the
+/// serializer from writing that inherited set back out as direct markup
+/// (§17.4.39). `CellFormatting::default()` answers "present == authored",
+/// which is right where the model is constructed and wrong at the parse edge:
+/// a cell with no `w:tcPr` authored nothing.
+///
+/// The consequence of getting this wrong is not visible in the document that
+/// has the defect — nothing is emitted while `borders` is still empty. It
+/// appears one save later, when the cell claims the resolved table borders as
+/// its own and they harden into direct cell markup that no longer follows the
+/// table style.
+#[test]
+fn a_cell_without_tc_pr_authored_no_borders_or_shading() {
+    let doc = Document::parse(&make_table_docx_without_cell_properties()).expect("parse");
+    let canonical = doc.snapshot().canonical.clone();
+    let BlockNode::Table(table) = &canonical
+        .blocks
+        .iter()
+        .find(|block| matches!(block.block, BlockNode::Table(_)))
+        .expect("fixture table")
+        .block
+    else {
+        unreachable!("filtered to tables")
+    };
+
+    for (index, cell) in table.rows[0].cells.iter().enumerate() {
+        assert!(
+            !cell.formatting.has_direct_borders,
+            "cell {index} has no tcPr, so it authored no borders"
+        );
+        assert!(
+            !cell.formatting.has_direct_shading,
+            "cell {index} has no tcPr, so it authored no shading"
+        );
+    }
+
+    // And the round trip must not harden the table's borders into the cells.
+    let bytes = doc.serialize(&ExportOptions::default()).expect("serialize");
+    let archive = DocxArchive::read(&bytes).expect("read exported");
+    let xml = String::from_utf8_lossy(archive.get("word/document.xml").unwrap()).to_string();
+    assert!(
+        !xml.contains("tcBorders"),
+        "inherited table borders must not be written back as direct cell borders: {xml}"
+    );
+}
+
 fn first_table_id(doc: &CanonDoc) -> String {
     for tb in &doc.blocks {
         if let BlockNode::Table(t) = &tb.block {
@@ -804,5 +878,93 @@ fn set_cell_format_serializes_clean_tcprchange_and_round_trips() {
     assert!(
         !rej_xml.contains("FFFF00") && !rej_xml.contains("tcPrChange"),
         "reject-all must revert to the unshaded cell with no tcPrChange, xml: {rej_xml}"
+    );
+}
+
+/// A tracked paragraph format inside a table cell survives the save.
+///
+/// Wave-8 lifecycle 385: a `SetParagraphFormatting` centring a cell paragraph
+/// reads back as `align: Left, has_direct_align: false` after a persistence
+/// boundary — the proposal is simply gone, and with it the reviewer's ability
+/// to see or reject it. A cell paragraph is ordinary editable content; its
+/// `w:jc` must serialize like any other paragraph's.
+#[test]
+fn a_tracked_paragraph_format_in_a_cell_survives_persistence() {
+    let base = Document::parse(&make_table_docx()).expect("parse");
+    let canonical = base.snapshot().canonical.clone();
+    let BlockNode::Table(table) = &canonical
+        .blocks
+        .iter()
+        .find(|block| matches!(block.block, BlockNode::Table(_)))
+        .expect("fixture table")
+        .block
+    else {
+        unreachable!("filtered to tables")
+    };
+    let BlockNode::Paragraph(target) = &table.rows[0].cells[1].blocks[0] else {
+        panic!("cell paragraph");
+    };
+    let target_id = target.id.clone();
+
+    let edited = base
+        .apply(&EditTransaction {
+            steps: vec![stemma::edit::EditStep::SetParagraphFormatting {
+                block_id: target_id.clone(),
+                semantic_hash: None,
+                patch: stemma::edit::ParagraphFormattingPatch {
+                    align: Some(Alignment::Center),
+                    indent: None,
+                    spacing: None,
+                    borders: None,
+                    shading: None,
+                },
+                rationale: None,
+            }],
+            summary: None,
+            materialization_mode: stemma::edit::MaterializationMode::TrackedChange,
+            revision: RevisionInfo {
+                revision_id: 77,
+                identity: 0,
+                author: Some("Reviewer".to_string()),
+                date: Some("2026-03-01T00:00:00Z".to_string()),
+                apply_op_id: None,
+            },
+        })
+        .expect("centre the cell paragraph");
+
+    let alignment = |doc: &CanonDoc| {
+        let BlockNode::Table(table) = &doc
+            .blocks
+            .iter()
+            .find(|block| matches!(block.block, BlockNode::Table(_)))
+            .expect("table survives")
+            .block
+        else {
+            unreachable!("filtered to tables")
+        };
+        let BlockNode::Paragraph(paragraph) = &table.rows[0].cells[1].blocks[0] else {
+            panic!("cell paragraph");
+        };
+        (
+            paragraph.align.clone(),
+            paragraph.has_direct_align,
+            paragraph.formatting_change.is_some(),
+        )
+    };
+
+    assert_eq!(
+        alignment(edited.snapshot().canonical.as_ref()),
+        (Some(Alignment::Center), true, true),
+        "the edit centres the cell paragraph and records a tracked change"
+    );
+
+    let bytes = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let reopened = Document::parse(&bytes).expect("reopen");
+    assert_eq!(
+        alignment(reopened.snapshot().canonical.as_ref()),
+        (Some(Alignment::Center), true, true),
+        "the save dropped a tracked paragraph format inside a table cell"
     );
 }

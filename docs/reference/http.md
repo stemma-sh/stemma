@@ -19,6 +19,15 @@ transaction grammar, receipts, and refusal vocabulary are identical to the
 cargo run -p stemma-api          # then open http://127.0.0.1:3000
 ```
 
+`stemma-api` is **not published to crates.io** (deliberately; see the scope
+note above); running it means cloning
+[the repository](https://github.com/stemma-sh/stemma) and starting it from the
+source workspace. A `cargo install stemma-cli` install alone cannot reach
+these endpoints: the CLI does not serve the read model. To consume
+[`DocumentView`](read-model.md#the-lean-view) or the
+[full render view](read-model.md#the-full-render-view) from your own code,
+embed the engine ([embedding](embedding.md)).
+
 One command starts the API **and** serves the browser review editor that
 runs on it. This Word-style front end uses plain static files and requires no
 build step. The first load fetches ProseMirror and MathJax from public CDNs. It

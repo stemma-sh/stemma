@@ -229,6 +229,131 @@ fn edited_document() -> Document {
     edited_document_by(AUTHOR)
 }
 
+#[test]
+fn whole_paragraph_insertion_reopens_as_the_same_block_level_state() {
+    let doc0 = Document::parse(&base_docx()).expect("parse base");
+    let insert = EditStep::InsertParagraphs {
+        anchor_block_id: first_para_id(&doc0.snapshot().canonical),
+        position: InsertPosition::After,
+        rationale: None,
+        blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            role: Some("body".to_string()),
+            content: parse_paragraph_markup(INSERTED).unwrap(),
+            restart_numbering: false,
+            list: None,
+        })],
+    };
+    let inserted = doc0
+        .apply(&txn(vec![insert], AUTHOR, 1))
+        .expect("insert applies");
+    let original_identity = inserted
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|tracked| match (&tracked.status, &tracked.block) {
+            (TrackingStatus::Inserted(revision), BlockNode::Paragraph(paragraph))
+                if paragraph_text(paragraph) == INSERTED =>
+            {
+                Some(revision.identity)
+            }
+            _ => None,
+        })
+        .expect("nonempty insertion has an identity before save");
+    let bytes = inserted
+        .serialize(&ExportOptions::default())
+        .expect("serialize inserted paragraph");
+    let reopened = Document::parse(&bytes).expect("reopen inserted paragraph");
+
+    let block = reopened
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find(|tracked| {
+            matches!(&tracked.block, BlockNode::Paragraph(paragraph)
+                if paragraph_text(paragraph) == INSERTED)
+        })
+        .expect("inserted paragraph remains present");
+    assert!(
+        matches!(block.status, TrackingStatus::Inserted(_)),
+        "complete inserted content plus inserted pilcrow must lift back to the public block-level insertion model"
+    );
+    let TrackingStatus::Inserted(reopened_revision) = &block.status else {
+        unreachable!()
+    };
+    assert_eq!(reopened_revision.identity, original_identity);
+    let BlockNode::Paragraph(paragraph) = &block.block else {
+        unreachable!()
+    };
+    assert!(paragraph.para_mark_status.is_none());
+    assert!(
+        paragraph
+            .segments
+            .iter()
+            .all(|segment| matches!(segment.status, TrackingStatus::Normal))
+    );
+}
+
+#[test]
+fn empty_whole_paragraph_insertion_reopens_as_the_same_block_level_state() {
+    let doc0 = Document::parse(&base_docx()).expect("parse base");
+    let insert = EditStep::InsertParagraphs {
+        anchor_block_id: first_para_id(&doc0.snapshot().canonical),
+        position: InsertPosition::After,
+        rationale: None,
+        blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            role: Some("body".to_string()),
+            content: ParagraphContent { fragments: vec![] },
+            restart_numbering: false,
+            list: None,
+        })],
+    };
+    let inserted = doc0
+        .apply(&txn(vec![insert], AUTHOR, 1))
+        .expect("empty insert applies");
+    let (original_identity, original_para_id, original_block_id) = inserted
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|tracked| match (&tracked.status, &tracked.block) {
+            (TrackingStatus::Inserted(revision), BlockNode::Paragraph(paragraph)) => Some((
+                revision.identity,
+                paragraph.para_id.clone(),
+                paragraph.id.clone(),
+            )),
+            _ => None,
+        })
+        .expect("empty insertion has an identity before save");
+    let bytes = inserted
+        .serialize(&ExportOptions::default())
+        .expect("serialize empty inserted paragraph");
+    let reopened = Document::parse(&bytes).expect("reopen empty inserted paragraph");
+
+    let inserted_blocks: Vec<_> = reopened
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .filter(|tracked| matches!(tracked.status, TrackingStatus::Inserted(_)))
+        .collect();
+    assert_eq!(inserted_blocks.len(), 1);
+    let BlockNode::Paragraph(paragraph) = &inserted_blocks[0].block else {
+        panic!("empty inserted block must remain a paragraph")
+    };
+    let TrackingStatus::Inserted(reopened_revision) = &inserted_blocks[0].status else {
+        unreachable!()
+    };
+    assert_eq!(
+        reopened_revision.identity, original_identity,
+        "empty insertion identity changed; original para_id={original_para_id:?} block_id={original_block_id}, reopened para_id={:?} block_id={}",
+        paragraph.para_id, paragraph.id
+    );
+    assert_eq!(paragraph_text(paragraph), "");
+    assert!(paragraph.para_mark_status.is_none());
+}
+
 // ── IR projection ───────────────────────────────────────────────────────────
 
 #[test]

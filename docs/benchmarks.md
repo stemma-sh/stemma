@@ -304,6 +304,139 @@ written) where the vanilla agent merely *happened to get them right*, and
 stemma does the same work in ~4 tool calls where the vanilla agent hand-edits
 across ~26 turns.
 
+## Lifecycle gauntlet (v0.5.0)
+
+Everything above measures single editing **episodes**: one task, one
+document, graded once. v0.5.0 adds evidence for **trajectories**: the
+multi-round, multi-author lives real documents actually have, where a
+counterparty accepts some proposals, rejects others, adds its own tracked
+edits, saves, and the engine has to keep going.
+
+Trajectories have no ground truth to grade against, so the gauntlet grades
+**laws** instead: properties that must hold for every program on every
+document, checkable without knowing the "right" answer.
+
+- `accept(track(P)) ≡ direct(P)`: tracking an edit and accepting it equals
+  making it directly.
+- `reject(track(P)) ≡ identity`: tracking an edit and rejecting it changes
+  nothing.
+- `deserialize(serialize(doc)) ≡ doc`, resolution fixpoint, revision-identity
+  and attribution stability, per round.
+- `stemma ∘ word_save ∘ stemma ≡ stemma` (semantic), with real Word in the middle.
+
+Each law is scoped to the revisions the program itself minted, so pre-existing
+pending changes in a wild document stay untouched on both sides of every
+comparison.
+
+### Three legs
+
+**Modeled churn (volume, hermetic).** 1,000 lifecycles of 5-7
+rounds each, at least 3 authors, 5,924 persisted rounds
+total, drawn from the same wild corpus as the robustness lanes above. Every
+round runs the full battery; every persisted round is then checked in
+LibreOffice, an independent consumer rather than our own reader. A round derived
+from a wild source that LibreOffice cannot itself load is reported separately
+as an inherited-source exclusion. An unclassified load failure fails the gate;
+an independently reproduced consumer limitation is named and counted
+separately rather than silently passed or attributed to the engine. Law
+violations: 0. LibreOffice: 5,898 loads, 0 engine-attributable failures
+(23 inherited-source exclusions and 3 independently reproduced note-layout
+consumer limitations).
+
+**Real-Word churn (sampled).** 100 lifecycles / 590 rounds where scripted
+Microsoft Word plays *every* counterparty round: resolving, tracked-editing,
+and saving each document on a real Word instance. Sampling rate: 10% by
+lifecycle, recorded rather than implied. Self-play cannot catch a blindspot the
+engine shares with its own model of Word, which is what this leg and the
+replay leg exist for. Repair dialogs: 0. Law violations: 0.
+
+Divergences between Word's output and the engine's model of it were
+adjudicated against Word itself and resolved one of two ways: an engine fix
+(those shipped in this release), or a **named producer-state boundary**:
+a field where Word rewrites its own spelling on every save and no law about
+document content can hinge on it. The named boundaries are: `rsid*`
+revision-save ids; `rFonts` provenance (font values remain strict); run-join
+transport flags when Word merges same-format runs; the list engine's
+generated `Num` tab stop and its derived effective view; and Word lowering
+`fldSimple` fields to the equivalent complex-field spelling on touched
+documents. Opaque-object hashes are never blanket-excluded: when Word and the
+engine initially differ only across Word-owned serialization, both endpoints
+are independently passed through Word saves and must then compare equal with
+object content still strict. Word also re-mints a drawing's `wp14:editId` on
+each save; only that edit-session attribute is removed before the opaque hash
+is recomputed, while the stable anchor, relationship, and remaining payload
+stay strict. Word's `w:lastRenderedPageBreak` is a pagination
+cache rather than document content; comparison removes it and rejoins
+equal-format text fragments
+on its sides. When a non-zero character-unit indent supersedes its twip sibling
+under §17.3.1.12, the character value remains strict while Word's recomputed,
+ignored twip value does not participate. The comparison producer can also
+re-author paragraph-mark run
+properties and `rFonts` provenance on a newly synthesized comparison
+paragraph even when an ordinary Word save preserves the input; that boundary
+is restricted to those generated paragraphs. On the harness's unmistakable
+synthetic insertion markers, Word's precise insertion-point font selection and
+per-character bidirectional run partition are ground truth; the modeled
+counterparty's single-host-run approximation is excluded only on those marker
+runs, never on wild content. Finally, when a document explicitly enables
+Word's `removePersonalInformation` or `removeDateAndTime` policy, the revision
+inventory is compared after applying that requested author/date removal; kind,
+story, excerpt, and multiplicity remain strict.
+
+The foreign-edit repertoire also has three explicit eligibility limits where a
+Word operation has no like-for-like engine twin: whole-paragraph deletion is
+sampled only when Word's smart cut-and-paste will not absorb the following
+whitespace, and insert-after is not sampled when the following paragraph is
+empty and Word would source the new run's format from that paragraph mark, or
+when a top-level marker lies between the anchor and the next paragraph and the
+two systems define opposite sides of that marker as "after". Formatting is
+also excluded when the source explicitly enables Word's
+`doNotTrackFormatting` policy: Word then applies formatting directly and
+cannot produce the tracked proposal that this leg grades. These shapes are
+excluded before selection; they are not retried under a different strategy
+after a draw.
+
+**Reality replay (held-out).** Wild documents that arrive carrying pending
+tracked changes are fossilized real workflows. Reverse-applying the pending
+set reconstructs the before-document, and the redline itself is ground truth
+for proposals real people actually left pending. These lanes are drawn from reality by
+construction, unable to encode our own assumptions about how people edit.
+55 lanes mined, 55/55 pass the admission battery (`reject(replay) ≡ before`,
+persistence), zero failed admissions.
+
+A bounded agent arm then attempted to reproduce each bundle through the MCP
+verb surface: 10 cold sessions, frozen briefs, no shell and no web tool.
+
+| outcome | n |
+|---|---|
+| scored | 8 |
+| explicit capability refusal (input left untouched) | 2 |
+| fully equivalent reproduction | 1 |
+| proposals reproduced (micro) | 58 / 599 = **0.097** |
+| per-lane rate averaged (macro) | **0.344** |
+
+Both rates are reported because they answer different questions and differ
+by 3×: the micro rate is the share of all expected proposals actually
+reproduced, while the macro average weights every lane equally: a
+one-proposal lane counts as much as the 458-proposal bundle in this sample.
+Quoting either alone would be a coin flip between two honest numbers.
+
+Wild redline bundles are **hard** to reproduce through verb-level editing.
+These numbers are a baseline for the lane family, not a target, and the arm
+is measured but is not a release gate.
+
+### What is held out, and why
+
+The mined lanes, their briefs, the modeled programs, and the per-lane
+artifacts are held out because publishing them would make the family trivially
+overfittable, and the replay lanes' value is precisely that they were never
+authored by us. What is published is the shape above (counts, rates, and the
+named boundaries), plus the machine-readable
+[aggregate](benchmark-data-lifecycle-gauntlet-v0.5.0.json). Engine version:
+0.5.0. Modeled churn and literal replay are deterministic and hermetic. The
+bounded agent arm is stochastic, and the real-Word leg requires a Word
+instance.
+
 ## What replication overturned
 
 Read this section before quoting any number above.

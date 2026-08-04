@@ -261,6 +261,11 @@ pub enum SegmentView {
         text: String,
         status: TrackStatus,
         marks: Vec<TextMark>,
+        /// Pending run-format revision carried by this exact span, if any.
+        /// Its `revision_id` is the stable engine identity used by selective
+        /// accept/reject, not the non-unique wire w:id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format_revision: Option<RevisionView>,
         /// Ephemeral block-local span handle (`s_<n>`), assigned in document
         /// order by the shared span enumeration. The write path resolves it
         /// back to this exact inline range while the block `guard` is unchanged.
@@ -666,6 +671,7 @@ pub(crate) enum EnumeratedSpan {
         text: String,
         status: TrackStatus,
         marks: Vec<TextMark>,
+        format_revision: Option<RevisionView>,
     },
     /// A single `OpaqueInline` at `inlines[inline_idx]`.
     Opaque {
@@ -716,12 +722,14 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
         let mut run_start: Option<usize> = None;
         let mut run_text = String::new();
         let mut run_marks: Vec<TextMark> = Vec::new();
+        let mut run_format_revision: Option<RevisionView> = None;
         let mut run_last_end = 0usize; // exclusive end of the pending run
 
         let flush = |out: &mut Vec<EnumeratedSpan>,
                      run_start: &mut Option<usize>,
                      run_text: &mut String,
                      run_marks: &mut Vec<TextMark>,
+                     run_format_revision: &mut Option<RevisionView>,
                      run_last_end: usize| {
             if let Some(start) = run_start.take() {
                 if !run_text.is_empty() {
@@ -732,10 +740,12 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         text: std::mem::take(run_text),
                         status: status.clone(),
                         marks: std::mem::take(run_marks),
+                        format_revision: run_format_revision.take(),
                     });
                 } else {
                     run_text.clear();
                     run_marks.clear();
+                    *run_format_revision = None;
                 }
             }
         };
@@ -744,13 +754,22 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
             match inline {
                 InlineNode::Text(t) => {
                     let marks = text_marks(t);
+                    let format_revision = t.formatting_change.as_ref().map(|change| RevisionView {
+                        revision_id: change.identity,
+                        author: Some(change.author.clone()),
+                        date: change.date.clone(),
+                        apply_op_id: None,
+                    });
                     // A run breaks when its meaningful marks change.
-                    if !run_text.is_empty() && marks != run_marks {
+                    if !run_text.is_empty()
+                        && (marks != run_marks || format_revision != run_format_revision)
+                    {
                         flush(
                             &mut out,
                             &mut run_start,
                             &mut run_text,
                             &mut run_marks,
+                            &mut run_format_revision,
                             run_last_end,
                         );
                     }
@@ -758,6 +777,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         run_start = Some(inline_idx);
                     }
                     run_marks = marks;
+                    run_format_revision = format_revision;
                     run_text.push_str(&t.text);
                     run_last_end = inline_idx + 1;
                 }
@@ -767,6 +787,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         &mut run_start,
                         &mut run_text,
                         &mut run_marks,
+                        &mut run_format_revision,
                         run_last_end,
                     );
                     out.push(EnumeratedSpan::Opaque {
@@ -785,6 +806,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         &mut run_start,
                         &mut run_text,
                         &mut run_marks,
+                        &mut run_format_revision,
                         run_last_end,
                     );
                     out.push(EnumeratedSpan::Opaque {
@@ -814,6 +836,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         &mut run_start,
                         &mut run_text,
                         &mut run_marks,
+                        &mut run_format_revision,
                         run_last_end,
                     );
                     out.push(EnumeratedSpan::Opaque {
@@ -834,6 +857,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         &mut run_start,
                         &mut run_text,
                         &mut run_marks,
+                        &mut run_format_revision,
                         run_last_end,
                     );
                     out.push(EnumeratedSpan::Opaque {
@@ -854,6 +878,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                         &mut run_start,
                         &mut run_text,
                         &mut run_marks,
+                        &mut run_format_revision,
                         run_last_end,
                     );
                     out.push(EnumeratedSpan::Opaque {
@@ -886,6 +911,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
             &mut run_start,
             &mut run_text,
             &mut run_marks,
+            &mut run_format_revision,
             run_last_end,
         );
     }
@@ -1263,11 +1289,13 @@ fn segment_views_with_handles(p: &crate::domain::ParagraphNode) -> Vec<SegmentVi
                     text,
                     status,
                     marks,
+                    format_revision,
                     ..
                 } => SegmentView::Text {
                     text,
                     status,
                     marks,
+                    format_revision,
                     handle,
                 },
                 EnumeratedSpan::Opaque {
@@ -1746,6 +1774,7 @@ mod tests {
                     status,
                     marks,
                     handle,
+                    ..
                 } => {
                     assert_eq!(text, expected);
                     assert_eq!(*status, TrackStatus::Normal);
@@ -2173,6 +2202,7 @@ mod tests {
                         text: "Preamble before any heading.".to_string(),
                         status: TrackStatus::Normal,
                         marks: vec![],
+                        format_revision: None,
                         handle: None,
                     }],
                     opaque_label: None,
@@ -2194,6 +2224,7 @@ mod tests {
                         text: "Article One".to_string(),
                         status: TrackStatus::Normal,
                         marks: vec![],
+                        format_revision: None,
                         handle: None,
                     }],
                     opaque_label: None,
@@ -2215,6 +2246,7 @@ mod tests {
                         text: "Body under article one.".to_string(),
                         status: TrackStatus::Normal,
                         marks: vec![],
+                        format_revision: None,
                         handle: None,
                     }],
                     opaque_label: None,
@@ -2236,6 +2268,7 @@ mod tests {
                         text: "Section 1.1".to_string(),
                         status: TrackStatus::Normal,
                         marks: vec![],
+                        format_revision: None,
                         handle: None,
                     }],
                     opaque_label: None,
