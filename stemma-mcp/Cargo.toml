@@ -1,6 +1,6 @@
 [package]
 name = "stemma-mcp"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 # Uniform workspace toolchain floor (see stemma-engine/Cargo.toml for the full
 # derivation). This crate's rmcp stack alone requires >= 1.88 (darling 0.23);

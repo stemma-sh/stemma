@@ -14,7 +14,7 @@ default:
 # Merge gate: mirrors ci.yml job for job so a green gate means a green push.
 # Must be green with no env set. The only CI coverage this cannot replicate
 # locally is the Windows/macOS leg of the test matrix.
-gate: contamination docs-check lint test conformance npm-smoke msrv
+gate: contamination docs-check lint test conformance npm-smoke demo-check msrv
 
 [doc("Validate public documentation links, anchors, and style rules")]
 docs-check:
@@ -90,6 +90,11 @@ _wait-crate-visible crate manifest:
 
 test:
     cargo test --workspace
+
+[doc("Regenerate and verify the public synthetic redline demo")]
+demo-check:
+    cargo build -p stemma-cli
+    python3 scripts/check-demo.py
 
 _build-mcp:
     cargo build -p stemma-mcp

@@ -439,8 +439,11 @@ jobs:
           fi
 
           release_json="$RUNNER_TEMP/release.json"
+          notes_path="$RUNNER_TEMP/release-notes.md"
+          python3 stemma-mcp/render_release_notes.py \
+            "$REQUESTED_VERSION" > "$notes_path"
+          notes="$(cat "$notes_path")"
           if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > "$release_json" 2>/dev/null; then
-            notes="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed."
             gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
               -f tag_name="$tag" \
               -f target_commitish="$GITHUB_SHA" \
@@ -449,14 +452,18 @@ jobs:
               -F draft=true > "$release_json"
           fi
 
-          release_metadata="$(python3 - "$release_json" "$tag" <<'PY'
+          release_metadata="$(python3 - "$release_json" "$tag" "$notes_path" <<'PY'
           import json
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               release = json.load(stream)
+          with open(sys.argv[3], encoding="utf-8") as stream:
+              expected_body = stream.read()
           if release.get("tag_name") != sys.argv[2]:
               raise SystemExit("release tag does not match the approved tag")
+          if (release.get("body") or "").rstrip("\n") != expected_body.rstrip("\n"):
+              raise SystemExit("release body does not match the source-controlled release notes")
           release_id = release.get("id")
           if type(release_id) is not int:
               raise SystemExit("release response has no numeric id")

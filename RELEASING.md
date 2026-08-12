@@ -44,13 +44,21 @@ maintainer checklist; contributors never need it.
    GitHub redacts bypass actors from tokens without ruleset-write access, so
    the no-bypass setting remains a maintainer setup check. A missing or changed
    ruleset is a release blocker.
-5. **Immutable GitHub releases.** In repository Settings → General → Releases,
+5. **Protected default branch.** Create one active branch ruleset for `main`.
+   Block deletion and non-fast-forward updates, and require the status named
+   exactly `required CI gate`. That aggregate job depends explicitly on every
+   mandatory CI job, so the ruleset does not drift when an individual job is
+   renamed or split. Land the aggregate job and let it report once before
+   making the status required. If pull requests are required, configure the
+   approval count for the actual maintainer model rather than adding a bypass
+   that silently defeats the rule.
+6. **Immutable GitHub releases.** In repository Settings → General → Releases,
    enable **Release immutability**. This setting applies only to releases
    published after it is enabled. It is required before running this workflow:
    publication freezes the approved assets and tag, and the final workflow
    assertion fails unless GitHub reports `immutable: true`. Tag rules alone do
    not prevent a contents writer from replacing or deleting release assets.
-6. **crates.io.** The workspace has five package names: `stemma` (engine),
+7. **crates.io.** The workspace has five package names: `stemma` (engine),
    `stemma-artifacts` (host artifact boundary), `stemma-cli`, `stemma-mcp`,
    and `stemma-api`. As of 2026-07-12, the project's `stemma` and
    `stemma-cli` 0.1.0 releases exist in the registry; `stemma-artifacts` has
@@ -62,14 +70,14 @@ maintainer checklist; contributors never need it.
    token must never live in CI secrets (any compromised workflow step can
    read it), and trusted publishing cannot be configured on a crate that does
    not exist yet.
-7. **After the first release: switch crates.io to trusted publishing.** Same
+8. **After the first release: switch crates.io to trusted publishing.** Same
    endgame as npm: on crates.io, for each published crate, Settings →
    Trusted Publishing → add the GitHub repo (`stemma-sh/stemma`) and
    workflow (`release.yml`). Then a `crates-publish` job can be added to
    release.yml using OIDC (`id-token: write`, no stored token), and the
    local API token is revoked. Until that job exists, crates publishes stay
    manual per release.
-8. **Mailboxes.** `security@stemma.sh` and `conduct@stemma.sh` must be live —
+9. **Mailboxes.** `security@stemma.sh` and `conduct@stemma.sh` must be live —
    SECURITY.md and CODE_OF_CONDUCT.md point at them.
 
 ## Per release
@@ -84,8 +92,15 @@ maintainer checklist; contributors never need it.
    versions together, plus the `stemma`/`stemma-artifacts` registry version
    requirements in the CLI and MCP manifests; commit the resulting lockfile.
 2. Move the `[Unreleased]` CHANGELOG section under the new version heading.
-3. `just gate` — green, no exceptions.
-4. Commit and push the release commit. Do not create the tag yet. Start the
+3. If the README includes a captured Word demonstration, regenerate the
+   synthetic redline through the promoted natural-language MCP workflow before
+   freezing the release commit. Capture the visual from that exact output in
+   desktop Word, check the asset into the path referenced by the README, and
+   confirm that accept/reject match `demo/accepted.txt` and
+   `demo/rejected.txt`. A rendering fabricated from XML or another editor is
+   not a Word demonstration.
+4. `just gate` — green, no exceptions.
+5. Commit and push the release commit. Do not create the tag yet. Start the
    manual workflow from that exact ref:
 
    ```bash
@@ -97,7 +112,7 @@ maintainer checklist; contributors never need it.
 
    The workflow refuses if the selected ref no longer resolves to the supplied
    full SHA. Record the workflow run id and its `GITHUB_SHA`.
-5. CI builds the candidate (`.github/workflows/release.yml`):
+6. CI builds the candidate (`.github/workflows/release.yml`):
    - **version-guard** treats manual inputs only as environment data, validates
      stable `MAJOR.MINOR.PATCH` and the exact SHA shape, and refuses a mismatch,
      a commit not reachable from `main`, a tag bound to another SHA, or a
@@ -119,8 +134,15 @@ maintainer checklist; contributors never need it.
      content-minimized create-new manifest;
    - **release-approval** waits at the protected `release` environment. While
      it is pending, download the candidate manifest and exact artifacts, run
-     the required Word/client qualification, and record the report. Reject the
-     deployment on any open gate; no tag or package has been published yet;
+     the required Word/client qualification, and record the report. The
+     qualification must include the exact natural-language workflow in
+     `demo/README.md` through the promoted path-based MCP setup: confirm the
+     source hash is unchanged, the output is new, desktop Word opens it without
+     repair, the tracked replacement is attributed to `Demo Reviewer`, and
+     accept-all/reject-all match `demo/accepted.txt` and `demo/rejected.txt`.
+     Confirm that this behavior agrees with the Word visual already frozen in
+     the release commit. Reject the deployment on any open gate; no tag or
+     package has been published yet;
    - approving **release-approval** is the explicit promotion decision. No tag
      exists yet for a first attempt;
    - **release-claim** re-verifies tag protection and creates or confirms the
@@ -153,7 +175,7 @@ maintainer checklist; contributors never need it.
    still fails closed if any already-published npm package or GitHub asset
    differs from its newly approved bytes. A fresh run from another SHA cannot
    reuse the SHA-stamped platform tarballs.
-6. **crates.io** (manual and deliberate — the workflow does not touch cargo).
+7. **crates.io** (manual and deliberate — the workflow does not touch cargo).
    Publishing is per-crate opt-in through each `Cargo.toml`'s `publish` field.
    Intended split: `stemma` (the engine library), `stemma-artifacts` (the
    shared host-side artifact boundary required by transports), and
@@ -171,7 +193,7 @@ maintainer checklist; contributors never need it.
    CLI's two internal dependencies carry both `path` and `version`. The recipe
    uses the committed lockfile, dry-runs each crate immediately before its
    real publish, refuses a dirty working tree, and asks for confirmation.
-7. Verify exact packages from a clean machine:
+8. Verify exact packages from a clean machine:
    `npx -y @stemma-sh/mcp@<version> --version` must print
    `<version>+g<first-12-characters-of-tag-commit>`, and (if
    crates were published) `cargo install stemma-cli --version <version>

@@ -50,6 +50,11 @@ jobs:
       contents: write # create the release + upload assets
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Recovery executes newer workflow code, but release-note inputs come
+          # from the exact already-tagged source. The requested commit must be
+          # locally available for the fail-closed `git show` below.
+          fetch-depth: 0
       - name: Validate inputs and the existing tag binding
         env:
           GH_TOKEN: ${{ github.token }}
@@ -140,8 +145,14 @@ jobs:
           set -euo pipefail
           tag="v$REQUESTED_VERSION"
           release_json="$RUNNER_TEMP/release.json"
+          release_changelog="$RUNNER_TEMP/release-changelog.md"
+          notes_path="$RUNNER_TEMP/release-notes.md"
+          git show "$REQUESTED_COMMIT_SHA:CHANGELOG.md" > "$release_changelog"
+          python3 stemma-mcp/render_release_notes.py \
+            "$REQUESTED_VERSION" \
+            --changelog "$release_changelog" > "$notes_path"
+          notes="$(cat "$notes_path")"
           if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > "$release_json" 2>/dev/null; then
-            notes="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for what changed."
             gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
               -f tag_name="$tag" \
               -f target_commitish="$REQUESTED_COMMIT_SHA" \
@@ -149,11 +160,26 @@ jobs:
               -f body="$notes" \
               -F draft=true > "$release_json"
           fi
-          release_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$release_json")"
-          if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prerelease"])' "$release_json")" != "False" ]; then
-            echo "::error::Release must not be marked as a prerelease."
-            exit 1
-          fi
+          release_id="$(python3 - "$release_json" "$tag" "$notes_path" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              release = json.load(stream)
+          with open(sys.argv[3], encoding="utf-8") as stream:
+              expected_body = stream.read()
+          if release.get("tag_name") != sys.argv[2]:
+              raise SystemExit("release tag does not match the approved tag")
+          if (release.get("body") or "").rstrip("\n") != expected_body.rstrip("\n"):
+              raise SystemExit("release body does not match the source-controlled release notes")
+          if release.get("prerelease") is not False:
+              raise SystemExit("release must not be marked as a prerelease")
+          release_id = release.get("id")
+          if type(release_id) is not int:
+              raise SystemExit("release response has no numeric id")
+          print(release_id)
+          PY
+          )"
 
           # Never replace an uploaded, byte-bearing asset: an existing asset
           # must already match the approved bytes or the run fails closed.

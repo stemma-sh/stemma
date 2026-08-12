@@ -11,10 +11,10 @@ Rust toolchain required.
 > [stability policy](https://github.com/stemma-sh/stemma/blob/main/docs/guide/stability.md)
 > states exactly what you can depend on today.
 
-Run it:
+Run it with an explicit boundary around the documents it may access:
 
 ```bash
-npx -y @stemma-sh/mcp
+STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents npx -y @stemma-sh/mcp
 ```
 
 Or wire it into an MCP client (stdio transport):
@@ -38,6 +38,11 @@ The server speaks JSON-RPC over stdio and takes no arguments (`--help` /
 (`open_docx { "path": ... }`). `STEMMA_MCP_WORKSPACE_ROOT` confines every
 read and output path; when unset it is the canonical startup current directory.
 Relative paths resolve under it and read symlinks may not escape it.
+
+Stemma does not upload documents to a Stemma-operated service. In the
+path-based workflow, parsing and file writes happen locally. The MCP client or
+its configured model provider may receive selected document content through
+tool calls; consult the client's data policy.
 
 Image files supplied by `path` default to a 20 MiB per-image cap
 (`STEMMA_MCP_MAX_IMAGE_BYTES`) and a 50 MiB aggregate cap per transaction

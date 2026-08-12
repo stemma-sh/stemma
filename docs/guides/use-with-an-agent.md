@@ -1,7 +1,10 @@
 # Use Stemma with an agent
 
 Use this guide when you want an MCP-capable agent to inspect and edit Word
-documents without sending the whole DOCX through the model context.
+documents through a path-based local server. Stemma does not upload the
+document to a Stemma-operated service. The MCP client or its configured model
+provider may receive selected document content through tool calls; consult the
+client's data policy.
 
 The default MCP profile exposes five tools:
 
@@ -10,10 +13,13 @@ The default MCP profile exposes five tools:
 ## 1. Register the server
 
 Released npm packages include prebuilt binaries for Linux, macOS, and Windows.
-For Claude Code:
+For Claude Code, choose the narrowest directory containing the documents and
+media the agent needs, then register Stemma privately in the current project:
 
 ```bash
-claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
+claude mcp add --scope local stemma \
+  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
+  -- npx -y @stemma-sh/mcp
 claude mcp list
 ```
 
@@ -36,8 +42,9 @@ For a project-scoped configuration with an explicit document boundary, use:
 }
 ```
 
-Set the workspace root to the narrowest directory containing the documents and
-media the agent needs. Tool paths cannot escape it.
+Tool paths cannot escape the workspace root. This is an application boundary,
+not an operating-system sandbox against a hostile process running as the same
+user.
 
 ## 2. Ask for one bounded task
 

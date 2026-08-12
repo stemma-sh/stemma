@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Stemma — native Word tracked changes for agents</title>
+  <desc id="desc">A product card showing the synthetic demo replacement from 24 months to 36 months by Demo Reviewer.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e293b"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#020617" flood-opacity="0.34"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="640" rx="34" fill="url(#background)"/>
+  <circle cx="1164" cy="-16" r="210" fill="#334155" opacity="0.5"/>
+  <circle cx="86" cy="650" r="230" fill="#172554" opacity="0.65"/>
+
+  <g font-family="Inter, Aptos, Arial, sans-serif">
+    <text x="78" y="102" fill="#93c5fd" font-size="26" font-weight="700" letter-spacing="3">STEMMA</text>
+    <text x="78" y="174" fill="#f8fafc" font-size="49" font-weight="760">Native Word tracked changes</text>
+    <text x="78" y="226" fill="#cbd5e1" font-size="30">for agents and document automation</text>
+
+    <g transform="translate(78 278)" filter="url(#shadow)">
+      <rect width="1124" height="250" rx="24" fill="#ffffff"/>
+      <rect width="8" height="250" rx="4" fill="#ef4444"/>
+      <text x="52" y="57" fill="#64748b" font-size="19" font-weight="700" letter-spacing="1.5">SYNTHETIC CONFIDENTIALITY AGREEMENT</text>
+      <text x="52" y="112" fill="#1e293b" font-size="28">Each receiving party must protect Confidential Information for</text>
+      <text x="52" y="166" fill="#b91c1c" font-size="32" text-decoration="line-through">24</text>
+      <text x="98" y="166" fill="#15803d" font-size="32" text-decoration="underline">36</text>
+      <text x="144" y="166" fill="#1e293b" font-size="32"> months after disclosure.</text>
+      <circle cx="944" cy="49" r="10" fill="#ef4444"/>
+      <text x="968" y="57" fill="#475569" font-size="20">Demo Reviewer</text>
+      <text x="52" y="218" fill="#64748b" font-size="20">A new DOCX · original preserved · accept or reject in Microsoft Word</text>
+    </g>
+
+    <text x="78" y="590" fill="#94a3b8" font-size="20">Open source · Rust · MCP · local path-based engine</text>
+    <text x="1202" y="590" fill="#bfdbfe" font-size="22" font-weight="700" text-anchor="end">stemma.sh</text>
+  </g>
+</svg>

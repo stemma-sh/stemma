@@ -208,6 +208,11 @@ the narrowest directory containing the documents and media the agent needs:
 STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents npx -y @stemma-sh/mcp
 ```
 
+Stemma does not upload documents to a Stemma-operated service. In this
+path-based workflow, parsing and file writes happen locally. The MCP client or
+its configured model provider may receive selected document content through
+tool calls; consult the client's data policy.
+
 Every output path is create-new. `save_docx`, `compare_docx`, and optional
 `review_session`/`audit_docx` renders refuse any existing destination and any
 alias of a consumed input; this release has no overwrite override. Output bytes
@@ -237,18 +242,24 @@ are not a claim of power-loss durability.
 
 ### Claude Code (CLI)
 
-Register the built binary by absolute path:
+Register the server privately in the current project with an explicit document
+boundary:
 
 ```bash
-# project scope (writes .mcp.json in the repo, shared with collaborators)
-claude mcp add stemma --scope project -- /absolute/path/to/target/release/stemma-mcp
+claude mcp add --scope local stemma \
+  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
+  -- /absolute/path/to/target/release/stemma-mcp
 
-# or user scope (just for you, all projects)
-claude mcp add stemma --scope user -- /absolute/path/to/target/release/stemma-mcp
-
-# installed from npm instead:
-claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
+# Installed from npm instead:
+claude mcp add --scope local stemma \
+  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
+  -- npx -y @stemma-sh/mcp
 ```
+
+The `local` scope is private to you and specific to the current project. For a
+shared project configuration, use the explicit `.mcp.json` form below. For a
+long-lived user-scoped registration, keep the same narrow workspace root; do
+not rely on the server process's startup directory.
 
 Verify it is connected:
 

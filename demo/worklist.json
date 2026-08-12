@@ -1,0 +1,16 @@
+{
+  "schema": "stemma.worklist.v0",
+  "input": {
+    "sha256": "529dd017a7351a9bcd0d641c38d87a0014f6bee83e61474c7196cf819e8f1988",
+    "bytes": 6243
+  },
+  "author": "Demo Reviewer",
+  "changes": [
+    {
+      "id": "confidentiality-term",
+      "old": "24 months",
+      "new": "36 months",
+      "expected_matches": 1
+    }
+  ]
+}

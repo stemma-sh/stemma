@@ -133,3 +133,49 @@ jobs:
             exit 1
           fi
           echo "Contamination check passed: no forbidden references in tracked tree."
+
+  demo:
+    # The launch demo is a public product walkthrough, not a benchmark lane.
+    # Keep its checked-in redline and accept/reject claims tied to the current
+    # engine so the most visible example cannot silently drift.
+    name: demo (redline + accept/reject)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p stemma-cli
+      - name: Verify synthetic demo
+        run: python3 scripts/check-demo.py
+
+  gate:
+    # Branch protection requires only this stable status. Individual jobs can
+    # be renamed or split without weakening the required-check ruleset, as long
+    # as every mandatory job remains in this explicit dependency list.
+    name: required CI gate
+    if: ${{ always() }}
+    needs: [lint, test, msrv, npm-launcher, docs, contamination, demo]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every mandatory job
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["REQUIRED_RESULTS"])
+          failed = {
+              name: details.get("result")
+              for name, details in jobs.items()
+              if details.get("result") != "success"
+          }
+          if failed:
+              raise SystemExit(
+                  "required CI jobs did not succeed: "
+                  + ", ".join(f"{name}={result}" for name, result in sorted(failed.items()))
+              )
+          print("all required CI jobs succeeded")
+          PY

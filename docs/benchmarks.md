@@ -1,5 +1,12 @@
 # Agent benchmarks: stemma-mcp vs. the stock DOCX skill
 
+> **Provenance and version basis.** This is a maintainer-run benchmark, not an
+> independent evaluation. The 95% headline comes from pinned pre-release
+> builds of the line released as v0.1.0; the compact-contract re-run is reported
+> separately against the v0.2.0 release-qualification build. No v0.5 agent
+> benchmark has been run or is implied. The report publishes the losses,
+> corrections, and reproducibility limits alongside the results.
+
 **TL;DR.** Claude's stock DOCX skill is better than its reputation: on
 flat-text edits a frontier agent hand-editing the XML matches stemma, and the
 edit-safety head-to-head on real dirty documents is a tie. What survives

@@ -8,6 +8,50 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-08-13
+
+### Added
+
+- **The public demo is an executable release artifact.** A synthetic agreement,
+  exact MCP instruction, approved worklist, expected native redline, and
+  accept/reject projections now live together under `demo/`. The merge gate
+  regenerates the redline, compares its document and revision model with the
+  checked-in result, and verifies both generated and checked-in accept/reject
+  projections. The checked-in Word visual is captured from that synthetic
+  workflow before the release commit is frozen; release qualification confirms
+  the same behavior against the candidate.
+- **CI has one stable required status.** `required CI gate` depends on every
+  mandatory job, including the new demo check, so default-branch protection
+  can require one status without silently losing coverage when jobs are
+  renamed or split.
+- **GitHub releases now carry their own usable summary.** Release notes are
+  rendered from the exact version's changelog and include installation,
+  platforms, pre-1.0 status, product scope, and version-pinned documentation
+  links alongside the live documentation site. Creation and recovery both
+  refuse an existing draft whose body differs from the source-controlled
+  rendering; recovery reads changelog content from the requested release
+  commit, not the newer workflow checkout.
+
+### Changed
+
+- **The MCP privacy statement now describes the actual data boundary.** Stemma
+  does not upload documents to a Stemma-operated service, and path-based parsing
+  and writes remain local; the docs now state that an MCP client or configured
+  model provider may receive selected document content through tool calls.
+- **The promoted Claude Code setup is project-local and workspace-confined.**
+  The exact clean-install-tested command uses `--scope local` and requires an
+  explicit `STEMMA_MCP_WORKSPACE_ROOT` instead of registering a user-scoped
+  server with an implicit startup-directory boundary.
+- **Benchmark summaries name their provenance and version basis.** The 95%
+  result is identified as a maintainer-run agent benchmark on pinned
+  pre-release v0.1-line builds, the v0.2.0 compact-contract rerun remains
+  separate, and the report explicitly says that no v0.5 agent rerun is claimed.
+- **The AI-assistance disclosure now sits beside validation evidence.** The
+  README names the three-platform tests, specification-focused conformance
+  suite, protocol smoke tests, exact-artifact release qualification, and
+  published benchmark corrections, then links directly to content-safe
+  first-use reporting.
+
 ## [0.5.0] — 2026-08-04
 
 ### Added

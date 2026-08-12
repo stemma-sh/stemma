@@ -99,6 +99,17 @@ class WorkflowShellSyntax(unittest.TestCase):
                 ),
             )
 
+    def test_recovery_release_notes_use_the_requested_source_changelog(self):
+        recovery = (REPO / ".github/workflows/complete-release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("fetch-depth: 0", recovery)
+        self.assertIn(
+            'git show "$REQUESTED_COMMIT_SHA:CHANGELOG.md" > "$release_changelog"',
+            recovery,
+        )
+        self.assertIn('--changelog "$release_changelog"', recovery)
+
 
 if __name__ == "__main__":
     unittest.main()

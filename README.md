@@ -14,8 +14,13 @@ Stemma edits existing Word documents using native tracked changes. Give it a
 accept or reject in Microsoft Word. The original is preserved, and ambiguous
 changes are refused instead of guessed.
 
-<!-- Screenshot: a Stemma-produced redline open in Word (tracked changes
-     visible, author attributed). Place the image here before promotion. -->
+![Stemma redline opened and resolved in Microsoft Word](docs/assets/stemma-word-redline.gif)
+
+*Actual Microsoft Word capture: source, generated redline attributed to Demo
+Reviewer, accept-all result, then reject-all result.*
+
+[Try the synthetic tracked-change demo](demo/README.md) to inspect the source,
+exact instruction, expected redline, and accept/reject results.
 
 Use it to:
 
@@ -29,12 +34,10 @@ Use it to:
 - apply the same approved wording change across many documents, with a
   per-file receipt.
 
-Everything runs on your machine, as a command-line tool or a local MCP
-server: documents are read and written locally and never sent to a service.
-
-In [published agent benchmarks](https://stemma.sh/docs/benchmarks), Stemma reaches 95% task
-success, compared with 82% for the same model editing the raw document XML
-directly.
+Stemma does not upload documents to a Stemma-operated service. In the
+path-based workflow, parsing and file writes happen locally. When used through
+MCP, the MCP client or its configured model provider may receive selected
+document content through tool calls; consult the client's data policy.
 
 [Documentation](https://stemma.sh/docs) ·
 [CLI reference](https://stemma.sh/docs/reference/cli) ·
@@ -45,11 +48,14 @@ directly.
 ## Quick start: with an AI assistant
 
 The Stemma MCP server ships prebuilt binaries for Linux, macOS, and Windows;
-`npx` fetches the right one, so there is nothing to build. Add it to Claude
-Code with:
+`npx` fetches the right one, so there is nothing to build. Choose the narrowest
+directory containing the documents and media the agent needs, then add Stemma
+to the current project with:
 
 ```bash
-claude mcp add stemma --scope user -- npx -y @stemma-sh/mcp
+claude mcp add --scope local stemma \
+  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
+  -- npx -y @stemma-sh/mcp
 ```
 
 Then ask for the edit in plain language, for example: *"Open nda.docx and
@@ -58,9 +64,12 @@ save it as nda-redline.docx."* The agent opens, inspects, edits, verifies,
 and saves; the result opens in Word as an ordinary redline, attributed to the
 author you chose, ready to accept or reject.
 
-The document stays on your machine with the server; the agent requests only
-the parts it needs. See
-[MCP setup and configuration for other clients](stemma-mcp/README.md).
+The `local` scope keeps this registration private to you in the current
+project. The workspace root confines the server's file reads and writes; it is
+an application boundary, not an OS sandbox. The MCP client or model provider
+may receive document content returned by tool calls. See
+[MCP setup and configuration for other clients](stemma-mcp/README.md) and the
+[security boundary](SECURITY.md#scope).
 
 ## Quick start: command line
 
@@ -174,6 +183,15 @@ rejecting each change must produce.
   before mutation, then emit a manifest that is independently checkable from
   the delivered files. The manifest does not prove undeclared intent.
 
+### Evidence
+
+In our maintainer-run agent benchmark on pinned pre-release v0.1-line builds,
+Stemma achieved 95% task success versus 82% for raw-XML editing. The
+[full report](https://stemma.sh/docs/benchmarks) documents the version basis,
+methodology, failures, corrections, and reproducibility limits. It is evidence
+about the agent interface, not a claim of independent validation or current
+v0.5 engine correctness.
+
 ## Current scope
 
 The focused CLI worklist currently supports explicit old-to-new changes in
@@ -221,7 +239,16 @@ boundary, and a local HTTP/editor demonstration. See the
 [architecture map](https://stemma.sh/docs/internals/architecture) for the component layout.
 
 Most of the code was written with AI assistance. Human maintainers provide the
-domain model, product direction, review, and release decisions.
+domain model, product direction, review, and release decisions. Validation is
+independent of code authorship: the public gate runs formatting and linting,
+workspace tests on Linux, macOS, and Windows, the supported Rust-version build,
+roughly 1,060 specification-focused conformance tests, documentation checks,
+and npm/MCP protocol smoke tests. Release candidates additionally require
+exact-artifact qualification, and published benchmark corrections remain in
+the report.
+
+[Try the synthetic demo](demo/README.md), then share a
+[content-safe first-use report](https://github.com/stemma-sh/stemma/issues/new?template=evaluation_report.yml).
 
 ## Contributing
 
