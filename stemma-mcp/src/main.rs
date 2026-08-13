@@ -8494,6 +8494,10 @@ async fn main() -> anyhow::Result<()> {
     // Log to stderr so stdout stays a clean JSON-RPC channel.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // Stdio hosts and CI capture stderr as a diagnostic stream. Keep it
+        // stable and machine-readable instead of injecting terminal-dependent
+        // ANSI bytes into field names and separators.
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "stemma_mcp=info".into()),
