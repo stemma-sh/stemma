@@ -5,8 +5,10 @@ contracts. For a first successful workflow, start with
 [Create your first redline](../getting-started.md).
 
 `stemma` is the canonical local process contract for Stemma's focused workflow:
-apply an explicit approved worklist to an existing DOCX and create a native
-tracked-changes redline. It also exposes the engine's existing compare,
+apply an explicit worklist to an existing DOCX and create a native
+tracked-changes redline. Exact input binding is optional for ordinary use and
+available when a worklist crosses an approval boundary. The CLI also exposes
+the engine's existing compare,
 extract, read, resolve, and validate verbs. Install/build instructions live in
 [stemma-cli/README.md](https://github.com/stemma-sh/stemma/blob/main/stemma-cli/README.md).
 
@@ -178,6 +180,28 @@ name because v0 is an explicit change list, not a general intent language.
 ```json
 {
   "schema": "stemma.worklist.v0",
+  "author": "Approved Reviewer",
+  "changes": [
+    {
+      "id": "change-1",
+      "old": "twelve (12) months",
+      "new": "twenty-four (24) months"
+    }
+  ]
+}
+```
+
+Top-level and item objects reject unknown fields. `schema`, `author`, and a
+non-empty `changes` array are required; v0 accepts at most 100 changes and a
+1 MiB worklist. When `input` is omitted, Stemma applies the worklist to the
+explicit positional input and reports `input_binding: "unbound"`; the receipt
+still records that input's exact identity.
+
+For a worklist approved separately from execution, add an exact input binding:
+
+```json
+{
+  "schema": "stemma.worklist.v0",
   "input": {
     "sha256": "2cdfb8ecd1a27ef7132ebbaa1f718d6705ea6532bf3b155c09bfd7e87d410667",
     "bytes": 11431
@@ -187,20 +211,16 @@ name because v0 is an explicit change list, not a general intent language.
     {
       "id": "change-1",
       "old": "twelve (12) months",
-      "new": "twenty-four (24) months",
-      "expected_matches": 1,
-      "match_mode": "normalize_ws",
-      "scope": { "block_id": "p_41" }
+      "new": "twenty-four (24) months"
     }
   ]
 }
 ```
 
-Top-level and item objects reject unknown fields. `schema`, `input`, `author`,
-and a non-empty `changes` array are required; v0 accepts at most 100 changes and
-a 1 MiB worklist. `input.sha256` is exactly 64 lowercase hex characters and
-`input.bytes` is the exact source length. Stemma checks both before planning, so
-a worklist approved for one document cannot run against another document that
+When present, `input.sha256` must be exactly 64 lowercase hexadecimal
+characters and `input.bytes` must be the exact source length. Stemma checks
+both before planning and reports `input_binding: "input_verified"`, so a
+worklist approved for one document cannot run against another document that
 happens to contain the same phrase. Run `stemma validate INPUT` to print the
 binding values.
 
@@ -245,6 +265,8 @@ status, deliverability, or exit code.
 
 - exact SHA-256 identities and byte sizes for input, worklist, and the expected
   output bytes;
+- `input_binding`, which is `unbound` when the worklist omitted its optional
+  identity or `input_verified` when the supplied identity matched;
 - producer version/build stamp, exact running-executable identity, ruleset,
   verification profile, `complete` or `partial` status, deliverability, and
   applied/refused counts;

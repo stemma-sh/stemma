@@ -3,7 +3,9 @@
 Use this guide when a human or upstream system has approved exact old-to-new
 replacements for one specific Word document. Stemma binds the worklist to the
 input bytes, applies each item explicitly, and writes a new native redline plus
-a durable receipt.
+a durable receipt. Exact input binding is optional in the general worklist
+contract, but recommended here because approval and execution are separate
+steps.
 
 The focused worklist currently targets top-level body paragraphs. Unsupported,
 missing, or ambiguous changes are refused instead of guessed.
@@ -67,6 +69,7 @@ The decisive receipt fields look like this:
 {
   "status": "complete",
   "deliverable": true,
+  "input_binding": "input_verified",
   "summary": {
     "total": 1,
     "applied": 1,

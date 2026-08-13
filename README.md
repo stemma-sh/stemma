@@ -14,10 +14,11 @@ Stemma edits existing Word documents using native tracked changes. Give it a
 accept or reject in Microsoft Word. The original is preserved, and ambiguous
 changes are refused instead of guessed.
 
-![Stemma redline opened and resolved in Microsoft Word](docs/assets/stemma-word-redline.gif)
+[![Generated Stemma redline open in Microsoft Word](docs/assets/stemma-word-redline.png)](https://stemma.sh/stemma-word-redline.mp4)
 
-*Actual Microsoft Word capture: source, generated redline attributed to Demo
-Reviewer, accept-all result, then reject-all result.*
+*[Watch the 19-second capture](https://stemma.sh/stemma-word-redline.mp4): inspect the
+worklist and Stemma creating and validating the redline, then see the generated
+DOCX in Microsoft Word with the change attributed to Demo Reviewer.*
 
 [Try the synthetic tracked-change demo](demo/README.md) to inspect the source,
 exact instruction, expected redline, and accept/reject results.

@@ -46,7 +46,8 @@ impl ApplyStatus {
 #[serde(deny_unknown_fields)]
 struct WorklistV0 {
     schema: String,
-    input: InputBindingV0,
+    #[serde(default)]
+    input: Option<InputBindingV0>,
     author: String,
     changes: Vec<ChangeV0>,
 }
@@ -93,7 +94,7 @@ enum MatchModeV0 {
 
 #[derive(Debug)]
 struct PreparedWorklist {
-    input: InputBindingV0,
+    input: Option<InputBindingV0>,
     author: String,
     changes: Vec<PreparedChange>,
 }
@@ -130,6 +131,7 @@ struct ApplyReceipt {
     status: ReceiptStatus,
     deliverable: bool,
     emit_partial_requested: bool,
+    input_binding: InputBindingReceipt,
     input: ArtifactIdentity,
     worklist: ArtifactIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +200,13 @@ struct PersistenceConfirmationReceipt {
 enum ReceiptStatus {
     Complete,
     Partial,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InputBindingReceipt {
+    Unbound,
+    InputVerified,
 }
 
 #[derive(Serialize)]
@@ -359,7 +368,13 @@ where
         .map_err(|e| e.to_string())?;
     let worklist_identity = worklist_artifact.identity().clone();
     let worklist = parse_worklist(worklist_artifact.bytes(), worklist_path)?;
-    verify_input_binding(&worklist.input, &input_identity, worklist_path)?;
+    let input_binding = match &worklist.input {
+        Some(binding) => {
+            verify_input_binding(binding, &input_identity, worklist_path)?;
+            InputBindingReceipt::InputVerified
+        }
+        None => InputBindingReceipt::Unbound,
+    };
     let receipt_path = receipt_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_receipt_path(output_path));
@@ -523,7 +538,7 @@ where
         let before_revision_ids = revision_ids(&document);
         let transaction = EditTransaction {
             steps: plan.steps,
-            summary: Some(format!("approved worklist item {}", change.id)),
+            summary: Some(format!("worklist item {}", change.id)),
             materialization_mode: MaterializationMode::TrackedChange,
             revision: RevisionInfo {
                 revision_id: 0,
@@ -672,6 +687,7 @@ where
         status,
         deliverable,
         emit_partial_requested: emit_partial,
+        input_binding,
         input: input_identity,
         worklist: worklist_identity,
         output: output_receipt.clone(),
@@ -741,7 +757,7 @@ where
         eprintln!(
             "wrote {} to {} ({applied} applied, {refused} refused); {}; {receipt_summary}",
             if deliverable {
-                "approved-worklist redline"
+                "worklist redline"
             } else {
                 "non-deliverable partial redline"
             },
@@ -773,7 +789,9 @@ fn parse_worklist(bytes: &[u8], path: &Path) -> Result<PreparedWorklist, String>
             worklist.schema
         ));
     }
-    validate_input_binding(&worklist.input, path)?;
+    if let Some(binding) = &worklist.input {
+        validate_input_binding(binding, path)?;
+    }
     if worklist.author.trim().is_empty() {
         return Err(format!(
             "{}: worklist author must be non-empty",

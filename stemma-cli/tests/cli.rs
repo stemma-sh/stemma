@@ -305,6 +305,7 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     assert_eq!(receipt, durable_receipt);
     assert_eq!(receipt["schema"], "stemma.apply_receipt.v0");
     assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["input_binding"], "input_verified");
     assert_eq!(receipt["summary"]["total"], 1);
     assert_eq!(receipt["summary"]["applied"], 1);
     assert_eq!(receipt["summary"]["refused"], 0);
@@ -388,6 +389,56 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
         rejected, original,
         "reject-all restores the exact input text"
     );
+}
+
+#[test]
+fn apply_accepts_an_unbound_worklist_and_records_the_actual_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("redline.docx");
+    std::fs::write(
+        &worklist,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.worklist.v0",
+            "author": "Ordinary Reviewer",
+            "changes": [{
+                "id": "change-1",
+                "old": "foo bar",
+                "new": "review-ready language"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let input = fixture("simple-text/before.docx");
+    let expected_identity = PathAuthority::explicit()
+        .unwrap()
+        .read_source(&input, "test_input", None)
+        .unwrap()
+        .identity()
+        .clone();
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "unbound apply should succeed: {output:?}"
+    );
+    assert!(out.exists());
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["input_binding"], "unbound");
+    assert_eq!(
+        receipt["input"]["digest"]["hex"],
+        expected_identity.digest.hex
+    );
+    assert_eq!(receipt["input"]["bytes"], expected_identity.bytes);
 }
 
 #[test]
@@ -854,7 +905,7 @@ fn apply_refuses_a_worklist_bound_to_different_input_bytes() {
 }
 
 #[test]
-fn apply_rejects_invalid_input_binding_shapes_before_execution() {
+fn apply_rejects_invalid_supplied_input_binding_shapes_before_execution() {
     let directory = tempfile::tempdir().unwrap();
     let input = PathAuthority::explicit()
         .unwrap()
@@ -866,14 +917,6 @@ fn apply_rejects_invalid_input_binding_shapes_before_execution() {
         "new": "must not apply"
     }]);
     let invalid = [
-        (
-            "missing-input",
-            serde_json::json!({
-                "schema": "stemma.worklist.v0",
-                "author": "Approved Reviewer",
-                "changes": changes.clone(),
-            }),
-        ),
         (
             "uppercase-sha",
             serde_json::json!({

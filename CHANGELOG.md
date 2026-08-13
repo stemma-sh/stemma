@@ -8,6 +8,14 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+### Changed
+
+- **Ordinary worklists no longer require precomputed document identity.**
+  `stemma.worklist.v0` accepts an omitted `input` binding for the direct
+  apply path while retaining exact hash-and-size verification whenever the
+  binding is supplied. Every apply receipt still records the actual input and
+  now reports `input_binding: unbound` or `input_verified` explicitly.
+
 ## [0.5.1] — 2026-08-13
 
 ### Added

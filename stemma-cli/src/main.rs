@@ -1,8 +1,9 @@
 //! `stemma` — a thin command-line interface to the DOCX engine.
 //!
-//! The focused path applies an approved worklist to an existing DOCX as native
-//! tracked changes. Maintenance verbs compare, extract, read, resolve, and
-//! validate.
+//! The focused path applies an explicit worklist to an existing DOCX as native
+//! tracked changes. Worklists may optionally bind themselves to exact input
+//! bytes when they cross an approval boundary. Maintenance verbs compare,
+//! extract, read, resolve, and validate.
 //!
 //! Design contract (CLAUDE.md): parse at the edges, no silent fallbacks. Every
 //! failure exits nonzero with a one-line actionable message on stderr naming
@@ -41,8 +42,9 @@ use stemma_artifacts::{
     version,
     about = "Compact inspect, execute, and verify workflows for tracked-change DOCX.",
     long_about = "Inspect a DOCX through compact revision-aware Markdown, execute an \
-                  exact-input-bound plan as native tracked changes, independently verify \
-                  any before/after pair, and access maintenance compare/extract/resolve verbs."
+                  explicit plan as native tracked changes, optionally verify its exact-input \
+                  binding, independently verify any before/after pair, and access maintenance \
+                  compare/extract/resolve verbs."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -51,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Apply an explicit approved worklist and create a native Word redline.
+    /// Apply an explicit worklist and create a native Word redline.
     #[command(visible_alias = "execute")]
     Apply {
         /// The existing document to change. It is never modified.

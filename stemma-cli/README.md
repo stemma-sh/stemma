@@ -2,12 +2,14 @@
 
 A thin command-line interface to the `stemma` DOCX engine. Its primary job is
 to provide a compact `inspect -> verified execute` front end over the typed
-DOCX engine. `execute` applies an explicit approved worklist, verifies the exact
+DOCX engine. `execute` applies an explicit worklist, verifies the exact
 serialized candidate, and creates a native Word redline with complete item
-outcomes. The standalone `verify` command remains a producer-neutral audit; it
-is not required after a successful `execute`. `verify-task` checks an MCP task
-manifest and its files without session state. The CLI also exposes compare,
-extract, read, resolve, and validate as maintenance verbs.
+outcomes. A worklist can optionally bind itself to exact input bytes when it
+crosses a separate approval boundary. The standalone `verify` command remains
+a producer-neutral audit; it is not required after a successful `execute`.
+`verify-task` checks an MCP task manifest and its files without session state.
+The CLI also exposes compare, extract, read, resolve, and validate as
+maintenance verbs.
 
 The binary is named `stemma`. General-purpose verbs drive the engine's stable
 `stemma::api::Document` facade. The experimental worklist command uses the
@@ -73,8 +75,8 @@ stemma resolve  <file.docx> -o <out.docx> (--accept-all | --reject-all
 stemma validate <file.docx> [--format text|json]
 ```
 
-- `apply` consumes an exact-input-bound experimental `stemma.worklist.v0` and
-  commits its authoritative `stemma.apply_receipt.v0` sidecar before any
+- `apply` consumes an experimental `stemma.worklist.v0` and commits its
+  authoritative `stemma.apply_receipt.v0` sidecar before any
   Word-native redline. Before commit, it audits the exact serialized candidate;
   a complete receipt binds that passing audit to the output SHA-256 with
   `verification.artifact_stage: "serialized_output"`. The sidecar defaults to
@@ -85,6 +87,9 @@ stemma validate <file.docx> [--format text|json]
   non-deliverable and still exits `3`. Receipt-only delivery is invalid: the
   actual exit, output presence, and output hash/size must match the receipt's
   `persistence_confirmation` requirements.
+  `input_binding` is `unbound` when the worklist omits its optional input
+  identity and `input_verified` when a supplied identity matched before
+  planning. The receipt records the actual input identity in both cases.
   The producer section identifies the exact running executable by SHA-256 and
   byte size; optional compile-time `STEMMA_BUILD_STAMP` is only a readable
   build label.

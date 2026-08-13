@@ -192,11 +192,13 @@ def main() -> None:
         expected_receipt = {
             "status": "complete",
             "deliverable": True,
+            "input_binding": "unbound",
             "summary": {"total": 1, "applied": 1, "refused": 0},
         }
         actual_receipt = {
             "status": receipt.get("status"),
             "deliverable": receipt.get("deliverable"),
+            "input_binding": receipt.get("input_binding"),
             "summary": receipt.get("summary"),
         }
         require_equal("receipt outcome", expected_receipt, actual_receipt)

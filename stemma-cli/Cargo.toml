@@ -2,7 +2,7 @@
 name = "stemma-cli"
 version = "0.5.0"
 edition = "2024"
-description = "Apply approved worklists to existing DOCX files as native tracked changes, with item outcomes and audit evidence."
+description = "Apply explicit worklists to existing DOCX files as native tracked changes, with item outcomes and audit evidence."
 repository = "https://github.com/stemma-sh/stemma"
 keywords = ["docx", "cli", "tracked-changes", "ooxml", "redline"]
 categories = ["command-line-utilities", "text-processing"]
