@@ -1256,6 +1256,8 @@ const ENV_MAX_IMAGE_BYTES: &str = "STEMMA_MCP_MAX_IMAGE_BYTES";
 const ENV_MAX_IMAGE_TOTAL_BYTES: &str = "STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES";
 /// Env var: the only filesystem tree agent-controlled MCP paths may access.
 const ENV_WORKSPACE_ROOT: &str = "STEMMA_MCP_WORKSPACE_ROOT";
+/// Claude Code injects its stable project directory into local stdio servers.
+const ENV_CLAUDE_PROJECT_DIR: &str = "CLAUDE_PROJECT_DIR";
 /// Env var selecting the compact default surface or the full expert surface.
 const ENV_PROFILE: &str = "STEMMA_MCP_PROFILE";
 
@@ -1501,17 +1503,73 @@ fn env_u64(name: &str, default: u64) -> Result<u64, String> {
     }
 }
 
-/// Resolve one workspace-root setting against an explicit startup directory.
-/// Keeping environment access outside this helper makes every path case
+/// The selected source of filesystem authority. Keeping the source attached to
+/// its value makes precedence and diagnostics explicit rather than reconstructing
+/// them after configuration has been flattened into a path.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceRootSelection {
+    CommandLine(PathBuf),
+    StemmaEnvironment(std::ffi::OsString),
+    ClaudeProjectDirectory(std::ffi::OsString),
+    StartupDirectory,
+}
+
+impl WorkspaceRootSelection {
+    fn configured_root(&self) -> Option<&std::ffi::OsStr> {
+        match self {
+            Self::CommandLine(path) => Some(path.as_os_str()),
+            Self::StemmaEnvironment(path) | Self::ClaudeProjectDirectory(path) => Some(path),
+            Self::StartupDirectory => None,
+        }
+    }
+
+    fn setting_name(&self) -> &'static str {
+        match self {
+            Self::CommandLine(_) => "--workspace-root",
+            Self::StemmaEnvironment(_) => ENV_WORKSPACE_ROOT,
+            Self::ClaudeProjectDirectory(_) => ENV_CLAUDE_PROJECT_DIR,
+            Self::StartupDirectory => "the server startup directory",
+        }
+    }
+
+    fn log_name(&self) -> &'static str {
+        match self {
+            Self::CommandLine(_) => "command_line",
+            Self::StemmaEnvironment(_) => "stemma_environment",
+            Self::ClaudeProjectDirectory(_) => "claude_project_dir",
+            Self::StartupDirectory => "startup_directory",
+        }
+    }
+}
+
+fn select_workspace_root(
+    command_line: Option<PathBuf>,
+    stemma_environment: Option<std::ffi::OsString>,
+    claude_project_dir: Option<std::ffi::OsString>,
+) -> WorkspaceRootSelection {
+    if let Some(path) = command_line {
+        WorkspaceRootSelection::CommandLine(path)
+    } else if let Some(path) = stemma_environment {
+        WorkspaceRootSelection::StemmaEnvironment(path)
+    } else if let Some(path) = claude_project_dir {
+        WorkspaceRootSelection::ClaudeProjectDirectory(path)
+    } else {
+        WorkspaceRootSelection::StartupDirectory
+    }
+}
+
+/// Resolve one selected workspace root against an explicit startup directory.
+/// Environment access stays outside this helper so every path case is
 /// deterministic and parallel-testable.
-fn artifact_authority_from_setting(
-    configured_root: Option<&std::ffi::OsStr>,
+fn artifact_authority_from_selection(
+    selection: &WorkspaceRootSelection,
     startup_dir: &Path,
 ) -> Result<PathAuthority, String> {
-    let supplied_root = match configured_root {
+    let supplied_root = match selection.configured_root() {
         Some(value) if value.is_empty() => {
             return Err(format!(
-                "{ENV_WORKSPACE_ROOT} is empty; set it to an existing directory or unset it to use the startup directory"
+                "{} is empty; set it to an existing directory or remove it",
+                selection.setting_name()
             ));
         }
         Some(value) => PathBuf::from(value),
@@ -1522,22 +1580,28 @@ fn artifact_authority_from_setting(
     } else {
         startup_dir.join(supplied_root)
     };
-    PathAuthority::rooted(&root)
-        .map_err(|e| format!("cannot use {} as {ENV_WORKSPACE_ROOT}: {e}", root.display()))
+    PathAuthority::rooted(&root).map_err(|e| {
+        format!(
+            "cannot use {} from {} as the MCP workspace root: {e}",
+            root.display(),
+            selection.setting_name()
+        )
+    })
 }
 
-fn artifact_authority_from_env() -> Result<PathAuthority, String> {
-    let configured_root = std::env::var_os(ENV_WORKSPACE_ROOT);
-    match configured_root.as_deref() {
+fn artifact_authority_for_process(
+    selection: &WorkspaceRootSelection,
+) -> Result<PathAuthority, String> {
+    match selection.configured_root() {
         // Absolute and explicitly empty settings do not depend on cwd. Preserve
         // that property even if the process's startup directory was removed.
         Some(value) if value.is_empty() || Path::new(value).is_absolute() => {
-            artifact_authority_from_setting(Some(value), Path::new("."))
+            artifact_authority_from_selection(selection, Path::new("."))
         }
-        configured_root => {
+        _ => {
             let startup_dir = std::env::current_dir()
                 .map_err(|e| format!("cannot determine the default MCP workspace root: {e}"))?;
-            artifact_authority_from_setting(configured_root, &startup_dir)
+            artifact_authority_from_selection(selection, &startup_dir)
         }
     }
 }
@@ -1557,13 +1621,14 @@ fn humanize_secs(secs: u64) -> String {
 // ─── CLI argument handling ───────────────────────────────────────────────────
 
 /// The action a command line resolves to. This binary is an MCP stdio server,
-/// not an interactive CLI, so the only accepted invocations are the bare server
-/// launch plus `--help`/`--version`; anything else is a usage error rather than
-/// a silent server start (which would surface downstream as a confusing
-/// "connection closed").
+/// not an interactive CLI, so accepted invocations are the server launch with
+/// an optional authority boundary plus `--help`/`--version`; anything else is a
+/// usage error rather than a silent server start.
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Serve,
+    Serve {
+        workspace_root: Option<PathBuf>,
+    },
     Help,
     Version,
     /// Unrecognized arguments (carries the offending argument list for the
@@ -1573,11 +1638,25 @@ enum Cli {
 
 /// Parse the command line (arguments EXCLUDING argv[0]).
 fn parse_cli(args: &[String]) -> Cli {
-    match args.first().map(String::as_str) {
-        None => Cli::Serve,
-        Some("--help" | "-h") if args.len() == 1 => Cli::Help,
-        Some("--version" | "-V") if args.len() == 1 => Cli::Version,
-        Some(_) => Cli::Bad(args.join(" ")),
+    match args {
+        [] => Cli::Serve {
+            workspace_root: None,
+        },
+        [flag] if matches!(flag.as_str(), "--help" | "-h") => Cli::Help,
+        [flag] if matches!(flag.as_str(), "--version" | "-V") => Cli::Version,
+        [flag] if flag == "--workspace-root" => {
+            Cli::Bad("--workspace-root requires a path".to_string())
+        }
+        [flag] if flag.starts_with("--workspace-root=") => Cli::Serve {
+            workspace_root: Some(PathBuf::from(
+                flag.strip_prefix("--workspace-root=")
+                    .expect("prefix checked"),
+            )),
+        },
+        [flag, path] if flag == "--workspace-root" => Cli::Serve {
+            workspace_root: Some(PathBuf::from(path)),
+        },
+        _ => Cli::Bad(format!("unrecognized arguments: {}", args.join(" "))),
     }
 }
 
@@ -1590,7 +1669,12 @@ fn usage() -> String {
          Launch it from an MCP client (e.g. Claude Code), not directly from a shell.\n\
          \n\
          USAGE:\n    \
+         stemma-mcp [--workspace-root PATH]\n    \
          stemma-mcp [--help | --version]\n\
+         \n\
+         OPTIONS:\n    \
+         --workspace-root PATH       Only filesystem tree MCP tools may read or write.\n                              \
+         Overrides workspace-root environment settings.\n\
          \n\
          ENVIRONMENT:\n    \
          {ENV_PROFILE}        Tool surface: core (default, 5 tools) or advanced\n                              \
@@ -1603,8 +1687,10 @@ fn usage() -> String {
          (default {DEFAULT_MAX_IMAGE_BYTES} = 20 MiB; set 0 to disable).\n    \
          {ENV_MAX_IMAGE_TOTAL_BYTES} Aggregate image path bytes per edit\n                              \
          (default {DEFAULT_MAX_IMAGE_TOTAL_BYTES} = 50 MiB; set 0 to disable).\n    \
-         {ENV_WORKSPACE_ROOT} Only filesystem tree MCP tools may read or write\n                              \
-         (default: the canonical server startup directory).\n    \
+         {ENV_WORKSPACE_ROOT} Explicit workspace root when the CLI option is absent.\n    \
+         {ENV_CLAUDE_PROJECT_DIR} Claude Code project root when neither explicit setting\n                              \
+         is present. Otherwise the canonical startup directory is used\n                              \
+         with a warning for backward compatibility.\n    \
          RUST_LOG                  Log filter (default stemma_mcp=info); logs go to stderr.\n\
          \n\
          See stemma-mcp/README.md for the full tool surface and lifecycle notes.\n"
@@ -8367,7 +8453,7 @@ async fn main() -> anyhow::Result<()> {
     // argument must fail loudly rather than silently starting the server (which
     // an interactive user would only see as a confusing "connection closed").
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_cli(&args) {
+    let command_line_workspace_root = match parse_cli(&args) {
         Cli::Help => {
             print!("{}", usage());
             return Ok(());
@@ -8376,15 +8462,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{SERVER_VERSION}");
             return Ok(());
         }
-        Cli::Bad(offending) => {
-            eprintln!(
-                "stemma-mcp: unrecognized argument: {offending}\n\n{}",
-                usage()
-            );
+        Cli::Bad(message) => {
+            eprintln!("stemma-mcp: {message}\n\n{}", usage());
             std::process::exit(2);
         }
-        Cli::Serve => {}
-    }
+        Cli::Serve { workspace_root } => workspace_root,
+    };
 
     // Parse configuration at the edge: a malformed env var is a startup error,
     // never a silent fallback. Absent vars take the documented defaults.
@@ -8395,7 +8478,12 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let artifacts = match artifact_authority_from_env() {
+    let workspace_root_selection = select_workspace_root(
+        command_line_workspace_root,
+        std::env::var_os(ENV_WORKSPACE_ROOT),
+        std::env::var_os(ENV_CLAUDE_PROJECT_DIR),
+    );
+    let artifacts = match artifact_authority_for_process(&workspace_root_selection) {
         Ok(authority) => authority,
         Err(message) => {
             eprintln!("stemma-mcp: invalid configuration: {message}");
@@ -8412,13 +8500,19 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    if workspace_root_selection == WorkspaceRootSelection::StartupDirectory {
+        tracing::warn!(
+            "no explicit or client project workspace root was provided; using the canonical server startup directory for backward compatibility"
+        );
+    }
+
     tracing::info!(
         doc_ttl_secs = config.doc_ttl_secs,
         profile = ?config.profile,
         max_doc_bytes = config.max_doc_bytes,
         max_image_bytes = config.max_image_bytes,
         max_image_total_bytes = config.max_image_total_bytes,
-        workspace_root = %artifacts.root().expect("production MCP authority is rooted").display(),
+        workspace_root_source = workspace_root_selection.log_name(),
         "stemma-mcp starting on stdio"
     );
     let service = StemmaServer::with_config_and_authority(config, artifacts)
@@ -13475,10 +13569,13 @@ mod tests {
             make_multi_para_docx(3),
         )
         .expect("write rooted input");
-        let startup_error = artifact_authority_from_setting(None, &non_utf8_workspace)
-            .expect_err("a rooted MCP cannot start with a non-UTF8 canonical workspace");
+        let startup_error = artifact_authority_from_selection(
+            &WorkspaceRootSelection::StartupDirectory,
+            &non_utf8_workspace,
+        )
+        .expect_err("a rooted MCP cannot start with a non-UTF8 canonical workspace");
         assert!(
-            startup_error.contains(ENV_WORKSPACE_ROOT)
+            startup_error.contains("server startup directory")
                 && startup_error.contains("not valid UTF-8")
                 && startup_error.contains("serialized receipts"),
             "startup refusal is explicit and actionable: {startup_error}"
@@ -13932,21 +14029,73 @@ mod tests {
 
     #[test]
     fn parse_cli_maps_each_invocation() {
-        assert_eq!(parse_cli(&[]), Cli::Serve);
+        assert_eq!(
+            parse_cli(&[]),
+            Cli::Serve {
+                workspace_root: None
+            }
+        );
+        assert_eq!(
+            parse_cli(&["--workspace-root".into(), "/documents".into()]),
+            Cli::Serve {
+                workspace_root: Some(PathBuf::from("/documents"))
+            }
+        );
+        assert_eq!(
+            parse_cli(&["--workspace-root=documents".into()]),
+            Cli::Serve {
+                workspace_root: Some(PathBuf::from("documents"))
+            }
+        );
         assert_eq!(parse_cli(&["--help".into()]), Cli::Help);
         assert_eq!(parse_cli(&["-h".into()]), Cli::Help);
         assert_eq!(parse_cli(&["--version".into()]), Cli::Version);
         assert_eq!(parse_cli(&["-V".into()]), Cli::Version);
         // An unrecognized flag, a positional argument, and extra tokens after a
         // known flag all fail loudly rather than starting the server.
-        assert_eq!(parse_cli(&["--bogus".into()]), Cli::Bad("--bogus".into()));
+        assert_eq!(
+            parse_cli(&["--bogus".into()]),
+            Cli::Bad("unrecognized arguments: --bogus".into())
+        );
         assert_eq!(
             parse_cli(&["file.docx".into()]),
-            Cli::Bad("file.docx".into())
+            Cli::Bad("unrecognized arguments: file.docx".into())
         );
         assert_eq!(
             parse_cli(&["--help".into(), "extra".into()]),
-            Cli::Bad("--help extra".into())
+            Cli::Bad("unrecognized arguments: --help extra".into())
+        );
+        assert_eq!(
+            parse_cli(&["--workspace-root".into()]),
+            Cli::Bad("--workspace-root requires a path".into())
+        );
+    }
+
+    #[test]
+    fn workspace_root_source_precedence_is_explicit() {
+        let cli = PathBuf::from("cli");
+        let stemma = std::ffi::OsString::from("stemma-env");
+        let claude = std::ffi::OsString::from("claude-project");
+
+        assert_eq!(
+            select_workspace_root(
+                Some(cli.clone()),
+                Some(stemma.clone()),
+                Some(claude.clone())
+            ),
+            WorkspaceRootSelection::CommandLine(cli)
+        );
+        assert_eq!(
+            select_workspace_root(None, Some(stemma.clone()), Some(claude.clone())),
+            WorkspaceRootSelection::StemmaEnvironment(stemma)
+        );
+        assert_eq!(
+            select_workspace_root(None, None, Some(claude.clone())),
+            WorkspaceRootSelection::ClaudeProjectDirectory(claude)
+        );
+        assert_eq!(
+            select_workspace_root(None, None, None),
+            WorkspaceRootSelection::StartupDirectory
         );
     }
 
@@ -14043,8 +14192,11 @@ mod tests {
         std::fs::create_dir(&startup).expect("startup");
         std::fs::create_dir(&configured).expect("configured root");
 
-        let default = artifact_authority_from_setting(None, &startup.join("."))
-            .expect("missing setting uses the startup directory");
+        let default = artifact_authority_from_selection(
+            &WorkspaceRootSelection::StartupDirectory,
+            &startup.join("."),
+        )
+        .expect("missing setting uses the startup directory");
         assert_eq!(
             default.root(),
             Some(startup.canonicalize().unwrap().as_path()),
@@ -14052,25 +14204,32 @@ mod tests {
         );
 
         let relative_setting = PathBuf::from("configured").join("..").join("configured");
-        let relative =
-            artifact_authority_from_setting(Some(relative_setting.as_os_str()), &startup)
-                .expect("a relative setting resolves from the startup directory");
+        let relative = artifact_authority_from_selection(
+            &WorkspaceRootSelection::CommandLine(relative_setting),
+            &startup,
+        )
+        .expect("a relative setting resolves from the startup directory");
         assert_eq!(
             relative.root(),
             Some(configured.canonicalize().unwrap().as_path()),
             "relative roots are resolved and canonicalized without changing process cwd"
         );
 
-        let empty = artifact_authority_from_setting(Some(std::ffi::OsStr::new("")), &startup)
-            .expect_err("an explicitly empty root must fail");
+        let empty = artifact_authority_from_selection(
+            &WorkspaceRootSelection::ClaudeProjectDirectory(std::ffi::OsString::new()),
+            &startup,
+        )
+        .expect_err("an explicitly empty root must fail");
         assert!(
-            empty.contains(ENV_WORKSPACE_ROOT) && empty.contains("empty"),
+            empty.contains(ENV_CLAUDE_PROJECT_DIR) && empty.contains("empty"),
             "empty-root error is actionable: {empty}"
         );
 
-        let missing =
-            artifact_authority_from_setting(Some(std::ffi::OsStr::new("missing")), &startup)
-                .expect_err("a missing root must fail");
+        let missing = artifact_authority_from_selection(
+            &WorkspaceRootSelection::StemmaEnvironment(std::ffi::OsString::from("missing")),
+            &startup,
+        )
+        .expect_err("a missing root must fail");
         assert!(
             missing.contains(ENV_WORKSPACE_ROOT) && missing.contains("missing"),
             "missing-root error names the setting and path: {missing}"
@@ -14078,10 +14237,11 @@ mod tests {
 
         let file = startup.join("not-a-directory");
         std::fs::write(&file, b"file").expect("write non-directory root");
-        let not_directory = artifact_authority_from_setting(Some(file.as_os_str()), &startup)
-            .expect_err("a file cannot be the workspace root");
+        let not_directory =
+            artifact_authority_from_selection(&WorkspaceRootSelection::CommandLine(file), &startup)
+                .expect_err("a file cannot be the workspace root");
         assert!(
-            not_directory.contains(ENV_WORKSPACE_ROOT) && not_directory.contains("not a directory"),
+            not_directory.contains("--workspace-root") && not_directory.contains("not a directory"),
             "non-directory error is actionable: {not_directory}"
         );
     }

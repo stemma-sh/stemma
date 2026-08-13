@@ -179,34 +179,46 @@ cargo build -p stemma-mcp --release
 ```
 
 The client stanzas below show the built-binary path. If you installed from
-npm, substitute command `npx` with args `["-y", "@stemma-sh/mcp"]` wherever a
-binary path appears.
+npm, use command `npx` and prepend `["-y", "@stemma-sh/mcp"]` to the shown
+server arguments.
 
 ## Wire it into Claude Code / Claude Desktop
 
-The server takes no arguments and speaks JSON-RPC over stdio. The `.docx` paths
-an agent opens and saves are passed as tool arguments
-(`open_docx { "path": ... }`). Filesystem access is confined to
-`STEMMA_MCP_WORKSPACE_ROOT`; there is no path argument that widens it. Logs go
-to stderr (`RUST_LOG=stemma_mcp=debug` for more).
+The server speaks JSON-RPC over stdio and accepts an optional
+`--workspace-root PATH` startup setting. The `.docx` paths an agent opens and
+saves are passed as tool arguments (`open_docx { "path": ... }`). Filesystem
+access is confined to the selected workspace root; no tool argument widens it.
+Logs go to stderr (`RUST_LOG=stemma_mcp=debug` for more).
 
 ### Workspace and artifact boundary
 
-`STEMMA_MCP_WORKSPACE_ROOT` names the directory the MCP server may read from
-and write to. The server canonicalizes it once at startup. When the variable is
-unset, the canonical startup current directory is the root. A relative root is
-resolved from that startup directory. Startup fails loudly if the root cannot
-be resolved to a directory or its canonical path cannot be represented exactly
+The MCP server chooses the directory it may read from and write to once at
+startup, in this order:
+
+1. `--workspace-root PATH`;
+2. `STEMMA_MCP_WORKSPACE_ROOT`;
+3. Claude Code's `CLAUDE_PROJECT_DIR`;
+4. the canonical startup directory, with a compatibility warning.
+
+A present but invalid higher-priority setting is an error; Stemma never falls
+through to a broader root. A relative explicit root is resolved from the
+startup directory. Startup fails loudly if the selected root cannot be
+resolved to a directory or its canonical path cannot be represented exactly
 in UTF-8 artifact receipts.
 
 Tool paths may be relative or absolute. Relative paths resolve under the root;
 absolute paths must still resolve inside it. Existing source symlinks are
-canonicalized, so a symlink that escapes the root is refused. Set the root to
-the narrowest directory containing the documents and media the agent needs:
+canonicalized, so a symlink that escapes the root is refused. Outside Claude
+Code, set the root to the narrowest directory containing the documents and
+media the agent needs:
 
 ```bash
-STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents npx -y @stemma-sh/mcp
+npx -y @stemma-sh/mcp --workspace-root /absolute/path/to/documents
 ```
+
+`STEMMA_MCP_WORKSPACE_ROOT` remains supported for managed deployments,
+containers, and clients whose configuration naturally uses environment
+variables.
 
 Stemma does not upload documents to a Stemma-operated service. In this
 path-based workflow, parsing and file writes happen locally. The MCP client or
@@ -242,24 +254,23 @@ are not a claim of power-loss durability.
 
 ### Claude Code (CLI)
 
-Register the server privately in the current project with an explicit document
-boundary:
+Open the directory containing the documents, then register the server privately
+in that Claude Code project:
 
 ```bash
+cd /path/to/documents
 claude mcp add --scope local stemma \
-  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
   -- /absolute/path/to/target/release/stemma-mcp
 
 # Installed from npm instead:
-claude mcp add --scope local stemma \
-  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
-  -- npx -y @stemma-sh/mcp
+claude mcp add --scope local stemma -- npx -y @stemma-sh/mcp
 ```
 
-The `local` scope is private to you and specific to the current project. For a
-shared project configuration, use the explicit `.mcp.json` form below. For a
-long-lived user-scoped registration, keep the same narrow workspace root; do
-not rely on the server process's startup directory.
+Claude Code sets `CLAUDE_PROJECT_DIR` in the local stdio server's environment,
+and Stemma uses it as the workspace root. The `local` scope is private to you
+and specific to that project. To grant Stemma a different narrow directory,
+append `--workspace-root /absolute/path/to/documents` to the server command.
+For a shared project configuration, use the explicit `.mcp.json` form below.
 
 Verify it is connected:
 
@@ -278,10 +289,7 @@ repo root. Replace the path with your built binary:
     "stemma": {
       "type": "stdio",
       "command": "/absolute/path/to/target/release/stemma-mcp",
-      "args": [],
-      "env": {
-        "STEMMA_MCP_WORKSPACE_ROOT": "/absolute/path/to/documents"
-      }
+      "args": ["--workspace-root", "/absolute/path/to/documents"]
     }
   }
 }
@@ -300,10 +308,7 @@ Same stanza under `mcpServers` (macOS:
   "mcpServers": {
     "stemma": {
       "command": "/absolute/path/to/target/release/stemma-mcp",
-      "args": [],
-      "env": {
-        "STEMMA_MCP_WORKSPACE_ROOT": "/absolute/path/to/documents"
-      }
+      "args": ["--workspace-root", "/absolute/path/to/documents"]
     }
   }
 }
@@ -318,23 +323,21 @@ find a clause (`find`), make a tracked change (`apply_edit`), check it
 ```toml
 [mcp_servers.stemma]
 command = "/absolute/path/to/target/release/stemma-mcp"
-args = []
-env = { STEMMA_MCP_WORKSPACE_ROOT = "/absolute/path/to/documents" }
+args = ["--workspace-root", "/absolute/path/to/documents"]
 ```
 
 ### VS Code
 
 Command palette → "MCP: Add Server…" → "Command (stdio)" → enter the absolute
-binary path → name it `stemma`. Set `STEMMA_MCP_WORKSPACE_ROOT` in the server's
-environment configuration when the generated entry is not project-local.
+binary path plus `--workspace-root /absolute/path/to/documents` → name it
+`stemma`.
 
 ### Any other MCP client
 
-Every client that speaks stdio MCP needs the same four facts: transport
-`stdio`, command = the absolute path to the built `stemma-mcp` binary, no
-arguments, and an explicit `STEMMA_MCP_WORKSPACE_ROOT` for the documents it may
-access. Consult your client's docs for where its server list and environment
-live and add those values.
+Every client that speaks stdio MCP needs the same facts: transport `stdio`,
+command = the absolute path to the built `stemma-mcp` binary, and
+`--workspace-root /absolute/path/to/documents`. Consult your client's docs for
+where its server command and arguments live and add those values.
 
 ### Packaged installers
 
@@ -354,8 +357,9 @@ The MCPB installer requires a **Document workspace** directory and injects it
 as `STEMMA_MCP_WORKSPACE_ROOT`; the bundle has no permissive default. MCPB
 packaging does not create an OS sandbox — the server still enforces this
 application-level boundary itself. Plugin hosts must configure the same
-environment variable explicitly; otherwise the plugin server uses its startup
-directory.
+environment variable explicitly; otherwise the plugin server uses
+`CLAUDE_PROJECT_DIR` when its host provides it, then its startup directory with
+a compatibility warning.
 
 ## Smoke test
 
@@ -378,8 +382,10 @@ and restarting the server drops all open handles. Five filesystem, lifecycle,
 and resource settings are parsed once at startup (a malformed value is a
 fail-loud startup error, not a silent fallback):
 
-- **Workspace root.** `STEMMA_MCP_WORKSPACE_ROOT` confines reads and writes as
-  described above. Unset means the canonical startup current directory.
+- **Workspace root.** `--workspace-root`, `STEMMA_MCP_WORKSPACE_ROOT`, or
+  `CLAUDE_PROJECT_DIR` confines reads and writes as described above, in that
+  precedence order. With none present, the canonical startup directory is the
+  compatibility fallback and emits a warning.
 - **Idle eviction.** Before every tool call the server evicts documents that have
   not been touched within `STEMMA_MCP_DOC_TTL_SECS` (default `86400`, i.e. 24h),
   so a long-lived host does not grow without bound. The default is deliberately

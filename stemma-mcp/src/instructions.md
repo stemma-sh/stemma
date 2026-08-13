@@ -9,7 +9,7 @@ hatches over the same kernels.
 
 1. **`open_docx(path)`** returns `doc_id`, exact input identity, and the first 16
    rows of a paged compact block index. Prefer find over walking every page.
-   Paths stay under `STEMMA_MCP_WORKSPACE_ROOT`.
+   Paths stay under the configured workspace root.
 2. **`inspect_docx(doc_id, ...)`** returns the first compact index page by default.
    Prefer `query:"find"` plus `pattern`, then inspect one exact block. When
    several known phrases must be located, pass `patterns:[...]` once (maximum
@@ -153,10 +153,11 @@ For "accept/reject <author>'s changes" tasks, especially on long documents:
 ## Filesystem boundary
 
 - Every server-side read and output path stays inside
-  `STEMMA_MCP_WORKSPACE_ROOT`, which defaults to the canonical directory where
-  the server started. Relative tool paths resolve under that root. Do not retry
-  a path that returns `artifact_outside_workspace`; choose a path inside the
-  configured root.
+  the workspace root selected when the server starts. Claude Code projects are
+  confined automatically; other hosts can set `--workspace-root` or
+  `STEMMA_MCP_WORKSPACE_ROOT`. Relative tool paths resolve under that root. Do
+  not retry a path that returns `artifact_outside_workspace`; choose a path
+  inside the configured root.
 - A read symlink that resolves outside the root is refused. Image `path` inputs
   follow the same rule as DOCX inputs.
 - Image `path` inputs default to 20 MiB each

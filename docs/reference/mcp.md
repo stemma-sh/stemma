@@ -136,10 +136,12 @@ and `limit` to retrieve all continuation pages.
 
 ## Filesystem and artifact boundary
 
-The MCP server confines every filesystem path to
-`STEMMA_MCP_WORKSPACE_ROOT`. The root is canonicalized once at startup. If the
-variable is unset, the canonical startup current directory becomes the root.
-Startup fails if the root is invalid, is not a directory, or cannot be
+The MCP server confines every filesystem path to one root, selected once at
+startup. `--workspace-root PATH` takes precedence, followed by
+`STEMMA_MCP_WORKSPACE_ROOT`, then Claude Code's `CLAUDE_PROJECT_DIR`. If none is
+present, the canonical startup directory is used with a compatibility warning.
+A present but invalid higher-priority setting fails rather than falling through.
+Startup also fails if the selected root is not a directory or cannot be
 represented exactly in UTF-8 artifact receipts.
 
 Relative paths resolve under the root. Absolute paths must still resolve inside

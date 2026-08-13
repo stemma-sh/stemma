@@ -47,14 +47,13 @@ document content through tool calls; consult the client's data policy.
 ## Quick start: with an AI assistant
 
 The Stemma MCP server ships prebuilt binaries for Linux, macOS, and Windows;
-`npx` fetches the right one, so there is nothing to build. Choose the narrowest
-directory containing the documents and media the agent needs, then add Stemma
-to the current project with:
+`npx` fetches the right one, so there is nothing to build. In Claude Code, open
+the directory containing the documents and media the agent needs, then add
+Stemma privately to that project:
 
 ```bash
-claude mcp add --scope local stemma \
-  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
-  -- npx -y @stemma-sh/mcp
+cd /path/to/documents
+claude mcp add --scope local stemma -- npx -y @stemma-sh/mcp
 ```
 
 Then ask for the edit in plain language, for example: *"Open nda.docx and
@@ -64,9 +63,12 @@ and saves; the result opens in Word as an ordinary redline, attributed to the
 author you chose, ready to accept or reject.
 
 The `local` scope keeps this registration private to you in the current
-project. The workspace root confines the server's file reads and writes; it is
-an application boundary, not an OS sandbox. The MCP client or model provider
-may receive document content returned by tool calls. See
+project. Claude Code gives the local Stemma process its stable project
+directory, which Stemma uses as the workspace root. That confines file reads
+and writes; it is an application boundary, not an OS sandbox. Use
+`--workspace-root /another/directory` after `@stemma-sh/mcp` to choose a
+different boundary. The MCP client or model provider may receive document
+content returned by tool calls. See
 [MCP setup and configuration for other clients](stemma-mcp/README.md) and the
 [security boundary](SECURITY.md#scope).
 

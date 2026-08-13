@@ -14,7 +14,7 @@ Rust toolchain required.
 Run it with an explicit boundary around the documents it may access:
 
 ```bash
-STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents npx -y @stemma-sh/mcp
+npx -y @stemma-sh/mcp --workspace-root /absolute/path/to/documents
 ```
 
 Or wire it into an MCP client (stdio transport):
@@ -24,20 +24,23 @@ Or wire it into an MCP client (stdio transport):
   "mcpServers": {
     "stemma": {
       "command": "npx",
-      "args": ["-y", "@stemma-sh/mcp"],
-      "env": {
-        "STEMMA_MCP_WORKSPACE_ROOT": "/absolute/path/to/documents"
-      }
+      "args": [
+        "-y",
+        "@stemma-sh/mcp",
+        "--workspace-root",
+        "/absolute/path/to/documents"
+      ]
     }
   }
 }
 ```
 
-The server speaks JSON-RPC over stdio and takes no arguments (`--help` /
-`--version` aside). Documents are passed as tool arguments
-(`open_docx { "path": ... }`). `STEMMA_MCP_WORKSPACE_ROOT` confines every
-read and output path; when unset it is the canonical startup current directory.
-Relative paths resolve under it and read symlinks may not escape it.
+The server speaks JSON-RPC over stdio. Documents are passed as tool arguments
+(`open_docx { "path": ... }`). `--workspace-root` confines every read and
+output path. When absent, `STEMMA_MCP_WORKSPACE_ROOT` takes precedence over
+Claude Code's `CLAUDE_PROJECT_DIR`; the canonical startup directory remains a
+warning-emitting compatibility fallback. Relative paths resolve under the
+selected root and read symlinks may not escape it.
 
 Stemma does not upload documents to a Stemma-operated service. In the
 path-based workflow, parsing and file writes happen locally. The MCP client or

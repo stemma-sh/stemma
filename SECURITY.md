@@ -40,11 +40,13 @@ input**. What matters for this project:
   local development only. Deploying `stemma-api` as a public service is a
   misconfiguration, not a vulnerability in stemma.
 - **The MCP server has a bounded application-level workspace, not an OS
-  sandbox.** `STEMMA_MCP_WORKSPACE_ROOT` confines normal MCP reads and writes;
-  it defaults to the canonical startup current directory. Relative paths resolve
-  under it, absolute paths must remain inside it, and read symlinks that escape
-  it are refused. Set an explicit, narrow root for long-lived or user-scoped MCP
-  registrations.
+  sandbox.** `--workspace-root`, `STEMMA_MCP_WORKSPACE_ROOT`, or Claude Code's
+  `CLAUDE_PROJECT_DIR` confines normal MCP reads and writes, in that precedence
+  order. With none present, the canonical startup directory is used with a
+  warning for compatibility. Relative paths resolve under the selected root,
+  absolute paths must remain inside it, and read symlinks that escape it are
+  refused. Set an explicit, narrow root for long-lived or user-scoped MCP
+  registrations outside Claude Code.
 - **MCP image-path reads are bounded before base64 expansion.**
   `STEMMA_MCP_MAX_IMAGE_BYTES` defaults to 20 MiB per image path and
   `STEMMA_MCP_MAX_IMAGE_TOTAL_BYTES` defaults to 50 MiB of image-path input per

@@ -29,7 +29,7 @@ usage.
 ## Filesystem and output contract
 
 CLI paths are explicit filesystem authority supplied by the human caller. They
-are not confined by the MCP-only `STEMMA_MCP_WORKSPACE_ROOT` setting.
+are not confined by the MCP server's workspace-root setting.
 Supplied and canonical paths must be valid UTF-8 because the shared artifact
 identity is a portable serialized contract; non-UTF-8 paths are refused before
 source bytes are read or output staging begins.

@@ -13,17 +13,19 @@ The default MCP profile exposes five tools:
 ## 1. Register the server
 
 Released npm packages include prebuilt binaries for Linux, macOS, and Windows.
-For Claude Code, choose the narrowest directory containing the documents and
-media the agent needs, then register Stemma privately in the current project:
+For Claude Code, open the narrowest directory containing the documents and
+media the agent needs, then register Stemma privately in that project:
 
 ```bash
-claude mcp add --scope local stemma \
-  -e STEMMA_MCP_WORKSPACE_ROOT=/absolute/path/to/documents \
-  -- npx -y @stemma-sh/mcp
+cd /path/to/documents
+claude mcp add --scope local stemma -- npx -y @stemma-sh/mcp
 claude mcp list
 ```
 
-The list should show Stemma as connected.
+The list should show Stemma as connected. Claude Code supplies its stable
+project directory to the local server, and Stemma automatically confines file
+access to it. To use a different directory, append
+`--workspace-root /absolute/path/to/documents` after `@stemma-sh/mcp`.
 
 For a project-scoped configuration with an explicit document boundary, use:
 
@@ -33,10 +35,12 @@ For a project-scoped configuration with an explicit document boundary, use:
     "stemma": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@stemma-sh/mcp"],
-      "env": {
-        "STEMMA_MCP_WORKSPACE_ROOT": "/absolute/path/to/documents"
-      }
+      "args": [
+        "-y",
+        "@stemma-sh/mcp",
+        "--workspace-root",
+        "/absolute/path/to/documents"
+      ]
     }
   }
 }

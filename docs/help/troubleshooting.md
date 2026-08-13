@@ -61,11 +61,13 @@ intend to continue that author's revision identity.
 
 ## An MCP path is outside the workspace
 
-Every MCP file path must resolve under `STEMMA_MCP_WORKSPACE_ROOT`. Symlinks
-that escape the root are also refused.
+Every MCP file path must resolve under the selected workspace root. Symlinks
+that escape the root are also refused. Run `stemma-mcp --help` to see the root
+selection precedence.
 
-Move the artifact under the configured root or restart the server with a
-different explicit root. No tool argument can widen the boundary at runtime.
+Move the artifact under the configured root or restart the server with
+`--workspace-root /path/to/documents`. No tool argument can widen the boundary
+at runtime.
 
 ## An MCP edit is stale
 

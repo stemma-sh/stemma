@@ -8,8 +8,20 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-08-13
+
 ### Changed
 
+- **Claude Code projects now become the MCP workspace automatically.** The MCP
+  server uses `CLAUDE_PROJECT_DIR` when no explicit root is supplied, so the
+  normal project-local setup no longer requires manually configuring
+  `STEMMA_MCP_WORKSPACE_ROOT`.
+- **Workspace-root configuration is discoverable and fail-loud.** The new
+  `--workspace-root PATH` option takes precedence over
+  `STEMMA_MCP_WORKSPACE_ROOT`, followed by `CLAUDE_PROJECT_DIR` and the startup
+  directory. Invalid higher-priority settings never fall through; the
+  startup-directory compatibility fallback warns; and ordinary startup logs
+  report the selected source without exposing the absolute path.
 - **Ordinary worklists no longer require precomputed document identity.**
   `stemma.worklist.v0` accepts an omitted `input` binding for the direct
   apply path while retaining exact hash-and-size verification whenever the
