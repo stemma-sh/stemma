@@ -8,11 +8,10 @@
 //! the existing `TableFormattingChange`. It touches neither the materializer
 //! (Invariant M) nor the serializer — a `tblPr` change is an in-place property
 //! delta, not a segment insert/delete, so it bypasses segment lowering entirely.
-//! The existing accept/reject projection already resolves `formatting_change`
-//! (`tracked_model.rs`: reject restores `previous_width`/`previous_borders`/
-//! `previous_default_cell_margins`; accept clears the change, keeping the new
-//! `tblPr`), and the serializer already emits the complete inner `tblPr`
-//! snapshot for `w:tblPrChange`. So this verb is a pure authoring-side lift.
+//! The existing accept/reject projection resolves `formatting_change` as one
+//! complete previous table-property projection; accept clears the change while
+//! keeping the new `tblPr`. The serializer emits that complete authored inner
+//! `tblPr`, so this verb is a pure authoring-side lift.
 //!
 //! ## In-place property edit (no whole-table rebuild)
 //!

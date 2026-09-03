@@ -28,6 +28,8 @@ use stemma::edit::{
     ContentFragment, EditStep, EditTransaction, MaterializationMode, ParagraphContent,
 };
 use stemma::{Resolution, ResolveSelectionAction, RevisionInfo};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 

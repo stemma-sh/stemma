@@ -773,27 +773,108 @@ pub struct ParagraphNode {
     pub preserved_ppr: Vec<PreservedProp>,
 }
 
-/// Conditional formatting flags from w:cnfStyle (§17.3.1.8).
+/// Transitional `ST_Cnf`: the legacy 12-bit conditional-formatting mask.
 ///
-/// Applied to paragraphs inside table cells to indicate which table
-/// conditional formats apply. The 12 boolean attributes correspond to
-/// the 12-bit `val` string (legacy format).
+/// This is a real wire type rather than an arbitrary string. Keeping the
+/// validation at construction/deserialization prevents malformed masks from
+/// entering the canonical model and later being serialized as valid output.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct CnfMask(String);
+
+impl CnfMask {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CnfMask {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() == 12 && value.bytes().all(|byte| matches!(byte, b'0' | b'1')) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "ST_Cnf value must contain exactly 12 binary digits, got {value:?}"
+            ))
+        }
+    }
+}
+
+impl TryFrom<&str> for CnfMask {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for CnfMask {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One unmodeled namespace-qualified OOXML attribute retained by a typed
+/// property element.
+///
+/// Attributes are namespace-qualified names, not prefix-shaped strings. The
+/// URI is required whenever a prefix is present so serialization can emit a
+/// locally valid namespace binding instead of an unbound lookalike.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedAttribute {
+    pub local_name: String,
+    pub prefix: Option<String>,
+    pub namespace: Option<String>,
+    pub value: String,
+}
+
+/// Authored attributes from `w:cnfStyle` (§17.3.1.8 / §17.4.7 / §17.4.8).
+///
+/// The element and every named flag have independent authored presence. An
+/// absent flag and an explicitly authored OFF flag have the same rendering
+/// value but different provenance, so each named attribute is three-state.
+/// The transitional `val` mask is preserved independently: Word ignores it
+/// whenever any named attribute is present, but that precedence must not erase
+/// either authored representation.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CnfStyle {
-    /// Legacy 12-character binary string (e.g. "100000000000").
-    pub val: Option<String>,
-    pub first_row: bool,
-    pub last_row: bool,
-    pub first_column: bool,
-    pub last_column: bool,
-    pub odd_v_band: bool,
-    pub even_v_band: bool,
-    pub odd_h_band: bool,
-    pub even_h_band: bool,
-    pub first_row_first_column: bool,
-    pub first_row_last_column: bool,
-    pub last_row_first_column: bool,
-    pub last_row_last_column: bool,
+    /// Transitional legacy mask. Strict OOXML uses the named attributes only.
+    #[serde(default)]
+    pub val: Option<CnfMask>,
+    #[serde(default)]
+    pub first_row: Option<bool>,
+    #[serde(default)]
+    pub last_row: Option<bool>,
+    #[serde(default)]
+    pub first_column: Option<bool>,
+    #[serde(default)]
+    pub last_column: Option<bool>,
+    #[serde(default)]
+    pub odd_v_band: Option<bool>,
+    #[serde(default)]
+    pub even_v_band: Option<bool>,
+    #[serde(default)]
+    pub odd_h_band: Option<bool>,
+    #[serde(default)]
+    pub even_h_band: Option<bool>,
+    #[serde(default)]
+    pub first_row_first_column: Option<bool>,
+    #[serde(default)]
+    pub first_row_last_column: Option<bool>,
+    #[serde(default)]
+    pub last_row_first_column: Option<bool>,
+    #[serde(default)]
+    pub last_row_last_column: Option<bool>,
+    /// Attributes outside `CT_Cnf`, retained by the established modeled-element
+    /// remainder so supported extension metadata is not silently dropped.
+    #[serde(default)]
+    pub extra_attrs: Vec<QualifiedAttribute>,
 }
 
 /// Vertical character alignment on each line per §17.3.1.39 `ST_TextAlignment`.
@@ -1067,6 +1148,14 @@ pub struct FrameProperties {
 }
 
 impl ParagraphNode {
+    /// True only when Word can resolve this paragraph's effective `w:numPr`
+    /// to a concrete level that generates numbering semantics.
+    pub fn has_resolved_numbering(&self) -> bool {
+        self.numbering
+            .as_ref()
+            .is_some_and(NumberingInfo::is_resolved)
+    }
+
     /// Flatten all paragraph inlines, ignoring tracking status.
     pub fn all_inlines(&self) -> impl Iterator<Item = &InlineNode> {
         self.segments
@@ -1119,13 +1208,13 @@ impl ParagraphNode {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments: vec![TrackedSegment {
@@ -1143,7 +1232,7 @@ impl ParagraphNode {
             }],
             block_text_hash: None,
             numbering: None,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -1939,9 +2028,9 @@ pub struct PageNumberType {
 /// resolved via direct > numbering > style per-attribute merge.
 ///
 /// On the edit/round-trip model, `effective_first_line_twips` is always the raw
-/// cascade value — prefix stripping does not change it. In the **render
-/// projection** ([`FullDocBlock::indent`]) it is the *resolved first-line
-/// origin*: when a literal-prefix marker is positioned by a leading tab, that
+/// cascade value — prefix stripping does not change it. In a render projection,
+/// it is the *resolved first-line origin*: when a literal-prefix marker is
+/// positioned by a leading tab, that
 /// tab's resolved landing is folded in here, so a render consumer applies a
 /// single `text-indent` (from `effective_first_line_twips`) to position the
 /// whole first line (prefix in `::before` + body) — no separate leading-tab
@@ -2031,6 +2120,16 @@ pub struct ParagraphBorders {
 pub struct NumberingInfo {
     pub num_id: u32,
     pub ilvl: u32,
+    /// Whether the authored reference resolves to a concrete numbering level.
+    ///
+    /// Word preserves a schema-valid `w:numPr` even when `numbering.xml` is
+    /// absent or the requested level is missing. Such a reference is active
+    /// paragraph-property state but produces no automatic label or level
+    /// indentation. Keeping that state typed prevents both silent demotion to
+    /// "no numbering" and accidental synthesis from an unrelated definition
+    /// imported for the opposite terminal.
+    #[serde(default)]
+    pub resolution: NumberingResolution,
     /// The synthesized number text (e.g., "1.", "(a)").
     pub synthesized_text: String,
     /// True when the numbering format is bullet (numFmt="bullet").
@@ -2050,12 +2149,29 @@ pub struct NumberingInfo {
     pub restart_numbering: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NumberingResolution {
+    #[default]
+    Resolved,
+    MissingDefinitions,
+    MissingNumberingInstance,
+    MissingAbstractNumbering,
+    MissingLevel,
+}
+
 impl NumberingInfo {
+    pub fn is_resolved(&self) -> bool {
+        self.resolution == NumberingResolution::Resolved
+    }
+
     /// Whether two `NumberingInfo` reference the same structural numbering
     /// (same `num_id` and `ilvl`).  Ignores `synthesized_text`, which is a
     /// derived counter value that drifts when list items are added/removed.
     pub fn structurally_eq(&self, other: &Self) -> bool {
-        self.num_id == other.num_id && self.ilvl == other.ilvl
+        self.num_id == other.num_id
+            && self.ilvl == other.ilvl
+            && self.resolution == other.resolution
     }
 }
 
@@ -2066,6 +2182,74 @@ pub fn numbering_structurally_eq(a: &Option<NumberingInfo>, b: &Option<Numbering
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Compare the complete paragraph numbering state that affects authored pPr
+/// semantics. Equal effective list coordinates are not enough: direct active,
+/// inherited, and explicit `numId=0` suppression are distinct states and must
+/// produce a paragraph-property change when transitioning between them.
+pub fn paragraph_numbering_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> bool {
+    a.has_direct_numbering == b.has_direct_numbering
+        && a.numbering_suppressed == b.numbering_suppressed
+        && numbering_structurally_eq(&a.numbering, &b.numbering)
+}
+
+/// Compare the authored/effective paragraph-property state switched by a
+/// `w:pPrChange`. Paragraph-mark run properties are deliberately excluded:
+/// Word tracks those through `w:pPr/w:rPr/w:rPrChange`, which can exist without
+/// a sibling `w:pPrChange`.
+pub fn paragraph_property_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> bool {
+    a.style_id == b.style_id
+        && a.align == b.align
+        && a.has_direct_align == b.has_direct_align
+        && a.indent == b.indent
+        && a.has_direct_indent == b.has_direct_indent
+        && a.authored_indent == b.authored_indent
+        && a.spacing == b.spacing
+        && a.has_direct_spacing == b.has_direct_spacing
+        && a.authored_spacing == b.authored_spacing
+        && a.borders == b.borders
+        && a.has_direct_borders == b.has_direct_borders
+        && a.keep_next == b.keep_next
+        && a.has_direct_keep_next == b.has_direct_keep_next
+        && a.keep_lines == b.keep_lines
+        && a.has_direct_keep_lines == b.has_direct_keep_lines
+        && a.page_break_before == b.page_break_before
+        && a.has_direct_page_break_before == b.has_direct_page_break_before
+        && a.widow_control == b.widow_control
+        && a.has_direct_widow_control == b.has_direct_widow_control
+        && a.contextual_spacing == b.contextual_spacing
+        && a.has_direct_contextual_spacing == b.has_direct_contextual_spacing
+        && a.shading == b.shading
+        && a.has_direct_shading == b.has_direct_shading
+        && a.tab_stops == b.tab_stops
+        && paragraph_numbering_state_eq(a, b)
+        && a.outline_lvl == b.outline_lvl
+        && a.heading_level == b.heading_level
+        && a.mirror_indents == b.mirror_indents
+        && a.auto_space_de == b.auto_space_de
+        && a.auto_space_dn == b.auto_space_dn
+        && a.bidi == b.bidi
+        && a.text_alignment == b.text_alignment
+        && a.text_direction == b.text_direction
+        && a.suppress_auto_hyphens == b.suppress_auto_hyphens
+        && a.snap_to_grid == b.snap_to_grid
+        && a.overflow_punct == b.overflow_punct
+        && a.adjust_right_ind == b.adjust_right_ind
+        && a.word_wrap == b.word_wrap
+        && a.frame_pr == b.frame_pr
+        && a.section_properties == b.section_properties
+        && a.cnf_style == b.cnf_style
+        && a.preserved_ppr == b.preserved_ppr
+}
+
+/// Compare the authored run properties of the paragraph mark. These are owned
+/// by the mark's `w:rPrChange`, not by the paragraph's `w:pPrChange` carrier.
+pub fn paragraph_mark_property_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> bool {
+    a.paragraph_mark_marks == b.paragraph_mark_marks
+        && a.paragraph_mark_style_props == b.paragraph_mark_style_props
+        && a.paragraph_mark_rfonts == b.paragraph_mark_rfonts
+        && a.paragraph_mark_rpr_off == b.paragraph_mark_rpr_off
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -2157,6 +2341,12 @@ pub struct TableRowNode {
     /// TableFormatting is meaningful here.
     #[serde(default)]
     pub tbl_pr_ex: Option<TableFormatting>,
+    /// Tracked row table-property-exception change from `w:tblPrExChange`
+    /// (§17.13.5.35). This is a sibling of `trPrChange`, not a row-formatting
+    /// change: Word gives it an independent revision identity and stores the
+    /// complete previous `CT_TblPrExBase` payload inside the change.
+    #[serde(default)]
+    pub tbl_pr_ex_change: Option<TablePropertyExceptionChange>,
     /// Row-level cell spacing (from w:tblCellSpacing w:w in trPr, §17.4.44),
     /// in twips. Mirrors `TableFormatting::cell_spacing` (type assumed dxa).
     /// Without this a row whose only trPr child is tblCellSpacing loses its
@@ -3161,7 +3351,7 @@ impl ShadingPattern {
 }
 
 /// Shading/fill for a cell or table.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Shading {
     /// Fill color as hex (e.g., "FFFF00", "auto").
     pub fill: Option<String>,
@@ -3173,7 +3363,7 @@ pub struct Shading {
     /// model — theme fills/colors (themeFill/themeFillTint/themeFillShade/
     /// themeColor/themeTint/themeShade). RFC-0003 "never silently drop".
     #[serde(default)]
-    pub extra_attrs: Vec<(String, String)>,
+    pub extra_attrs: Vec<QualifiedAttribute>,
 }
 
 /// East Asian emphasis mark per §17.18.24 `ST_Em`.
@@ -3569,6 +3759,8 @@ pub struct ThemeColorRef {
 /// use this boundary when its normalized domain view is intentionally lossy;
 /// `w:rFonts` is the canonical example because consumers need one effective
 /// Latin font while Word layout observes independently-authored script slots.
+/// Word's saved `w:gridSpan w:val="0"` sentinel on an otherwise normalized
+/// one-column vertical continuation is another bounded use.
 /// Invariant: never synthesized by the engine — only carried from a parsed
 /// source part. Two runs whose preserved sets differ are format-distinct
 /// (they must not coalesce), which the derived PartialEq provides.
@@ -3615,7 +3807,9 @@ pub struct StyleProps {
     pub font_family: Option<IStr>,
     /// Theme font reference for ascii/hAnsi slot (e.g., "minorHAnsi").
     /// When present, serialized as w:asciiTheme / w:hAnsiTheme on w:rFonts.
-    /// Per §17.3.2.26, theme attributes take precedence over direct font names.
+    /// Per §17.3.2.26, theme attributes take precedence over literal names
+    /// authored on the same rFonts element. A higher-level direct rFonts can
+    /// replace a lower-level inherited Theme selector in the style cascade.
     pub font_family_theme: Option<IStr>,
     /// Font size in half-points from w:sz (e.g., 24 = 12pt).
     pub font_size: Option<u32>,
@@ -3630,11 +3824,13 @@ pub struct StyleProps {
     pub underline_style: Option<UnderlineStyle>,
     /// East Asian font family from w:rFonts w:eastAsia.
     pub font_east_asia: Option<IStr>,
-    /// Theme font reference for eastAsia slot (e.g., "minorEastAsia").
+    /// Theme font reference for eastAsia slot (e.g., "minorEastAsia"). A
+    /// direct rFonts eastAsia literal replaces an inherited Theme selector.
     pub font_east_asia_theme: Option<IStr>,
     /// Complex script font family from w:rFonts w:cs.
     pub font_cs: Option<IStr>,
-    /// Theme font reference for cs slot (e.g., "minorBidi").
+    /// Theme font reference for cs slot (e.g., "minorBidi"). A direct rFonts
+    /// cs literal replaces an inherited Theme selector.
     pub font_cs_theme: Option<IStr>,
     /// Language tag from w:lang w:val (e.g., "en-US").
     pub lang: Option<IStr>,
@@ -3772,101 +3968,211 @@ impl StyleProps {
     }
 }
 
+/// The authored, direct paragraph properties in the previous `w:pPr`.
+///
+/// These values are deliberately separate from
+/// [`EffectiveParagraphProperties`]. An absent direct property can still have
+/// a resolved value inherited from a style or `docDefaults`; collapsing the two
+/// projections makes reject author formatting that the base paragraph never
+/// authored.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DirectParagraphProperties {
+    pub style_id: Option<IStr>,
+    pub alignment: Option<Alignment>,
+    pub indentation: Option<Indentation>,
+    pub spacing: Option<ParagraphSpacing>,
+    pub numbering: DirectParagraphNumbering,
+    pub keep_next: Option<bool>,
+    pub keep_lines: Option<bool>,
+    /// `None` means absent; `Some(false)` is an authored OFF value.
+    pub page_break_before: Option<bool>,
+    pub widow_control: Option<bool>,
+    pub contextual_spacing: Option<bool>,
+    pub shading: Option<Shading>,
+    pub borders: Option<ParagraphBorders>,
+    /// `None` means no previous `w:tabs`; `Some([])` is an authored empty
+    /// container. The distinction is required for an exact previous-pPr wire
+    /// snapshot even though both resolve to no effective direct stops.
+    pub tab_stops: Option<Vec<crate::word_ir::TabStopDef>>,
+    pub text_direction: Option<TextDirection>,
+    pub text_alignment: Option<TextAlignment>,
+    pub mirror_indents: Option<bool>,
+    pub auto_space_de: Option<bool>,
+    pub auto_space_dn: Option<bool>,
+    pub bidi: Option<bool>,
+    pub suppress_auto_hyphens: Option<bool>,
+    pub snap_to_grid: Option<bool>,
+    pub overflow_punct: Option<bool>,
+    pub adjust_right_ind: Option<bool>,
+    pub word_wrap: Option<bool>,
+    pub frame_pr: Option<FrameProperties>,
+    pub outline_lvl: Option<u8>,
+    pub cnf_style: Option<CnfStyle>,
+    /// The complete unmodeled remainder of the previous `w:pPr`.
+    pub preserved: Vec<PreservedProp>,
+}
+
+/// Exact authored children of a present paragraph `w:numPr`.
+///
+/// Both references are schema-optional. Their absence is retained rather than
+/// defaulted because direct provenance and effective numbering are separate
+/// projections. Tracked/extension children are carried as the exact remainder.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectParagraphNumPr {
+    pub num_id: Option<u32>,
+    pub ilvl: Option<u32>,
+    pub extra_attrs: Vec<QualifiedAttribute>,
+    pub preserved: Vec<PreservedProp>,
+}
+
+/// The two authored states of a paragraph's direct `w:numPr` container.
+///
+/// Suppression is `Present { num_id: Some(0), .. }`; active numbering is a
+/// positive `num_id`; a partial/empty present container remains representable
+/// without guessing its effective meaning.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum DirectParagraphNumbering {
+    Absent,
+    Present(DirectParagraphNumPr),
+}
+
+impl DirectParagraphNumbering {
+    pub fn active(num_id: u32, ilvl: u32) -> Self {
+        assert!(num_id > 0, "active direct numbering requires numId > 0");
+        Self::Present(DirectParagraphNumPr {
+            num_id: Some(num_id),
+            ilvl: Some(ilvl),
+            extra_attrs: Vec::new(),
+            preserved: Vec::new(),
+        })
+    }
+
+    pub fn suppressed() -> Self {
+        Self::Present(DirectParagraphNumPr {
+            num_id: Some(0),
+            ilvl: Some(0),
+            extra_attrs: Vec::new(),
+            preserved: Vec::new(),
+        })
+    }
+}
+
+/// The resolved/derived paragraph projection before a tracked pPr change.
+///
+/// Reject restores this independently from the authored projection so it does
+/// not have to guess whether a value came from direct pPr, styles, numbering,
+/// defaults, or an import-time rendering transform.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveParagraphProperties {
+    pub alignment: Option<Alignment>,
+    pub indentation: Option<Indentation>,
+    pub spacing: Option<ParagraphSpacing>,
+    pub numbering: Option<NumberingInfo>,
+    pub keep_next: Option<bool>,
+    pub keep_lines: Option<bool>,
+    pub page_break_before: bool,
+    pub widow_control: Option<bool>,
+    pub contextual_spacing: Option<bool>,
+    pub shading: Option<Shading>,
+    pub borders: Option<ParagraphBorders>,
+    pub tab_stops_rel: Vec<crate::word_ir::TabStopDef>,
+    pub heading_level: Option<HeadingLevel>,
+    /// Import-derived layout of a consumed leading literal-prefix tab.
+    pub literal_prefix_leading_tab_twips: Option<i32>,
+    /// Import-derived layout of a consumed trailing literal-prefix tab.
+    pub literal_prefix_trailing_tab_stop_twips: Option<i32>,
+}
+
+/// Authored formatting of the previous paragraph mark (`w:pPr/w:rPr`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ParagraphMarkProperties {
+    pub marks: Vec<Mark>,
+    pub style_props: StyleProps,
+    pub rfonts: AuthoredRFonts,
+    pub rpr_off: ParaMarkRprOff,
+}
+
+/// The complete typed previous-state projection carried by a pPr change.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PreviousParagraphProperties {
+    pub direct: DirectParagraphProperties,
+    pub effective: EffectiveParagraphProperties,
+    pub paragraph_mark: ParagraphMarkProperties,
+}
+
 /// Tracked paragraph formatting change: the "before" state from w:pPrChange (§17.13.5.29).
 /// Present on paragraphs whose formatting was changed via Word's Track Changes.
 ///
-/// Per the spec, the child pPr inside pPrChange must be a COMPLETE snapshot of the
-/// previous paragraph properties — not just the properties that changed.
+/// Per the spec, the child pPr inside pPrChange is the complete previous
+/// AUTHORED pPr. Stemma additionally carries the previous resolved projection
+/// because that information cannot be reconstructed from the inner pPr without
+/// the exact style/default/numbering environment in which it was imported.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ParagraphFormattingChange {
-    /// Previous alignment (before the change).
-    pub previous_alignment: Option<Alignment>,
-    /// Previous indentation (before the change).
-    pub previous_indentation: Option<Indentation>,
-    /// Previous spacing (before the change).
-    pub previous_spacing: Option<ParagraphSpacing>,
-    /// Previous numbering (before the change).
-    pub previous_numbering: Option<NumberingInfo>,
-    /// When true, the base paragraph had no numbering at all (no numPr AND no
-    /// literal prefix). The serializer emits `numId=0` in pPrChange's inner pPr
-    /// to signal this to the extraction, which skips the paragraph in the
-    /// reject-view numbering state machine. Without this flag, `previous_numbering:
-    /// None` is ambiguous — it could mean "had no numPr but had a literal prefix"
-    /// (where the current numPr replaced the prefix and should still be counted).
-    pub previous_numbering_explicitly_absent: bool,
-    /// Previous style ID from w:pStyle (before the change).
-    pub previous_style_id: Option<IStr>,
-    /// Previous keepNext (before the change).
-    pub previous_keep_next: Option<bool>,
-    /// Previous keepLines (before the change).
-    pub previous_keep_lines: Option<bool>,
-    /// Previous pageBreakBefore (before the change).
-    pub previous_page_break_before: bool,
-    /// Previous widowControl (before the change).
-    pub previous_widow_control: Option<bool>,
-    /// Previous contextualSpacing (before the change).
-    pub previous_contextual_spacing: Option<bool>,
-    /// Previous paragraph shading (before the change).
-    pub previous_shading: Option<Shading>,
-    /// Previous paragraph borders (before the change).
-    pub previous_borders: Option<ParagraphBorders>,
-    /// Previous tab stops (before the change).
-    pub previous_tab_stops: Vec<crate::word_ir::TabStopDef>,
-    /// Previous gap from margin-left to the consumed leading tab stop for a
-    /// stripped literal prefix like `\t(c)\t`.
-    pub previous_literal_prefix_leading_tab_twips: Option<i32>,
-    /// Previous gap from margin-left to the tab stop reached by a stripped
-    /// trailing tab after the literal prefix.
-    pub previous_literal_prefix_trailing_tab_stop_twips: Option<i32>,
-    /// Previous direct paragraph-mark formatting marks from w:pPr/w:rPr.
-    pub previous_paragraph_mark_marks: Vec<Mark>,
-    /// Previous direct paragraph-mark value-carrying style props from w:pPr/w:rPr.
-    pub previous_paragraph_mark_style_props: StyleProps,
-    /// Exact previous paragraph-mark `w:rFonts` slots from the pPrChange
-    /// snapshot; see `ParagraphNode::paragraph_mark_rfonts`.
+    pub previous: PreviousParagraphProperties,
+    /// Stable revision id (`w:id`) of this tracked formatting change — the
+    /// SAME identity the accept/reject selectors address. `0` is the legacy
+    /// sentinel for snapshots serialized before identity existed (such a
+    /// change cannot be selected by id until the doc is re-imported; the
+    /// serializer mints a fresh id for it on output, preserving old behavior).
     #[serde(default)]
-    pub previous_paragraph_mark_rfonts: AuthoredRFonts,
-    /// Previous authored OFF toggles on the paragraph mark's w:pPr/w:rPr (the
-    /// pilcrow analogue that `previous_paragraph_mark_marks` cannot carry).
+    pub revision_id: u32,
+    /// Revision author.
+    pub author: String,
+    /// Revision date.
+    pub date: Option<String>,
+    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
+    /// document-unique handle the resolution surface addresses, distinct from
+    /// the wire `revision_id` (which Word does not keep unique). `0` is the
+    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
+    /// on `revision_id`.
     #[serde(default)]
-    pub previous_paragraph_mark_rpr_off: ParaMarkRprOff,
-    /// Previous text direction (before the change).
-    pub previous_text_direction: Option<TextDirection>,
-    /// Previous text alignment (before the change).
-    pub previous_text_alignment: Option<TextAlignment>,
-    /// Previous mirrorIndents (before the change). Three-state, matching
-    /// `ParagraphNode::mirror_indents`.
+    pub identity: u32,
+    /// Which native Word property-history carrier owns this change. A
+    /// paragraph mark can carry `w:rPrChange` without any `w:pPrChange`; the
+    /// distinction prevents a mark-only edit from manufacturing an empty
+    /// paragraph-property revision.
     #[serde(default)]
-    pub previous_mirror_indents: Option<bool>,
-    /// Previous autoSpaceDE (before the change).
-    pub previous_auto_space_de: Option<bool>,
-    /// Previous autoSpaceDN (before the change).
-    pub previous_auto_space_dn: Option<bool>,
-    /// Previous bidi (before the change). Three-state, matching
-    /// `ParagraphNode::bidi`.
-    #[serde(default)]
-    pub previous_bidi: Option<bool>,
-    /// Previous suppressAutoHyphens (before the change).
-    pub previous_suppress_auto_hyphens: Option<bool>,
-    /// Previous snapToGrid (before the change).
-    pub previous_snap_to_grid: Option<bool>,
-    /// Previous overflowPunct (before the change).
-    pub previous_overflow_punct: Option<bool>,
-    /// Previous adjustRightInd (before the change).
-    pub previous_adjust_right_ind: Option<bool>,
-    /// Previous wordWrap (before the change).
-    pub previous_word_wrap: Option<bool>,
-    /// Previous framePr (before the change).
-    pub previous_frame_pr: Option<FrameProperties>,
-    /// Unmodeled children of the pPrChange's previous pPr, captured verbatim
-    /// at import and re-emitted inside the serialized w:pPrChange's inner
-    /// w:pPr. On reject, these REPLACE the restored paragraph's own
-    /// `ParagraphNode::preserved_ppr`: the snapshot IS the complete previous
-    /// pPr per §17.13.5.29, so its preserved remainder is the paragraph's
-    /// entire unmodeled remainder after reject, not a merge with whatever the
-    /// (about-to-be-discarded) current state happened to carry.
-    #[serde(default)]
-    pub previous_preserved_ppr: Vec<PreservedProp>,
+    pub carrier: ParagraphFormattingChangeCarrier,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParagraphFormattingChangeCarrier {
+    /// `w:pPrChange` only. Any previous paragraph-mark state is the complete
+    /// inner-pPr snapshot, not an independently selectable mark revision.
+    #[default]
+    ParagraphProperties,
+    /// `w:pPr/w:rPr/w:rPrChange` only.
+    ParagraphMarkProperties,
+    /// Both physical carriers are present.
+    ParagraphAndMarkProperties,
+}
+
+impl ParagraphFormattingChangeCarrier {
+    pub fn has_paragraph_properties(self) -> bool {
+        matches!(
+            self,
+            Self::ParagraphProperties | Self::ParagraphAndMarkProperties
+        )
+    }
+
+    pub fn has_paragraph_mark_properties(self) -> bool {
+        matches!(
+            self,
+            Self::ParagraphMarkProperties | Self::ParagraphAndMarkProperties
+        )
+    }
+}
+
+/// Tracked table formatting change: the "before" state from w:tblPrChange (§17.13.5.34).
+/// Present on tables whose formatting was changed via Word's Track Changes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TableFormattingChange {
+    /// Complete previous table-property projection. `grid_cols` is carried so
+    /// in-memory Reject can restore the complete canonical table frame, but it
+    /// is never emitted inside `w:tblPrChange`: `w:tblGrid` is not revisioned
+    /// by that construct and must remain identical across the change.
+    pub previous: TableFormatting,
     /// Stable revision id (`w:id`) of this tracked formatting change — the
     /// SAME identity the accept/reject selectors address. `0` is the legacy
     /// sentinel for snapshots serialized before identity existed (such a
@@ -3887,32 +4193,17 @@ pub struct ParagraphFormattingChange {
     pub identity: u32,
 }
 
-/// Tracked table formatting change: the "before" state from w:tblPrChange (§17.13.5.34).
-/// Present on tables whose formatting was changed via Word's Track Changes.
+/// Tracked per-row table-property-exception change from `w:tblPrExChange`
+/// (§17.13.5.35).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TableFormattingChange {
-    /// Previous table width (before the change).
-    pub previous_width: Option<TableMeasurement>,
-    /// Previous table borders (before the change).
-    pub previous_borders: Option<BorderSet>,
-    /// Previous default cell margins (before the change).
-    pub previous_default_cell_margins: Option<CellMargins>,
-    /// Stable revision id (`w:id`) of this tracked formatting change — the
-    /// SAME identity the accept/reject selectors address. `0` is the legacy
-    /// sentinel for snapshots serialized before identity existed (such a
-    /// change cannot be selected by id until the doc is re-imported; the
-    /// serializer mints a fresh id for it on output, preserving old behavior).
+pub struct TablePropertyExceptionChange {
+    /// Complete previous exception payload. `None` is the canonical semantic
+    /// state represented on the wire by the required empty inner `w:tblPrEx`.
+    pub previous: Option<TableFormatting>,
     #[serde(default)]
     pub revision_id: u32,
-    /// Revision author.
     pub author: String,
-    /// Revision date.
     pub date: Option<String>,
-    /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
-    /// document-unique handle the resolution surface addresses, distinct from
-    /// the wire `revision_id` (which Word does not keep unique). `0` is the
-    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
-    /// on `revision_id`.
     #[serde(default)]
     pub identity: u32,
 }
@@ -3925,6 +4216,8 @@ pub struct RowFormattingChange {
     pub previous_height: Option<u32>,
     /// Previous row height rule (before the change).
     pub previous_height_rule: Option<HeightRule>,
+    /// Previous authored table-style conditional formatting (`w:cnfStyle`).
+    pub previous_cnf_style: Option<CnfStyle>,
     /// Stable revision id (`w:id`) of this tracked formatting change — the
     /// SAME identity the accept/reject selectors address. `0` is the legacy
     /// sentinel for snapshots serialized before identity existed (such a
@@ -3965,6 +4258,8 @@ pub struct CellFormattingChange {
     pub previous_text_direction: Option<TextDirection>,
     /// Previous fit-text setting (before the change).
     pub previous_tc_fit_text: Option<bool>,
+    /// Previous authored table-style conditional formatting (`w:cnfStyle`).
+    pub previous_cnf_style: Option<CnfStyle>,
     /// Stable revision id (`w:id`) of this tracked formatting change — the
     /// SAME identity the accept/reject selectors address. `0` is the legacy
     /// sentinel for snapshots serialized before identity existed (such a
@@ -3985,10 +4280,36 @@ pub struct CellFormattingChange {
     pub identity: u32,
 }
 
-/// Tracked formatting change: the "before" state from w:rPrChange.
-/// Present on text nodes whose formatting was changed via Word's Track Changes.
+/// Previous effective run formatting retained by the proof model.
+///
+/// Usually this is the before-state from `w:rPrChange`. Paragraph- and
+/// table-style switches can also change effective run formatting without any
+/// run property changing directly; [`RunFormattingChangeCarrier`] records
+/// which native Word carrier owns the delta.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunFormattingChangeCarrier {
+    /// A real, independently selectable `w:rPrChange` owns the delta.
+    #[default]
+    RunProperties,
+    /// The effective run-formatting delta is a consequence of the enclosing
+    /// paragraph's `w:pPrChange` switching `w:pStyle`. It remains in the
+    /// canonical proof state so an isolated in-memory Reject projection can
+    /// reconstruct the source tape, but it is not a second Word revision and
+    /// must not serialize or enumerate as `w:rPrChange`.
+    ParagraphStyleCascade,
+    /// The effective run-formatting delta is a consequence of the enclosing
+    /// table's `w:tblPrChange` switching `w:tblStyle`. Like the paragraph
+    /// cascade variant, this is proof state owned by the enclosing physical
+    /// revision and must not serialize or enumerate as `w:rPrChange`.
+    TableStyleCascade,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FormattingChange {
+    /// The physical Word carrier that owns this effective formatting delta.
+    /// Older snapshots contain only genuine `w:rPrChange` records.
+    #[serde(default)]
+    pub carrier: RunFormattingChangeCarrier,
     /// The previous boolean marks (before the change).
     pub previous_marks: Vec<Mark>,
     /// The previous style properties (before the change).
@@ -4023,6 +4344,13 @@ pub struct FormattingChange {
     /// on `revision_id`.
     #[serde(default)]
     pub identity: u32,
+}
+
+impl FormattingChange {
+    /// Whether this snapshot owns an independently selectable Word revision.
+    pub fn is_physical_revision(&self) -> bool {
+        self.carrier == RunFormattingChangeCarrier::RunProperties
+    }
 }
 
 /// Per-slot provenance for a text run's `<w:rPr>`: was each property AUTHORED
@@ -4300,6 +4628,166 @@ impl RunRprAuthored {
         self.color || self.color_theme
     }
 
+    /// Project resolved run properties down to the properties authored by the
+    /// run itself. The imported [`StyleProps`] also contains values inherited
+    /// through character styles, paragraph styles, and document defaults; those
+    /// values must not be mistaken for a direct run-formatting edit.
+    pub fn direct_style_props(self, style_props: &StyleProps) -> StyleProps {
+        let mut props = style_props.clone();
+        if !self.font_family {
+            props.font_family = None;
+        }
+        if !self.font_family_theme {
+            props.font_family_theme = None;
+        }
+        if !self.font_east_asia {
+            props.font_east_asia = None;
+        }
+        if !self.font_east_asia_theme {
+            props.font_east_asia_theme = None;
+        }
+        if !self.font_cs {
+            props.font_cs = None;
+        }
+        if !self.font_cs_theme {
+            props.font_cs_theme = None;
+        }
+        if !self.font_hint {
+            props.font_hint = None;
+        }
+        if !self.font_size {
+            props.font_size = None;
+        }
+        if !self.font_size_cs {
+            props.font_size_cs = None;
+        }
+        if !self.color {
+            props.color = None;
+        }
+        if !self.color_theme {
+            props.color_theme = None;
+        }
+        if !self.lang {
+            props.lang = None;
+        }
+        if !self.lang_east_asia {
+            props.lang_east_asia = None;
+        }
+        if !self.kern {
+            props.kern = None;
+        }
+        if !self.char_spacing {
+            props.char_spacing = None;
+        }
+        if !self.strike {
+            props.strike = MarkValue::Inherit;
+        }
+        if !self.double_strike {
+            props.double_strike = MarkValue::Inherit;
+        }
+        if !self.caps {
+            props.caps = MarkValue::Inherit;
+        }
+        if !self.small_caps {
+            props.small_caps = MarkValue::Inherit;
+        }
+        if !self.vanish {
+            props.vanish = MarkValue::Inherit;
+        }
+        if !self.web_hidden {
+            props.web_hidden = MarkValue::Inherit;
+        }
+        if !self.emboss {
+            props.emboss = MarkValue::Inherit;
+        }
+        if !self.imprint {
+            props.imprint = MarkValue::Inherit;
+        }
+        if !self.outline {
+            props.outline = MarkValue::Inherit;
+        }
+        if !self.shadow {
+            props.shadow = MarkValue::Inherit;
+        }
+        if !self.bold_cs {
+            props.bold_cs = MarkValue::Inherit;
+        }
+        if !self.italic_cs {
+            props.italic_cs = MarkValue::Inherit;
+        }
+        if !self.rtl {
+            props.rtl = MarkValue::Inherit;
+        }
+        if !self.cs {
+            props.cs = MarkValue::Inherit;
+        }
+        if !self.no_proof {
+            props.no_proof = MarkValue::Inherit;
+        }
+        if !self.spec_vanish {
+            props.spec_vanish = MarkValue::Inherit;
+        }
+        if !self.o_math {
+            props.o_math = MarkValue::Inherit;
+        }
+        if !self.snap_to_grid {
+            props.snap_to_grid = MarkValue::Inherit;
+        }
+        if !self.highlight {
+            props.highlight = None;
+        }
+        if !self.underline_style {
+            props.underline_style = None;
+        }
+        if !self.position {
+            props.position = None;
+        }
+        if !self.char_width_scaling {
+            props.char_width_scaling = None;
+        }
+        if !self.char_style_id {
+            props.char_style_id = None;
+        }
+        if !self.run_border {
+            props.run_border = None;
+        }
+        if !self.run_shading {
+            props.run_shading = None;
+        }
+        if !self.emphasis_mark {
+            props.emphasis_mark = None;
+        }
+        if !self.text_effect {
+            props.text_effect = None;
+        }
+        if !self.fit_text {
+            props.fit_text = None;
+        }
+        props
+    }
+
+    /// Project resolved boolean marks down to marks authored by the run itself.
+    pub fn direct_marks(self, marks: &[Mark]) -> Vec<Mark> {
+        marks
+            .iter()
+            .filter(|mark| match mark {
+                Mark::Bold => self.bold && !self.bold_off,
+                Mark::Italic => self.italic && !self.italic_off,
+                Mark::Underline => self.underline,
+                Mark::Subscript | Mark::Superscript => self.vert_align,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Direct formatting identity, excluding the imported placement hint for
+    /// whether `w:rPr` followed the run content. That hint affects lossless
+    /// replay but is not a run-formatting value that `w:rPrChange` can switch.
+    pub fn formatting_identity(mut self) -> Self {
+        self.rpr_after_content = false;
+        self
+    }
+
     /// Presence-derived provenance for SYNTHESIZED runs (edit materializers,
     /// diff-built content): everything the run carries is treated as authored,
     /// so it all re-emits. Import-parsed runs must NOT use this — their
@@ -4481,6 +4969,10 @@ pub struct HardBreakNode {
     /// stability contract as text runs.
     #[serde(default)]
     pub source_run_attrs: Vec<(String, String)>,
+    /// Tracked change to the formatting of the run carrying this break. Word
+    /// represents this with the same `w:rPrChange` used by text-bearing runs.
+    #[serde(default)]
+    pub formatting_change: Option<FormattingChange>,
     /// This break and the immediately following TextNode were children of the
     /// same imported `w:r`. Word's table pagination can distinguish a leading
     /// break in the text run from a synthetic break-only run, so untouched
@@ -5961,6 +6453,10 @@ pub struct TableDiffResult {
 pub enum TableRowAlignment {
     /// Row exists in both tables.
     Matched { old_row: usize, new_row: usize },
+    /// Source and target content is unrelated, but the row/cell shell is
+    /// physically shared so native revisions can delete the complete source
+    /// payload and insert the complete target payload.
+    Replacement { old_row: usize, new_row: usize },
     /// Row was deleted from old table.
     Deleted { old_row: usize },
     /// Row was inserted in new table.
@@ -5995,210 +6491,6 @@ pub enum TableCellDiffType {
     Deleted,
     /// Cell merge (rowspan/colspan) changed.
     MergeChanged,
-}
-
-/// Source-document provenance for a merged block.
-///
-/// Each merged block may originate from the base document, the target document,
-/// or both (modified). This provenance is emitted by `merge_diff` alongside the
-/// merged CanonDoc, enabling downstream consumers (atom extraction, UI anchoring)
-/// to use the correct source-document identity without reverse-engineering
-/// merge-internal renaming.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BlockProvenance {
-    /// Block ID in the base (original) document. Present for deleted and modified blocks.
-    pub base_block_id: Option<NodeId>,
-    /// Block ID in the target (modified) document. Present for inserted and modified blocks.
-    pub target_block_id: Option<NodeId>,
-}
-
-/// Result of diffing two documents.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DocumentDiff {
-    pub base_fingerprint: DocFingerprint,
-    pub target_fingerprint: DocFingerprint,
-    pub changes: Vec<DiffChange>,
-}
-
-/// A single change in the diff.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub enum DiffChange {
-    /// Block was deleted from base.
-    BlockDeleted {
-        block_id: NodeId,
-        old_text: String,
-        /// The deleted block (for metadata extraction).
-        old_block: BlockNode,
-        /// When set, this deletion is the source of a move operation.
-        move_id: Option<String>,
-    },
-    /// Block was inserted (not in base).
-    BlockInserted {
-        after_block_id: Option<NodeId>,
-        block: BlockNode,
-        /// When set, this insertion is the destination of a move operation.
-        move_id: Option<String>,
-    },
-    /// Block text was modified (inline changes).
-    BlockModified {
-        block_id: NodeId,
-        old_text: String,
-        new_text: String,
-        inline_changes: Vec<InlineChange>,
-        /// The old block (for metadata extraction).
-        old_block: BlockNode,
-        /// The new block (for metadata extraction).
-        new_block: BlockNode,
-        /// True when the diff detected that this modification is the first
-        /// half of a paragraph split (one base paragraph → two target paragraphs).
-        /// The following `BlockInserted` carries the second half.
-        para_split: bool,
-    },
-    /// Table structure changed (different row/column layout).
-    /// Includes canonicalized tables and detailed diff for rendering.
-    TableStructureChanged {
-        table_id: NodeId,
-        target_table_id: NodeId,
-        old_hash: String,
-        new_hash: String,
-        /// Coarse old table text (for backwards compatibility / fallback).
-        old_text: String,
-        /// Coarse new table text (for backwards compatibility / fallback).
-        new_text: String,
-        /// Detailed table diff with row alignment and cell changes.
-        /// Some when detailed diffing succeeds, None for fallback.
-        table_diff: Option<Box<TableDiffResult>>,
-    },
-    /// Table cell content changed but table structure (rows, columns, merges) is identical.
-    /// Carries per-cell inline changes so the merge can apply them within the existing table
-    /// instead of replacing the entire table with a deleted + inserted copy.
-    TableCellsModified {
-        table_id: NodeId,
-        target_table_id: NodeId,
-        cell_changes: Vec<TableCellChange>,
-        /// Coarse old table text (for the comparison pipeline / atom assignment).
-        old_text: String,
-        /// Coarse new table text (for the comparison pipeline / atom assignment).
-        new_text: String,
-    },
-
-    // Story-level changes
-    /// Header was modified (content changed but kind matches).
-    HeaderModified {
-        kind: HeaderFooterKind,
-        /// Base document part name carrying the pre-change content.
-        base_part_name: String,
-        /// Target document part name for the same logical story slot.
-        target_part_name: String,
-        old_hash: String,
-        new_hash: String,
-        block_changes: Vec<DiffChange>,
-    },
-    /// Header was deleted (exists in base but not target).
-    HeaderDeleted {
-        kind: HeaderFooterKind,
-        /// Resolved part name (e.g., "header2.xml") for targeting the base part.
-        part_name: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-    /// Header was inserted (exists in target but not base).
-    HeaderInserted {
-        kind: HeaderFooterKind,
-        /// Resolved part name (e.g., "header3.xml") in target.
-        part_name: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-
-    /// Footer was modified (content changed but kind matches).
-    FooterModified {
-        kind: HeaderFooterKind,
-        /// Base document part name carrying the pre-change content.
-        base_part_name: String,
-        /// Target document part name for the same logical story slot.
-        target_part_name: String,
-        old_hash: String,
-        new_hash: String,
-        block_changes: Vec<DiffChange>,
-    },
-    /// Footer was deleted (exists in base but not target).
-    FooterDeleted {
-        kind: HeaderFooterKind,
-        /// Resolved part name (e.g., "footer2.xml") for targeting the base part.
-        part_name: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-    /// Footer was inserted (exists in target but not base).
-    FooterInserted {
-        kind: HeaderFooterKind,
-        /// Resolved part name (e.g., "footer3.xml") in target.
-        part_name: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-
-    /// Footnote was modified (content changed but id matches by content alignment).
-    FootnoteModified {
-        id: String,
-        old_hash: String,
-        new_hash: String,
-        block_changes: Vec<DiffChange>,
-    },
-    /// Footnote was deleted.
-    FootnoteDeleted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-    /// Footnote was inserted.
-    FootnoteInserted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-
-    /// Endnote was modified.
-    EndnoteModified {
-        id: String,
-        old_hash: String,
-        new_hash: String,
-        block_changes: Vec<DiffChange>,
-    },
-    /// Endnote was deleted.
-    EndnoteDeleted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-    /// Endnote was inserted.
-    EndnoteInserted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-
-    /// Comment was modified.
-    CommentModified {
-        id: String,
-        old_hash: String,
-        new_hash: String,
-        block_changes: Vec<DiffChange>,
-    },
-    /// Comment was deleted.
-    CommentDeleted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
-    /// Comment was inserted.
-    CommentInserted {
-        id: String,
-        content_hash: String,
-        blocks: Vec<BlockNode>,
-    },
 }
 
 /// A single cell's content change within a same-structure table.
@@ -6341,233 +6633,4 @@ pub enum OpaqueSegmentKind {
     /// Custom XML wrapper — transparent container, content shows through.
     CustomXml,
     Unknown(String),
-}
-
-/// A specific metadata property that changed on an image while the pixels stayed identical.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum ImageMetadataChange {
-    /// Image dimensions (wp:extent cx/cy) changed.
-    Size,
-    /// Cropping rectangle (a:srcRect) changed.
-    Cropping,
-    /// Alt text (wp:docPr descr) changed.
-    AltText,
-}
-
-/// The structural kind of a block in the full document view.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum BlockType {
-    Paragraph,
-    Heading,
-    Table,
-    Opaque,
-}
-
-impl BlockType {
-    /// Serialize to the wire-format string ("paragraph", "heading", "table", "opaque").
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            BlockType::Paragraph => "paragraph",
-            BlockType::Heading => "heading",
-            BlockType::Table => "table",
-            BlockType::Opaque => "opaque",
-        }
-    }
-}
-
-impl std::fmt::Display for BlockType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The change status of a block in the full document diff view.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum ChangeType {
-    Unchanged,
-    Modified,
-    Inserted,
-    Deleted,
-}
-
-impl ChangeType {
-    /// Serialize to the wire-format string ("unchanged", "modified", "inserted", "deleted").
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ChangeType::Unchanged => "unchanged",
-            ChangeType::Modified => "modified",
-            ChangeType::Inserted => "inserted",
-            ChangeType::Deleted => "deleted",
-        }
-    }
-}
-
-impl std::fmt::Display for ChangeType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// A block in the full document view with inline diff segments.
-///
-/// Represents every block in document order, where each block carries
-/// its inline diff segments (equal/insert/delete with marks).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct FullDocBlock {
-    /// Stable projection block identity.
-    ///
-    /// For blocks present in the target document, this reuses the target-side
-    /// canonical block ID. For deleted-only blocks, this is a stable tombstone
-    /// ID derived from the base-side canonical block ID.
-    pub block_id: NodeId,
-    /// Original block ID from the base document. Set for unchanged/modified/deleted, None for inserted.
-    pub doc1_block_id: Option<NodeId>,
-    /// Original block ID from the target document. Set for unchanged/modified/inserted, None for deleted.
-    pub doc2_block_id: Option<NodeId>,
-    pub block_type: BlockType,
-    pub heading_level: Option<u8>,
-    pub style_id: Option<IStr>,
-    pub change_type: ChangeType,
-    pub align: Option<Alignment>,
-    /// Render-resolved indentation: `effective_first_line_twips` already folds in
-    /// a literal-prefix marker's leading-tab landing, so it is the single
-    /// first-line origin to apply as `text-indent`. See [`Indentation`].
-    pub indent: Option<Indentation>,
-    pub spacing: Option<ParagraphSpacing>,
-    pub borders: Option<ParagraphBorders>,
-    /// Effective tab stops for this paragraph (empty = no custom stops).
-    pub tab_stops: Vec<crate::word_ir::TabStopDef>,
-    pub numbering_text: Option<String>,
-    pub numbering_ilvl: Option<u32>,
-    /// The paragraph's numbering `num_id` (Word auto-numbering only; None for a
-    /// literal-prefix "list"). Lets a list-editing consumer target an existing
-    /// list (e.g. join a paragraph to it via `set_numbering`).
-    pub numbering_num_id: Option<u32>,
-    pub segments: Vec<InlineChange>,
-    /// Optional table diff for table blocks (only when structure changed).
-    pub table_diff: Option<TableDiffResult>,
-    /// Content types present in this block, e.g. ["text"], ["image"], ["text", "image"].
-    pub content_types: Vec<String>,
-    /// Raw OMML XML strings for equations in this block (for LLM context).
-    pub equation_xmls: Vec<String>,
-    /// Number of doc1 equations in equation_xmls (the rest are doc2).
-    pub equation_doc1_count: usize,
-    /// Base64 data URIs for images in this block (e.g. "data:image/png;base64,...").
-    pub image_data_uris: Vec<String>,
-    /// Number of doc1 images in image_data_uris (the rest are doc2).
-    pub image_doc1_count: usize,
-    /// Metadata properties that changed on an image while the pixels stayed identical.
-    pub image_metadata_changes: Vec<ImageMetadataChange>,
-    /// Shared move identifier linking a "moved from" block to its "moved to" counterpart.
-    /// Set when the diff detects that a deleted block's content reappears as an insertion elsewhere.
-    pub move_id: Option<String>,
-    /// Direction of the move: "from" (content was here, moved away) or "to" (content arrived here).
-    pub move_direction: Option<MoveDirection>,
-    /// Structural change annotation: paragraph was joined into or split from an adjacent block.
-    pub structural_change: Option<StructuralChange>,
-    /// Border group identifier for consecutive paragraphs with identical border settings.
-    /// Paragraphs in the same group share a visual border box per OOXML §17.3.1.24.
-    pub border_group_id: Option<String>,
-    /// Tracked-change status of this paragraph's paragraph mark, when the
-    /// paragraph mark itself is tracked-inserted or tracked-deleted (ParagraphNode::para_mark_status).
-    /// When set, the last entry in `segments` is the synthesized `\n` segment
-    /// representing that paragraph-mark change, and projection-side ID computation
-    /// must tag it with `{block_id}_para_mark` to match the atom side.
-    pub paragraph_mark_status: Option<TrackingStatus>,
-}
-
-/// Direction of a move operation.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum MoveDirection {
-    /// Content was moved away from this location (appears as deleted).
-    From,
-    /// Content was moved to this location (appears as inserted).
-    To,
-}
-
-/// Structural change annotation for paragraph join/split detection.
-///
-/// When paragraphs are joined (two become one) or split (one becomes two),
-/// the diff shows modified + deleted/inserted blocks. This annotation
-/// makes the structural change explicit.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum StructuralChange {
-    /// This block was joined into an adjacent modified block.
-    /// `into_block_id` is the block_id of the modified block that absorbed this content.
-    Join { into_block_id: NodeId },
-    /// This block was split from an adjacent modified block.
-    /// `from_block_id` is the block_id of the modified block that lost this content.
-    Split { from_block_id: NodeId },
-}
-
-/// Full document view result including body blocks and referenced story content.
-pub struct FullDocViewResult {
-    pub blocks: Vec<FullDocBlock>,
-    /// Footnote stories from both documents (target takes precedence).
-    pub footnotes: Vec<StoryPayload>,
-    /// Endnote stories from both documents (target takes precedence).
-    pub endnotes: Vec<StoryPayload>,
-    /// Comment stories from both documents (target takes precedence).
-    pub comments: Vec<CommentPayload>,
-    /// Header stories referenced by the body section (§17.10.2), projected to
-    /// inline segments. One entry per `w:headerReference` the body section binds,
-    /// carrying its `kind` (default/first/even) so the frontend can pick the
-    /// applicable band. Empty when the section declares no headers.
-    pub headers: Vec<HeaderFooterPayload>,
-    /// Footer stories referenced by the body section (§17.10.5), same shape and
-    /// semantics as `headers`.
-    pub footers: Vec<HeaderFooterPayload>,
-    /// Body-level section properties from the target document.
-    pub body_section_properties: Option<SectionProperties>,
-}
-
-/// Rendered note story content for the frontend.
-pub struct StoryPayload {
-    pub id: String,
-    pub segments: Vec<InlineChange>,
-}
-
-/// One paragraph of a header/footer story, carrying the paragraph-level
-/// properties a faithful band render needs alongside its inline content. Word
-/// centers/right-aligns footer paragraphs (`w:jc`) and positions tabbed content
-/// at real stops (`w:tabs`); a flat inline stream cannot express either, so the
-/// projection keeps the story's paragraph structure here instead of flattening
-/// it (the discarded `pPr` is exactly why a centered footer rendered left).
-pub struct HeaderFooterParagraph {
-    /// Paragraph alignment (`w:jc`, §17.3.1.13). `None` = inherited (left).
-    pub align: Option<Alignment>,
-    /// Explicit tab stops (`w:tabs`, §17.3.1.38) — the classic left/center/right
-    /// footer. Empty = Word's default 0.5in grid (synthesized by the renderer).
-    pub tab_stops: Vec<crate::word_ir::TabStopDef>,
-    /// The paragraph's inline content (the same segment shape body blocks use:
-    /// marks, tabs, fields).
-    pub segments: Vec<InlineChange>,
-}
-
-/// Rendered header/footer story content for the frontend (read-only band).
-///
-/// `kind` is the `w:type` of the section's reference to this story
-/// (`"default"`, `"first"`, or `"even"`), so the frontend renders the band that
-/// applies to the page it is showing. `paragraphs` keeps the story's paragraph
-/// structure (one per `w:p`) so each line's alignment and tab stops survive —
-/// faithful to how Word lays out headers/footers.
-pub struct HeaderFooterPayload {
-    pub kind: String,
-    pub paragraphs: Vec<HeaderFooterParagraph>,
-}
-
-/// Rendered comment story content for the frontend.
-pub struct CommentPayload {
-    pub id: String,
-    pub author: Option<String>,
-    pub date: Option<String>,
-    pub segments: Vec<InlineChange>,
-    /// Resolved state from the matching `w15:commentEx` record (MS-DOCX §2.5.1),
-    /// linked by the comment's first body paragraph `w14:paraId`. `false` when
-    /// there is no commentsExtended record for this comment.
-    pub resolved: bool,
-    /// The `w14:paraId` of the parent comment when this is a reply thread child
-    /// (`w15:paraIdParent`); `None` for a top-level comment or when there is no
-    /// commentsExtended record.
-    pub parent_para_id: Option<String>,
 }

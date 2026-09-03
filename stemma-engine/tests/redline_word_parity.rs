@@ -13,6 +13,8 @@
 //! Run via: `just redline-word-parity`
 
 use std::fs;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::redline_extract::{RedlineParagraph, extract_redline};
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};

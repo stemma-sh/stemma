@@ -65,7 +65,7 @@ fn spec_ppr_change_is_parsed() {
         .expect("paragraph should have a formatting_change from pPrChange");
 
     assert_eq!(
-        change.previous_alignment,
+        change.previous.direct.alignment,
         Some(Alignment::Left),
         "previous alignment should be Left"
     );
@@ -179,7 +179,8 @@ fn spec_tbl_pr_change_is_exposed() {
     assert!(tbl_change.date.is_some(), "tblPrChange should have a date");
     // Previous width should be 5000 dxa
     let prev_width = tbl_change
-        .previous_width
+        .previous
+        .width
         .as_ref()
         .expect("tblPrChange should capture previous width");
     assert_eq!(prev_width.w, 5000);

@@ -14,6 +14,8 @@
 //! `testdata/spec-compliance/table-border-serialization/create_docs.py`
 
 use std::io::Cursor;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{BlockNode, CanonDoc, DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 

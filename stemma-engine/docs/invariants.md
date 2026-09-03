@@ -1,10 +1,11 @@
 # Invariant Catalog
 
-The master list of correctness invariants for the stemma engine. The engine is a
-pipeline:
+The master list of correctness invariants for the Stemma engine and its
+downstream comparison compiler. They are separate pipelines:
 
 ```
-DOCX bytes -> import -> CanonDoc -> diff / edit -> Transaction -> apply -> CanonDoc -> serialize -> DOCX bytes
+DOCX bytes -> import -> CanonDoc -> explicit edit / project -> serialize -> DOCX bytes
+accepted base + accepted target -> stemma-diff -> engine carriers -> redline
 ```
 
 Each stage has invariants; the tests are organized to prove them. This catalog is
@@ -13,9 +14,12 @@ the day-to-day gate, and references invariant numbers defined here. (Numbering i
 inherited from the catalog of the engine's original host application so historical
 cross-references stay stable; gaps and `[retired]` entries are kept on purpose.)
 
-**Scope.** This crate owns the canonical-space invariants (import, diff, edit,
-merge, serialize). Two tiers of invariant are proven *outside* this crate and are
-listed here only for completeness:
+**Scope.** The engine owns import, explicit edit, native carrier, resolution,
+package, and serialization invariants. `stemma-diff` owns correspondence,
+alignment, and presentation invariants, then relies on the engine invariants
+for its output. Some cross-boundary integration tests remain in the engine test
+tree and use `stemma-diff` only as a dev dependency. Two tiers of invariant are
+proven *outside* the product crates and are listed here only for completeness:
 
 - **Word-oracle invariants** (#13, #13b, #14, #14b, #15, #17, #21, and the
   `*-word-oracle` halves of #20) drive a real Microsoft Word instance. They live
@@ -35,10 +39,11 @@ changes in our redline and gets different text or formatting than intended, we
 have a bug — Word's interpretation of OOXML is ground truth because that's what
 the user will open.
 
-But Word is **not** authoritative about what the "correct" diff is. Word's
-`CompareDocuments` is just another diff algorithm with its own quirks. A case
-where stemma produces a finer-grained, more readable redline than Word is a
-feature, not a bug.
+But Word is **not** authoritative about Stemma's review presentation. Its
+comparison output is useful differential evidence: when another producer
+handles a document Stemma refuses or mishandles, reduce the case and determine
+whether Stemma is missing a valid carrier. Its revision envelopes and paragraph
+pivots are not golden output.
 
 ### Word comparison is asymmetric about accept vs reject
 
@@ -69,11 +74,12 @@ numbering/list markers, bold/italic on headings, font size, strikethrough leakin
 Cosmetic (tracked, not gated): indent/spacing drift, alignment, hyperlink
 styling, body font/color. **Invariant: #18.**
 
-### Tier 3: Redline presentation quality (quality metric)
+### Tier 3: Stemma redline presentation quality
 
 How the markup *looks* before accept/reject — ins/del granularity, move
-detection, format-only change surfacing. A difference here may mean we're
-*better*, not wrong. Track, don't gate. **Invariants: #8, #15.**
+detection, format-only change surfacing. The downstream comparer tests Stemma's
+one opinionated presentation. Other comparers are sources of candidate cases,
+not a visual target. **Invariant: #8.**
 
 ## Non-negotiable: redline output opens clean in Word
 
@@ -173,9 +179,10 @@ shared text beyond token boundaries and bail-out heuristics.
 
 ### 9. Redline quality comparison [retired]
 
-LibreOffice-compare quality benchmark, retired (not the product target; the
-Word-oracle gives a stronger, product-relevant external oracle). Replaced by #15
-(Word redline comparison), #14 (Word accept/reject), #18 (Word formatting).
+LibreOffice-compare quality benchmark, retired because another producer's
+presentation is not the product target. Native Word consumption remains a
+correctness oracle through #14 (Word accept/reject) and #18 (resolved
+formatting); #15 now describes differential case discovery only.
 
 ### 10. Diff identity: `diff(A, A) == empty` and `redline(A, A)` has no markup
 
@@ -243,10 +250,14 @@ disagrees with us about the accepted/rejected text, it's a real bug. *Held-out t
 `word_clean(A) ^ word_clean(B) -> word_clean(redline(A, B))`. Ship-stopper. Only
 pairs where both inputs are Word-clean are tested. *Held-out tier.*
 
-### 15. Word redline comparison [Tier 3 — quality metric — Word-oracle harness]
+### 15. External comparer differential analysis [research aid, not a product gate]
 
-Our redline vs Word's `CompareDocuments`, as a quality metric (not a gate;
-different algorithms produce different boundaries). *Held-out tier.*
+External comparison outputs can expose useful cases: a document Stemma refuses
+that another producer represents may reveal a missing valid Word carrier, and a
+Stemma output that Word resolves differently is a correctness defect. Minimize
+and classify those cases against Stemma's own terminal and package invariants.
+Do not score or gate Stemma on reproducing another comparer's revision
+envelopes, paragraph pivots, or visual presentation.
 
 ### 16. Corpus feature fingerprinting
 
@@ -360,14 +371,15 @@ two-doc/single-doc analysis live in the consuming app's server, not the engine.
 | **Non-negotiable** | Hard gate (Word) | #13, #13b, #14b, #21 | Output opens clean in Word |
 | **Tier 1: Text** | Hard gate | #6, #14 | Accept/reject produces correct text |
 | **Tier 2: Formatting** | Hard gate | #18 (structural), #20d (Tier 2) | Accept produces correct structural formatting |
-| **Tier 3: Presentation** | Quality metric | #8, #15, #18 (cosmetic) | Redline looks good |
+| **Tier 3: Presentation** | Stemma product tests | #8, #18 (cosmetic) | Redline follows Stemma's review rules |
 | **Pipeline** | Hard gate | #1, #3–#5, #7, #10–#12, #22 | Internal pipeline invariants hold |
 | **Production path** | Mixed | #19a/#19b (hard), #19c (best-effort) | Pre-existing tracked changes resolve |
 | **Edit engine** | Hard gate | #20a/#20b/#20d/#20e (canonical), #20c (Word) | Edit application produces correct tracked changes |
 
 Engine-resident (run with no real-Word oracle): #1, #3–#8, #10–#12, #16, #18 (structural),
 #19a/b, #20 (canonical), #22 (canonical). Held-out Word-oracle tier: #13,
-#13b, #14, #14b, #15, #17, #20c, #21.
+#13b, #14, #14b, #17, #20c, #21. #15 is differential research rather than a
+release or conformance gate.
 
 ---
 

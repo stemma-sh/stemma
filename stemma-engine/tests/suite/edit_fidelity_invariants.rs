@@ -22,6 +22,8 @@ use stemma::edit::*;
 use stemma::tracked_model::ResolveSelectionAction;
 use stemma::view::{BlockRole, SegmentView, TextMark, TrackStatus, build_document_view_from_canon};
 use stemma::{ExportOptions, Resolution, accept_all, reject_all_with_styles};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -437,13 +439,19 @@ fn set_run_formatting_extended_is_faithful() {
     assert_eq!(live.small_caps, MarkValue::On);
     assert_eq!(live.char_spacing, Some(40));
 
-    // Reject-all restores the original StyleProps exactly (shape() cannot see this).
+    // Reject-all restores the original direct rPr. The styles-free fixture's
+    // Times New Roman family is an implicit effective default, not authored run
+    // formatting, so the bare in-memory resolver correctly leaves that slot
+    // absent; serialization/re-import resolves the same default again (covered
+    // by assert_fidelity above).
     let mut rejected = tracked.clone();
     reject_all_with_styles(&mut rejected, None);
+    let mut expected_rejected_props = base_props;
+    expected_rejected_props.font_family = None;
     assert_eq!(
         styled_props(&rejected, "Confidential"),
-        base_props,
-        "reject-all must restore the original run StyleProps (color/highlight/font)"
+        expected_rejected_props,
+        "reject-all must restore the original direct run StyleProps"
     );
 
     // Accept-all equals Direct apply on the full StyleProps.
@@ -728,7 +736,12 @@ fn apply_style_is_faithful() {
             "tracked mode records a pPrChange"
         );
         assert_eq!(
-            p.formatting_change.as_ref().unwrap().previous_style_id,
+            p.formatting_change
+                .as_ref()
+                .unwrap()
+                .previous
+                .direct
+                .style_id,
             base_style,
             "pPrChange records the prior style"
         );
@@ -1093,8 +1106,7 @@ fn assert_numbering_fidelity(
 #[test]
 fn set_paragraph_numbering_attach_list_is_faithful() {
     // Plain paragraph → attach decimal list (numId=1, ilvl=0). Reject restores
-    // None; this exercises previous_numbering_explicitly_absent + the reject
-    // restore path.
+    // a physically absent previous numPr through the direct-state model.
     let (base, ids) = numbered_doc_and_ids(&[("First item", None), ("Second", None)]);
     assert_numbering_fidelity(
         "numbering_attach",
@@ -3230,9 +3242,9 @@ fn omath_para_fragment() -> Vec<u8> {
     .into_bytes()
 }
 
-/// InsertEquation is a tracked insert of an OMML opaque: it must satisfy the
-/// three fidelity invariants (reject==baseline, accept==direct, non-shrinking
-/// opaque inventory) for both inline and block placements.
+/// Inline `InsertEquation` is a tracked insert of an OMML opaque and must
+/// satisfy the three fidelity invariants. Block math has no qualified tracked
+/// carrier in native Word; direct insertion is covered by `equations_insert`.
 #[test]
 fn insert_equation_inline_is_faithful() {
     let (base, ids) = doc_and_ids(&["The value of x matters here"]);
@@ -3253,17 +3265,24 @@ fn insert_equation_inline_is_faithful() {
 #[test]
 fn insert_equation_block_is_faithful() {
     let (base, ids) = doc_and_ids(&["Display the equation below please"]);
-    assert_fidelity(
-        "insert_equation_block",
+    let err = apply_transaction(
         &base,
-        vec![EditStep::InsertEquation {
-            block_id: NodeId::from(ids[0].as_str()),
-            expect: "below".to_string(),
-            semantic_hash: None,
-            omml: omath_para_fragment(),
-            placement: EquationPlacement::Block,
-            rationale: None,
-        }],
+        &txn(
+            vec![EditStep::InsertEquation {
+                block_id: NodeId::from(ids[0].as_str()),
+                expect: "below".to_string(),
+                semantic_hash: None,
+                omml: omath_para_fragment(),
+                placement: EquationPlacement::Block,
+                rationale: None,
+            }],
+            MaterializationMode::TrackedChange,
+        ),
+    )
+    .expect_err("tracked display math must refuse");
+    assert!(
+        matches!(err, EditError::TrackedBlockEquationUnsupported { .. }),
+        "unexpected refusal: {err:?}"
     );
 }
 
@@ -3399,6 +3418,7 @@ fn table_fidelity_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         w_after: None,
         cnf_style: None,
         tbl_pr_ex: None,
+        tbl_pr_ex_change: None,
         cell_spacing: None,
         preserved: Vec::new(),
     }
@@ -3764,20 +3784,28 @@ fn create_header_is_faithful() {
         "the new header story starts blank"
     );
 
-    // (b1) Reversibility on the IR: reject-all restores the original — the new
-    //      Even story+ref are gone (the orphan blank story is pruned), and every
-    //      pre-existing (synthesized) reference + story is intact.
+    // (b1) Word cannot revision-switch the part binding. Reject retains the
+    //      blank physical Even story/ref while every pre-existing synthesized
+    //      reference and story remains intact.
     let mut rejected = tracked.clone();
     reject_all_with_styles(&mut rejected, None);
-    assert_eq!(
-        header_part_names(&rejected),
-        header_part_names(&base),
-        "reject-all must drop the net-new header story and keep the original ones"
+    let rejected_names = header_part_names(&rejected);
+    assert!(
+        header_part_names(&base)
+            .iter()
+            .all(|part| rejected_names.contains(part)),
+        "reject-all keeps every original header story"
     );
     assert_eq!(
-        body_header_refs(&rejected),
-        body_header_refs(&base),
-        "reject-all must restore the original section references exactly"
+        rejected_names.len(),
+        header_part_names(&base).len() + 1,
+        "reject-all retains one inert physical header story"
+    );
+    assert!(
+        body_header_refs(&rejected)
+            .iter()
+            .any(|(kind, part)| *kind == HeaderFooterKind::Even && part == new_part),
+        "reject-all retains the physical Even header binding"
     );
     assert!(
         rejected.body_section_property_change.is_none(),
@@ -3853,18 +3881,26 @@ fn create_footer_is_faithful() {
         "an Even footer reference was added"
     );
 
-    // Reject restores base exactly.
+    // Reject retains the unrevisionable physical binding, but no active story
+    // content was introduced by this blank creation.
     let mut rejected = tracked.clone();
     reject_all_with_styles(&mut rejected, None);
     assert_eq!(
         rejected.footers.len(),
-        base.footers.len(),
-        "reject-all drops the net-new footer story"
+        base.footers.len() + 1,
+        "reject-all retains one inert physical footer story"
     );
-    assert_eq!(
-        base_footer_refs(&rejected),
-        base_refs,
-        "reject-all restores the original footer references exactly"
+    assert!(
+        base_refs
+            .iter()
+            .all(|reference| base_footer_refs(&rejected).contains(reference)),
+        "reject-all keeps every original footer reference"
+    );
+    assert!(
+        base_footer_refs(&rejected)
+            .iter()
+            .any(|(kind, _)| *kind == HeaderFooterKind::Even),
+        "reject-all retains the physical Even footer binding"
     );
 
     // Accept equals direct.

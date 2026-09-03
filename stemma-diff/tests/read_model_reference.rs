@@ -32,13 +32,14 @@ use stemma::api::{
     WindowFormat,
 };
 use stemma::domain::{
-    Alignment, BlockType, ChangeType, ImageMetadataChange, InlineChange, InlineChangeSegmentType,
-    LineSpacingRule, Mark, MarkValue, MoveDirection, OpaqueSegmentKind, StructuralChange,
-    TrackingStatus,
+    Alignment, InlineChange, InlineChangeSegmentType, LineSpacingRule, Mark, MarkValue,
+    OpaqueSegmentKind, TrackingStatus,
 };
 use stemma::edit_v4::parse_transaction;
-use stemma::runtime::build_tracked_document_view_from_snapshot;
 use stemma::tracked_model::{RevisionKind, RevisionRecord};
+use stemma_diff::{
+    BlockType, ChangeType, FullDocViewResult, ImageMetadataChange, MoveDirection, StructuralChange,
+};
 
 fn doc_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/reference/read-model.md")
@@ -256,6 +257,10 @@ const SEGMENT_TEXT_FIELDS: &[(&str, &str)] = &[
     (
         "marks",
         r#"Meaningful inline marks: "Bold", "Italic", "Underline", "Strike", "Subscript", "Superscript". Value-carrying formatting (fonts, sizes, colors) lives in the full render view, not here."#,
+    ),
+    (
+        "format_revision",
+        "Pending run-format revision on this exact span: `revision_id`, `author`, `date`, and `apply_op_id`; omitted when none. `revision_id` joins the revision census. This identifies the change; the previous formatting payload lives only in the full render view.",
     ),
     (
         "handle",
@@ -660,6 +665,10 @@ const STYLE_PROPS_FIELDS: &[(&str, &str)] = &[
 ];
 
 const FORMATTING_CHANGE_FIELDS: &[(&str, &str)] = &[
+    (
+        "carrier",
+        "The native Word carrier that owns the effective delta: `RunProperties` for an independently selectable `w:rPrChange`, or `ParagraphStyleCascade` when the enclosing paragraph's `w:pPrChange` owns it. The latter is not a second selectable run revision.",
+    ),
     ("previous_marks", "The boolean marks before the change."),
     (
         "previous_style_props",
@@ -900,6 +909,7 @@ fn enum_vocabularies_are_pinned() {
         RevisionKind::Insert
         | RevisionKind::Delete
         | RevisionKind::FormatRun
+        | RevisionKind::FormatParagraphMark
         | RevisionKind::FormatParagraph
         | RevisionKind::FormatTable
         | RevisionKind::FormatRow
@@ -1004,8 +1014,8 @@ fn facade_read_surface_signatures_hold() {
     let _: fn(&Document, &stemma::ExportOptions) -> Result<Vec<u8>, stemma::RuntimeError> =
         Document::serialize;
     let _: fn(&Document) -> &stemma::EditSnapshot = Document::snapshot;
-    let _: fn(&stemma::EditSnapshot) -> stemma::domain::FullDocViewResult =
-        build_tracked_document_view_from_snapshot;
+    let _: fn(&Document) -> Result<FullDocViewResult, stemma::RuntimeError> =
+        stemma_diff::tracked_document_view;
 }
 
 // ─── The page ───────────────────────────────────────────────────────────────
@@ -1041,6 +1051,9 @@ fn render() -> String {
     let tracked_block = find_block(&lean, "capped at");
     let lean_example = serde_json::to_value(tracked_block).expect("BlockView serializes");
     assert_fields("BlockView", &lean_example, BLOCK_VIEW_FIELDS, &[]);
+    let formatting_block = find_block(&lean, "Contact");
+    let formatting_example =
+        serde_json::to_value(formatting_block).expect("formatting BlockView serializes");
 
     let mut text_keys: Option<Value> = None;
     let mut opaque_keys: Option<Value> = None;
@@ -1049,9 +1062,21 @@ fn render() -> String {
         for seg in &block.segments {
             let v = serde_json::to_value(seg).expect("SegmentView serializes");
             match seg {
-                SegmentView::Text { status, .. } => {
-                    if text_keys.is_none() {
+                SegmentView::Text {
+                    status,
+                    format_revision,
+                    ..
+                } => {
+                    if let Some(format_revision) = format_revision {
                         text_keys = Some(v["Text"].clone());
+                        assert!(
+                            revisions.iter().any(|record| {
+                                record.revision_id == format_revision.revision_id
+                                    && record.kind == RevisionKind::FormatRun
+                            }),
+                            "lean format_revision id {} must join the canonical format_run census",
+                            format_revision.revision_id
+                        );
                     }
                     if revision_view.is_none()
                         && let TrackStatus::Inserted(rv) = status
@@ -1068,7 +1093,7 @@ fn render() -> String {
             }
         }
     }
-    let text_seg = text_keys.expect("exemplar has text segments");
+    let text_seg = text_keys.expect("exemplar has a text segment with a format revision");
     assert_fields("SegmentView::Text", &text_seg, SEGMENT_TEXT_FIELDS, &[]);
     assert_fields(
         "SegmentView::Opaque",
@@ -1121,7 +1146,7 @@ fn render() -> String {
     assert_fields("TableMetaView", &table_meta, TABLE_META_FIELDS, &[]);
 
     // ── Full render view examples ──
-    let full = build_tracked_document_view_from_snapshot(doc.snapshot());
+    let full = stemma_diff::tracked_document_view(&doc).expect("build tracked document view");
     let rich_block = full
         .blocks
         .iter()
@@ -1258,6 +1283,7 @@ fn render() -> String {
 
     // ── Assemble the page ──
     let lean_pretty = pretty(&lean_example);
+    let formatting_pretty = pretty(&formatting_example);
     let cell_pretty = pretty(&cell_example);
     let rich_pretty = pretty(&rich_example);
     let section_pretty = pretty(&section);
@@ -1269,7 +1295,7 @@ fn render() -> String {
 # Read model reference
 
 <!-- GENERATED FILE. Do not edit by hand: this page is rendered from live
-     engine values by stemma-engine/tests/read_model_reference.rs, and that
+     engine values by stemma-diff/tests/read_model_reference.rs, and that
      test fails the gate when the page drifts (field tables are asserted
      against the engine's own serialization; every example is real engine
      output for a small exemplar document). Regenerate with:
@@ -1332,17 +1358,19 @@ that renders this page):
 | `serialize(&ExportOptions)` | Validated DOCX bytes back out. |
 | `snapshot()` | The documented Tier 3 escape hatch; the full render view is built from it. |
 
-The write surface (`apply`, `apply_authored`, `diff`, `diff_as`, `project`)
-is documented in the [v4 operation reference](operations.md) and the
-[stability policy](../guide/stability.md#rust-api).
+The engine write surface (`apply`, `apply_authored`, `project`) is documented
+in the [v4 operation reference](operations.md) and the
+[stability policy](../guide/stability.md#rust-api). Document comparison is a
+downstream operation exposed by `stemma-diff`.
 
 ## Where each surface serves the read model
 
 | Surface | Lean view | Full render view |
 |---|---|---|
-| Rust | `Document::read()` | `stemma::runtime::build_tracked_document_view_from_snapshot(doc.snapshot())`, or `SimpleRuntime::single_document_view` / `full_document_view` |
+| Rust | `Document::read()` | `stemma_diff::tracked_document_view(&doc)` |
 | HTTP | `GET /api/documents/{{id}}` serves a reduced hand-projection of it | `GET /api/documents/{{id}}/rich` serializes it whole, stamping each block with the lean `guard` and attaching the lean table `cells` and `table` metadata by block id |
 | MCP | `inspect_docx` with `detail:\"formatting\"` serves a projection of it (block detail plus spans) | not exposed; cell interiors reach MCP through the lean view's `paragraphs`, which reuse the full view's segment shape |
+| CLI | `stemma read` serializes `DocumentView` whole and adds the complete revision census | not exposed; embed the engine or run the source-only HTTP demo |
 
 Three honest caveats a builder should know:
 
@@ -1353,13 +1381,22 @@ Three honest caveats a builder should know:
 * The full view result also carries `footnotes` and `endnotes` stories, but
   the HTTP `/rich` envelope does not currently include them; over HTTP, note
   TEXT is reachable only by resolving the inline reference anchors.
-* The shipped CLI does not emit either view. `stemma extract --format json`
-  is a flat projection (one `text` string per block, no `segments`), and
-  `stemma inspect --format json` wraps the extended-Markdown projection as a
-  single string with integer counts. Consuming the types on this page means
-  embedding the engine ([embedding](embedding.md)); the HTTP transport that
-  serves them runs from a source checkout only (`cargo run -p stemma-api`,
-  `stemma-api` is not on crates.io).
+* The CLI's `stemma read` emits the complete lean view plus revision census as
+  `stemma.read.v0`. It does not emit the full render view. The `extract` and
+  `inspect` commands remain flatter projections, including in JSON format.
+  For the full view, embed the engine ([embedding](embedding.md)) or run the
+  source-only HTTP demo (`cargo run -p stemma-api`; `stemma-api` is not on
+  crates.io).
+
+## Choosing a surface
+
+| Need | CLI | Embedded engine | HTTP demo |
+|---|---|---|---|
+| Revision census and lean redline rendering | `stemma read` | `Document::read()` plus `Document::revisions()` | `GET /api/documents/{{id}}` plus `GET /api/documents/{{id}}/revisions` |
+| Resolve all, by author, by id, or with mixed outcomes | all, author, id, and one-call mixed plan | all and selective resolution; compose mixed outcomes in memory | selective ids; compose author groups client-side |
+| Complete value formatting and assets | not exposed | full render view | `GET /api/documents/{{id}}/rich` |
+| Headers, footers, comments, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, comments, and page geometry but omits footnote and endnote stories |
+| Stable installed local process boundary | yes | library API, not a process boundary | no; source-only demonstration transport |
 
 ## Units
 
@@ -1418,6 +1455,17 @@ carries a bold mark):
 
 ```json
 {lean_pretty}
+```
+
+### A real lean formatting block
+
+The pending run-format change sits on the exact lean text span it changes.
+Its `format_revision.revision_id` is the same identity the revision census and
+selective resolution use; the lean view deliberately omits the previous
+formatting payload.
+
+```json
+{formatting_pretty}
 ```
 
 ### Tables in the lean view
@@ -1627,6 +1675,7 @@ omit records with `revision_id` 0, which are reported but never selectable).
             .collect::<Vec<_>>()
             .join(", "),
         lean_pretty = lean_pretty,
+        formatting_pretty = formatting_pretty,
         cell_pretty = cell_pretty,
         rich_pretty = rich_pretty,
         section_pretty = section_pretty,

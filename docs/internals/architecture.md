@@ -1,13 +1,17 @@
 # Architecture
 
-A codemap for contributors. One pipeline, five workspace crates:
+A codemap for contributors. One engine pipeline, with comparison downstream:
 
 ```
-DOCX bytes -> import -> CanonDoc -> edit / diff -> apply -> serialize -> DOCX bytes
-             (stemma-engine)                                  ^ linter gates output
+DOCX bytes -> import -> CanonDoc -> explicit edit -> serialize -> DOCX bytes
+             (stemma-engine)                         ^ linker gates output
+
+accepted base + accepted target -> stemma-diff -> engine operations -> redline
 ```
 
 - **`stemma-engine`** owns the typed document model and transformation pipeline.
+- **`stemma-diff`** owns comparison inference and Stemma's one review
+  presentation, then lowers through the engine.
 - **`stemma-artifacts`** owns shared file identity and create-new persistence.
 - **`stemma-cli`** exposes local command-line workflows.
 - **`stemma-mcp`** exposes the engine to agents over stdio.
@@ -47,6 +51,12 @@ Inside the engine, the load-bearing ideas:
   from the IR, then a post-serialization OOXML linker (content types,
   ordering, annotation pairing, cross-refs) gates the bytes. Byte identity
   is explicitly not a goal. See the [fidelity contract](../guide/fidelity.md).
+- **Comparison subsystem** (`stemma-diff` crate): consumes two accepted
+  readings and chooses Stemma's review presentation. It depends on the engine's
+  native edit, package, serialization, and verification operations; the engine
+  has no dependency back to comparison. Product callers use the single
+  opinionated `stemma_diff::diff` surface. See the
+  [comparison boundary](comparison-boundary.md).
 
 Deeper dives live next to the code: `stemma-engine/docs/` (invariants
 catalog, testing strategy) and per-module `AGENTS.md` files.

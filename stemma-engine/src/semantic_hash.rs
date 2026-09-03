@@ -77,10 +77,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::domain::{
-    BlockNode, FullDocBlock, InlineChange, InlineChangeSegmentType, InlineNode, OpaqueKind,
-    OpaqueSegmentKind, ParagraphNode, TableNode, TrackingStatus,
-};
+use crate::domain::{BlockNode, InlineNode, OpaqueKind, ParagraphNode, TableNode, TrackingStatus};
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -125,26 +122,6 @@ fn hash_atoms(atoms: Vec<HashAtom>) -> String {
     out
 }
 
-fn opaque_kind_name(kind: &OpaqueSegmentKind) -> String {
-    match kind {
-        OpaqueSegmentKind::Drawing => "drawing".to_string(),
-        OpaqueSegmentKind::Omml => "omml".to_string(),
-        OpaqueSegmentKind::Hyperlink => "hyperlink".to_string(),
-        OpaqueSegmentKind::Field => "field".to_string(),
-        OpaqueSegmentKind::Sdt => "sdt".to_string(),
-        OpaqueSegmentKind::Ruby => "ruby".to_string(),
-        OpaqueSegmentKind::SmartArt => "smart_art".to_string(),
-        OpaqueSegmentKind::CommentReference => "comment_reference".to_string(),
-        OpaqueSegmentKind::FootnoteReference => "footnote_reference".to_string(),
-        OpaqueSegmentKind::EndnoteReference => "endnote_reference".to_string(),
-        OpaqueSegmentKind::SmartTag => "smart_tag".to_string(),
-        OpaqueSegmentKind::Sym => "sym".to_string(),
-        OpaqueSegmentKind::Ptab => "ptab".to_string(),
-        OpaqueSegmentKind::CustomXml => "custom_xml".to_string(),
-        OpaqueSegmentKind::Unknown(name) => format!("unknown:{name}"),
-    }
-}
-
 fn inline_opaque_kind_name(kind: &OpaqueKind) -> String {
     match kind {
         OpaqueKind::Drawing => "drawing".to_string(),
@@ -165,32 +142,6 @@ fn inline_opaque_kind_name(kind: &OpaqueKind) -> String {
         // Never appears inline (body-level quarantine only); defensive label.
         OpaqueKind::QuarantinedNestedTracking => "quarantined_nested_tracked_changes".to_string(),
     }
-}
-
-pub fn block_semantic_hash_for_full_doc_block(block: &FullDocBlock) -> String {
-    let mut atoms = Vec::new();
-    for segment in &block.segments {
-        match segment {
-            InlineChange::Deleted { .. } => {}
-            InlineChange::Unchanged { text, .. } | InlineChange::Inserted { text, .. } => {
-                atoms.push(HashAtom::Text { text: text.clone() });
-            }
-            InlineChange::Opaque {
-                segment_type,
-                kind,
-                opaque_id,
-                ..
-            } => {
-                if *segment_type != InlineChangeSegmentType::Delete {
-                    atoms.push(HashAtom::Opaque {
-                        opaque_id: opaque_id.clone(),
-                        opaque_kind: opaque_kind_name(kind),
-                    });
-                }
-            }
-        }
-    }
-    hash_atoms(atoms)
 }
 
 /// Scheme prefix of the v2 guard formula. v1 guards are bare hex.

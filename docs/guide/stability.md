@@ -19,13 +19,25 @@ documented in full at the top of
 
 - **Tier 1: the `api::Document` facade.** The intended public surface and the
   one new consumers should depend on. Stable within a `0.x` minor release line.
-- **Tier 2 covers the typed IR and domain model** (`domain`, `diff`, `table`,
-  `tracked_model`, …). Public but **engine-version-bound**: do not persist the
-  IR. Its shape can change with any engine release.
+- **Tier 2 covers the typed IR and domain model** (`domain`, `table`,
+  `tracked_model`, `vocabulary`, …). Public but **engine-version-bound**: do
+  not persist the IR. Its shape can change with any engine release.
 - **Tier 3 covers the unstable engine API** (`edit`, `edit_v4`, `view`, `import`,
   the part-level modules, …). A deliberate, explicitly-unstable surface that the
   in-workspace transports drive directly. May change between minor versions.
 - Everything else is sealed (`pub(crate)`).
+
+Document comparison is not an engine tier. The separate `stemma-diff` crate
+depends on the engine's version-bound compiler surface and exposes one small
+product facade: `diff`, `diff_as`, their metadata-bearing `diff_detailed` and
+`diff_as_detailed` forms, `ComparisonResult`, `FlattenedInputRevisions`, and
+the comparison read model. The comparison entry points and the two result
+types are stable within the matching `0.x` minor release line. The rich types
+returned by `tracked_document_view` remain engine-version-bound as documented
+in the [read model reference](../reference/read-model.md): do not persist them,
+and re-read after every engine upgrade. Use matching `stemma` and
+`stemma-diff` minor versions. The engine itself remains usable without
+comparison and has no production dependency back to it.
 
 Persist **DOCX bytes plus edit transactions** for durability. Never persist the
 IR or an `EditSnapshot`. Together the bytes and transactions reconstruct any
@@ -96,7 +108,9 @@ offline verifier trusts.
 [`stemma-api`](../reference/http.md) is demo infrastructure for the browser
 editor, not a product surface. Its routes and JSON shapes **carry no stability
 guarantee** and may change or disappear in any release without a changelog entry.
-It is also loopback-only with no authentication. See
+It binds to loopback by default; `--host` binds all interfaces. It has no
+authentication, TLS, authorization, or rate limiting and must not be exposed
+to an untrusted network. See
 [SECURITY.md](https://github.com/stemma-sh/stemma/blob/main/SECURITY.md). If you need a stable programmatic surface,
 embed the Rust `api::Document` facade or drive the MCP tools.
 
@@ -107,6 +121,7 @@ embed the Rust `api::Document` facade or drive the MCP tools.
 | Rust Tier 1 (`api::Document`) | stable | may break, with changelog |
 | Rust Tier 2 (typed IR) | engine-version-bound; do not persist | may change |
 | Rust Tier 3 (engine API) | unstable | may change |
+| `stemma-diff` facade | stable within the matching minor line | may break, with changelog |
 | v4 transaction JSON | additive; unknown fields rejected | breaking meaning-changes get a changelog entry |
 | MCP tool schema | additive (optional params) | renames/removals get a changelog entry |
 | Task manifest JSON | exact versioned schema; unknown fields rejected | incompatible shapes get a new schema identifier |

@@ -27,7 +27,7 @@ use stemma::api::Document;
 /// Header/footer relationship declarations for the duplicate-type specs. The
 /// fixtures reference rId10..rId12; declaring them (Id, Type, Target) makes the
 /// references resolve so the only non-conformance under test is the
-/// duplicate-type rule, not an I-REL-001 dangling reference. (Extra declared
+/// duplicate-type rule, not an I-REL-003 missing-target error. (Extra declared
 /// relationships are conformant, so the same triple serves the 2-ref and 3-ref
 /// cases.)
 const HEADER_REFS: [(&str, &str, &str); 3] = [
@@ -64,6 +64,34 @@ const FOOTER_REFS: [(&str, &str, &str); 3] = [
         "footer3.xml",
     ),
 ];
+const HEADER_PARTS: [(&str, &str); 3] = [
+    (
+        "word/header1.xml",
+        r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:hdr>"#,
+    ),
+    (
+        "word/header2.xml",
+        r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:hdr>"#,
+    ),
+    (
+        "word/header3.xml",
+        r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:hdr>"#,
+    ),
+];
+const FOOTER_PARTS: [(&str, &str); 3] = [
+    (
+        "word/footer1.xml",
+        r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:ftr>"#,
+    ),
+    (
+        "word/footer2.xml",
+        r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:ftr>"#,
+    ),
+    (
+        "word/footer3.xml",
+        r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p/></w:ftr>"#,
+    ),
+];
 
 /// Build a valid minimal `.docx`. `body_xml` is the inner content of
 /// `<w:body>` (paragraphs + an optional trailing sectPr). `extra_parts` are
@@ -80,7 +108,7 @@ fn make_docx(body_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
 /// relationships in `word/_rels/document.xml.rels`. Header/footer-reference
 /// specs need their `r:id` values to resolve to a declared relationship so the
 /// only non-conformance under test is the rule being probed (e.g. duplicate
-/// header/footer type) and not an I-REL-001 dangling-reference error.
+/// header/footer type) and not a relationship or package-closure error.
 fn make_docx_with_rels(
     body_xml: &str,
     extra_parts: &[(&str, &str)],
@@ -102,6 +130,10 @@ fn make_docx_with_rels(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"
         } else if path.ends_with("settings.xml") {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"
+        } else if path.contains("/header") && path.ends_with(".xml") {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
+        } else if path.contains("/footer") && path.ends_with(".xml") {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
         } else {
             "application/xml"
         };
@@ -254,7 +286,7 @@ fn titlepg_false_explicit_zero_distinct_from_omitted_opens_clean() {
 #[test]
 fn duplicate_first_header_ref_in_section_nonconformant() {
     let body = r#"<w:p/><w:sectPr><w:headerReference r:id="rId10" w:type="first"/><w:headerReference r:id="rId11" w:type="first"/></w:sectPr>"#;
-    let b = make_docx_with_rels(body, &[], &HEADER_REFS);
+    let b = make_docx_with_rels(body, &HEADER_PARTS, &HEADER_REFS);
     // §17.10.5: a section with more than one header of a given type ('first'
     // twice here) "shall be considered non-conformant"; Word repairs such files.
     // A Word-faithful validate() must report an error, so opens-clean must FAIL.
@@ -271,7 +303,7 @@ fn duplicate_first_header_ref_in_section_nonconformant() {
 #[test]
 fn duplicate_first_footer_ref_in_section_nonconformant() {
     let body = r#"<w:p/><w:sectPr><w:footerReference r:id="rId10" w:type="first"/><w:footerReference r:id="rId11" w:type="first"/><w:footerReference r:id="rId12" w:type="even"/></w:sectPr>"#;
-    let b = make_docx_with_rels(body, &[], &FOOTER_REFS);
+    let b = make_docx_with_rels(body, &FOOTER_PARTS, &FOOTER_REFS);
     assert_opens_clean(
         &b,
         "ISO 29500-1 §17.10.2 worked example: two footerReference of w:type=\"first\" \
@@ -285,7 +317,7 @@ fn duplicate_first_footer_ref_in_section_nonconformant() {
 #[test]
 fn duplicate_even_header_ref_in_section_nonconformant() {
     let body = r#"<w:p/><w:sectPr><w:headerReference r:id="rId10" w:type="even"/><w:headerReference r:id="rId11" w:type="even"/></w:sectPr>"#;
-    let b = make_docx_with_rels(body, &[], &HEADER_REFS);
+    let b = make_docx_with_rels(body, &HEADER_PARTS, &HEADER_REFS);
     assert_opens_clean(
         &b,
         "ISO 29500-1 §17.10.5: a section is capped at one header of each ST_HdrFtr \
@@ -298,7 +330,7 @@ fn duplicate_even_header_ref_in_section_nonconformant() {
 #[test]
 fn duplicate_default_footer_ref_in_section_nonconformant() {
     let body = r#"<w:p/><w:sectPr><w:footerReference r:id="rId10" w:type="default"/><w:footerReference r:id="rId11" w:type="default"/></w:sectPr>"#;
-    let b = make_docx_with_rels(body, &[], &FOOTER_REFS);
+    let b = make_docx_with_rels(body, &FOOTER_PARTS, &FOOTER_REFS);
     assert_opens_clean(
         &b,
         "ISO 29500-1 §17.10.2: a section is limited to one footer of each type; two \

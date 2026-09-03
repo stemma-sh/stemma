@@ -4,6 +4,8 @@
 //! save. They now round-trip verbatim via `Border.extra_attrs` / `Shading.extra_attrs`.
 
 use std::io::{Cursor, Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::ExportOptions;
 use stemma::api::{Document, validate};

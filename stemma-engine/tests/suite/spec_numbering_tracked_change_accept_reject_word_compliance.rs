@@ -155,6 +155,19 @@ fn assert_opens_clean(bytes: &[u8], msg: &str) {
     );
 }
 
+fn assert_numpr_tracking_refused(bytes: &[u8], child: &str) {
+    let error = match Document::parse(bytes) {
+        Ok(_) => panic!("the current model cannot project tracked state nested inside numPr"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .message
+            .contains(&format!("w:numPr contains unsupported child w:{child}")),
+        "the capability refusal must identify the unmodeled tracked numbering state: {error:?}"
+    );
+}
+
 fn accept_text(bytes: &[u8]) -> String {
     Document::parse(bytes)
         .expect("parse")
@@ -175,33 +188,26 @@ fn reject_text(bytes: &[u8]) -> String {
         .to_string()
 }
 
+const NUMBERING_ONE_AND_TWO: &str = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#;
+
 // ─── Specs ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn numpr_ins_follows_numberingchange_annexa_order() {
+fn ordered_numpr_tracking_is_an_explicit_capability_refusal() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="5" w:author="A" w:date="2005-01-01T10:00:00Z" w:original=""/><w:ins w:id="6" w:author="A" w:date="2005-01-01T10:00:00Z"/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-
-    // xmlRegex `<w:numberingChange[^>]*/>\s*<w:ins[^>]*/>` -> numberingChange
-    // must precede ins (Annex A CT_NumPr sequence ilvl,numId,numberingChange,ins).
-    let xml = collapse_intertag_ws(&reserialize(&b));
-    let nc = xml.find("<w:numberingChange");
-    let ins = xml.find("<w:ins");
-    assert!(
-        nc.is_some() && ins.is_some() && nc < ins,
-        "Annex A CT_NumPr sequence is ilvl,numId,numberingChange,ins; the serializer must emit ins AFTER numberingChange (ECMA-376 §17.13.5.19, Part 4 §14.7.1.2, Annex A CT_NumPr); got numberingChange at {nc:?}, ins at {ins:?}\n{xml}"
-    );
 
     assert_opens_clean(
         &b,
         "A numPr whose children follow the CT_NumPr sequence (ins last) is schema-conformant; Word opens it without repair (Annex A CT_NumPr, §17.13.5.19)",
     );
+    assert_numpr_tracking_refused(&b, "numberingChange");
 }
 
 #[test]
 fn pprchange_must_be_last_child_with_prior_numpr_snapshot() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr><w:pPrChange w:id="9" w:author="A" w:date="2006-01-01T10:00:00Z"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>item</w:t></w:r></w:p><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
+    let b = make_docx(body, &[("word/numbering.xml", NUMBERING_ONE_AND_TWO)]);
 
     // xmlRegex: `<w:pPrChange[^>]*>\s*<w:pPr>\s*<w:numPr>\s*<w:ilvl[^>]*/>\s*<w:numId w:val="1"/>`
     // The prior numId=1 must survive intact INSIDE the pPrChange snapshot.
@@ -224,7 +230,7 @@ fn pprchange_must_be_last_child_with_prior_numpr_snapshot() {
 #[test]
 fn pprchange_numbering_snapshot_carries_no_run_text() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr><w:pPrChange w:id="9" w:author="A" w:date="2006-01-01T10:00:00Z"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>item</w:t></w:r></w:p><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
+    let b = make_docx(body, &[("word/numbering.xml", NUMBERING_ONE_AND_TWO)]);
 
     assert_eq!(
         accept_text(&b),
@@ -239,26 +245,19 @@ fn pprchange_numbering_snapshot_carries_no_run_text() {
 }
 
 #[test]
-fn numpr_ins_serialized_after_numbering_change() {
+fn second_ordered_numpr_tracking_shape_is_an_explicit_capability_refusal() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="5" w:author="A" w:date="2006-01-01T10:00:00Z" w:original="%1:1:0:."/><w:ins w:id="6" w:author="A" w:date="2006-01-01T10:00:00Z"/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-
-    let xml = collapse_intertag_ws(&reserialize(&b));
-    let nc = xml.find("<w:numberingChange");
-    let ins = xml.find("<w:ins");
-    assert!(
-        nc.is_some() && ins.is_some() && nc < ins,
-        "CT_NumPr xsd:sequence orders numberingChange before ins; the serializer must emit them in that order (§17.13.5.19, §14.7.1.2, Annex A CT_NumPr); got numberingChange at {nc:?}, ins at {ins:?}\n{xml}"
-    );
 
     assert_opens_clean(
         &b,
         "A numPr containing ilvl,numId,numberingChange,ins in sequence order is schema-conformant; Word opens it without repair (Annex A CT_NumPr, §14.7.1.2)",
     );
+    assert_numpr_tracking_refused(&b, "numberingChange");
 }
 
 #[test]
-fn numbering_change_multilevel_original_opens_clean() {
+fn numbering_change_multilevel_original_is_an_explicit_capability_refusal() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="3" w:author="A" w:date="2006-01-01T10:00:00Z" w:original="%1:1:0:.%2:1:2:.%3:1:0:."/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
@@ -266,33 +265,20 @@ fn numbering_change_multilevel_original_opens_clean() {
         &b,
         "The multi-level original form is the standard's own example and the form Word parses (MS-OI §2.1.1772, Part 4 §14.7.1.2); Word opens it without repair",
     );
-    assert_eq!(
-        accept_text(&b),
-        "one",
-        "numberingChange is a prior-numbering cache carrying no run text; accept-all leaves body run 'one' unchanged (Part 4 §14.7.1.2)"
-    );
-    assert_eq!(
-        reject_text(&b),
-        "one",
-        "Rejecting the numberingChange history record removes no run text; body text stays 'one' (Part 4 §14.7.1.2)"
-    );
+    assert_numpr_tracking_refused(&b, "numberingChange");
 }
 
 #[test]
-fn ins_numbering_symbol_rpr_does_not_bleed_into_body() {
+fn inserted_numpr_with_symbol_rpr_is_an_explicit_capability_refusal() {
     let numbering = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:ins w:id="0" w:author="A" w:date="2006-01-01T10:00:00Z"/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[("word/numbering.xml", numbering)]);
 
-    assert_eq!(
-        accept_text(&b),
-        "one",
-        "The numbering level rPr formats only the synthesized counter, not body runs (§17.9.24); accepting the inserted numbering yields bare run text 'one' (§17.13.5.19)"
-    );
     assert_opens_clean(
         &b,
         "ins as a child of numPr referencing an existing numId whose level carries a symbol rPr is schema-conformant; Word opens it without repair (§17.9.24, §17.13.5.19)",
     );
+    assert_numpr_tracking_refused(&b, "ins");
 }
 
 #[test]
@@ -307,19 +293,19 @@ fn numbering_change_in_numpr_preserved_for_transitional_despite_strict_drop() {
 }
 
 #[test]
-fn numbering_suppressed_numid0_keeps_tracked_ins_on_reject() {
+fn numbering_suppressed_with_tracked_ins_is_an_explicit_capability_refusal() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/><w:ins w:id="3" w:author="A" w:date="2005-01-01T10:00:00Z"/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
-    assert_eq!(
-        accept_text(&b),
-        "one",
-        "§17.9.18 + §17.13.5.19: numId=0 suppresses the counter and the ins carries no run text, so accept yields the bare run text 'one'"
-    );
-    assert_eq!(
-        reject_text(&b),
-        "one",
-        "Rejecting the inserted numbering properties leaves the typed run text 'one' intact (no body content is tracked) (§17.9.18, §17.13.5.19)"
+    let error = match Document::parse(&b) {
+        Ok(_) => panic!("the current model cannot project tracked state nested inside numPr"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .message
+            .contains("w:numPr contains unsupported child w:ins"),
+        "the capability refusal must identify the unmodeled tracked numbering state: {error:?}"
     );
     assert_opens_clean(
         &b,
@@ -360,7 +346,7 @@ fn numbering_change_on_listnum_fldchar_opens_clean() {
 }
 
 #[test]
-fn numbering_change_double_percent_original_opens_clean() {
+fn numbering_change_double_percent_original_is_an_explicit_capability_refusal() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/><w:numberingChange w:id="4" w:author="A" w:date="2006-01-01T10:00:00Z" w:original="50%%off%1:1:0:."/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
@@ -368,11 +354,7 @@ fn numbering_change_double_percent_original_opens_clean() {
         &b,
         "Word treats '%%' as a single literal '%' in the prefix (MS-OI §2.1.1772); this original value is well-formed and Word opens it without repair (Part 4 §14.7.1.2)",
     );
-    assert_eq!(
-        reject_text(&b),
-        "one",
-        "numberingChange records prior numbering only and carries no run text; rejecting it leaves body text 'one' (MS-OI §2.1.1772, Part 4 §14.7.1.2)"
-    );
+    assert_numpr_tracking_refused(&b, "numberingChange");
 }
 
 #[test]

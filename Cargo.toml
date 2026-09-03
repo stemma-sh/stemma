@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "stemma-engine",
+    "stemma-diff",
+    "stemma-doc-tests",
     "stemma-artifacts",
     "stemma-mcp",
     "stemma-api",

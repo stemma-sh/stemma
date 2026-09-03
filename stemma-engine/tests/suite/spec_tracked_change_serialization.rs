@@ -11,6 +11,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 use xmltree::{Element, XMLNode};
@@ -22,6 +24,13 @@ const FIXTURES: &str = "testdata/spec-compliance/tracked-change-serialization";
 
 /// Run diff_and_redline on a before/after DOCX pair, export as Redline, return raw bytes.
 fn redline_export(before_path: &str, after_path: &str) -> Vec<u8> {
+    redline_export_result(before_path, after_path).expect("diff_and_redline")
+}
+
+fn redline_export_result(
+    before_path: &str,
+    after_path: &str,
+) -> Result<Vec<u8>, stemma::RuntimeError> {
     let before = fs::read(before_path).unwrap_or_else(|e| panic!("read {before_path}: {e}"));
     let after = fs::read(after_path).unwrap_or_else(|e| panic!("read {after_path}: {e}"));
 
@@ -34,14 +43,10 @@ fn redline_export(before_path: &str, after_path: &str) -> Vec<u8> {
         reason: Some("tracked-change-serialization spec test".to_string()),
         timestamp_utc: Some("2025-01-15T10:30:00Z".to_string()),
     };
-    let apply = runtime
-        .diff_and_redline(&ib.doc_handle, &ia.doc_handle, meta)
-        .expect("diff_and_redline");
+    let apply = runtime.diff_and_redline(&ib.doc_handle, &ia.doc_handle, meta)?;
     assert!(apply.applied, "redline should be applied");
 
-    runtime
-        .export_docx(&ib.doc_handle, ExportMode::Redline)
-        .expect("export redline")
+    runtime.export_docx(&ib.doc_handle, ExportMode::Redline)
 }
 
 /// Extract word/document.xml from a DOCX byte buffer.
@@ -55,21 +60,6 @@ fn extract_document_xml(docx_bytes: &[u8]) -> String {
     file.read_to_string(&mut out)
         .expect("read word/document.xml");
     out
-}
-
-/// Try to extract word/comments.xml from a DOCX byte buffer.
-/// Returns None if the part does not exist.
-fn extract_comments_xml(docx_bytes: &[u8]) -> Option<String> {
-    let cursor = Cursor::new(docx_bytes);
-    let mut zip = ZipArchive::new(cursor).expect("open DOCX zip");
-    let mut file = match zip.by_name("word/comments.xml") {
-        Ok(f) => f,
-        Err(_) => return None,
-    };
-    let mut out = String::new();
-    file.read_to_string(&mut out)
-        .expect("read word/comments.xml");
-    Some(out)
 }
 
 fn parse_xml(xml: &str) -> Element {
@@ -379,51 +369,23 @@ fn spec_serialized_no_nested_ins_del() {
 // MS-OI29500 §2.1.313
 // =========================================================================
 
-/// MS-OI29500 §2.1.313: Word does not support revisions inside comments.
-///
-/// When text around a comment is changed, the redline engine must NOT wrap
-/// comment content in w:del/w:ins elements.
+/// Changing text on both sides of an anchored comment currently duplicates the
+/// anchor when the paragraph is represented as an exact replacement. Word
+/// repairs that package. Until comparison owns a native anchor-relocation
+/// carrier, checked materialization must refuse rather than emit a false
+/// success. This supersedes the old characterization test, which inspected
+/// only `comments.xml` and missed the malformed duplicate anchors in the main
+/// story.
 #[test]
-fn spec_serialized_no_revisions_in_comments() {
+fn comparison_refuses_duplicate_comment_anchor_identity() {
     let before_path = format!("{FIXTURES}/no-revisions-in-comments/before.docx");
     let after_path = format!("{FIXTURES}/no-revisions-in-comments/after.docx");
-    let exported = redline_export(&before_path, &after_path);
+    let error = redline_export_result(&before_path, &after_path)
+        .expect_err("duplicate comment-anchor identities must be refused");
 
-    // Parse comments part if it exists
-    let comments_xml = match extract_comments_xml(&exported) {
-        Some(xml) => xml,
-        None => {
-            // If no comments.xml part, the constraint is trivially satisfied
-            return;
-        }
-    };
-
-    let comments_root = parse_xml(&comments_xml);
-
-    // Find all w:comment elements
-    let mut comment_elements = Vec::new();
-    find_all_w_elements(&comments_root, "comment", &mut comment_elements);
-
-    // Inside each comment, there should be no w:ins or w:del
-    for comment in &comment_elements {
-        let comment_id = attr_value(comment, "w:id").unwrap_or("?");
-
-        let mut ins_inside = Vec::new();
-        find_all_w_elements(comment, "ins", &mut ins_inside);
-        assert!(
-            ins_inside.is_empty(),
-            "MS-OI29500 §2.1.313 violation: w:ins found inside w:comment (id={comment_id}). \
-             Word does not support revisions inside comments."
-        );
-
-        let mut del_inside = Vec::new();
-        find_all_w_elements(comment, "del", &mut del_inside);
-        assert!(
-            del_inside.is_empty(),
-            "MS-OI29500 §2.1.313 violation: w:del found inside w:comment (id={comment_id}). \
-             Word does not support revisions inside comments."
-        );
-    }
+    assert_eq!(error.code, stemma::ErrorCode::ValidationFailed);
+    assert!(error.message.contains("I-ANN-010"), "{error}");
+    assert!(error.message.contains("multiple ranges"), "{error}");
 }
 
 // =========================================================================

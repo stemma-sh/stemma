@@ -29,11 +29,35 @@ const ANNOTATION_ID_ELEMENTS: &[&str] = &[
     "pPrChange",
     "rPrChange",
     "tblPrChange",
+    "tblPrExChange",
     "trPrChange",
     "tcPrChange",
     "sectPrChange",
     "cellIns",
     "cellDel",
+];
+
+/// Revision carriers whose `w:id` is required by their WordprocessingML
+/// content type. This is deliberately separate from annotation range markers:
+/// it covers the native changes that Accept/Reject address, including property
+/// and table-structure revisions outside `w:ins` / `w:del`.
+const REQUIRED_TRACKED_CHANGE_ID_ELEMENTS: &[&str] = &[
+    "ins",
+    "del",
+    "moveFrom",
+    "moveTo",
+    "pPrChange",
+    "rPrChange",
+    "tblPrChange",
+    "tblPrExChange",
+    "trPrChange",
+    "tcPrChange",
+    "sectPrChange",
+    "cellIns",
+    "cellDel",
+    "cellMerge",
+    "numberingChange",
+    "tblGridChange",
 ];
 
 /// Direct children allowed in CT_RunTrackChange (w:ins/w:del in paragraph
@@ -199,7 +223,10 @@ fn collect_forbidden_in_subtree(el: &Element, out: &mut Vec<String>) {
         let child_local = local_name(&child_el.name);
 
         // Stop recursion at content boundaries — they have their own scope.
-        if is_w_element(child_el) && TRACKED_CHANGE_CONTENT_BOUNDARIES.contains(&child_local) {
+        let is_textbox_scope = child_local == "txbxContent";
+        let is_wml_boundary =
+            is_w_element(child_el) && TRACKED_CHANGE_CONTENT_BOUNDARIES.contains(&child_local);
+        if is_textbox_scope || is_wml_boundary {
             continue;
         }
 
@@ -234,15 +261,16 @@ fn collect_deleted_text_form_violations(el: &Element, in_opaque: bool, out: &mut
         };
         let child_local = local_name(&child_el.name);
 
-        if is_w_element(child_el)
+        let is_textbox_scope = child_local == "txbxContent";
+        let is_wml_boundary = is_w_element(child_el)
             // Text-form scope boundaries — w:t is legitimately allowed here.
             && (DELETED_TEXT_FORM_BOUNDARIES.contains(&child_local)
                 // Paragraph-level-only elements are forbidden inside a tracked
                 // change outright (reported by the forbidden-descendant check);
                 // their inner text form is moot until they are removed, so we
                 // don't descend and double-report it.
-                || FORBIDDEN_DESCENDANTS_IN_TRACKED_CHANGE.contains(&child_local))
-        {
+                || FORBIDDEN_DESCENDANTS_IN_TRACKED_CHANGE.contains(&child_local));
+        if is_textbox_scope || is_wml_boundary {
             continue;
         }
 
@@ -499,13 +527,18 @@ pub fn check_para_id_range(stories: &[(String, &Element)]) -> Vec<ValidationFind
 // ---------------------------------------------------------------------------
 
 /// Check that every `commentRangeStart` has a matching `commentRangeEnd` with
-/// the same `w:id` within the same story part, and vice versa.
+/// the same `w:id` within the same story part, and vice versa. One comment id
+/// may own at most one start, one end, and one reference in a story. Pairing
+/// findings retain `I-ANN-005`; duplicate use is the narrower blocking
+/// `I-ANN-010`, because Word tolerates lone endpoints but repairs one identity
+/// reused for multiple ranges.
 pub fn check_comment_marker_pairing(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
     let mut findings = Vec::new();
 
     for (part_path, root) in stories {
         let mut starts: HashMap<String, u32> = HashMap::new();
         let mut ends: HashMap<String, u32> = HashMap::new();
+        let mut references: HashMap<String, u32> = HashMap::new();
 
         walk_elements(root, &mut |el, _path| {
             if is_w_tag(el, "commentRangeStart") {
@@ -516,12 +549,27 @@ pub fn check_comment_marker_pairing(stories: &[(String, &Element)]) -> Vec<Valid
                 && let Some(id) = attr_get(el, "w:id")
             {
                 *ends.entry(id.clone()).or_insert(0) += 1;
+            } else if is_w_tag(el, "commentReference")
+                && let Some(id) = attr_get(el, "w:id")
+            {
+                *references.entry(id.clone()).or_insert(0) += 1;
             }
         });
 
         // Every start must have an end
         for (id, count) in &starts {
             let end_count = ends.get(id).copied().unwrap_or(0);
+            if *count > 1 {
+                findings.push(ValidationFinding {
+                    rule_id: "I-ANN-010",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-ANN-010: commentRangeStart w:id='{id}' appears {count} times in \
+                         story part '{part_path}'; one comment id cannot delimit multiple ranges"
+                    ),
+                    location: format!("{part_path} <commentRangeStart w:id=\"{id}\">"),
+                });
+            }
             if end_count == 0 {
                 findings.push(ValidationFinding {
                     rule_id: "I-ANN-005",
@@ -546,7 +594,18 @@ pub fn check_comment_marker_pairing(stories: &[(String, &Element)]) -> Vec<Valid
         }
 
         // Every end must have a start
-        for id in ends.keys() {
+        for (id, count) in &ends {
+            if *count > 1 {
+                findings.push(ValidationFinding {
+                    rule_id: "I-ANN-010",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-ANN-010: commentRangeEnd w:id='{id}' appears {count} times in \
+                         story part '{part_path}'; one comment id cannot delimit multiple ranges"
+                    ),
+                    location: format!("{part_path} <commentRangeEnd w:id=\"{id}\">"),
+                });
+            }
             if !starts.contains_key(id) {
                 findings.push(ValidationFinding {
                     rule_id: "I-ANN-005",
@@ -556,6 +615,20 @@ pub fn check_comment_marker_pairing(stories: &[(String, &Element)]) -> Vec<Valid
                          commentRangeStart in story part '{part_path}'"
                     ),
                     location: format!("{part_path} <commentRangeEnd w:id=\"{id}\">"),
+                });
+            }
+        }
+
+        for (id, count) in &references {
+            if *count > 1 {
+                findings.push(ValidationFinding {
+                    rule_id: "I-ANN-010",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-ANN-010: commentReference w:id='{id}' appears {count} times in \
+                         story part '{part_path}'; one comment id cannot reference multiple ranges"
+                    ),
+                    location: format!("{part_path} <commentReference w:id=\"{id}\">"),
                 });
             }
         }
@@ -757,6 +830,41 @@ pub fn check_document_root(root: &Element) -> Vec<ValidationFinding> {
 // I-TC-001 + I-TC-002: Tracked change content model checks
 // ---------------------------------------------------------------------------
 
+/// Check that every native tracked-change carrier has a non-empty required
+/// `w:id`. Property and table-structure changes are revision carriers too;
+/// limiting this check to `w:ins` / `w:del` lets a non-conformant document pass
+/// validation even though Word cannot address the change correctly.
+pub fn check_required_tracked_change_ids(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            let el_local = local_name(&el.name);
+            if !is_w_element(el) || !REQUIRED_TRACKED_CHANGE_ID_ELEMENTS.contains(&el_local) {
+                return;
+            }
+
+            match attr_get(el, "w:id") {
+                None => findings.push(ValidationFinding {
+                    rule_id: "I-TC-002",
+                    severity: ValidationSeverity::Error,
+                    message: format!("I-TC-002: <{el_local}> is missing required w:id attribute"),
+                    location: format!("{part_path} <{el_local}>"),
+                }),
+                Some(value) if value.is_empty() => findings.push(ValidationFinding {
+                    rule_id: "I-TC-002",
+                    severity: ValidationSeverity::Error,
+                    message: format!("I-TC-002: <{el_local}> has empty w:id attribute"),
+                    location: format!("{part_path} <{el_local}>"),
+                }),
+                Some(_) => {}
+            }
+        });
+    }
+
+    findings
+}
+
 /// Check tracked-change content model invariants in every story:
 ///
 /// - **I-TC-001**: Every direct child element of `w:del`/`w:ins` at the
@@ -776,8 +884,6 @@ pub fn check_document_root(root: &Element) -> Vec<ValidationFinding> {
 ///   a paragraph-level tracked change, unless they are behind a content
 ///   boundary like `w:txbxContent`.
 ///
-/// - **I-TC-002**: every `w:del`/`w:ins` must have a `w:id` attribute with a
-///   non-empty value.
 pub fn check_tracked_change_content_model(
     stories: &[(String, &Element)],
 ) -> Vec<ValidationFinding> {
@@ -789,29 +895,6 @@ pub fn check_tracked_change_content_model(
 
             if !(is_w_tag(el, "del") || is_w_tag(el, "ins")) {
                 return;
-            }
-
-            // I-TC-002: del/ins must have w:id
-            match attr_get(el, "w:id") {
-                None => {
-                    findings.push(ValidationFinding {
-                        rule_id: "I-TC-002",
-                        severity: ValidationSeverity::Error,
-                        message: format!(
-                            "I-TC-002: <{el_local}> is missing required w:id attribute"
-                        ),
-                        location: format!("{part_path} <{el_local}>"),
-                    });
-                }
-                Some(val) if val.is_empty() => {
-                    findings.push(ValidationFinding {
-                        rule_id: "I-TC-002",
-                        severity: ValidationSeverity::Error,
-                        message: format!("I-TC-002: <{el_local}> has empty w:id attribute"),
-                        location: format!("{part_path} <{el_local}>"),
-                    });
-                }
-                Some(_) => {}
             }
 
             // Math runs (m:r) contain tracked changes with a different
@@ -1888,7 +1971,7 @@ mod tests {
         </w:document>"#;
         let root = parse_wml(xml);
         let stories = vec![("word/document.xml".to_string(), &root)];
-        let findings = check_tracked_change_content_model(&stories);
+        let findings = check_required_tracked_change_ids(&stories);
         let tc002: Vec<_> = findings
             .iter()
             .filter(|f| f.rule_id == "I-TC-002")
@@ -2018,13 +2101,52 @@ mod tests {
         </w:document>"#;
         let root = parse_wml(xml);
         let stories = vec![("word/document.xml".to_string(), &root)];
-        let findings = check_tracked_change_content_model(&stories);
+        let findings = check_required_tracked_change_ids(&stories);
         let tc002: Vec<_> = findings
             .iter()
             .filter(|f| f.rule_id == "I-TC-002")
             .collect();
         assert_eq!(tc002.len(), 1);
         assert!(tc002[0].message.contains("empty"));
+    }
+
+    #[test]
+    fn tc_002_property_changes_require_ids() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body>
+                <w:p>
+                    <w:pPr>
+                        <w:pPrChange w:author="x" w:date="2024-01-01T00:00:00Z">
+                            <w:pPr/>
+                        </w:pPrChange>
+                    </w:pPr>
+                </w:p>
+                <w:sectPr>
+                    <w:sectPrChange w:author="x" w:date="2024-01-01T00:00:00Z">
+                        <w:sectPr/>
+                    </w:sectPrChange>
+                </w:sectPr>
+            </w:body>
+        </w:document>"#;
+        let root = parse_wml(xml);
+        let stories = vec![("word/document.xml".to_string(), &root)];
+        let findings = check_required_tracked_change_ids(&stories);
+        let tc002: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.rule_id == "I-TC-002")
+            .collect();
+
+        assert_eq!(tc002.len(), 2, "both property changes require w:id");
+        assert!(
+            tc002
+                .iter()
+                .any(|finding| finding.message.contains("pPrChange"))
+        );
+        assert!(
+            tc002
+                .iter()
+                .any(|finding| finding.message.contains("sectPrChange"))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2088,6 +2210,35 @@ mod tests {
             findings[0]
                 .message
                 .contains("no matching commentRangeStart")
+        );
+    }
+
+    #[test]
+    fn ann_010_duplicate_balanced_ranges_and_references_are_errors() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body>
+                <w:p>
+                    <w:commentRangeStart w:id="9"/>
+                    <w:commentRangeEnd w:id="9"/>
+                    <w:r><w:commentReference w:id="9"/></w:r>
+                    <w:commentRangeStart w:id="9"/>
+                    <w:commentRangeEnd w:id="9"/>
+                    <w:r><w:commentReference w:id="9"/></w:r>
+                </w:p>
+            </w:body>
+        </w:document>"#;
+        let root = parse_wml(xml);
+        let stories = vec![("word/document.xml".to_string(), &root)];
+
+        let findings = check_comment_marker_pairing(&stories);
+
+        assert_eq!(findings.len(), 3, "one finding per duplicated marker role");
+        assert!(findings.iter().all(|finding| finding.rule_id == "I-ANN-010"
+            && finding.severity == ValidationSeverity::Error));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("commentReference"))
         );
     }
 

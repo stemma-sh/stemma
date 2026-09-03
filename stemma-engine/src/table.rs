@@ -83,11 +83,28 @@ pub fn canonicalize_table(table: &TableNode) -> Result<CanonicalTable, String> {
                             *slot = Some(cell_idx);
                         }
                     } else {
-                        return Err(format!(
-                            "Invalid vertical merge: <w:vMerge/> continue at row {row_idx}, \
-                             column {col} in table '{}' has no preceding restart anchor",
-                            table.id.0
-                        ));
+                        // Word treats a continuation with no active restart in
+                        // the same grid range as a standalone cell and keeps
+                        // the marker on save. Preserve that physical authored
+                        // state in TableCellNode while projecting the active
+                        // table as an ordinary one-row cell.
+                        let cell_idx = cells.len();
+                        cells.push(CanonicalCell {
+                            id: cell.id.clone(),
+                            row: row_idx,
+                            col,
+                            rowspan: 1,
+                            colspan,
+                            blocks: cell.blocks.clone(),
+                            text: extract_cell_text(&cell.blocks),
+                            formatting: cell.formatting.clone(),
+                        });
+                        for slot in &mut owner_grid[row_idx][col..col + colspan] {
+                            *slot = Some(cell_idx);
+                        }
+                        for column in col..col + colspan {
+                            v_merge_anchors.remove(&column);
+                        }
                     }
                 }
                 VerticalMerge::Restart | VerticalMerge::None => {
@@ -197,7 +214,8 @@ fn extract_block_text(block: &BlockNode) -> String {
 }
 
 /// Extract text from inline nodes.
-pub(crate) fn extract_inlines_text(inlines: &[InlineNode]) -> String {
+#[doc(hidden)]
+pub fn extract_inlines_text(inlines: &[InlineNode]) -> String {
     let mut text = String::new();
     for inline in inlines {
         match inline {
@@ -214,7 +232,7 @@ pub(crate) fn extract_inlines_text(inlines: &[InlineNode]) -> String {
 }
 
 /// Extract text from a nested table.
-fn extract_table_text(table: &TableNode) -> String {
+pub(crate) fn extract_table_text(table: &TableNode) -> String {
     let mut text = String::new();
     for row in &table.rows {
         for cell in &row.cells {
@@ -374,6 +392,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -399,6 +418,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -424,6 +444,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -484,6 +505,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -509,6 +531,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -573,6 +596,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -597,6 +621,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -658,6 +683,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -682,6 +708,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -741,6 +768,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -762,6 +790,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -815,6 +844,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -840,6 +870,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -888,6 +919,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -912,6 +944,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -934,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_continue_without_restart() {
-        // Lenient handling: Continue without prior Restart
+        // Word renders Continue without a prior Restart as a standalone cell.
         let table = TableNode {
             id: NodeId::from("tbl_0"),
             rows: vec![
@@ -959,6 +992,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -983,6 +1017,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 },
@@ -992,18 +1027,68 @@ mod tests {
             formatting_change: None,
         };
 
-        let result = canonicalize_table(&table);
+        let canonical = canonicalize_table(&table).expect("Word-lenient standalone continuation");
+        let cell = canonical
+            .cells
+            .iter()
+            .find(|cell| cell.id.0.as_ref() == "c10")
+            .expect("standalone continuation cell");
+        assert_eq!((cell.row, cell.col, cell.rowspan), (1, 0, 1));
+        assert_eq!(cell.text, "X");
+        assert_ne!(canonical.owner_grid[0][0], canonical.owner_grid[1][0]);
+    }
 
-        // Should return an error for vMerge continue without restart
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("Invalid vertical merge"),
-            "Error should describe invalid vMerge: {err}"
-        );
-        assert!(
-            err.contains("row 1") && err.contains("column 0"),
-            "Error should include row/column context: {err}"
-        );
+    #[test]
+    fn test_word_orphan_continuation_below_grid_before_is_standalone() {
+        let row = |id: &str, grid_before: u32, cells: Vec<TableCellNode>| TableRowNode {
+            id: NodeId::from(id),
+            cells,
+            grid_before,
+            grid_after: 0,
+            tracking_status: None,
+            is_header: false,
+            height: None,
+            height_rule: None,
+            formatting_change: None,
+            para_id: None,
+            text_id: None,
+            cant_split: false,
+            jc: None,
+            w_before: None,
+            w_after: None,
+            cnf_style: None,
+            tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
+            cell_spacing: None,
+            preserved: Vec::new(),
+        };
+        let table = TableNode {
+            id: NodeId::from("word-orphan-vmerge"),
+            rows: vec![
+                row("r0", 1, vec![make_text_cell("c01", "right")]),
+                row(
+                    "r1",
+                    0,
+                    vec![
+                        make_merged_cell("c10", "implicit", 1, VerticalMerge::Continue),
+                        make_text_cell("c11", "right-2"),
+                    ],
+                ),
+            ],
+            structure_hash: String::new(),
+            formatting: TableFormatting::default(),
+            formatting_change: None,
+        };
+
+        let canonical = canonicalize_table(&table).expect("Word-compatible standalone cell");
+        let standalone = canonical
+            .cells
+            .iter()
+            .find(|cell| cell.id.0.as_ref() == "c10")
+            .expect("standalone continuation cell");
+        assert_eq!((standalone.row, standalone.col), (1, 0));
+        assert_eq!(standalone.rowspan, 1);
+        assert_eq!(standalone.text, "implicit");
+        assert_ne!(canonical.owner_grid[0][0], canonical.owner_grid[1][0]);
     }
 }

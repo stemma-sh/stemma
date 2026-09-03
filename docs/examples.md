@@ -9,8 +9,8 @@
 -->
 
 Runnable, compile-gated code for the common flows. Every example is a single
-file in `stemma-engine/examples/`, uses only the public facade and the v4
-wire path (the same path every transport drives), and is compiled with
+file in a public workspace crate's `examples/` directory, uses only supported
+public surfaces, and is compiled with
 warnings denied as part of the merge gate, so none of them can silently rot.
 Each file's header comment explains, step by step, what it demonstrates.
 
@@ -40,14 +40,6 @@ One tracked replacement, end to end: apply through the v4 wire path, read the re
 
 ```bash
 cargo run -p stemma --example my_first_edit
-```
-
-### `redline_from_two_files`
-
-Diff a base and a target into one reviewable redline whose accept-all reading IS the target and whose reject-all reading IS the base.
-
-```bash
-cargo run -p stemma --example redline_from_two_files
 ```
 
 ### `resolve_a_redline`
@@ -84,6 +76,18 @@ Corpus preparation: parse and reserialize every document in a manifest so revisi
 
 ```bash
 cargo run -p stemma --release --example revision_roundtrip
+```
+
+## Compare documents
+
+Use the opinionated comparison subsystem on two independently authored documents.
+
+### `redline_from_two_files`
+
+Parse a base and target document, infer their differences, emit one native tracked-change redline, and write it without folding comparison logic into the engine.
+
+```bash
+cargo run -p stemma-diff --example redline_from_two_files -- base.docx target.docx redline.docx
 ```
 
 ## Related

@@ -1,5 +1,5 @@
-//! `docs/examples.md` is GENERATED from the example inventory in
-//! `stemma-engine/examples/`. This test is both the generator and the drift
+//! `docs/examples.md` is GENERATED from the public example inventories in
+//! `stemma-engine/examples/` and `stemma-diff/examples/`. This test is both the generator and the drift
 //! guard:
 //!
 //! - `examples_reference_is_current` (runs in the gate) renders the page and
@@ -23,8 +23,11 @@ fn doc_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/examples.md")
 }
 
-fn examples_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+fn examples_dir(crate_name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(crate_name)
+        .join("examples")
 }
 
 struct ExampleEntry {
@@ -34,6 +37,7 @@ struct ExampleEntry {
 }
 
 struct ExampleGroup {
+    crate_name: &'static str,
     title: &'static str,
     intro: &'static str,
     entries: &'static [ExampleEntry],
@@ -41,6 +45,7 @@ struct ExampleGroup {
 
 const GROUPS: &[ExampleGroup] = &[
     ExampleGroup {
+        crate_name: "stemma-engine",
         title: "Learn the loop",
         intro: "In reading order: each teaches one idea from the guide chapters, \
                 end to end, through the public facade.",
@@ -67,13 +72,6 @@ const GROUPS: &[ExampleGroup] = &[
                 run: "cargo run -p stemma --example my_first_edit",
             },
             ExampleEntry {
-                name: "redline_from_two_files",
-                blurb: "Diff a base and a target into one reviewable redline whose \
-                        accept-all reading IS the target and whose reject-all reading \
-                        IS the base.",
-                run: "cargo run -p stemma --example redline_from_two_files",
-            },
-            ExampleEntry {
                 name: "resolve_a_redline",
                 blurb: "Resolve a two-author redline selectively, then verify by \
                         CONTENT: accept and reject both remove the marker, so only the \
@@ -90,6 +88,7 @@ const GROUPS: &[ExampleGroup] = &[
         ],
     },
     ExampleGroup {
+        crate_name: "stemma-engine",
         title: "Measure and prepare",
         intro: "Operational tools that happen to live in the same directory; not part \
                 of the learning path.",
@@ -110,31 +109,53 @@ const GROUPS: &[ExampleGroup] = &[
             },
         ],
     },
+    ExampleGroup {
+        crate_name: "stemma-diff",
+        title: "Compare documents",
+        intro: "Use the opinionated comparison subsystem on two independently authored documents.",
+        entries: &[ExampleEntry {
+            name: "redline_from_two_files",
+            blurb: "Parse a base and target document, infer their differences, emit one native tracked-change redline, and write it without folding comparison logic into the engine.",
+            run: "cargo run -p stemma-diff --example redline_from_two_files -- base.docx target.docx redline.docx",
+        }],
+    },
 ];
 
 fn render() -> String {
     // Coverage drift guard: the curated groups must name exactly the example
     // files that exist, no more and no less.
-    let on_disk: BTreeSet<String> = std::fs::read_dir(examples_dir())
-        .expect("read stemma-engine/examples/")
-        .filter_map(|e| {
-            let path = e.expect("dir entry").path();
-            (path.extension().and_then(|x| x.to_str()) == Some("rs")).then(|| {
-                path.file_stem()
-                    .expect("stem")
-                    .to_string_lossy()
-                    .into_owned()
-            })
+    let on_disk: BTreeSet<(String, String)> = ["stemma-engine", "stemma-diff"]
+        .into_iter()
+        .flat_map(|crate_name| {
+            std::fs::read_dir(examples_dir(crate_name))
+                .unwrap_or_else(|error| panic!("read {crate_name}/examples/: {error}"))
+                .filter_map(move |entry| {
+                    let path = entry.expect("dir entry").path();
+                    (path.extension().and_then(|x| x.to_str()) == Some("rs")).then(|| {
+                        (
+                            crate_name.to_string(),
+                            path.file_stem()
+                                .expect("stem")
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    })
+                })
         })
         .collect();
-    let listed: BTreeSet<String> = GROUPS
+    let listed: BTreeSet<(String, String)> = GROUPS
         .iter()
-        .flat_map(|g| g.entries.iter().map(|e| e.name.to_string()))
+        .flat_map(|group| {
+            group
+                .entries
+                .iter()
+                .map(|entry| (group.crate_name.to_string(), entry.name.to_string()))
+        })
         .collect();
     assert_eq!(
         on_disk, listed,
-        "docs/examples.md must list exactly the files in stemma-engine/examples/; \
-         update EXAMPLES in this test and run `just regen-examples-reference`"
+        "docs/examples.md must list exactly the files in the public example directories; \
+         update GROUPS in this test and run `just regen-examples-reference`"
     );
 
     let mut page = String::from(
@@ -150,8 +171,8 @@ fn render() -> String {
 -->
 
 Runnable, compile-gated code for the common flows. Every example is a single
-file in `stemma-engine/examples/`, uses only the public facade and the v4
-wire path (the same path every transport drives), and is compiled with
+file in a public workspace crate's `examples/` directory, uses only supported
+public surfaces, and is compiled with
 warnings denied as part of the merge gate, so none of them can silently rot.
 Each file's header comment explains, step by step, what it demonstrates.
 ",

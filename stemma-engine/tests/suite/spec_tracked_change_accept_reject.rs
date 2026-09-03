@@ -480,7 +480,7 @@ fn spec_reject_property_change_restores_previous_state() {
         .as_ref()
         .expect("paragraph should have formatting_change from pPrChange");
     assert_eq!(
-        change.previous_alignment,
+        change.previous.direct.alignment,
         Some(Alignment::Left),
         "pPrChange should record previous alignment as left"
     );

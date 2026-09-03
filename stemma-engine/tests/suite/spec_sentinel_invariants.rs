@@ -44,10 +44,13 @@ use stemma::edit::{
     apply_transaction,
 };
 use stemma::{
-    BlockNode, CanonDoc, DiffChange, DocxRuntime, ExportMode, InlineNode, Mark, RevisionInfo,
-    SimpleRuntime, TransactionMeta, accept_all, diff_documents, merge_diff,
+    BlockNode, CanonDoc, DocxRuntime, ExportMode, InlineNode, Mark, RevisionInfo, SimpleRuntime,
+    TransactionMeta, accept_all,
     redline_extract::{RedlineSpan, extract_redline},
 };
+use stemma_diff::test_support::{DiffChange, diff_documents, merge_diff};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use crate::common;
 
@@ -1097,14 +1100,21 @@ fn tracked_delete_of_inline_sdt() -> (Vec<u8>, Vec<u8>) {
     (a, b)
 }
 
-// Tracked REPLACE of an inline content control's content. Both A and B carry
-//   the SAME `w:sdt` (same `w:sdtPr>w:id`), only its inner text differs; the diff
-//   sees two unequal opaques and emits the original inside `w:del` and the
-//   replacement inside `w:ins`. Cloned from a shared source, both copies would
-//   carry one `w:sdtPr>w:id` — but ECMA-376 §17.5.2.18 makes that id the SDT's
-//   unique identity, and while both copies are live (before accept/reject) two
-//   tags claim it. The inserted copy must be re-id'd; the deleted original keeps
-//   the source id (it survives reject and restores A's byte-shape).
+fn tracked_delete_of_locked_inline_sdt() -> (Vec<u8>, Vec<u8>) {
+    let sdt = r#"<w:sdt><w:sdtPr><w:alias w:val="Clause"/><w:tag w:val="ctl"/><w:id w:val="55"/><w:lock w:val="sdtContentLocked"/></w:sdtPr><w:sdtContent><w:r><w:t xml:space="preserve">secret clause</w:t></w:r></w:sdtContent></w:sdt>"#;
+    let a = pack(&document(&format!(
+        r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r>{sdt}<w:r><w:t xml:space="preserve"> tail</w:t></w:r></w:p>"#
+    )));
+    let b = pack(&document(
+        r#"<w:p><w:r><w:t xml:space="preserve">Keep </w:t></w:r><w:r><w:t xml:space="preserve"> tail</w:t></w:r></w:p>"#,
+    ));
+    (a, b)
+}
+
+// A whole inline content-control replacement requires an inserted SDT envelope.
+// `w:ins > w:sdt` is schema-valid, but native Word Reject All can leave the
+// inserted control's content and revision pending. The exact comparison must
+// refuse instead of silently degrading the target to inserted plain text.
 fn tracked_replace_of_inline_sdt() -> (Vec<u8>, Vec<u8>) {
     let sdt = |txt: &str| {
         format!(
@@ -1119,23 +1129,6 @@ fn tracked_replace_of_inline_sdt() -> (Vec<u8>, Vec<u8>) {
     let a = pack(&document(&body(&sdt("secret clause"))));
     let b = pack(&document(&body(&sdt("public clause"))));
     (a, b)
-}
-
-/// Extract each `<w:ins …>…</w:ins>` region (mirror of [`del_spans`]). The
-/// witness produces non-nested insertions, so an open→next-close scan is exact.
-fn ins_spans(xml: &str) -> Vec<String> {
-    let mut spans = Vec::new();
-    let mut rest = xml;
-    while let Some(open) = rest.find("<w:ins ") {
-        let after = &rest[open..];
-        let Some(close_rel) = after.find("</w:ins>") else {
-            break;
-        };
-        let end = close_rel + "</w:ins>".len();
-        spans.push(after[..end].to_string());
-        rest = &after[end..];
-    }
-    spans
 }
 
 /// Every `w:sdtPr>w:id` value in the document, in order. `<w:id w:val="` is the
@@ -1156,64 +1149,80 @@ fn sdt_id_vals(xml: &str) -> Vec<String> {
 }
 
 #[test]
-fn sentinel_tracked_replace_of_inline_sdt_reids_inserted_copy() {
+fn sentinel_tracked_replace_of_inline_sdt_refuses_unqualified_insertion() {
     let class = "tracked-replace-inline-sdt";
     let (a, b) = tracked_replace_of_inline_sdt();
-
-    let exported = redline_export(class, &a, &b);
-    let xml = document_xml(&exported);
-
-    // The source SDT id, present on BOTH A and B.
-    let source_id = "55";
-
-    // (a)+(b) the del-wrapped and ins-wrapped SDT carry DIFFERENT w:sdtPr>w:id,
-    //     and the deleted copy keeps the source id (it IS the original).
-    let del = del_spans(&xml);
-    let ins = ins_spans(&xml);
-    let del_sdt_id = del
-        .iter()
-        .find_map(|s| sdt_id_vals(s).into_iter().next())
-        .unwrap_or_else(|| panic!("[{class}] the deleted content control must carry an sdt id"));
-    let ins_sdt_id = ins
-        .iter()
-        .find_map(|s| sdt_id_vals(s).into_iter().next())
-        .unwrap_or_else(|| panic!("[{class}] the inserted content control must carry an sdt id"));
-    assert_eq!(
-        del_sdt_id, source_id,
-        "[{class}] (b) the deleted copy must keep the source sdt id"
-    );
-    assert_ne!(
-        del_sdt_id, ins_sdt_id,
-        "[{class}] (a) the deleted and inserted SDT copies must not share one w:sdtPr>w:id \
-         (§17.5.2.18 — two live tags cannot claim one identity)"
-    );
-
-    // (c) every SDT id in the exported document is unique.
-    let all_ids = sdt_id_vals(&xml);
-    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
-    assert_eq!(
-        all_ids.len(),
-        unique.len(),
-        "[{class}] (c) all sdt ids in the export must be unique, found {all_ids:?}"
-    );
-
-    // (d) accept/reject text identity through serialize→reparse. The SDT content
-    //     is opaque (not in canonical text), so both sides read the same wrapper
-    //     text; the reject side must restore A, the accept side B.
-    assert_reparse_accept_reject(class, &exported, &imported_text(&b), &imported_text(&a));
-
-    // (d′) the SURVIVING SDT identity: reject restores the source id (A's copy),
-    //      accept keeps the re-id'd replacement — the same value Word would keep,
-    //      so canonical and Word accept/reject agree (no id asymmetry).
     let rt = SimpleRuntime::new();
-    let canon =
-        std::sync::Arc::unwrap_or_clone(rt.import_docx(&exported).expect("re-import").canonical);
-    let surviving_sdt_id = |doc: &CanonDoc| -> Vec<String> {
+    let ia = rt
+        .import_docx(&a)
+        .unwrap_or_else(|error| panic!("[{class}] import A: {error:?}"));
+    let ib = rt
+        .import_docx(&b)
+        .unwrap_or_else(|error| panic!("[{class}] import B: {error:?}"));
+    let error = rt
+        .diff_and_redline(&ia.doc_handle, &ib.doc_handle, redline_meta())
+        .expect_err("a whole inserted SDT envelope must refuse before output");
+
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(
+        error.message.contains("inline content-control envelope"),
+        "unexpected refusal: {error:?}"
+    );
+    assert!(
+        error
+            .details
+            .context
+            .as_deref()
+            .is_some_and(|context| context.contains("w:sdt")),
+        "unexpected refusal: {error:?}"
+    );
+}
+
+#[test]
+fn sentinel_tracked_delete_of_locked_inline_sdt_refuses() {
+    let class = "tracked-delete-locked-inline-sdt";
+    let (a, b) = tracked_delete_of_locked_inline_sdt();
+    let rt = SimpleRuntime::new();
+    let ia = rt
+        .import_docx(&a)
+        .unwrap_or_else(|error| panic!("[{class}] import A: {error:?}"));
+    let ib = rt
+        .import_docx(&b)
+        .unwrap_or_else(|error| panic!("[{class}] import B: {error:?}"));
+    let error = rt
+        .diff_and_redline(&ia.doc_handle, &ib.doc_handle, redline_meta())
+        .expect_err("a locked inline content-control deletion must refuse before output");
+
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(
+        error.message.contains("locked inline content-control"),
+        "unexpected refusal: {error:?}"
+    );
+    assert!(
+        error.details.context.as_deref().is_some_and(|context| {
+            context.contains("lock=sdtContentLocked") && context.contains("native Word Accept All")
+        }),
+        "unexpected refusal context: {error:?}"
+    );
+}
+
+#[test]
+fn sentinel_word_saved_inline_sdt_deletion_remains_resolvable() {
+    let class = "word-saved-inline-sdt-deletion";
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">LEFT </w:t></w:r><w:customXmlDelRangeStart w:id="0" w:author="Stemma"/><w:sdt><w:sdtPr><w:tag w:val="control"/><w:id w:val="701"/></w:sdtPr><w:sdtEndPr/><w:sdtContent><w:customXmlDelRangeEnd w:id="0"/><w:del w:id="1" w:author="Stemma"><w:r><w:delText>CONTROL</w:delText></w:r></w:del><w:customXmlDelRangeStart w:id="2" w:author="Stemma"/></w:sdtContent></w:sdt><w:customXmlDelRangeEnd w:id="2"/><w:r><w:t xml:space="preserve"> RIGHT</w:t></w:r></w:p>"#;
+    let bytes = pack(&document(body));
+    let rt = SimpleRuntime::new();
+    let canonical = std::sync::Arc::unwrap_or_clone(
+        rt.import_docx(&bytes)
+            .expect("import Word-normalized SDT deletion")
+            .canonical,
+    );
+    let surviving_sdt_ids = |doc: &CanonDoc| -> Vec<String> {
         common::all_paragraphs(doc)
             .iter()
-            .flat_map(|p| p.all_inlines_owned())
+            .flat_map(|paragraph| paragraph.all_inlines_owned())
             .filter_map(|inline| match inline {
-                InlineNode::OpaqueInline(o) => o.raw_xml.as_ref().and_then(|raw| {
+                InlineNode::OpaqueInline(opaque) => opaque.raw_xml.as_ref().and_then(|raw| {
                     sdt_id_vals(&String::from_utf8_lossy(raw))
                         .into_iter()
                         .next()
@@ -1222,23 +1231,61 @@ fn sentinel_tracked_replace_of_inline_sdt_reids_inserted_copy() {
             })
             .collect()
     };
-    let mut accepted = canon.clone();
-    accept_all(&mut accepted);
-    let mut rejected = canon;
-    stemma::reject_all_with_styles(&mut rejected, None);
-    assert_eq!(
-        surviving_sdt_id(&rejected),
-        vec![source_id.to_string()],
-        "[{class}] (d′) reject_all must restore the source SDT id"
-    );
-    assert_eq!(
-        surviving_sdt_id(&accepted),
-        vec![ins_sdt_id.clone()],
-        "[{class}] (d′) accept_all must keep the re-id'd inserted SDT id"
-    );
+    let has_deletion_range = |doc: &CanonDoc| {
+        common::all_paragraphs(doc).iter().any(|paragraph| {
+            paragraph.all_inlines_owned().iter().any(|inline| {
+                matches!(inline, InlineNode::Decoration(decoration)
+                if decoration.raw_xml.as_deref().is_some_and(|raw| {
+                    String::from_utf8_lossy(raw).contains("customXmlDelRange")
+                }))
+            })
+        })
+    };
+    let deletion_id = stemma::enumerate_revisions(&canonical)
+        .into_iter()
+        .find(|revision| revision.kind == stemma::RevisionKind::OpaqueInterior)
+        .map(|revision| revision.revision_id)
+        .filter(|identity| *identity != 0)
+        .expect("Word-normalized SDT deletion remains selectable");
 
-    // (e) validator-clean (#13 hermetic proxy — opens clean in Word).
-    assert_validator_clean(class, &exported);
+    for (label, action, expected_ids) in [
+        (
+            "accept",
+            stemma::ResolveSelectionAction::Accept,
+            Vec::<String>::new(),
+        ),
+        (
+            "reject",
+            stemma::ResolveSelectionAction::Reject,
+            vec!["701".to_string()],
+        ),
+    ] {
+        let mut projected = canonical.clone();
+        stemma::resolve_selected_revisions_with_styles(
+            &mut projected,
+            &std::collections::HashSet::from([deletion_id]),
+            action,
+            None,
+        )
+        .unwrap_or_else(|ids| panic!("[{class}] selective {label} refused ids {ids:?}"));
+        assert_eq!(surviving_sdt_ids(&projected), expected_ids, "{label}");
+        assert!(!has_deletion_range(&projected), "{label}");
+        assert!(
+            stemma::enumerate_revisions(&projected)
+                .iter()
+                .all(|revision| revision.revision_id != deletion_id),
+            "{label}: the selected logical deletion must be fully settled"
+        );
+    }
+
+    let mut accepted = canonical.clone();
+    accept_all(&mut accepted);
+    assert!(surviving_sdt_ids(&accepted).is_empty());
+    assert!(!has_deletion_range(&accepted));
+    let mut rejected = canonical;
+    stemma::reject_all_with_styles(&mut rejected, None);
+    assert_eq!(surviving_sdt_ids(&rejected), vec!["701".to_string()]);
+    assert!(!has_deletion_range(&rejected));
 }
 
 #[test]

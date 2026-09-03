@@ -7,8 +7,11 @@
 //! 4. Structure changes produce TableStructureChanged
 
 use std::fs;
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
-use stemma::{BlockNode, DiffChange, DocxRuntime, SimpleRuntime};
+use stemma::{BlockNode, DocxRuntime, SimpleRuntime};
 
 /// Test that table documents are properly parsed with TableNode blocks.
 #[test]

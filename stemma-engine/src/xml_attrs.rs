@@ -7,7 +7,7 @@ const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006
 const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
 pub(crate) const W16DU_NS: &str = "http://schemas.microsoft.com/office/word/2023/wordml/word16du";
 
-pub(crate) fn attr_get<'a>(element: &'a Element, qname: &str) -> Option<&'a String> {
+pub fn attr_get<'a>(element: &'a Element, qname: &str) -> Option<&'a String> {
     let (want_prefix, want_local) = split_qname(qname);
 
     if let Some(prefix) = want_prefix {
@@ -60,7 +60,7 @@ pub(crate) fn capture_extra_attrs(
     out
 }
 
-pub(crate) fn attr_set(element: &mut Element, qname: &str, value: impl AsRef<str>) {
+pub fn attr_set(element: &mut Element, qname: &str, value: impl AsRef<str>) {
     let name = attr_name(qname);
 
     // Replace existing key variant for the same attribute to avoid duplicates.

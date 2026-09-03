@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::io::{Cursor, Read};
+use stemma_diff::test_support::RuntimeComparisonExt as _;
 
 use stemma::{CanonDoc, DocxRuntime, ExportMode, Mark, SimpleRuntime, TransactionMeta};
 use xmltree::{Element, XMLNode};
@@ -803,66 +804,6 @@ fn safe_singapore_name_title_aligned_via_first_line_cascade() {
         "[name] and [title] should align. [name]={name_pos}, [title]={title_pos}"
     );
     assert_eq!(name_pos, 5760, "Both should start at 5760 twips");
-}
-
-// ==========================================================================
-// Test: [name] firstLine cascade survives the full compare (diff) path
-// ==========================================================================
-
-/// The full_document_view (compare) path builds full-doc blocks from
-/// before + after. The [name] paragraph's firstLine inheritance must
-/// survive through this path — the same cascade applies.
-#[test]
-fn safe_singapore_name_first_line_cascade_in_compare_path() {
-    let before_path = "testdata/safe-us-vs-singapore/before.docx";
-    let after_path = "testdata/safe-us-vs-singapore/after.docx";
-    let before_bytes = fs::read(before_path).unwrap();
-    let after_bytes = fs::read(after_path).unwrap();
-
-    let runtime = SimpleRuntime::new();
-    let before_import = runtime.import_docx(&before_bytes).unwrap();
-    let after_import = runtime.import_docx(&after_bytes).unwrap();
-
-    let full_view = runtime
-        .full_document_view(&before_import.doc_handle, &after_import.doc_handle)
-        .expect("full_document_view");
-
-    // Find the full-doc block containing "[name]" (not "[title]")
-    let name_block = full_view
-        .blocks
-        .iter()
-        .find(|b| {
-            let text: String = b
-                .segments
-                .iter()
-                .map(|s| match s {
-                    stemma::InlineChange::Unchanged { text, .. } => text.as_str(),
-                    stemma::InlineChange::Inserted { text, .. } => text.as_str(),
-                    stemma::InlineChange::Deleted { text, .. } => text.as_str(),
-                    stemma::InlineChange::Opaque { .. } => "",
-                })
-                .collect();
-            text.contains("[name]") && !text.contains("[title]")
-        })
-        .expect("should find '[name]' full-doc block");
-
-    let indent = name_block
-        .indent
-        .as_ref()
-        .expect("[name] block should have indent");
-
-    // The after.docx [name] has left=5040, no firstLine → inherits 720 from Normal.
-    assert_eq!(indent.left, Some(5040), "[name] compare-path left");
-    assert_eq!(
-        indent.effective_first_line_twips,
-        Some(720),
-        "[name] compare-path: firstLine should inherit 720 from Normal (per-attribute cascade)"
-    );
-
-    // NOTE: the JSON-projection assertion (full_doc_block_to_payload preserves
-    // effective_first_line_twips) lives with the consuming application — it tests the app-layer
-    // json_types projection, which is not part of the stemma engine.
-    // See its full_doc_payload_projection tests.
 }
 
 /// Same test using the after (Singapore) document.

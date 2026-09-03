@@ -741,6 +741,7 @@ fn edit_preserves_numbering_through_accept() {
     let numbering = NumberingInfo {
         num_id: 3,
         ilvl: 0,
+        resolution: Default::default(),
         synthesized_text: "1.".to_string(),
         is_bullet: false,
         restart_numbering: false,

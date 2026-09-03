@@ -8,17 +8,15 @@
 //!
 //! It is designed **independently of the IR** so the IR (`CanonDoc` and all of
 //! `domain`) can keep moving underneath it. None of the following leak through
-//! this surface: `CanonDoc`/`domain` IR types, the internal change vocabulary
-//! (`InlineChange`/`DiffChange`), the pairwise-diff projection (`FullDocBlock`),
-//! or any diff-only field (`doc1_block_id`, `change_type`, `move_id`, …).
+//! this surface: `CanonDoc`/`domain` IR types, localized native edit plans, or
+//! any pairwise-comparison projection.
 //!
 //! The one IR type intentionally re-used is [`NodeId`]: it is already public and
 //! is exactly the handle an [`EditTransaction`] targets, so exposing it here
 //! keeps targeting friction-free rather than forcing a translation step.
 //!
-//! The role / heading / paragraph-mark decisions mirror the established
-//! single-document projection (`diff::project_tracked_document`,
-//! `diff::block_metadata`) so this clean view agrees with the engine's rules.
+//! Role, heading, and paragraph-mark decisions are derived directly from the
+//! canonical single-document state.
 
 use std::collections::HashMap;
 
@@ -225,9 +223,8 @@ pub struct TableMetaView {
     pub indent: Option<i32>,
 }
 
-/// The role of a block. Mirrors `diff::block_metadata`'s decision: a paragraph
-/// with a heading level is a `Heading`, otherwise `Paragraph`; tables are
-/// `Table`; opaque blocks are `Opaque`.
+/// The role of a block. A paragraph with a heading level is a `Heading`,
+/// otherwise `Paragraph`; tables are `Table`; opaque blocks are `Opaque`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BlockRole {
     Paragraph,
@@ -631,7 +628,7 @@ fn paragraph_role(heading_level: Option<&HeadingLevel>) -> BlockRole {
     }
 }
 
-/// Mirror of `diff::heading_level_to_u8` (kept private there).
+/// Convert the canonical heading level into the read-model representation.
 fn heading_level_to_u8(level: &HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -950,9 +947,9 @@ fn paragraph_text(segments: &[TrackedSegment]) -> String {
 /// text.
 ///
 /// Returns the trimmed label (no separators). `None` when there is no label to
-/// show (no prefix, or auto-numbering supersedes it).
+/// show (no prefix, or resolved auto-numbering supersedes it).
 pub(crate) fn literal_prefix_label(p: &crate::domain::ParagraphNode) -> Option<&str> {
-    if p.numbering.is_some() {
+    if p.has_resolved_numbering() {
         return None;
     }
     p.literal_prefix
@@ -1029,7 +1026,7 @@ fn block_to_view(tracked: &TrackedBlock, role_ids: &HashMap<NodeId, String>) -> 
             list: None,
             cells: table_cell_views(t),
             table: Some(table_meta_view(t)),
-            text: crate::diff::extract_table_text(t),
+            text: crate::local_change::extract_table_text(t),
             // A table is not a paragraph — no literal-prefix enumeration label.
             literal_prefix: None,
             block_status,
@@ -1180,9 +1177,8 @@ fn table_meta_view(t: &crate::domain::TableNode) -> TableMetaView {
 /// Project a table cell's paragraph blocks into render-ready inline segments,
 /// one [`CellParagraphView`] per paragraph in document order.
 ///
-/// Uses the SAME projection the body's single-document rich view uses for an
-/// unchanged paragraph (`diff::inlines_to_segments` over the paragraph's owned
-/// inlines), so a cell run carries the identical `marks` + `style_props` +
+/// Uses the same projection as an unchanged body paragraph, so a cell run
+/// carries the identical `marks` + `style_props` +
 /// hyperlink shape the body does and a frontend renders both through one path.
 ///
 /// Two documented boundaries, both consistent with the lean view's contract of
@@ -1212,7 +1208,7 @@ fn cell_paragraph_views(blocks: &[BlockNode]) -> Vec<CellParagraphView> {
                         crate::domain::TrackingStatus::Deleted(_)
                         | crate::domain::TrackingStatus::InsertedThenDeleted(_) => "delete",
                     };
-                    let mut seg_parts = crate::diff::inlines_to_segments(
+                    let mut seg_parts = crate::local_change::inlines_to_segments(
                         &tracked_seg.inlines,
                         change_type_str,
                         &note_markers,
@@ -1682,11 +1678,9 @@ mod tests {
         ContentFragment, EditStep, EditTransaction, MaterializationMode, ParagraphContent,
     };
 
-    // Compile-time property (domain-model §9): `DocumentView` exposes NO
-    // `InlineChange`, `FullDocBlock`, or `CanonDoc`/`domain` IR type in its
-    // public surface. The only `domain` type that appears is `NodeId`, the
-    // intentional targeting handle. This is enforced by the signatures above,
-    // not by a runtime assertion.
+    // Compile-time property (domain-model §9): `DocumentView` exposes no
+    // localized edit-plan or `CanonDoc` IR type in its public surface. The only
+    // domain type that appears is `NodeId`, the intentional targeting handle.
 
     /// Build a minimal valid DOCX byte stream (copied from `api.rs` tests).
     fn make_test_docx(paragraphs: &[&str]) -> Vec<u8> {

@@ -44,19 +44,19 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         widow_control: None,
         contextual_spacing: None,
         shading: None,
-        has_direct_keep_next: true,
-        has_direct_keep_lines: true,
-        has_direct_page_break_before: true,
-        has_direct_widow_control: true,
-        has_direct_contextual_spacing: true,
-        has_direct_shading: true,
-        has_direct_borders: true,
+        has_direct_keep_next: false,
+        has_direct_keep_lines: false,
+        has_direct_page_break_before: false,
+        has_direct_widow_control: false,
+        has_direct_contextual_spacing: false,
+        has_direct_shading: false,
+        has_direct_borders: false,
         tab_stops: vec![],
         effective_tab_stops_rel: vec![],
         segments,
         block_text_hash: None,
         numbering: None,
-        has_direct_numbering: true,
+        has_direct_numbering: false,
         numbering_suppressed: false,
         materialized_numbering: None,
         rendered_text: None,
@@ -284,18 +284,22 @@ fn range_move_keeps_auto_numbering_native() {
     heading.numbering = Some(NumberingInfo {
         num_id: 10,
         ilvl: 0,
+        resolution: Default::default(),
         synthesized_text: "1.".to_string(),
         is_bullet: false,
         restart_numbering: false,
     });
+    heading.has_direct_numbering = true;
     let mut body = make_para("b1", normal_segment(vec![make_text("b1_t", "first item")]));
     body.numbering = Some(NumberingInfo {
         num_id: 20,
         ilvl: 1,
+        resolution: Default::default(),
         synthesized_text: "(a)".to_string(),
         is_bullet: false,
         restart_numbering: false,
     });
+    body.has_direct_numbering = true;
     let anchor = make_para("anchor", normal_segment(vec![make_text("a_t", "anchor")]));
     let doc = make_doc(vec![
         normal_tracked_block(BlockNode::from(heading)),

@@ -29,19 +29,19 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         widow_control: None,
         contextual_spacing: None,
         shading: None,
-        has_direct_keep_next: true,
-        has_direct_keep_lines: true,
-        has_direct_page_break_before: true,
-        has_direct_widow_control: true,
-        has_direct_contextual_spacing: true,
-        has_direct_shading: true,
-        has_direct_borders: true,
+        has_direct_keep_next: false,
+        has_direct_keep_lines: false,
+        has_direct_page_break_before: false,
+        has_direct_widow_control: false,
+        has_direct_contextual_spacing: false,
+        has_direct_shading: false,
+        has_direct_borders: false,
         tab_stops: vec![],
         effective_tab_stops_rel: vec![],
         segments,
         block_text_hash: None,
         numbering: None,
-        has_direct_numbering: true,
+        has_direct_numbering: false,
         numbering_suppressed: false,
         materialized_numbering: None,
         rendered_text: None,
@@ -146,6 +146,7 @@ fn make_hard_break(id: &str) -> InlineNode {
         wrapper_style_props: StyleProps::default(),
         wrapper_rpr_authored: RunRprAuthored::default(),
         source_run_attrs: Vec::new(),
+        formatting_change: None,
         joins_following_text_run: false,
     })
 }
@@ -2624,6 +2625,7 @@ fn make_numbered_para(id: &str, synthesized: &str, body: &str) -> ParagraphNode 
     para.numbering = Some(NumberingInfo {
         num_id: 1,
         ilvl: 0,
+        resolution: Default::default(),
         synthesized_text: synthesized.to_string(),
         is_bullet: false,
         restart_numbering: false,
@@ -2710,6 +2712,7 @@ fn replace_duplicated_prefix_refused_even_when_target_runs_are_clean() {
     para.numbering = Some(NumberingInfo {
         num_id: 1,
         ilvl: 0,
+        resolution: Default::default(),
         synthesized_text: "2.".to_string(),
         is_bullet: false,
         restart_numbering: false,
@@ -3226,9 +3229,11 @@ fn set_attr_records_pprchange_and_applies_exemplar_numbering() {
         .formatting_change
         .as_ref()
         .expect("set_attr must attach a ParagraphFormattingChange");
-    // The previous numbering was None (body text had no numPr).
-    assert!(fc.previous_numbering.is_none());
-    assert!(fc.previous_numbering_explicitly_absent);
+    // The previous direct numbering was absent (body text had no numPr).
+    assert!(matches!(
+        fc.previous.direct.numbering,
+        DirectParagraphNumbering::Absent
+    ));
     assert!(
         body_para.numbering.is_some(),
         "target paragraph must now carry the exemplar's numbering"
@@ -3984,6 +3989,7 @@ fn make_table_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         w_after: None,
         cnf_style: None,
         tbl_pr_ex: None,
+        tbl_pr_ex_change: None,
         cell_spacing: None,
         preserved: Vec::new(),
     }

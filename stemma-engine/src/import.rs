@@ -12,21 +12,21 @@ use xmltree::{Element, XMLNode};
 use crate::docx::{DocxArchive, DocxError};
 use crate::domain::{
     Alignment, BlockNode, BlockSdtWrap, Border, BorderSet, BorderStyle, CanonDoc, CellFormatting,
-    CellFormattingChange, CellMargins, CellSdtWrap, CommentExtended, CommentPayload, CommentStory,
-    CompatSettings, DecorationNode, DecorationType, DocFingerprint, DocMeta, DocPart,
-    DocProtectEdit, EmphasisMark, EndnoteStory, FieldData, FieldKind, FitText, FooterStory,
-    FootnoteStory, FormattingChange, FullDocBlock, FullDocViewResult, HAnchor, HeaderFooterKind,
-    HeaderStory, HeadingLevel, HeightRule, HighlightColor, INTERNAL_IDS_VERSION_V0, IStr,
-    Indentation, InlineChange, InlineChangeSegmentType, InlineNode, LineSpacingRule, Mark,
-    MarkValue, NodeId, NoteReferenceData, NoteType, OpaqueBlockNode, OpaqueKind, ParagraphBorders,
-    ParagraphFormattingChange, ParagraphNode, ParagraphSpacing, ProofRef, RangeMarkerMeta,
-    RevisionInfo, RowFormattingChange, RunRprAuthored, SCHEMA_VERSION_V0, SdtWrapper,
-    SectionPropertyChange, SectionType, Shading, ShadingPattern, StoryPayload, StoryScope,
-    StyleProps, SymData, TableCellNode, TableFormatting, TableFormattingChange, TableLayout,
-    TableMeasurement, TableNode, TableOverlap, TablePositioning, TableRowNode, TblLook,
-    TextDirection, TextEffect, TextNode, TrackedBlock, TrackedSegment, TrackingStatus,
-    UnderlineStyle, VAnchor, VerticalAlignment, VerticalMerge, WidthType, XAlign, YAlign,
-    normal_tracked_block,
+    CellFormattingChange, CellMargins, CellSdtWrap, CommentExtended, CommentStory, CompatSettings,
+    DecorationNode, DecorationType, DirectParagraphNumbering, DirectParagraphProperties,
+    DocFingerprint, DocMeta, DocPart, DocProtectEdit, EffectiveParagraphProperties, EmphasisMark,
+    EndnoteStory, FieldData, FieldKind, FitText, FooterStory, FootnoteStory, FormattingChange,
+    HAnchor, HeaderFooterKind, HeaderStory, HeadingLevel, HeightRule, HighlightColor,
+    INTERNAL_IDS_VERSION_V0, IStr, Indentation, InlineNode, LineSpacingRule, Mark, MarkValue,
+    NodeId, NoteReferenceData, NoteType, OpaqueBlockNode, OpaqueKind, ParagraphBorders,
+    ParagraphFormattingChange, ParagraphMarkProperties, ParagraphNode, ParagraphSpacing,
+    PreviousParagraphProperties, ProofRef, RangeMarkerMeta, RevisionInfo, RowFormattingChange,
+    RunRprAuthored, SCHEMA_VERSION_V0, SdtWrapper, SectionPropertyChange, SectionType, Shading,
+    ShadingPattern, StoryScope, StyleProps, SymData, TableCellNode, TableFormatting,
+    TableFormattingChange, TableLayout, TableMeasurement, TableNode, TableOverlap,
+    TablePositioning, TableRowNode, TblLook, TextAlignment, TextDirection, TextEffect, TextNode,
+    TrackedBlock, TrackedSegment, TrackingStatus, UnderlineStyle, VAnchor, VerticalAlignment,
+    VerticalMerge, WidthType, XAlign, YAlign, normal_tracked_block,
 };
 use crate::runtime::{
     COMMENTS_EXTENDED_REL_TYPE, COMMENTS_REL_TYPE, CUSTOM_XML_REL_TYPE, Diagnostic,
@@ -36,7 +36,7 @@ use crate::runtime::{
 };
 use crate::word_ir::{
     Atom, AtomKind, AtomTrackingContext, MarkValue as WordMarkValue, ParagraphView, TextMarks,
-    WordIrError, is_mc_alternate_content, select_mc_branch,
+    WordIrError, is_mc_alternate_content, parse_cnf_style_element, select_mc_branch,
 };
 use crate::word_xml::{self, WordXmlError, body_element, is_w_tag};
 use crate::xml_attrs::attr_get;
@@ -54,6 +54,21 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// Stable identity for body content the canonical model deliberately treats as
+/// opaque.
+///
+/// Position remains provenance (`ProofRef::docx_anchor`), not identity. Since
+/// the engine cannot interpret an opaque element well enough to establish a
+/// semantic equivalence, byte identity is the only honest unchanged relation.
+/// In particular, two different content controls at the same body index must
+/// not collapse into one unchanged block.
+pub(crate) fn opaque_body_ref(element: &Element) -> String {
+    format!(
+        "body_item_sha256:{}",
+        sha256_hex(&word_xml::serialize_raw_fragment(element))
+    )
 }
 
 fn invalid_docx(message: &str) -> RuntimeError {
@@ -390,17 +405,30 @@ pub fn build_canonical_from_docx_preserving_tracked(
 /// here with `revision_id == 0`; the `*id == 0` skip is a defensive guard, not
 /// a live path.
 fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
-    let mut next = crate::runtime::max_revision_id(doc) + 1;
+    let mut used = std::collections::HashSet::new();
+    for_each_revision_id_mut(doc, &mut |id| {
+        if *id != 0 {
+            used.insert(*id);
+        }
+    });
+    let mut next = used
+        .iter()
+        .copied()
+        .max()
+        .and_then(|id| id.checked_add(1))
+        .unwrap_or(1);
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    let claim = |id: &mut u32, seen: &mut std::collections::HashSet<u32>, next: &mut u32| {
+    let claim = |id: &mut u32,
+                 seen: &mut std::collections::HashSet<u32>,
+                 used: &mut std::collections::HashSet<u32>,
+                 next: &mut u32| {
         if *id == 0 {
             return;
         }
         if !seen.insert(*id) {
-            *id = *next;
+            *id = take_next_revision_annotation_id(used, next);
             seen.insert(*id);
-            *next += 1;
         }
     };
 
@@ -414,6 +442,7 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
                     for inline in &mut seg.inlines {
                         if let crate::domain::InlineNode::Text(t) = inline
                             && let Some(fc) = &mut t.formatting_change
+                            && fc.is_physical_revision()
                         {
                             claim(&mut fc.revision_id);
                         }
@@ -426,6 +455,9 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
                 }
                 for row in &mut t.rows {
                     if let Some(fc) = &mut row.formatting_change {
+                        claim(&mut fc.revision_id);
+                    }
+                    if let Some(fc) = &mut row.tbl_pr_ex_change {
                         claim(&mut fc.revision_id);
                     }
                     for cell in &mut row.cells {
@@ -442,7 +474,7 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
         }
     }
 
-    let mut claim_fn = |id: &mut u32| claim(id, &mut seen, &mut next);
+    let mut claim_fn = |id: &mut u32| claim(id, &mut seen, &mut used, &mut next);
     for tb in &mut doc.blocks {
         visit_block(&mut tb.block, &mut claim_fn);
     }
@@ -502,16 +534,43 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
 /// added to one but not here would let a wire-0 revision on it re-open the
 /// divergence.
 fn mint_wire_zero_revision_ids(doc: &mut CanonDoc) {
-    // Seed above every id already present (across the SAME complete carrier set
-    // — `max_revision_id` covers hyperlink runs and the comment story status
-    // too), so every minted id is unique against existing ids and each other.
-    let mut next = crate::runtime::max_revision_id(doc) + 1;
+    // Prefer the space above the current maximum. `u32::MAX` is itself a legal
+    // wire value, so that space may be exhausted at the top; in that case wrap
+    // to 1 and claim the first free slot. The package size limit makes actual
+    // exhaustion of the 32-bit space unreachable, but the bounded search still
+    // fails as a named invariant rather than looping.
+    let mut used = std::collections::HashSet::new();
     for_each_revision_id_mut(doc, &mut |id| {
-        if *id == 0 {
-            *id = next;
-            next += 1;
+        if *id != 0 {
+            used.insert(*id);
         }
     });
+    let mut next = used
+        .iter()
+        .copied()
+        .max()
+        .and_then(|id| id.checked_add(1))
+        .unwrap_or(1);
+    for_each_revision_id_mut(doc, &mut |id| {
+        if *id == 0 {
+            *id = take_next_revision_annotation_id(&mut used, &mut next);
+        }
+    });
+}
+
+fn take_next_revision_annotation_id(
+    used: &mut std::collections::HashSet<u32>,
+    next: &mut u32,
+) -> u32 {
+    let search_bound = used.len() + 1;
+    for _ in 0..search_bound {
+        let candidate = *next;
+        *next = next.checked_add(1).unwrap_or(1);
+        if candidate != 0 && used.insert(candidate) {
+            return candidate;
+        }
+    }
+    panic!("revision annotation id space exhausted while normalizing imported ids");
 }
 
 /// Visit every tracked-change carrier's `revision_id` mutably, in the carrier
@@ -547,7 +606,16 @@ pub(crate) fn for_each_revision_id_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(&mu
             for inline in &mut seg.inlines {
                 match inline {
                     InlineNode::Text(t) => {
-                        if let Some(fc) = &mut t.formatting_change {
+                        if let Some(fc) = &mut t.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            f(&mut fc.revision_id);
+                        }
+                    }
+                    InlineNode::HardBreak(hard_break) => {
+                        if let Some(fc) = &mut hard_break.formatting_change
+                            && fc.is_physical_revision()
+                        {
                             f(&mut fc.revision_id);
                         }
                     }
@@ -577,6 +645,9 @@ pub(crate) fn for_each_revision_id_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(&mu
                 for row in &mut t.rows {
                     visit_optional_status(&mut row.tracking_status, f);
                     if let Some(fc) = &mut row.formatting_change {
+                        f(&mut fc.revision_id);
+                    }
+                    if let Some(fc) = &mut row.tbl_pr_ex_change {
                         f(&mut fc.revision_id);
                     }
                     for cell in &mut row.cells {
@@ -646,7 +717,7 @@ pub(crate) struct RevCarrierMut<'a> {
     /// move enumerates as one record and resolves atomically. `None` for
     /// formatting changes (always their own revision) and non-move content.
     pub move_group: Option<String>,
-    /// Formatting-change elements are independent OOXML annotations even when
+    /// Physical formatting-change elements are independent OOXML annotations even when
     /// they happen to reuse the same wire id/author/date. The serializer must
     /// give sibling `rPrChange` elements distinct annotation ids, so folding
     /// them through the ordinary wire group here would split one in-memory
@@ -704,8 +775,10 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
             visit_status(s, move_group, move_signature, f);
         }
     }
-    // A formatting change is ALWAYS its own revision (never part of a move):
-    // group it by (wire, author, date) with `move_group: None`.
+    // A physical formatting change is ALWAYS its own revision (never part of
+    // a move): group it by (wire, author, date) with `move_group: None`.
+    // ParagraphStyleCascade snapshots are deliberately skipped by callers:
+    // their enclosing pPrChange is the only Word revision carrier.
     fn visit_fmt(
         identity: &mut u32,
         wire_id: u32,
@@ -743,7 +816,16 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
             for inline in &mut seg.inlines {
                 match inline {
                     InlineNode::Text(t) => {
-                        if let Some(fc) = &mut t.formatting_change {
+                        if let Some(fc) = &mut t.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_fmt(&mut fc.identity, fc.revision_id, &fc.author, &fc.date, f);
+                        }
+                    }
+                    InlineNode::HardBreak(hard_break) => {
+                        if let Some(fc) = &mut hard_break.formatting_change
+                            && fc.is_physical_revision()
+                        {
                             visit_fmt(&mut fc.identity, fc.revision_id, &fc.author, &fc.date, f);
                         }
                     }
@@ -778,6 +860,9 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                 for row in &mut t.rows {
                     visit_optional_status(&mut row.tracking_status, None, None, f);
                     if let Some(fc) = &mut row.formatting_change {
+                        visit_fmt(&mut fc.identity, fc.revision_id, &fc.author, &fc.date, f);
+                    }
+                    if let Some(fc) = &mut row.tbl_pr_ex_change {
                         visit_fmt(&mut fc.identity, fc.revision_id, &fc.author, &fc.date, f);
                     }
                     for cell in &mut row.cells {
@@ -914,6 +999,9 @@ pub(crate) struct RevisionIdentityCollision {
 
 impl std::fmt::Display for RevisionIdentityCollision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.candidate == 0 {
+            return write!(f, "revision identity invariant failed: {}", self.records);
+        }
         write!(
             f,
             "canonical revision identity digest prefix {} is already occupied for {}",
@@ -1047,18 +1135,27 @@ fn adopt_persisted_revision_identities(archive: &DocxArchive, doc: &mut CanonDoc
 }
 
 pub(crate) fn try_mint_identities(doc: &mut CanonDoc) -> Result<(), RevisionIdentityCollision> {
-    fn allocate_temporary_identity(next: &mut u32, occupied: &mut HashSet<u32>) -> u32 {
+    fn allocate_temporary_identity(
+        next: &mut u32,
+        occupied: &mut HashSet<u32>,
+    ) -> Result<u32, RevisionIdentityCollision> {
         while occupied.contains(next) || *next == 0 {
             *next = next
                 .checked_add(1)
-                .expect("revision identity space exhausted before temporary minting");
+                .ok_or_else(|| RevisionIdentityCollision {
+                    candidate: 0,
+                    records: "u32 space exhausted before temporary minting".to_string(),
+                })?;
         }
         let identity = *next;
         occupied.insert(identity);
         *next = next
             .checked_add(1)
-            .expect("revision identity space exhausted after temporary minting");
-        identity
+            .ok_or_else(|| RevisionIdentityCollision {
+                candidate: 0,
+                records: "u32 space exhausted after temporary minting".to_string(),
+            })?;
+        Ok(identity)
     }
 
     // Pass 1: recover existing group memberships. Temporary ids for new groups
@@ -1086,29 +1183,65 @@ pub(crate) fn try_mint_identities(doc: &mut CanonDoc) -> Result<(), RevisionIden
     let mut occupied = existing_identities.clone();
     let mut next = 1;
     let mut newly_minted_groups = HashSet::new();
+    let mut allocation_error = None;
     // Pass 2: assign a temporary grouped identity to every zero carrier, in
     // document order, preserving the established H7 grouping rules.
     for_each_rev_carrier_mut(doc, &mut |c| {
-        if *c.identity != 0 {
+        if *c.identity != 0 || allocation_error.is_some() {
             return;
         }
         let id = match &c.move_group {
-            Some(m) => *move_groups
-                .entry(m.clone())
-                .or_insert_with(|| allocate_temporary_identity(&mut next, &mut occupied)),
-            None if c.force_distinct => allocate_temporary_identity(&mut next, &mut occupied),
-            None => *wire_groups
-                .entry((c.wire_id, c.author.clone(), c.date.clone()))
-                .or_insert_with(|| allocate_temporary_identity(&mut next, &mut occupied)),
+            Some(m) => match move_groups.get(m) {
+                Some(identity) => *identity,
+                None => match allocate_temporary_identity(&mut next, &mut occupied) {
+                    Ok(identity) => {
+                        move_groups.insert(m.clone(), identity);
+                        identity
+                    }
+                    Err(error) => {
+                        allocation_error = Some(error);
+                        return;
+                    }
+                },
+            },
+            None if c.force_distinct => {
+                match allocate_temporary_identity(&mut next, &mut occupied) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        allocation_error = Some(error);
+                        return;
+                    }
+                }
+            }
+            None => {
+                let key = (c.wire_id, c.author.clone(), c.date.clone());
+                match wire_groups.get(&key) {
+                    Some(identity) => *identity,
+                    None => match allocate_temporary_identity(&mut next, &mut occupied) {
+                        Ok(identity) => {
+                            wire_groups.insert(key, identity);
+                            identity
+                        }
+                        Err(error) => {
+                            allocation_error = Some(error);
+                            return;
+                        }
+                    },
+                }
+            }
         };
         *c.identity = id;
         if !existing_identities.contains(&id) {
             newly_minted_groups.insert(id);
         }
     });
+    if let Some(error) = allocation_error {
+        return Err(error);
+    }
     unify_inserted_move_origin_identities(doc);
     unify_whole_paragraph_insert_identities(doc);
     unify_inserted_note_identities(doc);
+    unify_comment_change_identities(doc);
     unify_created_header_footer_identities(doc);
     unify_tail_paragraph_insert_identities(doc);
     unify_whole_paragraph_delete_identities(doc);
@@ -1251,6 +1384,150 @@ fn unify_inserted_note_identities(doc: &mut CanonDoc) {
     }
     for tracked in &mut doc.blocks {
         visit_block(&mut tracked.block, &insertions);
+    }
+}
+
+/// Give a comparison-created comment change one shared review identity.
+///
+/// A comment insertion/deletion spans two package regions: its definition in
+/// `comments.xml` and its range/reference markers in an active story. Those
+/// marker envelopes need distinct wire annotation ids, but exposing them as
+/// independently selectable revisions permits a partial resolution to remove
+/// the definition while retaining an anchor (or the inverse). A marker-only
+/// tracked segment, the shared comment id, polarity, and attribution provide
+/// the structural proof needed to reunite those carriers.
+fn unify_comment_change_identities(doc: &mut CanonDoc) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Polarity {
+        Inserted,
+        Deleted,
+    }
+
+    struct CommentChange {
+        comment_id: String,
+        polarity: Polarity,
+        identity: u32,
+        author: Option<String>,
+        date: Option<String>,
+    }
+
+    fn inserted_story_revision(blocks: &[TrackedBlock]) -> Option<&RevisionInfo> {
+        let first = blocks.first()?;
+        match &first.status {
+            TrackingStatus::Inserted(revision) => Some(revision),
+            _ => None,
+        }
+    }
+
+    fn marker_id(inline: &InlineNode) -> Option<&str> {
+        match inline {
+            InlineNode::CommentRangeStart { id }
+            | InlineNode::CommentRangeEnd { id }
+            | InlineNode::CommentReference { id } => Some(id),
+            InlineNode::OpaqueInline(opaque) => match &opaque.kind {
+                OpaqueKind::CommentReference(reference) => Some(&reference.reference_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn visit_block(block: &mut BlockNode, changes: &[CommentChange]) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    let (polarity, revision) = match &mut segment.status {
+                        TrackingStatus::Inserted(revision) => (Polarity::Inserted, revision),
+                        TrackingStatus::Deleted(revision) => (Polarity::Deleted, revision),
+                        TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => continue,
+                    };
+                    if segment.inlines.is_empty()
+                        || segment
+                            .inlines
+                            .iter()
+                            .any(|inline| marker_id(inline).is_none())
+                    {
+                        continue;
+                    }
+                    let Some(comment_id) = marker_id(&segment.inlines[0]) else {
+                        continue;
+                    };
+                    if !segment
+                        .inlines
+                        .iter()
+                        .all(|inline| marker_id(inline) == Some(comment_id))
+                    {
+                        continue;
+                    }
+                    if let Some(change) = changes.iter().find(|change| {
+                        change.comment_id == comment_id
+                            && change.polarity == polarity
+                            && change.author == revision.author
+                            && change.date == revision.date
+                    }) {
+                        revision.identity = change.identity;
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            visit_block(nested, changes);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn visit_blocks(blocks: &mut [TrackedBlock], changes: &[CommentChange]) {
+        for tracked in blocks {
+            visit_block(&mut tracked.block, changes);
+        }
+    }
+
+    let mut changes = Vec::new();
+    for story in &doc.comments {
+        if let Some(revision) = inserted_story_revision(&story.blocks) {
+            changes.push(CommentChange {
+                comment_id: story.id.clone(),
+                polarity: Polarity::Inserted,
+                identity: revision.identity,
+                author: revision.author.clone(),
+                date: revision.date.clone(),
+            });
+        }
+        if let Some(TrackingStatus::Deleted(revision)) = &story.tracking_status {
+            changes.push(CommentChange {
+                comment_id: story.id.clone(),
+                polarity: Polarity::Deleted,
+                identity: revision.identity,
+                author: revision.author.clone(),
+                date: revision.date.clone(),
+            });
+        }
+    }
+    if changes.is_empty() {
+        return;
+    }
+
+    visit_blocks(&mut doc.blocks, &changes);
+    for story in &mut doc.headers {
+        visit_blocks(&mut story.blocks, &changes);
+    }
+    for story in &mut doc.footers {
+        visit_blocks(&mut story.blocks, &changes);
+    }
+    for story in &mut doc.footnotes {
+        visit_blocks(&mut story.blocks, &changes);
+    }
+    for story in &mut doc.endnotes {
+        visit_blocks(&mut story.blocks, &changes);
+    }
+    for story in &mut doc.comments {
+        visit_blocks(&mut story.blocks, &changes);
     }
 }
 
@@ -1880,11 +2157,14 @@ fn assign_canonical_revision_identities(
         replacements.insert(*temporary, candidate);
     }
 
-    assert_eq!(
-        replacements.len(),
-        temporary_ids.len(),
-        "every newly minted revision group must appear in canonical enumeration: temporary={temporary_ids:?} replacements={replacements:?}"
-    );
+    if replacements.len() != temporary_ids.len() {
+        return Err(RevisionIdentityCollision {
+            candidate: 0,
+            records: format!(
+                "not every temporary revision group appeared in canonical enumeration: temporary={temporary_ids:?} replacements={replacements:?}"
+            ),
+        });
+    }
     for_each_rev_carrier_mut(doc, &mut |carrier| {
         if let Some(identity) = replacements.get(carrier.identity) {
             *carrier.identity = *identity;
@@ -1893,7 +2173,8 @@ fn assign_canonical_revision_identities(
     Ok(())
 }
 
-pub(crate) fn mint_identities(doc: &mut CanonDoc) {
+#[doc(hidden)]
+pub fn mint_identities(doc: &mut CanonDoc) {
     try_mint_identities(doc).expect("canonical revision identities must fit the public u32 domain");
 }
 
@@ -2599,12 +2880,17 @@ fn build_canonical_from_archive(
         crate::numbering::NumberingDefinitions::parse,
     )?;
 
-    // Load style definitions (optional - may not exist in all docx files)
-    let mut style_defs = parse_optional_docx_part(
-        archive,
-        "word/styles.xml",
-        crate::styles::StyleDefinitions::parse,
-    )?;
+    // Load style definitions. A missing part still has the Word run-property
+    // fallback semantics (notably Times New Roman when no font resolves), so
+    // keep an empty definition table rather than bypassing style resolution.
+    let mut style_defs = Some(
+        parse_optional_docx_part(
+            archive,
+            "word/styles.xml",
+            crate::styles::StyleDefinitions::parse,
+        )?
+        .unwrap_or_default(),
+    );
 
     // Load theme font definitions (optional) and attach to style definitions
     let theme_fonts = parse_optional_docx_part(
@@ -2775,12 +3061,12 @@ fn build_canonical_from_archive(
         comments,
         body_section_properties,
         body_section_property_change,
+        even_and_odd_headers,
         document_background,
     });
 
     doc.compat_settings = compat_settings;
     doc.comments_extended = comments_extended;
-    doc.even_and_odd_headers = even_and_odd_headers;
     apply_document_protection(archive, &mut doc, &mut diagnostics).map_err(invalid_docx_message)?;
 
     // Resolve external hyperlink URLs from document relationships
@@ -2832,6 +3118,7 @@ pub(crate) fn build_canonical_from_root_with_stories(
     footnotes: Vec<FootnoteStory>,
     endnotes: Vec<EndnoteStory>,
     comments: Vec<CommentStory>,
+    even_and_odd_headers: Option<bool>,
     // The package this document came from, when there is one. Used only to
     // adopt engine identities a previous save recorded; `None` for callers
     // that build from a bare root (fragments, tests), which simply derive.
@@ -2908,6 +3195,7 @@ pub(crate) fn build_canonical_from_root_with_stories(
         comments,
         body_section_properties,
         body_section_property_change,
+        even_and_odd_headers,
         document_background,
     });
 
@@ -2983,6 +3271,7 @@ struct AssembleCanonical {
     comments: Vec<CommentStory>,
     body_section_properties: Option<crate::domain::SectionProperties>,
     body_section_property_change: Option<SectionPropertyChange>,
+    even_and_odd_headers: Option<bool>,
     document_background: Option<crate::domain::DocumentBackground>,
 }
 
@@ -3051,9 +3340,7 @@ fn assemble_canonical_doc(parts: AssembleCanonical) -> CanonDoc {
         body_section_properties: parts.body_section_properties,
         body_section_property_change: parts.body_section_property_change,
         compat_settings: CompatSettings::default(),
-        // Populated by the archive-aware caller (it has settings.xml); default
-        // to absent here so the root builder stays archive-agnostic.
-        even_and_odd_headers: None,
+        even_and_odd_headers: parts.even_and_odd_headers,
         document_background: parts.document_background,
         // Populated by the archive-aware caller (it has settings.xml); default
         // to absent here so the root builder stays archive-agnostic.
@@ -3345,9 +3632,10 @@ fn resolve_refs(
 /// preceding section to inherit from), a blank/empty default header is
 /// synthesized.
 ///
-/// Additionally, per §17.10.5: when the first section has titlePg=true but no
-/// first-page headerReference, a blank first-page header is synthesized (since
-/// there is no preceding section to inherit from).
+/// Additionally, when the first section has titlePg=true but no first-page
+/// reference, or different even/odd headers are enabled without an even-page
+/// reference, the missing first-section story is blank because no preceding
+/// section can supply an inherited value.
 ///
 /// This must run after `resolve_section_header_inheritance` so that
 /// inheritance has already been resolved and we only fill in gaps for
@@ -3366,7 +3654,7 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
     });
 
     // Determine which header kinds need synthesis
-    let (needs_blank_default, needs_blank_first) = if first_section_is_body {
+    let (needs_blank_default, needs_blank_first, needs_blank_even) = if first_section_is_body {
         doc.body_section_properties
             .as_ref()
             .map(|sp| {
@@ -3378,10 +3666,18 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
                     .header_refs
                     .iter()
                     .any(|r| r.kind == HeaderFooterKind::First);
+                let has_even = sp
+                    .header_refs
+                    .iter()
+                    .any(|r| r.kind == HeaderFooterKind::Even);
                 let title_pg = sp.title_page == Some(true);
-                (!has_default, title_pg && !has_first)
+                (
+                    !has_default,
+                    title_pg && !has_first,
+                    doc.even_and_odd_headers == Some(true) && !has_even,
+                )
             })
-            .unwrap_or((false, false))
+            .unwrap_or((false, false, false))
     } else {
         doc.blocks
             .iter()
@@ -3401,13 +3697,21 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
                     .header_refs
                     .iter()
                     .any(|r| r.kind == HeaderFooterKind::First);
+                let has_even = sp
+                    .header_refs
+                    .iter()
+                    .any(|r| r.kind == HeaderFooterKind::Even);
                 let title_pg = sp.title_page == Some(true);
-                (!has_default, title_pg && !has_first)
+                (
+                    !has_default,
+                    title_pg && !has_first,
+                    doc.even_and_odd_headers == Some(true) && !has_even,
+                )
             })
-            .unwrap_or((false, false))
+            .unwrap_or((false, false, false))
     };
 
-    if !needs_blank_default && !needs_blank_first {
+    if !needs_blank_default && !needs_blank_first && !needs_blank_even {
         return;
     }
 
@@ -3423,6 +3727,11 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
             HeaderFooterKind::First,
             "synthesized-blank-header-first",
         ),
+        (
+            needs_blank_even,
+            HeaderFooterKind::Even,
+            "synthesized-blank-header-even",
+        ),
     ]
     .iter()
     .filter(|(needed, _, _)| *needed)
@@ -3430,10 +3739,10 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
     .collect();
 
     for (kind, name_prefix) in &kinds_to_synthesize {
-        let part_suffix = if *kind == HeaderFooterKind::First {
-            "first"
-        } else {
-            "default"
+        let part_suffix = match kind {
+            HeaderFooterKind::First => "first",
+            HeaderFooterKind::Even => "even",
+            HeaderFooterKind::Default => "default",
         };
         let part_name = format!("synthesized-blank-header-{part_suffix}.xml");
         let empty_para = synthesize_blank_paragraph(name_prefix, "Header");
@@ -3473,11 +3782,14 @@ pub(crate) fn synthesize_blank_headers_for_first_section(doc: &mut CanonDoc) {
 }
 
 /// Synthesize a blank paragraph for use in blank header/footer stories.
-fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockNode {
+pub(crate) fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockNode {
     BlockNode::from(ParagraphNode {
         id: NodeId::from(format!("{rel_id}:p0")),
         style_id: Some(style_id.to_string().into()),
-        align: None,
+        // The blank still has Word's effective LTR paragraph alignment. Keep
+        // effective value and direct provenance separate, as for every parsed
+        // paragraph and `ParagraphNode::new_story_body`.
+        align: Some(crate::domain::Alignment::Left),
         has_direct_align: false,
         indent: None,
         has_direct_indent: false,
@@ -3489,22 +3801,25 @@ fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockNode {
         keep_next: None,
         keep_lines: None,
         page_break_before: false,
-        widow_control: None,
+        // w:widowControl defaults to true when absent (§17.3.1.44).
+        widow_control: Some(true),
         contextual_spacing: None,
         shading: None,
-        has_direct_keep_next: true,
-        has_direct_keep_lines: true,
-        has_direct_page_break_before: true,
-        has_direct_widow_control: true,
-        has_direct_contextual_spacing: true,
-        has_direct_shading: true,
-        has_direct_borders: true,
+        // A synthesized blank carries only its explicit Header/Footer style.
+        // Effective absences are not authored direct pPr values.
+        has_direct_keep_next: false,
+        has_direct_keep_lines: false,
+        has_direct_page_break_before: false,
+        has_direct_widow_control: false,
+        has_direct_contextual_spacing: false,
+        has_direct_shading: false,
+        has_direct_borders: false,
         tab_stops: vec![],
         effective_tab_stops_rel: vec![],
         segments: vec![],
         block_text_hash: None,
         numbering: None,
-        has_direct_numbering: true,
+        has_direct_numbering: false,
         numbering_suppressed: false,
         materialized_numbering: None,
         rendered_text: None,
@@ -3555,8 +3870,8 @@ fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockNode {
 /// preceding section to inherit from), a blank/empty default footer is
 /// synthesized.
 ///
-/// Additionally, per §17.10.5: when the first section has titlePg=true but no
-/// first-page footerReference, a blank first-page footer is synthesized.
+/// The same first-section default, first-page, and enabled-even-page rules
+/// apply to footers.
 ///
 /// This mirrors `synthesize_blank_headers_for_first_section` exactly.
 pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
@@ -3570,7 +3885,7 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
         }
     });
 
-    let (needs_blank_default, needs_blank_first) = if first_section_is_body {
+    let (needs_blank_default, needs_blank_first, needs_blank_even) = if first_section_is_body {
         doc.body_section_properties
             .as_ref()
             .map(|sp| {
@@ -3582,10 +3897,18 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
                     .footer_refs
                     .iter()
                     .any(|r| r.kind == HeaderFooterKind::First);
+                let has_even = sp
+                    .footer_refs
+                    .iter()
+                    .any(|r| r.kind == HeaderFooterKind::Even);
                 let title_pg = sp.title_page == Some(true);
-                (!has_default, title_pg && !has_first)
+                (
+                    !has_default,
+                    title_pg && !has_first,
+                    doc.even_and_odd_headers == Some(true) && !has_even,
+                )
             })
-            .unwrap_or((false, false))
+            .unwrap_or((false, false, false))
     } else {
         doc.blocks
             .iter()
@@ -3605,13 +3928,21 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
                     .footer_refs
                     .iter()
                     .any(|r| r.kind == HeaderFooterKind::First);
+                let has_even = sp
+                    .footer_refs
+                    .iter()
+                    .any(|r| r.kind == HeaderFooterKind::Even);
                 let title_pg = sp.title_page == Some(true);
-                (!has_default, title_pg && !has_first)
+                (
+                    !has_default,
+                    title_pg && !has_first,
+                    doc.even_and_odd_headers == Some(true) && !has_even,
+                )
             })
-            .unwrap_or((false, false))
+            .unwrap_or((false, false, false))
     };
 
-    if !needs_blank_default && !needs_blank_first {
+    if !needs_blank_default && !needs_blank_first && !needs_blank_even {
         return;
     }
 
@@ -3626,6 +3957,11 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
             HeaderFooterKind::First,
             "synthesized-blank-footer-first",
         ),
+        (
+            needs_blank_even,
+            HeaderFooterKind::Even,
+            "synthesized-blank-footer-even",
+        ),
     ]
     .iter()
     .filter(|(needed, _, _)| *needed)
@@ -3633,10 +3969,10 @@ pub(crate) fn synthesize_blank_footers_for_first_section(doc: &mut CanonDoc) {
     .collect();
 
     for (kind, name_prefix) in &kinds_to_synthesize {
-        let part_suffix = if *kind == HeaderFooterKind::First {
-            "first"
-        } else {
-            "default"
+        let part_suffix = match kind {
+            HeaderFooterKind::First => "first",
+            HeaderFooterKind::Even => "even",
+            HeaderFooterKind::Default => "default",
         };
         let part_name = format!("synthesized-blank-footer-{part_suffix}.xml");
         let empty_para = synthesize_blank_paragraph(name_prefix, "Footer");
@@ -3861,7 +4197,7 @@ fn append_blocks_from_element(
                 blocks.push(normal_tracked_block(BlockNode::from(OpaqueBlockNode {
                     id: opaque_id,
                     kind: OpaqueKind::QuarantinedNestedTracking,
-                    opaque_ref: format!("body_item_{index}"),
+                    opaque_ref: opaque_body_ref(element),
                     proof_ref,
                     range_marker: None,
                 })));
@@ -4043,7 +4379,7 @@ fn append_blocks_from_element(
         blocks.push(normal_tracked_block(BlockNode::from(OpaqueBlockNode {
             id: opaque_id,
             kind: OpaqueKind::Sdt,
-            opaque_ref: format!("body_item_{index}"),
+            opaque_ref: opaque_body_ref(element),
             proof_ref,
             range_marker: None,
         })));
@@ -4085,7 +4421,7 @@ fn append_blocks_from_element(
         blocks.push(normal_tracked_block(BlockNode::from(OpaqueBlockNode {
             id: opaque_id,
             kind,
-            opaque_ref: format!("body_item_{index}"),
+            opaque_ref: opaque_body_ref(element),
             proof_ref,
             range_marker,
         })));
@@ -4574,7 +4910,7 @@ fn table_from_element(
             // fields don't model (vendor extensions, future OOXML) verbatim.
             formatting.preserved =
                 capture_unmodeled_children(el, crate::docx_validate_ordering::TBLPR_ORDER);
-            formatting_change = parse_tbl_pr_change(el)?;
+            formatting_change = parse_tbl_pr_change(el, ctx.style_defs)?;
             continue;
         }
 
@@ -4737,6 +5073,12 @@ fn table_from_element(
 
     // Store tbl_look on formatting for roundtrip serialization.
     formatting.tbl_look = Some(parsed_tbl_look);
+    // `tblPrChange` cannot carry `tblGrid`; the grid is shared by both
+    // terminal readings. Retain it in the canonical previous projection so
+    // in-memory Reject is exact without pretending it was revisioned.
+    if let Some(change) = formatting_change.as_mut() {
+        change.previous.grid_cols = formatting.grid_cols.clone();
+    }
 
     // Post-process: clamp gridSpan to not exceed tblGrid column count (§17.4.17).
     let grid_col_count = formatting.grid_cols.len() as u32;
@@ -4750,8 +5092,12 @@ fn table_from_element(
         }
     }
 
-    // Post-process: validate vMerge grid alignment (§17.4.84).
-    normalize_vmerge_grid_alignment(&mut rows);
+    // Validate vMerge grid alignment (§17.4.84). A non-conformant chain is an
+    // input error, not a normalization opportunity: clearing the imported
+    // `vMerge` state would make the canonical source differ from the package
+    // that Word actually opened and would let later terminal proofs certify a
+    // lossy Reject projection.
+    validate_vmerge_grid_alignment(&rows)?;
 
     // Post-process: resolve border conflicts between table and cell borders
     // (MS-OI29500 §17.4.66(a)). Higher weight wins.
@@ -4798,6 +5144,8 @@ fn table_row_from_element(
     let mut w_after: Option<TableMeasurement> = None;
     let mut cnf_style: Option<crate::domain::CnfStyle> = None;
     let mut tbl_pr_ex: Option<TableFormatting> = None;
+    let mut tbl_pr_ex_change: Option<crate::domain::TablePropertyExceptionChange> = None;
+    let mut saw_tbl_pr_ex = false;
     let mut cell_spacing: Option<i64> = None;
     let mut preserved: Vec<crate::domain::PreservedProp> = Vec::new();
 
@@ -4862,7 +5210,10 @@ fn table_row_from_element(
                     }
                     // Parse cnfStyle (row conditional formatting, §17.4.7).
                     if is_w_tag(prop_el, "cnfStyle") {
-                        cnf_style = parse_cnf_style(prop_el);
+                        cnf_style =
+                            Some(parse_cnf_style_element(prop_el).map_err(|error| {
+                                invalid_docx(&format!("row cnfStyle: {error}"))
+                            })?);
                     }
                     // Parse trHeight (row height)
                     if is_w_tag(prop_el, "trHeight") {
@@ -4931,7 +5282,14 @@ fn table_row_from_element(
         // Row-level table property exceptions (w:tblPrEx, §17.4.61) — a direct
         // child of w:tr, NOT inside trPr. Per-row override of table properties.
         if is_w_tag(el, "tblPrEx") {
-            tbl_pr_ex = Some(parse_tbl_pr_ex(el)?);
+            if saw_tbl_pr_ex {
+                return Err(invalid_docx(&format!(
+                    "table row tbl_{table_id}_r{row_index} contains more than one w:tblPrEx"
+                )));
+            }
+            saw_tbl_pr_ex = true;
+            tbl_pr_ex = canonical_tbl_pr_ex(parse_tbl_pr_ex(el)?);
+            tbl_pr_ex_change = parse_tbl_pr_ex_change(el)?;
             continue;
         }
 
@@ -5094,6 +5452,7 @@ fn table_row_from_element(
         w_after,
         cnf_style,
         tbl_pr_ex,
+        tbl_pr_ex_change,
         cell_spacing,
         preserved,
     })
@@ -5113,6 +5472,11 @@ fn table_cell_from_element(
     // Cell-level bookmark markers with the block count at their position.
     let mut pending_markers: Vec<(usize, InlineNode)> = Vec::new();
     let mut grid_span: u32 = 1;
+    // Word rewrites a vMerge continuation below a gridBefore/gridAfter omission
+    // as `gridSpan=0` while removing the row omission. The normalized table
+    // model still gives that continuation one logical column; retain Word's
+    // zero-valued carrier separately so it can be recognized and re-emitted.
+    let mut word_zero_grid_span = None;
     let mut v_merge = VerticalMerge::None;
     // `CellFormatting::default()` assumes present == authored, which is right
     // where the model is constructed and wrong at the parse edge: this cell has
@@ -5174,11 +5538,20 @@ fn table_cell_from_element(
                         // `w:gridSpan` counts grid columns and a cell occupies
                         // at least one (§17.4.17). Wild documents do carry
                         // `w:val="0"`, and Word lays those out as a single
-                        // column, so this normalizes rather than refuses —
-                        // a documented contract decision, not a silent repair.
-                        // Storing the zero verbatim was worse than either: the
-                        // serializer emits the element only above one, so the
-                        // value could not survive its own round trip.
+                        // column, so the domain projection remains one. When
+                        // Word uses zero on a vMerge continuation it is also a
+                        // physical sentinel for an omitted vertical region;
+                        // capture it now and qualify that bounded form after
+                        // all tcPr children have been parsed.
+                        if parsed == 0 {
+                            word_zero_grid_span = Some(crate::domain::PreservedProp {
+                                name: qualified_prop_name(prop_el),
+                                raw_xml: String::from_utf8(
+                                    crate::word_xml::serialize_raw_fragment(prop_el),
+                                )
+                                .expect("serialize_raw_fragment always emits valid UTF-8 XML"),
+                            });
+                        }
                         grid_span = parsed.max(1);
                     }
                     // Parse vMerge (vertical merge)
@@ -5191,7 +5564,10 @@ fn table_cell_from_element(
                     }
                     // Parse cnfStyle (cell conditional formatting, §17.4.7).
                     if is_w_tag(prop_el, "cnfStyle") {
-                        cnf_style = parse_cnf_style(prop_el);
+                        cnf_style =
+                            Some(parse_cnf_style_element(prop_el).map_err(|error| {
+                                invalid_docx(&format!("cell cnfStyle: {error}"))
+                            })?);
                     }
                     // Parse hideMark (hidden end-of-cell mark, §17.4.10).
                     if is_w_tag(prop_el, "hideMark") {
@@ -5286,6 +5662,11 @@ fn table_cell_from_element(
             // RFC-0003 "never silently drop": capture any tcPr child the typed
             // fields don't consume — legacy w:hMerge, vendor extensions.
             preserved = capture_unmodeled_children(el, TCPR_CONSUMED);
+            if v_merge == VerticalMerge::Continue
+                && let Some(zero_grid_span) = word_zero_grid_span.take()
+            {
+                preserved.push(zero_grid_span);
+            }
             continue;
         }
 
@@ -5754,14 +6135,49 @@ fn parse_shading(props: &Element) -> Result<Option<Shading>, RuntimeError> {
         if let XMLNode::Element(el) = child
             && is_w_tag(el, "shd")
         {
-            let fill = attr_get(el, "w:fill").cloned();
-            let val = attr_get(el, "w:val")
+            let word_attribute = |local_name: &str| {
+                el.attributes.iter().find_map(|(name, value)| {
+                    if name.local_name != local_name {
+                        return None;
+                    }
+                    let is_word_attribute = match name.namespace.as_deref() {
+                        Some(namespace) => {
+                            namespace
+                                == "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                        }
+                        None => name.prefix.as_deref() == Some("w"),
+                    };
+                    is_word_attribute.then_some(value)
+                })
+            };
+            let fill = word_attribute("fill").cloned();
+            let val = word_attribute("val")
                 .map(|v| ShadingPattern::from_xml_str(v))
                 .transpose()
                 .map_err(|e| invalid_docx(&format!("shading: {e}")))?;
-            let color = attr_get(el, "w:color").cloned();
+            let color = word_attribute("color").cloned();
             // Preserve theme fills/colors verbatim (RFC-0003).
-            let extra_attrs = crate::xml_attrs::capture_extra_attrs(el, &["val", "fill", "color"]);
+            let extra_attrs = el
+                .attributes
+                .iter()
+                .filter_map(|(name, value)| {
+                    if name.prefix.as_deref() == Some("xmlns") || name.local_name == "xmlns" {
+                        return None;
+                    }
+                    if name.namespace.as_deref()
+                        == Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main")
+                        && ["val", "fill", "color"].contains(&name.local_name.as_str())
+                    {
+                        return None;
+                    }
+                    Some(crate::domain::QualifiedAttribute {
+                        local_name: name.local_name.clone(),
+                        prefix: name.prefix.clone(),
+                        namespace: name.namespace.clone(),
+                        value: value.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
             // Only return shading if there's meaningful data
             if fill.is_some() || val.is_some() || color.is_some() || !extra_attrs.is_empty() {
                 return Ok(Some(Shading {
@@ -6132,36 +6548,6 @@ fn parse_table_measurement(
     Ok(None)
 }
 
-/// Parse a single `w:cnfStyle` element (§17.4.7 / §17.3.1.8) into a CnfStyle.
-///
-/// Used for the row-level (trPr) and cell-level (tcPr) conditional-formatting
-/// flags. Paragraph-level cnfStyle is parsed independently in word_ir.rs; both
-/// produce the same domain type. The 12 boolean attributes mirror the bits of
-/// the legacy `w:val` 12-character binary string, which is preserved verbatim.
-fn parse_cnf_style(cnf_el: &Element) -> Option<crate::domain::CnfStyle> {
-    let bool_attr = |name: &str| -> bool {
-        matches!(
-            attr_get(cnf_el, name).map(|s| s.as_str()),
-            Some("1") | Some("true")
-        )
-    };
-    Some(crate::domain::CnfStyle {
-        val: attr_get(cnf_el, "w:val").cloned(),
-        first_row: bool_attr("w:firstRow"),
-        last_row: bool_attr("w:lastRow"),
-        first_column: bool_attr("w:firstColumn"),
-        last_column: bool_attr("w:lastColumn"),
-        odd_v_band: bool_attr("w:oddVBand"),
-        even_v_band: bool_attr("w:evenVBand"),
-        odd_h_band: bool_attr("w:oddHBand"),
-        even_h_band: bool_attr("w:evenHBand"),
-        first_row_first_column: bool_attr("w:firstRowFirstColumn"),
-        first_row_last_column: bool_attr("w:firstRowLastColumn"),
-        last_row_first_column: bool_attr("w:lastRowFirstColumn"),
-        last_row_last_column: bool_attr("w:lastRowLastColumn"),
-    })
-}
-
 /// Parse a `w:tblPrEx` element (§17.4.61, CT_TblPrEx) into a TableFormatting.
 ///
 /// tblPrEx carries per-row overrides of table-level properties. Only the
@@ -6185,9 +6571,97 @@ fn parse_tbl_pr_ex(el: &Element) -> Result<TableFormatting, RuntimeError> {
         layout: parse_table_layout(el)?,
         cell_spacing: parse_table_cell_spacing(el),
         tbl_look: has_tbl_look.then(|| parse_tbl_look(el)),
+        shading: parse_shading(el)?,
+        preserved: capture_unmodeled_children(el, TBLPREX_CONSUMED),
         ..Default::default()
     };
     Ok(fmt)
+}
+
+const TBLPREX_CONSUMED: &[&str] = &[
+    "tblW",
+    "jc",
+    "tblCellSpacing",
+    "tblInd",
+    "tblBorders",
+    "shd",
+    "tblLayout",
+    "tblCellMar",
+    "tblLook",
+    "tblPrExChange",
+];
+
+fn canonical_tbl_pr_ex(formatting: TableFormatting) -> Option<TableFormatting> {
+    let is_empty = formatting.style_id.is_none()
+        && formatting.tbl_look.is_none()
+        && formatting.borders.is_none()
+        && formatting.width.is_none()
+        && formatting.grid_cols.is_empty()
+        && formatting.default_cell_margins.is_none()
+        && formatting.alignment.is_none()
+        && formatting.indent.is_none()
+        && formatting.layout.is_none()
+        && formatting.cell_spacing.is_none()
+        && formatting.positioning.is_none()
+        && formatting.overlap.is_none()
+        && formatting.row_band_size.is_none()
+        && formatting.col_band_size.is_none()
+        && formatting.shading.is_none()
+        && !formatting.bidi_visual
+        && formatting.caption.is_none()
+        && formatting.description.is_none()
+        && formatting.preserved.is_empty();
+    (!is_empty).then_some(formatting)
+}
+
+fn parse_tbl_pr_ex_change(
+    outer: &Element,
+) -> Result<Option<crate::domain::TablePropertyExceptionChange>, RuntimeError> {
+    let changes: Vec<&Element> = outer
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, "tblPrExChange") => Some(element),
+            _ => None,
+        })
+        .collect();
+    let change = match changes.as_slice() {
+        [] => return Ok(None),
+        [change] => *change,
+        _ => {
+            return Err(invalid_docx(
+                "w:tblPrEx contains more than one w:tblPrExChange",
+            ));
+        }
+    };
+    let previous_nodes: Vec<&Element> = change
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, "tblPrEx") => Some(element),
+            _ => None,
+        })
+        .collect();
+    let previous = match previous_nodes.as_slice() {
+        [previous] => canonical_tbl_pr_ex(parse_tbl_pr_ex(previous)?),
+        [] => {
+            return Err(invalid_docx(
+                "w:tblPrExChange is missing its required inner w:tblPrEx",
+            ));
+        }
+        _ => {
+            return Err(invalid_docx(
+                "w:tblPrExChange contains more than one inner w:tblPrEx",
+            ));
+        }
+    };
+    Ok(Some(crate::domain::TablePropertyExceptionChange {
+        previous,
+        revision_id: parse_revision_id(change, "w:tblPrExChange")?,
+        identity: 0,
+        author: attr_get(change, "w:author").cloned().unwrap_or_default(),
+        date: attr_get(change, "w:date").cloned(),
+    }))
 }
 
 /// Parse grid column widths from a w:tblGrid element.
@@ -6791,36 +7265,55 @@ fn resolve_border_conflict(a: &Border, b: &Border) -> Border {
 
 /// Validate vMerge grid alignment (ISO 29500-1 §17.4.84).
 ///
-/// For each column position, track the grid_span of the most recent vMerge "restart"
-/// cell. Any "continue" cell at the same column with a different grid_span is
-/// non-conformant -- break its vMerge chain by setting it to VerticalMerge::None.
-fn normalize_vmerge_grid_alignment(rows: &mut [TableRowNode]) {
+/// For each logical grid position, track the grid span of the active vMerge
+/// chain from the immediately preceding row. Word treats a continuation with
+/// no active restart above it as a standalone cell and preserves the authored
+/// `w:vMerge` marker on save. A continuation that overlaps an active merge at
+/// a different grid position or span remains invalid.
+fn validate_vmerge_grid_alignment(rows: &[TableRowNode]) -> Result<(), RuntimeError> {
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
     let mut active_restart_span: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
-    for row in rows.iter_mut() {
-        let mut col_pos: u32 = 0;
-        for cell in &mut row.cells {
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut continuing_span = std::collections::HashMap::new();
+        let mut col_pos = row.grid_before;
+        for (cell_index, cell) in row.cells.iter().enumerate() {
             match cell.v_merge {
                 VerticalMerge::Restart => {
-                    active_restart_span.insert(col_pos, cell.grid_span);
+                    continuing_span.insert(col_pos, cell.grid_span);
                 }
-                VerticalMerge::Continue => match active_restart_span.get(&col_pos) {
-                    Some(&restart_span) if restart_span == cell.grid_span => {}
-                    _ => {
-                        cell.v_merge = VerticalMerge::None;
-                        active_restart_span.remove(&col_pos);
+                VerticalMerge::Continue => {
+                    let active_at_start = active_restart_span.get(&col_pos).copied();
+                    let end = col_pos.saturating_add(cell.grid_span);
+                    let overlaps_other_active_merge =
+                        active_restart_span
+                            .iter()
+                            .any(|(&restart_col, &restart_span)| {
+                                let restart_end = restart_col.saturating_add(restart_span);
+                                col_pos < restart_end && restart_col < end
+                            });
+                    if active_at_start == Some(cell.grid_span) {
+                        continuing_span.insert(col_pos, cell.grid_span);
+                    } else if active_at_start.is_some() || overlaps_other_active_merge {
+                        return Err(invalid_docx(&format!(
+                            "table vMerge continuation at row {row_index}, cell {cell_index}, logical column {col_pos}, span {} overlaps an immediately preceding vertical merge with a different grid range",
+                            cell.grid_span
+                        )));
                     }
-                },
-                VerticalMerge::None => {
-                    active_restart_span.remove(&col_pos);
+                    // With no active merge in this range, Word ignores the
+                    // continuation semantics, renders a standalone cell, and
+                    // preserves the marker. It therefore does not enter the
+                    // active map for the next row.
                 }
+                VerticalMerge::None => {}
             }
             col_pos += cell.grid_span;
         }
+        active_restart_span = continuing_span;
     }
+    Ok(())
 }
 
 /// Resolve a single edge: cell border vs table border.
@@ -7099,7 +7592,10 @@ fn parse_change_revision_id(change_el: &Element) -> u32 {
 
 /// Parse w:tblPrChange from within a w:tblPr element (§17.13.5.34).
 /// Returns the previous table formatting before the tracked change.
-fn parse_tbl_pr_change(tbl_pr: &Element) -> Result<Option<TableFormattingChange>, RuntimeError> {
+fn parse_tbl_pr_change(
+    tbl_pr: &Element,
+    style_defs: Option<&crate::styles::StyleDefinitions>,
+) -> Result<Option<TableFormattingChange>, RuntimeError> {
     let change_el = match tbl_pr.children.iter().find_map(|child| {
         if let XMLNode::Element(el) = child
             && is_w_tag(el, "tblPrChange")
@@ -7116,26 +7612,94 @@ fn parse_tbl_pr_change(tbl_pr: &Element) -> Result<Option<TableFormattingChange>
     let date = attr_get(change_el, "w:date").cloned();
     let revision_id = parse_change_revision_id(change_el);
 
-    // Inner w:tblPr contains the previous property values
+    // Inner w:tblPr contains the complete previous authored properties. Its
+    // resolved twin is reconstructed through the same table-style cascade as
+    // a live table, while directness flags retain what was actually authored.
     let inner = tbl_pr_inner_child(change_el, "tblPr");
-    let (previous_width, previous_borders, previous_default_cell_margins) = match inner {
-        Some(inner_el) => (
-            parse_table_measurement(inner_el, "tblW")?,
-            parse_border_set(inner_el, "tblBorders")?,
-            parse_cell_margins(inner_el, "tblCellMar"),
-        ),
-        None => (None, None, None),
+    let previous = match inner {
+        Some(inner_el) => parse_previous_table_properties(inner_el, style_defs)?,
+        None => TableFormatting {
+            has_direct_borders: false,
+            has_direct_cell_margins: false,
+            has_direct_alignment: false,
+            has_direct_indent: false,
+            has_direct_tbl_look: false,
+            tbl_look: Some(TblLook::default()),
+            ..TableFormatting::default()
+        },
     };
 
     Ok(Some(TableFormattingChange {
-        previous_width,
-        previous_borders,
-        previous_default_cell_margins,
+        previous,
         revision_id,
         identity: 0,
         author,
         date,
     }))
+}
+
+/// Parse one `CT_TblPr` into the complete authored/resolved canonical table
+/// property projection. `grid_cols` remains empty here because `w:tblGrid` is
+/// a sibling of `w:tblPr`, not part of the tracked property snapshot.
+fn parse_previous_table_properties(
+    tbl_pr: &Element,
+    style_defs: Option<&crate::styles::StyleDefinitions>,
+) -> Result<TableFormatting, RuntimeError> {
+    let direct_borders = parse_border_set(tbl_pr, "tblBorders")?;
+    let direct_cell_margins = parse_cell_margins(tbl_pr, "tblCellMar");
+    let direct_alignment = parse_table_alignment(tbl_pr);
+    let direct_indent = parse_table_indent(tbl_pr);
+    let style_id = tbl_pr.children.iter().find_map(|child| {
+        let XMLNode::Element(child) = child else {
+            return None;
+        };
+        is_w_tag(child, "tblStyle")
+            .then(|| attr_get(child, "w:val").cloned())
+            .flatten()
+    });
+    let style_props = style_id
+        .as_deref()
+        .and_then(|id| style_defs.and_then(|defs| defs.table_style(id)));
+    let has_direct_tbl_look = tbl_pr
+        .children
+        .iter()
+        .any(|child| matches!(child, XMLNode::Element(el) if is_w_tag(el, "tblLook")));
+
+    Ok(TableFormatting {
+        style_id: style_id.map(IStr::from),
+        tbl_look: Some(parse_tbl_look(tbl_pr)),
+        borders: direct_borders
+            .clone()
+            .or_else(|| style_props.and_then(|style| style.borders.clone())),
+        width: parse_table_measurement(tbl_pr, "tblW")?,
+        grid_cols: Vec::new(),
+        default_cell_margins: direct_cell_margins
+            .clone()
+            .or_else(|| style_props.and_then(|style| style.default_cell_margins.clone())),
+        alignment: direct_alignment
+            .clone()
+            .or_else(|| style_props.and_then(|style| style.alignment.clone())),
+        indent: direct_indent.or_else(|| style_props.and_then(|style| style.indent)),
+        layout: parse_table_layout(tbl_pr)?,
+        cell_spacing: parse_table_cell_spacing(tbl_pr),
+        positioning: parse_table_positioning(tbl_pr)?,
+        overlap: parse_table_overlap(tbl_pr)?,
+        row_band_size: parse_band_size(tbl_pr, "tblStyleRowBandSize"),
+        col_band_size: parse_band_size(tbl_pr, "tblStyleColBandSize"),
+        has_direct_borders: direct_borders.is_some(),
+        has_direct_cell_margins: direct_cell_margins.is_some(),
+        has_direct_alignment: direct_alignment.is_some(),
+        has_direct_indent: direct_indent.is_some(),
+        has_direct_tbl_look,
+        shading: parse_shading(tbl_pr)?,
+        bidi_visual: tbl_pr
+            .children
+            .iter()
+            .any(|child| matches!(child, XMLNode::Element(el) if is_w_tag(el, "bidiVisual"))),
+        caption: find_w_child_val(tbl_pr, "tblCaption"),
+        description: find_w_child_val(tbl_pr, "tblDescription"),
+        preserved: capture_unmodeled_children(tbl_pr, crate::docx_validate_ordering::TBLPR_ORDER),
+    })
 }
 
 /// Parse w:trPrChange from within a w:trPr element (§17.13.5.36).
@@ -7159,7 +7723,7 @@ fn parse_tr_pr_change(tr_pr: &Element) -> Result<Option<RowFormattingChange>, Ru
 
     // Inner w:trPr contains the previous property values
     let inner = tbl_pr_inner_child(change_el, "trPr");
-    let (previous_height, previous_height_rule) = match inner {
+    let (previous_height, previous_height_rule, previous_cnf_style) = match inner {
         Some(inner_el) => {
             // Look for trHeight inside the inner trPr
             let mut h = None;
@@ -7177,9 +7741,9 @@ fn parse_tr_pr_change(tr_pr: &Element) -> Result<Option<RowFormattingChange>, Ru
                         .map_err(|e| invalid_docx(&format!("trPrChange trHeight: {e}")))?;
                 }
             }
-            (h, hr)
+            (h, hr, parse_previous_cnf_style(inner_el, "trPrChange")?)
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     Ok(Some(RowFormattingChange {
@@ -7187,6 +7751,7 @@ fn parse_tr_pr_change(tr_pr: &Element) -> Result<Option<RowFormattingChange>, Ru
         identity: 0,
         previous_height,
         previous_height_rule,
+        previous_cnf_style,
         author,
         date,
     }))
@@ -7222,6 +7787,7 @@ fn parse_tc_pr_change(tc_pr: &Element) -> Result<Option<CellFormattingChange>, R
         previous_no_wrap,
         previous_text_direction,
         previous_tc_fit_text,
+        previous_cnf_style,
     ) = match inner {
         Some(inner_el) => {
             let mut v_align = None;
@@ -7266,9 +7832,10 @@ fn parse_tc_pr_change(tc_pr: &Element) -> Result<Option<CellFormattingChange>, R
                 no_wrap,
                 text_direction,
                 tc_fit_text,
+                parse_previous_cnf_style(inner_el, "tcPrChange")?,
             )
         }
-        None => (None, None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None, None),
     };
 
     Ok(Some(CellFormattingChange {
@@ -7282,9 +7849,34 @@ fn parse_tc_pr_change(tc_pr: &Element) -> Result<Option<CellFormattingChange>, R
         previous_no_wrap,
         previous_text_direction,
         previous_tc_fit_text,
+        previous_cnf_style,
         author,
         date,
     }))
+}
+
+fn parse_previous_cnf_style(
+    properties: &Element,
+    context: &'static str,
+) -> Result<Option<crate::domain::CnfStyle>, RuntimeError> {
+    let candidates = properties
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, "cnfStyle") => Some(element),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [element] => parse_cnf_style_element(element)
+            .map(Some)
+            .map_err(|error| invalid_docx(&format!("{context} cnfStyle: {error}"))),
+        _ => Err(invalid_docx(&format!(
+            "{context} contains {} cnfStyle children; expected at most one",
+            candidates.len()
+        ))),
+    }
 }
 
 /// Find a w: namespaced child element inside a *PrChange element.
@@ -7565,6 +8157,7 @@ pub(crate) struct StrippedLiteralPrefix {
     pub trailing_rpr: Option<crate::domain::PrefixLeadingRpr>,
 }
 
+#[doc(hidden)]
 pub(crate) fn strip_literal_prefix(inlines: &mut Vec<InlineNode>) -> Option<StrippedLiteralPrefix> {
     strip_literal_prefix_with_tracked_flags(inlines, &[])
 }
@@ -8098,27 +8691,28 @@ fn paragraph_from_element(
     // Resolved here (before the literal-prefix strip) so the strip can see
     // whether the paragraph carries structural numbering.
     // DirectNumPr::Suppressed (numId=0, §17.9.18) blocks style and pStyle binding.
-    let mut effective_num_props = if let Some(sd) = style_defs {
-        sd.resolve_effective_num_props(view.style_id.as_deref(), &view.num_props)
+    let mut resolved_num_pr = if let Some(sd) = style_defs {
+        sd.resolve_effective_num_props(effective_style_id, &view.num_props)
     } else {
-        match &view.num_props {
-            crate::word_ir::DirectNumPr::Active(np) => Some(np.clone()),
-            _ => None,
-        }
+        view.num_props.clone()
     };
 
     // §17.9.23: pStyle reverse binding — if no numPr from direct or style,
     // check if any numbering level claims this paragraph's style via <w:pStyle>.
     // Only applies when numPr is truly absent — Suppressed (numId=0) blocks this.
-    if effective_num_props.is_none()
-        && view.num_props == crate::word_ir::DirectNumPr::Absent
-        && let (Some(style_id), Some(defs)) = (view.style_id.as_deref(), numbering_defs)
+    if resolved_num_pr == crate::word_ir::DirectNumPr::Absent
+        && let (Some(style_id), Some(defs)) = (effective_style_id, numbering_defs)
     {
         let pstyle_map = defs.build_pstyle_reverse_map();
         if let Some(&(num_id, ilvl)) = pstyle_map.get(style_id) {
-            effective_num_props = Some(crate::word_ir::NumProps { num_id, ilvl });
+            resolved_num_pr =
+                crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl });
         }
     }
+    let effective_num_props = match &resolved_num_pr {
+        crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
+        crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+    };
 
     // MODEL: a paragraph that carries structural numbering (w:numPr resolving to
     // a real numbering level) has its label RENDERED by Word from the numbering
@@ -8126,17 +8720,12 @@ fn paragraph_from_element(
     // (e.g. runs ["10. ", "J. MARTINS"] under a numId — common in
     // converted/generated documents) is therefore NOT the rendered label: it is
     // real body text that Word shows in ADDITION to the structural number. It
-    // must not be hoisted into `literal_prefix`. Hoisting it there is doubly
-    // wrong: the model gets two labels, and the serializer suppresses
-    // `literal_prefix` whenever `numbering.is_some()` (Word regenerates the
-    // label), so the baked run's bytes vanish on any whole-document rebuild —
-    // and reimporting the stripped output hoists the NEXT token ("J. "), eroding
-    // more text on every cycle. So: only hoist a literal prefix when the
-    // paragraph will NOT carry structural numbering. The condition mirrors what
-    // makes `paragraph.numbering` end up `Some` below — an effective numPr AND a
-    // resolvable level; a dangling numId that demotes to plain text (its
-    // `synthesize` fails via a missing `get_level`) still hoists, matching the
-    // demotion fallback that emits `literal_prefix` as a run.
+    // must not be hoisted into `literal_prefix`: the model would otherwise
+    // describe Word's generated label and the real body text as one label.
+    // Only a reference that resolves to a real level has this behavior. A
+    // Word-accepted unresolved numPr remains typed paragraph-property state but
+    // generates no label, so label-shaped authored text stays ordinary text (or
+    // the existing literal-prefix projection) and is re-emitted verbatim.
     let has_structural_numbering = effective_num_props
         .as_ref()
         .zip(numbering_defs)
@@ -8223,6 +8812,7 @@ fn paragraph_from_element(
 
     // Body text after prefix stripping, for rendered_text computation
     let body_text = extract_inline_text_simple(&inlines);
+    let has_literal_prefix = literal_prefix.is_some();
 
     // Extract style_id from view
     let style_id = view.style_id.clone();
@@ -8521,6 +9111,7 @@ fn paragraph_from_element(
                     let numbering_info = crate::domain::NumberingInfo {
                         num_id: num_props.num_id,
                         ilvl: num_props.ilvl,
+                        resolution: crate::domain::NumberingResolution::Resolved,
                         synthesized_text: synthesized.clone(),
                         is_bullet,
                         restart_numbering: false,
@@ -8538,34 +9129,67 @@ fn paragraph_from_element(
                     };
                     (Some(numbering_info), rendered)
                 }
-                Err(err) => {
-                    // OBSERVABLE DEGRADATION BOUNDARY: numId/ilvl referencing a
-                    // dangling or incomplete numbering definition is malformed
-                    // producer output that Word itself tolerates (it just
-                    // renders the paragraph without a number). Per invariant
-                    // #1 (parse totality) we don't refuse the whole import
-                    // over one paragraph's broken numPr — we demote it from
-                    // list item to plain paragraph, same as "no numPr at all".
-                    // The demotion must stay observable rather than silent.
-                    tracing::warn!(
-                        block_id = %block_id.0,
-                        num_id = num_props.num_id,
-                        ilvl = num_props.ilvl,
-                        error = %err,
-                        "numbering synthesis failed; demoting paragraph to plain text (literal prefix fallback)"
-                    );
-                    // Fall back to literal prefix for rendered_text so the
-                    // canonical text stays consistent with the serializer
-                    // (which emits literal_prefix as a run).
-                    if let Some(ref lp) = literal_prefix {
-                        (None, Some(format!("{lp}\t{body_text}")))
-                    } else {
-                        (None, None)
-                    }
+                Err(crate::numbering::NumberingError::MissingNumberingInstance { .. }) => (
+                    Some(crate::domain::NumberingInfo {
+                        num_id: num_props.num_id,
+                        ilvl: num_props.ilvl,
+                        resolution: crate::domain::NumberingResolution::MissingNumberingInstance,
+                        synthesized_text: String::new(),
+                        is_bullet: false,
+                        restart_numbering: false,
+                    }),
+                    literal_prefix
+                        .as_ref()
+                        .map(|prefix| format!("{prefix}\t{body_text}")),
+                ),
+                Err(crate::numbering::NumberingError::MissingAbstractNum { .. }) => (
+                    Some(crate::domain::NumberingInfo {
+                        num_id: num_props.num_id,
+                        ilvl: num_props.ilvl,
+                        resolution: crate::domain::NumberingResolution::MissingAbstractNumbering,
+                        synthesized_text: String::new(),
+                        is_bullet: false,
+                        restart_numbering: false,
+                    }),
+                    literal_prefix
+                        .as_ref()
+                        .map(|prefix| format!("{prefix}\t{body_text}")),
+                ),
+                Err(crate::numbering::NumberingError::MissingLevel { .. }) => (
+                    Some(crate::domain::NumberingInfo {
+                        num_id: num_props.num_id,
+                        ilvl: num_props.ilvl,
+                        resolution: crate::domain::NumberingResolution::MissingLevel,
+                        synthesized_text: String::new(),
+                        is_bullet: false,
+                        restart_numbering: false,
+                    }),
+                    literal_prefix
+                        .as_ref()
+                        .map(|prefix| format!("{prefix}\t{body_text}")),
+                ),
+                Err(err @ crate::numbering::NumberingError::XmlParse(_)) => {
+                    return Err(invalid_docx(&format!(
+                        "paragraph {} numbering numId={} ilvl={} cannot be resolved: {err}",
+                        block_id.0, num_props.num_id, num_props.ilvl
+                    )));
                 }
             }
         }
-        _ => {
+        (Some(num_props), None) => (
+            Some(crate::domain::NumberingInfo {
+                num_id: num_props.num_id,
+                ilvl: num_props.ilvl,
+                resolution: crate::domain::NumberingResolution::MissingDefinitions,
+                synthesized_text: String::new(),
+                is_bullet: false,
+                restart_numbering: false,
+            }),
+            literal_prefix
+                .as_ref()
+                .map(|prefix| format!("{prefix}\t{body_text}")),
+        ),
+        (None, _) => {
             // No structural numbering — use literal prefix for rendered_text if available
             if let Some(ref lp) = literal_prefix {
                 (None, Some(format!("{lp}\t{body_text}")))
@@ -8599,22 +9223,7 @@ fn paragraph_from_element(
 
     // Convert direct paragraph shading
     let shading_authored = view.paragraph_shading.is_some();
-    let direct_shading = match view.paragraph_shading {
-        Some((fill, val, color)) => {
-            let val = val
-                .as_deref()
-                .map(ShadingPattern::from_xml_str)
-                .transpose()
-                .map_err(|e| invalid_docx(&format!("paragraph shading: {e}")))?;
-            Some(Shading {
-                fill,
-                val,
-                color,
-                extra_attrs: Vec::new(),
-            })
-        }
-        None => None,
-    };
+    let direct_shading = view.paragraph_shading;
 
     // Resolve shading through style chain (§17.3.1.31)
     let shading = if let Some(sd) = style_defs {
@@ -8623,7 +9232,12 @@ fn paragraph_from_element(
         direct_shading
     };
 
-    Ok(BlockNode::from(ParagraphNode {
+    let mark_only_change = view
+        .ppr_change
+        .is_none()
+        .then(|| view.paragraph_mark_rpr.rpr_change.as_deref().cloned())
+        .flatten();
+    let mut paragraph = ParagraphNode {
         id: block_id,
         style_id,
         align,
@@ -8688,9 +9302,16 @@ fn paragraph_from_element(
             .map(|change| {
                 convert_ppr_change(
                     change,
-                    numbering.as_ref(),
-                    numbering_defs,
-                    &view.paragraph_mark_rpr,
+                    PprChangeConversionContext {
+                        numbering_defs,
+                        style_defs,
+                        live_mark_rpr: &view.paragraph_mark_rpr,
+                        body_text: &body_text,
+                        has_literal_prefix,
+                        literal_prefix_has_leading_tab,
+                        literal_prefix_has_trailing_tab,
+                        default_tab_stop,
+                    },
                 )
             })
             .transpose()?,
@@ -8728,7 +9349,9 @@ fn paragraph_from_element(
         text_direction: view.text_direction.clone(),
         cnf_style: view.cnf_style.clone(),
         preserved_ppr: view.preserved.clone(),
-    }))
+    };
+    attach_mark_only_formatting_change(&mut paragraph, mark_only_change.as_ref())?;
+    Ok(BlockNode::from(paragraph))
 }
 /// Convert a paragraph's OWN direct `w:ind` (the raw pre-cascade parse) into the
 /// domain `Indentation` the serializer re-emits verbatim. Unlike the resolved
@@ -9043,234 +9666,481 @@ pub(crate) fn reresolve_run_style_props(
 
 /// Convert a word_ir::PprChange to a domain::ParagraphFormattingChange.
 ///
-/// The snapshot's values are converted RAW (no style-chain resolution): the
-/// inner pPr is the previous DIRECT formatting per §17.13.5.29, and the
-/// serializer re-emits it as-is.
+/// The inner pPr is converted as authored DIRECT formatting per §17.13.5.29.
+/// Its EFFECTIVE twin is resolved independently through the exact style,
+/// defaults, and numbering context; it is never copied from the live paragraph.
+struct PprChangeConversionContext<'a> {
+    numbering_defs: Option<&'a crate::numbering::NumberingDefinitions>,
+    style_defs: Option<&'a crate::styles::StyleDefinitions>,
+    live_mark_rpr: &'a crate::word_ir::TextMarks,
+    body_text: &'a str,
+    has_literal_prefix: bool,
+    literal_prefix_has_leading_tab: bool,
+    literal_prefix_has_trailing_tab: bool,
+    default_tab_stop: i32,
+}
+
 fn convert_ppr_change(
     ppr_change: &crate::word_ir::PprChange,
-    current_numbering: Option<&crate::domain::NumberingInfo>,
-    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
-    live_mark_rpr: &crate::word_ir::TextMarks,
+    context: PprChangeConversionContext<'_>,
 ) -> Result<ParagraphFormattingChange, RuntimeError> {
-    let previous_num_props = ppr_change
-        .preserved
-        .iter()
-        .find(|prop| prop.name == "numPr" || prop.name == "w:numPr")
-        .map(|prop| {
-            let element = crate::word_xml::parse_raw_fragment(prop.raw_xml.as_bytes())
-                .map_err(|error| invalid_docx(&format!("pPrChange numPr: {error}")))?;
-            let value = |name: &str| {
-                element.children.iter().find_map(|child| {
-                    let xmltree::XMLNode::Element(child) = child else {
-                        return None;
-                    };
-                    is_w_tag(child, name)
-                        .then(|| attr_get(child, "w:val"))
-                        .flatten()
-                        .and_then(|value| value.parse::<u32>().ok())
-                })
-            };
-            Ok::<_, RuntimeError>((value("numId").unwrap_or(0), value("ilvl").unwrap_or(0)))
+    // The inner pPr proves the previous DIRECT state. Its EFFECTIVE projection
+    // is necessarily environment-relative: resolve it against this document's
+    // exact styles/defaults/numbering package context, never against the live
+    // paragraph's already-resolved values. A caller that combines independently
+    // authored packages must separately prove that this resolution environment
+    // is unchanged or transport every referenced definition completely.
+    // A package without styles.xml is still a fully defined Word environment:
+    // resolve against ECMA defaults (notably widowControl=on). `None` here
+    // means exactly that empty/default environment, not unknown context.
+    let default_style_defs;
+    let style_defs = match context.style_defs {
+        Some(definitions) => definitions,
+        None => {
+            default_style_defs = crate::styles::StyleDefinitions::default();
+            &default_style_defs
+        }
+    };
+    let alignment = |raw: Option<&str>| -> Result<Option<Alignment>, RuntimeError> {
+        raw.map(|value| match value {
+            "left" | "start" => Ok(Alignment::Left),
+            "center" => Ok(Alignment::Center),
+            "right" | "end" => Ok(Alignment::Right),
+            "both" | "justify" => Ok(Alignment::Justify),
+            "distribute" => Ok(Alignment::Distribute),
+            "highKashida" => Ok(Alignment::HighKashida),
+            "lowKashida" => Ok(Alignment::LowKashida),
+            "mediumKashida" => Ok(Alignment::MediumKashida),
+            "numTab" => Ok(Alignment::NumTab),
+            "thaiDistribute" => Ok(Alignment::ThaiDistribute),
+            other => Err(invalid_docx(&format!(
+                "pPrChange previous jc has unrecognized value {other:?}"
+            ))),
+        })
+        .transpose()
+    };
+    let direct_alignment = alignment(ppr_change.previous_alignment.as_deref())?;
+    let direct_text_alignment = ppr_change
+        .previous_text_alignment
+        .as_deref()
+        .map(TextAlignment::from_xml_str)
+        .transpose()
+        .map_err(|error| invalid_docx(&format!("pPrChange previous textAlignment: {error}")))?;
+    let direct_text_direction = ppr_change
+        .previous_text_direction
+        .as_deref()
+        .map(TextDirection::from_xml_str)
+        .transpose()
+        .map_err(|error| invalid_docx(&format!("pPrChange previous textDirection: {error}")))?;
+    let direct_outline_lvl = ppr_change
+        .previous_outline_lvl
+        .as_ref()
+        .map(|raw| {
+            let value = raw.value.as_deref().ok_or_else(|| {
+                invalid_docx("pPrChange previous outlineLvl is present without w:val")
+            })?;
+            let level = value.parse::<u8>().map_err(|_| {
+                invalid_docx(&format!(
+                    "pPrChange previous outlineLvl has invalid w:val {value:?}"
+                ))
+            })?;
+            if level > 9 {
+                return Err(invalid_docx(&format!(
+                    "pPrChange previous outlineLvl is outside 0..=9: {level}"
+                )));
+            }
+            Ok(level)
         })
         .transpose()?;
-    let previous_numbering_explicitly_absent =
-        previous_num_props.is_some_and(|(num_id, _)| num_id == 0);
-    let previous_numbering = previous_num_props.and_then(|(num_id, ilvl)| {
-        if num_id == 0 {
-            return None;
-        }
-        if let Some(current) = current_numbering
-            && current.num_id == num_id
-            && current.ilvl == ilvl
-        {
-            return Some(current.clone());
-        }
-        let level = numbering_defs?.get_level(num_id, ilvl)?;
-        Some(crate::domain::NumberingInfo {
+    let parse_previous_num_value =
+        |raw: &crate::word_ir::RawRequiredValue, child: &str| -> Result<u32, RuntimeError> {
+            let value = raw.value.as_deref().ok_or_else(|| {
+                invalid_docx(&format!(
+                    "pPrChange previous {child} is present without w:val"
+                ))
+            })?;
+            value.parse::<u32>().map_err(|_| {
+                invalid_docx(&format!(
+                    "pPrChange previous {child} has invalid w:val {value:?}"
+                ))
+            })
+        };
+    let direct_numbering = match &ppr_change.previous_numbering {
+        crate::word_ir::RawPreviousNumPr::Absent => DirectParagraphNumbering::Absent,
+        crate::word_ir::RawPreviousNumPr::Present {
             num_id,
             ilvl,
-            // A bullet's lvlText is position-independent. For a numeric list
-            // whose previous numPr differs from the live paragraph, the exact
-            // counter requires the alternate document-order state; keep the
-            // structural numbering typed and let the render projection derive
-            // its label rather than inventing a counter.
-            synthesized_text: if level.num_fmt == crate::numbering::NumFormat::Bullet {
-                level.lvl_text.clone()
-            } else {
-                String::new()
-            },
-            is_bullet: level.num_fmt == crate::numbering::NumFormat::Bullet,
-            restart_numbering: false,
-        })
-    });
-    // Only consume the raw numPr when it has an honest typed representation.
-    // A nonzero reference with no matching numbering definition cannot supply
-    // NumberingInfo's presentation fields; preserve that XML verbatim rather
-    // than silently dropping it or inventing resolved numbering metadata.
-    let previous_num_pr_is_modeled =
-        previous_numbering_explicitly_absent || previous_numbering.is_some();
-    let previous_alignment =
-        ppr_change
-            .previous_alignment
-            .as_ref()
-            .and_then(|a| match a.as_str() {
-                "left" | "start" => Some(Alignment::Left),
-                "center" => Some(Alignment::Center),
-                "right" | "end" => Some(Alignment::Right),
-                "both" | "justify" => Some(Alignment::Justify),
-                "distribute" => Some(Alignment::Distribute),
-                "highKashida" => Some(Alignment::HighKashida),
-                "lowKashida" => Some(Alignment::LowKashida),
-                "mediumKashida" => Some(Alignment::MediumKashida),
-                "numTab" => Some(Alignment::NumTab),
-                "thaiDistribute" => Some(Alignment::ThaiDistribute),
-                _ => None,
-            });
-    let previous_indentation = ppr_change
-        .previous_indentation
-        .as_ref()
-        .map(|i| Indentation {
-            left: i.left,
-            right: i.right,
-            effective_first_line_twips: i.effective_first_line_twips,
-            start_chars: i.start_chars,
-            end_chars: i.end_chars,
-            first_line_chars: i.first_line_chars,
-            hanging_chars: i.hanging_chars,
-        });
-    let previous_spacing = ppr_change
-        .previous_spacing
-        .as_ref()
-        .map(|sp| ParagraphSpacing {
-            before: sp.before,
-            after: sp.after,
-            before_lines: sp.before_lines,
-            after_lines: sp.after_lines,
-            before_autospacing: sp.before_autospacing,
-            after_autospacing: sp.after_autospacing,
-            line: sp.line,
-            line_rule: sp.line_rule.as_deref().and_then(|r| match r {
-                "auto" => Some(LineSpacingRule::Auto),
-                "exact" => Some(LineSpacingRule::Exact),
-                "atLeast" => Some(LineSpacingRule::AtLeast),
-                _ => None,
-            }),
-        });
-    let previous_shading = match &ppr_change.previous_shading {
-        Some((fill, val, color)) => {
-            let val = val
-                .as_deref()
-                .map(ShadingPattern::from_xml_str)
-                .transpose()
-                .map_err(|e| invalid_docx(&format!("pPrChange previous shading: {e}")))?;
-            Some(Shading {
-                fill: fill.clone(),
-                val,
-                color: color.clone(),
-                extra_attrs: Vec::new(),
-            })
-        }
-        None => None,
+            extra_attrs,
+            preserved,
+        } => DirectParagraphNumbering::Present(crate::domain::DirectParagraphNumPr {
+            num_id: num_id
+                .as_ref()
+                .map(|raw| parse_previous_num_value(raw, "numId"))
+                .transpose()?,
+            ilvl: ilvl
+                .as_ref()
+                .map(|raw| parse_previous_num_value(raw, "ilvl"))
+                .transpose()?,
+            extra_attrs: extra_attrs.clone(),
+            preserved: preserved.clone(),
+        }),
     };
-    Ok(ParagraphFormattingChange {
-        previous_alignment,
-        previous_indentation,
-        previous_spacing,
-        previous_numbering,
-        previous_numbering_explicitly_absent,
-        previous_style_id: ppr_change.previous_style_id.clone(),
-        previous_keep_next: ppr_change.previous_keep_next,
-        previous_keep_lines: ppr_change.previous_keep_lines,
-        // Domain models this as bool (same collapse as the outer paragraph):
-        // an explicit `w:pageBreakBefore w:val="0"` restores as absent.
-        previous_page_break_before: ppr_change.previous_page_break_before == Some(true),
-        previous_widow_control: ppr_change.previous_widow_control,
-        previous_contextual_spacing: ppr_change.previous_contextual_spacing,
-        previous_shading,
-        previous_borders: convert_paragraph_borders_from_edges(ppr_change.previous_borders.clone())
-            .map_err(|e| invalid_docx(&format!("pPrChange previous borders: {}", e.message)))?,
-        previous_tab_stops: ppr_change.previous_tab_stops.clone().unwrap_or_default(),
-        // Internal literal-prefix synthesis state — never present in Word XML.
-        previous_literal_prefix_leading_tab_twips: None,
-        previous_literal_prefix_trailing_tab_stop_twips: None,
-        // The snapshot mark fields go through the SAME converters as the live
-        // mark (`paragraph_mark_props_without_rfonts` strips the preserved
-        // rFonts double-representation), and an ABSENT inner rPr reads as
-        // "the mark formatting did not change" — the live values — because
-        // that is what this serializer's emission gate persists for the
-        // unchanged case. Reading it as "no formatting" made the reopened
-        // snapshot differ from the authored one on every pPrChange whose mark
-        // was untouched.
-        //
-        // KNOWN BOUNDARY: when the mark formatting DID change, the previous
-        // values travel in the mark's own `w:rPrChange` (not the inner pPr),
-        // and this fallback records the live (post-change) values instead of
-        // recovering them from there — the same information the pre-existing
-        // code lost by recording nothing. Recovering from the mark rPrChange
-        // is a separate, currently unwitnessed repair.
-        previous_paragraph_mark_marks: match &ppr_change.previous_paragraph_mark_rpr {
-            Some(rpr) => convert_text_marks_to_marks(rpr),
-            None => convert_text_marks_to_marks(live_mark_rpr),
+    let direct_indentation = authored_indentation(ppr_change.previous_indentation.as_ref());
+    let direct_spacing = authored_paragraph_spacing(ppr_change.previous_spacing.as_ref());
+    let direct_shading = ppr_change.previous_shading.clone();
+    let direct_borders = convert_paragraph_borders_from_edges(ppr_change.previous_borders.clone())
+        .map_err(|error| invalid_docx(&format!("pPrChange previous borders: {}", error.message)))?;
+    let numbering_info =
+        |num_props: &crate::word_ir::NumProps| -> Result<crate::domain::NumberingInfo, RuntimeError> {
+            let Some(definitions) = context.numbering_defs else {
+                return Ok(crate::domain::NumberingInfo {
+                    num_id: num_props.num_id,
+                    ilvl: num_props.ilvl,
+                    resolution: crate::domain::NumberingResolution::MissingDefinitions,
+                    synthesized_text: String::new(),
+                    is_bullet: false,
+                    restart_numbering: false,
+                });
+            };
+            let Some(level) = definitions.get_level(num_props.num_id, num_props.ilvl) else {
+                let resolution = match definitions.num_instances.get(&num_props.num_id) {
+                    None => crate::domain::NumberingResolution::MissingNumberingInstance,
+                    Some(instance)
+                        if !definitions
+                            .abstract_nums
+                            .contains_key(&instance.abstract_num_id) =>
+                    {
+                        crate::domain::NumberingResolution::MissingAbstractNumbering
+                    }
+                    Some(_) => crate::domain::NumberingResolution::MissingLevel,
+                };
+                return Ok(crate::domain::NumberingInfo {
+                    num_id: num_props.num_id,
+                    ilvl: num_props.ilvl,
+                    resolution,
+                    synthesized_text: String::new(),
+                    is_bullet: false,
+                    restart_numbering: false,
+                });
+            };
+            let is_bullet = level.num_fmt == crate::numbering::NumFormat::Bullet;
+            Ok(crate::domain::NumberingInfo {
+                num_id: num_props.num_id,
+                ilvl: num_props.ilvl,
+                resolution: crate::domain::NumberingResolution::Resolved,
+                // Numeric counter text is a document/story-order derived view,
+                // not part of the authored direct numPr. Full and selective
+                // projectors unconditionally call renumber_projected_blocks
+                // after restoring pPr, which fills this before the projection
+                // becomes terminal. A bullet's lvlText is position-independent.
+                synthesized_text: if is_bullet {
+                    level.lvl_text.clone()
+                } else {
+                    String::new()
+                },
+                is_bullet,
+                restart_numbering: false,
+            })
+        };
+    let effective_style_id = ppr_change
+        .previous_style_id
+        .as_deref()
+        .or_else(|| style_defs.default_para_style_id());
+    // CT_NumPr's numId and ilvl are independently optional on the wire. The
+    // controlled Word witness establishes exactly one partial active form:
+    // positive numId with omitted ilvl resolves at level zero while the authored
+    // omission remains preserved in the previous-state snapshot. Other partial
+    // forms remain refused rather than guessed.
+    let style_num_pr = style_defs
+        .resolve_effective_num_props(effective_style_id, &crate::word_ir::DirectNumPr::Absent);
+    let mut resolved_num_pr = match &direct_numbering {
+        DirectParagraphNumbering::Absent => style_num_pr,
+        DirectParagraphNumbering::Present(direct) if direct.num_id == Some(0) => {
+            crate::word_ir::DirectNumPr::Suppressed
+        }
+        DirectParagraphNumbering::Present(direct) => match (direct.num_id, direct.ilvl) {
+            (Some(num_id), Some(ilvl)) => {
+                crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl })
+            }
+            (Some(num_id), None) if num_id > 0 => {
+                crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl: 0 })
+            }
+            _ => {
+                return Err(invalid_docx(
+                    "pPrChange previous numPr has a schema-valid partial numId/ilvl shape whose effective numbering is not established by the current evidence policy",
+                ));
+            }
         },
-        previous_paragraph_mark_style_props: paragraph_mark_props_without_rfonts(
-            ppr_change
-                .previous_paragraph_mark_rpr
+    };
+    if resolved_num_pr == crate::word_ir::DirectNumPr::Absent
+        && let (Some(style_id), Some(definitions)) = (effective_style_id, context.numbering_defs)
+        && let Some(&(num_id, ilvl)) = definitions.build_pstyle_reverse_map().get(style_id)
+    {
+        resolved_num_pr =
+            crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl });
+    }
+    let effective_num_props = match &resolved_num_pr {
+        crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
+        crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+    };
+    let effective_numbering = effective_num_props
+        .as_ref()
+        .map(numbering_info)
+        .transpose()?;
+    let numbering_indent = effective_num_props
+        .as_ref()
+        .and_then(|props| context.numbering_defs?.get_level(props.num_id, props.ilvl))
+        .and_then(|level| level.indent.as_ref());
+    let resolved_indent = style_defs.resolve_effective_indent(
+        effective_style_id,
+        ppr_change.previous_indentation.as_ref(),
+        numbering_indent,
+    );
+    let resolved_spacing = style_defs
+        .resolve_effective_spacing(effective_style_id, ppr_change.previous_spacing.as_ref());
+    let resolved_borders = style_defs
+        .resolve_effective_borders(effective_style_id, ppr_change.previous_borders.as_ref());
+    let effective_borders =
+        convert_paragraph_borders_from_edges(resolved_borders).map_err(|error| {
+            invalid_docx(&format!(
+                "pPrChange previous effective borders: {}",
+                error.message
+            ))
+        })?;
+    let effective_shading =
+        style_defs.resolve_effective_para_shading(effective_style_id, direct_shading.as_ref());
+    let resolved_alignment = style_defs
+        .resolve_effective_alignment(effective_style_id, ppr_change.previous_alignment.as_deref());
+    let effective_alignment =
+        Some(alignment(resolved_alignment.as_deref())?.unwrap_or(Alignment::Left));
+    let resolved_stops = style_defs
+        .resolve_effective_tabs(effective_style_id, ppr_change.previous_tab_stops.as_deref());
+    let left_indent = resolved_indent
+        .as_ref()
+        .and_then(|indent| indent.left)
+        .unwrap_or(0);
+    let first_line = resolved_indent
+        .as_ref()
+        .and_then(|indent| indent.effective_first_line_twips)
+        .unwrap_or(0);
+    let effective_edge = left_indent + first_line;
+    let prefix_had_tab =
+        context.literal_prefix_has_leading_tab || context.literal_prefix_has_trailing_tab;
+    let tab_stops_abs = crate::word_ir::synthesize_default_tab_stops(
+        &resolved_stops,
+        context.body_text.matches('\t').count() + usize::from(prefix_had_tab),
+        context.default_tab_stop,
+        effective_edge,
+    );
+    let body_left = if prefix_had_tab {
+        tab_stops_abs
+            .iter()
+            .find(|stop| stop.position > effective_edge)
+            .map_or(effective_edge, |stop| stop.position)
+    } else {
+        effective_edge
+    };
+    let effective_tab_stops_rel = tab_stops_abs
+        .into_iter()
+        .map(|mut stop| {
+            stop.position -= body_left;
+            stop
+        })
+        .filter(|stop| stop.position > 0)
+        .collect();
+    let effective_indentation = if context.has_literal_prefix {
+        Some(Indentation {
+            left: Some(left_indent),
+            right: resolved_indent.as_ref().and_then(|indent| indent.right),
+            effective_first_line_twips: resolved_indent
                 .as_ref()
-                .unwrap_or(live_mark_rpr),
-        )?,
-        previous_paragraph_mark_rfonts: ppr_change
-            .previous_paragraph_mark_rpr
-            .as_ref()
-            .unwrap_or(live_mark_rpr)
-            .authored_rfonts
-            .clone(),
-        previous_paragraph_mark_rpr_off: convert_text_marks_to_para_mark_off(
-            ppr_change
-                .previous_paragraph_mark_rpr
+                .and_then(|indent| indent.effective_first_line_twips),
+            start_chars: resolved_indent
                 .as_ref()
-                .unwrap_or(live_mark_rpr),
-        ),
-        previous_text_direction: ppr_change.previous_text_direction.clone(),
-        previous_text_alignment: ppr_change.previous_text_alignment.clone(),
-        previous_mirror_indents: ppr_change.previous_mirror_indents,
-        previous_auto_space_de: ppr_change.previous_auto_space_de,
-        previous_auto_space_dn: ppr_change.previous_auto_space_dn,
-        previous_bidi: ppr_change.previous_bidi,
-        previous_suppress_auto_hyphens: ppr_change.previous_suppress_auto_hyphens,
-        previous_snap_to_grid: ppr_change.previous_snap_to_grid,
-        previous_overflow_punct: ppr_change.previous_overflow_punct,
-        previous_adjust_right_ind: ppr_change.previous_adjust_right_ind,
-        previous_word_wrap: ppr_change.previous_word_wrap,
-        previous_frame_pr: ppr_change.previous_frame_pr.as_ref().map(|fp| {
+                .and_then(|indent| indent.start_chars),
+            end_chars: resolved_indent.as_ref().and_then(|indent| indent.end_chars),
+            first_line_chars: None,
+            hanging_chars: None,
+        })
+    } else if context.body_text.contains('\t') && first_line < 0 {
+        Some(Indentation {
+            left: Some(effective_edge),
+            right: resolved_indent.as_ref().and_then(|indent| indent.right),
+            effective_first_line_twips: None,
+            start_chars: resolved_indent
+                .as_ref()
+                .and_then(|indent| indent.start_chars),
+            end_chars: resolved_indent.as_ref().and_then(|indent| indent.end_chars),
+            first_line_chars: None,
+            hanging_chars: None,
+        })
+    } else {
+        authored_indentation(resolved_indent.as_ref())
+    };
+    let effective_outline =
+        style_defs.resolve_effective_outline_lvl(effective_style_id, direct_outline_lvl);
+    let heading_level = effective_outline
+        .filter(|level| *level <= 8)
+        .map(|level| HeadingLevel::from_number(level + 1))
+        .or_else(|| {
+            ppr_change.previous_style_id.as_ref().and_then(|style_id| {
+                style_id
+                    .strip_prefix("Heading")
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .filter(|value| (1..=9).contains(value))
+                    .map(HeadingLevel::from_number)
+            })
+        });
+    // A paragraph-mark formatting change can be evidenced by the inner
+    // pPrChange/pPr/rPr, by the live mark's outer rPrChange, or by both. Two
+    // present proof carriers must agree; choosing one would hide contradictory
+    // previous-state evidence and make reject depend on parser priority.
+    let inner_previous_mark = ppr_change.previous_paragraph_mark_rpr.as_ref();
+    let outer_mark_change = context.live_mark_rpr.rpr_change.as_ref();
+    if let (Some(inner), Some(outer)) = (inner_previous_mark, outer_mark_change)
+        && inner != &outer.previous_marks
+    {
+        return Err(invalid_docx(&format!(
+            "pPrChange revision {} has conflicting previous paragraph-mark state between inner pPr/rPr and outer rPrChange revision {}",
+            ppr_change.revision_id, outer.revision_id
+        )));
+    }
+    let previous_mark_rpr = inner_previous_mark
+        .or_else(|| outer_mark_change.map(|change| &change.previous_marks))
+        .unwrap_or(context.live_mark_rpr);
+    let direct = DirectParagraphProperties {
+        style_id: ppr_change.previous_style_id.clone(),
+        alignment: direct_alignment,
+        indentation: direct_indentation,
+        spacing: direct_spacing,
+        numbering: direct_numbering,
+        keep_next: ppr_change.previous_keep_next,
+        keep_lines: ppr_change.previous_keep_lines,
+        page_break_before: ppr_change.previous_page_break_before,
+        widow_control: ppr_change.previous_widow_control,
+        contextual_spacing: ppr_change.previous_contextual_spacing,
+        shading: direct_shading,
+        borders: direct_borders,
+        tab_stops: ppr_change.previous_tab_stops.clone(),
+        text_direction: direct_text_direction,
+        text_alignment: direct_text_alignment,
+        mirror_indents: ppr_change.previous_mirror_indents,
+        auto_space_de: ppr_change.previous_auto_space_de,
+        auto_space_dn: ppr_change.previous_auto_space_dn,
+        bidi: ppr_change.previous_bidi,
+        suppress_auto_hyphens: ppr_change.previous_suppress_auto_hyphens,
+        snap_to_grid: ppr_change.previous_snap_to_grid,
+        overflow_punct: ppr_change.previous_overflow_punct,
+        adjust_right_ind: ppr_change.previous_adjust_right_ind,
+        word_wrap: ppr_change.previous_word_wrap,
+        frame_pr: ppr_change.previous_frame_pr.as_ref().map(|frame| {
             crate::domain::FrameProperties {
-                width: fp.width,
-                height: fp.height,
-                h_rule: fp.h_rule.clone(),
-                h_space: fp.h_space,
-                v_space: fp.v_space,
-                wrap: fp.wrap.clone(),
-                v_anchor: fp.v_anchor.clone(),
-                h_anchor: fp.h_anchor.clone(),
-                x: fp.x,
-                x_align: fp.x_align.clone(),
-                y: fp.y,
-                y_align: fp.y_align.clone(),
-                extra_attrs: fp.extra_attrs.clone(),
+                width: frame.width,
+                height: frame.height,
+                h_rule: frame.h_rule.clone(),
+                h_space: frame.h_space,
+                v_space: frame.v_space,
+                wrap: frame.wrap.clone(),
+                v_anchor: frame.v_anchor.clone(),
+                h_anchor: frame.h_anchor.clone(),
+                x: frame.x,
+                x_align: frame.x_align.clone(),
+                y: frame.y,
+                y_align: frame.y_align.clone(),
+                extra_attrs: frame.extra_attrs.clone(),
             }
         }),
-        previous_preserved_ppr: ppr_change
-            .preserved
-            .iter()
-            .filter(|prop| {
-                !previous_num_pr_is_modeled || (prop.name != "numPr" && prop.name != "w:numPr")
-            })
-            .cloned()
-            .collect(),
+        outline_lvl: direct_outline_lvl,
+        cnf_style: ppr_change.previous_cnf_style.clone(),
+        preserved: ppr_change.preserved.clone(),
+    };
+    let effective = EffectiveParagraphProperties {
+        alignment: effective_alignment,
+        indentation: effective_indentation,
+        spacing: authored_paragraph_spacing(resolved_spacing.as_ref()),
+        numbering: effective_numbering,
+        keep_next: style_defs
+            .resolve_effective_keep_next(effective_style_id, ppr_change.previous_keep_next),
+        keep_lines: style_defs
+            .resolve_effective_keep_lines(effective_style_id, ppr_change.previous_keep_lines),
+        page_break_before: style_defs
+            .resolve_effective_page_break_before(
+                effective_style_id,
+                ppr_change.previous_page_break_before,
+            )
+            .unwrap_or(false),
+        widow_control: style_defs
+            .resolve_effective_widow_control(effective_style_id, ppr_change.previous_widow_control),
+        contextual_spacing: style_defs.resolve_effective_contextual_spacing(
+            effective_style_id,
+            ppr_change.previous_contextual_spacing,
+        ),
+        shading: effective_shading,
+        borders: effective_borders,
+        tab_stops_rel: effective_tab_stops_rel,
+        heading_level,
+        literal_prefix_leading_tab_twips: context
+            .literal_prefix_has_leading_tab
+            .then_some(body_left - left_indent),
+        literal_prefix_trailing_tab_stop_twips: (prefix_had_tab
+            && resolved_stops.iter().any(|stop| stop.position == body_left))
+        .then_some(body_left - left_indent),
+    };
+    let paragraph_mark = ParagraphMarkProperties {
+        marks: convert_text_marks_to_marks(previous_mark_rpr),
+        style_props: paragraph_mark_props_without_rfonts(previous_mark_rpr)?,
+        rfonts: previous_mark_rpr.authored_rfonts.clone(),
+        rpr_off: convert_text_marks_to_para_mark_off(previous_mark_rpr),
+    };
+    Ok(ParagraphFormattingChange {
+        previous: PreviousParagraphProperties {
+            direct,
+            effective,
+            paragraph_mark,
+        },
         revision_id: ppr_change.revision_id,
         identity: 0,
         author: ppr_change.author.clone(),
         date: ppr_change.date.clone(),
+        carrier: if outer_mark_change.is_some() {
+            crate::domain::ParagraphFormattingChangeCarrier::ParagraphAndMarkProperties
+        } else {
+            crate::domain::ParagraphFormattingChangeCarrier::ParagraphProperties
+        },
     })
+}
+
+/// Attach a paragraph-mark-only `w:rPrChange` after the live paragraph has
+/// been constructed. The ordinary paragraph snapshot is intentionally the
+/// current state: rejecting this carrier restores only the mark properties and
+/// leaves every non-mark pPr slot unchanged.
+fn attach_mark_only_formatting_change(
+    paragraph: &mut ParagraphNode,
+    change: Option<&crate::word_ir::RprChange>,
+) -> Result<(), RuntimeError> {
+    let Some(change) = change else { return Ok(()) };
+    assert!(
+        paragraph.formatting_change.is_none(),
+        "mark-only attachment requires no pPrChange on paragraph {}",
+        paragraph.id
+    );
+    let revision = RevisionInfo {
+        revision_id: change.revision_id,
+        author: (!change.author.is_empty()).then(|| change.author.clone()),
+        date: change.date.clone(),
+        apply_op_id: None,
+        identity: 0,
+    };
+    let mut snapshot = crate::edit::snapshot_paragraph_formatting(paragraph, &revision);
+    snapshot.carrier = crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties;
+    snapshot.previous.paragraph_mark = ParagraphMarkProperties {
+        marks: convert_text_marks_to_marks(&change.previous_marks),
+        style_props: paragraph_mark_props_without_rfonts(&change.previous_marks)?,
+        rfonts: change.previous_marks.authored_rfonts.clone(),
+        rpr_off: convert_text_marks_to_para_mark_off(&change.previous_marks),
+    };
+    paragraph.formatting_change = Some(snapshot);
+    Ok(())
 }
 
 /// Convert a word_ir::RprChange to a domain::FormattingChange.
@@ -9280,6 +10150,7 @@ fn convert_rpr_change(text_marks: &TextMarks) -> Result<Option<FormattingChange>
         None => return Ok(None),
     };
     Ok(Some(FormattingChange {
+        carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
         previous_marks: convert_text_marks_to_marks(&rpr.previous_marks),
         previous_style_props: convert_text_marks_to_style_props(&rpr.previous_marks)?,
         // Same derivation `run_rpr_authored` already applies to a run's LIVE
@@ -9394,6 +10265,7 @@ fn inline_nodes_from_atoms(
                     wrapper_style_props: convert_text_marks_to_style_props(&resolved_marks)?,
                     wrapper_rpr_authored: run_rpr_authored(&atom.marks),
                     source_run_attrs: atom.source_run_attrs.clone(),
+                    formatting_change: convert_rpr_change(&atom.marks)?,
                     joins_following_text_run,
                 }));
             }
@@ -9516,7 +10388,9 @@ fn inline_nodes_from_atoms(
                     } else {
                         (Vec::new(), StyleProps::default())
                     };
-                let joins_following_text_run = atom.origin.run_index.is_some()
+                let local_name = name.split(':').next_back().unwrap_or(name);
+                let joins_following_text_run = crate::word_ir::is_run_decoration(local_name)
+                    && atom.origin.run_index.is_some()
                     && atoms.get(atom_index + 1).is_some_and(|next| {
                         next.origin.run_index == atom.origin.run_index
                             && matches!(
@@ -9696,6 +10570,7 @@ pub(crate) fn parse_document_relationships(
                 details: ErrorDetails::default(),
             })?
             .clone();
+        let rel_type = word_xml::canonicalize_relationship_type(&rel_type).into_owned();
         let target = attr_get(el, "Target")
             .ok_or_else(|| RuntimeError {
                 code: ErrorCode::InvalidDocx,
@@ -10938,30 +11813,32 @@ fn parse_story_block(
         // pairing the remaining atoms with inlines for segment building.
         let prefix_len = pre_strip_count - inlines.len();
         let body_text = extract_inline_text_simple(&inlines);
+        let has_literal_prefix = literal_prefix.is_some();
 
         // Resolve effective numPr: direct wins, else style-resolved (§17.7.4.14).
         // DirectNumPr::Suppressed (numId=0, §17.9.18) blocks style and pStyle binding.
-        let mut effective_num_props = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_num_props(view.style_id.as_deref(), &view.num_props)
+        let mut resolved_num_pr = if let Some(sd) = ctx.style_defs {
+            sd.resolve_effective_num_props(effective_style_id, &view.num_props)
         } else {
-            match &view.num_props {
-                crate::word_ir::DirectNumPr::Active(np) => Some(np.clone()),
-                _ => None,
-            }
+            view.num_props.clone()
         };
 
         // §17.9.23: pStyle reverse binding — if no numPr from direct or style,
         // check if any numbering level claims this paragraph's style via <w:pStyle>.
         // Only applies when numPr is truly absent — Suppressed (numId=0) blocks this.
-        if effective_num_props.is_none()
-            && view.num_props == crate::word_ir::DirectNumPr::Absent
-            && let (Some(style_id), Some(defs)) = (view.style_id.as_deref(), ctx.numbering_defs)
+        if resolved_num_pr == crate::word_ir::DirectNumPr::Absent
+            && let (Some(style_id), Some(defs)) = (effective_style_id, ctx.numbering_defs)
         {
             let pstyle_map = defs.build_pstyle_reverse_map();
             if let Some(&(num_id, ilvl)) = pstyle_map.get(style_id) {
-                effective_num_props = Some(crate::word_ir::NumProps { num_id, ilvl });
+                resolved_num_pr =
+                    crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl });
             }
         }
+        let effective_num_props = match &resolved_num_pr {
+            crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
+            crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+        };
 
         // Synthesize numbering if available
         let (numbering, rendered_text) = match (&effective_num_props, ctx.numbering_defs) {
@@ -10977,6 +11854,7 @@ fn parse_story_block(
                         let numbering_info = crate::domain::NumberingInfo {
                             num_id: num_props.num_id,
                             ilvl: num_props.ilvl,
+                            resolution: crate::domain::NumberingResolution::Resolved,
                             synthesized_text: synthesized.clone(),
                             is_bullet,
                             restart_numbering: false,
@@ -10993,29 +11871,69 @@ fn parse_story_block(
                         };
                         (Some(numbering_info), rendered)
                     }
-                    Err(err) => {
-                        // OBSERVABLE DEGRADATION BOUNDARY — same as the body
-                        // paragraph path (paragraph_from_element): a dangling
-                        // numId/ilvl demotes this story paragraph from list
-                        // item to plain paragraph rather than refusing the
-                        // whole import (invariant #1, parse totality). Kept
-                        // observable rather than silent.
-                        tracing::warn!(
-                            block_id = %block_id.0,
-                            num_id = num_props.num_id,
-                            ilvl = num_props.ilvl,
-                            error = %err,
-                            "numbering synthesis failed; demoting story paragraph to plain text (literal prefix fallback)"
-                        );
-                        if let Some(ref lp) = literal_prefix {
-                            (None, Some(format!("{lp}\t{body_text}")))
-                        } else {
-                            (None, None)
-                        }
+                    Err(crate::numbering::NumberingError::MissingNumberingInstance { .. }) => (
+                        Some(crate::domain::NumberingInfo {
+                            num_id: num_props.num_id,
+                            ilvl: num_props.ilvl,
+                            resolution:
+                                crate::domain::NumberingResolution::MissingNumberingInstance,
+                            synthesized_text: String::new(),
+                            is_bullet: false,
+                            restart_numbering: false,
+                        }),
+                        literal_prefix
+                            .as_ref()
+                            .map(|prefix| format!("{prefix}\t{body_text}")),
+                    ),
+                    Err(crate::numbering::NumberingError::MissingAbstractNum { .. }) => (
+                        Some(crate::domain::NumberingInfo {
+                            num_id: num_props.num_id,
+                            ilvl: num_props.ilvl,
+                            resolution:
+                                crate::domain::NumberingResolution::MissingAbstractNumbering,
+                            synthesized_text: String::new(),
+                            is_bullet: false,
+                            restart_numbering: false,
+                        }),
+                        literal_prefix
+                            .as_ref()
+                            .map(|prefix| format!("{prefix}\t{body_text}")),
+                    ),
+                    Err(crate::numbering::NumberingError::MissingLevel { .. }) => (
+                        Some(crate::domain::NumberingInfo {
+                            num_id: num_props.num_id,
+                            ilvl: num_props.ilvl,
+                            resolution: crate::domain::NumberingResolution::MissingLevel,
+                            synthesized_text: String::new(),
+                            is_bullet: false,
+                            restart_numbering: false,
+                        }),
+                        literal_prefix
+                            .as_ref()
+                            .map(|prefix| format!("{prefix}\t{body_text}")),
+                    ),
+                    Err(err @ crate::numbering::NumberingError::XmlParse(_)) => {
+                        return Err(invalid_docx(&format!(
+                            "story paragraph {} numbering numId={} ilvl={} cannot be resolved: {err}",
+                            block_id.0, num_props.num_id, num_props.ilvl
+                        )));
                     }
                 }
             }
-            _ => {
+            (Some(num_props), None) => (
+                Some(crate::domain::NumberingInfo {
+                    num_id: num_props.num_id,
+                    ilvl: num_props.ilvl,
+                    resolution: crate::domain::NumberingResolution::MissingDefinitions,
+                    synthesized_text: String::new(),
+                    is_bullet: false,
+                    restart_numbering: false,
+                }),
+                literal_prefix
+                    .as_ref()
+                    .map(|prefix| format!("{prefix}\t{body_text}")),
+            ),
+            (None, _) => {
                 if let Some(ref lp) = literal_prefix {
                     (None, Some(format!("{lp}\t{body_text}")))
                 } else {
@@ -11273,27 +12191,7 @@ fn parse_story_block(
 
         // Convert direct paragraph shading
         let shading_authored = view.paragraph_shading.is_some();
-        let direct_shading = match view.paragraph_shading {
-            Some((fill, val, color)) => {
-                let val = val
-                    .as_deref()
-                    .map(ShadingPattern::from_xml_str)
-                    .transpose()
-                    .map_err(|e| {
-                        invalid_docx(&format!(
-                            "story paragraph {}: paragraph shading: {e}",
-                            block_id.0
-                        ))
-                    })?;
-                Some(Shading {
-                    fill,
-                    val,
-                    color,
-                    extra_attrs: Vec::new(),
-                })
-            }
-            None => None,
-        };
+        let direct_shading = view.paragraph_shading;
 
         // Resolve shading through style chain (§17.3.1.31)
         let shading = if let Some(sd) = ctx.style_defs {
@@ -11302,7 +12200,12 @@ fn parse_story_block(
             direct_shading
         };
 
-        return Ok(Some(BlockNode::from(ParagraphNode {
+        let mark_only_change = view
+            .ppr_change
+            .is_none()
+            .then(|| view.paragraph_mark_rpr.rpr_change.as_deref().cloned())
+            .flatten();
+        let mut paragraph = ParagraphNode {
             id: block_id,
             style_id: view.style_id.clone(),
             align,
@@ -11359,7 +12262,7 @@ fn parse_story_block(
             heading_level: heading_level.map(HeadingLevel::from_number),
             para_mark_status: view.para_mark_status,
             paragraph_mark_marks: convert_text_marks_to_marks(&view.paragraph_mark_rpr),
-            paragraph_mark_style_props: convert_text_marks_to_style_props(
+            paragraph_mark_style_props: paragraph_mark_props_without_rfonts(
                 &view.paragraph_mark_rpr,
             )?,
             paragraph_mark_rfonts: view.paragraph_mark_rpr.authored_rfonts.clone(),
@@ -11372,9 +12275,16 @@ fn parse_story_block(
                 .map(|change| {
                     convert_ppr_change(
                         change,
-                        numbering.as_ref(),
-                        ctx.numbering_defs,
-                        &view.paragraph_mark_rpr,
+                        PprChangeConversionContext {
+                            numbering_defs: ctx.numbering_defs,
+                            style_defs: ctx.style_defs,
+                            live_mark_rpr: &view.paragraph_mark_rpr,
+                            body_text: &body_text,
+                            has_literal_prefix,
+                            literal_prefix_has_leading_tab,
+                            literal_prefix_has_trailing_tab,
+                            default_tab_stop: ctx.default_tab_stop,
+                        },
                     )
                 })
                 .transpose()?,
@@ -11412,7 +12322,9 @@ fn parse_story_block(
             text_direction: view.text_direction.clone(),
             cnf_style: view.cnf_style.clone(),
             preserved_ppr: view.preserved.clone(),
-        })));
+        };
+        attach_mark_only_formatting_change(&mut paragraph, mark_only_change.as_ref())?;
+        return Ok(Some(BlockNode::from(paragraph)));
     }
 
     // Handle w:tbl (table)
@@ -11564,230 +12476,6 @@ pub fn extract_block_text(block: &BlockNode) -> String {
         BlockNode::OpaqueBlock(_) => String::new(),
     }
 }
-/// Build story payloads (footnotes, endnotes, comments) from both canonical docs.
-/// Target takes precedence; base-only stories are included when not in target.
-pub(crate) fn build_story_payloads(
-    base: &CanonDoc,
-    target: &CanonDoc,
-    blocks: Vec<FullDocBlock>,
-) -> FullDocViewResult {
-    let target_fn_ids: HashSet<&str> = target
-        .footnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| n.id.as_str())
-        .collect();
-    let mut footnotes: Vec<StoryPayload> = target
-        .footnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| StoryPayload {
-            id: n.id.clone(),
-            segments: story_blocks_to_segments(&n.blocks),
-        })
-        .collect();
-    footnotes.extend(
-        base.footnotes
-            .iter()
-            .filter(|n| n.note_type == NoteType::Normal && !target_fn_ids.contains(n.id.as_str()))
-            .map(|n| StoryPayload {
-                id: n.id.clone(),
-                segments: story_blocks_to_segments(&n.blocks),
-            }),
-    );
-
-    let target_en_ids: HashSet<&str> = target
-        .endnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| n.id.as_str())
-        .collect();
-    let mut endnotes: Vec<StoryPayload> = target
-        .endnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| StoryPayload {
-            id: n.id.clone(),
-            segments: story_blocks_to_segments(&n.blocks),
-        })
-        .collect();
-    endnotes.extend(
-        base.endnotes
-            .iter()
-            .filter(|n| n.note_type == NoteType::Normal && !target_en_ids.contains(n.id.as_str()))
-            .map(|n| StoryPayload {
-                id: n.id.clone(),
-                segments: story_blocks_to_segments(&n.blocks),
-            }),
-    );
-
-    let target_comment_ids: HashSet<&str> = target.comments.iter().map(|c| c.id.as_str()).collect();
-    let mut comments: Vec<CommentPayload> = target
-        .comments
-        .iter()
-        .map(|c| {
-            let (resolved, parent_para_id) =
-                crate::domain::comment_extended_state(c, &target.comments_extended);
-            CommentPayload {
-                id: c.id.clone(),
-                author: c.author.clone(),
-                date: c.date.clone(),
-                segments: story_blocks_to_segments(&c.blocks),
-                resolved,
-                parent_para_id,
-            }
-        })
-        .collect();
-    comments.extend(
-        base.comments
-            .iter()
-            .filter(|c| !target_comment_ids.contains(c.id.as_str()))
-            .map(|c| {
-                let (resolved, parent_para_id) =
-                    crate::domain::comment_extended_state(c, &base.comments_extended);
-                CommentPayload {
-                    id: c.id.clone(),
-                    author: c.author.clone(),
-                    date: c.date.clone(),
-                    segments: story_blocks_to_segments(&c.blocks),
-                    resolved,
-                    parent_para_id,
-                }
-            }),
-    );
-
-    FullDocViewResult {
-        blocks,
-        footnotes,
-        endnotes,
-        comments,
-        // Headers/footers follow the target section's bindings (target takes
-        // precedence, matching footnotes/comments above).
-        headers: crate::diff::project_section_headers(target),
-        footers: crate::diff::project_section_footers(target),
-        body_section_properties: target.body_section_properties.clone(),
-    }
-}
-/// Convert story blocks (footnote/endnote/comment) to a flat list of inline segments.
-pub(crate) fn story_blocks_to_segments(blocks: &[TrackedBlock]) -> Vec<InlineChange> {
-    let mut segments = Vec::new();
-    for (i, tracked_block) in blocks.iter().enumerate() {
-        if i > 0 {
-            // Separate paragraphs with a newline.
-            segments.push(InlineChange::Unchanged {
-                text: "\n".to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-            });
-        }
-        if let BlockNode::Paragraph(p) = &tracked_block.block {
-            for inline in p.all_inlines() {
-                match inline {
-                    InlineNode::Text(t) => {
-                        segments.push(InlineChange::Unchanged {
-                            text: t.text.clone(),
-                            marks: t.marks.clone(),
-                            style_props: t.style_props.clone(),
-                            formatting_change: t.formatting_change.clone(),
-                        });
-                    }
-                    InlineNode::HardBreak(_) => {
-                        segments.push(InlineChange::Unchanged {
-                            text: "\n".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        });
-                    }
-                    InlineNode::OpaqueInline(o) => {
-                        let (text, reference_id, field_kind, field_instruction, asset_ref) =
-                            match &o.kind {
-                                OpaqueKind::Hyperlink(data) => {
-                                    let text = if data.text.is_empty() {
-                                        None
-                                    } else {
-                                        Some(data.text.clone())
-                                    };
-                                    // Surface URL (or #anchor for internal links) via asset_ref;
-                                    // json_types.rs maps this to the `url` JSON field for hyperlinks.
-                                    let url = data
-                                        .url
-                                        .clone()
-                                        .or_else(|| data.anchor.as_ref().map(|a| format!("#{a}")));
-                                    (text, None, None, None, url)
-                                }
-                                OpaqueKind::FootnoteReference(ref_data)
-                                | OpaqueKind::EndnoteReference(ref_data)
-                                | OpaqueKind::CommentReference(ref_data) => {
-                                    (None, Some(ref_data.reference_id.clone()), None, None, None)
-                                }
-                                OpaqueKind::Field(field_data) => {
-                                    // Prefer canonical instruction text from
-                                    // the typed semantic (whitespace-invariant);
-                                    // fall back to raw fragment bytes when no
-                                    // semantic is parsed.
-                                    let field_instruction = field_data
-                                        .semantic
-                                        .as_ref()
-                                        .map(|s| s.to_instruction_text())
-                                        .or_else(|| field_data.instruction_text.clone());
-                                    (
-                                        field_data.result_text.clone(),
-                                        None,
-                                        Some(field_data.field_kind.clone()),
-                                        field_instruction,
-                                        None,
-                                    )
-                                }
-                                _ => (None, None, None, None, None),
-                            };
-                        segments.push(InlineChange::Opaque {
-                            segment_type: InlineChangeSegmentType::Equal,
-                            kind: crate::diff::opaque_kind_to_segment_kind(&o.kind),
-                            opaque_id: o.id.0.to_string(),
-                            inline_index: 0,
-                            text,
-                            reference_id,
-                            field_kind,
-                            field_instruction,
-                            asset_ref,
-                            asset_width_emu: None,
-                            asset_height_emu: None,
-                            alt_text: None,
-                            url: crate::diff::opaque_url(&o.kind),
-                            content_hash: o.content_hash.clone(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    segments
-}
-
-/// Project a header/footer story into per-paragraph bands, keeping each `w:p`'s
-/// alignment and tab stops (which `story_blocks_to_segments` flattens away). The
-/// inline content reuses the same walker on a one-paragraph slice — for a single
-/// block it emits no inter-paragraph separator, so it yields exactly that
-/// paragraph's segments.
-pub(crate) fn story_blocks_to_paragraphs(
-    blocks: &[TrackedBlock],
-) -> Vec<crate::domain::HeaderFooterParagraph> {
-    blocks
-        .iter()
-        .filter_map(|tracked_block| match &tracked_block.block {
-            BlockNode::Paragraph(p) => Some(crate::domain::HeaderFooterParagraph {
-                align: p.align.clone(),
-                tab_stops: p.tab_stops.clone(),
-                segments: story_blocks_to_segments(std::slice::from_ref(tracked_block)),
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Extract symbol character data from a `w:sym` element's raw XML.
 ///
 /// Per ECMA-376 §17.3.3.30, the `char` attribute is a hex codepoint from the font
@@ -12131,6 +12819,58 @@ mod tests {
     use crate::docx::DocxFile;
     use crate::runtime::ErrorCode;
 
+    fn import_single_body_opaque_ref(document_xml: &[u8]) -> String {
+        let root = word_xml::parse_document_xml(document_xml).expect("parse synthetic document");
+        let (doc, _) = build_canonical_from_root_with_stories(
+            &root,
+            DocFingerprint("synthetic".to_string()),
+            None,
+            None,
+            720,
+            &CompatSettings::default(),
+            &HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("import synthetic document");
+        let refs: Vec<&str> = doc
+            .blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::OpaqueBlock(opaque) => Some(opaque.opaque_ref.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 1, "synthetic document must contain one opaque");
+        refs[0].to_string()
+    }
+
+    #[test]
+    fn body_opaque_identity_uses_content_not_body_position() {
+        let base = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:sdt><w:sdtPr><w:tag w:val="base"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Base</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>"#;
+        let target = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:sdt><w:sdtPr><w:tag w:val="target"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Target</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>"#;
+        let shifted_base = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Before</w:t></w:r></w:p><w:sdt><w:sdtPr><w:tag w:val="base"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Base</w:t></w:r></w:p></w:sdtContent></w:sdt></w:body></w:document>"#;
+
+        let base_ref = import_single_body_opaque_ref(base);
+        let target_ref = import_single_body_opaque_ref(target);
+        let shifted_base_ref = import_single_body_opaque_ref(shifted_base);
+
+        assert_ne!(
+            base_ref, target_ref,
+            "different SDT bytes at the same position are different opaque blocks"
+        );
+        assert_eq!(
+            base_ref, shifted_base_ref,
+            "moving identical opaque bytes must not change their identity"
+        );
+        assert!(base_ref.starts_with("body_item_sha256:"));
+    }
+
     /// Pre-Rung-6 whole-tree archive build: materialize the entire document.xml
     /// tree up front, parse header/footer refs from it, then run the body loop.
     /// Kept ONLY in tests as the oracle the streaming `build_canonical_from_archive`
@@ -12152,11 +12892,14 @@ mod tests {
             "word/numbering.xml",
             crate::numbering::NumberingDefinitions::parse,
         )?;
-        let mut style_defs = parse_optional_docx_part(
-            archive,
-            "word/styles.xml",
-            crate::styles::StyleDefinitions::parse,
-        )?;
+        let mut style_defs = Some(
+            parse_optional_docx_part(
+                archive,
+                "word/styles.xml",
+                crate::styles::StyleDefinitions::parse,
+            )?
+            .unwrap_or_default(),
+        );
         let theme_fonts = parse_optional_docx_part(
             archive,
             "word/theme/theme1.xml",
@@ -12235,12 +12978,12 @@ mod tests {
             footnotes,
             endnotes,
             comments,
+            even_and_odd_headers,
             None,
         )?;
         diagnostics.extend(story_diagnostics);
         doc.compat_settings = compat_settings;
         doc.comments_extended = comments_extended;
-        doc.even_and_odd_headers = even_and_odd_headers;
         resolve_hyperlink_urls(&mut doc, &rels.hyperlinks);
         Ok((doc, diagnostics))
     }
@@ -12641,6 +13384,69 @@ mod tests {
     }
 
     #[test]
+    fn enabled_even_headers_synthesize_a_blank_first_section_story() {
+        let archive = DocxArchive::from_parts(vec![
+            DocxFile {
+                name: "_rels/.rels".to_string(),
+                data: br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+            },
+            DocxFile {
+                name: "word/document.xml".to_string(),
+                data: br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#.to_vec(),
+            },
+            DocxFile {
+                name: "word/_rels/document.xml.rels".to_string(),
+                data: br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#.to_vec(),
+            },
+            DocxFile {
+                name: "word/settings.xml".to_string(),
+                data: br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:evenAndOddHeaders/></w:settings>"#.to_vec(),
+            },
+        ]);
+
+        let (document, _) = build_canonical_from_archive(
+            &archive,
+            DocFingerprint("even-header-synthesis".to_string()),
+        )
+        .expect("enabled even-page mode has a modeled blank first-section story");
+        assert_eq!(document.even_and_odd_headers, Some(true));
+        assert!(
+            document
+                .headers
+                .iter()
+                .any(|story| { story.kind == HeaderFooterKind::Even && story.synthesized })
+        );
+        assert!(
+            document
+                .footers
+                .iter()
+                .any(|story| { story.kind == HeaderFooterKind::Even && story.synthesized })
+        );
+        assert!(
+            document
+                .body_section_properties
+                .as_ref()
+                .expect("body section")
+                .header_refs
+                .iter()
+                .any(|reference| {
+                    reference.kind == HeaderFooterKind::Even && reference.synthesized
+                })
+        );
+        assert!(
+            document
+                .body_section_properties
+                .as_ref()
+                .expect("body section")
+                .footer_refs
+                .iter()
+                .any(|reference| {
+                    reference.kind == HeaderFooterKind::Even && reference.synthesized
+                })
+        );
+    }
+
+    #[test]
     fn parse_header_footer_ref_type_odd_maps_to_default() {
         // Apache POI and other producers emit w:type="odd" instead of "default".
         // "odd" is semantically equivalent: in OOXML, "default" already means
@@ -12679,6 +13485,157 @@ mod tests {
             r#"<w:tblPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:tblPr>"#
         );
         Element::parse(Cursor::new(xml.as_bytes())).expect("test XML must parse")
+    }
+
+    fn tbl_pr_ex_element(inner: &str) -> Element {
+        use std::io::Cursor;
+        let xml = format!(
+            r#"<w:tblPrEx xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:tblPrEx>"#
+        );
+        Element::parse(Cursor::new(xml.as_bytes())).expect("test XML must parse")
+    }
+
+    #[test]
+    fn table_property_exception_change_parses_current_and_previous_payloads() {
+        let element = tbl_pr_ex_element(
+            r#"<w:shd w:val="solid" w:fill="AABBCC"/><w:future/><w:tblPrExChange w:id="7" w:author="A"><w:tblPrEx><w:tblW w:w="2400" w:type="dxa"/></w:tblPrEx></w:tblPrExChange>"#,
+        );
+        let current = canonical_tbl_pr_ex(parse_tbl_pr_ex(&element).expect("current payload"))
+            .expect("nonempty current payload");
+        assert_eq!(
+            current
+                .shading
+                .as_ref()
+                .and_then(|shading| shading.fill.as_deref()),
+            Some("AABBCC")
+        );
+        assert_eq!(current.preserved.len(), 1);
+        let change = parse_tbl_pr_ex_change(&element)
+            .expect("valid change")
+            .expect("present change");
+        assert_eq!(change.revision_id, 7);
+        assert_eq!(change.author, "A");
+        assert_eq!(
+            change
+                .previous
+                .as_ref()
+                .and_then(|formatting| formatting.width.as_ref())
+                .map(|width| width.w),
+            Some(2_400)
+        );
+    }
+
+    #[test]
+    fn empty_table_property_exception_is_canonical_absence() {
+        let element = tbl_pr_ex_element("");
+        assert!(canonical_tbl_pr_ex(parse_tbl_pr_ex(&element).expect("empty payload")).is_none());
+    }
+
+    #[test]
+    fn table_property_exception_change_requires_exactly_one_previous_payload() {
+        let missing = tbl_pr_ex_element(r#"<w:tblPrExChange w:id="1"/>"#);
+        assert!(parse_tbl_pr_ex_change(&missing).is_err());
+        let duplicate = tbl_pr_ex_element(
+            r#"<w:tblPrExChange w:id="1"><w:tblPrEx/><w:tblPrEx/></w:tblPrExChange>"#,
+        );
+        assert!(parse_tbl_pr_ex_change(&duplicate).is_err());
+    }
+
+    fn vmerge_test_cell(id: &str, v_merge: VerticalMerge) -> TableCellNode {
+        TableCellNode {
+            id: NodeId::from(id.to_string()),
+            blocks: Vec::new(),
+            grid_span: 1,
+            v_merge,
+            formatting: CellFormatting::default(),
+            formatting_change: None,
+            tracking_status: None,
+            row_sdt_wrapper: None,
+            content_sdt_wraps: Vec::new(),
+            cnf_style: None,
+            hide_mark: false,
+            preserved: Vec::new(),
+        }
+    }
+
+    fn vmerge_test_row(id: &str, grid_before: u32, cells: Vec<TableCellNode>) -> TableRowNode {
+        TableRowNode {
+            id: NodeId::from(id.to_string()),
+            cells,
+            grid_before,
+            grid_after: 0,
+            tracking_status: None,
+            is_header: false,
+            height: None,
+            height_rule: None,
+            formatting_change: None,
+            para_id: None,
+            text_id: None,
+            cant_split: false,
+            jc: None,
+            w_before: None,
+            w_after: None,
+            cnf_style: None,
+            tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
+            cell_spacing: None,
+            preserved: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn vmerge_validation_uses_logical_grid_columns_and_adjacent_rows() {
+        let aligned = vec![
+            vmerge_test_row(
+                "r0",
+                1,
+                vec![vmerge_test_cell("restart", VerticalMerge::Restart)],
+            ),
+            vmerge_test_row(
+                "r1",
+                1,
+                vec![vmerge_test_cell("continue", VerticalMerge::Continue)],
+            ),
+        ];
+        validate_vmerge_grid_alignment(&aligned).expect("aligned continuation must validate");
+        assert_eq!(aligned[1].cells[0].v_merge, VerticalMerge::Continue);
+
+        let shifted = vec![
+            vmerge_test_row(
+                "r0",
+                1,
+                vec![vmerge_test_cell("restart", VerticalMerge::Restart)],
+            ),
+            vmerge_test_row(
+                "r1",
+                0,
+                vec![vmerge_test_cell("continue", VerticalMerge::Continue)],
+            ),
+        ];
+        validate_vmerge_grid_alignment(&shifted)
+            .expect("Word treats a continuation without an aligned restart as standalone");
+        assert_eq!(shifted[1].cells[0].v_merge, VerticalMerge::Continue);
+
+        let interrupted = vec![
+            vmerge_test_row(
+                "r0",
+                0,
+                vec![vmerge_test_cell("restart", VerticalMerge::Restart)],
+            ),
+            vmerge_test_row(
+                "r1",
+                0,
+                vec![vmerge_test_cell("other", VerticalMerge::None)],
+            ),
+            vmerge_test_row(
+                "r2",
+                0,
+                vec![vmerge_test_cell("continue", VerticalMerge::Continue)],
+            ),
+        ];
+        validate_vmerge_grid_alignment(&interrupted)
+            .expect("Word treats a continuation after an interrupted chain as standalone");
+        assert_eq!(interrupted[2].cells[0].v_merge, VerticalMerge::Continue);
     }
 
     #[test]
@@ -12988,6 +13945,43 @@ mod tests {
         assert!(
             !normal_has_removed,
             "deleted footnote text must not be flattened into a live Normal segment"
+        );
+    }
+
+    #[test]
+    fn story_paragraph_mark_fonts_have_one_exact_typed_owner() {
+        use std::io::Cursor;
+
+        fn paragraph(xml: &str) -> ParagraphNode {
+            let element = Element::parse(Cursor::new(xml.as_bytes())).expect("parse story");
+            parse_note_blocks(&element, None, None, 720)
+                .expect("parse story blocks")
+                .into_iter()
+                .find_map(|block| match block {
+                    BlockNode::Paragraph(paragraph) => Some(*paragraph),
+                    _ => None,
+                })
+                .expect("story paragraph")
+        }
+
+        let first = paragraph(
+            r#"<w:footnote xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="1"><w:p><w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:eastAsia="Calibri" w:hAnsi="Calibri" w:cs="Arial"/></w:rPr></w:pPr></w:p></w:footnote>"#,
+        );
+        let reordered = paragraph(
+            r#"<w:footnote xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="1"><w:p><w:pPr><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Arial"/></w:rPr></w:pPr></w:p></w:footnote>"#,
+        );
+
+        assert_eq!(first.paragraph_mark_rfonts, reordered.paragraph_mark_rfonts);
+        assert_eq!(
+            first.paragraph_mark_style_props,
+            reordered.paragraph_mark_style_props
+        );
+        assert!(
+            first
+                .paragraph_mark_style_props
+                .preserved
+                .iter()
+                .all(|property| !property.name.ends_with(":rFonts"))
         );
     }
 
@@ -13410,11 +14404,559 @@ mod tests {
         archive.write().expect("test DOCX archive should serialize")
     }
 
+    fn docx_with_body_and_numbering(body_inner_xml: &str, numbering_xml: &str) -> Vec<u8> {
+        let document_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>{body_inner_xml}</w:body>
+</w:document>"#
+        );
+        let archive = DocxArchive::from_parts(vec![
+            DocxFile {
+                name: "[Content_Types].xml".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>
+</Types>"#
+                    .to_vec(),
+            },
+            DocxFile {
+                name: "_rels/.rels".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#
+                    .to_vec(),
+            },
+            DocxFile {
+                name: "word/document.xml".to_string(),
+                data: document_xml.into_bytes(),
+            },
+            DocxFile {
+                name: "word/_rels/document.xml.rels".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdNumbering" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>
+</Relationships>"#
+                    .to_vec(),
+            },
+            DocxFile {
+                name: "word/numbering.xml".to_string(),
+                data: numbering_xml.as_bytes().to_vec(),
+            },
+        ]);
+        archive.write().expect("test DOCX archive should serialize")
+    }
+
     /// Import bytes and return (canonical, diagnostics) — the diagnostics-
     /// preserving path, so the tolerance's visibility contract is assertable.
     fn import_with_diagnostics(bytes: &[u8]) -> (CanonDoc, Vec<Diagnostic>) {
         build_canonical_from_docx_preserving_tracked(bytes, DocFingerprint("compat".to_string()))
             .expect("witnessed compat shape must import cleanly")
+    }
+
+    #[test]
+    fn unresolved_direct_numbering_without_definitions_is_preserved_without_a_label() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let numbering = paragraph
+            .numbering
+            .as_ref()
+            .expect("the authored unresolved reference is active state");
+        assert_eq!(numbering.num_id, 7);
+        assert_eq!(numbering.ilvl, 0);
+        assert_eq!(
+            numbering.resolution,
+            crate::domain::NumberingResolution::MissingDefinitions
+        );
+        assert!(!paragraph.has_resolved_numbering());
+        assert_eq!(paragraph.rendered_text, None);
+        assert!(paragraph.has_direct_numbering);
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn unresolved_direct_numbering_without_an_instance_is_typed() {
+        let bytes = docx_with_body_and_numbering(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum></w:numbering>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let numbering = paragraph.numbering.as_ref().expect("unresolved reference");
+        assert_eq!(
+            numbering.resolution,
+            crate::domain::NumberingResolution::MissingNumberingInstance
+        );
+        assert!(!paragraph.has_resolved_numbering());
+        assert_eq!(paragraph.rendered_text, None);
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn unresolved_direct_numbering_without_an_abstract_definition_is_typed() {
+        let bytes = docx_with_body_and_numbering(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:num w:numId="7"><w:abstractNumId w:val="8"/></w:num></w:numbering>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let numbering = paragraph.numbering.as_ref().expect("unresolved reference");
+        assert_eq!(
+            numbering.resolution,
+            crate::domain::NumberingResolution::MissingAbstractNumbering
+        );
+        assert!(!paragraph.has_resolved_numbering());
+        assert_eq!(paragraph.rendered_text, None);
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn unresolved_direct_numbering_with_a_missing_level_is_typed() {
+        let bytes = docx_with_body_and_numbering(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let numbering = paragraph.numbering.as_ref().expect("unresolved reference");
+        assert_eq!(
+            numbering.resolution,
+            crate::domain::NumberingResolution::MissingLevel
+        );
+        assert_eq!(paragraph.indent, None, "a missing level supplies no indent");
+        assert_eq!(
+            paragraph.rendered_text, None,
+            "a missing level supplies no label"
+        );
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn ppr_change_styleless_import_separates_direct_from_spec_default_effective() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:jc w:val="right"/><w:pPrChange w:id="7" w:author=""><w:pPr><w:jc w:val="left"/></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange imports");
+
+        assert_eq!(change.previous.direct.alignment, Some(Alignment::Left));
+        assert_eq!(change.previous.effective.alignment, Some(Alignment::Left));
+        assert_eq!(change.previous.direct.widow_control, None);
+        assert_eq!(change.previous.effective.widow_control, Some(true));
+    }
+
+    #[test]
+    fn ppr_change_import_uses_outer_rpr_change_for_previous_paragraph_mark() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:rPr><w:b/><w:rPrChange w:id="10" w:author=""><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:pPrChange w:id="11" w:author=""><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange imports");
+
+        assert_eq!(paragraph.paragraph_mark_marks, vec![Mark::Bold]);
+        assert_eq!(change.previous.paragraph_mark.marks, vec![Mark::Italic]);
+    }
+
+    #[test]
+    fn paragraph_mark_rpr_change_imports_without_manufacturing_ppr_change() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:rPr><w:b/><w:rPrChange w:id="10" w:author="reviewer"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("paragraph-mark rPrChange imports as a modeled carrier");
+
+        assert_eq!(
+            change.carrier,
+            crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties
+        );
+        assert_eq!(paragraph.paragraph_mark_marks, vec![Mark::Bold]);
+        assert_eq!(change.previous.paragraph_mark.marks, vec![Mark::Italic]);
+        let revisions = crate::tracked_model::enumerate_revisions(&document);
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(
+            revisions[0].kind,
+            crate::tracked_model::RevisionKind::FormatParagraphMark
+        );
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn ppr_change_import_rejects_conflicting_previous_paragraph_mark_proofs() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:rPr><w:b/><w:rPrChange w:id="20" w:author=""><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:pPrChange w:id="21" w:author=""><w:pPr><w:rPr><w:u w:val="single"/></w:rPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let error = build_canonical_from_docx_preserving_tracked(
+            &bytes,
+            DocFingerprint("conflicting-mark-proof".to_string()),
+        )
+        .expect_err("contradictory previous paragraph-mark proofs must fail import");
+
+        assert_eq!(error.code, ErrorCode::InvalidDocx);
+        assert!(
+            error
+                .message
+                .contains("conflicting previous paragraph-mark state"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("revision 21"), "{}", error.message);
+        assert!(error.message.contains("revision 20"), "{}", error.message);
+    }
+
+    #[test]
+    fn ppr_change_import_rejects_unknown_previous_text_enums() {
+        for (property, expected) in [
+            (r#"<w:textAlignment w:val="sideways"/>"#, "textAlignment"),
+            (r#"<w:textDirection w:val="diagonal"/>"#, "textDirection"),
+        ] {
+            let bytes = docx_with_body(&format!(
+                r#"<w:p><w:pPr><w:pPrChange w:id="12" w:author=""><w:pPr>{property}</w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+            ));
+            let error = build_canonical_from_docx_preserving_tracked(
+                &bytes,
+                DocFingerprint("invalid-ppr-change".to_string()),
+            )
+            .expect_err("unknown previous text enum must fail import");
+
+            assert_eq!(error.code, ErrorCode::InvalidDocx);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn strict_universal_paragraph_measures_rebuild_as_equal_twips() {
+        use crate::ExportOptions;
+        use crate::api::Document;
+
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:ind w:start="36pt"/><w:spacing w:before="0pt" w:after="1in" w:line="12pt"/></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let parsed = Document::parse(&bytes).expect("strict universal spacing imports");
+        let serialized = parsed
+            .serialize(&ExportOptions::default())
+            .expect("canonical spacing serializes");
+        let (reimported, _) = import_with_diagnostics(&serialized);
+        let BlockNode::Paragraph(paragraph) = &reimported.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+
+        let authored = ParagraphSpacing {
+            before: Some(0),
+            after: Some(1_440),
+            before_lines: None,
+            after_lines: None,
+            before_autospacing: None,
+            after_autospacing: None,
+            line: Some(240),
+            line_rule: None,
+        };
+        let effective = ParagraphSpacing {
+            line_rule: Some(LineSpacingRule::Auto),
+            ..authored.clone()
+        };
+        let indentation = Indentation {
+            left: Some(720),
+            ..Indentation::default()
+        };
+        assert_eq!(paragraph.authored_indent, Some(indentation.clone()));
+        assert_eq!(paragraph.indent, Some(indentation));
+        assert_eq!(paragraph.authored_spacing, Some(authored));
+        assert_eq!(paragraph.spacing, Some(effective));
+    }
+
+    #[test]
+    fn ppr_change_import_refuses_unresolved_or_malformed_previous_numpr_and_outline() {
+        for (property, expected) in [
+            (r#"<w:numPr/>"#, "schema-valid partial numId/ilvl shape"),
+            (
+                r#"<w:numPr><w:numId/></w:numPr>"#,
+                "numId is present without w:val",
+            ),
+            (
+                r#"<w:numPr><w:numId w:val="not-a-number"/></w:numPr>"#,
+                "numId has invalid w:val",
+            ),
+            (
+                r#"<w:numPr><w:ilvl/><w:numId w:val="7"/></w:numPr>"#,
+                "ilvl is present without w:val",
+            ),
+            (r#"<w:outlineLvl/>"#, "outlineLvl is present without w:val"),
+            (
+                r#"<w:outlineLvl w:val="not-a-level"/>"#,
+                "outlineLvl has invalid w:val",
+            ),
+            (r#"<w:outlineLvl w:val="10"/>"#, "outside 0..=9"),
+        ] {
+            let bytes = docx_with_body(&format!(
+                r#"<w:p><w:pPr><w:pPrChange w:id="13" w:author=""><w:pPr>{property}</w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+            ));
+            let error = build_canonical_from_docx_preserving_tracked(
+                &bytes,
+                DocFingerprint("malformed-ppr-change".to_string()),
+            )
+            .expect_err("malformed previous property must fail import");
+
+            assert_eq!(error.code, ErrorCode::InvalidDocx);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn ppr_change_import_models_exact_cnfstyle_without_preserved_double_accounting() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:pPrChange w:id="14" w:author=""><w:pPr><w:cnfStyle w:val="100000000000" w:firstRow="0" w:lastRow="1" w:custom="kept"/></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange imports");
+
+        let cnf = change
+            .previous
+            .direct
+            .cnf_style
+            .as_ref()
+            .expect("previous cnfStyle is typed");
+        assert_eq!(
+            cnf.val.as_ref().map(|mask| mask.as_str()),
+            Some("100000000000")
+        );
+        assert_eq!(cnf.first_row, Some(false));
+        assert_eq!(cnf.last_row, Some(true));
+        assert_eq!(cnf.first_column, None);
+        assert_eq!(
+            cnf.extra_attrs,
+            vec![crate::domain::QualifiedAttribute {
+                local_name: "custom".into(),
+                prefix: Some("w".into()),
+                namespace: Some(
+                    "http://schemas.openxmlformats.org/wordprocessingml/2006/main".into(),
+                ),
+                value: "kept".into(),
+            }]
+        );
+        assert!(
+            change.previous.direct.preserved.is_empty(),
+            "typed cnfStyle must not also remain as raw previous-pPr content"
+        );
+    }
+
+    #[test]
+    fn ppr_change_empty_composites_and_shading_attributes_serialize_and_reimport_exactly() {
+        use crate::ExportOptions;
+        use crate::api::Document;
+
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:pPrChange w:id="15" w:author=""><w:pPr><w:pBdr/><w:shd xmlns:x="urn:foreign" w:themeFill="accent1" w:themeFillTint="99" x:fill="foreign"/><w:tabs/><w:spacing/><w:ind/></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let parsed = Document::parse(&bytes).expect("initial tracked document");
+        let serialized = parsed
+            .serialize(&ExportOptions::default())
+            .expect("previous pPr serializes");
+        let (reimported, _) = import_with_diagnostics(&serialized);
+        let BlockNode::Paragraph(paragraph) = &reimported.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let previous = &paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange reimports")
+            .previous
+            .direct;
+
+        assert_eq!(previous.indentation, Some(Indentation::default()));
+        assert_eq!(
+            previous.spacing,
+            Some(ParagraphSpacing {
+                before: None,
+                after: None,
+                before_lines: None,
+                after_lines: None,
+                before_autospacing: None,
+                after_autospacing: None,
+                line: None,
+                line_rule: None,
+            })
+        );
+        assert_eq!(
+            previous.borders,
+            Some(ParagraphBorders {
+                top: None,
+                bottom: None,
+                left: None,
+                right: None,
+                between: None,
+                bar: None,
+            })
+        );
+        assert_eq!(previous.tab_stops, Some(Vec::new()));
+        let shading = previous.shading.as_ref().expect("previous shading");
+        assert_eq!(shading.fill, None);
+        assert_eq!(shading.val, None);
+        assert_eq!(shading.color, None);
+        assert_eq!(
+            shading.extra_attrs,
+            vec![
+                crate::domain::QualifiedAttribute {
+                    local_name: "themeFill".into(),
+                    prefix: Some("w".into()),
+                    namespace: Some(
+                        "http://schemas.openxmlformats.org/wordprocessingml/2006/main".into(),
+                    ),
+                    value: "accent1".into(),
+                },
+                crate::domain::QualifiedAttribute {
+                    local_name: "themeFillTint".into(),
+                    prefix: Some("w".into()),
+                    namespace: Some(
+                        "http://schemas.openxmlformats.org/wordprocessingml/2006/main".into(),
+                    ),
+                    value: "99".into(),
+                },
+                crate::domain::QualifiedAttribute {
+                    local_name: "fill".into(),
+                    prefix: Some("x".into()),
+                    namespace: Some("urn:foreign".into()),
+                    value: "foreign".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ppr_change_num_id_zero_without_inheritance_is_explicit_suppression() {
+        let bytes = docx_with_body(
+            r#"<w:p><w:pPr><w:pPrChange w:id="8" w:author=""><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange imports");
+
+        assert_eq!(
+            change.previous.direct.numbering,
+            DirectParagraphNumbering::suppressed()
+        );
+        assert_eq!(change.previous.effective.numbering, None);
+    }
+
+    #[test]
+    fn ppr_change_positive_num_id_without_ilvl_resolves_previous_level_zero() {
+        let bytes = docx_with_body_and_numbering(
+            r#"<w:p><w:pPr><w:pPrChange w:id="8" w:author=""><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>"#,
+        );
+        let (document, _) = import_with_diagnostics(&bytes);
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph
+            .formatting_change
+            .as_ref()
+            .expect("pPrChange imports");
+        assert_eq!(
+            change.previous.direct.numbering,
+            DirectParagraphNumbering::Present(crate::domain::DirectParagraphNumPr {
+                num_id: Some(7),
+                ilvl: None,
+                extra_attrs: Vec::new(),
+                preserved: Vec::new(),
+            })
+        );
+        let effective = change
+            .previous
+            .effective
+            .numbering
+            .as_ref()
+            .expect("Word resolves the omitted previous ilvl as level zero");
+        assert_eq!((effective.num_id, effective.ilvl), (7, 0));
+        assert!(effective.is_resolved());
+        assert_eq!(
+            change
+                .previous
+                .effective
+                .indentation
+                .as_ref()
+                .and_then(|indent| indent.left),
+            Some(720)
+        );
+        assert_roundtrip_idempotent(&bytes);
+    }
+
+    #[test]
+    fn ppr_change_num_id_zero_with_style_numbering_is_true_suppression() {
+        let paragraph = crate::word_xml::parse_raw_fragment(
+            br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:pPrChange w:id="9" w:author=""><w:pPr><w:pStyle w:val="Numbered"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>same</w:t></w:r></w:p>"#,
+        )
+        .expect("paragraph XML");
+        let view =
+            ParagraphView::from_paragraph(&paragraph, &HashMap::new()).expect("paragraph view");
+        let wire_change = view.ppr_change.as_ref().expect("pPrChange");
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Numbered"><w:name w:val="Numbered"/><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:style></w:styles>"#,
+        )
+        .expect("style definitions");
+
+        let change = convert_ppr_change(
+            wire_change,
+            PprChangeConversionContext {
+                numbering_defs: None,
+                style_defs: Some(&styles),
+                live_mark_rpr: &view.paragraph_mark_rpr,
+                body_text: "same",
+                has_literal_prefix: false,
+                literal_prefix_has_leading_tab: false,
+                literal_prefix_has_trailing_tab: false,
+                default_tab_stop: 720,
+            },
+        )
+        .expect("suppression does not need a numbering counter");
+        assert_eq!(
+            change.previous.direct.numbering,
+            DirectParagraphNumbering::suppressed()
+        );
+        assert_eq!(change.previous.effective.numbering, None);
     }
 
     /// Assert one import → export → re-import → export cycle is a fixed point:
@@ -13729,7 +15271,7 @@ mod tests {
         .expect_err("an unknown, non-witnessed shading value must still fail fast");
         assert_eq!(err.code, ErrorCode::InvalidDocx);
         assert!(
-            err.message.contains("ShadingPattern") && err.message.contains("bogus"),
+            err.message.contains("w:shd/@w:val") && err.message.contains("bogus"),
             "error must name the offending value; got {}",
             err.message
         );

@@ -147,10 +147,12 @@ fn ppr_change_nonempty_previous_payload_survives_roundtrip() {
         other => panic!("second block should be a paragraph, got {other:?}"),
     };
     let change = paragraph.formatting_change.as_ref().expect("pPrChange");
-    assert_eq!(change.previous_alignment, Some(Alignment::Right));
+    assert_eq!(change.previous.direct.alignment, Some(Alignment::Right));
     assert_eq!(
         change
-            .previous_spacing
+            .previous
+            .direct
+            .spacing
             .as_ref()
             .and_then(|spacing| spacing.before),
         Some(240)

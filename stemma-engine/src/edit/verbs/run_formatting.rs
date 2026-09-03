@@ -640,6 +640,7 @@ fn apply_marks(
         MaterializationMode::TrackedChange => {
             if node.formatting_change.is_none() {
                 node.formatting_change = Some(FormattingChange {
+                    carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                     revision_id: revision.revision_id,
                     identity: 0,
                     previous_marks: baseline_marks,

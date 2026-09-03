@@ -40,7 +40,8 @@ fn main() {
     // 3. Author ONE tracked edit as a typed, schema-validated transaction. The
     //    `guard` pins the op to the block we just read: if the block changed
     //    since the read, `apply` fails loud (StaleEdit) instead of editing the
-    //    wrong text. No author already in the redline may be impersonated.
+    //    wrong text. Reusing an author label already in the redline requires
+    //    explicit confirmation because Word groups those revisions together.
     let txn_json = format!(
         r#"{{
             "ops": [

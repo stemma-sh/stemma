@@ -4,10 +4,10 @@
 //!
 //! This is the SAME lift as `paragraph_formatting.rs`: a paragraph's
 //! `style_id` already serializes as `w:pStyle` at pPr position 0, the existing
-//! `ParagraphFormattingChange.previous_style_id` already records the prior
+//! `ParagraphFormattingChange.previous.direct.style_id` records the prior
 //! style, `snapshot_paragraph_formatting` already snapshots it, and the
 //! accept/reject projection already resolves it (`tracked_model.rs`: reject
-//! restores `previous_style_id`, accept clears the change keeping the new
+//! restores the previous direct style, accept clears the change keeping the new
 //! style). So this verb is a **pure authoring-side lift** — ZERO domain or
 //! serialize change — exactly like the paragraph-formatting verb. It does not
 //! go through the segment materializer (Invariant M): a style swap is an
@@ -194,13 +194,13 @@ mod tests {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments: vec![TrackedSegment {
@@ -209,7 +209,7 @@ mod tests {
             }],
             block_text_hash: None,
             numbering: None,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -281,7 +281,10 @@ mod tests {
         .expect("apply");
         assert_eq!(p.style_id.as_deref(), Some("Heading2"));
         let fc = p.formatting_change.as_ref().expect("pPrChange recorded");
-        assert_eq!(fc.previous_style_id, None, "prior style was Normal/None");
+        assert_eq!(
+            fc.previous.direct.style_id, None,
+            "prior style was Normal/None"
+        );
     }
 
     #[test]
@@ -303,7 +306,9 @@ mod tests {
             p.formatting_change
                 .as_ref()
                 .unwrap()
-                .previous_style_id
+                .previous
+                .direct
+                .style_id
                 .as_deref(),
             Some("Heading1"),
             "prior named style must be recorded for reject-restore"

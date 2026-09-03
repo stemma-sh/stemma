@@ -667,6 +667,7 @@ fn fresh_row_like(
         w_after: template.w_after.clone(),
         cnf_style: template.cnf_style.clone(),
         tbl_pr_ex: template.tbl_pr_ex.clone(),
+        tbl_pr_ex_change: None,
         cell_spacing: template.cell_spacing,
         preserved: Vec::new(),
     }
@@ -895,6 +896,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             });

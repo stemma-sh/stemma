@@ -14,11 +14,15 @@ default:
 # Merge gate: mirrors ci.yml job for job so a green gate means a green push.
 # Must be green with no env set. The only CI coverage this cannot replicate
 # locally is the Windows/macOS leg of the test matrix.
-gate: contamination docs-check lint test conformance npm-smoke demo-check msrv
+gate: contamination docs-check lint test package-check conformance npm-smoke demo-check msrv
 
 [doc("Validate public documentation links, anchors, and style rules")]
 docs-check:
     python3 scripts/check-docs.py
+
+[doc("Build and doctest each publishable crate from its isolated source archive")]
+package-check:
+    python3 scripts/check-crate-packages.py
 
 # docs/reference/operations.md is generated from the engine op catalog
 # (stemma-engine/src/edit_v4/catalog.rs); the gate fails when it drifts.
@@ -27,10 +31,10 @@ regen-operations-reference:
     cargo test -p stemma --test operations_reference regenerate_operations_reference -- --ignored
 
 # docs/reference/read-model.md is generated from live engine view values
-# (stemma-engine/tests/read_model_reference.rs); the gate fails when it drifts.
+# (stemma-diff/tests/read_model_reference.rs); the gate fails when it drifts.
 [doc("Regenerate docs/reference/read-model.md from the engine read model")]
 regen-read-model-reference:
-    cargo test -p stemma --test read_model_reference regenerate_read_model_reference -- --ignored
+    cargo test -p stemma-diff --test read_model_reference regenerate_read_model_reference -- --ignored
 
 # docs/examples.md is generated from the stemma-engine/examples/ inventory
 # (stemma-engine/tests/examples_reference.rs); the gate fails when it drifts.
@@ -50,22 +54,25 @@ lint: check-toolchain
 check-toolchain:
     @want="$(sed -n 's/^rust = "\([^"]*\)".*/\1/p' .mise.toml)"; have="$(rustc --version | cut -d' ' -f2)"; if [ "$want" != "$have" ]; then echo "error: toolchain drift — rustc $have active but .mise.toml pins $want. Run: mise install (or rustup default $want)"; exit 1; fi
 
-# Publish the crates.io surface in dependency order: engine, host artifact
-# boundary, then CLI. The CLI's two workspace dependencies must already be
-# visible in the registry before its package can resolve there. Manual and
+# Publish the crates.io surface in dependency order: engine, comparison,
+# host artifact boundary, then CLI. The CLI's three workspace dependencies
+# must already be visible in the registry before its package can resolve there. Manual and
 # deliberate; see RELEASING.md for where this sits in a release. Fails loud
 # unless a registry token is present (`cargo login` or
 # CARGO_REGISTRY_TOKEN), every selected crate permits publishing, the lockfile
 # is current, and the working tree is clean. Each crate is dry-run-verified
 # immediately before its real publish. stemma-mcp (npm is its channel) and
 # stemma-api (demo infrastructure) are deliberately not published.
-[doc("Publish stemma -> stemma-artifacts -> stemma-cli (guarded; see RELEASING.md)")]
-[confirm("Publish stemma, stemma-artifacts, and stemma-cli to crates.io? Published versions are permanent. (y/N)")]
-publish-crates: check-toolchain
+[doc("Publish stemma -> stemma-diff -> stemma-artifacts -> stemma-cli (guarded; see RELEASING.md)")]
+[confirm("Publish stemma, stemma-diff, stemma-artifacts, and stemma-cli to crates.io? Published versions are permanent. (y/N)")]
+publish-crates: check-toolchain package-check
     @test -z "$(git status --porcelain)" || { echo "error: working tree not clean — publish only from the release commit"; exit 1; }
     cargo publish --locked -p stemma --dry-run
     cargo publish --locked -p stemma
     just _wait-crate-visible stemma stemma-engine/Cargo.toml
+    cargo publish --locked -p stemma-diff --dry-run
+    cargo publish --locked -p stemma-diff
+    just _wait-crate-visible stemma-diff stemma-diff/Cargo.toml
     cargo publish --locked -p stemma-artifacts --dry-run
     cargo publish --locked -p stemma-artifacts
     just _wait-crate-visible stemma-artifacts stemma-artifacts/Cargo.toml

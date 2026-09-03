@@ -391,6 +391,147 @@ fn rel_001_valid_rid_reference_no_error() {
         rel_001.is_empty(),
         "valid r:id reference should not produce I-REL-001"
     );
+    assert!(
+        result.findings.iter().all(|f| f.rule_id != "I-REL-005"),
+        "a w:hyperlink bound to a hyperlink relationship must satisfy I-REL-005"
+    );
+}
+
+#[test]
+fn rel_005_hyperlink_rid_must_bind_to_hyperlink_relationship() {
+    let content_types = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>"#;
+
+    let rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:tbl><w:tr><w:tc><w:p><w:hyperlink r:id="rId7"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p></w:tc></w:tr></w:tbl>
+  </w:body>
+</w:document>"#;
+
+    // The Id exists, so I-REL-001 alone cannot detect this corruption. Its
+    // binding has the wrong semantic type: Word repairs the document and drops
+    // the hyperlink rather than interpreting custom XML as a link target.
+    let doc_rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item1.xml"/>
+</Relationships>"#;
+
+    let bytes = build_zip(&[
+        ("[Content_Types].xml", content_types),
+        ("_rels/.rels", rels),
+        ("word/_rels/document.xml.rels", doc_rels),
+        ("word/document.xml", document),
+        ("customXml/item1.xml", b"<root/>"),
+    ]);
+    let result = validate_docx(&bytes);
+    assert!(
+        result.findings.iter().all(|f| f.rule_id != "I-REL-001"),
+        "the relationship id exists; this is a type mismatch, not a dangling reference"
+    );
+    let rel_005: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.rule_id == "I-REL-005")
+        .collect();
+    assert_eq!(rel_005.len(), 1, "expected one typed hyperlink finding");
+    assert!(rel_005[0].message.contains("rId7"));
+    assert!(rel_005[0].message.contains("customXml"));
+    assert_eq!(rel_005[0].severity, ValidationSeverity::Error);
+
+    let report = stemma::api::validate(&bytes);
+    assert!(
+        !report.ok
+            && report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("expected")
+                    && issue.message.contains("relationships/hyperlink")),
+        "the public byte validator must expose the same semantic binding defect: {:?}",
+        report.issues
+    );
+
+    let error =
+        stemma::runtime::gate_serialized_bytes(&bytes, stemma::runtime::ValidatorLevel::Blocking)
+            .expect_err("a hyperlink bound to the wrong relationship type must not be emitted");
+    assert!(
+        error.message.contains("I-REL-005"),
+        "the blocking gate must identify the typed relationship invariant: {}",
+        error.message
+    );
+}
+
+#[test]
+fn xref_003_dangling_comment_reference_is_blocking() {
+    let content_types = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+
+    let rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+
+    let doc_rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
+
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:commentReference w:id="6"/></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>"#;
+
+    let bytes = build_zip(&[
+        ("[Content_Types].xml", content_types),
+        ("_rels/.rels", rels),
+        ("word/_rels/document.xml.rels", doc_rels),
+        ("word/document.xml", document),
+    ]);
+
+    let result = validate_docx(&bytes);
+    let xref_003: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|finding| finding.rule_id == "I-XREF-003")
+        .collect();
+    assert_eq!(xref_003.len(), 1, "expected one dangling-comment finding");
+    assert_eq!(xref_003[0].severity, ValidationSeverity::Error);
+    assert!(xref_003[0].message.contains("6"));
+
+    let report = stemma::api::validate(&bytes);
+    assert!(
+        !report.ok
+            && report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("commentReference")
+                    && issue.message.contains("6")),
+        "the public byte validator must expose dangling comment identities: {:?}",
+        report.issues
+    );
+
+    let error =
+        stemma::runtime::gate_serialized_bytes(&bytes, stemma::runtime::ValidatorLevel::Blocking)
+            .expect_err("a dangling comment reference must not be emitted");
+    assert!(
+        error.message.contains("I-XREF-003"),
+        "the blocking gate must identify the dangling comment invariant: {}",
+        error.message
+    );
 }
 
 #[test]

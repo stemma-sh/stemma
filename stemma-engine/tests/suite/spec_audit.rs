@@ -16,6 +16,8 @@ use stemma::edit::{
     ParagraphFormattingPatch,
 };
 use stemma::{Alignment, RevisionInfo, RevisionKind, StoryScope};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -56,6 +58,43 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
         ),
         ("word/document.xml", &document_xml),
+    ])
+}
+
+fn make_multisection_docx_with_repeated_story_kinds() -> Vec<u8> {
+    zip_docx(&[
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header2.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/header3.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer2.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/word/footer3.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdH2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header2.xml"/><Relationship Id="rIdH3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header3.xml"/><Relationship Id="rIdF2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer2.xml"/><Relationship Id="rIdF3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer3.xml"/></Relationships>"#,
+        ),
+        (
+            "word/document.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdH2"/><w:footerReference w:type="default" r:id="rIdF2"/></w:sectPr></w:pPr><w:r><w:t>Section one.</w:t></w:r></w:p><w:p><w:r><w:t>Section two.</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdH3"/><w:footerReference w:type="default" r:id="rIdF3"/></w:sectPr></w:body></w:document>"#,
+        ),
+        (
+            "word/header2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>POST-MONEY VALUATION CAP</w:t></w:r></w:p></w:hdr>"#,
+        ),
+        (
+            "word/header3.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Version 1.2</w:t></w:r></w:p></w:hdr>"#,
+        ),
+        (
+            "word/footer2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Confidential</w:t></w:r></w:p></w:ftr>"#,
+        ),
+        (
+            "word/footer3.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Copyright 2026</w:t></w:r></w:p></w:ftr>"#,
+        ),
     ])
 }
 
@@ -178,6 +217,32 @@ fn review_of_unedited_document_is_empty() {
     assert!(report.direct_changes.is_empty());
     assert!(report.untouched.violations.is_empty());
     assert_eq!(report.untouched.verified_blocks, 3);
+}
+
+/// A header/footer kind is a rendering role, not a story identity. Different
+/// sections may legally bind distinct physical stories under the same role.
+/// Reviewing an unedited document must pair those stories by their canonical
+/// part names and report the identity audit as clean.
+#[test]
+fn review_of_unedited_multisection_document_with_repeated_story_kinds_is_empty() {
+    let doc = Document::parse(&make_multisection_docx_with_repeated_story_kinds())
+        .expect("parse multisection fixture");
+    let snapshot = doc.snapshot();
+    assert_eq!(snapshot.canonical.headers.len(), 2);
+    assert_eq!(snapshot.canonical.footers.len(), 2);
+    assert_eq!(
+        snapshot.canonical.headers[0].kind, snapshot.canonical.headers[1].kind,
+        "fixture must exercise two physical headers with the same role"
+    );
+    assert_eq!(
+        snapshot.canonical.footers[0].kind, snapshot.canonical.footers[1].kind,
+        "fixture must exercise two physical footers with the same role"
+    );
+
+    let report = doc.review().expect("review runs");
+    assert!(report.new_revisions.is_empty(), "{report:?}");
+    assert!(report.direct_changes.is_empty(), "{report:?}");
+    assert!(report.untouched.violations.is_empty(), "{report:?}");
 }
 
 // ─── Section 1a: the tracked census ──────────────────────────────────────────
@@ -666,15 +731,24 @@ fn unexplained_difference_is_an_untouched_violation() {
     let doc = Document::parse(&make_docx_with_body(THREE_PARAS)).expect("parse");
     let before = doc.snapshot().canonical.as_ref().clone();
     let mut after = before.clone();
-    // A change invisible to the text/marks diff AND to the census, but a
-    // real fidelity difference (it changes what serializes):
-    // `numbering_suppressed` is document content under the roundtrip
-    // comparator's classification, and no diff row or revision covers it.
-    // The proof must catch it itself — it does not trust the diff.
+    // A change invisible to the semantic text/formatting diff AND to the
+    // revision census, but a real wire-fidelity difference: an authored run
+    // provenance attribute changes what serializes. The proof must catch it
+    // itself — it does not trust the diff.
     {
         let tb = &mut after.blocks[2];
         if let stemma::BlockNode::Paragraph(p) = &mut tb.block {
-            p.numbering_suppressed = true;
+            let text = p
+                .segments
+                .iter_mut()
+                .flat_map(|segment| &mut segment.inlines)
+                .find_map(|inline| match inline {
+                    stemma::InlineNode::Text(text) => Some(text),
+                    _ => None,
+                })
+                .expect("fixture paragraph has text");
+            text.source_run_attrs
+                .push(("w:rsidR".to_string(), "00ABCDEF".to_string()));
         } else {
             panic!("fixture block 2 is a paragraph");
         }

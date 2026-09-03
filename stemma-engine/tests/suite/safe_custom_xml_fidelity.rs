@@ -1,13 +1,13 @@
 use std::fs;
 use std::io::{Cursor, Read};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 use xmltree::{Element, XMLNode};
 use zip::ZipArchive;
 const CUSTOM_XML_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml";
-const CUSTOM_PROPERTIES_REL_TYPE: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties";
 
 fn generate_redline_docx(fixture: &str) -> Vec<u8> {
     let before_path = format!("testdata/{fixture}/before.docx");
@@ -31,6 +31,30 @@ fn generate_redline_docx(fixture: &str) -> Vec<u8> {
     runtime
         .export_docx(&import_before.doc_handle, ExportMode::Redline)
         .expect("export redline")
+}
+
+#[test]
+fn safe_cayman_comparison_refuses_differing_active_document_defaults() {
+    let before = fs::read("testdata/safe-us-vs-cayman/before.docx").expect("read before.docx");
+    let after = fs::read("testdata/safe-us-vs-cayman/after.docx").expect("read after.docx");
+    let runtime = SimpleRuntime::new();
+    let base = runtime.import_docx(&before).expect("import before");
+    let target = runtime.import_docx(&after).expect("import after");
+
+    let error = runtime
+        .diff_and_redline(
+            &base.doc_handle,
+            &target.doc_handle,
+            TransactionMeta {
+                author: "Stemma".to_string(),
+                reason: Some("global style refusal regression".to_string()),
+                timestamp_utc: Some("2026-03-26T00:00:00Z".to_string()),
+            },
+        )
+        .expect_err("unqualified document-default difference must refuse");
+
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(error.message.contains("document defaults"));
 }
 
 fn read_part_from_docx(docx_bytes: &[u8], part_name: &str) -> Vec<u8> {
@@ -91,47 +115,6 @@ fn custom_xml_targets_from_docx(docx_bytes: &[u8]) -> Vec<String> {
     targets
 }
 
-fn root_relationship_targets_from_docx(docx_bytes: &[u8], rel_type: &str) -> Vec<String> {
-    let rels = read_part_from_docx(docx_bytes, "_rels/.rels");
-    let root = Element::parse(Cursor::new(rels)).expect("parse root rels");
-    let mut targets = Vec::new();
-    for child in &root.children {
-        let XMLNode::Element(rel) = child else {
-            continue;
-        };
-        if rel.name != "Relationship" && rel.name != "pr:Relationship" {
-            continue;
-        }
-        let current_type = rel
-            .attributes
-            .iter()
-            .find_map(|(name, value)| {
-                if name.local_name == "Type" {
-                    Some(value.as_str())
-                } else {
-                    None
-                }
-            })
-            .expect("Relationship@Type");
-        if current_type == rel_type {
-            targets.push(
-                rel.attributes
-                    .iter()
-                    .find_map(|(name, value)| {
-                        if name.local_name == "Target" {
-                            Some(value.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .expect("Relationship@Target"),
-            );
-        }
-    }
-    targets.sort();
-    targets
-}
-
 #[test]
 fn safe_singapore_redline_preserves_target_custom_xml_relationships_and_payload() {
     let redline = generate_redline_docx("safe-us-vs-singapore");
@@ -151,40 +134,5 @@ fn safe_singapore_redline_preserves_target_custom_xml_relationships_and_payload(
     assert_eq!(
         actual_item_props, expected_item_props,
         "redline should prefer target customXml payload for overlapping itemProps parts"
-    );
-}
-
-#[test]
-fn safe_cayman_redline_preserves_target_custom_xml_relationships() {
-    let redline = generate_redline_docx("safe-us-vs-cayman");
-    let expected_targets = custom_xml_targets_from_docx(
-        &fs::read("testdata/safe-us-vs-cayman/after.docx").expect("read after"),
-    );
-    let actual_targets = custom_xml_targets_from_docx(&redline);
-
-    assert_eq!(
-        actual_targets, expected_targets,
-        "redline should preserve target customXml document relationships"
-    );
-}
-
-#[test]
-fn safe_cayman_redline_preserves_target_custom_properties_part_and_root_relationship() {
-    let redline = generate_redline_docx("safe-us-vs-cayman");
-    let target_bytes = fs::read("testdata/safe-us-vs-cayman/after.docx").expect("read after");
-
-    let expected_targets =
-        root_relationship_targets_from_docx(&target_bytes, CUSTOM_PROPERTIES_REL_TYPE);
-    let actual_targets = root_relationship_targets_from_docx(&redline, CUSTOM_PROPERTIES_REL_TYPE);
-    assert_eq!(
-        actual_targets, expected_targets,
-        "redline should preserve target custom-properties root relationship"
-    );
-
-    let expected_custom = read_part_from_docx(&target_bytes, "docProps/custom.xml");
-    let actual_custom = read_part_from_docx(&redline, "docProps/custom.xml");
-    assert_eq!(
-        actual_custom, expected_custom,
-        "redline should preserve target custom properties payload"
     );
 }

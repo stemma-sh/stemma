@@ -8,8 +8,8 @@ contracts. For a first successful workflow, start with
 apply an explicit worklist to an existing DOCX and create a native
 tracked-changes redline. Exact input binding is optional for ordinary use and
 available when a worklist crosses an approval boundary. The CLI also exposes
-the engine's existing compare,
-extract, read, resolve, and validate verbs. Install/build instructions live in
+the downstream `stemma-diff` comparison alongside the engine's extract, read,
+resolve, and validate verbs. Install/build instructions live in
 [stemma-cli/README.md](https://github.com/stemma-sh/stemma/blob/main/stemma-cli/README.md).
 
 The compact product path is `inspect -> execute`: successful execution includes
@@ -65,10 +65,10 @@ durability promise.
 | `stemma execute <input> --plan <json> -o <out>` | Execute a concrete plan; exact alias of `apply`. |
 | `stemma verify <before> <after> [--policy tracked-delivery-v0]` | Certify any producer's result; exit `3` when policy fails. |
 | `stemma verify-task <manifest.json> [--root <dir>]` | Verify an MCP task delivery from its manifest and artifact files. |
-| `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. |
-| `stemma compare <base> <target> -o <out> [--author NAME] [--format text\|json]` | Diff two files into a redline (`reject-all == base`, `accept-all == target`); `--author` attributes the revisions; `--format json` emits a `stemma.compare_receipt.v0`. |
+| `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial] [--allow-existing-author]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. `--allow-existing-author` confirms that the worklist intentionally continues an existing Word reviewer group. |
+| `stemma compare <base> <target> -o <out> [--author NAME] [--format text\|json]` | Diff two files' accepted readings into a redline (`reject-all == accepted base`, `accept-all == accepted target`); `--author` attributes the revisions; `--format json` emits a `stemma.compare_receipt.v0`. |
 | `stemma extract <file> [--format text\|json]` | Read the body as plain text (default) or structured JSON. |
-| `stemma read <file>` | Emit the full structured read model (`stemma.read.v0`): typed blocks with per-segment tracked status, plus the complete revision census. |
+| `stemma read <file>` | Emit the complete structured lean view (`stemma.read.v0`): typed blocks with per-segment tracked status, plus the complete revision census. |
 | `stemma resolve <file> -o <out> <disposition> [--dry-run] [--format text\|json]` | Accept/reject tracked changes; write the result; `--format json` emits a `stemma.resolve_receipt.v0`. |
 | `stemma validate <file> [--format text\|json]` | Parse + validate; print block/revision counts, or a structured `stemma.validate.v0` result. |
 
@@ -78,6 +78,10 @@ executed `apply` whose receipt is partial or a completed `verify` whose policy
 result is `fail`. By default an apply exit `3` creates no DOCX. `--emit-partial` explicitly
 requests a non-deliverable partial redline, but the status and exit remain
 partial/`3`.
+
+Successful apply receipts record `author_label_policy` as either
+`require_confirmation_on_collision` or `continue_existing`. The latter appears
+only when the caller supplied `--allow-existing-author`.
 
 `verify-task` has its own four-way projection: `0` verified complete, `1`
 verified partial, `2` artifact/evidence mismatch, and `3` usage, I/O, malformed
@@ -265,6 +269,8 @@ status, deliverability, or exit code.
 
 - exact SHA-256 identities and byte sizes for input, worklist, and the expected
   output bytes;
+- `input_diagnostics`, preserving any deterministic normalization disclosed
+  when the input was parsed;
 - `input_binding`, which is `unbound` when the worklist omitted its optional
   identity or `input_verified` when the supplied identity matched;
 - producer version/build stamp, exact running-executable identity, ruleset,
@@ -322,6 +328,15 @@ Discovers the deltas between two documents and materializes them as tracked
 changes on the output. The two versions collapse into one reviewable file you
 step through in Word like any reviewer redline.
 
+Comparison uses the accepted reading of each input. Pending revisions in either
+input are resolved on an internal clone before discovery and do not survive as
+stacked history in the output. Thus reject-all reconstructs the base's accepted
+reading and accept-all reconstructs the target's accepted reading. When this
+flattening occurs, the human diagnostic reports the number consumed from each
+input; the JSON receipt records their full censuses under
+`flattened_input_revisions.base` and `.target` (both arrays are empty for clean
+inputs).
+
 ```
 $ stemma compare memo.docx memo-v2.docx -o redline.docx
 wrote redline to redline.docx (2 tracked revisions); bytes=<n> sha256=<hex> collision_policy=create_new disposition=created
@@ -333,13 +348,16 @@ refused.
 
 `--format json` additionally emits a `stemma.compare_receipt.v0` on stdout:
 the exact `base`/`target` input identities, the requested `author` (`null`
-for an anonymous redline), the committed `output` identity (bytes, SHA-256,
-collision policy, disposition), and `revisions`: the full census of
-discovered revisions, same rows and ids as `extract --format json` on the
-output, so a consumer can drive `resolve` without a second read.
+for an anonymous redline), `semantic_change_count`, source-labelled
+`base_diagnostics` and `target_diagnostics`, `flattened_input_revisions` for
+both inputs, the committed `output` identity (bytes, SHA-256, collision policy,
+disposition), and `revisions`: the full census of discovered revisions, same
+rows and ids as `extract --format json` on the output, so a consumer can drive
+`resolve` without a second read. Import diagnostics are also written to stderr
+for every CLI command that parses a normalized input.
 
 > **Attribution.** By default the redline's tracked changes carry the engine's
-> own blank authorship because discovery has no authoring identity. Pass
+> own blank author label because discovery has no attribution intent. Pass
 > `--author NAME` to attribute every discovered revision to `NAME` (it appears
 > as each change's `author`, and `resolve --accept-author`/`--reject-author`
 > can then select by it):
@@ -384,7 +402,6 @@ $ stemma extract redline.docx --format json
       "revision_id": 3,
       "kind": "delete",
       "author": "",
-      "date": "",
       "block_id": "p_1",
       "excerpt": "now foo bar baz"
     },
@@ -392,7 +409,6 @@ $ stemma extract redline.docx --format json
       "revision_id": 4,
       "kind": "insert",
       "author": "",
-      "date": "",
       "block_id": "p_1",
       "excerpt": "what are the chances"
     }
@@ -431,9 +447,10 @@ those changes. A tracked change whose `w:author` attribute is entirely
 absent is refused at import (`InvalidDocx: missing required tracked change
 attribute: author`), so an extracted revision always has an `author` value.
 `date` is the change's `w:date` timestamp (ISO-8601), the same value the
-read model's `RevisionRecord.date` carries: empty when the source stamps a
-blank date (a `compare` redline does), omitted when the source carries no
-`w:date` at all.
+read model's `RevisionRecord.date` carries: empty when the source explicitly
+stamps a blank date, and omitted when the source carries no `w:date` at all.
+Stemma-authored `compare` revisions carry no `w:date`, so their census rows
+omit `date`.
 
 > **Id durability.** A `revision_id` is the engine's content-derived identity:
 > a hash of the change's kind, story, author, date, and content, plus a
@@ -450,8 +467,8 @@ blank date (a `compare` redline does), omitted when the source carries no
 
 ## read
 
-Emit the engine's full structured [read model](read-model.md) in one call, as
-`stemma.read.v0` JSON on stdout:
+Emit the engine's complete structured [lean view](read-model.md#the-lean-view)
+plus revision census in one call, as `stemma.read.v0` JSON on stdout:
 
 ```
 $ stemma read redline.docx
@@ -471,8 +488,10 @@ literal prefix, and (for tables) the cell grid. This is enough to render a
 redline view from one invocation. `revisions` is the same complete census as
 `extract --format json` (the segment view alone omits formatting-change
 records), so the ids that `resolve` selects on arrive in the same call.
-`extract` remains the compact body reading; `read` is the full-fidelity
-machine surface.
+`extract` remains the compact body reading; `read` is the complete structured
+lean machine surface. The CLI does not expose the separately defined
+[full render view](read-model.md#the-full-render-view), which adds resolved
+value formatting, assets, stories, and page geometry.
 
 Stability, same statement as the read-model reference: the envelope
 (`schema`, `input`, the presence of `blocks`/`revisions`) is the v0 contract,

@@ -49,7 +49,7 @@ use stemma::view::{
 use stemma::{
     BlockNode, CanonDoc, DocHandle, DocxRuntime, ExportMode, NoteType, Resolution,
     ResolveSelectionAction, RevisionKind, SimpleRuntime, StoryScope, TableNode, TableRowNode,
-    TrackedBlock, TrackingStatus, TransactionMeta, block_semantic_hash_for_block,
+    TrackedBlock, TrackingStatus, block_semantic_hash_for_block,
 };
 
 // ─── Tool argument schemas ───────────────────────────────────────────────────
@@ -772,11 +772,12 @@ struct ApplyEditArgs {
     /// rejected (no silent fallback).
     #[serde(default)]
     mode: Option<String>,
-    /// Author-impersonation override. When the transaction's
-    /// `revision.author` already authors revisions in this document (the
-    /// existing redline), the write is refused so the agent's edits stay
-    /// distinguishable from the prior reviewer's. Pass `true` to deliberately
-    /// continue an existing author's work. Default false.
+    /// Existing-author-label confirmation. When the transaction's
+    /// `revision.author` matches a label present when the document was opened,
+    /// the write is refused because Word would group the revisions together.
+    /// Pass `true` when the user or an approved worklist explicitly intends to
+    /// continue that reviewer group. Direct mode creates no revisions, so the
+    /// label policy is not applicable there. Default false.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -924,10 +925,11 @@ struct ReplaceTextArgs {
     /// reported in `skipped_straddles`) or "fail" (reject the whole operation).
     #[serde(default = "default_barrier")]
     on_barrier_match: String,
-    /// Author-impersonation override. When `author` already authors revisions
-    /// in this document (the existing redline), the write is refused so the
-    /// agent's edits stay distinguishable from the prior reviewer's. Pass
-    /// `true` to deliberately continue an existing author's work. Default false.
+    /// Existing-author-label confirmation. When `author` matches a label
+    /// present when the document was opened, the write is refused because Word
+    /// would group the revisions together. Pass `true` to continue that
+    /// reviewer group based on explicit user or approved-worklist intent.
+    /// Default false.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -981,7 +983,7 @@ struct ReplaceTextBatchArgs {
     /// is persisted.
     #[serde(default)]
     preview: bool,
-    /// Author-impersonation override (see replace_text). Default false.
+    /// Existing-author-label confirmation (see replace_text). Default false.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -1128,6 +1130,9 @@ fn attach_transaction_outcomes(
         "atomicity".into(),
         json!({"mode": "all", "status": atomicity_status}),
     );
+    if preview && is_error {
+        payload.insert("would_apply".into(), json!(false));
+    }
     let value = Value::Object(payload);
     let rebuilt = if is_error {
         CallToolResult::structured_error(value)
@@ -1723,11 +1728,52 @@ fn fail(code: &str, message: impl Into<String>) -> CallToolResult {
     fail_json(json!({ "code": code, "error": message.into() }))
 }
 
-/// Preserve the generic debug-details channel while projecting v0.5
-/// formatting refusals into their frozen, agent-consumable top-level shape.
+fn author_label_policy(
+    mode: stemma::edit::MaterializationMode,
+    allow_existing_author: bool,
+) -> &'static str {
+    if mode == stemma::edit::MaterializationMode::Direct {
+        "not_applicable_direct"
+    } else if allow_existing_author {
+        "continue_existing"
+    } else {
+        "require_confirmation_on_collision"
+    }
+}
+
+/// Preserve the generic debug-details channel while projecting typed
+/// refusals into their agent-consumable top-level shapes.
 fn edit_failure(error: stemma::RuntimeError) -> CallToolResult {
+    if let Some(collision) = error.details.author_label_collision() {
+        return fail_json(json!({
+            "code": "AuthorLabelCollision",
+            "status": "confirmation_required",
+            "author_label": collision.author_label,
+            "existing_revision_count": collision.existing_revision_count,
+            "existing_scope": "present_when_document_opened",
+            "message": "New revisions with this label will appear in Microsoft Word as part of the same reviewer group.",
+            "error": error.message,
+            "mutation": "none",
+            "actions": [
+                {
+                    "action": "continue_existing_label",
+                    "allow_existing_author": true,
+                    "effect": format!(
+                        "New revisions will appear under the existing {} reviewer group.",
+                        collision.author_label
+                    ),
+                },
+                {
+                    "action": "use_separate_label",
+                    "effect": "This editing round will appear as a separate reviewer group; the user must supply the label.",
+                },
+            ],
+            "details": format!("{:?}", error.details),
+        }));
+    }
+
     if let Some(stemma::runtime::FormattingErrorDetails::Target(target)) =
-        error.details.formatting.as_deref()
+        error.details.formatting()
     {
         let mut allowed_actions = Vec::new();
         let revision_id = target
@@ -1803,7 +1849,7 @@ fn edit_failure(error: stemma::RuntimeError) -> CallToolResult {
     }
 
     if let Some(stemma::runtime::FormattingErrorDetails::Ambiguous(target)) =
-        error.details.formatting.as_deref()
+        error.details.formatting()
     {
         return fail_json(json!({
             "code": "ambiguous_format_target",
@@ -3647,7 +3693,7 @@ impl StemmaServer {
 #[tool_router]
 impl StemmaServer {
     #[tool(
-        description = "Open a .docx file into the engine. Returns a doc_id, block_count, \
+        description = "Open a .docx file into the engine. Returns a doc_id, import diagnostics, block_count, \
                        total_chars, server_version, and the first 16 rows of a PAGED compact \
                        structural index (id, index, role, heading depth, a 120-char \
                        text preview, char/byte length, tracked status, role_token, list \
@@ -3750,6 +3796,7 @@ impl StemmaServer {
             Ok(r) => r,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
+        let diagnostics = import.diagnostics.clone();
         let doc_id = import.doc_handle.0.clone();
         // Record the handle we are about to hand out so a later "doc handle not
         // found" for this id can be attributed to eviction rather than a typo.
@@ -3779,7 +3826,7 @@ impl StemmaServer {
             Err(failure) => return failure,
         };
         // The document's origin authors (the existing redline's authors, off
-        // limits to the impersonation guard) are captured by the engine
+        // limits to the author-label collision guard) are captured by the engine
         // itself at import time — see `EditSnapshot::guard_author` /
         // `SnapshotMeta::origin_authors`. No transport-side bookkeeping
         // needed here.
@@ -3790,6 +3837,7 @@ impl StemmaServer {
             "server_version": SERVER_VERSION,
             "task_id": task_id,
             "input_artifact": input_artifact,
+            "diagnostics": diagnostics,
             "index": page["entries"],
             "index_offset": page["offset"],
             "index_limit": page["limit"],
@@ -4059,9 +4107,9 @@ impl StemmaServer {
     /// full outline). Shared by `apply_edit`, `apply_batch`, and `replace_all`
     /// so every creating-write tool returns one shape. On engine failure the
     /// structured `{code, error, details}` error is surfaced unchanged —
-    /// including `AuthorImpersonation` from the engine's author-impersonation
-    /// guard (`SimpleRuntime::apply_edit_authored`), which runs before the
-    /// write is attempted.
+    /// including `AuthorLabelCollision` from the engine's author-label
+    /// confirmation guard (`SimpleRuntime::apply_edit_authored`), which runs
+    /// before the write is attempted.
     fn apply_edit_receipt(
         &self,
         handle: &DocHandle,
@@ -4158,6 +4206,7 @@ impl StemmaServer {
                         "changed_block_ids": changed,
                         "changed_blocks": changed_blocks,
                         "block_count": block_count,
+                        "author_label_policy": author_label_policy(txn.materialization_mode, allow_existing_author),
                         // Neighborhood receipt for any move(s) this transaction
                         // performed — empty when none did. See `move_receipts`.
                         "moves": moves,
@@ -4391,7 +4440,8 @@ impl StemmaServer {
     #[tool(
         description = "Compare two .docx files and write a redline .docx (the target with \
                        tracked changes relative to the base) to out_path. Returns the \
-                       number of detected changes."
+                       number of detected semantic changes, the pending Word revision count, \
+                       and source-labelled import diagnostics."
     )]
     async fn compare_docx(&self, Parameters(args): Parameters<CompareArgs>) -> CallToolResult {
         let base = match self.read_source(&args.base_path, "base_docx", self.max_doc_bytes()) {
@@ -4403,27 +4453,32 @@ impl StemmaServer {
             Ok(source) => source,
             Err(failure) => return failure,
         };
-        let (base_import, target_import) =
-            match self.runtime.import_docx_pair(base.bytes(), target.bytes()) {
-                Ok(pair) => pair,
+        let base_document = match stemma::api::Document::parse(base.bytes()) {
+            Ok(document) => document,
+            Err(e) => return fail(&format!("{:?}", e.code), e.message),
+        };
+        let target_document = match stemma::api::Document::parse(target.bytes()) {
+            Ok(document) => document,
+            Err(e) => return fail(&format!("{:?}", e.code), e.message),
+        };
+        let author = args.author.unwrap_or_else(|| "stemma".to_string());
+        let comparison =
+            match stemma_diff::diff_as_detailed(&base_document, &target_document, &author) {
+                Ok(comparison) => comparison,
                 Err(e) => return fail(&format!("{:?}", e.code), e.message),
             };
-        let meta = TransactionMeta {
-            author: args.author.unwrap_or_else(|| "stemma".to_string()),
-            reason: None,
-            timestamp_utc: None,
-        };
-        let result = match self.runtime.compare_and_redline(
-            &base_import.doc_handle,
-            &target_import.doc_handle,
-            meta,
-        ) {
-            Ok(r) => r,
+        let change_count = comparison.semantic_change_count;
+        let revision_count = comparison.document.revisions().len();
+        let base_diagnostics = comparison.base_diagnostics;
+        let target_diagnostics = comparison.target_diagnostics;
+        let redline = comparison.document;
+        let redline_bytes = match redline.serialize(&stemma::api::ExportOptions::unchecked()) {
+            Ok(bytes) => bytes,
             Err(e) => return fail(&format!("{:?}", e.code), e.message),
         };
         // Gate the redline before persisting it, same as save_docx.
         if let Err(e) =
-            stemma::gate_serialized_bytes(&result.redline_bytes, stemma::ValidatorLevel::Blocking)
+            stemma::gate_serialized_bytes(&redline_bytes, stemma::ValidatorLevel::Blocking)
         {
             return fail(&format!("{:?}", e.code), e.message);
         }
@@ -4431,7 +4486,7 @@ impl StemmaServer {
         let output_artifact = match self.artifacts.commit_new(
             &args.out_path,
             "output_redline",
-            &result.redline_bytes,
+            &redline_bytes,
             &input_artifacts,
         ) {
             Ok(output) => output,
@@ -4439,8 +4494,11 @@ impl StemmaServer {
         };
         ok(json!({
             "out_path": args.out_path,
-            "change_count": result.diff.changes.len(),
-            "bytes_written": result.redline_bytes.len(),
+            "change_count": change_count,
+            "revision_count": revision_count,
+            "base_diagnostics": base_diagnostics,
+            "target_diagnostics": target_diagnostics,
+            "bytes_written": redline_bytes.len(),
             "input_artifacts": input_artifacts,
             "output_artifact": output_artifact,
             "server_version": SERVER_VERSION,
@@ -4562,7 +4620,7 @@ impl StemmaServer {
         // Route through the SAME lean-receipt path the v4 surface uses, then add
         // match_count (the only field specific to find-and-replace). This tool
         // has no `allow_existing_author` of its own (its author is the fixed
-        // "stemma" identity), so it never opts out of the impersonation guard.
+        // fixed "stemma" label), so it never opts out of the collision guard.
         let mut receipt = self.apply_edit_receipt(&handle, &transaction, false);
         attach_field(&mut receipt, "match_count", json!(match_count));
         receipt
@@ -4959,6 +5017,10 @@ impl StemmaServer {
             "applied": if args.preview { 0 } else { applied },
             "would_apply": if args.preview { Some(applied) } else { None },
             "failed": failed,
+            "author_label_policy": author_label_policy(
+                stemma::edit::MaterializationMode::TrackedChange,
+                args.allow_existing_author,
+            ),
             "items": outcomes.into_rows(),
         }))
     }
@@ -5956,7 +6018,7 @@ struct ExecutePlanArgs {
     /// "tracked" (default) or "direct" for transaction plans only.
     #[serde(default)]
     mode: Option<String>,
-    /// Author-impersonation override for transaction plans only.
+    /// Existing-author-label confirmation for transaction plans only.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -6127,9 +6189,10 @@ struct BatchArgs {
     /// to both the preview and the persisted apply.
     #[serde(default)]
     mode: Option<String>,
-    /// Author-impersonation override (same contract as apply_edit's). Default
-    /// false: a transaction whose `revision.author` already authors revisions
-    /// in this document is refused.
+    /// Existing-author-label confirmation (same contract as apply_edit's).
+    /// Default false: a transaction whose `revision.author` matches a label
+    /// present when the document was opened is refused. Direct mode creates no
+    /// revisions and does not apply this policy.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -7641,18 +7704,13 @@ impl StemmaServer {
         let handle = DocHandle(args.doc_id.clone());
         // Run the same package-aware, author-protected apply used by commit and
         // discard the derived snapshot. Pure apply_transaction cannot check
-        // package-level style/media constraints or origin-author impersonation.
+        // package-level style/media constraints or an origin author-label collision.
         let outcome = self
             .runtime
             .with(&handle, |snap| snap.apply_authored(&txn, false).map(|_| ()));
         let result = match outcome {
             Ok(Ok(())) => ok(json!({ "doc_id": args.doc_id, "would_apply": true })),
-            Ok(Err(error)) => fail_json(json!({
-                "code": format!("{:?}", error.code),
-                "error": error.message,
-                "details": format!("{:?}", error.details),
-                "would_apply": false,
-            })),
+            Ok(Err(error)) => edit_failure(error),
             Err(e) => fail(
                 &format!("{:?}", e.code),
                 format!("doc not open: {}", e.message),
@@ -7934,6 +7992,10 @@ impl StemmaServer {
                             "changed_block_ids": changed,
                             "changed_blocks": changed_blocks,
                             "block_count": after.blocks.len(),
+                            "author_label_policy": author_label_policy(
+                                txn.materialization_mode,
+                                args.allow_existing_author,
+                            ),
                             "moves": move_receipts(&before, &after),
                             "table_receipts": table_receipts(&before, &after),
                             "server_version": SERVER_VERSION,
@@ -7942,12 +8004,7 @@ impl StemmaServer {
             });
             let result = match outcome {
                 Ok(Ok(receipt)) => ok(receipt),
-                Ok(Err(error)) => fail_json(json!({
-                    "code": format!("{:?}", error.code),
-                    "error": error.message,
-                    "details": format!("{:?}", error.details),
-                    "would_apply": false,
-                })),
+                Ok(Err(error)) => edit_failure(error),
                 Err(e) => fail(
                     &format!("{:?}", e.code),
                     format!("doc not open: {}", e.message),
@@ -8358,35 +8415,34 @@ impl StemmaServer {
         output_role: &str,
         protected_sources: &[ArtifactIdentity],
     ) -> Result<Value, CallToolResult> {
-        let (base_import, target_import) = self
-            .runtime
-            .import_docx_pair(base, target)
+        let base_document = stemma::api::Document::parse(base)
             .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
-        let meta = TransactionMeta {
-            author: "stemma".to_string(),
-            reason: None,
-            timestamp_utc: None,
-        };
-        let result = self
-            .runtime
-            .compare_and_redline(&base_import.doc_handle, &target_import.doc_handle, meta)
+        let target_document = stemma::api::Document::parse(target)
+            .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
+        let comparison = stemma_diff::diff_as_detailed(&base_document, &target_document, "stemma")
+            .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
+        let change_count = comparison.semantic_change_count;
+        let revision_count = comparison.document.revisions().len();
+        let base_diagnostics = comparison.base_diagnostics;
+        let target_diagnostics = comparison.target_diagnostics;
+        let redline = comparison.document;
+        let redline_bytes = redline
+            .serialize(&stemma::api::ExportOptions::unchecked())
             .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
         // Gate the redline before persisting it, same as save_docx/compare_docx.
-        stemma::gate_serialized_bytes(&result.redline_bytes, stemma::ValidatorLevel::Blocking)
+        stemma::gate_serialized_bytes(&redline_bytes, stemma::ValidatorLevel::Blocking)
             .map_err(|e| fail(&format!("{:?}", e.code), e.message))?;
         let output_artifact = self
             .artifacts
-            .commit_new(
-                out_path,
-                output_role,
-                &result.redline_bytes,
-                protected_sources,
-            )
+            .commit_new(out_path, output_role, &redline_bytes, protected_sources)
             .map_err(artifact_fail)?;
         Ok(json!({
             "path": out_path,
-            "change_count": result.diff.changes.len(),
-            "bytes_written": result.redline_bytes.len(),
+            "change_count": change_count,
+            "revision_count": revision_count,
+            "base_diagnostics": base_diagnostics,
+            "target_diagnostics": target_diagnostics,
+            "bytes_written": redline_bytes.len(),
             "output_artifact": output_artifact,
             "server_version": SERVER_VERSION,
         }))
@@ -8548,7 +8604,7 @@ mod tests {
         for marker in [
             "## Golden path",
             "## Sharp edges",
-            "AuthorImpersonation",
+            "AuthorLabelCollision",
             "replace_text",
             "## Multi-document tasks",
             "## Policy: layer beside, don't resolve, unless asked",
@@ -8571,20 +8627,22 @@ mod tests {
             code: stemma::ErrorCode::FormatRevisionConflict,
             message: "cannot add a second format proposal".to_string(),
             details: stemma::ErrorDetails {
-                formatting: Some(Box::new(stemma::runtime::FormattingErrorDetails::Target(
-                    stemma::runtime::FormatTargetDetails {
-                        block_id: stemma::NodeId::from("p_6"),
-                        text: "$150".to_string(),
-                        tracking_status: "inserted".to_string(),
-                        existing_revision: Some(stemma::runtime::FormatRevisionDetails {
-                            revision_id: 880725669,
-                            author: "Round1Reviewer".to_string(),
-                        }),
-                        container_revision: Some(stemma::runtime::ContainerRevisionDetails {
-                            revision_id: 948020661,
-                            kind: "insert".to_string(),
-                        }),
-                    },
+                typed: Some(Box::new(stemma::runtime::TypedErrorDetails::Formatting(
+                    stemma::runtime::FormattingErrorDetails::Target(
+                        stemma::runtime::FormatTargetDetails {
+                            block_id: stemma::NodeId::from("p_6"),
+                            text: "$150".to_string(),
+                            tracking_status: "inserted".to_string(),
+                            existing_revision: Some(stemma::runtime::FormatRevisionDetails {
+                                revision_id: 880725669,
+                                author: "Round1Reviewer".to_string(),
+                            }),
+                            container_revision: Some(stemma::runtime::ContainerRevisionDetails {
+                                revision_id: 948020661,
+                                kind: "insert".to_string(),
+                            }),
+                        },
+                    ),
                 ))),
                 ..stemma::ErrorDetails::default()
             },
@@ -8618,7 +8676,7 @@ mod tests {
             code: stemma::ErrorCode::AmbiguousFormatTarget,
             message: "target occurs twice".to_string(),
             details: stemma::ErrorDetails {
-                formatting: Some(Box::new(
+                typed: Some(Box::new(stemma::runtime::TypedErrorDetails::Formatting(
                     stemma::runtime::FormattingErrorDetails::Ambiguous(
                         stemma::runtime::AmbiguousFormatTargetDetails {
                             block_id: stemma::NodeId::from("p_2"),
@@ -8626,7 +8684,7 @@ mod tests {
                             occurrences: 2,
                         },
                     ),
-                )),
+                ))),
                 ..stemma::ErrorDetails::default()
             },
         };
@@ -10465,6 +10523,113 @@ mod tests {
         make_docx(&body, false)
     }
 
+    fn with_dangling_package_thumbnail(bytes: &[u8]) -> Vec<u8> {
+        let mut archive = stemma::docx::DocxArchive::read(bytes).expect("read test package");
+        let relationships = String::from_utf8(
+            archive
+                .get("_rels/.rels")
+                .expect("root relationships")
+                .to_vec(),
+        )
+        .expect("test relationships are UTF-8");
+        let dangling = r#"<Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>"#;
+        archive.upsert(
+            "_rels/.rels",
+            relationships
+                .replacen(
+                    "</Relationships>",
+                    &format!("{dangling}</Relationships>"),
+                    1,
+                )
+                .into_bytes(),
+        );
+        archive.write().expect("write test package")
+    }
+
+    #[tokio::test]
+    async fn comparison_preserves_semantic_count_and_source_labelled_diagnostics() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let base = make_docx(r#"<w:p><w:r><w:t>old</w:t></w:r></w:p>"#, false);
+        let target = with_dangling_package_thumbnail(&make_docx(
+            r#"<w:p><w:r><w:t>new</w:t></w:r></w:p>"#,
+            false,
+        ));
+        std::fs::write(workspace.path().join("base.docx"), &base).expect("write base");
+        std::fs::write(workspace.path().join("target.docx"), &target).expect("write target");
+        let authority = PathAuthority::rooted(workspace.path()).expect("rooted authority");
+        let server = StemmaServer::with_config_and_authority(Config::defaults(), authority);
+
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: "target.docx".to_string(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let open_payload = structured(&opened);
+        assert_eq!(
+            open_payload["diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(
+            open_payload["diagnostics"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rIdThumbnail"))
+        );
+
+        let compared = server
+            .compare_docx(Parameters(CompareArgs {
+                base_path: "base.docx".to_string(),
+                target_path: "target.docx".to_string(),
+                out_path: "compare.docx".to_string(),
+                author: None,
+            }))
+            .await;
+        let compare_payload = structured(&compared);
+        assert_eq!(compare_payload["change_count"], 1);
+        assert_eq!(compare_payload["revision_count"], 2);
+        assert_eq!(
+            compare_payload["base_diagnostics"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            compare_payload["target_diagnostics"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let reverse = server
+            .compare_docx(Parameters(CompareArgs {
+                base_path: "target.docx".to_string(),
+                target_path: "base.docx".to_string(),
+                out_path: "compare-reverse.docx".to_string(),
+                author: None,
+            }))
+            .await;
+        let reverse_payload = structured(&reverse);
+        assert_eq!(
+            reverse_payload["base_diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            reverse_payload["target_diagnostics"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let rendered = server
+            .render_redline_between(&base, &target, "render.docx", "output_redline", &[])
+            .expect("render comparison");
+        assert_eq!(rendered["change_count"], 1);
+        assert_eq!(rendered["revision_count"], 2);
+        assert_eq!(
+            rendered["target_diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
     /// A whole-paragraph replace transaction targeting one block id.
     fn replace_txn_arg(target: &str, expect: &str, new_text: &str) -> TransactionArg {
         TransactionArg(json!({
@@ -11115,43 +11280,67 @@ mod tests {
         );
     }
 
-    /// THE CONTRACT (author-impersonation refusal): an authored write must not
-    /// adopt the identity of an author already present in the opened redline —
-    /// that would make the agent's edits indistinguishable from the prior
-    /// reviewer's and silently defeat layered review. It is a refusal, not a
-    /// default, so it cannot be drifted off. The session's OWN author (novel at
-    /// open) is fine to reuse across edits; `allow_existing_author=true`
-    /// deliberately continues an existing author's work.
+    /// THE CONTRACT (author-label collision): a Word author label present when
+    /// the document was opened requires confirmation before reuse because Word
+    /// will group the new revisions with the existing reviewer group. The
+    /// session's own label (novel at open) is fine to reuse across edits;
+    /// `allow_existing_author=true` deliberately continues an existing group.
     #[tokio::test]
-    async fn an_authored_write_refuses_to_impersonate_an_existing_author() {
+    async fn an_authored_write_requires_confirmation_for_an_existing_label() {
         let server = StemmaServer::new();
         // The redline was authored by AuthorA and AuthorB.
         let doc_id = open_and_id(&server, &redline_docx()).await;
 
-        // Impersonating an existing author is refused, fail-loud.
+        // Reusing an existing label is refused, fail-loud.
         let refused = server
             .replace_text(Parameters(replace_second_para(&doc_id, "AuthorA", false)))
             .await;
         assert_eq!(
             refused.is_error,
             Some(true),
-            "impersonating AuthorA must be refused"
+            "reusing AuthorA must require confirmation"
         );
         assert_eq!(
             structured(&refused)["code"],
-            "AuthorImpersonation",
-            "the refusal names the impersonation contract: {}",
+            "AuthorLabelCollision",
+            "the refusal names the label-collision contract: {}",
             structured(&refused)
         );
+        assert_eq!(structured(&refused)["status"], "confirmation_required");
+        assert_eq!(structured(&refused)["author_label"], "AuthorA");
+        assert_eq!(
+            structured(&refused)["message"],
+            "New revisions with this label will appear in Microsoft Word as part of the same reviewer group."
+        );
+        assert!(
+            structured(&refused)["existing_revision_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert_eq!(
+            structured(&refused)["existing_scope"],
+            "present_when_document_opened"
+        );
+        assert_eq!(structured(&refused)["mutation"], "none");
+        assert_eq!(
+            structured(&refused)["actions"][0]["allow_existing_author"],
+            true
+        );
+        assert!(
+            structured(&refused)["actions"][1]
+                .get("author_label")
+                .is_none()
+        );
 
-        // A DISTINCT author is accepted.
+        // A new author label is accepted.
         let ok = server
             .replace_text(Parameters(replace_second_para(&doc_id, "Reviewer", false)))
             .await;
         assert_ne!(
             ok.is_error,
             Some(true),
-            "a distinct author must be accepted: {}",
+            "a new author label must be accepted: {}",
             structured(&ok)
         );
     }
@@ -11180,20 +11369,41 @@ mod tests {
                 transaction: transaction(),
             }))
             .await;
-        assert_eq!(structured(&checked)["code"], "AuthorImpersonation");
+        assert_eq!(structured(&checked)["code"], "AuthorLabelCollision");
+        assert_eq!(structured(&checked)["status"], "confirmation_required");
         assert_eq!(structured(&checked)["would_apply"], false);
 
         let previewed = server
             .apply_batch(Parameters(BatchArgs {
-                doc_id,
+                doc_id: doc_id.clone(),
                 transaction: transaction(),
                 preview: true,
                 mode: None,
                 allow_existing_author: false,
             }))
             .await;
-        assert_eq!(structured(&previewed)["code"], "AuthorImpersonation");
+        assert_eq!(structured(&previewed)["code"], "AuthorLabelCollision");
+        assert_eq!(structured(&previewed)["status"], "confirmation_required");
         assert_eq!(structured(&previewed)["would_apply"], false);
+
+        let direct = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: transaction(),
+                mode: Some("direct".to_string()),
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_ne!(
+            direct.is_error,
+            Some(true),
+            "direct materialization emits no Word author label: {}",
+            structured(&direct)
+        );
+        assert_eq!(
+            structured(&direct)["author_label_policy"],
+            "not_applicable_direct"
+        );
     }
 
     #[tokio::test]
@@ -11245,11 +11455,11 @@ mod tests {
         }
     }
 
-    /// The session's own (novel) author is not impersonation — a second edit by
+    /// The session's own (novel) label is not a collision — a second edit by
     /// the SAME new author must not be refused just because the first edit put
     /// that author into the document. The off-limits set is frozen at open.
     #[tokio::test]
-    async fn reusing_the_sessions_own_author_is_not_impersonation() {
+    async fn reusing_the_sessions_own_author_label_is_not_a_collision() {
         let server = StemmaServer::new();
         let doc_id = open_and_id(&server, &redline_docx()).await;
         let first = server
@@ -11268,33 +11478,35 @@ mod tests {
         second_args.old = "omega.".to_string();
         second_args.new = "omega tightened.".to_string();
         let second = server.replace_text(Parameters(second_args)).await;
-        // Whatever the edit's own outcome, it must NOT be an impersonation refusal.
+        // Whatever the edit's own outcome, it must NOT be a label-collision refusal.
         if second.is_error == Some(true) {
             assert_ne!(
                 structured(&second)["code"],
-                "AuthorImpersonation",
-                "the session's own author is never impersonation: {}",
+                "AuthorLabelCollision",
+                "the session's own author label does not collide: {}",
                 structured(&second)
             );
         }
     }
 
-    /// The override deliberately continues an existing author's work.
+    /// The override deliberately continues an existing reviewer group.
     #[tokio::test]
-    async fn allow_existing_author_overrides_the_impersonation_refusal() {
+    async fn allow_existing_author_confirms_the_existing_reviewer_group() {
         let server = StemmaServer::new();
         let doc_id = open_and_id(&server, &redline_docx()).await;
         let result = server
             .replace_text(Parameters(replace_second_para(&doc_id, "AuthorA", true)))
             .await;
-        if result.is_error == Some(true) {
-            assert_ne!(
-                structured(&result)["code"],
-                "AuthorImpersonation",
-                "allow_existing_author=true must bypass the impersonation refusal: {}",
-                structured(&result)
-            );
-        }
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "allow_existing_author=true must continue the reviewer group: {}",
+            structured(&result)
+        );
+        assert_eq!(
+            structured(&result)["author_label_policy"],
+            "continue_existing"
+        );
     }
 
     /// A unique phrase in exactly one paragraph: replace_text replaces it and the

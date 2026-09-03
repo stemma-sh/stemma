@@ -2,10 +2,11 @@
 
 use std::fs;
 use std::io::{Cursor, Read};
+use stemma_diff::test_support::{DiffChange, merge_diff};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
-use stemma::{
-    BlockNode, DiffChange, DocxRuntime, ExportMode, InlineNode, SimpleRuntime, TransactionMeta,
-};
+use stemma::{BlockNode, DocxRuntime, ExportMode, InlineNode, SimpleRuntime, TransactionMeta};
 
 use zip::ZipArchive;
 
@@ -510,7 +511,7 @@ fn merge_accept_all_preserves_multi_insert_ordering() {
         .diff(&import_before.doc_handle, &import_after.doc_handle)
         .expect("diff");
 
-    let merged = stemma::merge_diff(
+    let merged = merge_diff(
         &import_before.canonical,
         &import_after.canonical,
         &diff,

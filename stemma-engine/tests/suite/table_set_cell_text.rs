@@ -215,6 +215,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         w_after: None,
         cnf_style: None,
         tbl_pr_ex: None,
+        tbl_pr_ex_change: None,
         cell_spacing: None,
         preserved: Vec::new(),
     }

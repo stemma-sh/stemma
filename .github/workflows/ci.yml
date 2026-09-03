@@ -70,6 +70,20 @@ jobs:
       - name: Build workspace on MSRV
         run: cargo build --workspace
 
+  crate-packages:
+    # A workspace build can accidentally read files outside a publishable
+    # package root. Build and doctest the extracted crates.io archives in an
+    # unrelated temporary directory so missing packaged files fail before a
+    # release reaches the registry.
+    name: crates.io packages (isolated build + doctest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check isolated source packages
+        run: python3 scripts/check-crate-packages.py
+
   npm-launcher:
     # The npm distribution (stemma-mcp/npm) must not rot between releases:
     # assemble the host-platform packages from a fresh build, install them the
@@ -155,7 +169,7 @@ jobs:
     # as every mandatory job remains in this explicit dependency list.
     name: required CI gate
     if: ${{ always() }}
-    needs: [lint, test, msrv, npm-launcher, docs, contamination, demo]
+    needs: [lint, test, msrv, crate-packages, npm-launcher, docs, contamination, demo]
     runs-on: ubuntu-latest
     steps:
       - name: Require every mandatory job

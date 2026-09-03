@@ -10,8 +10,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::panic;
 use std::path::PathBuf;
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
-use stemma::{BlockNode, DiffChange, DocxRuntime, InlineNode, SimpleRuntime};
+use stemma::{BlockNode, DocxRuntime, InlineNode, SimpleRuntime};
 
 /// Extract plain text from a BlockNode::Paragraph by iterating all_inlines().
 fn paragraph_text(block: &BlockNode) -> Option<String> {

@@ -140,7 +140,7 @@ input. Only the host operator should raise process-wide limits.
 | `MatchCountMismatch` | The replacement found a different number of matches. | Narrow the text, scope it, or correct the expected count. |
 | `AmbiguousAnchorAfterMove` | The plan anchors on a block moved earlier in the transaction. | Use the moved id named by the error or a stable neighbor. |
 | `OpaqueDestroyed` | The operation would silently drop an opaque object. | Edit around it or use a structure-aware operation. |
-| `AuthorImpersonation` | The author already owns revisions in the document. | Use a distinct author or the explicit override. |
+| `AuthorLabelCollision` | The Word author label was already present when the document was opened. | If the user intended the existing reviewer group, pass the explicit override. Otherwise ask the user to choose a separate label. |
 | `CommentAnchorOverlapsDeleted` | A comment anchor falls on deleted text. | Anchor on retained text or resolve the deletion first. |
 | `ParagraphContainsTrackedSegments` | The requested span operation lacks a safe coordinate space. | Resolve the paragraph or use `replace_text`. |
 | `StyleNotFound` | A requested style does not exist. | Read current styles or create the style in the same transaction. |
@@ -180,9 +180,30 @@ a comment body.
 revision, converts a tracked edit to direct formatting, or creates a comment on
 its own; choosing among them stays the caller's decision.
 
-The `AuthorImpersonation` override is the `allow_existing_author` argument on
-the mutating tools, a per-call assertion that deliberately continues that
-author's own work (it is never a transaction field):
+`AuthorLabelCollision` is an attribution-confirmation refusal, not an identity
+or authentication check. Word author values are free-form display labels, and
+Word groups revisions that carry the same label. The refusal response includes
+the label, the current pending-revision count, the open-time scope, two explicit
+actions, and `mutation: "none"`.
+
+```json
+{
+  "code": "AuthorLabelCollision",
+  "status": "confirmation_required",
+  "author_label": "J. Osei",
+  "existing_revision_count": 12,
+  "existing_scope": "present_when_document_opened",
+  "mutation": "none",
+  "actions": [
+    {"action": "continue_existing_label", "allow_existing_author": true},
+    {"action": "use_separate_label"}
+  ]
+}
+```
+
+The `allow_existing_author` argument on mutating tools is a per-call assertion
+that deliberately continues the existing Word reviewer group (it is never a
+transaction field):
 
 ```text
 apply_edit  {"doc_id": ...,
@@ -190,6 +211,16 @@ apply_edit  {"doc_id": ...,
                              "revision": {"author": "J. Osei"}},
              "allow_existing_author": true}
 ```
+
+Successful mutation and preview receipts record `author_label_policy` as
+`continue_existing` when that assertion was supplied, otherwise
+`require_confirmation_on_collision`. Direct materialization records
+`not_applicable_direct` because it creates no Word revisions.
+
+Never invent a new author label merely to clear the refusal. If the existing
+label was not explicit in the user's instruction or another approved source,
+surface the choice between continuing that group and supplying a separate,
+user-chosen label.
 
 On text nodes, `marks` takes an array of tagged objects such as
 `[{"type":"bold"}]`, never bare strings; the grammar is specified under
@@ -245,7 +276,10 @@ compare_docx  {"base_path": "as-sent.docx",
 ```
 
 Reject-all must reconstruct the base reading. Accept-all must reconstruct the
-target reading.
+target reading. The response keeps `change_count` as the number of semantic
+differences, reports pending Word carriers separately as `revision_count`, and
+attributes import normalization under `base_diagnostics` or
+`target_diagnostics`.
 
 ### Negotiation round
 
@@ -253,13 +287,14 @@ For a mixed accept, reject, and counterproposal task:
 
 1. Open the document and list current revisions.
 2. Accept and reject only explicit current ids.
-3. Add the counterproposal as a distinct author.
+3. Add the counterproposal under the user-chosen author label.
 4. Read the accepted projection.
 5. Run `review_session` or `validate_docx`.
 6. Save to a new path.
 
 Do not reuse revision ids from a previous session, hide new work under an
-existing author's identity, or end with unsaved in-memory state.
+existing reviewer group without confirmation, or end with unsaved in-memory
+state.
 
 ## Related
 

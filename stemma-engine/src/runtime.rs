@@ -2,7 +2,7 @@
 //!
 //! [`SimpleRuntime`] is a `DashMap<DocHandle, EditSnapshot>` keyed by
 //! handle, plus operations that look up a handle, call the engine's pure
-//! per-module functions ([`crate::import`], [`crate::diff`],
+//! per-module functions ([`crate::import`], native edit planning,
 //! [`crate::edit`], [`crate::serialize`], etc.), and store the new snapshot
 //! back. The IR ([`crate::CanonDoc`]) lives in this store while a document
 //! is in active use; the source-of-truth artifact is the DOCX bytes, and
@@ -18,34 +18,30 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use xmltree::{Element, EmitterConfig, XMLNode};
 
-use crate::diff::{
-    build_full_document_view, build_tracked_document_view, diff_and_full_document, diff_documents,
-};
 use crate::docx::{DocxArchive, DocxError};
-use crate::docx_package::DocxPackage;
+use crate::docx_package::{DocxPackage, RelationshipSet};
 use crate::domain::{
-    BlockNode, Border, CanonDoc, DocFingerprint, DocHandle, DocumentDiff, FullDocViewResult,
+    BlockNode, Border, CanonDoc, DecorationNode, DecorationType, DocFingerprint, DocHandle,
     HeaderFooterKind, IStr, InlineNode, NodeId, OpaqueKind, PageOrientation, ParagraphNode,
-    RevisionInfo, SdtWrapper, SectionProperties, TrackedBlock, TrackingStatus, TransactionMeta,
+    RevisionInfo, SdtWrapper, SectionProperties, TrackedBlock, TrackedSegment, TrackingStatus,
 };
 use crate::import::{
-    build_canonical_from_root_with_stories, build_image_data_lookup, build_rel_lookup_from_rels,
-    build_story_payloads, parse_comments, parse_document_relationships, parse_endnotes,
-    parse_footers, parse_footnotes, parse_header_footer_refs, parse_headers,
-    resolve_hyperlink_urls, sha256_hex,
+    build_canonical_from_root_with_stories, build_rel_lookup_from_rels, opaque_body_ref,
+    parse_comments, parse_document_relationships, parse_endnotes, parse_footers, parse_footnotes,
+    parse_header_footer_refs, parse_headers, resolve_hyperlink_urls, sha256_hex,
 };
 use crate::serialize::{
-    build_people_xml, collect_tracked_change_authors, serialize_comments_part,
-    serialize_endnotes_part, serialize_footnotes_part, serialize_tracked_block,
+    collect_tracked_change_authors, serialize_comments_part, serialize_endnotes_part,
+    serialize_footnotes_part, serialize_tracked_block,
 };
-use crate::tracked_model::{BlockProvenanceMap, ResolveSelectionAction, merge_diff};
+use crate::tracked_model::ResolveSelectionAction;
 use crate::word_xml::{self, WordXmlError, body_element, body_element_mut, is_w_tag, w_el};
 use crate::xml_attrs::{attr_get, attr_set};
 use crate::xml_write::{self, XmlWriter};
@@ -80,6 +76,18 @@ pub(crate) const CUSTOM_XML_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml";
 pub(crate) const CUSTOM_PROPERTIES_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties";
+const STYLES_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+const SETTINGS_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
+const FONT_TABLE_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable";
+const THEME_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+const WEB_SETTINGS_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/webSettings";
+const STYLES_WITH_EFFECTS_REL_TYPE: &str =
+    "http://schemas.microsoft.com/office/2007/relationships/stylesWithEffects";
 
 /// A relationship entry from document.xml.rels.
 #[derive(Clone, Debug)]
@@ -185,51 +193,6 @@ pub struct ViewResult {
     pub canonical: Arc<CanonDoc>,
     pub diagnostics: Vec<Diagnostic>,
     pub fingerprint: DocFingerprint,
-    /// Pending revisions `view()` projected to their accepted reading,
-    /// grouped by author. `view()` FLATTENS: it returns the accepted
-    /// projection, so a document carrying pending revisions loses them (and
-    /// their attribution) here. This field is the disclosure of that
-    /// flattening; empty when the input carried none (or for `tracked_view`,
-    /// which preserves revisions instead).
-    pub flattened_pending_revisions: Vec<crate::tracked_model::PendingRevisionAuthor>,
-}
-
-/// The pending revisions compare consumed from its INPUTS. Compare diffs the
-/// accepted readings of base and target (`view()` runs accept-all before the
-/// diff), and the output redline re-attributes every change to the compare's
-/// own author — so any negotiation record in the inputs (pending revisions,
-/// with their original authors) is projected away. This notice is the
-/// structured disclosure of that contract, per input. Empty = the input
-/// carried no pending revisions.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct FlattenedPendingRevisions {
-    pub base: Vec<crate::tracked_model::PendingRevisionAuthor>,
-    pub target: Vec<crate::tracked_model::PendingRevisionAuthor>,
-}
-
-/// Result of `diff_and_full_document_view`, including the canonical docs
-/// needed for clause tree computation.
-pub struct DiffAndFullDocViewResult {
-    pub diff: DocumentDiff,
-    pub full_doc: FullDocViewResult,
-    pub base_canonical: Arc<CanonDoc>,
-    pub target_canonical: Arc<CanonDoc>,
-    /// Disclosure of the flatten contract — see [`FlattenedPendingRevisions`].
-    pub flattened_pending_revisions: FlattenedPendingRevisions,
-}
-
-/// Result of computing pair analysis IR and redline bytes from one shared pass.
-pub struct CompareAndRedlineResult {
-    pub diff: DocumentDiff,
-    pub full_doc: FullDocViewResult,
-    pub base_canonical: Arc<CanonDoc>,
-    pub target_canonical: Arc<CanonDoc>,
-    pub merged_canonical: Arc<CanonDoc>,
-    pub block_provenance: BlockProvenanceMap,
-    pub redline_bytes: Vec<u8>,
-    pub redline_fingerprint: DocFingerprint,
-    /// Disclosure of the flatten contract — see [`FlattenedPendingRevisions`].
-    pub flattened_pending_revisions: FlattenedPendingRevisions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,10 +312,10 @@ pub enum ErrorCode {
     InvalidSnapshot,
     InternalError,
     ValidationFailed,
-    /// An authored write's `revision.author` matches an author already
-    /// present in the document's redline at open time (`SnapshotMeta::
-    /// origin_authors`). See [`EditSnapshot::guard_author`].
-    AuthorImpersonation,
+    /// An authored write's Word author label matches a label already present
+    /// in the document's redline at open time (`SnapshotMeta::origin_authors`).
+    /// See [`EditSnapshot::guard_author`].
+    AuthorLabelCollision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -379,9 +342,43 @@ pub struct ErrorDetails {
     /// moveTo copy id without string-parsing the human message. Boxed for
     /// the same `result_large_err` reason as `opaque_preservation`.
     pub ambiguous_anchor: Option<Box<AmbiguousAnchorDetails>>,
-    /// Structured refusal context for run-format conflicts and unsupported
-    /// pending target states.
-    pub formatting: Option<Box<FormattingErrorDetails>>,
+    /// Typed refusal context for cases whose transport response is richer than
+    /// the generic debug-details channel. Boxed so adding a typed variant does
+    /// not enlarge the common `RuntimeError` result.
+    pub typed: Option<Box<TypedErrorDetails>>,
+}
+
+impl ErrorDetails {
+    pub fn formatting(&self) -> Option<&FormattingErrorDetails> {
+        match self.typed.as_deref() {
+            Some(TypedErrorDetails::Formatting(details)) => Some(details),
+            _ => None,
+        }
+    }
+
+    pub fn author_label_collision(&self) -> Option<&AuthorLabelCollisionDetails> {
+        match self.typed.as_deref() {
+            Some(TypedErrorDetails::AuthorLabelCollision(details)) => Some(details),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedErrorDetails {
+    Formatting(FormattingErrorDetails),
+    /// A Word author value is a display label, not an authenticated identity;
+    /// this variant lets transports explain the grouping consequence without
+    /// parsing prose.
+    AuthorLabelCollision(AuthorLabelCollisionDetails),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorLabelCollisionDetails {
+    pub author_label: String,
+    /// Pending revision rows currently carrying this label. The collision set
+    /// itself is frozen when the document is opened; this count is diagnostic.
+    pub existing_revision_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,23 +530,42 @@ pub struct SimpleRuntime {
 /// needed to rebuild `word/document.xml` without treating original upload bytes
 /// as authoritative state.
 #[derive(Clone)]
-struct BodyTemplate {
+pub(crate) struct BodyTemplate {
     /// The fully-parsed document.xml root element with body children drained.
     /// Serialize can reuse this shell (namespaces, prefixes, document element
     /// structure) without re-parsing the multi-MB document.xml.
-    root_shell: Element,
+    pub(crate) root_shell: Element,
     /// Body children referenced by OpaqueBlock proof anchors, keyed by body index.
-    opaque_children: HashMap<usize, XMLNode>,
+    pub(crate) opaque_children: HashMap<usize, XMLNode>,
     /// All w:sectPr children from the body.
-    sect_pr_nodes: Vec<XMLNode>,
+    pub(crate) sect_pr_nodes: Vec<XMLNode>,
     /// Original body children count (before draining), needed by serialize.
-    body_children_len: usize,
+    pub(crate) body_children_len: usize,
 }
 
 #[derive(Clone)]
-struct PackageScaffold {
-    package: DocxPackage,
-    body_template: BodyTemplate,
+pub(crate) struct PackageScaffold {
+    pub(crate) package: DocxPackage,
+    pub(crate) body_template: BodyTemplate,
+    serialization: PackageSerialization,
+}
+
+/// How the scaffold may be serialized.
+///
+/// Strict OOXML is parsed through the engine's Transitional namespace model so
+/// reads can use the same typed representation. Namespace replacement alone is
+/// not, however, a valid Strict-to-Transitional conversion: Strict permits
+/// lexical forms (for example universal measures and percentages) that the
+/// Transitional schema does not. Until the engine owns that complete
+/// conversion, an untouched Strict package is byte-preserved and any mutation
+/// that would serialize the normalized scaffold is refused.
+#[derive(Clone)]
+enum PackageSerialization {
+    Transitional,
+    StrictReadOnly {
+        original_bytes: Arc<[u8]>,
+        normalized_package_fingerprint: DocFingerprint,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -558,12 +574,12 @@ struct SnapshotMeta {
     document_version: u64,
     source_fingerprint: DocFingerprint,
     current_docx_fingerprint: DocFingerprint,
-    /// Authors already present in this document's redline at
+    /// Word author labels already present in this document's redline at
     /// snapshot-construction time (import or blob restore) — BEFORE this
     /// handle's session authored anything. Frozen at construction and
     /// carried forward unchanged by every rebuild (edit, metadata rewrite,
     /// merge); nothing that runs after construction ever adds to this set.
-    /// This is the author-impersonation guard's off-limits set — see
+    /// This is the author-label collision guard's confirmation set — see
     /// [`EditSnapshot::guard_author`].
     origin_authors: BTreeSet<String>,
 }
@@ -597,7 +613,7 @@ pub struct EditSnapshot {
     /// take an owned copy) before mutating, so a writer always sees an
     /// independent `CanonDoc` and never observes another holder's tree.
     pub canonical: Arc<CanonDoc>,
-    scaffold: PackageScaffold,
+    pub(crate) scaffold: PackageScaffold,
     meta: SnapshotMeta,
 }
 
@@ -697,7 +713,34 @@ fn now_epoch_secs() -> u64 {
 // Break-only run rPr controls the Word-visible line box, so dropping it during
 // canonical rebuild is a layout change. Positional IR shape change — breaking
 // blob change, fail-fast gated.
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 20;
+// v21: ParagraphFormattingChange carries separate authored-direct and
+// resolved-effective previous paragraph-property projections, including exact
+// cnfStyle authored presence (legacy mask plus tri-state named attributes),
+// present-empty composite pPr containers, and namespace-qualified shading
+// remainder attributes.
+// v22: HardBreakNode gained the same tracked run-formatting snapshot already
+// carried by TextNode. Positional IR shape change — breaking blob change,
+// fail-fast gated.
+// v23: TableFormattingChange carries the complete previous table-property
+// projection rather than three partial fields. Positional IR shape change —
+// breaking blob change, fail-fast gated.
+// v24: RowFormattingChange and CellFormattingChange carry the previous
+// table-style conditional-format projection (`w:cnfStyle`). Positional IR
+// shape change — breaking blob change, fail-fast gated.
+// v25: TableRowNode carries an independent `w:tblPrExChange` snapshot so row
+// table-property exceptions have exact Accept/Reject projections. Positional
+// IR shape change — breaking blob change, fail-fast gated.
+// v26: FormattingChange distinguishes a physical `w:rPrChange` from an
+// effective run-formatting snapshot owned by an enclosing paragraph-style
+// change. Positional IR shape change — breaking blob change, fail-fast gated.
+// v27: NumberingInfo distinguishes resolved numbering definitions from
+// Word-accepted unresolved references. Positional IR shape change — breaking
+// blob change, fail-fast gated.
+// v28: ParagraphFormattingChange distinguishes paragraph-property history from
+// paragraph-mark run-property history so a mark-only change does not synthesize
+// an empty w:pPrChange. Positional IR shape change — breaking blob change,
+// fail-fast gated.
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 28;
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
 
@@ -774,8 +817,6 @@ impl SimpleRuntime {
             canonical,
             diagnostics,
             fingerprint,
-            // tracked_view PRESERVES pending revisions — nothing is flattened.
-            flattened_pending_revisions: Vec::new(),
         })
     }
 
@@ -826,21 +867,6 @@ impl SimpleRuntime {
         ))
     }
 
-    fn canonical_for(&self, handle: &DocHandle) -> Result<Arc<CanonDoc>, RuntimeError> {
-        let entry = self.docs.get(&handle.0).ok_or_else(|| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: "doc handle not found".to_string(),
-            details: ErrorDetails {
-                context: Some(handle.0.clone()),
-                ..ErrorDetails::default()
-            },
-        })?;
-        entry
-            .last_accessed_epoch_secs
-            .store(now_epoch_secs(), Ordering::Relaxed);
-        Ok(Arc::clone(&entry.snapshot.canonical))
-    }
-
     fn edit_context_for(
         &self,
         handle: &DocHandle,
@@ -868,27 +894,6 @@ impl SimpleRuntime {
         ))
     }
 
-    fn scaffold_update_context_for(
-        &self,
-        handle: &DocHandle,
-    ) -> Result<(BodyTemplate, SnapshotMeta), RuntimeError> {
-        let entry = self.docs.get(&handle.0).ok_or_else(|| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: "doc handle not found".to_string(),
-            details: ErrorDetails {
-                context: Some(handle.0.clone()),
-                ..ErrorDetails::default()
-            },
-        })?;
-        entry
-            .last_accessed_epoch_secs
-            .store(now_epoch_secs(), Ordering::Relaxed);
-        Ok((
-            entry.snapshot.scaffold.body_template.clone(),
-            entry.snapshot.meta.clone(),
-        ))
-    }
-
     fn diagnostics_for(&self, handle: &DocHandle) -> Result<Vec<Diagnostic>, RuntimeError> {
         let entry = self.docs.get(&handle.0).ok_or_else(|| RuntimeError {
             code: ErrorCode::InvalidDocx,
@@ -902,21 +907,6 @@ impl SimpleRuntime {
             .last_accessed_epoch_secs
             .store(now_epoch_secs(), Ordering::Relaxed);
         Ok(entry.diagnostics.clone())
-    }
-
-    fn body_template_for(&self, handle: &DocHandle) -> Result<BodyTemplate, RuntimeError> {
-        let entry = self.docs.get(&handle.0).ok_or_else(|| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: "doc handle not found".to_string(),
-            details: ErrorDetails {
-                context: Some(handle.0.clone()),
-                ..ErrorDetails::default()
-            },
-        })?;
-        entry
-            .last_accessed_epoch_secs
-            .store(now_epoch_secs(), Ordering::Relaxed);
-        Ok(entry.snapshot.scaffold.body_template.clone())
     }
 
     /// Regenerate anchored DOCX bytes from the snapshot scaffold when the
@@ -939,14 +929,10 @@ impl SimpleRuntime {
                 ..ErrorDetails::default()
             },
         })?;
-        let archive = entry
-            .snapshot
-            .scaffold
-            .package
-            .clone()
-            .into_archive()
-            .map_err(map_package_error)?;
-        let bytes: Arc<[u8]> = Arc::from(archive.write().map_err(map_docx_error)?);
+        let bytes: Arc<[u8]> = Arc::from(serialize_snapshot(
+            &entry.snapshot,
+            &ExportOptions::unchecked(),
+        )?);
         entry
             .last_accessed_epoch_secs
             .store(now_epoch_secs(), Ordering::Relaxed);
@@ -1212,11 +1198,12 @@ impl SimpleRuntime {
                 "snapshot package bytes are not a valid DOCX archive: {source:?}"
             ))
         })?;
-        let package = DocxPackage::from_archive(&archive).map_err(|source| {
+        let mut package = DocxPackage::from_archive(&archive).map_err(|source| {
             invalid_snapshot(&format!(
                 "snapshot package scaffold decode failed: {source}"
             ))
         })?;
+        package.ensure_canonical_wml_content_types();
         let package_fingerprint = fingerprint(&persisted.package_bytes);
         if package_fingerprint != persisted.meta.current_docx_fingerprint {
             return Err(invalid_snapshot(&format!(
@@ -1238,6 +1225,7 @@ impl SimpleRuntime {
         let snapshot = EditSnapshot {
             canonical: Arc::clone(&canonical),
             scaffold: PackageScaffold {
+                serialization: package_serialization(&archive, &persisted.package_bytes, &package)?,
                 package,
                 body_template,
             },
@@ -1452,6 +1440,58 @@ fn apply_even_and_odd_headers_to_settings(
     Ok(())
 }
 
+/// Replace only the default tab interval in a package used as a temporary
+/// semantic projection.
+///
+/// The real redline keeps the source settings part. This helper lets target
+/// paragraphs be reparsed under that one physical interval so the bounded
+/// local lowering can identify exactly which active tab consumers need
+/// explicit paragraph stops.
+pub fn project_default_tab_stop(
+    package: &mut DocxPackage,
+    interval_twips: i32,
+) -> Result<(), String> {
+    let (mut root, part_existed) = match package.get_part("word/settings.xml") {
+        Some(bytes) => (
+            Element::parse(Cursor::new(bytes))
+                .map_err(|error| format!("failed to parse word/settings.xml: {error}"))?,
+            true,
+        ),
+        None => {
+            let mut root = Element::new("w:settings");
+            let mut namespaces = xmltree::Namespace::empty();
+            namespaces.put(
+                "w",
+                "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            );
+            root.namespaces = Some(namespaces);
+            (root, false)
+        }
+    };
+    crate::settings::set_default_tab_stop(&mut root, interval_twips)?;
+    let mut bytes = Vec::new();
+    root.write_with_config(
+        &mut bytes,
+        EmitterConfig::new().write_document_declaration(true),
+    )
+    .map_err(|error| format!("failed to serialize word/settings.xml: {error}"))?;
+    package.set_part("word/settings.xml", bytes);
+    if !part_existed {
+        package.content_types.add_override(
+            "/word/settings.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+        );
+        if package
+            .document_rels
+            .find_by_type_and_target(SETTINGS_REL_TYPE, "settings.xml")
+            .is_none()
+        {
+            package.document_rels.add(SETTINGS_REL_TYPE, "settings.xml");
+        }
+    }
+    Ok(())
+}
+
 impl Default for SimpleRuntime {
     fn default() -> Self {
         Self::new()
@@ -1459,414 +1499,12 @@ impl Default for SimpleRuntime {
 }
 
 impl SimpleRuntime {
-    /// Diff two documents and return the diff structure.
-    pub fn diff(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-    ) -> Result<DocumentDiff, RuntimeError> {
-        let start = Instant::now();
-        let base = self.view(base_handle)?;
-        let view1_elapsed = start.elapsed();
-
-        let view2_start = Instant::now();
-        let target = self.view(target_handle)?;
-        let view2_elapsed = view2_start.elapsed();
-
-        let diff_start = Instant::now();
-        let diff = diff_documents(&base.canonical, &target.canonical).map_err(map_diff_error)?;
-        let diff_elapsed = diff_start.elapsed();
-
-        if runtime_timing_logs_enabled() {
-            eprintln!(
-                "TIMING diff: view1={:.3}s view2={:.3}s diff_algo={:.3}s total={:.3}s changes={}",
-                view1_elapsed.as_secs_f64(),
-                view2_elapsed.as_secs_f64(),
-                diff_elapsed.as_secs_f64(),
-                start.elapsed().as_secs_f64(),
-                diff.changes.len(),
-            );
-        }
-
-        Ok(diff)
-    }
-
-    /// Build the full document view with inline diff segments for every block.
-    pub fn full_document_view(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-    ) -> Result<FullDocViewResult, RuntimeError> {
-        let base = self.view(base_handle)?;
-        let target = self.view(target_handle)?;
-        let base_bytes = self.get_doc_bytes(base_handle)?;
-        let target_bytes = self.get_doc_bytes(target_handle)?;
-        let base_archive = DocxArchive::read(&base_bytes).map_err(map_docx_error)?;
-        let target_archive = DocxArchive::read(&target_bytes).map_err(map_docx_error)?;
-        let base_image_lookup = build_image_data_lookup(&base_archive)?;
-        let target_image_lookup = build_image_data_lookup(&target_archive)?;
-        let blocks = build_full_document_view(
-            &base.canonical,
-            &target.canonical,
-            &base_image_lookup,
-            &target_image_lookup,
-        )
-        .map_err(map_diff_error)?;
-
-        Ok(build_story_payloads(
-            &base.canonical,
-            &target.canonical,
-            blocks,
-        ))
-    }
-
-    /// Project a single document into the full-document block format.
-    ///
-    /// Unlike `full_document_view` (which diffs two documents), this projects one
-    /// document directly. Every block is unchanged with canonical IDs. This is the
-    /// editing-ready projection path for viewing/editing without comparison.
-    pub fn single_document_view(
-        &self,
-        handle: &DocHandle,
-    ) -> Result<FullDocViewResult, RuntimeError> {
-        let canonical = self.canonical_for(handle)?;
-        let bytes = self.get_doc_bytes(handle)?;
-        let archive = DocxArchive::read(&bytes).map_err(map_docx_error)?;
-        let image_lookup = build_image_data_lookup(&archive)?;
-        Ok(build_tracked_document_view(&canonical, &image_lookup))
-    }
-
-    /// Combined diff + full document view from a single alignment computation.
-    ///
-    /// This is the preferred method for the comparison pipeline: it parses each
-    /// document once, computes alignment once, and produces both the changes array
-    /// (for atom assignment / changelets) and the full document view (for rendering)
-    /// with guaranteed-consistent block IDs.
-    pub fn diff_and_full_document_view(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-    ) -> Result<DiffAndFullDocViewResult, RuntimeError> {
-        let start = Instant::now();
-        let base = self.view(base_handle)?;
-        let view1_elapsed = start.elapsed();
-
-        let view2_start = Instant::now();
-        let target = self.view(target_handle)?;
-        let view2_elapsed = view2_start.elapsed();
-
-        let archive_start = Instant::now();
-        let base_bytes = self.get_doc_bytes(base_handle)?;
-        let target_bytes = self.get_doc_bytes(target_handle)?;
-        let base_archive = DocxArchive::read(&base_bytes).map_err(map_docx_error)?;
-        let target_archive = DocxArchive::read(&target_bytes).map_err(map_docx_error)?;
-        let base_image_lookup = build_image_data_lookup(&base_archive)?;
-        let target_image_lookup = build_image_data_lookup(&target_archive)?;
-        let archive_elapsed = archive_start.elapsed();
-
-        let algo_start = Instant::now();
-        let (diff, blocks) = diff_and_full_document(
-            &base.canonical,
-            &target.canonical,
-            &base_image_lookup,
-            &target_image_lookup,
-        )
-        .map_err(map_diff_error)?;
-        let algo_elapsed = algo_start.elapsed();
-
-        if runtime_timing_logs_enabled() {
-            eprintln!(
-                "TIMING diff_and_full_doc: view1={:.3}s view2={:.3}s archives={:.3}s algo={:.3}s total={:.3}s changes={} blocks={}",
-                view1_elapsed.as_secs_f64(),
-                view2_elapsed.as_secs_f64(),
-                archive_elapsed.as_secs_f64(),
-                algo_elapsed.as_secs_f64(),
-                start.elapsed().as_secs_f64(),
-                diff.changes.len(),
-                blocks.len(),
-            );
-        }
-
-        let full_doc = build_story_payloads(&base.canonical, &target.canonical, blocks);
-
-        Ok(DiffAndFullDocViewResult {
-            diff,
-            full_doc,
-            base_canonical: base.canonical,
-            target_canonical: target.canonical,
-            flattened_pending_revisions: FlattenedPendingRevisions {
-                base: base.flattened_pending_revisions,
-                target: target.flattened_pending_revisions,
-            },
-        })
-    }
-
-    /// Compute pair analysis IR and render the redline from one shared diff/merge pass.
-    ///
-    /// This is the efficient pair-comparison entrypoint for callers that need both
-    /// the analysis IR inputs and the tracked-change DOCX artifact.
-    pub fn compare_and_redline(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-        meta: TransactionMeta,
-    ) -> Result<CompareAndRedlineResult, RuntimeError> {
-        let total_start = Instant::now();
-
-        let view_start = Instant::now();
-        let base = self.view(base_handle)?;
-        let target = self.view(target_handle)?;
-        let view_elapsed = view_start.elapsed();
-
-        refuse_quarantined_compare(&base.canonical, &target.canonical)?;
-
-        let archive_start = Instant::now();
-        let base_bytes = self.get_doc_bytes(base_handle)?;
-        let target_bytes = self.get_doc_bytes(target_handle)?;
-        let base_archive = DocxArchive::read(&base_bytes).map_err(map_docx_error)?;
-        let target_archive = DocxArchive::read(&target_bytes).map_err(map_docx_error)?;
-        let base_image_lookup = build_image_data_lookup(&base_archive)?;
-        let target_image_lookup = build_image_data_lookup(&target_archive)?;
-        let archive_elapsed = archive_start.elapsed();
-
-        let diff_start = Instant::now();
-        let (diff, blocks) = diff_and_full_document(
-            &base.canonical,
-            &target.canonical,
-            &base_image_lookup,
-            &target_image_lookup,
-        )
-        .map_err(map_diff_error)?;
-        let diff_elapsed = diff_start.elapsed();
-
-        let full_doc = build_story_payloads(&base.canonical, &target.canonical, blocks);
-
-        let merge_start = Instant::now();
-        let next_revision_id = max_revision_id(&base.canonical) + 1;
-        let revision = revision_info_from_transaction_meta(&meta, next_revision_id);
-        let merge_result = merge_diff(&base.canonical, &target.canonical, &diff, &revision)
-            .map_err(map_merge_error)?;
-        let mut merged = merge_result.doc;
-        // H7: diff is a revision PRODUCER; mint stable identities for the
-        // revisions it discovered so the redline is enumerable/resolvable.
-        crate::import::mint_identities(&mut merged);
-        let merge_elapsed = merge_start.elapsed();
-
-        let serialize_start = Instant::now();
-        let cached_body = Some(self.body_template_for(base_handle)?);
-        let redline_bytes = serialize_canonical_docx(
-            &base_bytes,
-            &target_bytes,
-            &mut merged,
-            cached_body,
-            &crate::edit::PendingParts::default(),
-        )?;
-        let serialize_elapsed = serialize_start.elapsed();
-        let redline_fingerprint = fingerprint(&redline_bytes);
-        merged.meta.docx_fingerprint = redline_fingerprint.clone();
-
-        if runtime_timing_logs_enabled() {
-            eprintln!(
-                "TIMING compare_and_redline: view={:.3}s archives={:.3}s diff_full_doc={:.3}s merge={:.3}s serialize={:.3}s total={:.3}s changes={}",
-                view_elapsed.as_secs_f64(),
-                archive_elapsed.as_secs_f64(),
-                diff_elapsed.as_secs_f64(),
-                merge_elapsed.as_secs_f64(),
-                serialize_elapsed.as_secs_f64(),
-                total_start.elapsed().as_secs_f64(),
-                diff.changes.len(),
-            );
-        }
-
-        Ok(CompareAndRedlineResult {
-            diff,
-            full_doc,
-            base_canonical: base.canonical,
-            target_canonical: target.canonical,
-            merged_canonical: Arc::new(merged),
-            block_provenance: merge_result.block_provenance,
-            redline_bytes,
-            redline_fingerprint,
-            flattened_pending_revisions: FlattenedPendingRevisions {
-                base: base.flattened_pending_revisions,
-                target: target.flattened_pending_revisions,
-            },
-        })
-    }
-
-    /// Diff and apply as tracked changes, returning the redlined document.
-    /// The base document is modified in place with tracked changes applied.
-    ///
-    /// Memory note: the pipeline produces several large intermediate structures
-    /// (base/target canonical docs, diff, merged doc). We scope them so each
-    /// phase's intermediates are dropped before the next phase begins, keeping
-    /// peak RSS bounded to roughly one canonical doc at a time.
-    pub fn diff_and_redline(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-        meta: TransactionMeta,
-    ) -> Result<ApplyResult, RuntimeError> {
-        let view_start = Instant::now();
-        let base_view = self.view(base_handle)?;
-        let target_view = self.view(target_handle)?;
-        let view_elapsed = view_start.elapsed();
-
-        self.diff_and_redline_inner(
-            base_handle,
-            target_handle,
-            base_view,
-            target_view,
-            view_elapsed,
-            meta,
-        )
-    }
-
-    fn diff_and_redline_inner(
-        &self,
-        base_handle: &DocHandle,
-        target_handle: &DocHandle,
-        base_view: ViewResult,
-        target_view: ViewResult,
-        view_elapsed: Duration,
-        meta: TransactionMeta,
-    ) -> Result<ApplyResult, RuntimeError> {
-        let total_start = Instant::now();
-
-        refuse_quarantined_compare(&base_view.canonical, &target_view.canonical)?;
-
-        let diff_start = Instant::now();
-        let diff =
-            diff_documents(&base_view.canonical, &target_view.canonical).map_err(map_diff_error)?;
-        let diff_elapsed = diff_start.elapsed();
-
-        // Note: we intentionally do NOT early-return when diff.changes is empty.
-        // Even when text content is identical, the target document may have
-        // different formatting (font, style, color, etc.). The merge pipeline's
-        // sync_target_formatting pass adopts the target's formatting for
-        // unchanged blocks, so we must always go through merge + serialize.
-
-        let merge_start = Instant::now();
-        let diff_changes_len = diff.changes.len();
-        let next_revision_id = max_revision_id(&base_view.canonical) + 1;
-        let revision = revision_info_from_transaction_meta(&meta, next_revision_id);
-        let merge_result = merge_diff(
-            &base_view.canonical,
-            &target_view.canonical,
-            &diff,
-            &revision,
-        )
-        .map_err(map_merge_error)?;
-        let mut merged = merge_result.doc;
-        // H7: diff is a revision PRODUCER; mint stable identities for the
-        // revisions it discovered so the redline is enumerable/resolvable.
-        crate::import::mint_identities(&mut merged);
-        let merge_elapsed = merge_start.elapsed();
-
-        // Drop base_view, target_view, and diff — they are no longer needed.
-        drop(base_view);
-        drop(target_view);
-        drop(diff);
-        hint_release_memory();
-
-        // Phase 2: serialize the merged canonical doc to a DOCX byte stream.
-        // serialize_canonical_docx emits anchor bookmarks on every paragraph,
-        // so the output is already fully anchored — no re-import needed.
-        let serialize_start = Instant::now();
-        let base_bytes = self.get_doc_bytes(base_handle)?;
-        let target_bytes = self.get_doc_bytes(target_handle)?;
-        let cached_body = Some(self.body_template_for(base_handle)?);
-        let redline_bytes = serialize_canonical_docx(
-            &base_bytes,
-            &target_bytes,
-            &mut merged,
-            cached_body,
-            &crate::edit::PendingParts::default(),
-        )?;
-        let serialize_elapsed = serialize_start.elapsed();
-
-        // Drop serialize-phase intermediates.
-        drop(base_bytes);
-        drop(target_bytes);
-        hint_release_memory();
-
-        // Phase 3: reuse the merged canonical directly.
-        // The serialized DOCX already contains anchor bookmarks (emitted by
-        // serialize_paragraph_node), so we skip the expensive import_and_anchor
-        // roundtrip. The merged CanonDoc is semantically equivalent to what a
-        // re-import would produce: block IDs match anchor names, formatting and
-        // numbering are already resolved, and hyperlink URLs are carried over
-        // from the base/target imports.
-        let canon_start = Instant::now();
-        let fp = fingerprint(&redline_bytes);
-        merged.meta.docx_fingerprint = fp.clone();
-        // Share the merged IR between the stored snapshot and the returned
-        // `ApplyResult` via one `Arc` (Rung 1) instead of an extra deep copy.
-        let merged = Arc::new(merged);
-        let (body_template, base_meta) = self.scaffold_update_context_for(base_handle)?;
-        let archive = DocxArchive::read(&redline_bytes).map_err(map_docx_error)?;
-        let package = DocxPackage::from_archive(&archive).map_err(map_package_error)?;
-        self.update_snapshot(
-            base_handle,
-            EditSnapshot {
-                canonical: Arc::clone(&merged),
-                scaffold: PackageScaffold {
-                    package,
-                    body_template,
-                },
-                meta: SnapshotMeta {
-                    snapshot_schema_version: base_meta.snapshot_schema_version,
-                    document_version: base_meta.document_version + 1,
-                    origin_authors: base_meta.origin_authors.clone(),
-                    source_fingerprint: base_meta.source_fingerprint,
-                    current_docx_fingerprint: fp.clone(),
-                },
-            },
-            Vec::new(),
-            None,
-            Some(Arc::from(redline_bytes)),
-        )?;
-        let canon_elapsed = canon_start.elapsed();
-
-        if runtime_timing_logs_enabled() {
-            eprintln!(
-                "TIMING diff_and_redline_v2: view={:.3}s diff={:.3}s merge={:.3}s serialize={:.3}s canon={:.3}s total={:.3}s changes={}",
-                view_elapsed.as_secs_f64(),
-                diff_elapsed.as_secs_f64(),
-                merge_elapsed.as_secs_f64(),
-                serialize_elapsed.as_secs_f64(),
-                canon_elapsed.as_secs_f64(),
-                total_start.elapsed().as_secs_f64(),
-                diff_changes_len,
-            );
-        }
-
-        // Diagnostics are empty because the merged canonical was built from
-        // already-validated base/target imports. The old path ran import_and_anchor
-        // on the serialized bytes, which would detect parsing issues — but since we
-        // just produced those bytes from a valid CanonDoc, re-import diagnostics
-        // were always empty in practice.
-        Ok(ApplyResult {
-            canonical: merged,
-            diagnostics: Vec::new(),
-            fingerprint: fp,
-            applied: true,
-            step_results: Vec::new(),
-            cascaded_revision_ids: Vec::new(),
-        })
-    }
-
-    /// Apply an edit transaction to a document, serialize the result, and store
     /// the updated DOCX bytes.
     ///
-    /// This is the editing counterpart to `diff_and_redline`: it takes a single
-    /// document handle and an `EditTransaction`, applies the steps to the
-    /// document's CanonDoc, serializes the result to DOCX with tracked changes,
-    /// and stores the bytes back in the handle.
-    ///
-    /// The serialized output uses the same `TrackedSegment` model as
-    /// `diff_and_redline`, so the serializer, accept/reject, and full-doc-view
-    /// all work unchanged.
+    /// Takes one document handle and an `EditTransaction`, applies the steps to
+    /// the canonical document, and stores the resulting tracked state back in
+    /// the handle. Serialization, Accept, Reject, and review all consume that
+    /// same native tracked model.
     pub fn apply_edit(
         &self,
         handle: &DocHandle,
@@ -1875,7 +1513,7 @@ impl SimpleRuntime {
         // Snapshot the current state, run the pure verb core, store the result.
         let prev = self.with(handle, |s| s.clone())?;
         let updated_snapshot = prev.apply(transaction)?;
-        self.store_applied_snapshot(handle, updated_snapshot)
+        self.store_derived_snapshot(handle, updated_snapshot)
     }
 
     /// [`Self::apply_edit`], but enforcing [`EditSnapshot::guard_author`]
@@ -1891,12 +1529,17 @@ impl SimpleRuntime {
     ) -> Result<ApplyResult, RuntimeError> {
         let prev = self.with(handle, |s| s.clone())?;
         let updated_snapshot = prev.apply_authored(transaction, allow_existing_author)?;
-        self.store_applied_snapshot(handle, updated_snapshot)
+        self.store_derived_snapshot(handle, updated_snapshot)
     }
 
-    /// Shared tail of `apply_edit` / `apply_edit_authored`: store the new
-    /// snapshot back on the handle and build the `ApplyResult`.
-    fn store_applied_snapshot(
+    /// Commit a fully derived snapshot to an existing runtime handle.
+    ///
+    /// This is a comparison-independent engine boundary: downstream
+    /// compilers may derive a document through generic engine operations,
+    /// then atomically install the verified result without teaching the
+    /// runtime how that derivation was inferred.
+    #[doc(hidden)]
+    pub fn store_derived_snapshot(
         &self,
         handle: &DocHandle,
         updated_snapshot: EditSnapshot,
@@ -1997,6 +1640,7 @@ impl SimpleRuntime {
             scaffold: PackageScaffold {
                 package,
                 body_template,
+                serialization: PackageSerialization::Transitional,
             },
             meta: SnapshotMeta {
                 snapshot_schema_version: meta.snapshot_schema_version,
@@ -2068,43 +1712,6 @@ impl SimpleRuntime {
     }
 }
 
-/// Hint the allocator to return freed pages to the OS. On glibc (Linux) this
-/// calls `malloc_trim(0)` which releases freed pages back to the kernel,
-/// reducing RSS. On other platforms this is a no-op.
-///
-/// This is important for large documents where the pipeline drops large
-/// intermediate structures between phases — without this hint, glibc retains
-/// the freed pages, causing RSS to stay high and potentially exceeding cgroup
-/// memory limits in constrained environments.
-fn hint_release_memory() {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> std::ffi::c_int;
-        }
-        unsafe { malloc_trim(0) };
-    }
-}
-
-pub(crate) fn map_diff_error(err: String) -> RuntimeError {
-    RuntimeError {
-        code: ErrorCode::InvalidDocx,
-        message: err,
-        details: ErrorDetails::default(),
-    }
-}
-
-fn map_merge_error(err: crate::tracked_model::MergeError) -> RuntimeError {
-    RuntimeError {
-        code: ErrorCode::InternalError,
-        message: err.message,
-        details: ErrorDetails {
-            context: Some(err.context),
-            ..ErrorDetails::default()
-        },
-    }
-}
-
 /// Walk a canonical document and find the maximum revision ID across all tracked changes.
 /// Returns 0 if there are no tracked changes.
 ///
@@ -2137,7 +1744,7 @@ fn max_wid_in_opaque_children(opaque_children: &HashMap<usize, XMLNode>) -> u32 
     max_id
 }
 
-fn max_wid_in_archive(archive: &DocxArchive) -> u32 {
+pub(crate) fn max_wid_in_archive(archive: &DocxArchive) -> u32 {
     let mut max_id: u32 = 0;
     let needle = b"w:id=\"";
     for name in archive.list() {
@@ -2178,7 +1785,7 @@ fn max_wid_in_archive(archive: &DocxArchive) -> u32 {
 /// with any live SDT id. Only non-negative values are considered — a fresh id is
 /// always positive, so a negative source id (a legal signed-32-bit SDT id) can
 /// never collide with it and need not raise the seed.
-fn max_sdt_id_in_archive(archive: &DocxArchive) -> u32 {
+pub(crate) fn max_sdt_id_in_archive(archive: &DocxArchive) -> u32 {
     let mut max_id: u32 = 0;
     let needle = b"<w:id w:val=\"";
     for name in archive.list() {
@@ -2228,7 +1835,9 @@ pub fn max_revision_id(doc: &CanonDoc) -> u32 {
             for inline in &seg.inlines {
                 match inline {
                     crate::domain::InlineNode::Text(t) => {
-                        if let Some(fc) = &t.formatting_change {
+                        if let Some(fc) = &t.formatting_change
+                            && fc.is_physical_revision()
+                        {
                             *max_id = (*max_id).max(fc.revision_id);
                         }
                     }
@@ -2288,6 +1897,9 @@ pub fn max_revision_id(doc: &CanonDoc) -> u32 {
                         *max_id = (*max_id).max(id);
                     }
                     if let Some(fc) = &row.formatting_change {
+                        *max_id = (*max_id).max(fc.revision_id);
+                    }
+                    if let Some(fc) = &row.tbl_pr_ex_change {
                         *max_id = (*max_id).max(fc.revision_id);
                     }
                     for cell in &row.cells {
@@ -2379,133 +1991,396 @@ pub(crate) fn next_annotation_id(counter: &mut u32) -> u32 {
     id
 }
 
-fn revision_info_from_transaction_meta(meta: &TransactionMeta, revision_id: u32) -> RevisionInfo {
-    let date = meta
-        .timestamp_utc
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    RevisionInfo {
-        revision_id,
-        identity: 0,
-        author: Some(meta.author.clone()),
-        date: Some(date),
-        apply_op_id: None,
-    }
-}
-
-/// Extract image relationship mappings from a typed RelationshipSet.
+/// Import every target-owned relationship referenced by inserted opaque body
+/// content, then rewrite that content to the output relationship ids.
 ///
-/// Returns a map of rId -> media archive path (e.g. "rId4" -> "word/media/image1.tmp").
-fn image_rels_from_package(rels: &crate::docx_package::RelationshipSet) -> HashMap<String, String> {
-    const IMAGE_REL_TYPE: &str =
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
-
-    let mut map = HashMap::new();
-    for r in &rels.entries {
-        if r.rel_type != IMAGE_REL_TYPE {
-            continue;
-        }
-        let archive_path = if let Some(stripped) = r.target.strip_prefix('/') {
-            stripped.to_string()
-        } else {
-            format!("word/{}", r.target)
-        };
-        map.insert(r.id.clone(), archive_path);
-    }
-    map
-}
-
-/// Copy media files from the target archive for inserted drawing nodes and remap their rIds.
-fn copy_target_media_for_inserted_drawings(
+/// Relationship ids are local to one package. A target chart at `rId8` cannot
+/// retain that spelling when the base already uses `rId8` for a header: the
+/// reference would resolve, but to the wrong semantic object. This phase uses
+/// the inserted segment status as explicit target provenance, imports each
+/// internal part's full transitive closure, and remaps before body XML is
+/// serialized. It covers images, charts, diagrams, embedded packages, and
+/// hyperlinks rather than treating media as a special relationship universe.
+fn reconcile_target_relationships_for_inserted_content(
     doc: &mut CanonDoc,
     base_pkg: &mut DocxPackage,
-    target_archive: &DocxArchive,
-    target_document_rels: &crate::docx_package::RelationshipSet,
+    target_pkg: &DocxPackage,
 ) -> Result<(), RuntimeError> {
-    let target_image_rels = image_rels_from_package(target_document_rels);
-    if target_image_rels.is_empty() {
-        return Ok(());
-    }
-    let base_image_rels = image_rels_from_package(&base_pkg.document_rels);
-
-    let mut rid_remap: HashMap<String, String> = HashMap::new();
-    let mut copied_media: HashMap<String, String> = HashMap::new();
-
-    // Document order (first-appearance, deduped): the new rIds and copied media
-    // part names are allocated sequentially in this loop, so the iteration order
-    // is observable in the serialized bytes. Walking in document order makes the
-    // rId→media-name assignment deterministic across processes (a HashSet's
-    // per-process RandomState would otherwise leak into the wire) — see H1.
-    let mut target_rids_needed: Vec<String> = Vec::new();
-    collect_inserted_drawing_rids(&doc.blocks, &mut target_rids_needed);
-
-    if target_rids_needed.is_empty() {
+    let mut target_rids = Vec::new();
+    collect_inserted_relationship_rids(&doc.blocks, &mut target_rids)?;
+    if target_rids.is_empty() {
         return Ok(());
     }
 
-    for target_rid in &target_rids_needed {
-        let Some(target_media_path) = target_image_rels.get(target_rid) else {
-            return Err(RuntimeError {
-                code: ErrorCode::InvalidDocx,
-                message: format!(
-                    "inserted drawing references rId '{target_rid}' which has no image relationship in the target document — output would contain an orphaned rId"
-                ),
-                details: ErrorDetails {
-                    context: Some(format!(
-                        "copy_target_media_for_inserted_drawings: target_rid={target_rid}"
-                    )),
-                    ..Default::default()
-                },
-            });
-        };
-        let Some(target_media_bytes) = target_archive.get(target_media_path) else {
-            return Err(RuntimeError {
-                code: ErrorCode::InvalidDocx,
-                message: format!(
-                    "target media file '{target_media_path}' for rId '{target_rid}' not found in archive — output would contain an orphaned rId"
-                ),
-                details: ErrorDetails {
-                    context: Some(format!(
-                        "copy_target_media_for_inserted_drawings: target_rid={target_rid}, target_media_path={target_media_path}"
-                    )),
-                    ..Default::default()
-                },
-            });
-        };
+    let rid_remap = import_target_document_relationships(base_pkg, target_pkg, &target_rids)?;
+    rewrite_inserted_relationship_rids(&mut doc.blocks, &rid_remap)?;
+    Ok(())
+}
 
-        if let Some(base_media_path) = base_image_rels.get(target_rid)
-            && let Some(base_media_bytes) = base_pkg.get_part(base_media_path)
-            && base_media_bytes == target_media_bytes
+fn import_target_document_relationships(
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+    target_rids: &[String],
+) -> Result<HashMap<String, String>, RuntimeError> {
+    let mut imports = HashMap::new();
+    let mut rid_remap = HashMap::new();
+    for target_rid in target_rids {
+        let relationship = target_pkg
+            .document_rels
+            .find_by_id(target_rid)
+            .cloned()
+            .ok_or_else(|| {
+                relationship_reconciliation_error(format!(
+                    "inserted target content references relationship {target_rid:?}, but the target package supplies no such binding"
+                ))
+            })?;
+        let output_target = if relationship.target_mode.as_deref() == Some("External") {
+            relationship.target.clone()
+        } else {
+            let target_path = target_pkg
+                .document_rels
+                .resolve_internal_target(&relationship.target);
+            let output_path =
+                import_target_part_closure(base_pkg, target_pkg, &target_path, &mut imports)?;
+            format!("/{output_path}")
+        };
+        let output_rid = if relationship.target_mode.as_deref() == Some("External") {
+            base_pkg
+                .document_rels
+                .add_external(&relationship.rel_type, &output_target)
+        } else {
+            base_pkg
+                .document_rels
+                .add(&relationship.rel_type, &output_target)
+        };
+        rid_remap.insert(target_rid.clone(), output_rid);
+    }
+    Ok(rid_remap)
+}
+
+fn relationship_reconciliation_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError {
+        code: ErrorCode::InvalidDocx,
+        message: message.into(),
+        details: ErrorDetails {
+            context: Some("reconcile_output_relationship_graph".to_string()),
+            ..Default::default()
+        },
+    }
+}
+
+fn relationships_for_part<'a>(
+    package: &'a DocxPackage,
+    part_path: &str,
+) -> Option<&'a crate::docx_package::RelationshipSet> {
+    let rels_path = crate::docx_package::rels_part_path(part_path);
+    package
+        .story_rels
+        .iter()
+        .find(|(stored, _)| stored.eq_ignore_ascii_case(&rels_path))
+        .map(|(_, relationships)| relationships)
+}
+
+fn collision_safe_target_part_path(
+    base_pkg: &DocxPackage,
+    target_path: &str,
+    target_bytes: &[u8],
+) -> Result<String, RuntimeError> {
+    let digest = sha256_hex_bytes(target_bytes);
+    let (directory, filename) = target_path
+        .rsplit_once('/')
+        .map_or(("", target_path), |(directory, filename)| {
+            (directory, filename)
+        });
+    let (stem, extension) = filename
+        .rsplit_once('.')
+        .map_or((filename, ""), |(stem, extension)| (stem, extension));
+    let imported_name = if extension.is_empty() {
+        format!("{stem}_stemma_target_{}", &digest[..12])
+    } else {
+        format!("{stem}_stemma_target_{}.{extension}", &digest[..12])
+    };
+    let candidate = if directory.is_empty() {
+        imported_name
+    } else {
+        format!("{directory}/{imported_name}")
+    };
+    if let Some(existing) = base_pkg.get_part(&candidate)
+        && existing != target_bytes
+    {
+        return Err(relationship_reconciliation_error(format!(
+            "deterministic target-part collision at {candidate:?}: existing bytes differ from target part {target_path:?}"
+        )));
+    }
+    Ok(candidate)
+}
+
+/// Import one target-owned OPC part and its transitive relationship closure.
+///
+/// `imports` is keyed case-insensitively by the target part name and is filled
+/// before descending, so cyclic OPC graphs terminate. When the base already
+/// owns the same path with different bytes (or different part relationships),
+/// the target part gets a deterministic collision-safe name and every imported
+/// relationship is rewritten package-absolute to that name.
+fn import_target_part_closure(
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+    target_path: &str,
+    imports: &mut HashMap<String, String>,
+) -> Result<String, RuntimeError> {
+    let target_path = crate::docx_package::normalize_package_path(target_path);
+    let import_key = target_path.to_ascii_lowercase();
+    if let Some(imported) = imports.get(&import_key) {
+        return Ok(imported.clone());
+    }
+
+    let target_bytes = target_pkg
+        .get_part(&target_path)
+        .ok_or_else(|| {
+            relationship_reconciliation_error(format!(
+                "target relationship resolves to absent part {target_path:?}"
+            ))
+        })?
+        .to_vec();
+    let target_content_type = target_pkg
+        .content_types
+        .content_type_for_part(&target_path)
+        .ok_or_else(|| {
+            relationship_reconciliation_error(format!(
+                "target part {target_path:?} has no declared OPC content type"
+            ))
+        })?
+        .to_string();
+
+    let target_part_rels = relationships_for_part(target_pkg, &target_path).cloned();
+    let existing_part_rels = relationships_for_part(base_pkg, &target_path);
+    let relationships_match = match (&target_part_rels, existing_part_rels) {
+        (None, None) => true,
+        (Some(target), Some(existing)) => target.entries == existing.entries,
+        _ => false,
+    };
+    let output_path = match base_pkg.get_part(&target_path) {
+        None => target_path.clone(),
+        Some(existing) if existing == target_bytes && relationships_match => target_path.clone(),
+        Some(_) => collision_safe_target_part_path(base_pkg, &target_path, &target_bytes)?,
+    };
+
+    // Register before recursion: a relationship cycle back to this target part
+    // resolves to the already-selected output name.
+    imports.insert(import_key, output_path.clone());
+    if base_pkg
+        .get_part(&output_path)
+        .is_none_or(|existing| existing != target_bytes)
+    {
+        base_pkg.set_part(&output_path, target_bytes);
+    }
+
+    let output_content_type = base_pkg
+        .content_types
+        .content_type_for_part(&output_path)
+        .map(str::to_string);
+    if output_content_type.as_deref() != Some(target_content_type.as_str()) {
+        let override_name = format!("/{output_path}");
+        if base_pkg.content_types.has_override(&override_name) {
+            return Err(relationship_reconciliation_error(format!(
+                "output part {output_path:?} already has content type {:?}, cannot import target content type {target_content_type:?}",
+                output_content_type
+            )));
+        }
+        base_pkg
+            .content_types
+            .add_override(&override_name, &target_content_type);
+    }
+
+    if let Some(target_rels) = target_part_rels {
+        let output_rels_path = crate::docx_package::rels_part_path(&output_path);
+        let mut output_rels = target_rels.rebased(&output_rels_path);
+        for relationship in &mut output_rels.entries {
+            if relationship.target_mode.as_deref() == Some("External") {
+                continue;
+            }
+            let child_target_path = target_rels.resolve_internal_target(&relationship.target);
+            let child_output_path =
+                import_target_part_closure(base_pkg, target_pkg, &child_target_path, imports)?;
+            relationship.target = format!("/{child_output_path}");
+        }
+        base_pkg.story_rels.insert(output_rels_path, output_rels);
+    }
+
+    Ok(output_path)
+}
+
+#[derive(Clone)]
+enum RelationshipOwner {
+    Root,
+    Document,
+    Part(String),
+}
+
+#[derive(Clone)]
+struct MissingInternalTarget {
+    owner: RelationshipOwner,
+    relationship_index: usize,
+    target_path: String,
+}
+
+fn missing_internal_relationship_targets(package: &DocxPackage) -> Vec<MissingInternalTarget> {
+    fn collect(
+        owner: RelationshipOwner,
+        relationships: &crate::docx_package::RelationshipSet,
+        package: &DocxPackage,
+        out: &mut Vec<MissingInternalTarget>,
+    ) {
+        for (relationship_index, relationship) in relationships.entries.iter().enumerate() {
+            if relationship.target_mode.as_deref() == Some("External") {
+                continue;
+            }
+            let target_path = relationships.resolve_internal_target(&relationship.target);
+            if !package.has_part(&target_path) {
+                out.push(MissingInternalTarget {
+                    owner: owner.clone(),
+                    relationship_index,
+                    target_path,
+                });
+            }
+        }
+    }
+
+    let mut missing = Vec::new();
+    collect(
+        RelationshipOwner::Root,
+        &package.root_rels,
+        package,
+        &mut missing,
+    );
+    collect(
+        RelationshipOwner::Document,
+        &package.document_rels,
+        package,
+        &mut missing,
+    );
+    let mut rels_paths: Vec<&String> = package.story_rels.keys().collect();
+    rels_paths.sort();
+    for rels_path in rels_paths {
+        collect(
+            RelationshipOwner::Part(rels_path.clone()),
+            &package.story_rels[rels_path],
+            package,
+            &mut missing,
+        );
+    }
+    missing
+}
+
+fn set_relationship_target(
+    package: &mut DocxPackage,
+    missing: &MissingInternalTarget,
+    output_path: &str,
+) -> Result<(), RuntimeError> {
+    let relationships = match &missing.owner {
+        RelationshipOwner::Root => &mut package.root_rels,
+        RelationshipOwner::Document => &mut package.document_rels,
+        RelationshipOwner::Part(rels_path) => {
+            package.story_rels.get_mut(rels_path).ok_or_else(|| {
+                relationship_reconciliation_error(format!(
+                    "relationship set {rels_path:?} disappeared during reconciliation"
+                ))
+            })?
+        }
+    };
+    let relationship = relationships
+        .entries
+        .get_mut(missing.relationship_index)
+        .ok_or_else(|| {
+            relationship_reconciliation_error(
+                "relationship index changed during package reconciliation",
+            )
+        })?;
+    relationship.target = format!("/{output_path}");
+    Ok(())
+}
+
+fn reconcile_main_document_relationship_references(
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+    imports: &mut HashMap<String, String>,
+) -> Result<(), RuntimeError> {
+    let main_part = base_pkg.main_document_part_name().to_string();
+    let document_xml = base_pkg
+        .get_part(&main_part)
+        .ok_or_else(|| relationship_reconciliation_error("output main document part is absent"))?;
+    let root = word_xml::parse_document_xml(document_xml).map_err(map_word_xml_error)?;
+    let mut referenced_ids = Vec::new();
+    crate::docx_validate::collect_relationship_references(&root, &mut referenced_ids);
+    let referenced_ids: BTreeSet<String> = referenced_ids.into_iter().collect();
+
+    for relationship_id in referenced_ids {
+        if base_pkg
+            .document_rels
+            .find_by_id(&relationship_id)
+            .is_some()
         {
             continue;
         }
-
-        let next_rid_num = base_pkg.document_rels.max_rid_number() + 1;
-        let new_media_path = if let Some(existing) = copied_media.get(target_media_path) {
-            existing.clone()
+        let target_relationship = target_pkg
+            .document_rels
+            .find_by_id(&relationship_id)
+            .cloned()
+            .ok_or_else(|| {
+                relationship_reconciliation_error(format!(
+                    "output main document references relationship {relationship_id:?}, but neither source package supplies that binding"
+                ))
+            })?;
+        let output_target = if target_relationship.target_mode.as_deref() == Some("External") {
+            target_relationship.target.clone()
         } else {
-            let ext = target_media_path.rsplit('.').next().unwrap_or("bin");
-            let new_name = format!("word/media/image_target_{next_rid_num}.{ext}");
-            base_pkg.set_part(&new_name, target_media_bytes.to_vec());
-            copied_media.insert(target_media_path.clone(), new_name.clone());
-            new_name
+            let target_path = target_pkg
+                .document_rels
+                .resolve_internal_target(&target_relationship.target);
+            let output_path =
+                import_target_part_closure(base_pkg, target_pkg, &target_path, imports)?;
+            format!("/{output_path}")
         };
-
-        let rel_target = new_media_path
-            .strip_prefix("word/")
-            .unwrap_or(&new_media_path);
-        let new_rid = base_pkg.document_rels.add(
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
-            rel_target,
-        );
-        rid_remap.insert(target_rid.clone(), new_rid);
+        if !base_pkg.document_rels.insert_exact(
+            &relationship_id,
+            &target_relationship.rel_type,
+            &output_target,
+            target_relationship.target_mode.as_deref(),
+        ) {
+            return Err(relationship_reconciliation_error(format!(
+                "relationship ID {relationship_id:?} became occupied during reconciliation"
+            )));
+        }
     }
+    Ok(())
+}
 
-    if rid_remap.is_empty() {
-        return Ok(());
+/// Close the merged output's active OPC graph using explicit target provenance.
+/// Missing bindings in serialized main-document XML are imported by exact rId;
+/// every internal relationship target is then resolved transitively. A target
+/// part is never allowed to overwrite different base-owned bytes.
+fn reconcile_output_relationship_graph(
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+) -> Result<(), RuntimeError> {
+    let mut imports = HashMap::new();
+    reconcile_main_document_relationship_references(base_pkg, target_pkg, &mut imports)?;
+
+    loop {
+        let missing = missing_internal_relationship_targets(base_pkg);
+        if missing.is_empty() {
+            break;
+        }
+        for relationship in missing {
+            let output_path = import_target_part_closure(
+                base_pkg,
+                target_pkg,
+                &relationship.target_path,
+                &mut imports,
+            )?;
+            set_relationship_target(base_pkg, &relationship, &output_path)?;
+        }
     }
-
-    rewrite_inserted_drawing_rids(&mut doc.blocks, &rid_remap);
     Ok(())
 }
 
@@ -2518,9 +2393,9 @@ const IMAGE_REL_TYPE: &str =
 /// This is the save-path twin of the pure verb core: `apply_transaction` stages
 /// media binaries and styles.xml ops in a `PendingParts` (it has no
 /// `DocxPackage` in scope by design), and this function realizes them against
-/// the real package. Generalizes `copy_target_media_for_inserted_drawings`:
-/// same shape (write a part, register a rel, rewrite the IR rId), but the parts
-/// are supplied by a verb rather than inferred from a second archive.
+/// the real package. It shares the inserted-content reconciliation shape (write
+/// a part, register a relationship, rewrite the IR id), but the parts are
+/// supplied by a verb rather than inferred from a second archive.
 ///
 /// Fails loud (no silent fallback, no orphaned part) on:
 /// - empty image bytes,
@@ -2644,22 +2519,20 @@ fn apply_pending_media(
 
     // Rewrite the IR's logical rIds to the real rIds the package assigned.
     //
-    // Unlike `copy_target_media_for_inserted_drawings` (which only rewrites
-    // INSERTED drawings, because the merge path only copies media for inserted
-    // content), a verb-staged media item must rewrite its drawing regardless of
-    // segment status: `InsertImage` lands an Inserted segment, but `ReplaceImage`
-    // rewrites an existing Normal-segment drawing. A staged `logical_rid` is an
-    // explicit contract — wherever the verb wrote it, that is exactly the rId we
-    // must rewrite, or the output carries an orphan rId.
+    // Comparison imports rewrite only target-origin content. A verb-staged
+    // media item must instead rewrite its drawing regardless of segment status:
+    // `InsertImage` lands an Inserted segment, while `ReplaceImage` rewrites an
+    // existing Normal-segment drawing. A staged `logical_rid` is an explicit
+    // contract — wherever the verb wrote it, that is exactly the rId we must
+    // rewrite, or the output carries an orphan rId.
     rewrite_staged_drawing_rids(&mut doc.blocks, &rid_remap);
     Ok(())
 }
 
 /// Rewrite blip rIds in ALL drawings (any segment status) by `remap`. Used by the
 /// verb-staged media path, which must rewrite both inserted (`InsertImage`) and
-/// normal (`ReplaceImage`) drawings. Distinct from
-/// `rewrite_inserted_drawing_rids`, which is intentionally inserted-only for the
-/// merge path.
+/// normal (`ReplaceImage`) drawings. Distinct from comparison import, which is
+/// intentionally target-origin-only.
 fn rewrite_staged_drawing_rids(blocks: &mut [TrackedBlock], remap: &HashMap<String, String>) {
     for tb in blocks {
         match &mut tb.block {
@@ -3647,47 +3520,22 @@ fn sha256_hex_bytes(bytes: &[u8]) -> String {
     s
 }
 
-/// Collect the rIds of inserted drawings in first-appearance document order,
-/// deduped. Order matters: the caller allocates new rIds/media part names in
-/// iteration order, so it must not depend on hash iteration (see H1).
-fn collect_inserted_drawing_rids(blocks: &[TrackedBlock], out: &mut Vec<String>) {
+/// Collect target relationship ids from inserted opaque content in
+/// first-appearance document order. A whole inserted table makes every nested
+/// cell block target-owned even though those nested blocks have no top-level
+/// [`TrackingStatus`] of their own.
+pub(crate) fn collect_inserted_relationship_rids(
+    blocks: &[TrackedBlock],
+    out: &mut Vec<String>,
+) -> Result<(), RuntimeError> {
     for tb in blocks {
-        match &tb.block {
-            BlockNode::Paragraph(p) => {
-                for seg in &p.segments {
-                    if !matches!(seg.status, TrackingStatus::Inserted(_)) {
-                        continue;
-                    }
-                    for inline in &seg.inlines {
-                        if let InlineNode::OpaqueInline(o) = inline
-                            && matches!(o.kind, OpaqueKind::Drawing)
-                            && let Some(ref raw) = o.raw_xml
-                            && let Ok(s) = std::str::from_utf8(raw)
-                            && let Some(rid) = crate::diff::find_blip_rid(s)
-                            // Skip verb-staged image rIds (reserved "rIdimg" prefix,
-                            // see image_insert.rs::logical_rid): their media is
-                            // registered by apply_pending_media, not copied from the
-                            // target package, so they're absent from target_image_rels
-                            // and must not be looked up there.
-                            && !rid.starts_with("rIdimg")
-                        {
-                            push_unique_rid(out, rid);
-                        }
-                    }
-                }
-            }
-            BlockNode::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        if matches!(tb.status, TrackingStatus::Inserted(_)) {
-                            collect_drawing_rids_from_blocks(&cell.blocks, out);
-                        }
-                    }
-                }
-            }
-            BlockNode::OpaqueBlock(_) => {}
-        }
+        collect_relationship_rids_from_block(
+            &tb.block,
+            matches!(tb.status, TrackingStatus::Inserted(_)),
+            out,
+        )?;
     }
+    Ok(())
 }
 
 /// Append `rid` to `out` if not already present (ordered-set semantics; the
@@ -3699,84 +3547,254 @@ fn push_unique_rid(out: &mut Vec<String>, rid: String) {
     }
 }
 
-fn collect_drawing_rids_from_blocks(blocks: &[BlockNode], out: &mut Vec<String>) {
-    for block in blocks {
-        match block {
-            BlockNode::Paragraph(p) => {
-                for seg in &p.segments {
-                    for inline in &seg.inlines {
-                        if let InlineNode::OpaqueInline(o) = inline
-                            && matches!(o.kind, OpaqueKind::Drawing)
-                            && let Some(ref raw) = o.raw_xml
-                            && let Ok(s) = std::str::from_utf8(raw)
-                            && let Some(rid) = crate::diff::find_blip_rid(s)
-                            // Skip verb-staged image rIds (see the sibling collector).
+fn collect_relationship_rids_from_block(
+    block: &BlockNode,
+    inherited_target_origin: bool,
+    out: &mut Vec<String>,
+) -> Result<(), RuntimeError> {
+    match block {
+        BlockNode::Paragraph(paragraph) => {
+            for segment in &paragraph.segments {
+                if !inherited_target_origin
+                    && !matches!(segment.status, TrackingStatus::Inserted(_))
+                {
+                    continue;
+                }
+                for inline in &segment.inlines {
+                    let InlineNode::OpaqueInline(opaque) = inline else {
+                        continue;
+                    };
+                    if let crate::domain::OpaqueKind::Hyperlink(data) = &opaque.kind {
+                        if let Some(rid) = &data.r_id
                             && !rid.starts_with("rIdimg")
                         {
+                            push_unique_rid(out, rid.clone());
+                        }
+                        continue;
+                    }
+                    let Some(raw) = &opaque.raw_xml else {
+                        continue;
+                    };
+                    let root =
+                        word_xml::parse_raw_fragment(raw).map_err(|source| RuntimeError {
+                            code: ErrorCode::InvalidDocx,
+                            message: "failed to inspect inserted opaque relationship references"
+                                .to_string(),
+                            details: ErrorDetails {
+                                block_id: Some(paragraph.id.clone()),
+                                context: Some(format!(
+                                    "opaque_ref={} err={source}",
+                                    opaque.opaque_ref
+                                )),
+                                ..ErrorDetails::default()
+                            },
+                        })?;
+                    let mut referenced = Vec::new();
+                    crate::docx_validate::collect_relationship_references(&root, &mut referenced);
+                    for rid in referenced {
+                        // Verb-staged relationships belong to PendingParts, not
+                        // either comparison package.
+                        if !rid.starts_with("rIdimg") {
                             push_unique_rid(out, rid);
                         }
                     }
                 }
             }
-            BlockNode::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        collect_drawing_rids_from_blocks(&cell.blocks, out);
+        }
+        BlockNode::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for nested in &cell.blocks {
+                        collect_relationship_rids_from_block(nested, inherited_target_origin, out)?;
                     }
                 }
             }
-            BlockNode::OpaqueBlock(_) => {}
         }
+        BlockNode::OpaqueBlock(_) => {}
     }
+    Ok(())
 }
 
-fn rewrite_inserted_drawing_rids(blocks: &mut [TrackedBlock], remap: &HashMap<String, String>) {
+pub(crate) fn rewrite_inserted_relationship_rids(
+    blocks: &mut [TrackedBlock],
+    remap: &HashMap<String, String>,
+) -> Result<(), RuntimeError> {
     for tb in blocks {
-        match &mut tb.block {
-            BlockNode::Paragraph(p) => {
-                for seg in &mut p.segments {
-                    if !matches!(seg.status, TrackingStatus::Inserted(_)) {
+        rewrite_relationship_rids_in_block(
+            &mut tb.block,
+            matches!(tb.status, TrackingStatus::Inserted(_)),
+            remap,
+        )?;
+    }
+    Ok(())
+}
+
+/// Import and remap relationships in target-origin body children whose XML is
+/// preserved outside the canonical inline model (currently body-level content
+/// controls and relocated range markers).
+fn reconcile_target_relationships_for_opaque_body_children(
+    children: &mut HashMap<usize, XMLNode>,
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+) -> Result<(), RuntimeError> {
+    let mut indices: Vec<usize> = children.keys().copied().collect();
+    indices.sort_unstable();
+
+    let mut target_rids = Vec::new();
+    for index in &indices {
+        let Some(XMLNode::Element(element)) = children.get(index) else {
+            continue;
+        };
+        let mut referenced = Vec::new();
+        crate::docx_validate::collect_relationship_references(element, &mut referenced);
+        for rid in referenced {
+            push_unique_rid(&mut target_rids, rid);
+        }
+    }
+    if target_rids.is_empty() {
+        return Ok(());
+    }
+
+    let rid_remap = import_target_document_relationships(base_pkg, target_pkg, &target_rids)?;
+    for index in indices {
+        if let Some(XMLNode::Element(element)) = children.get_mut(&index) {
+            rewrite_relationship_attrs(element, &rid_remap);
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_relationship_rids_in_block(
+    block: &mut BlockNode,
+    inherited_target_origin: bool,
+    remap: &HashMap<String, String>,
+) -> Result<(), RuntimeError> {
+    match block {
+        BlockNode::Paragraph(paragraph) => {
+            for segment in &mut paragraph.segments {
+                if !inherited_target_origin
+                    && !matches!(segment.status, TrackingStatus::Inserted(_))
+                {
+                    continue;
+                }
+                for inline in &mut segment.inlines {
+                    let InlineNode::OpaqueInline(opaque) = inline else {
+                        continue;
+                    };
+                    if let crate::domain::OpaqueKind::Hyperlink(data) = &mut opaque.kind {
+                        if let Some(output_rid) = data
+                            .r_id
+                            .as_ref()
+                            .and_then(|target_rid| remap.get(target_rid))
+                        {
+                            data.r_id = Some(output_rid.clone());
+                        }
                         continue;
                     }
-                    for inline in &mut seg.inlines {
-                        if let InlineNode::OpaqueInline(o) = inline
-                            && matches!(o.kind, OpaqueKind::Drawing)
-                        {
-                            rewrite_opaque_drawing_rid(o, remap);
-                        }
+                    let Some(raw) = &opaque.raw_xml else {
+                        continue;
+                    };
+                    let mut root =
+                        word_xml::parse_raw_fragment(raw).map_err(|source| RuntimeError {
+                            code: ErrorCode::InvalidDocx,
+                            message: "failed to rewrite inserted opaque relationship references"
+                                .to_string(),
+                            details: ErrorDetails {
+                                block_id: Some(paragraph.id.clone()),
+                                context: Some(format!(
+                                    "opaque_ref={} err={source}",
+                                    opaque.opaque_ref
+                                )),
+                                ..ErrorDetails::default()
+                            },
+                        })?;
+                    if rewrite_relationship_attrs(&mut root, remap) {
+                        let rewritten = word_xml::serialize_raw_fragment(&root);
+                        opaque.content_hash = Some(sha256_hex_bytes(&rewritten));
+                        opaque.raw_xml = Some(rewritten);
                     }
                 }
             }
-            BlockNode::Table(t) => {
-                for row in &mut t.rows {
-                    if matches!(tb.status, TrackingStatus::Inserted(_)) {
-                        for cell in &mut row.cells {
-                            rewrite_drawing_rids_in_blocks(&mut cell.blocks, remap);
-                        }
-                    }
-                }
-            }
-            BlockNode::OpaqueBlock(_) => {}
         }
+        BlockNode::Table(table) => {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    for nested in &mut cell.blocks {
+                        rewrite_relationship_rids_in_block(nested, inherited_target_origin, remap)?;
+                    }
+                }
+            }
+        }
+        BlockNode::OpaqueBlock(_) => {}
+    }
+    Ok(())
+}
+
+/// Rewrite relationship-valued attributes and report whether any bytes need to
+/// be reserialized. Preserving an untouched raw fragment byte-for-byte matters:
+/// XML round-tripping can change prefix declarations and other lexical details
+/// even when the relationship binding was already valid.
+fn rewrite_relationship_attrs(element: &mut Element, remap: &HashMap<String, String>) -> bool {
+    let mut changed = false;
+    for (name, value) in &mut element.attributes {
+        let relationship_namespace = name
+            .namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace.ends_with("/relationships"));
+        let relationship_prefix = name.prefix.as_deref() == Some("r");
+        let relationship_local = matches!(name.local_name.as_str(), "id" | "embed" | "link");
+        if relationship_local
+            && (relationship_namespace || relationship_prefix)
+            && let Some(output_rid) = remap.get(value)
+            && output_rid != value
+        {
+            *value = output_rid.clone();
+            changed = true;
+        }
+    }
+    for child in &mut element.children {
+        if let XMLNode::Element(child) = child {
+            changed |= rewrite_relationship_attrs(child, remap);
+        }
+    }
+    changed
+}
+
+/// Pending-media compatibility wrapper. Authored image operations supply one
+/// logical blip id and have already validated their raw drawing XML at the edit
+/// boundary; keep this non-fallible surface while sharing the exact attribute
+/// rewrite used by comparison imports.
+fn rewrite_opaque_drawing_rid(
+    opaque: &mut crate::domain::OpaqueInlineNode,
+    remap: &HashMap<String, String>,
+) {
+    let Some(raw) = &opaque.raw_xml else { return };
+    let Ok(mut root) = word_xml::parse_raw_fragment(raw) else {
+        return;
+    };
+    if rewrite_relationship_attrs(&mut root, remap) {
+        let rewritten = word_xml::serialize_raw_fragment(&root);
+        opaque.content_hash = Some(sha256_hex_bytes(&rewritten));
+        opaque.raw_xml = Some(rewritten);
     }
 }
 
 fn rewrite_drawing_rids_in_blocks(blocks: &mut [BlockNode], remap: &HashMap<String, String>) {
     for block in blocks {
         match block {
-            BlockNode::Paragraph(p) => {
-                for seg in &mut p.segments {
-                    for inline in &mut seg.inlines {
-                        if let InlineNode::OpaqueInline(o) = inline
-                            && matches!(o.kind, OpaqueKind::Drawing)
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    for inline in &mut segment.inlines {
+                        if let InlineNode::OpaqueInline(opaque) = inline
+                            && matches!(opaque.kind, OpaqueKind::Drawing)
                         {
-                            rewrite_opaque_drawing_rid(o, remap);
+                            rewrite_opaque_drawing_rid(opaque, remap);
                         }
                     }
                 }
             }
-            BlockNode::Table(t) => {
-                for row in &mut t.rows {
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
                     for cell in &mut row.cells {
                         rewrite_drawing_rids_in_blocks(&mut cell.blocks, remap);
                     }
@@ -3785,24 +3803,6 @@ fn rewrite_drawing_rids_in_blocks(blocks: &mut [BlockNode], remap: &HashMap<Stri
             BlockNode::OpaqueBlock(_) => {}
         }
     }
-}
-
-fn rewrite_opaque_drawing_rid(
-    o: &mut crate::domain::OpaqueInlineNode,
-    remap: &HashMap<String, String>,
-) {
-    let Some(ref raw) = o.raw_xml else { return };
-    let Ok(s) = std::str::from_utf8(raw) else {
-        return;
-    };
-    let Some(old_rid) = crate::diff::find_blip_rid(s) else {
-        return;
-    };
-    let Some(new_rid) = remap.get(&old_rid) else {
-        return;
-    };
-    let updated = s.replace(&old_rid, new_rid);
-    o.raw_xml = Some(updated.into_bytes());
 }
 
 /// Merge numbering definitions from the target DOCX into the base archive.
@@ -3845,7 +3845,9 @@ fn merge_target_numbering(
         for block in blocks {
             match block {
                 BlockNode::Paragraph(p) => {
-                    if let Some(n) = &p.numbering {
+                    if let Some(n) = &p.numbering
+                        && n.is_resolved()
+                    {
                         out.insert(n.num_id);
                     }
                 }
@@ -3865,7 +3867,9 @@ fn merge_target_numbering(
         for tb in blocks {
             match &tb.block {
                 BlockNode::Paragraph(p) => {
-                    if let Some(n) = &p.numbering {
+                    if let Some(n) = &p.numbering
+                        && n.is_resolved()
+                    {
                         out.insert(n.num_id);
                     }
                 }
@@ -3902,61 +3906,11 @@ fn merge_target_numbering(
         return Ok(());
     }
 
-    // Bounded, deterministic sample of the needed numIds for error messages —
-    // large documents can reference dozens of lists; the full set is noise,
-    // but the caller needs concrete ids to go debug the source document with.
-    let needed_ids_sample = || {
-        let mut ids: Vec<u32> = needed_num_ids.iter().copied().collect();
-        ids.sort_unstable();
-        ids.truncate(10);
-        ids.iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    // Parse target numbering.xml. Blocks in the merged doc need at least one
-    // numId that is not already in base, so the target archive MUST supply a
-    // parseable word/numbering.xml — a document can only have populated
-    // `NumberingInfo` on a paragraph by resolving numPr against a real
-    // numbering.xml at import time (see import::build_canonical_from_archive),
-    // so reaching "part missing" here with a non-empty needed set means the
-    // CanonDoc and the archive it was built from have gone out of sync: a
-    // real invariant violation, not a legitimate flow.
-    let target_numbering_bytes =
-        target_archive
-            .get("word/numbering.xml")
-            .ok_or_else(|| RuntimeError {
-                code: ErrorCode::InvalidDocx,
-                message: format!(
-                    "cannot merge numbering: target archive has no word/numbering.xml, \
-                 but the merged document references numId(s) [{}] that are not already \
-                 in the base archive — exporting would leave dangling w:numPr references",
-                    needed_ids_sample()
-                ),
-                details: ErrorDetails::default(),
-            })?;
-    let target_root =
-        Element::parse(std::io::Cursor::new(target_numbering_bytes)).map_err(|err| {
-            RuntimeError {
-                code: ErrorCode::InvalidDocx,
-                message: "failed to parse target word/numbering.xml during numbering merge"
-                    .to_string(),
-                details: ErrorDetails {
-                    context: Some(format!(
-                        "needed numId(s): [{}]; parse error: {err}",
-                        needed_ids_sample()
-                    )),
-                    ..ErrorDetails::default()
-                },
-            }
-        })?;
-
     // Parse base numbering.xml (may not exist — create empty root if so). If
     // it exists but fails to parse, that is the runtime's own doc going
     // corrupt, not an absent-part case — fail loud rather than silently
     // dropping the merge and leaving base's numbering.xml stale.
-    let (mut base_root, base_existed) = match base_pkg.get_part("word/numbering.xml") {
+    let (base_root, base_existed) = match base_pkg.get_part("word/numbering.xml") {
         Some(b) => {
             let r = Element::parse(std::io::Cursor::new(b)).map_err(|err| RuntimeError {
                 code: ErrorCode::InvalidDocx,
@@ -3969,12 +3923,7 @@ fn merge_target_numbering(
             })?;
             (r, true)
         }
-        None => {
-            let mut r = Element::new("numbering");
-            r.prefix = Some("w".to_string());
-            r.namespaces = target_root.namespaces.clone();
-            (r, false)
-        }
+        None => (Element::new("numbering"), false),
     };
 
     // Collect existing base numId and abstractNumId values to detect conflicts.
@@ -3996,6 +3945,233 @@ fn merge_target_numbering(
             }
         }
     }
+
+    // One physical numbering part serves both native terminals. A numId is a
+    // package-local transport identity, not a semantic identity: independently
+    // authored documents routinely reuse the same number for different list
+    // definitions. The old early return below treated "the base contains this
+    // integer" as proof that the target reference was closed. Native Accept
+    // then selected the source definition for target paragraphs.
+    //
+    // Only target-active references matter here. Source-only definitions may
+    // coexist with unrelated target definitions that happen to reuse an ID as
+    // long as the target never selects that ID. Project the compiled document
+    // through the engine's normal Accept model, then refuse any active same-ID
+    // collision until a carrier can remap the target side without rewriting the
+    // source/previous projections.
+    let mut accepted_doc = doc.clone();
+    crate::tracked_model::accept_all(&mut accepted_doc);
+    let mut target_active_num_ids = HashSet::new();
+    collect_num_ids_from_blocks(&accepted_doc.blocks, &mut target_active_num_ids);
+    for header in &accepted_doc.headers {
+        collect_num_ids_from_blocks(&header.blocks, &mut target_active_num_ids);
+    }
+    for footer in &accepted_doc.footers {
+        collect_num_ids_from_blocks(&footer.blocks, &mut target_active_num_ids);
+    }
+    for footnote in &accepted_doc.footnotes {
+        collect_num_ids_from_blocks(&footnote.blocks, &mut target_active_num_ids);
+    }
+    for endnote in &accepted_doc.endnotes {
+        collect_num_ids_from_blocks(&endnote.blocks, &mut target_active_num_ids);
+    }
+    for comment in &accepted_doc.comments {
+        collect_num_ids_from_blocks(&comment.blocks, &mut target_active_num_ids);
+    }
+
+    fn abstract_num_id(num: &Element) -> Option<u32> {
+        num.children.iter().find_map(|child| {
+            let XMLNode::Element(element) = child else {
+                return None;
+            };
+            if !is_w_tag(element, "abstractNumId") {
+                return None;
+            }
+            attr_get(element, "val").and_then(|value| value.parse::<u32>().ok())
+        })
+    }
+
+    fn numbering_definition(root: &Element, num_id: u32) -> Option<(Element, Element)> {
+        let mut num = root.children.iter().find_map(|child| {
+            let XMLNode::Element(element) = child else {
+                return None;
+            };
+            (is_w_tag(element, "num")
+                && attr_get(element, "numId").and_then(|value| value.parse::<u32>().ok())
+                    == Some(num_id))
+            .then(|| element.clone())
+        })?;
+        let abstract_id = abstract_num_id(&num)?;
+        let mut abstract_num = root.children.iter().find_map(|child| {
+            let XMLNode::Element(element) = child else {
+                return None;
+            };
+            (is_w_tag(element, "abstractNum")
+                && attr_get(element, "abstractNumId").and_then(|value| value.parse::<u32>().ok())
+                    == Some(abstract_id))
+            .then(|| element.clone())
+        })?;
+
+        // The concrete/abstract IDs and Word's generated numbering identity
+        // tokens are transport/provenance bindings. Independently authored
+        // packages routinely mint different durableId, nsid, tmpl, and tplc
+        // values for the same list behavior. They have no reference sites
+        // outside this closed numbering definition, so retaining the source
+        // definition is a complete transport remap when the remaining
+        // concrete and abstract definitions are identical.
+        //
+        // Every presentation- or editing-relevant property remains in the
+        // comparison: overrides, restart behavior, level text, formatting,
+        // indentation, styles, and all unrecognized children/attributes.
+        attr_set(&mut num, "w:numId", "0");
+        num.attributes
+            .retain(|name, _| name.local_name != "durableId");
+        if let Some(reference) = num.children.iter_mut().find_map(|child| {
+            let XMLNode::Element(element) = child else {
+                return None;
+            };
+            is_w_tag(element, "abstractNumId").then_some(element)
+        }) {
+            attr_set(reference, "w:val", "0");
+        }
+        attr_set(&mut abstract_num, "w:abstractNumId", "0");
+        abstract_num.children.retain(|child| {
+            !matches!(child, XMLNode::Element(element) if is_w_tag(element, "nsid") || is_w_tag(element, "tmpl"))
+        });
+        for child in &mut abstract_num.children {
+            let XMLNode::Element(level) = child else {
+                continue;
+            };
+            if is_w_tag(level, "lvl") {
+                level.attributes.retain(|name, _| name.local_name != "tplc");
+            }
+        }
+        Some((num, abstract_num))
+    }
+
+    let target_root = if target_active_num_ids
+        .iter()
+        .any(|num_id| base_num_ids.contains(num_id))
+    {
+        target_archive
+            .get("word/numbering.xml")
+            .map(|bytes| {
+                Element::parse(std::io::Cursor::new(bytes)).map_err(|err| RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message:
+                        "failed to parse target word/numbering.xml during numbering reconciliation"
+                            .to_string(),
+                    details: ErrorDetails {
+                        context: Some(format!("parse error: {err}")),
+                        ..ErrorDetails::default()
+                    },
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    if let Some(target_root) = &target_root {
+        let mut shared_active_ids: Vec<u32> = target_active_num_ids
+            .intersection(&base_num_ids)
+            .copied()
+            .collect();
+        shared_active_ids.sort_unstable();
+        for num_id in shared_active_ids {
+            let Some(target_definition) = numbering_definition(target_root, num_id) else {
+                // The accepted target may legitimately retain a source-owned
+                // list unchanged; absence from target numbering.xml is not a
+                // conflicting target definition.
+                continue;
+            };
+            let base_definition = numbering_definition(&base_root, num_id).ok_or_else(|| {
+                RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: format!(
+                        "base numbering instance numId {num_id} does not resolve to a complete abstract definition"
+                    ),
+                    details: ErrorDetails {
+                        context: Some("word/numbering.xml".to_string()),
+                        ..ErrorDetails::default()
+                    },
+                }
+            })?;
+            if base_definition != target_definition {
+                return Err(RuntimeError {
+                    code: ErrorCode::UnsupportedEdit,
+                    message: format!(
+                        "package reconciliation cannot switch active numId {num_id} between different source and target numbering definitions"
+                    ),
+                    details: ErrorDetails {
+                        context: Some(format!("word/numbering.xml/w:num[@w:numId='{num_id}']")),
+                        ..ErrorDetails::default()
+                    },
+                });
+            }
+        }
+    }
+
+    // Only definitions absent from the base need to be sourced from the
+    // target. A target without numbering.xml is entirely legitimate when all
+    // live references in the merged document already resolve in the base.
+    let missing_num_ids: HashSet<u32> = needed_num_ids.difference(&base_num_ids).copied().collect();
+    if missing_num_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Bounded, deterministic sample of unresolved numIds for diagnostics.
+    let missing_ids_sample = || {
+        let mut ids: Vec<u32> = missing_num_ids.iter().copied().collect();
+        ids.sort_unstable();
+        ids.truncate(10);
+        ids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // At least one live numId is absent from the base, so the target must now
+    // supply a parseable numbering part from which that definition can be
+    // copied.
+    let target_numbering_bytes =
+        target_archive
+            .get("word/numbering.xml")
+            .ok_or_else(|| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: format!(
+                    "cannot merge numbering: target archive has no word/numbering.xml, \
+                 but the merged document references numId(s) [{}] that are not already \
+                 in the base archive — exporting would leave dangling w:numPr references",
+                    missing_ids_sample()
+                ),
+                details: ErrorDetails::default(),
+            })?;
+    let target_root = match target_root {
+        Some(root) => root,
+        None => Element::parse(std::io::Cursor::new(target_numbering_bytes)).map_err(|err| {
+            RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "failed to parse target word/numbering.xml during numbering merge"
+                    .to_string(),
+                details: ErrorDetails {
+                    context: Some(format!(
+                        "needed numId(s): [{}]; parse error: {err}",
+                        missing_ids_sample()
+                    )),
+                    ..ErrorDetails::default()
+                },
+            }
+        })?,
+    };
+    let mut base_root = if base_existed {
+        base_root
+    } else {
+        let mut root = base_root;
+        root.prefix = Some("w".to_string());
+        root.namespaces = target_root.namespaces.clone();
+        root
+    };
 
     // Build lookup tables from target: numId -> w:num element, abstractNumId -> w:abstractNum element.
     let mut target_nums: HashMap<u32, Element> = HashMap::new();
@@ -4022,11 +4198,13 @@ fn merge_target_numbering(
     let mut next_num_id = base_num_ids.iter().copied().max().unwrap_or(0) + 1;
     let mut next_abstract_id = base_abstract_ids.iter().copied().max().unwrap_or(0) + 1;
 
-    for &num_id in &needed_num_ids {
-        if base_num_ids.contains(&num_id) {
-            // Already exists in base — no copy needed, no remap.
-            continue;
-        }
+    // HashSet iteration is process-randomized. The order here becomes the order
+    // of copied definitions in numbering.xml (the schema sort below is stable
+    // within each element group), so iterate by numId to make identical inputs
+    // produce byte-identical packages across processes.
+    let mut sorted_missing_num_ids: Vec<u32> = missing_num_ids.iter().copied().collect();
+    sorted_missing_num_ids.sort_unstable();
+    for num_id in sorted_missing_num_ids {
         // Documented non-error exception: a numId absent from BOTH base and
         // target is not necessarily dangling. The list-split verb
         // (edit/verbs/numbering.rs `apply_split`) re-points a run of
@@ -4622,7 +4800,8 @@ fn remap_numids_in_blocks(blocks: &mut [TrackedBlock], remap: &HashMap<u32, u32>
 }
 
 /// Remap all numId references on a single paragraph: `numbering`,
-/// `materialized_numbering`, and `formatting_change.previous_numbering`.
+/// `materialized_numbering`, and both projections of a formatting change's
+/// previous numbering.
 fn remap_paragraph_numids(p: &mut crate::domain::ParagraphNode, remap: &HashMap<u32, u32>) {
     if let Some(n) = &mut p.numbering
         && let Some(&new_id) = remap.get(&n.num_id)
@@ -4634,50 +4813,97 @@ fn remap_paragraph_numids(p: &mut crate::domain::ParagraphNode, remap: &HashMap<
     {
         n.num_id = new_id;
     }
-    if let Some(fc) = &mut p.formatting_change
-        && let Some(n) = &mut fc.previous_numbering
-        && let Some(&new_id) = remap.get(&n.num_id)
-    {
-        n.num_id = new_id;
+    if let Some(fc) = &mut p.formatting_change {
+        if let crate::domain::DirectParagraphNumbering::Present(n) =
+            &mut fc.previous.direct.numbering
+            && let Some(num_id) = &mut n.num_id
+            && let Some(&new_id) = remap.get(num_id)
+        {
+            *num_id = new_id;
+        }
+        if let Some(n) = &mut fc.previous.effective.numbering
+            && let Some(&new_id) = remap.get(&n.num_id)
+        {
+            n.num_id = new_id;
+        }
     }
 }
 
-/// Detect style ID collisions between base and target documents.
+/// Refuse style-table state that one physical package cannot represent in both
+/// native Word terminals.
 ///
-/// Collects all style IDs referenced by paragraphs and tables in the merged
-/// document, then compares their definitions across both archives. Emits a
-/// `tracing::warn!` for each style ID that has diverging XML in base vs target.
-fn detect_and_warn_style_collisions(
+/// `styles.xml` has no Accept/Reject carrier. Package reconciliation may import
+/// target-only definitions and retain source-only definitions, but it cannot
+/// choose between different document defaults or different definitions of the
+/// same actively referenced style without making one terminal wrong.
+fn ensure_reconcilable_style_state(
     doc: &CanonDoc,
     base_pkg: &DocxPackage,
     target_archive: &DocxArchive,
-) {
-    let base_styles_xml = match base_pkg.get_part("word/styles.xml") {
-        Some(b) => b,
-        None => return,
+) -> Result<(), RuntimeError> {
+    let (base_styles_xml, target_styles_xml) = match (
+        base_pkg.get_part("word/styles.xml"),
+        target_archive.get("word/styles.xml"),
+    ) {
+        (None, None) => return Ok(()),
+        (Some(base), Some(target)) => (base, target),
+        _ => {
+            return Err(RuntimeError {
+                code: ErrorCode::UnsupportedEdit,
+                message: "package reconciliation cannot switch styles.xml presence between native Word terminals"
+                    .to_string(),
+                details: ErrorDetails {
+                    context: Some("unrepresentable global style state".to_string()),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
     };
-    let target_styles_xml = match target_archive.get("word/styles.xml") {
-        Some(b) => b,
-        None => return,
-    };
+
+    let defaults_equal =
+        crate::styles::authored_doc_defaults_equal(base_styles_xml, target_styles_xml).map_err(
+            |message| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message,
+                details: ErrorDetails {
+                    context: Some("package style reconciliation".to_string()),
+                    ..ErrorDetails::default()
+                },
+            },
+        )?;
+    if !defaults_equal {
+        return Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: "package reconciliation cannot switch differing document defaults between native Word terminals"
+                .to_string(),
+            details: ErrorDetails {
+                context: Some("word/styles.xml/w:docDefaults".to_string()),
+                ..ErrorDetails::default()
+            },
+        });
+    }
 
     let referenced = collect_referenced_style_ids(doc);
-    if referenced.is_empty() {
-        return;
-    }
-
     let collisions =
         crate::styles::detect_style_collisions(base_styles_xml, target_styles_xml, &referenced);
-
-    for collision in &collisions {
-        tracing::warn!(
-            style_id = %collision.style_id,
-            style_type = %collision.style_type,
-            style_name = collision.style_name.as_deref().unwrap_or("(unnamed)"),
-            kept = "base",
-            "style ID collision — base and target define style with different formatting; base definition will be used"
-        );
+    if let Some(collision) = collisions.first() {
+        return Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!(
+                "package reconciliation cannot switch active style '{}' between different source and target definitions",
+                collision.style_id
+            ),
+            details: ErrorDetails {
+                context: Some(format!(
+                    "word/styles.xml style type={} name={}",
+                    collision.style_type,
+                    collision.style_name.as_deref().unwrap_or("(unnamed)")
+                )),
+                ..ErrorDetails::default()
+            },
+        });
     }
+    Ok(())
 }
 
 /// Collect all style IDs referenced by paragraphs and tables in a CanonDoc.
@@ -4753,21 +4979,24 @@ fn collect_referenced_style_ids(doc: &CanonDoc) -> HashSet<IStr> {
 /// [`serialize_canonical_docx`] and the [`ValidatorLevel`] gate in
 /// [`serialize_snapshot`] so both paths refuse on exactly the same set.
 pub(crate) const BLOCKING_RULES: &[&str] = &[
-    "I-TC-001", // tracked change content model (no hyperlink/fldSimple inside del/ins)
-    "I-TC-002", // tracked change missing w:id
-    "I-TC-003", // tracked-change nesting: del-in-ins allowed, same-type nesting never
+    "I-ANN-010", // one comment identity cannot delimit/reference multiple ranges (Word repairs it)
+    "I-TC-001",  // tracked change content model (no hyperlink/fldSimple inside del/ins)
+    "I-TC-002",  // tracked change missing w:id
+    "I-TC-003",  // tracked-change nesting: del-in-ins allowed, same-type nesting never
     //             (promoted to blocking with stacked revisions —
     //             cheap insurance against a same-type-nesting emission bug)
-    "I-DOC-001", // root must be w:document
-    "I-DOC-002", // exactly one w:body
-    "I-PKG-000", // package unreadable (ZIP open/read failure)
-    "I-PKG-001", // _rels/.rels must exist
-    "I-PKG-002", // word/document.xml must exist
+    "I-DOC-001",  // root must be w:document
+    "I-DOC-002",  // exactly one w:body
+    "I-PKG-000",  // package unreadable (ZIP open/read failure)
+    "I-PKG-001",  // _rels/.rels must exist
+    "I-PKG-002",  // word/document.xml must exist
     "I-CT-002", // WML parts must carry their canonical content type (§15.2; Word drops the part otherwise)
     "I-XML-001", // a part that is not well-formed XML — nothing downstream of it is checkable
     "I-REL-001", // dangling r:id/r:embed/r:link reference (Word repairs and drops the content)
     "I-REL-002", // duplicate relationship Id (resolution is ambiguous)
     "I-REL-003", // relationship target missing from the package (repair/data-loss class)
+    "I-REL-005", // w:hyperlink r:id bound to a non-hyperlink relationship (Word repairs it)
+    "I-XREF-003", // w:commentReference without a comments.xml definition (Word repairs it)
     "I-NS-002", // undeclared namespace prefix — the part is not even well-formed XML at the use site
 ];
 
@@ -4896,7 +5125,521 @@ fn build_revision_ids_xml(doc: &CanonDoc) -> String {
     )
 }
 
-fn serialize_canonical_docx(
+#[derive(Clone, Copy)]
+enum BodySdtChange {
+    Inserted,
+    Deleted,
+}
+
+/// Materialize a body-level content-control change inside the preserved SDT.
+///
+/// OOXML has no block-level insertion/deletion envelope for `w:sdt`. Word
+/// retains the structural envelope in the pending redline and marks the
+/// paragraphs and their content inside `w:sdtContent`. The canonical block
+/// status still governs terminal projection. This rewrite is therefore scoped
+/// to redline serialization and never mutates either source scaffold.
+fn track_body_sdt_content_change(
+    element: &mut Element,
+    revision: &RevisionInfo,
+    annotation_id: &mut u32,
+    change: BodySdtChange,
+) {
+    fn revision_marker(change: BodySdtChange, id: u32, author: &str, date: &str) -> Element {
+        match change {
+            BodySdtChange::Inserted => word_xml::w_ins(id, author, date),
+            BodySdtChange::Deleted => word_xml::w_del(id, author, date),
+        }
+    }
+
+    fn is_untracked_boundary(element: &Element) -> bool {
+        [
+            "pPr",
+            "proofErr",
+            "bookmarkStart",
+            "bookmarkEnd",
+            "commentRangeStart",
+            "commentRangeEnd",
+            "permStart",
+            "permEnd",
+            "moveFromRangeStart",
+            "moveFromRangeEnd",
+            "moveToRangeStart",
+            "moveToRangeEnd",
+            "customXmlInsRangeStart",
+            "customXmlInsRangeEnd",
+            "customXmlDelRangeStart",
+            "customXmlDelRangeEnd",
+            "customXmlMoveFromRangeStart",
+            "customXmlMoveFromRangeEnd",
+            "customXmlMoveToRangeStart",
+            "customXmlMoveToRangeEnd",
+        ]
+        .iter()
+        .any(|local| is_w_tag(element, local))
+    }
+
+    fn mark_paragraph(
+        paragraph: &mut Element,
+        revision: &RevisionInfo,
+        annotation_id: &mut u32,
+        change: BodySdtChange,
+    ) {
+        let author = revision.author.as_deref().unwrap_or("");
+        let date = revision.date.as_deref().unwrap_or("");
+        match change {
+            BodySdtChange::Inserted => word_xml::ensure_ppr_rpr_ins(
+                paragraph,
+                next_annotation_id(annotation_id),
+                author,
+                date,
+            ),
+            BodySdtChange::Deleted => word_xml::ensure_ppr_rpr_del(
+                paragraph,
+                next_annotation_id(annotation_id),
+                author,
+                date,
+            ),
+        }
+
+        fn requires_inner_tracking(element: &Element) -> bool {
+            matches!(local_element_name(element), "hyperlink" | "fldSimple")
+        }
+
+        fn track_inline_sdt(
+            sdt: &mut Element,
+            revision: &RevisionInfo,
+            annotation_id: &mut u32,
+            change: BodySdtChange,
+        ) {
+            for child in &mut sdt.children {
+                let XMLNode::Element(content) = child else {
+                    continue;
+                };
+                if is_w_tag(content, "sdtContent") {
+                    track_children(content, revision, annotation_id, change);
+                }
+            }
+        }
+
+        fn must_remain_paragraph_level(element: &Element) -> bool {
+            matches!(local_element_name(element), "subDoc" | "oMathPara")
+        }
+
+        fn track_children(
+            parent: &mut Element,
+            revision: &RevisionInfo,
+            annotation_id: &mut u32,
+            change: BodySdtChange,
+        ) {
+            let author = revision.author.as_deref().unwrap_or("");
+            let date = revision.date.as_deref().unwrap_or("");
+            let children: Vec<XMLNode> = parent.children.drain(..).collect();
+            for child in children {
+                match child {
+                    XMLNode::Element(content) if is_untracked_boundary(&content) => {
+                        parent.children.push(XMLNode::Element(content));
+                    }
+                    XMLNode::Element(content) if must_remain_paragraph_level(&content) => {
+                        parent.children.push(XMLNode::Element(content));
+                    }
+                    XMLNode::Element(mut content) if is_w_tag(&content, "sdt") => {
+                        // Word keeps an inline SDT's envelope outside w:ins/w:del
+                        // and tracks the runs within its sdtContent. Wrapping the
+                        // SDT itself would put a paragraph-level element under a
+                        // run-level revision container.
+                        track_inline_sdt(&mut content, revision, annotation_id, change);
+                        parent.children.push(XMLNode::Element(content));
+                    }
+                    XMLNode::Element(mut content) if requires_inner_tracking(&content) => {
+                        track_children(&mut content, revision, annotation_id, change);
+                        parent.children.push(XMLNode::Element(content));
+                    }
+                    XMLNode::Element(mut content) => {
+                        crate::serialize::coerce_opaque_run_text(
+                            &mut content,
+                            matches!(change, BodySdtChange::Deleted),
+                        );
+                        let mut tracked = revision_marker(
+                            change,
+                            next_annotation_id(annotation_id),
+                            author,
+                            date,
+                        );
+                        tracked.children.push(XMLNode::Element(content));
+                        parent.children.push(XMLNode::Element(tracked));
+                    }
+                    other => parent.children.push(other),
+                }
+            }
+        }
+
+        let children: Vec<XMLNode> = paragraph.children.drain(..).collect();
+        for child in children {
+            match child {
+                XMLNode::Element(content) if must_remain_paragraph_level(&content) => {
+                    paragraph.children.push(XMLNode::Element(content));
+                }
+                XMLNode::Element(mut content) if is_w_tag(&content, "sdt") => {
+                    track_inline_sdt(&mut content, revision, annotation_id, change);
+                    paragraph.children.push(XMLNode::Element(content));
+                }
+                XMLNode::Element(mut content) if requires_inner_tracking(&content) => {
+                    track_children(&mut content, revision, annotation_id, change);
+                    paragraph.children.push(XMLNode::Element(content));
+                }
+                XMLNode::Element(mut content) if !is_untracked_boundary(&content) => {
+                    crate::serialize::coerce_opaque_run_text(
+                        &mut content,
+                        matches!(change, BodySdtChange::Deleted),
+                    );
+                    let mut tracked =
+                        revision_marker(change, next_annotation_id(annotation_id), author, date);
+                    tracked.children.push(XMLNode::Element(content));
+                    paragraph.children.push(XMLNode::Element(tracked));
+                }
+                other => paragraph.children.push(other),
+            }
+        }
+    }
+
+    fn mark_table_row(
+        row: &mut Element,
+        revision: &RevisionInfo,
+        annotation_id: &mut u32,
+        change: BodySdtChange,
+    ) {
+        let author = revision.author.as_deref().unwrap_or("");
+        let date = revision.date.as_deref().unwrap_or("");
+        let marker = revision_marker(change, next_annotation_id(annotation_id), author, date);
+        let tr_pr_index = row
+            .children
+            .iter()
+            .position(|child| matches!(child, XMLNode::Element(el) if is_w_tag(el, "trPr")));
+        let tr_pr = if let Some(index) = tr_pr_index {
+            let XMLNode::Element(tr_pr) = &mut row.children[index] else {
+                unreachable!("trPr index must identify an element")
+            };
+            tr_pr
+        } else {
+            // CT_Row orders tblPrEx before trPr; both precede cell content.
+            let insert_at = usize::from(row.children.first().is_some_and(
+                |child| matches!(child, XMLNode::Element(el) if is_w_tag(el, "tblPrEx")),
+            ));
+            row.children
+                .insert(insert_at, XMLNode::Element(w_el("trPr")));
+            let XMLNode::Element(tr_pr) = &mut row.children[insert_at] else {
+                unreachable!("inserted trPr must be an element")
+            };
+            tr_pr
+        };
+        let insert_at = tr_pr
+            .children
+            .iter()
+            .position(|child| matches!(child, XMLNode::Element(el) if is_w_tag(el, "trPrChange")))
+            .unwrap_or(tr_pr.children.len());
+        tr_pr.children.insert(insert_at, XMLNode::Element(marker));
+    }
+
+    fn descend(
+        element: &mut Element,
+        revision: &RevisionInfo,
+        annotation_id: &mut u32,
+        change: BodySdtChange,
+    ) {
+        // A text box is a separate story. Its outer drawing/run carrier is
+        // tracked by the containing paragraph; do not add a second revision to
+        // the nested story or coerce its plain `w:t` content to `w:delText`.
+        if local_element_name(element) == "txbxContent" {
+            return;
+        }
+        if is_w_tag(element, "p") {
+            mark_paragraph(element, revision, annotation_id, change);
+            return;
+        }
+        if is_w_tag(element, "tr") {
+            mark_table_row(element, revision, annotation_id, change);
+        }
+        for child in &mut element.children {
+            if let XMLNode::Element(child) = child {
+                descend(child, revision, annotation_id, change);
+            }
+        }
+    }
+
+    descend(element, revision, annotation_id, change);
+}
+
+/// Move pending direct-body range halves onto the nearest modeled paragraph.
+/// Direct `w:body` range markers have no generic tracked-change envelope. The
+/// same zero-width boundary is legal at the start of the following paragraph
+/// (or the end of the preceding paragraph at end-of-body), where comment range
+/// halves can participate in `w:ins`/`w:del` and structural bookmark halves can
+/// use the serializer's pair-checked decoration path.
+fn relocate_pending_body_range_markers(
+    doc: &mut CanonDoc,
+    base_children: &mut HashMap<usize, XMLNode>,
+    target_children: &mut HashMap<usize, XMLNode>,
+) -> Result<(), RuntimeError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MarkerTerminal {
+        Reject,
+        Accept,
+        Either,
+    }
+
+    struct RelocatedMarker {
+        boundary: usize,
+        terminal: MarkerTerminal,
+        segment: TrackedSegment,
+    }
+
+    fn block_survives(tracked: &TrackedBlock, terminal: MarkerTerminal) -> bool {
+        match terminal {
+            MarkerTerminal::Reject => !matches!(
+                tracked.status,
+                TrackingStatus::Inserted(_) | TrackingStatus::InsertedThenDeleted(_)
+            ),
+            MarkerTerminal::Accept => !matches!(
+                tracked.status,
+                TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_)
+            ),
+            MarkerTerminal::Either => true,
+        }
+    }
+
+    fn first_paragraph(block: &mut BlockNode) -> Option<&mut ParagraphNode> {
+        match block {
+            BlockNode::Paragraph(paragraph) => Some(paragraph),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for block in &mut cell.blocks {
+                            if let Some(paragraph) = first_paragraph(block) {
+                                return Some(paragraph);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            BlockNode::OpaqueBlock(_) => None,
+        }
+    }
+
+    fn last_paragraph(block: &mut BlockNode) -> Option<&mut ParagraphNode> {
+        match block {
+            BlockNode::Paragraph(paragraph) => Some(paragraph),
+            BlockNode::Table(table) => {
+                for row in table.rows.iter_mut().rev() {
+                    for cell in row.cells.iter_mut().rev() {
+                        for block in cell.blocks.iter_mut().rev() {
+                            if let Some(paragraph) = last_paragraph(block) {
+                                return Some(paragraph);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            BlockNode::OpaqueBlock(_) => None,
+        }
+    }
+
+    fn marker_inline(
+        opaque: &crate::domain::OpaqueBlockNode,
+        child: &XMLNode,
+        target_origin: bool,
+    ) -> Result<InlineNode, RuntimeError> {
+        let marker = opaque.range_marker.as_ref().ok_or_else(|| RuntimeError {
+            code: ErrorCode::InternalError,
+            message: "range-marker relocation requested for a non-range opaque block".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                ..ErrorDetails::default()
+            },
+        })?;
+        let XMLNode::Element(element) = child else {
+            return Err(RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "body range-marker proof anchor does not reference an element".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    context: Some(opaque.proof_ref.docx_anchor.clone()),
+                    ..ErrorDetails::default()
+                },
+            });
+        };
+        let reconciled_target_comment = target_origin
+            && marker.family == crate::domain::RangeMarkerFamily::CommentRange
+            && body_range_marker_kind_matches(element, marker);
+        if !body_range_marker_matches(element, marker) && !reconciled_target_comment {
+            return Err(RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "body range-marker proof anchor references a different marker".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    context: Some(opaque.proof_ref.docx_anchor.clone()),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
+
+        use crate::domain::{RangeMarkerFamily, RangeMarkerRole};
+        match (marker.family, marker.role) {
+            (RangeMarkerFamily::CommentRange, RangeMarkerRole::Start) => {
+                Ok(InlineNode::CommentRangeStart {
+                    id: marker.id.clone(),
+                })
+            }
+            (RangeMarkerFamily::CommentRange, RangeMarkerRole::End) => {
+                Ok(InlineNode::CommentRangeEnd {
+                    id: marker.id.clone(),
+                })
+            }
+            (family, _) => {
+                let kind = match family {
+                    RangeMarkerFamily::Bookmark => DecorationType::Bookmark,
+                    RangeMarkerFamily::Permission => DecorationType::PermissionRange,
+                    RangeMarkerFamily::CommentRange => unreachable!("comments handled above"),
+                };
+                Ok(InlineNode::from(DecorationNode {
+                    id: opaque.id.clone(),
+                    kind,
+                    opaque_ref: opaque.opaque_ref.clone(),
+                    proof_ref: opaque.proof_ref.clone(),
+                    wrapper_marks: Vec::new(),
+                    wrapper_style_props: crate::domain::StyleProps::default(),
+                    joins_following_text_run: false,
+                    raw_xml: Some(word_xml::serialize_raw_fragment(element)),
+                    origin: target_origin.then(|| "target".to_string()),
+                }))
+            }
+        }
+    }
+
+    let mut retained = Vec::with_capacity(doc.blocks.len());
+    let mut relocated = Vec::new();
+    for tracked in std::mem::take(&mut doc.blocks) {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            retained.push(tracked);
+            continue;
+        };
+        if opaque.range_marker.is_none() || tracked.status == TrackingStatus::Normal {
+            retained.push(tracked);
+            continue;
+        }
+        if tracked.block_sdt_wrap.is_some() {
+            return Err(RuntimeError {
+                code: ErrorCode::InternalError,
+                message: "body range marker unexpectedly opens a content-control wrap".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
+
+        let (index_text, children, target_origin) =
+            if let Some(index) = opaque.proof_ref.docx_anchor.strip_prefix("body_index:") {
+                (index, &mut *base_children, false)
+            } else if let Some(index) = opaque
+                .proof_ref
+                .docx_anchor
+                .strip_prefix("target_body_index:")
+            {
+                (index, &mut *target_children, true)
+            } else {
+                return Err(RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: "pending body range marker has no body proof anchor".to_string(),
+                    details: ErrorDetails {
+                        block_id: Some(opaque.id.clone()),
+                        context: Some(opaque.proof_ref.docx_anchor.clone()),
+                        ..ErrorDetails::default()
+                    },
+                });
+            };
+        let index = index_text.parse::<usize>().map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "invalid body proof anchor on pending range marker".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!(
+                    "anchor={} err={source}",
+                    opaque.proof_ref.docx_anchor
+                )),
+                ..ErrorDetails::default()
+            },
+        })?;
+        let child = children.remove(&index).ok_or_else(|| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "body range-marker proof anchor has no source child".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(opaque.proof_ref.docx_anchor.clone()),
+                ..ErrorDetails::default()
+            },
+        })?;
+        let inline = marker_inline(opaque, &child, target_origin)?;
+        let terminal = match &tracked.status {
+            TrackingStatus::Inserted(_) => MarkerTerminal::Accept,
+            TrackingStatus::Deleted(_) => MarkerTerminal::Reject,
+            TrackingStatus::InsertedThenDeleted(_) => MarkerTerminal::Either,
+            TrackingStatus::Normal => unreachable!("normal body markers are retained above"),
+        };
+        relocated.push(RelocatedMarker {
+            boundary: retained.len(),
+            terminal,
+            segment: TrackedSegment {
+                status: tracked.status,
+                inlines: vec![inline],
+            },
+        });
+    }
+    doc.blocks = retained;
+
+    let mut groups: Vec<(usize, MarkerTerminal, Vec<TrackedSegment>)> = Vec::new();
+    for item in relocated {
+        if let Some((boundary, terminal, segments)) = groups.last_mut()
+            && *boundary == item.boundary
+            && *terminal == item.terminal
+        {
+            segments.push(item.segment);
+        } else {
+            groups.push((item.boundary, item.terminal, vec![item.segment]));
+        }
+    }
+    for (boundary, terminal, segments) in groups {
+        let (before, after) = doc.blocks.split_at_mut(boundary);
+        if let Some(paragraph) = after
+            .iter_mut()
+            .filter(|tracked| block_survives(tracked, terminal))
+            .find_map(|tracked| first_paragraph(&mut tracked.block))
+        {
+            paragraph.segments.splice(0..0, segments);
+        } else if let Some(paragraph) = before
+            .iter_mut()
+            .rev()
+            .filter(|tracked| block_survives(tracked, terminal))
+            .find_map(|tracked| last_paragraph(&mut tracked.block))
+        {
+            paragraph.segments.extend(segments);
+        } else {
+            return Err(RuntimeError {
+                code: ErrorCode::UnsupportedEdit,
+                message: "cannot anchor a pending body range marker without a paragraph"
+                    .to_string(),
+                details: ErrorDetails {
+                    context: Some(format!("body_boundary={boundary}")),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn serialize_canonical_docx(
     base_bytes: &[u8],
     target_bytes: &[u8],
     doc: &mut CanonDoc,
@@ -4910,6 +5653,11 @@ fn serialize_canonical_docx(
     // children must also be normalized so tracked-change elements (w:ins, w:del)
     // from the original document don't leak into the serialized output.
     let raw_base_archive = DocxArchive::read(base_bytes).map_err(map_docx_error)?;
+    if crate::docx_package::archive_uses_strict_ooxml(&raw_base_archive) {
+        return Err(strict_ooxml_mutation_error(
+            "the source package would have to be rewritten",
+        ));
+    }
     // Scan the RAW archive for max w:id BEFORE normalization strips tracked changes.
     let max_raw_wid = max_wid_in_archive(&raw_base_archive);
     let base_archive = {
@@ -4920,10 +5668,29 @@ fn serialize_canonical_docx(
         })?
     };
     let target_archive = DocxArchive::read(target_bytes).map_err(map_docx_error)?;
+    if crate::docx_package::archive_uses_strict_ooxml(&target_archive) {
+        return Err(strict_ooxml_mutation_error(
+            "the target package would have to be imported",
+        ));
+    }
+    // The compare model was imported through the compatibility-normalizing
+    // boundary. Source package parts used to satisfy that model must pass
+    // through the same boundary: a Strict package expresses relationship types
+    // in the purl namespace, while the canonical output is Transitional.
+    let target_package_archive =
+        crate::normalize::normalize_if_needed(&target_archive).map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: format!("failed to normalize target package for reconciliation: {source:?}"),
+            details: ErrorDetails {
+                context: Some("serialize_canonical_docx: target package".to_string()),
+                ..ErrorDetails::default()
+            },
+        })?;
 
     // Parse both archives into typed package models.
     let mut base_pkg = DocxPackage::from_archive(&base_archive).map_err(map_package_error)?;
-    let target_pkg = DocxPackage::from_archive(&target_archive).map_err(map_package_error)?;
+    let target_pkg =
+        DocxPackage::from_archive(&target_package_archive).map_err(map_package_error)?;
 
     // The main document part is located by the OPC officeDocument relationship
     // (ECMA-376 Part 2 §9.3); its name is not fixed. Every main-part read/write
@@ -4958,14 +5725,10 @@ fn serialize_canonical_docx(
         .max(max_sdt_id)
         + 1;
 
-    // Copy media files from target archive for inserted drawings and remap their rIds.
-    // Must happen before body serialization so the rewritten raw_xml is used.
-    copy_target_media_for_inserted_drawings(
-        doc,
-        &mut base_pkg,
-        &target_archive,
-        &target_pkg.document_rels,
-    )?;
+    // Import every target relationship referenced by inserted opaque body
+    // content and remap its package-local id. Must happen before body
+    // serialization so the rewritten raw XML is emitted.
+    reconcile_target_relationships_for_inserted_content(doc, &mut base_pkg, &target_pkg)?;
 
     // Merge target's numbering definitions into the base package so inserted
     // paragraphs can keep their w:numPr references instead of materializing
@@ -4978,10 +5741,9 @@ fn serialize_canonical_docx(
     // remapped in the base numbering.xml before we allocate overrides.
     apply_numbering_restart_overrides(doc, &mut base_pkg)?;
 
-    // Detect style ID collisions between base and target.
-    // When the same style ID has different definitions in each document, the
-    // merged output silently uses the base definition — warn so callers know.
-    detect_and_warn_style_collisions(doc, &base_pkg, &target_archive);
+    // A single styles part must serve both native terminals. Refuse global
+    // defaults or active same-ID definitions that cannot coexist honestly.
+    ensure_reconcilable_style_state(doc, &base_pkg, &target_archive)?;
 
     if let (Some(base_styles_xml), Some(target_styles_xml)) = (
         base_pkg.get_part("word/styles.xml"),
@@ -4993,7 +5755,7 @@ fn serialize_canonical_docx(
     }
 
     // Apply verb-staged OPC parts (media binaries + styles.xml ops). Runs AFTER
-    // copy_target_media_for_inserted_drawings (so logical rIds rewrite cleanly)
+    // target relationship reconciliation (so logical rIds rewrite cleanly)
     // and AFTER merge_styles_xml_preferring_target (so an authored Create/Modify
     // style wins a base/target style-id collision instead of being overwritten
     // by the merge). Empty `pending` => no-op for all current verbs.
@@ -5062,7 +5824,169 @@ fn serialize_canonical_docx(
     apply_opaque_child_text_sets(&mut opaque_body_children, &pending.opaque_child_text_sets)?;
 
     let mut sect_pr_nodes = sect_pr_nodes;
-    let opaque_body_children = opaque_body_children;
+    let mut opaque_body_children = opaque_body_children;
+
+    // Target-origin opaque proof anchors address the raw target body captured at
+    // import. Range markers need that exact child (comment-id reconciliation
+    // updates the model, not the source bytes). Body SDTs need their accepted
+    // contents, so map their raw body position to the same SDT ordinal in the
+    // normalized body instead of assuming normalization preserved child indices.
+    // Load only referenced children; all other target body XML stays out of memory.
+    let mut target_opaque_sources: HashMap<usize, bool> = HashMap::new();
+    for tracked in &doc.blocks {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            continue;
+        };
+        let Some(index) = opaque
+            .proof_ref
+            .docx_anchor
+            .strip_prefix("target_body_index:")
+        else {
+            continue;
+        };
+        let index = index.parse::<usize>().map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "invalid target_body_index proof anchor on opaque block".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!(
+                    "anchor={} err={source}",
+                    opaque.proof_ref.docx_anchor
+                )),
+                ..ErrorDetails::default()
+            },
+        })?;
+        let is_sdt = opaque.kind == OpaqueKind::Sdt;
+        if let Some(previous_is_sdt) = target_opaque_sources.insert(index, is_sdt)
+            && previous_is_sdt != is_sdt
+        {
+            return Err(RuntimeError {
+                code: ErrorCode::InternalError,
+                message: "target opaque proof anchor has conflicting modeled kinds".to_string(),
+                details: ErrorDetails {
+                    context: Some(format!("anchor=target_body_index:{index}")),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
+    }
+    let target_opaque_body_children: HashMap<usize, XMLNode> = if target_opaque_sources.is_empty() {
+        HashMap::new()
+    } else {
+        let target_main = crate::docx_package::resolve_main_document_part(&target_archive)
+            .map_err(crate::import::map_package_error)?;
+        let target_xml = target_archive.get(&target_main).ok_or_else(|| {
+            invalid_docx(&format!("missing target main document part {target_main}"))
+        })?;
+        let target_root = word_xml::parse_document_xml(target_xml).map_err(map_word_xml_error)?;
+        let target_body = body_element(&target_root).map_err(map_word_xml_error)?;
+        let normalized_target = if target_opaque_sources.values().any(|is_sdt| *is_sdt) {
+            Some(
+                crate::normalize::normalize_if_needed(&target_archive).map_err(|e| {
+                    RuntimeError {
+                        code: ErrorCode::InvalidDocx,
+                        message: format!(
+                            "failed to normalize target archive for serialization: {e:?}"
+                        ),
+                        details: ErrorDetails::default(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let normalized_root = normalized_target
+            .as_ref()
+            .map(|archive| {
+                let main = crate::docx_package::resolve_main_document_part(archive)
+                    .map_err(crate::import::map_package_error)?;
+                let xml = archive.get(&main).ok_or_else(|| {
+                    invalid_docx(&format!(
+                        "missing normalized target main document part {main}"
+                    ))
+                })?;
+                word_xml::parse_document_xml(xml).map_err(map_word_xml_error)
+            })
+            .transpose()?;
+        let normalized_body = normalized_root
+            .as_ref()
+            .map(body_element)
+            .transpose()
+            .map_err(map_word_xml_error)?;
+
+        let mut children = HashMap::with_capacity(target_opaque_sources.len());
+        for (index, is_sdt) in target_opaque_sources {
+            let raw_child = target_body
+                .children
+                .get(index)
+                .ok_or_else(|| RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: "target_body_index proof anchor out of bounds in source body"
+                        .to_string(),
+                    details: ErrorDetails {
+                        context: Some(format!(
+                            "anchor=target_body_index:{index} body_children={}",
+                            target_body.children.len()
+                        )),
+                        ..ErrorDetails::default()
+                    },
+                })?;
+            let child = if is_sdt {
+                if !matches!(raw_child, XMLNode::Element(element) if is_w_tag(element, "sdt")) {
+                    return Err(RuntimeError {
+                        code: ErrorCode::InvalidDocx,
+                        message: "target SDT proof anchor does not reference a body SDT"
+                            .to_string(),
+                        details: ErrorDetails {
+                            context: Some(format!("anchor=target_body_index:{index}")),
+                            ..ErrorDetails::default()
+                        },
+                    });
+                }
+                let ordinal = target_body.children[..=index]
+                    .iter()
+                    .filter(|node| {
+                        matches!(node, XMLNode::Element(element) if is_w_tag(element, "sdt"))
+                    })
+                    .count()
+                    - 1;
+                normalized_body
+                    .expect("normalized target body exists when an SDT was requested")
+                    .children
+                    .iter()
+                    .filter(|node| {
+                        matches!(node, XMLNode::Element(element) if is_w_tag(element, "sdt"))
+                    })
+                    .nth(ordinal)
+                    .ok_or_else(|| RuntimeError {
+                        code: ErrorCode::InvalidDocx,
+                        message: "normalized target body lost a referenced SDT".to_string(),
+                        details: ErrorDetails {
+                            context: Some(format!(
+                                "anchor=target_body_index:{index} sdt_ordinal={ordinal}"
+                            )),
+                            ..ErrorDetails::default()
+                        },
+                    })?
+            } else {
+                raw_child
+            };
+            children.insert(index, child.clone());
+        }
+        children
+    };
+
+    let mut target_opaque_body_children = target_opaque_body_children;
+    reconcile_target_relationships_for_opaque_body_children(
+        &mut target_opaque_body_children,
+        &mut base_pkg,
+        &target_pkg,
+    )?;
+    relocate_pending_body_range_markers(
+        doc,
+        &mut opaque_body_children,
+        &mut target_opaque_body_children,
+    )?;
 
     // Bookmark/move-range id policy for word/document.xml (ids pair per part,
     // ECMA-376 §17.13.2/§17.13.6): pre-scan everything the body emission will
@@ -5179,28 +6103,43 @@ fn serialize_canonical_docx(
             sdt_remaining = wrap.span;
         }
         // Handle opaque blocks: look up the pre-cloned body child and stream it.
-        // Base-origin blocks use "body_index:N", target-origin blocks use "target_body_index:N".
-        // Target-origin OpaqueBlocks (Inserted status) are skipped — they can't be wrapped in
-        // <w:ins> tracked-change markup (OOXML doesn't support block-level insertion tracking
-        // for SDTs/custom XML), so they'd appear as untracked content breaking accept/reject.
-        // The canonical model retains them for fixpoint correctness.
+        // Base-origin blocks use "body_index:N"; target-origin blocks use
+        // "target_body_index:N" until the rebuilt snapshot re-anchors them.
+        // OOXML has no envelope for a body-level SDT insertion/deletion, so the
+        // structural envelope is retained and its inner paragraph/content is
+        // tracked. Other target-origin opaque block kinds still have no honest
+        // tracked representation and are refused rather than silently lost.
         if let BlockNode::OpaqueBlock(opaque) = &tracked.block {
-            if opaque
-                .proof_ref
-                .docx_anchor
-                .starts_with("target_body_index:")
-            {
-                continue;
-            }
-            let (index_str, source_children) = if let Some(idx) =
+            let (index_str, source_children, target_origin) = if let Some(idx) =
                 opaque.proof_ref.docx_anchor.strip_prefix("body_index:")
             {
-                (idx, &opaque_body_children)
+                (idx, &opaque_body_children, false)
+            } else if let Some(idx) = opaque
+                .proof_ref
+                .docx_anchor
+                .strip_prefix("target_body_index:")
+            {
+                if opaque.kind != OpaqueKind::Sdt {
+                    return Err(RuntimeError {
+                        code: ErrorCode::UnsupportedEdit,
+                        message: "cannot serialize an inserted opaque body block without a tracked OOXML representation".to_string(),
+                        details: ErrorDetails {
+                            block_id: Some(opaque.id.clone()),
+                            context: Some(format!(
+                                "anchor={} kind={:?}",
+                                opaque.proof_ref.docx_anchor, opaque.kind
+                            )),
+                            ..ErrorDetails::default()
+                        },
+                    });
+                }
+                (idx, &target_opaque_body_children, true)
             } else {
                 return Err(RuntimeError {
                     code: ErrorCode::UnsupportedEdit,
-                    message: "cannot serialize body opaque block without body_index proof anchor"
-                        .to_string(),
+                    message:
+                        "cannot serialize body opaque block without a source body proof anchor"
+                            .to_string(),
                     details: ErrorDetails {
                         block_id: Some(opaque.id.clone()),
                         context: Some(opaque.proof_ref.docx_anchor.clone()),
@@ -5210,7 +6149,7 @@ fn serialize_canonical_docx(
             };
             let index = index_str.parse::<usize>().map_err(|source| RuntimeError {
                 code: ErrorCode::InvalidDocx,
-                message: "invalid body_index proof anchor on opaque block".to_string(),
+                message: "invalid body proof anchor on opaque block".to_string(),
                 details: ErrorDetails {
                     block_id: Some(opaque.id.clone()),
                     context: Some(format!(
@@ -5222,14 +6161,47 @@ fn serialize_canonical_docx(
             })?;
             let child = source_children.get(&index).ok_or_else(|| RuntimeError {
                 code: ErrorCode::InvalidDocx,
-                message: "body_index proof anchor out of bounds during serialization".to_string(),
+                message: "body proof anchor out of bounds during serialization".to_string(),
                 details: ErrorDetails {
                     block_id: Some(opaque.id.clone()),
                     context: Some(format!("anchor={}", opaque.proof_ref.docx_anchor,)),
                     ..ErrorDetails::default()
                 },
             })?;
-            w.write_xml_node(child).map_err(map_xml_write_error)?;
+            let mut tracked_sdt = None;
+            let change = match (&tracked.status, target_origin) {
+                (TrackingStatus::Deleted(revision), false) => {
+                    Some((revision, BodySdtChange::Deleted))
+                }
+                (TrackingStatus::Inserted(revision), true) => {
+                    Some((revision, BodySdtChange::Inserted))
+                }
+                (_, false) => None,
+                (status, true) => {
+                    return Err(RuntimeError {
+                        code: ErrorCode::InternalError,
+                        message: "target-origin body content control is not pending insertion"
+                            .to_string(),
+                        details: ErrorDetails {
+                            block_id: Some(opaque.id.clone()),
+                            context: Some(format!(
+                                "anchor={} status={status:?}",
+                                opaque.proof_ref.docx_anchor
+                            )),
+                            ..ErrorDetails::default()
+                        },
+                    });
+                }
+            };
+            if let Some((revision, change)) = change
+                && let XMLNode::Element(element) = child
+            {
+                let mut element = element.clone();
+                track_body_sdt_content_change(&mut element, revision, &mut annotation_id, change);
+                tracked_sdt = Some(XMLNode::Element(element));
+            }
+            w.write_xml_node(tracked_sdt.as_ref().unwrap_or(child))
+                .map_err(map_xml_write_error)?;
             continue;
         }
 
@@ -5393,6 +6365,20 @@ fn serialize_canonical_docx(
                 w.write_xml_node(node).map_err(map_xml_write_error)?;
             }
         }
+    } else if sect_pr_nodes.is_empty() {
+        // The base package had no body sectPr, while the merge model can still
+        // carry one introduced by the target. There is no previous section
+        // state to track, so emit the target properties directly. Falling
+        // through to the verbatim-base path would write nothing and orphan any
+        // target header/footer stories that the package merge already copied.
+        if let Some(ref target_sp) = doc.body_section_properties {
+            let mut rid_resolver = |part_path: &str, rel_type: &str| -> String {
+                resolve_story_part_to_rid(part_path, rel_type, &mut base_pkg, &target_pkg)
+            };
+            let new_sect_pr =
+                section_properties_to_element(target_sp, None, None, Some(&mut rid_resolver));
+            w.write_element(&new_sect_pr).map_err(map_xml_write_error)?;
+        }
     } else {
         // No section property change — preserve the base sectPr opaquely.
         // Still validate header/footer rIds in case the base sectPr carries
@@ -5415,7 +6401,7 @@ fn serialize_canonical_docx(
     // Body-level stories (headers/footers) — streamed element-by-element.
     // §17.10.5 blank-synthesized stories are render-time models only: writing
     // them would create orphan blank parts (+ injected references).
-    for header in doc.headers.iter().filter(|h| !h.synthesized) {
+    for header in doc.headers.iter().filter(|header| !header.synthesized) {
         let part_path = relationship_target_to_part_path(&header.part_name);
         let root = load_story_template_root(&base_pkg, &target_archive, &part_path)?;
         let root_tag = story_root_tag(&root);
@@ -5459,7 +6445,7 @@ fn serialize_canonical_docx(
         }
     }
 
-    for footer in doc.footers.iter().filter(|f| !f.synthesized) {
+    for footer in doc.footers.iter().filter(|footer| !footer.synthesized) {
         let part_path = relationship_target_to_part_path(&footer.part_name);
         let root = load_story_template_root(&base_pkg, &target_archive, &part_path)?;
         let root_tag = story_root_tag(&root);
@@ -5503,6 +6489,17 @@ fn serialize_canonical_docx(
         }
     }
 
+    serialize_comments_part(
+        &mut base_pkg,
+        &target_archive,
+        &base_rels,
+        &target_rels,
+        &doc.comments,
+        &mut annotation_id,
+    )?;
+    crate::serialize::serialize_comments_extended_part(&mut base_pkg, &doc.comments_extended)?;
+    crate::serialize::serialize_comments_ids_part(&mut base_pkg, &doc.comments)?;
+
     serialize_footnotes_part(
         &mut base_pkg,
         &target_archive,
@@ -5519,26 +6516,6 @@ fn serialize_canonical_docx(
         &doc.endnotes,
         &mut annotation_id,
     )?;
-    serialize_comments_part(
-        &mut base_pkg,
-        &target_archive,
-        &base_rels,
-        &target_rels,
-        &doc.comments,
-        &mut annotation_id,
-    )?;
-    // commentsExtended.xml (reply threading + resolved state) is a typed model:
-    // re-emit it from `comments_extended` when present. A document we never
-    // authored into still round-trips equivalently (same paraId/parent/done
-    // set). Beside the people-part synthesis below in spirit, but emitted here
-    // next to comments since it is the comments sidecar.
-    crate::serialize::serialize_comments_extended_part(&mut base_pkg, &doc.comments_extended)?;
-    // commentsIds.xml (w16cid durable-id sidecar, MS-DOCX §2.5.3.1) is opaque
-    // passthrough; reconcile it against the current comment set so a
-    // newly-authored comment gets its durable-id entry (Word distrusts a comment
-    // absent from this part). Only maintained when the package already carries
-    // the part — never created where absent.
-    crate::serialize::serialize_comments_ids_part(&mut base_pkg, &doc.comments)?;
     sync_document_custom_xml_parts(&mut base_pkg, &target_pkg, &target_rels);
     sync_custom_properties_part(&mut base_pkg, &target_pkg);
 
@@ -5549,14 +6526,12 @@ fn serialize_canonical_docx(
     // referenced by sectPr sections). Copy them through so the output is complete.
     copy_missing_story_parts(&mut base_pkg, &target_pkg, &base_rels, &target_rels)?;
 
-    // Copy standard parts from target when base lacks them.
-    for part in &["word/styles.xml", "word/settings.xml", "word/fontTable.xml"] {
-        if !base_pkg.has_part(part)
-            && let Some(data) = target_archive.get(part)
-        {
-            base_pkg.set_part(part, data.to_vec());
-        }
-    }
+    // A target-owned paragraph/style/theme is active only through its document
+    // relationship. Import the relationship and its full part closure together;
+    // copying a conventional filename alone leaves an orphan that consumers do
+    // not apply (for example, a present-but-unrelated styles.xml suppresses list
+    // indentation and bullets).
+    import_missing_target_document_companions(&mut base_pkg, &target_pkg)?;
 
     // Apply the document-level evenAndOddHeaders toggle (ISO 29500-1
     // §17.15.1.35) to word/settings.xml, honoring the three-state model
@@ -5568,16 +6543,21 @@ fn serialize_canonical_docx(
     // Generate word/people.xml with all tracked change authors.
     let authors = collect_tracked_change_authors(doc);
     if !authors.is_empty() {
-        let people_xml = build_people_xml(&authors);
-        base_pkg.set_part("word/people.xml", people_xml.into_bytes());
-        base_pkg.document_rels.add(
-            "http://schemas.microsoft.com/office/2011/relationships/people",
-            "people.xml",
-        );
-        base_pkg.content_types.add_override(
-            "/word/people.xml",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.people+xml",
-        );
+        let operation = crate::package_ops::generated_people::plan_generated_people_operation(
+            &base_pkg, &authors,
+        )
+        .map_err(|error| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: error.to_string(),
+            details: ErrorDetails::default(),
+        })?;
+        operation
+            .apply_to(&mut base_pkg)
+            .map_err(|error| RuntimeError {
+                code: ErrorCode::InternalError,
+                message: error.to_string(),
+                details: ErrorDetails::default(),
+            })?;
     }
 
     // Record the engine identity of every revision this save emits, so
@@ -5591,6 +6571,13 @@ fn serialize_canonical_docx(
     base_pkg
         .content_types
         .add_override("/word/stemmaRevisionIds.xml", REVISION_IDS_CONTENT_TYPE);
+
+    // Reconcile the output as an OPC graph after every modeled/story part has
+    // been written. Imported main-story XML may still carry target-owned rIds,
+    // and copied story relationship sets may point at target-owned media or
+    // objects. Close those bindings transitively without overwriting different
+    // base-owned parts; unresolved provenance is a hard error.
+    reconcile_output_relationship_graph(&mut base_pkg, &target_pkg)?;
 
     // Post-serialization bookmark-pairing guard (read-only). Imbalance the
     // INPUT already had passes through byte-faithfully; imbalance the
@@ -5925,59 +6912,55 @@ fn input_part_has_del_field_char_imbalance(archive: &DocxArchive, path: &str) ->
     part_has_del_field_char_imbalance(&root)
 }
 
-/// True if any paragraph in the tree (including nested table paragraphs) has an
-/// unbalanced count of `fldChar` begins vs ends inside its `<w:del>` blocks.
+/// True if any complex field in the story has different deletion state on its
+/// begin and end characters.
+///
+/// Complex fields may span paragraph boundaries (a TOC commonly begins in its
+/// first result paragraph and ends in its last), so balance must be evaluated in
+/// story order rather than independently per paragraph. The stack also handles
+/// nested PAGEREF fields inside a spanning TOC field.
 fn part_has_del_field_char_imbalance(root: &Element) -> bool {
-    fn walk(el: &Element) -> bool {
-        if is_w_tag(el, "p") && paragraph_del_field_chars_imbalanced(el) {
-            return true;
-        }
-        el.children.iter().any(|child| {
-            if let XMLNode::Element(child_el) = child {
-                walk(child_el)
-            } else {
-                false
-            }
-        })
-    }
-    walk(root)
+    field_deletion_state_imbalanced(root)
 }
 
-/// Count `fldChar` begins vs ends that appear inside `<w:del>` blocks among a
-/// paragraph's direct children; `true` when they don't balance. Only `fldChar`
-/// (begin/separate/end) affects field balance — standalone deleted `instrText`
-/// is harmless and is intentionally not counted.
+/// Paragraph-scoped wrapper retained for focused detector tests. Production
+/// validation calls the same detector on the complete story root.
+#[cfg(test)]
 fn paragraph_del_field_chars_imbalanced(para: &Element) -> bool {
-    let mut del_begins: u32 = 0;
-    let mut del_ends: u32 = 0;
+    field_deletion_state_imbalanced(para)
+}
 
-    for child in &para.children {
-        let XMLNode::Element(child_el) = child else {
-            continue;
-        };
-        if !is_w_tag(child_el, "del") {
-            continue;
-        }
-        for del_child in &child_el.children {
-            let XMLNode::Element(run) = del_child else {
-                continue;
-            };
-            for run_child in &run.children {
-                if let XMLNode::Element(rc) = run_child
-                    && is_w_tag(rc, "fldChar")
-                    && let Some(ftype) = attr_get(rc, "w:fldCharType")
-                {
-                    match ftype.as_str() {
-                        "begin" => del_begins += 1,
-                        "end" => del_ends += 1,
-                        _ => {}
-                    }
-                }
+fn field_deletion_state_imbalanced(root: &Element) -> bool {
+    fn walk(el: &Element, inside_deletion: bool, stack: &mut Vec<bool>) -> bool {
+        let inside_deletion = inside_deletion || is_w_tag(el, "del");
+
+        if is_w_tag(el, "fldChar")
+            && let Some(field_type) = attr_get(el, "w:fldCharType")
+        {
+            match field_type.as_str() {
+                "begin" => stack.push(inside_deletion),
+                "end" => match stack.pop() {
+                    Some(begin_deleted) if begin_deleted != inside_deletion => return true,
+                    Some(_) => {}
+                    None if inside_deletion => return true,
+                    None => {}
+                },
+                _ => {}
             }
         }
+
+        for child in &el.children {
+            if let XMLNode::Element(child) = child
+                && walk(child, inside_deletion, stack)
+            {
+                return true;
+            }
+        }
+        false
     }
 
-    del_begins != del_ends
+    let mut field_stack = Vec::new();
+    walk(root, false, &mut field_stack) || field_stack.into_iter().any(|deleted| deleted)
 }
 
 /// Read-only guard: `w:delText`/`w:delInstrText` may appear only inside `w:del`
@@ -6172,6 +7155,71 @@ fn copy_missing_story_parts(
         base_pkg
             .content_types
             .add_override(&ct_part_name, content_type);
+    }
+
+    Ok(())
+}
+
+/// Import target document-level companion parts when the base has no active
+/// relationship of that singleton type.
+///
+/// These parts are not referenced by an `r:id` in `document.xml`, so the
+/// general relationship-reference reconciler cannot discover them. The
+/// relationship is the source of truth: an orphan conventional filename is
+/// not silently promoted into an active package part.
+fn import_missing_target_document_companions(
+    base_pkg: &mut DocxPackage,
+    target_pkg: &DocxPackage,
+) -> Result<(), RuntimeError> {
+    const COMPANION_REL_TYPES: [&str; 6] = [
+        STYLES_REL_TYPE,
+        SETTINGS_REL_TYPE,
+        FONT_TABLE_REL_TYPE,
+        THEME_REL_TYPE,
+        WEB_SETTINGS_REL_TYPE,
+        STYLES_WITH_EFFECTS_REL_TYPE,
+    ];
+
+    let mut imports = HashMap::new();
+    for rel_type in COMPANION_REL_TYPES {
+        if base_pkg
+            .document_rels
+            .entries
+            .iter()
+            .any(|relationship| relationship.rel_type == rel_type)
+        {
+            continue;
+        }
+
+        let mut target_relationships = target_pkg
+            .document_rels
+            .entries
+            .iter()
+            .filter(|relationship| relationship.rel_type == rel_type);
+        let Some(target_relationship) = target_relationships.next() else {
+            continue;
+        };
+        if target_relationships.next().is_some() {
+            return Err(relationship_reconciliation_error(format!(
+                "target package has multiple document companion relationships of singleton type {rel_type:?}"
+            )));
+        }
+        if target_relationship.target_mode.as_deref() == Some("External") {
+            return Err(relationship_reconciliation_error(format!(
+                "target document companion relationship {rel_type:?} is External"
+            )));
+        }
+
+        let target_path = target_pkg
+            .document_rels
+            .resolve_internal_target(&target_relationship.target);
+        let output_path =
+            import_target_part_closure(base_pkg, target_pkg, &target_path, &mut imports)?;
+        base_pkg.document_rels.add_with_preferred_id(
+            rel_type,
+            &format!("/{output_path}"),
+            &target_relationship.id,
+        );
     }
 
     Ok(())
@@ -6527,20 +7575,16 @@ impl DocxRuntime for SimpleRuntime {
         // block_ids are preserved across the operation — the IR is the
         // source of truth, not a re-parse of serialized bytes.
         let fingerprint = entry.snapshot.meta.current_docx_fingerprint.clone();
-        let (canonical, flattened_pending_revisions) = if entry.cached_view_fingerprint.is_some() {
+        let canonical = if entry.cached_view_fingerprint.is_some() {
             // No pre-existing revisions: the snapshot canonical already is the
             // accepted projection. Hand out a cheap shared `Arc` clone (Rung 1).
-            (Arc::clone(&entry.snapshot.canonical), Vec::new())
+            Arc::clone(&entry.snapshot.canonical)
         } else {
             // Pre-existing revisions: accept-all must mutate, so take an owned
-            // copy of the IR, project it, and re-wrap for the result. Summarize
-            // what the projection consumes FIRST (from the un-projected
-            // snapshot) — the flatten contract's disclosure.
-            let flattened =
-                crate::tracked_model::pending_revision_authors(&entry.snapshot.canonical);
+            // copy of the IR, project it, and re-wrap for the result.
             let mut canonical = (*entry.snapshot.canonical).clone();
             crate::tracked_model::accept_all(&mut canonical);
-            (Arc::new(canonical), flattened)
+            Arc::new(canonical)
         };
         let diagnostics = entry.diagnostics.clone();
         if runtime_timing_logs_enabled() {
@@ -6550,7 +7594,6 @@ impl DocxRuntime for SimpleRuntime {
             canonical,
             diagnostics,
             fingerprint,
-            flattened_pending_revisions,
         })
     }
 
@@ -6671,7 +7714,7 @@ pub fn serialize_snapshot(
     // `mode` is currently single-variant (`Redline`); destructure so adding a
     // variant forces a decision here rather than silently ignoring it.
     let ExportMode::Redline = options.mode;
-    let bytes = snapshot
+    let normalized_bytes = snapshot
         .scaffold
         .package
         .clone()
@@ -6679,6 +7722,20 @@ pub fn serialize_snapshot(
         .map_err(map_package_error)?
         .write()
         .map_err(map_docx_error)?;
+    let bytes = match &snapshot.scaffold.serialization {
+        PackageSerialization::Transitional => normalized_bytes,
+        PackageSerialization::StrictReadOnly {
+            original_bytes,
+            normalized_package_fingerprint,
+        } => {
+            if fingerprint(&normalized_bytes) != *normalized_package_fingerprint {
+                return Err(strict_ooxml_mutation_error(
+                    "the package scaffold changed after import",
+                ));
+            }
+            original_bytes.as_ref().to_vec()
+        }
+    };
 
     // Built-in OOXML linker gate. Runs in any build (not gated on
     // `debug_assertions`) so release callers that opt in get the structural
@@ -6693,6 +7750,120 @@ pub fn serialize_snapshot(
         })?;
     }
     Ok(bytes)
+}
+
+/// Prepare one target snapshot for source-based package coexistence by
+/// remapping only package-local numbering identities whose definitions collide
+/// semantically with the source. This is a generic engine operation: it keeps
+/// every target reference and definition synchronized but does not infer or
+/// author any comparison change.
+#[doc(hidden)]
+pub fn prepare_numbering_transport_for_coexistence(
+    source: &EditSnapshot,
+    target: &EditSnapshot,
+) -> Result<EditSnapshot, RuntimeError> {
+    let mut remapped = target.clone();
+    let Some(remap) = crate::package_ops::numbering_transport::remap_target_for_coexistence(
+        &source.scaffold.package,
+        &mut remapped.scaffold.package,
+    )?
+    else {
+        return Ok(target.clone());
+    };
+    if matches!(
+        &target.scaffold.serialization,
+        PackageSerialization::StrictReadOnly { .. }
+    ) {
+        return Err(strict_ooxml_mutation_error(
+            "target numbering transport identities would have to be remapped",
+        ));
+    }
+    let canonical = Arc::make_mut(&mut remapped.canonical);
+    remap_numids_in_blocks(&mut canonical.blocks, &remap);
+    for story in &mut canonical.headers {
+        remap_numids_in_blocks(&mut story.blocks, &remap);
+    }
+    for story in &mut canonical.footers {
+        remap_numids_in_blocks(&mut story.blocks, &remap);
+    }
+    for story in &mut canonical.footnotes {
+        remap_numids_in_blocks(&mut story.blocks, &remap);
+    }
+    for story in &mut canonical.endnotes {
+        remap_numids_in_blocks(&mut story.blocks, &remap);
+    }
+    for story in &mut canonical.comments {
+        remap_numids_in_blocks(&mut story.blocks, &remap);
+    }
+    let bytes = remapped
+        .scaffold
+        .package
+        .clone()
+        .into_archive()
+        .map_err(map_package_error)?
+        .write()
+        .map_err(map_docx_error)?;
+    remapped.meta.current_docx_fingerprint = fingerprint(&bytes);
+    Ok(remapped)
+}
+
+/// Materialize a canonical document produced by a downstream compiler through
+/// the engine's package import, native-carrier serialization, validation, and
+/// snapshot rebuild path.
+///
+/// The source owns the physical package. Target-owned relationship closures are
+/// imported and remapped as one checked operation. Callers do not receive direct
+/// access to either snapshot's package scaffold.
+#[doc(hidden)]
+pub fn materialize_compiled_document(
+    source: &EditSnapshot,
+    target: &EditSnapshot,
+    mut document: CanonDoc,
+) -> Result<EditSnapshot, RuntimeError> {
+    let source_bytes = serialize_snapshot(source, &ExportOptions::unchecked())?;
+    let target_bytes = serialize_snapshot(target, &ExportOptions::unchecked())?;
+    let output_bytes = serialize_canonical_docx(
+        &source_bytes,
+        &target_bytes,
+        &mut document,
+        Some(source.scaffold.body_template.clone()),
+        &crate::edit::PendingParts::default(),
+    )?;
+    rebuild_snapshot(source, document, &output_bytes)
+}
+
+fn strict_ooxml_mutation_error(context: &str) -> RuntimeError {
+    RuntimeError {
+        code: ErrorCode::UnsupportedEdit,
+        message: format!(
+            "Strict OOXML mutation is not supported: {context}; Stemma preserves an untouched \
+             Strict package exactly but refuses to emit a partially converted Transitional package"
+        ),
+        details: ErrorDetails {
+            context: Some("strict_ooxml_read_only".to_string()),
+            ..ErrorDetails::default()
+        },
+    }
+}
+
+fn package_serialization(
+    archive: &DocxArchive,
+    original_bytes: &[u8],
+    normalized_package: &DocxPackage,
+) -> Result<PackageSerialization, RuntimeError> {
+    if !crate::docx_package::archive_uses_strict_ooxml(archive) {
+        return Ok(PackageSerialization::Transitional);
+    }
+    let normalized_bytes = normalized_package
+        .clone()
+        .into_archive()
+        .map_err(map_package_error)?
+        .write()
+        .map_err(map_docx_error)?;
+    Ok(PackageSerialization::StrictReadOnly {
+        original_bytes: Arc::from(original_bytes),
+        normalized_package_fingerprint: fingerprint(&normalized_bytes),
+    })
 }
 
 /// Run the built-in OOXML linker over serialized bytes and refuse on findings
@@ -6736,10 +7907,9 @@ pub fn gate_serialized_bytes(bytes: &[u8], level: ValidatorLevel) -> Result<(), 
 /// The first quarantined block (import-time nested-tracked-changes
 /// quarantine) in a document's body, if any. Quarantine is body-level by
 /// construction — stories containing the shape refuse at import — so scanning
-/// `doc.blocks` is complete. Used by the operations whose OUTPUT would
-/// misrepresent the quarantine's content (compare, audit); resolution does
-/// NOT refuse on it — the placeholder is carried through un-resolved and
-/// stays census-visible.
+/// `doc.blocks` is complete. Audit refuses because it cannot inspect the
+/// placeholder's content; resolution does not refuse because the placeholder
+/// is carried through unresolved and stays census-visible.
 pub(crate) fn first_quarantined_block(doc: &CanonDoc) -> Option<&crate::domain::NodeId> {
     doc.blocks.iter().find_map(|tb| match &tb.block {
         BlockNode::OpaqueBlock(o)
@@ -6825,41 +7995,6 @@ pub(crate) fn first_unparseable_opaque_with_revisions(
         }
     }
     None
-}
-
-/// THE COMPARE CONTRACT (flatten): compare diffs the ACCEPTED READINGS of
-/// its inputs. `view()` runs accept-all before the diff, so pending
-/// revisions in base or target — plain Inserted/Deleted and the stacked
-/// state alike — are projected to their accepted image (the stacked state's
-/// is "dropped", origin rule 3), and the output redline re-attributes every
-/// change to the compare's own author. This matches Word's own Compare,
-/// which compares as-if-accepted when inputs carry revisions. The flattening
-/// is DISCLOSED, not silent: the compare results carry
-/// [`FlattenedPendingRevisions`] naming what was consumed, per input, by
-/// author. Carrying pending revisions through with their original
-/// attribution is a different operation (a rebase of negotiation state onto
-/// a new base), not a variant of compare.
-///
-/// The one refusal: quarantined blocks — nested tracked changes in an
-/// unsupported shape, preserved byte-faithfully as opaque placeholders with
-/// no readable content. Accept-all cannot reach inside them, so their
-/// placeholders would identity-compare and the diff would silently miss
-/// whatever the quarantine holds. That is not honestly comparable; refuse.
-fn refuse_quarantined_compare(base: &CanonDoc, target: &CanonDoc) -> Result<(), RuntimeError> {
-    for (label, doc) in [("base", base), ("target", target)] {
-        if let Some(block_id) = first_quarantined_block(doc) {
-            return Err(RuntimeError {
-                code: ErrorCode::UnsupportedEdit,
-                message: format!(
-                    "compare refused: {label} document block '{block_id}' is quarantined \
-                     (nested tracked changes in an unsupported shape), so its content \
-                     cannot be honestly compared"
-                ),
-                details: ErrorDetails::default(),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// How to resolve the tracked deltas in a document.
@@ -7050,6 +8185,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::ConflictingFormattingMarks { .. }
         | EditError::FormatTargetNotEditable { .. }
         | EditError::InsertListNumIdUnknown { .. }
+        | EditError::TrackedBlockEquationUnsupported { .. }
         | EditError::BlocksToTableNonParagraph { .. }
         | EditError::BlocksToTableOpaqueInline { .. }
         | EditError::BlocksToTableSplitMismatch { .. }
@@ -7192,8 +8328,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         } => ErrorDetails {
             block_id: Some(block_id.clone()),
             step_index: Some(*step_index),
-            formatting: Some(Box::new(FormattingErrorDetails::Target(
-                FormatTargetDetails {
+            typed: Some(Box::new(TypedErrorDetails::Formatting(
+                FormattingErrorDetails::Target(FormatTargetDetails {
                     block_id: block_id.clone(),
                     text: text.clone(),
                     tracking_status: (*tracking_status).to_string(),
@@ -7212,7 +8348,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
                             .to_string(),
                         }
                     }),
-                },
+                }),
             ))),
             ..ErrorDetails::default()
         },
@@ -7225,8 +8361,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         } => ErrorDetails {
             block_id: Some(block_id.clone()),
             step_index: Some(*step_index),
-            formatting: Some(Box::new(FormattingErrorDetails::Target(
-                FormatTargetDetails {
+            typed: Some(Box::new(TypedErrorDetails::Formatting(
+                FormattingErrorDetails::Target(FormatTargetDetails {
                     block_id: block_id.clone(),
                     text: text.clone(),
                     tracking_status: (*tracking_status).to_string(),
@@ -7242,7 +8378,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
                             .to_string(),
                         }
                     }),
-                },
+                }),
             ))),
             ..ErrorDetails::default()
         },
@@ -7254,12 +8390,12 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         } => ErrorDetails {
             block_id: Some(block_id.clone()),
             step_index: Some(*step_index),
-            formatting: Some(Box::new(FormattingErrorDetails::Ambiguous(
-                AmbiguousFormatTargetDetails {
+            typed: Some(Box::new(TypedErrorDetails::Formatting(
+                FormattingErrorDetails::Ambiguous(AmbiguousFormatTargetDetails {
                     block_id: block_id.clone(),
                     text: expected.clone(),
                     occurrences: *occurrences,
-                },
+                }),
             ))),
             ..ErrorDetails::default()
         },
@@ -7326,7 +8462,7 @@ fn rebuild_metadata_snapshot(
     rebuild_snapshot(prev, Arc::unwrap_or_clone(mutated.canonical), &bytes)
 }
 
-fn rebuild_snapshot(
+pub(crate) fn rebuild_snapshot(
     prev: &EditSnapshot,
     mut new_canonical: CanonDoc,
     serialized_bytes: &[u8],
@@ -7354,6 +8490,7 @@ fn rebuild_snapshot(
         scaffold: PackageScaffold {
             package,
             body_template,
+            serialization: PackageSerialization::Transitional,
         },
         meta: SnapshotMeta {
             snapshot_schema_version: prev.meta.snapshot_schema_version,
@@ -7393,22 +8530,40 @@ fn reanchor_body_opaque_blocks(
         let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
             continue;
         };
-        let Some(old_index) = opaque
+        let previous_node = if let Some(index) = opaque
             .proof_ref
             .docx_anchor
             .strip_prefix("body_index:")
             .and_then(|value| value.parse::<usize>().ok())
-        else {
-            // Target-origin opaque blocks are retained in the model for diff
-            // fixpoint evidence but deliberately are not emitted as tracked
-            // body blocks. They therefore have no output anchor to refresh.
-            if opaque
+        {
+            previous.opaque_children.get(&index)
+        } else if opaque.kind == OpaqueKind::Sdt
+            && opaque
                 .proof_ref
                 .docx_anchor
                 .starts_with("target_body_index:")
-            {
-                continue;
-            }
+        {
+            // A newly emitted target SDT has no node in the previous (base)
+            // scaffold. It is located by the ordered SDT match below, then its
+            // target anchor becomes an ordinary body_index anchor.
+            None
+        } else if opaque
+            .proof_ref
+            .docx_anchor
+            .starts_with("target_body_index:")
+        {
+            // Unsupported target-origin opaque kinds were refused during
+            // serialization, so reaching re-anchoring with one is impossible.
+            return Err(RuntimeError {
+                code: ErrorCode::InternalError,
+                message: "unsupported target-origin opaque block reached re-anchoring".to_string(),
+                details: ErrorDetails {
+                    block_id: Some(opaque.id.clone()),
+                    context: Some(opaque.proof_ref.docx_anchor.clone()),
+                    ..ErrorDetails::default()
+                },
+            });
+        } else {
             return Err(RuntimeError {
                 code: ErrorCode::InvalidDocx,
                 message: "cannot rebuild snapshot with an unanchored body opaque block".to_string(),
@@ -7419,7 +8574,6 @@ fn reanchor_body_opaque_blocks(
                 },
             });
         };
-        let previous_node = previous.opaque_children.get(&old_index);
         let start = last_match.map_or(0, |index| index + 1);
         let new_index = body
             .children
@@ -7464,14 +8618,36 @@ fn reanchor_body_opaque_blocks(
         };
         if let Some((_, index)) = replacements.iter().find(|(id, _)| id == &opaque.id) {
             opaque.proof_ref.docx_anchor = format!("body_index:{index}");
-            opaque.opaque_ref = format!("body_item_{index}");
+            let element = body.children[*index]
+                .as_element()
+                .ok_or_else(|| RuntimeError {
+                    code: ErrorCode::InternalError,
+                    message: "retained body opaque block is not an XML element".to_string(),
+                    details: ErrorDetails {
+                        block_id: Some(opaque.id.clone()),
+                        context: Some(format!("body_index:{index}")),
+                        ..ErrorDetails::default()
+                    },
+                })?;
+            opaque.opaque_ref = opaque_body_ref(element);
         }
     }
 
     extract_body_template(root, canonical)
 }
 
-fn body_range_marker_matches(element: &Element, marker: &crate::domain::RangeMarkerMeta) -> bool {
+pub(crate) fn body_range_marker_matches(
+    element: &Element,
+    marker: &crate::domain::RangeMarkerMeta,
+) -> bool {
+    body_range_marker_kind_matches(element, marker)
+        && attr_get(element, "id").is_some_and(|id| id == marker.id.as_str())
+}
+
+fn body_range_marker_kind_matches(
+    element: &Element,
+    marker: &crate::domain::RangeMarkerMeta,
+) -> bool {
     use crate::domain::{RangeMarkerFamily, RangeMarkerRole};
     let expected = match (&marker.family, &marker.role) {
         (RangeMarkerFamily::Bookmark, RangeMarkerRole::Start) => "bookmarkStart",
@@ -7482,7 +8658,6 @@ fn body_range_marker_matches(element: &Element, marker: &crate::domain::RangeMar
         (RangeMarkerFamily::Permission, RangeMarkerRole::End) => "permEnd",
     };
     is_w_tag(element, expected)
-        && attr_get(element, "id").is_some_and(|id| id == marker.id.as_str())
 }
 
 /// Word's built-in (latent) paragraph / character / table / numbering style
@@ -7862,21 +9037,17 @@ impl EditSnapshot {
         Ok(next)
     }
 
-    /// Refuse an authored write whose `author` impersonates one of this
-    /// document's ORIGIN authors (`SnapshotMeta::origin_authors` — the
-    /// authors already present in the redline this snapshot was built from,
-    /// frozen before this handle's own session authored anything). Editing
-    /// under an existing author's identity makes an agent's changes
-    /// indistinguishable from theirs and silently defeats layered review —
-    /// a security property in a negotiation, not a nicety (an adversarial
-    /// agent could impersonate a counterparty reviewer to HIDE its edits
-    /// inside their redline). This is a refusal, not a documented default: a
-    /// default an agent can drift off is the invisible-ink pattern again; a
-    /// refusal cannot be drifted off.
+    /// Refuse an authored write whose Word author label matches one of this
+    /// document's ORIGIN labels (`SnapshotMeta::origin_authors` — the labels
+    /// already present in the redline this snapshot was built from, frozen
+    /// before this handle's own session authored anything). Reusing the label
+    /// groups the new revisions with existing revisions in Microsoft Word.
+    /// Because a Word author label is not an authenticated identity, this is
+    /// an attribution-confirmation boundary rather than an identity check.
     ///
     /// `allow_existing_author=true` deliberately continues an existing
-    /// author's own work. `author = None` (an anonymized write) is never
-    /// impersonation, since it adopts no identity.
+    /// reviewer group. `author = None` (an anonymized write) cannot collide
+    /// with a concrete label.
     pub fn guard_author(
         &self,
         author: Option<&str>,
@@ -7889,24 +9060,28 @@ impl EditSnapshot {
             return Ok(());
         };
         if self.meta.origin_authors.contains(author) {
-            let existing = self
-                .meta
-                .origin_authors
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
+            let existing_revision_count =
+                crate::tracked_model::enumerate_revisions(&self.canonical)
+                    .into_iter()
+                    .filter(|revision| revision.author.as_deref() == Some(author))
+                    .count();
             return Err(RuntimeError {
-                code: ErrorCode::AuthorImpersonation,
+                code: ErrorCode::AuthorLabelCollision,
                 message: format!(
-                    "author {author:?} already authors revisions in this document (the \
-                     existing redline's authors: {existing}). Editing under an existing \
-                     author's identity makes your changes indistinguishable from theirs and \
-                     defeats layered review. Choose a distinct author name, or pass \
-                     allow_existing_author=true to deliberately continue that author's work."
+                    "author label {author:?} was already present when this document was \
+                     opened. New revisions with the same label will appear in Microsoft Word \
+                     as part of the same reviewer group. To continue that group, retry with \
+                     allow_existing_author=true. To keep this editing round separate, supply \
+                     a different author label chosen by the user. The document was not changed."
                 ),
                 details: ErrorDetails {
                     context: Some(author.to_string()),
+                    typed: Some(Box::new(TypedErrorDetails::AuthorLabelCollision(
+                        AuthorLabelCollisionDetails {
+                            author_label: author.to_string(),
+                            existing_revision_count,
+                        },
+                    ))),
                     ..ErrorDetails::default()
                 },
             });
@@ -7927,7 +9102,9 @@ impl EditSnapshot {
         txn: &crate::edit::EditTransaction,
         allow_existing_author: bool,
     ) -> Result<EditSnapshot, RuntimeError> {
-        self.guard_author(txn.revision.author.as_deref(), allow_existing_author)?;
+        if txn.materialization_mode == crate::edit::MaterializationMode::TrackedChange {
+            self.guard_author(txn.revision.author.as_deref(), allow_existing_author)?;
+        }
         self.apply(txn)
     }
 
@@ -8075,7 +9252,7 @@ impl EditSnapshot {
         numbering_definitions_from_package(&self.scaffold.package)
     }
 
-    fn default_tab_stop(&self) -> Result<i32, RuntimeError> {
+    pub(crate) fn default_tab_stop(&self) -> Result<i32, RuntimeError> {
         crate::settings::parse_default_tab_stop_bytes(
             self.scaffold.package.get_part("word/settings.xml"),
         )
@@ -8349,81 +9526,6 @@ impl EditSnapshot {
         };
         rebuild_snapshot(self, resolved, &projected_bytes)
     }
-
-    /// Discover the deltas between this snapshot and `other` and materialize
-    /// them as tracked changes.
-    ///
-    /// Pure twin of [`SimpleRuntime::diff_and_redline`]: diff -> merge ->
-    /// serialize -> rebuild. The revision id namespace is advanced past this
-    /// snapshot's existing tracked changes; author/date are left to the
-    /// engine default (the discovery side does not carry a transaction meta).
-    pub fn diff(&self, other: &EditSnapshot) -> Result<EditSnapshot, RuntimeError> {
-        self.diff_with_author(other, None)
-    }
-
-    /// Attributed twin of [`Self::diff`]: identical discovery, but every
-    /// produced revision is stamped with `author`.
-    ///
-    /// An empty author is refused (`ErrorCode::ValidationFailed`) rather than
-    /// silently attributing the revisions to no one — anonymous discovery is
-    /// exactly what [`Self::diff`] is for.
-    pub fn diff_as(
-        &self,
-        other: &EditSnapshot,
-        author: &str,
-    ) -> Result<EditSnapshot, RuntimeError> {
-        if author.is_empty() {
-            return Err(RuntimeError {
-                code: ErrorCode::ValidationFailed,
-                message: "diff_as requires a non-empty author; use diff for anonymous discovery"
-                    .to_string(),
-                details: ErrorDetails::default(),
-            });
-        }
-        self.diff_with_author(other, Some(author.to_string()))
-    }
-
-    /// Shared implementation behind [`Self::diff`] (anonymous) and
-    /// [`Self::diff_as`] (attributed): diff -> merge -> serialize -> rebuild,
-    /// stamping every produced revision with `author` (`None` = anonymous).
-    fn diff_with_author(
-        &self,
-        other: &EditSnapshot,
-        author: Option<String>,
-    ) -> Result<EditSnapshot, RuntimeError> {
-        let diff = diff_documents(&self.canonical, &other.canonical).map_err(map_diff_error)?;
-        let next_revision_id = max_revision_id(&self.canonical) + 1;
-        // Discovery does not carry an authoring transaction. Anonymous `diff`
-        // leaves `author` None (the engine's own attribution); `diff_as`
-        // threads a caller-supplied author through. `date` is left None in both
-        // cases — the runtime's `diff_and_redline` (which takes a full
-        // `TransactionMeta`) is the path that stamps a timestamp.
-        let revision = RevisionInfo {
-            revision_id: next_revision_id,
-            identity: 0,
-            author,
-            date: None,
-            apply_op_id: None,
-        };
-        let merge_result = merge_diff(&self.canonical, &other.canonical, &diff, &revision)
-            .map_err(map_merge_error)?;
-        let mut merged = merge_result.doc;
-        // H7: diff is a revision PRODUCER; mint stable identities for the
-        // revisions it discovered so the redline is enumerable/resolvable.
-        crate::import::mint_identities(&mut merged);
-        // Re-zips of the two unmodified input scaffolds as merge inputs —
-        // internal intermediates, not output (output is gated at `serialize`).
-        let self_bytes = serialize_snapshot(self, &ExportOptions::unchecked())?;
-        let other_bytes = serialize_snapshot(other, &ExportOptions::unchecked())?;
-        let redline_bytes = serialize_canonical_docx(
-            &self_bytes,
-            &other_bytes,
-            &mut merged,
-            Some(self.scaffold.body_template.clone()),
-            &crate::edit::PendingParts::default(),
-        )?;
-        rebuild_snapshot(self, merged, &redline_bytes)
-    }
 }
 
 fn first_conflicting_quarantined_move_mixture(
@@ -8482,16 +9584,23 @@ fn first_conflicting_quarantined_move_mixture(
 /// This is the snapshot-construction portion factored out of
 /// `SimpleRuntime::import_docx`. It returns the snapshot plus the
 /// `(diagnostics, has_revisions, anchored_bytes)` the runtime needs for its
-/// caches; `crate::api::Document::parse` ignores those and keeps the snapshot.
+/// caches. The public [`crate::api::Document`] retains import diagnostics as
+/// immutable provenance; runtime-only callers may discard them explicitly.
 fn build_snapshot_from_bytes(
     docx_bytes: &[u8],
 ) -> Result<(EditSnapshot, Vec<Diagnostic>, bool, Vec<u8>), RuntimeError> {
-    let (anchored_bytes, canonical, diagnostics, has_revisions, body_template) =
-        import_and_anchor(docx_bytes)?;
-    let fp = fingerprint(&anchored_bytes);
-    let mut package =
-        DocxPackage::from_archive(&DocxArchive::read(&anchored_bytes).map_err(map_docx_error)?)
-            .map_err(map_package_error)?;
+    let source_archive = DocxArchive::read(docx_bytes).map_err(map_docx_error)?;
+    let strict_input = crate::docx_package::archive_uses_strict_ooxml(&source_archive);
+    let (
+        anchored_bytes,
+        mut canonical,
+        diagnostics,
+        has_revisions,
+        body_template,
+        normalized_missing_thumbnail,
+    ) = import_and_anchor(docx_bytes)?;
+    let anchored_archive = DocxArchive::read(&anchored_bytes).map_err(map_docx_error)?;
+    let mut package = DocxPackage::from_archive(&anchored_archive).map_err(map_package_error)?;
     // Guarantee every WordprocessingML part the scaffold carries has its
     // canonical content-type Override (OPC §10.1.2 / ECMA-376 Part 1 §15.2).
     // `import_and_anchor` already applied this same correction to the anchored
@@ -8499,14 +9608,29 @@ fn build_snapshot_from_bytes(
     // re-applying it on the scaffold package is idempotent and keeps the
     // scaffold honest if the anchored-bytes shape ever diverges.
     package.ensure_canonical_wml_content_types();
-    // Capture the ORIGIN authors now, before any edit exists: the authors
+    // Strict input is readable through the canonical namespace model, but an
+    // untouched package remains in its original dialect. A namespace-only
+    // rewrite would leave Strict lexical values under Transitional schemas.
+    let stored_bytes = if strict_input && !normalized_missing_thumbnail {
+        docx_bytes.to_vec()
+    } else {
+        anchored_bytes
+    };
+    let serialization = if strict_input {
+        package_serialization(&anchored_archive, &stored_bytes, &package)?
+    } else {
+        PackageSerialization::Transitional
+    };
+    let fp = fingerprint(&stored_bytes);
+    canonical.meta.docx_fingerprint = fp.clone();
+    // Capture the ORIGIN author labels now, before any edit exists: the labels
     // already present in the redline this document carried on arrival. Use
     // `pending_revision_authors` (the flatten-contract summary — segments,
     // paragraph marks, rows/cells, hyperlink runs, every story, PLUS
     // formatting-change records) rather than a narrower carrier walk, so the
-    // guard's off-limits set matches what an accept-all would actually
-    // attribute. Anonymized revisions (author == None) are not an identity
-    // anyone can impersonate, so they are excluded.
+    // guard's confirmation set matches what an accept-all would actually
+    // attribute. Revisions without an author attribute carry no label to
+    // collide with, so they are excluded.
     let origin_authors = crate::tracked_model::pending_revision_authors(&canonical)
         .into_iter()
         .filter_map(|a| a.author)
@@ -8516,6 +9640,7 @@ fn build_snapshot_from_bytes(
         scaffold: PackageScaffold {
             package,
             body_template,
+            serialization,
         },
         meta: SnapshotMeta {
             snapshot_schema_version: EDIT_SNAPSHOT_SCHEMA_VERSION,
@@ -8525,7 +9650,7 @@ fn build_snapshot_from_bytes(
             origin_authors,
         },
     };
-    Ok((snapshot, diagnostics, has_revisions, anchored_bytes))
+    Ok((snapshot, diagnostics, has_revisions, stored_bytes))
 }
 
 /// Build an [`EditSnapshot`] from DOCX bytes, discarding the runtime-only
@@ -8537,23 +9662,16 @@ pub fn snapshot_from_docx_bytes(docx_bytes: &[u8]) -> Result<EditSnapshot, Runti
     Ok(snapshot)
 }
 
-/// Build the v1 read projection for a single snapshot.
-///
-/// Mirrors [`SimpleRuntime::single_document_view`] but operates on an owned
-/// [`EditSnapshot`] with no handle store: re-zip the scaffold, read the
-/// archive's media, and project the canonical IR into the tracked
-/// single-document view.
-pub fn build_tracked_document_view_from_snapshot(snapshot: &EditSnapshot) -> FullDocViewResult {
-    // Re-zip the scaffold to recover the media parts the view needs. If the
-    // package cannot be re-zipped or the image lookup fails, fall back to an
-    // empty image lookup: the view is a read projection, not an authoritative
-    // artifact, and the IR is the source of structure.
-    let image_lookup = serialize_snapshot(snapshot, &ExportOptions::unchecked())
-        .ok()
-        .and_then(|bytes| DocxArchive::read(&bytes).ok())
-        .and_then(|archive| build_image_data_lookup(&archive).ok())
-        .unwrap_or_default();
-    build_tracked_document_view(&snapshot.canonical, &image_lookup)
+/// Build the public session-free document state together with every disclosed
+/// import normalization. Kept crate-private so [`crate::api::Document`] is the
+/// stable owner of this surface rather than exposing runtime construction
+/// details.
+pub(crate) fn snapshot_and_diagnostics_from_docx_bytes(
+    docx_bytes: &[u8],
+) -> Result<(EditSnapshot, Vec<Diagnostic>), RuntimeError> {
+    let (snapshot, diagnostics, _has_revisions, _anchored_bytes) =
+        build_snapshot_from_bytes(docx_bytes)?;
+    Ok((snapshot, diagnostics))
 }
 
 /// Validate DOCX bytes as a property of the bytes (no handle / session).
@@ -8581,6 +9699,41 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
             context: None,
         });
     }
+    // OPC §10.1.2: every package part except [Content_Types].xml itself must
+    // resolve to a declared content type. This belongs on the production
+    // validation path, not only in the richer diagnostic validator: a missing
+    // media declaration makes neutral package consumers fail before they can
+    // accept or reject the redline.
+    match archive.get(crate::docx_package::CONTENT_TYPES_PATH) {
+        Some(bytes) => match crate::docx_package::ContentTypes::parse(bytes) {
+            Ok(content_types) => {
+                for part_name in archive.list().filter(|name| {
+                    !name.ends_with('/')
+                        && !name.eq_ignore_ascii_case(crate::docx_package::CONTENT_TYPES_PATH)
+                }) {
+                    if content_types.content_type_for_part(part_name).is_none() {
+                        issues.push(ValidationIssue {
+                            code: ValidationIssueCode::PackageInvariant,
+                            message: format!(
+                                "package part {part_name:?} has no declared OPC content type"
+                            ),
+                            context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+                        });
+                    }
+                }
+            }
+            Err(error) => issues.push(ValidationIssue {
+                code: ValidationIssueCode::PackageInvariant,
+                message: format!("cannot parse [Content_Types].xml: {error}"),
+                context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+            }),
+        },
+        None => issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message: "package is missing [Content_Types].xml".to_string(),
+            context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+        }),
+    }
     // Locate the main document part via the OPC officeDocument relationship
     // (ECMA-376 Part 2 §9.3): its name is not fixed at word/document.xml. A
     // package with no discoverable main part is itself a package invariant
@@ -8598,8 +9751,8 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
         }
     };
     // Curated structural checks that mirror genuine Word rejections. The rich
-    // content-model validator is not on the production path, so run this targeted
-    // subset on the main document story here:
+    // content-model validator is not generally on the production path, so run
+    // this targeted subset on the main document story here:
     //   I-MATH-001/002 — m:oMath nested in oMath (Word repairs) / oMath outside a
     //                     paragraph (Word cannot open);
     //   I-PERM-001     — non-integer permStart/permEnd w:id;
@@ -8625,17 +9778,11 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
                 //
                 // NOTE: this `story` is the BODY part only, so I-ANN-009 catches
                 // body-local torn pairs; a pair that legitimately spans
-                // body↔header/footer would not be checkable here. No corpus doc
-                // exercises a cross-story customXml range (4079/0).
-                //
-                // FOLLOW-UP (pre-existing, out of task #6 scope): the bookmark
-                // (I-ANN-003 check_bookmark_pairing) and comment (I-ANN-005
-                // check_comment_marker_pairing) pairing checks are likewise OFF
-                // this production path — torn bookmark/comment pairs are NOT
-                // flagged via api::validate today. Wiring them in mirrors the
-                // call below, BUT first needs the cross-story question resolved
-                // (a body↔header bookmark must not false-positive on a body-only
-                // check), so it is intentionally NOT a drop-in two-liner. Filed.
+                // body↔header/footer would not be checkable here. Comment range
+                // identity is checked package-wide below by I-ANN-010 because
+                // Word scopes each comment identity to one range in one story.
+                // Bookmark pairing remains outside this body-only production
+                // check until its cross-story semantics are modeled explicitly.
                 structural.extend(check_custom_xml_range_pairing(&story));
                 // I-ANN-006 — footnote/endnote REFERENCE ids past Word's 32767 ceiling
                 // (MS-OI29500 §2.1.300-302). References live in the body story; the note
@@ -8697,6 +9844,32 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
             }
         }
     }
+
+    // These package-wide carrier invariants cannot be reconstructed from the
+    // main story alone: tracked changes can live in auxiliary stories, and a
+    // relationship in any `.rels` part can target a missing package part.
+    // Surface only findings that make the accepted input unsafe. Other rich
+    // findings retain their existing product policy because ordinary
+    // serialization deliberately normalizes some of them (for example a
+    // missing canonical content-type override) before applying its output
+    // gate.
+    let tracked_change_validation = crate::docx_validate::validate_docx(docx_bytes);
+    for finding in tracked_change_validation
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule_id,
+                "I-TC-002" | "I-TC-003" | "I-ANN-010" | "I-REL-003" | "I-REL-005" | "I-XREF-003"
+            )
+        })
+    {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::WordprocessingInvariant,
+            message: finding.message,
+            context: Some(finding.location),
+        });
+    }
     // Model-level body-state invariants (hardening H2). Build the CanonDoc the
     // producers operate on and run the unified validator, surfacing each
     // violation as a WordprocessingInvariant issue. This is the RELEASE-available
@@ -8731,7 +9904,8 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
     })
 }
 
-/// Import and anchor a DOCX, returning `(bytes, canonical, diagnostics, has_revisions, cached_body)`.
+/// Import and anchor a DOCX, returning
+/// `(bytes, canonical, diagnostics, has_revisions, cached_body, normalized_missing_thumbnail)`.
 /// `has_revisions` is true when the archive contains pre-existing revision markup,
 /// meaning the canonical was built without normalization and differs from what
 /// `build_canonical_from_docx` (the `view()` path) would produce.
@@ -8740,9 +9914,11 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
 #[allow(clippy::type_complexity)]
 fn import_and_anchor(
     docx_bytes: &[u8],
-) -> Result<(Vec<u8>, CanonDoc, Vec<Diagnostic>, bool, BodyTemplate), RuntimeError> {
+) -> Result<(Vec<u8>, CanonDoc, Vec<Diagnostic>, bool, BodyTemplate, bool), RuntimeError> {
     let mut archive = DocxArchive::read(docx_bytes).map_err(map_docx_error)?;
     ensure_docx_not_encrypted(&archive)?;
+    let removed_thumbnails = normalize_dangling_package_thumbnails(&mut archive)?;
+    let normalized_missing_thumbnail = !removed_thumbnails.is_empty();
     // Locate the main document part via the OPC officeDocument relationship
     // (ECMA-376 Part 2 §9.3): its name is not fixed at word/document.xml.
     let main_part = crate::docx_package::resolve_main_document_part(&archive)
@@ -8804,12 +9980,16 @@ fn import_and_anchor(
         crate::numbering::NumberingDefinitions::parse,
     )?;
 
-    // Load style definitions (optional - may not exist in all docx files)
-    let mut style_defs = crate::import::parse_optional_docx_part(
-        &archive,
-        "word/styles.xml",
-        crate::styles::StyleDefinitions::parse,
-    )?;
+    // Load style definitions. A styles-free package still observes Word's
+    // implicit run-property fallbacks; an empty table models those defaults.
+    let mut style_defs = Some(
+        crate::import::parse_optional_docx_part(
+            &archive,
+            "word/styles.xml",
+            crate::styles::StyleDefinitions::parse,
+        )?
+        .unwrap_or_default(),
+    );
 
     // Load theme font definitions (optional) and attach to style definitions
     let theme_fonts = crate::import::parse_optional_docx_part(
@@ -8828,6 +10008,8 @@ fn import_and_anchor(
 
     // Parse compatibility settings from settings.xml (MS-DOCX §2.3)
     let compat_settings = crate::settings::parse_compat_settings(&archive)
+        .map_err(crate::import::invalid_docx_message)?;
+    let even_and_odd_headers = crate::settings::parse_even_and_odd_headers_state(&archive)
         .map_err(crate::import::invalid_docx_message)?;
 
     // Parse document relationships and stories
@@ -8905,20 +10087,23 @@ fn import_and_anchor(
         footnotes,
         endnotes,
         comments,
+        even_and_odd_headers,
         Some(&archive),
     )?;
     // Empty-running-head tolerances were recorded while parsing the story parts
     // above, before the diagnostics sink existed; fold them in.
     diagnostics.extend(story_diagnostics);
+    diagnostics.extend(removed_thumbnails.into_iter().map(|removed| Diagnostic {
+        level: DiagnosticLevel::Warning,
+        message: format!(
+            "removed dangling package-thumbnail relationship {:?}: target {:?} resolves to absent part {:?}; Microsoft Word performs the same deterministic normalization on save",
+            removed.id, removed.target, removed.resolved_target
+        ),
+        context: Some(crate::docx_package::ROOT_RELS_PATH.to_string()),
+    }));
 
     canonical.compat_settings = compat_settings;
     canonical.comments_extended = comments_extended;
-
-    // Parse the three-state w:evenAndOddHeaders toggle (§17.15.1.35): None =
-    // absent, Some(true) = on, Some(false) = explicitly off. Carried honestly so
-    // the settings.xml writer round-trips the absent-vs-off distinction.
-    canonical.even_and_odd_headers = crate::settings::parse_even_and_odd_headers_state(&archive)
-        .map_err(crate::import::invalid_docx_message)?;
 
     // Record the w:documentProtection declaration (ISO/IEC 29500-1 §17.15.1.29)
     // and emit an import diagnostic when it is enforced. Reported, not enforced —
@@ -8933,7 +10118,72 @@ fn import_and_anchor(
     // avoiding a redundant full xmltree re-parse of document.xml.
     let cached = extract_body_template(root, &canonical)?;
 
-    Ok((updated_bytes, canonical, diagnostics, has_revisions, cached))
+    Ok((
+        updated_bytes,
+        canonical,
+        diagnostics,
+        has_revisions,
+        cached,
+        normalized_missing_thumbnail,
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemovedDanglingPackageThumbnail {
+    id: String,
+    target: String,
+    resolved_target: String,
+}
+
+/// Apply Word's narrow, lossless normalization for a package thumbnail whose
+/// target part is already absent.
+///
+/// This is intentionally not a generic dangling-relationship repair. Missing
+/// document images, stories, embedded objects, or any other internal targets
+/// remain I-REL-003 hard failures because removing those edges can discard
+/// active document semantics. A missing thumbnail contains no reachable bytes;
+/// Word removes only the dead package-root relationship when it saves.
+fn normalize_dangling_package_thumbnails(
+    archive: &mut DocxArchive,
+) -> Result<Vec<RemovedDanglingPackageThumbnail>, RuntimeError> {
+    let rels_path = crate::docx_package::ROOT_RELS_PATH;
+    let rels_bytes = archive
+        .get(rels_path)
+        .ok_or_else(|| invalid_docx("package root relationships part _rels/.rels is missing"))?;
+    let mut relationships =
+        RelationshipSet::parse(rels_bytes, rels_path).map_err(map_package_error)?;
+
+    let mut removed = Vec::new();
+    relationships.entries.retain(|relationship| {
+        if relationship.rel_type != crate::docx_package::PACKAGE_THUMBNAIL_REL_TYPE
+            || !crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+            || relationship.target.starts_with('#')
+        {
+            return true;
+        }
+
+        let resolved_target = crate::docx_package::normalize_package_path(&relationship.target);
+        if archive.get(&resolved_target).is_some() {
+            return true;
+        }
+
+        removed.push(RemovedDanglingPackageThumbnail {
+            id: relationship.id.clone(),
+            target: relationship.target.clone(),
+            resolved_target,
+        });
+        false
+    });
+
+    if !removed.is_empty() {
+        let bytes = relationships
+            .serialize(rels_path)
+            .map_err(map_package_error)?;
+        archive.set(rels_path, bytes).map_err(map_docx_error)?;
+    }
+    Ok(removed)
 }
 
 fn extract_body_template(
@@ -9048,7 +10298,9 @@ fn resolve_story_part_to_rid(
     // relationship with Target="rId9" is minted.
     if let Some(existing) = base_pkg.document_rels.find_by_id(part_path)
         && existing.rel_type == rel_type
-        && existing.target_mode.is_none()
+        && crate::docx_package::relationship_target_mode_is_internal(
+            existing.target_mode.as_deref(),
+        )
     {
         return existing.id.clone();
     }
@@ -9257,10 +10509,10 @@ pub(crate) fn resolve_sect_pr_change_story_refs(
 /// `w:sectPrChange` whose previous snapshot is an EMPTY `<w:sectPr/>` registers
 /// NO revision in Word — the tracked layout change is invisible in the review
 /// pane and unrejectable (reject silently keeps the new layout). Any non-empty
-/// snapshot registers. So at the WRITE EDGE, an empty snapshot materializes
-/// Word's default page geometry, exactly as Word's own writer does. The stored
-/// model keeps the faithful (possibly empty) authored state — stemma's own
-/// reject restores that verbatim; only the serialized wire form is widened.
+/// snapshot registers. An empty snapshot therefore materializes Word's default
+/// page geometry, exactly as Word's own writer does. The stored model keeps the
+/// faithful (possibly empty) authored state; both the write edge and in-memory
+/// Reject project this widened native carrier.
 pub(crate) fn materialize_empty_sect_pr_snapshot(prev: &mut Element) {
     use crate::edit::verbs::page_setup::{
         WORD_DEFAULT_HEADER_FOOTER_DISTANCE, WORD_DEFAULT_MARGIN, WORD_DEFAULT_PAGE_HEIGHT,
@@ -9298,7 +10550,7 @@ pub(crate) fn materialize_empty_sect_pr_snapshot(prev: &mut Element) {
 /// argument supplies non-dominated extension children (used by the sectPrChange
 /// overlay path); unknown children are merged in only from that base.
 #[allow(clippy::type_complexity)]
-pub(crate) fn section_properties_to_element(
+pub fn section_properties_to_element(
     sp: &SectionProperties,
     base_sect_pr: Option<&Element>,
     sect_pr_change: Option<Element>,
@@ -9378,7 +10630,7 @@ fn sort_sect_pr_children(sect_pr: &mut Element) {
 /// Returns `true` for child element tags of `w:sectPr` that are modeled in
 /// `SectionProperties` and will be rebuilt from the parsed struct fields.
 /// Matches the dominated set used in the sectPrChange overlay path.
-fn is_dominated_sect_pr_child(el: &Element) -> bool {
+pub(crate) fn is_dominated_sect_pr_child(el: &Element) -> bool {
     is_w_tag(el, "headerReference")
         || is_w_tag(el, "footerReference")
         || is_w_tag(el, "pgSz")
@@ -9802,7 +11054,7 @@ pub(crate) fn invalid_snapshot(message: &str) -> RuntimeError {
     }
 }
 
-fn map_docx_error(err: DocxError) -> RuntimeError {
+pub fn map_docx_error(err: DocxError) -> RuntimeError {
     let message = match err {
         DocxError::ZipRead(source) => format!("docx read failed: {source}"),
         DocxError::ZipWrite(source) => format!("docx write failed: {source}"),
@@ -9824,7 +11076,7 @@ fn map_docx_error(err: DocxError) -> RuntimeError {
     }
 }
 
-fn map_package_error(err: crate::docx_package::PackageError) -> RuntimeError {
+pub(crate) fn map_package_error(err: crate::docx_package::PackageError) -> RuntimeError {
     RuntimeError {
         code: ErrorCode::InvalidDocx,
         message: format!("package error: {err}"),
@@ -9877,17 +11129,56 @@ mod tests {
     use crate::domain::{
         BorderStyle, CellFormatting, FormattingChange, HighlightColor, InlineNode, MarkValue,
         NodeId, NumberingInfo, StyleProps, TableCellNode, TableFormatting, TableNode, TableRowNode,
-        TextNode, TrackedSegment, VerticalMerge, normal_tracked_block,
+        TextNode, VerticalMerge, normal_tracked_block,
     };
     use crate::import::{extract_inline_text_simple, strip_literal_prefix};
     use crate::serialize::{build_paragraph_properties, build_text_run, serialize_paragraph_node};
-
-    /// Parse a `<w:p>` fragment for the field-char integrity detector tests.
     fn parse_para(xml: &str) -> Element {
         let wrapped = format!(
             r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{xml}</w:p>"#
         );
         Element::parse(Cursor::new(wrapped.into_bytes())).expect("test paragraph XML must parse")
+    }
+
+    #[test]
+    fn deleted_body_sdt_tracks_textbox_drawing_carrier_not_nested_story_text() {
+        let mut sdt = word_xml::parse_raw_fragment(
+            br#"<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"><w:sdtContent><w:p><w:r><w:drawing><wne:txbxContent><w:p><w:r><w:t>Textbox</w:t></w:r></w:p></wne:txbxContent></w:drawing></w:r></w:p></w:sdtContent></w:sdt>"#,
+        )
+        .expect("synthetic body SDT must parse");
+        let revision = RevisionInfo {
+            revision_id: 1,
+            identity: 1,
+            author: Some("Reviewer".to_string()),
+            date: Some("2026-08-16T00:00:00Z".to_string()),
+            apply_op_id: None,
+        };
+
+        track_body_sdt_content_change(&mut sdt, &revision, &mut 10, BodySdtChange::Deleted);
+
+        let xml = String::from_utf8(word_xml::serialize_raw_fragment(&sdt))
+            .expect("serialized SDT is UTF-8");
+        assert!(
+            xml.contains("<w:del") && xml.contains("<w:drawing>"),
+            "the drawing run must be carried by the deletion: {xml}"
+        );
+        assert!(
+            xml.contains("<w:t>Textbox</w:t>"),
+            "textbox text remains plain in its separate story scope: {xml}"
+        );
+        assert!(
+            !xml.contains("<w:delText>Textbox</w:delText>"),
+            "the outer deletion must not coerce nested textbox story text: {xml}"
+        );
+
+        let findings = crate::docx_validate_annotations::check_tracked_change_content_model(&[(
+            "word/document.xml".to_string(),
+            &sdt,
+        )]);
+        assert!(
+            findings.is_empty(),
+            "tracked textbox carrier must satisfy the OOXML content model: {findings:?}"
+        );
     }
 
     #[test]
@@ -9911,6 +11202,41 @@ mod tests {
         );
         assert!(paragraph_del_field_chars_imbalanced(&para));
         assert!(part_has_del_field_char_imbalance(&para));
+    }
+
+    #[test]
+    fn deleted_field_spanning_paragraphs_is_balanced_at_story_scope() {
+        // TOC fields routinely span several result paragraphs. Per-paragraph
+        // counting falsely classified both boundary paragraphs as torn even
+        // though the field is deleted consistently across the complete story.
+        let story = Element::parse(Cursor::new(
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                  <w:body>
+                    <w:p><w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:del></w:p>
+                    <w:p><w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                                  <w:r><w:fldChar w:fldCharType="end"/></w:r></w:del></w:p>
+                    <w:p><w:del><w:r><w:fldChar w:fldCharType="end"/></w:r></w:del></w:p>
+                  </w:body>
+                </w:document>"#,
+        ))
+        .expect("story XML");
+
+        assert!(!part_has_del_field_char_imbalance(&story));
+    }
+
+    #[test]
+    fn field_spanning_paragraphs_with_mixed_deletion_state_is_torn() {
+        let story = Element::parse(Cursor::new(
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                  <w:body>
+                    <w:p><w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:del></w:p>
+                    <w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+                  </w:body>
+                </w:document>"#,
+        ))
+        .expect("story XML");
+
+        assert!(part_has_del_field_char_imbalance(&story));
     }
 
     #[test]
@@ -10034,6 +11360,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relationship_reconciliation_imports_target_story_media_closure() {
+        let bytes = build_docx(&wrap_body("<w:p/>"));
+        let archive = DocxArchive::read(&bytes).expect("test package");
+        let mut base_pkg = DocxPackage::from_archive(&archive).expect("base package");
+        let mut target_pkg = base_pkg.clone();
+        let header_xml = br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:p><w:r><w:drawing><a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" r:embed="rId1"/></w:drawing></w:r></w:p></w:hdr>"#;
+        let header_rels_xml = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#;
+        let header_rels = crate::docx_package::RelationshipSet::parse(
+            header_rels_xml,
+            "word/_rels/header1.xml.rels",
+        )
+        .expect("header relationships");
+
+        target_pkg.set_part("word/header1.xml", header_xml.to_vec());
+        target_pkg.set_part("word/media/image1.png", b"target image".to_vec());
+        target_pkg.content_types.add_override(
+            "/word/header1.xml",
+            content_type_for_story_rel(HEADER_REL_TYPE).unwrap(),
+        );
+        target_pkg
+            .content_types
+            .add_override("/word/media/image1.png", "image/png");
+        target_pkg.story_rels.insert(
+            "word/_rels/header1.xml.rels".to_string(),
+            header_rels.clone(),
+        );
+
+        // Model the save path after it has serialized a target-owned header
+        // and copied that header's relationship set, but not its media closure.
+        base_pkg.set_part("word/header1.xml", header_xml.to_vec());
+        base_pkg
+            .story_rels
+            .insert("word/_rels/header1.xml.rels".to_string(), header_rels);
+        base_pkg.document_rels.add(HEADER_REL_TYPE, "header1.xml");
+
+        reconcile_output_relationship_graph(&mut base_pkg, &target_pkg)
+            .expect("target media closure should import");
+
+        assert_eq!(
+            base_pkg.get_part("word/media/image1.png"),
+            Some(b"target image".as_slice())
+        );
+        assert_eq!(
+            base_pkg
+                .content_types
+                .content_type_for_part("word/media/image1.png"),
+            Some("image/png")
+        );
+        assert!(missing_internal_relationship_targets(&base_pkg).is_empty());
+    }
+
+    #[test]
+    fn relationship_reconciliation_keeps_different_base_part_bytes() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body><w:p><w:r><w:drawing><a:blip r:embed="rId8"/></w:drawing></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let bytes = build_docx(document_xml);
+        let archive = DocxArchive::read(&bytes).expect("test package");
+        let mut base_pkg = DocxPackage::from_archive(&archive).expect("base package");
+        let mut target_pkg = base_pkg.clone();
+        base_pkg.set_part("word/media/image1.png", b"base image".to_vec());
+        base_pkg
+            .content_types
+            .add_override("/word/media/image1.png", "image/png");
+        target_pkg.set_part("word/media/image1.png", b"target image".to_vec());
+        target_pkg
+            .content_types
+            .add_override("/word/media/image1.png", "image/png");
+        assert!(target_pkg.document_rels.insert_exact(
+            "rId8",
+            IMAGE_REL_TYPE,
+            "media/image1.png",
+            None,
+        ));
+
+        reconcile_output_relationship_graph(&mut base_pkg, &target_pkg)
+            .expect("target-owned rId should import without overwriting base bytes");
+
+        assert_eq!(
+            base_pkg.get_part("word/media/image1.png"),
+            Some(b"base image".as_slice()),
+            "base-owned bytes must not be overwritten"
+        );
+        let imported_relationship = base_pkg
+            .document_rels
+            .find_by_id("rId8")
+            .expect("exact target relationship id");
+        let imported_path = base_pkg
+            .document_rels
+            .resolve_internal_target(&imported_relationship.target);
+        assert_ne!(imported_path, "word/media/image1.png");
+        assert_eq!(
+            base_pkg.get_part(&imported_path),
+            Some(b"target image".as_slice())
+        );
+    }
+
+    #[test]
+    fn relationship_reconciliation_refuses_unprovenanced_main_reference() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:hyperlink r:id="rIdMissing"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p><w:sectPr/></w:body></w:document>"#;
+        let bytes = build_docx(document_xml);
+        let archive = DocxArchive::read(&bytes).expect("test package");
+        let mut base_pkg = DocxPackage::from_archive(&archive).expect("base package");
+        let target_pkg = base_pkg.clone();
+
+        let error = reconcile_output_relationship_graph(&mut base_pkg, &target_pkg)
+            .expect_err("missing relationship provenance must fail");
+        assert!(
+            error
+                .message
+                .contains("neither source package supplies that binding"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
     fn decode_snapshot_blob(blob: &[u8]) -> PersistedEditSnapshot {
         let decoded = zstd::stream::decode_all(Cursor::new(blob)).expect("decode snapshot blob");
         bincode::deserialize(&decoded).expect("deserialize snapshot blob")
@@ -10100,6 +11543,33 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(restored.import.canonical, before.canonical);
         assert_eq!(restored.import.fingerprint, before.fingerprint);
+    }
+
+    #[test]
+    fn snapshot_blob_rejects_pre_numbering_resolution_schema() {
+        let bytes = build_docx(&wrap_body(
+            r#"<w:p><w:r><w:t>Schema witness.</w:t></w:r></w:p>"#,
+        ));
+        let runtime = SimpleRuntime::new();
+        let imported = runtime.import_docx(&bytes).expect("import clean docx");
+        let blob = runtime
+            .export_snapshot_blob(&imported.doc_handle)
+            .expect("export current snapshot blob");
+        let mut persisted = decode_snapshot_blob(&blob);
+        persisted.blob_schema_version = 26;
+        let encoded = bincode::serialize(&persisted).expect("encode prior-version witness");
+        let old_blob = zstd::stream::encode_all(Cursor::new(encoded), SNAPSHOT_BLOB_ZSTD_LEVEL)
+            .expect("compress prior-version witness");
+
+        let error = runtime
+            .import_snapshot_blob(&old_blob)
+            .expect_err("schema 26 must not decode without typed numbering resolution");
+        assert!(
+            error
+                .message
+                .contains("unsupported snapshot blob schema version 26, expected 28"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -10278,135 +11748,6 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "The party shall use best efforts to protect data.");
-    }
-
-    #[test]
-    fn single_document_view_reflects_tracked_edit_from_snapshot_state() {
-        let document_xml = wrap_body(
-            r#"
-    <w:p>
-      <w:r><w:t>The liability cap is one million dollars.</w:t></w:r>
-    </w:p>"#,
-        );
-        let bytes = build_docx(&document_xml);
-        let runtime = SimpleRuntime::new();
-        let imported = runtime.import_docx(&bytes).expect("import clean docx");
-
-        let tx = crate::edit::EditTransaction {
-            steps: vec![crate::edit::EditStep::ReplaceParagraphText {
-                block_id: NodeId::from("p_1"),
-                rationale: Some("lower the liability cap".to_string()),
-                replacement_role: None,
-                expect: "one million dollars".to_string(),
-                semantic_hash: None,
-                content: crate::edit::ParagraphContent {
-                    fragments: vec![crate::edit::ContentFragment::Text(
-                        "The liability cap is five hundred thousand dollars.".to_string(),
-                    )],
-                },
-            }],
-            summary: Some("Lower liability cap".to_string()),
-            materialization_mode: crate::edit::MaterializationMode::TrackedChange,
-            revision: RevisionInfo {
-                revision_id: 1,
-                identity: 0,
-                author: Some("Stemma".to_string()),
-                date: Some("2026-04-09T00:00:00Z".to_string()),
-                apply_op_id: None,
-            },
-        };
-
-        runtime
-            .apply_edit(&imported.doc_handle, &tx)
-            .expect("apply_edit should succeed");
-
-        let full_doc = runtime
-            .single_document_view(&imported.doc_handle)
-            .expect("single_document_view");
-        let block = &full_doc.blocks[0];
-        assert_eq!(block.change_type.as_str(), "modified");
-        assert!(
-            block
-                .segments
-                .iter()
-                .any(|seg| matches!(seg, crate::InlineChange::Deleted { .. })),
-            "single-document projection should show deleted tracked text after apply_edit",
-        );
-        assert!(
-            block
-                .segments
-                .iter()
-                .any(|seg| matches!(seg, crate::InlineChange::Inserted { .. })),
-            "single-document projection should show inserted tracked text after apply_edit",
-        );
-    }
-
-    #[test]
-    fn single_document_view_reflects_direct_edit_without_tracked_segments() {
-        let document_xml = wrap_body(
-            r#"
-    <w:p>
-      <w:r><w:t>The liability cap is one million dollars.</w:t></w:r>
-    </w:p>"#,
-        );
-        let bytes = build_docx(&document_xml);
-        let runtime = SimpleRuntime::new();
-        let imported = runtime.import_docx(&bytes).expect("import clean docx");
-
-        let tx = crate::edit::EditTransaction {
-            steps: vec![crate::edit::EditStep::ReplaceParagraphText {
-                block_id: NodeId::from("p_1"),
-                rationale: Some("lower the liability cap".to_string()),
-                replacement_role: None,
-                expect: "one million dollars".to_string(),
-                semantic_hash: None,
-                content: crate::edit::ParagraphContent {
-                    fragments: vec![crate::edit::ContentFragment::Text(
-                        "The liability cap is five hundred thousand dollars.".to_string(),
-                    )],
-                },
-            }],
-            summary: Some("Lower liability cap directly".to_string()),
-            materialization_mode: crate::edit::MaterializationMode::Direct,
-            revision: RevisionInfo {
-                revision_id: 1,
-                identity: 0,
-                author: Some("Stemma".to_string()),
-                date: Some("2026-04-09T00:00:00Z".to_string()),
-                apply_op_id: None,
-            },
-        };
-
-        runtime
-            .apply_edit(&imported.doc_handle, &tx)
-            .expect("apply_edit should succeed");
-
-        let tracked = runtime
-            .tracked_view(&imported.doc_handle)
-            .expect("tracked_view after direct edit");
-        let BlockNode::Paragraph(tracked_para) = &tracked.canonical.blocks[0].block else {
-            panic!("expected paragraph");
-        };
-        assert!(
-            tracked_para
-                .segments
-                .iter()
-                .all(|seg| seg.status == TrackingStatus::Normal),
-            "direct apply must not leave tracked segments behind",
-        );
-
-        let full_doc = runtime
-            .single_document_view(&imported.doc_handle)
-            .expect("single_document_view");
-        let block = &full_doc.blocks[0];
-        assert_eq!(block.change_type.as_str(), "unchanged");
-        assert!(
-            block
-                .segments
-                .iter()
-                .all(|seg| matches!(seg, crate::InlineChange::Unchanged { .. })),
-            "single-document projection should remain clean after direct apply",
-        );
     }
 
     #[test]
@@ -11018,6 +12359,7 @@ mod tests {
         use crate::domain::Mark;
 
         let fc = FormattingChange {
+            carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
             previous_marks: vec![],
             previous_style_props: StyleProps::default(),
             previous_rpr_authored: crate::domain::RunRprAuthored::default(),
@@ -11123,6 +12465,7 @@ mod tests {
                 rpr_authored: crate::domain::RunRprAuthored::default(),
                 source_run_attrs: Vec::new(),
                 formatting_change: Some(FormattingChange {
+                    carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                     previous_marks: vec![],
                     previous_style_props: StyleProps::default(),
                     previous_rpr_authored: crate::domain::RunRprAuthored::default(),
@@ -11487,19 +12830,16 @@ mod tests {
 
         let mut para = make_test_paragraph();
         para.cnf_style = Some(CnfStyle {
-            val: Some("100000000000".to_string()),
-            first_row: true,
-            last_row: false,
-            first_column: false,
-            last_column: false,
-            odd_v_band: false,
-            even_v_band: false,
-            odd_h_band: false,
-            even_h_band: false,
-            first_row_first_column: false,
-            first_row_last_column: false,
-            last_row_first_column: false,
-            last_row_last_column: false,
+            val: Some(crate::domain::CnfMask::try_from("100000000000").unwrap()),
+            first_row: Some(true),
+            last_row: Some(false),
+            extra_attrs: vec![crate::domain::QualifiedAttribute {
+                local_name: "custom".into(),
+                prefix: Some("w14".into()),
+                namespace: Some("http://schemas.microsoft.com/office/word/2010/wordml".into()),
+                value: "kept".into(),
+            }],
+            ..CnfStyle::default()
         });
         let ppr = build_paragraph_properties(&para, &mut 100, None).expect("pPr with cnfStyle");
         let mut buf = Vec::new();
@@ -11514,6 +12854,14 @@ mod tests {
         assert!(
             xml.contains("firstRow"),
             "firstRow attr should be present: {xml}"
+        );
+        assert!(
+            xml.contains("lastRow=\"0\""),
+            "authored OFF must remain distinct from absence: {xml}"
+        );
+        assert!(
+            xml.contains("custom=\"kept\""),
+            "extension attribute should roundtrip: {xml}"
         );
     }
 
@@ -11626,6 +12974,7 @@ mod tests {
         p.numbering = Some(NumberingInfo {
             num_id,
             ilvl,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: String::new(),
             is_bullet: false,
             restart_numbering: false,
@@ -11685,6 +13034,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -12003,7 +13353,7 @@ mod tests {
     // proved by `stemma-engine/tests/pending_parts_foundation.rs`.
     mod pending_parts_save {
         use super::super::*;
-        use super::make_test_paragraph;
+        use super::{make_table, make_test_paragraph};
         use crate::docx::{DocxArchive, DocxFile};
         use crate::docx_package::DocxPackage;
         use crate::domain::{
@@ -12129,6 +13479,80 @@ mod tests {
             doc
         }
 
+        /// One inserted table whose cell contains a typed hyperlink. Hyperlinks
+        /// deliberately have no `raw_xml`: their relationship id lives in the
+        /// canonical `HyperlinkData`, so relationship import must not depend on
+        /// the opaque-fragment path used by drawings and embedded objects.
+        fn doc_with_inserted_table_hyperlink(rid: &str, url: &str) -> CanonDoc {
+            let opaque = InlineNode::from(crate::domain::OpaqueInlineNode {
+                id: NodeId::from("link1"),
+                kind: OpaqueKind::Hyperlink(crate::domain::HyperlinkData {
+                    url: Some(url.to_string()),
+                    anchor: None,
+                    text: "Link".to_string(),
+                    r_id: Some(rid.to_string()),
+                    runs: vec![crate::domain::HyperlinkRun {
+                        text: "Link".to_string(),
+                        rpr_xml: None,
+                        additional_rpr_xml: Vec::new(),
+                        source_xml: None,
+                        source_run_attrs: Vec::new(),
+                        status: TrackingStatus::Normal,
+                    }],
+                    extra_attrs: Vec::new(),
+                }),
+                opaque_ref: "hyperlink_link1".to_string(),
+                proof_ref: ProofRef {
+                    part: DocPart::DocumentXml,
+                    block_id: NodeId::from("cell-p"),
+                    docx_anchor: String::new(),
+                },
+                wrapper_marks: Vec::new(),
+                wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
+                raw_xml: None,
+                content_hash: None,
+            });
+            let mut paragraph = make_test_paragraph();
+            paragraph.id = NodeId::from("cell-p");
+            paragraph.segments = vec![TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![opaque],
+            }];
+            let table = make_table(vec![BlockNode::from(paragraph)]);
+            let mut inserted = normal_tracked_block(BlockNode::from(table));
+            inserted.status = TrackingStatus::Inserted(RevisionInfo {
+                revision_id: 1,
+                identity: 1,
+                author: Some("Reviewer".to_string()),
+                date: None,
+                apply_op_id: None,
+            });
+            let mut doc = empty_canon();
+            doc.blocks = vec![inserted];
+            doc
+        }
+
+        fn first_table_hyperlink_rid(doc: &CanonDoc) -> Option<&str> {
+            let BlockNode::Table(table) = &doc.blocks.first()?.block else {
+                return None;
+            };
+            let BlockNode::Paragraph(paragraph) =
+                table.rows.first()?.cells.first()?.blocks.first()?
+            else {
+                return None;
+            };
+            let InlineNode::OpaqueInline(opaque) = paragraph.segments.first()?.inlines.first()?
+            else {
+                return None;
+            };
+            let OpaqueKind::Hyperlink(data) = &opaque.kind else {
+                return None;
+            };
+            data.r_id.as_deref()
+        }
+
         fn first_drawing_rid(doc: &CanonDoc) -> Option<String> {
             let BlockNode::Paragraph(p) = &doc.blocks[0].block else {
                 return None;
@@ -12137,7 +13561,20 @@ mod tests {
                 return None;
             };
             let raw = o.raw_xml.as_ref()?;
-            crate::diff::find_blip_rid(std::str::from_utf8(raw).ok()?)
+            crate::local_change::find_blip_rid(std::str::from_utf8(raw).ok()?)
+        }
+
+        fn first_opaque_relationship_rid(doc: &CanonDoc) -> Option<String> {
+            let BlockNode::Paragraph(paragraph) = &doc.blocks[0].block else {
+                return None;
+            };
+            let InlineNode::OpaqueInline(opaque) = &paragraph.segments[0].inlines[0] else {
+                return None;
+            };
+            let root = word_xml::parse_raw_fragment(opaque.raw_xml.as_ref()?).ok()?;
+            let mut referenced = Vec::new();
+            crate::docx_validate::collect_relationship_references(&root, &mut referenced);
+            referenced.into_iter().next()
         }
 
         /// One-paragraph CanonDoc with a single opaque inline whose `raw_xml` is
@@ -12267,6 +13704,240 @@ mod tests {
                         .content_types
                         .has_override(&format!("/{}", media_parts[0])),
                 "png content type must be declared"
+            );
+        }
+
+        #[test]
+        fn compared_inserted_drawing_imports_target_relationship_closure() {
+            let mut base_pkg = minimal_pkg(None);
+            let mut target_pkg = minimal_pkg(None);
+            let target_bytes = png_bytes();
+            target_pkg.set_part("word/media/image1.png", target_bytes.clone());
+            target_pkg
+                .content_types
+                .add_override("/word/media/image1.png", "image/png");
+            assert!(target_pkg.document_rels.insert_exact(
+                "rId7",
+                IMAGE_REL_TYPE,
+                "media/image1.png",
+                None,
+            ));
+            let mut doc = doc_with_inserted_drawing("rId7");
+
+            reconcile_target_relationships_for_inserted_content(
+                &mut doc,
+                &mut base_pkg,
+                &target_pkg,
+            )
+            .expect("target media import should succeed");
+
+            let imported_path = base_pkg
+                .part_names()
+                .find(|path| path.starts_with("word/media/"))
+                .expect("target media part should be copied")
+                .to_string();
+            assert_eq!(
+                base_pkg.get_part(&imported_path),
+                Some(target_bytes.as_slice())
+            );
+            assert_eq!(
+                base_pkg.content_types.content_type_for_part(&imported_path),
+                Some("image/png"),
+                "a copied media part must carry its source OPC content type"
+            );
+            assert_ne!(
+                first_drawing_rid(&doc).as_deref(),
+                Some("rId7"),
+                "the inserted drawing must use the output relationship"
+            );
+        }
+
+        #[test]
+        fn compared_inserted_chart_cannot_bind_to_colliding_base_relationship_id() {
+            const CHART_REL_TYPE: &str =
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+            const CHART_CONTENT_TYPE: &str =
+                "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+
+            let mut base_pkg = minimal_pkg(None);
+            assert!(base_pkg.document_rels.insert_exact(
+                "rId7",
+                HYPERLINK_REL_TYPE,
+                "https://base.example.invalid/",
+                Some("External"),
+            ));
+
+            let mut target_pkg = minimal_pkg(None);
+            let chart_bytes = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>"#;
+            target_pkg.set_part("word/charts/chart1.xml", chart_bytes.to_vec());
+            target_pkg
+                .content_types
+                .add_override("/word/charts/chart1.xml", CHART_CONTENT_TYPE);
+            assert!(target_pkg.document_rels.insert_exact(
+                "rId7",
+                CHART_REL_TYPE,
+                "charts/chart1.xml",
+                None,
+            ));
+
+            let mut doc = doc_with_inserted_drawing("rId7");
+            let BlockNode::Paragraph(paragraph) = &mut doc.blocks[0].block else {
+                panic!("fixture must contain a paragraph");
+            };
+            let InlineNode::OpaqueInline(opaque) = &mut paragraph.segments[0].inlines[0] else {
+                panic!("fixture must contain opaque inline content");
+            };
+            opaque.raw_xml = Some(
+                format!(
+                    r#"<w:drawing xmlns:w="{STYLES_NS}" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart r:id="rId7"/></w:drawing>"#
+                )
+                .into_bytes(),
+            );
+
+            reconcile_target_relationships_for_inserted_content(
+                &mut doc,
+                &mut base_pkg,
+                &target_pkg,
+            )
+            .expect("target chart import should succeed");
+
+            let output_rid = first_opaque_relationship_rid(&doc)
+                .expect("rewritten chart reference should remain present");
+            assert_ne!(
+                output_rid, "rId7",
+                "target-owned XML must not retain a colliding base relationship id"
+            );
+            let base_binding = base_pkg
+                .document_rels
+                .find_by_id("rId7")
+                .expect("the base relationship must remain present");
+            assert_eq!(base_binding.rel_type, HYPERLINK_REL_TYPE);
+            assert_eq!(base_binding.target_mode.as_deref(), Some("External"));
+
+            let chart_binding = base_pkg
+                .document_rels
+                .find_by_id(&output_rid)
+                .expect("rewritten chart relationship must resolve");
+            assert_eq!(chart_binding.rel_type, CHART_REL_TYPE);
+            let imported_path = base_pkg
+                .document_rels
+                .resolve_internal_target(&chart_binding.target);
+            assert_eq!(
+                base_pkg.get_part(&imported_path),
+                Some(chart_bytes.as_slice()),
+                "the rewritten relationship must resolve to the target chart bytes"
+            );
+            assert_eq!(
+                base_pkg.content_types.content_type_for_part(&imported_path),
+                Some(CHART_CONTENT_TYPE)
+            );
+        }
+
+        #[test]
+        fn compared_inserted_table_hyperlink_cannot_bind_to_colliding_base_relationship_id() {
+            let mut base_pkg = minimal_pkg(None);
+            assert!(base_pkg.document_rels.insert_exact(
+                "rId7",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml",
+                "../customXml/item1.xml",
+                None,
+            ));
+
+            let target_url = "https://target.example.invalid/benefits";
+            let mut target_pkg = minimal_pkg(None);
+            assert!(target_pkg.document_rels.insert_exact(
+                "rId7",
+                HYPERLINK_REL_TYPE,
+                target_url,
+                Some("External"),
+            ));
+            let mut doc = doc_with_inserted_table_hyperlink("rId7", target_url);
+
+            reconcile_target_relationships_for_inserted_content(
+                &mut doc,
+                &mut base_pkg,
+                &target_pkg,
+            )
+            .expect("typed hyperlink relationship import should succeed inside a table");
+
+            let output_rid = first_table_hyperlink_rid(&doc)
+                .expect("the table hyperlink must retain a relationship id");
+            assert_ne!(
+                output_rid, "rId7",
+                "target-owned typed hyperlink must not retain a colliding base relationship id"
+            );
+            let binding = base_pkg
+                .document_rels
+                .find_by_id(output_rid)
+                .expect("the remapped hyperlink relationship must resolve");
+            assert_eq!(binding.rel_type, HYPERLINK_REL_TYPE);
+            assert_eq!(binding.target, target_url);
+            assert_eq!(binding.target_mode.as_deref(), Some("External"));
+        }
+
+        #[test]
+        fn compared_inserted_body_control_remaps_nested_relationships() {
+            const CHART_REL_TYPE: &str =
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+            const CHART_CONTENT_TYPE: &str =
+                "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+
+            let mut base_pkg = minimal_pkg(None);
+            assert!(base_pkg.document_rels.insert_exact(
+                "rId7",
+                HYPERLINK_REL_TYPE,
+                "https://base.example.invalid/",
+                Some("External"),
+            ));
+            let mut target_pkg = minimal_pkg(None);
+            let chart_bytes = b"target chart bytes";
+            target_pkg.set_part("word/charts/chart1.xml", chart_bytes.to_vec());
+            target_pkg
+                .content_types
+                .add_override("/word/charts/chart1.xml", CHART_CONTENT_TYPE);
+            assert!(target_pkg.document_rels.insert_exact(
+                "rId7",
+                CHART_REL_TYPE,
+                "charts/chart1.xml",
+                None,
+            ));
+
+            let raw = format!(
+                r#"<w:sdt xmlns:w="{STYLES_NS}" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:sdtContent><w:p><w:r><w:drawing><c:chart r:id="rId7"/></w:drawing></w:r></w:p></w:sdtContent></w:sdt>"#
+            );
+            let mut children = HashMap::from([(
+                4,
+                XMLNode::Element(
+                    word_xml::parse_raw_fragment(raw.as_bytes()).expect("fixture XML parses"),
+                ),
+            )]);
+
+            reconcile_target_relationships_for_opaque_body_children(
+                &mut children,
+                &mut base_pkg,
+                &target_pkg,
+            )
+            .expect("body-control relationship import should succeed");
+
+            let XMLNode::Element(control) = children.get(&4).expect("control remains present")
+            else {
+                panic!("fixture must remain an element");
+            };
+            let mut referenced = Vec::new();
+            crate::docx_validate::collect_relationship_references(control, &mut referenced);
+            assert_eq!(referenced.len(), 1);
+            assert_ne!(referenced[0], "rId7");
+            let binding = base_pkg
+                .document_rels
+                .find_by_id(&referenced[0])
+                .expect("nested chart reference must resolve");
+            assert_eq!(binding.rel_type, CHART_REL_TYPE);
+            let imported_path = base_pkg
+                .document_rels
+                .resolve_internal_target(&binding.target);
+            assert_eq!(
+                base_pkg.get_part(&imported_path),
+                Some(chart_bytes.as_slice())
             );
         }
 
@@ -12606,12 +14277,33 @@ mod tests {
             para.numbering = Some(NumberingInfo {
                 num_id,
                 ilvl: 0,
+                resolution: crate::domain::NumberingResolution::Resolved,
                 synthesized_text: "1.".to_string(),
                 is_bullet: false,
                 restart_numbering: false,
             });
             let mut doc = empty_canon();
             doc.blocks = vec![normal_tracked_block(BlockNode::from(para))];
+            doc
+        }
+
+        fn doc_needing_num_ids(num_ids: &[u32]) -> CanonDoc {
+            let mut doc = empty_canon();
+            doc.blocks = num_ids
+                .iter()
+                .map(|&num_id| {
+                    let mut para = make_test_paragraph();
+                    para.numbering = Some(NumberingInfo {
+                        num_id,
+                        ilvl: 0,
+                        resolution: crate::domain::NumberingResolution::Resolved,
+                        synthesized_text: "1.".to_string(),
+                        is_bullet: false,
+                        restart_numbering: false,
+                    });
+                    normal_tracked_block(BlockNode::from(para))
+                })
+                .collect();
             doc
         }
 
@@ -12683,6 +14375,50 @@ mod tests {
             ])
         }
 
+        fn target_archive_with_two_numbering_definitions() -> DocxArchive {
+            DocxArchive::from_parts(vec![
+                DocxFile {
+                    name: "word/document.xml".to_string(),
+                    data: br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body/></w:document>"#
+                        .to_vec(),
+                },
+                DocxFile {
+                    name: "word/numbering.xml".to_string(),
+                    data: br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0"/></w:abstractNum>
+  <w:abstractNum w:abstractNumId="16"><w:lvl w:ilvl="0"/></w:abstractNum>
+  <w:num w:numId="14"><w:abstractNumId w:val="9"/></w:num>
+  <w:num w:numId="5"><w:abstractNumId w:val="16"/></w:num>
+</w:numbering>"#
+                        .to_vec(),
+                },
+            ])
+        }
+
+        fn target_archive_with_numbering(numbering: &str) -> DocxArchive {
+            DocxArchive::from_parts(vec![
+                DocxFile {
+                    name: "word/document.xml".to_string(),
+                    data: br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body/></w:document>"#
+                        .to_vec(),
+                },
+                DocxFile {
+                    name: "word/numbering.xml".to_string(),
+                    data: numbering.as_bytes().to_vec(),
+                },
+            ])
+        }
+
+        fn install_base_numbering(base_pkg: &mut DocxPackage, numbering: &str) {
+            base_pkg.set_part("word/numbering.xml", numbering.as_bytes().to_vec());
+            base_pkg.document_rels.add(
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering",
+                "numbering.xml",
+            );
+        }
+
         #[test]
         fn errors_when_needed_and_target_has_no_numbering_part() {
             let mut doc = doc_needing_num_id(5);
@@ -12703,6 +14439,84 @@ mod tests {
                 "error should name the unresolved numId: {}",
                 err.message
             );
+        }
+
+        #[test]
+        fn target_without_numbering_is_valid_when_base_defines_every_live_num_id() {
+            let mut doc = doc_needing_num_id(5);
+            let mut base_pkg = base_pkg_without_numbering();
+            base_pkg.set_part(
+                "word/numbering.xml",
+                br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+  <w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>"#
+                    .to_vec(),
+            );
+            base_pkg.document_rels.add(
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering",
+                "numbering.xml",
+            );
+            let target_archive = target_archive_without_numbering();
+
+            merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
+                .expect("the base already closes every live numbering reference");
+            assert!(base_pkg.get_part("word/numbering.xml").is_some());
+        }
+
+        #[test]
+        fn refuses_active_same_num_id_with_different_definition() {
+            let mut doc = doc_needing_num_id(5);
+            let mut base_pkg = base_pkg_without_numbering();
+            install_base_numbering(
+                &mut base_pkg,
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            );
+            let target_archive = target_archive_with_numbering(
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="9"/></w:num></w:numbering>"#,
+            );
+
+            let err = merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
+                .expect_err("one physical numId cannot select two active definitions");
+
+            assert_eq!(err.code, ErrorCode::UnsupportedEdit);
+            assert!(err.message.contains("active numId 5"), "{}", err.message);
+            assert_eq!(
+                err.details.context.as_deref(),
+                Some("word/numbering.xml/w:num[@w:numId='5']")
+            );
+        }
+
+        #[test]
+        fn accepts_same_definition_with_different_abstract_transport_id() {
+            let mut doc = doc_needing_num_id(5);
+            let mut base_pkg = base_pkg_without_numbering();
+            install_base_numbering(
+                &mut base_pkg,
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            );
+            let target_archive = target_archive_with_numbering(
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="9"/></w:num></w:numbering>"#,
+            );
+
+            merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
+                .expect("transport-only abstract numbering IDs are not semantic conflicts");
+        }
+
+        #[test]
+        fn accepts_same_definition_with_different_word_generated_identity_tokens() {
+            let mut doc = doc_needing_num_id(5);
+            let mut base_pkg = base_pkg_without_numbering();
+            install_base_numbering(
+                &mut base_pkg,
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"><w:abstractNum w:abstractNumId="0"><w:nsid w:val="AAAAAAAA"/><w:tmpl w:val="BBBBBBBB"/><w:lvl w:ilvl="0" w:tplc="CCCCCCCC"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5" w16cid:durableId="123"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            );
+            let target_archive = target_archive_with_numbering(
+                r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"><w:abstractNum w:abstractNumId="9"><w:nsid w:val="11111111"/><w:tmpl w:val="22222222"/><w:lvl w:ilvl="0" w:tplc="33333333"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5" w16cid:durableId="456"><w:abstractNumId w:val="9"/></w:num></w:numbering>"#,
+            );
+
+            merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
+                .expect("Word-generated numbering identity tokens are transport state");
         }
 
         #[test]
@@ -12733,6 +14547,46 @@ mod tests {
 
             merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
                 .expect("no needed numIds means nothing to source");
+        }
+
+        #[test]
+        fn copies_missing_numbering_definitions_in_stable_num_id_order() {
+            // The document discovers 14 before 5 and the target also stores 14
+            // first. Neither source order may leak through HashSet iteration:
+            // copied definitions are ordered by the referenced numId.
+            let mut doc = doc_needing_num_ids(&[14, 5]);
+            let mut base_pkg = base_pkg_without_numbering();
+            let target_archive = target_archive_with_two_numbering_definitions();
+
+            merge_target_numbering(&mut doc, &mut base_pkg, &target_archive)
+                .expect("both live numbering definitions are available in the target");
+
+            let numbering = String::from_utf8(
+                base_pkg
+                    .get_part("word/numbering.xml")
+                    .expect("merge authors numbering.xml")
+                    .to_vec(),
+            )
+            .expect("numbering.xml is UTF-8");
+            let abstract_16 = numbering
+                .find("abstractNumId=\"16\"")
+                .expect("numId 5's abstract definition was copied");
+            let abstract_9 = numbering
+                .find("abstractNumId=\"9\"")
+                .expect("numId 14's abstract definition was copied");
+            let num_5 = numbering
+                .find("numId=\"5\"")
+                .expect("numId 5 definition was copied");
+            let num_14 = numbering
+                .find("numId=\"14\"")
+                .expect("numId 14 definition was copied");
+
+            assert!(
+                abstract_16 < abstract_9,
+                "abstract definitions: {numbering}"
+            );
+            assert!(abstract_9 < num_5, "schema groups: {numbering}");
+            assert!(num_5 < num_14, "numbering instances: {numbering}");
         }
     }
 }

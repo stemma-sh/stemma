@@ -21,6 +21,8 @@
 //! (opens-clean), never on re-serialized XML.
 
 use std::io::{Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::api::{Document, validate};
 

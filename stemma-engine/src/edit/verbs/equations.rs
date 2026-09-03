@@ -5,10 +5,11 @@
 //! This verb is a **lift**, not a build: the IR already models math as
 //! `OpaqueKind::OmmlInline` / `OpaqueKind::OmmlBlock`, the importer maps both
 //! (`import.rs` ~4674), and the serializer already emits them — including a
-//! tracked container for the block form (`append_tracked_omml_paragraph_opaque`
-//! wraps `m:oMathPara` inside `w:ins`/`w:del`). So block equations are
-//! tracked-change-capable for free, and inline equations ride the same
-//! segment-splice the cross-reference verb uses.
+//! block form directly. Inline equations use the same tracked segment splice
+//! as cross-references. Native Word does not reliably resolve a tracked
+//! `m:oMathPara` wrapped directly in `w:ins`, so tracked block insertion is
+//! refused until a qualified carrier exists; direct block insertion remains
+//! supported.
 //!
 //! Unlike the field verb (`raw_xml: None`, serializer rebuilds), an equation's
 //! OMML fragment **is** the source of truth — there is no semantic OMML builder.
@@ -93,6 +94,10 @@ pub(crate) fn apply(
             expected_root,
             step_index,
         });
+    }
+
+    if placement == EquationPlacement::Block && mode == MaterializationMode::TrackedChange {
+        return Err(EditError::TrackedBlockEquationUnsupported { step_index });
     }
 
     let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {

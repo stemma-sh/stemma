@@ -58,14 +58,15 @@ maintainer checklist; contributors never need it.
    publication freezes the approved assets and tag, and the final workflow
    assertion fails unless GitHub reports `immutable: true`. Tag rules alone do
    not prevent a contents writer from replacing or deleting release assets.
-7. **crates.io.** The workspace has five package names: `stemma` (engine),
-   `stemma-artifacts` (host artifact boundary), `stemma-cli`, `stemma-mcp`,
-   and `stemma-api`. As of 2026-07-12, the project's `stemma` and
-   `stemma-cli` 0.1.0 releases exist in the registry; `stemma-artifacts` has
-   not been published yet and must be claimed before publishing a CLI version
-   that depends on it. `stemma-mcp` and `stemma-api` are intentionally absent
-   from crates.io. Log in with GitHub, `cargo login` with an API token (scoped
-   to publish, short expiry), then see "crates.io" under Per release below.
+7. **crates.io.** The release surface has six versioned package names: `stemma` (engine),
+   `stemma-diff` (opinionated comparison), `stemma-artifacts` (host artifact
+   boundary), `stemma-cli`, `stemma-mcp`, and `stemma-api`. As of 2026-07-12,
+   the project's `stemma` and `stemma-cli` 0.1.0 releases exist in the
+   registry; `stemma-artifacts` 0.5.0 is also published. `stemma-diff` has not
+   been published yet and must be claimed before publishing a CLI version that
+   depends on it. `stemma-mcp` and `stemma-api` are intentionally absent from
+   crates.io. Log in with GitHub, `cargo login` with an API token (scoped to
+   publish, short expiry), then see "crates.io" under Per release below.
    A first publish stays deliberately manual and local: a long-lived registry
    token must never live in CI secrets (any compromised workflow step can
    read it), and trusted publishing cannot be configured on a crate that does
@@ -76,7 +77,9 @@ maintainer checklist; contributors never need it.
    workflow (`release.yml`). Then a `crates-publish` job can be added to
    release.yml using OIDC (`id-token: write`, no stored token), and the
    local API token is revoked. Until that job exists, crates publishes stay
-   manual per release.
+   manual per release. The workspace also contains the unversioned,
+   `publish = false` `stemma-doc-tests` compile guard; it is not a release
+   package.
 9. **Mailboxes.** `security@stemma.sh` and `conduct@stemma.sh` must be live —
    SECURITY.md and CODE_OF_CONDUCT.md point at them.
 
@@ -84,13 +87,11 @@ maintainer checklist; contributors never need it.
 
 1. Update versions. Releases use stable `MAJOR.MINOR.PATCH` versions only;
    prerelease and build metadata are refused rather than silently assigned to
-   npm's `latest` tag. `stemma-mcp/Cargo.toml` is the single source of truth for
-   the npm packages — the assembly script stamps every package.json from it.
-   Keep `stemma-mcp/mcpb/manifest.json` and
-   `stemma-mcp/plugin/.claude-plugin/plugin.json` in step. For a crates.io
-   release, also update `stemma`, `stemma-artifacts`, and `stemma-cli` package
-   versions together, plus the `stemma`/`stemma-artifacts` registry version
-   requirements in the CLI and MCP manifests; commit the resulting lockfile.
+   npm's `latest` tag. All six release package versions and the MCPB and
+   Claude plugin manifests must match. `stemma-mcp/Cargo.toml` remains the
+   source from which the npm assembly script stamps every package.json. Update
+   the `stemma`, `stemma-diff`, and `stemma-artifacts` registry requirements in
+   dependent manifests at the same time, then commit the resulting lockfile.
 2. Move the `[Unreleased]` CHANGELOG section under the new version heading.
 3. If the README includes a captured Word demonstration, regenerate the
    synthetic redline through the promoted natural-language MCP workflow before
@@ -99,7 +100,9 @@ maintainer checklist; contributors never need it.
    confirm that accept/reject match `demo/accepted.txt` and
    `demo/rejected.txt`. A rendering fabricated from XML or another editor is
    not a Word demonstration.
-4. `just gate` — green, no exceptions.
+4. `just gate` — green, no exceptions. This includes building and doctesting
+   each publishable crate from its extracted `.crate` archive outside the
+   workspace, so repository-only paths cannot leak into a source package.
 5. Commit and push the release commit. Do not create the tag yet. Start the
    manual workflow from that exact ref:
 
@@ -177,21 +180,23 @@ maintainer checklist; contributors never need it.
    reuse the SHA-stamped platform tarballs.
 7. **crates.io** (manual and deliberate — the workflow does not touch cargo).
    Publishing is per-crate opt-in through each `Cargo.toml`'s `publish` field.
-   Intended split: `stemma` (the engine library), `stemma-artifacts` (the
-   shared host-side artifact boundary required by transports), and
-   `stemma-cli` (`cargo install stemma-cli`) publish; `stemma-mcp` stays off
-   crates.io because npm/prebuilt binaries are its distribution channel;
-   `stemma-api` stays unpublished because it is demo infrastructure, not a
-   deployable. Then, with a registry token in the environment:
+   Intended split: `stemma` (the engine library), `stemma-diff` (the
+   downstream comparison compiler), `stemma-artifacts` (the shared host-side
+   artifact boundary required by transports), and `stemma-cli` (`cargo install
+   stemma-cli`) publish; `stemma-mcp` stays off crates.io because npm/prebuilt
+   binaries are its distribution channel; `stemma-api` stays unpublished
+   because it is demo infrastructure, not a deployable. Then, with a registry
+   token in the environment:
 
    ```bash
    just publish-crates
    ```
 
-   The recipe enforces `stemma` → `stemma-artifacts` → `stemma-cli`. Each real
-   `cargo publish` waits for registry visibility before the next package; the
-   CLI's two internal dependencies carry both `path` and `version`. The recipe
-   uses the committed lockfile, dry-runs each crate immediately before its
+   The recipe enforces `stemma` → `stemma-diff` → `stemma-artifacts` →
+   `stemma-cli`. Each real `cargo publish` waits for registry visibility before
+   the next package; the CLI's three internal dependencies carry both `path`
+   and `version`. The recipe uses the committed lockfile, dry-runs each crate
+   immediately before its
    real publish, refuses a dirty working tree, and asks for confirmation.
 8. Verify exact packages from a clean machine:
    `npx -y @stemma-sh/mcp@<version> --version` must print

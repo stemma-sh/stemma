@@ -449,7 +449,8 @@ fn framepr_dropcap_lines_at_word_max_10_opens_clean() {
 #[test]
 fn numpr_ilvl_serializes_before_numid() {
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>numbered body</w:t></w:r></w:p><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
+    let numbering = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%3."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+    let b = make_docx(body, &[("word/numbering.xml", numbering)]);
     let xml = reserialize(&b);
 
     assert!(

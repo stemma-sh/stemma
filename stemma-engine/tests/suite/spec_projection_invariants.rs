@@ -23,9 +23,9 @@
 use std::collections::HashMap;
 use std::fs;
 
-use stemma::diff::project_tracked_document;
-use stemma::domain::{BlockType, FullDocBlock};
 use stemma::{DocxRuntime, SimpleRuntime};
+use stemma_diff::test_support::project_tracked_document;
+use stemma_diff::{BlockType, FullDocBlock};
 
 /// Import a DOCX and run the tracked-document projection over it.
 fn project_fixture(doc_bytes: &[u8]) -> Vec<FullDocBlock> {

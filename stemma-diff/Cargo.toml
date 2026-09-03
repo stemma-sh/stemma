@@ -1,0 +1,28 @@
+[package]
+name = "stemma-diff"
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Opinionated document comparison for the Stemma Word engine."
+repository = "https://github.com/stemma-sh/stemma"
+keywords = ["docx", "ooxml", "tracked-changes", "diff", "wordprocessingml"]
+categories = ["text-processing"]
+license = "MIT OR Apache-2.0"
+publish = true
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+stemma = { path = "../stemma-engine", version = "0.6.0" }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+similar = "2.6"
+tracing = "0.1.40"
+unicode-segmentation = "1.11"
+xmltree = { package = "xmltree-ns", version = "0.13", features = ["attribute-order"] }
+
+[dev-dependencies]
+zip = "0.6.6"

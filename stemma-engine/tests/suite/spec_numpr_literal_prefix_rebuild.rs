@@ -30,6 +30,8 @@ use stemma::{
     CanonDoc, DocxRuntime, ExportMode, ExportOptions, SimpleRuntime, TransactionMeta, accept_all,
     docx_validate::validate_docx, reject_all_with_styles,
 };
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use crate::common;
 

@@ -8,6 +8,8 @@
 //! marked `#[ignore]` with the gap reason — they become a live TODO list.
 
 use std::fs;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{
     DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta, redline_extract::extract_redline,

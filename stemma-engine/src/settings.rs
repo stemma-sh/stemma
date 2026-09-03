@@ -26,7 +26,7 @@ fn parse_settings_root_bytes(xml_bytes: Option<&[u8]>) -> Result<Option<xmltree:
         .map_err(|err| format!("failed to parse word/settings.xml: {err:?}"))
 }
 
-fn parse_on_off_value(value: &str, context: &str) -> Result<bool, String> {
+pub fn parse_on_off_value(value: &str, context: &str) -> Result<bool, String> {
     match value {
         "1" | "true" | "on" => Ok(true),
         "0" | "false" | "off" => Ok(false),
@@ -197,9 +197,7 @@ pub fn parse_default_tab_stop(archive: &DocxArchive) -> Result<Option<i32>, Stri
 /// an already-decoded [`crate::docx_package::DocxPackage`], not a
 /// [`DocxArchive`], but must use the same setting when re-deriving paragraph tab
 /// geometry after accept/reject.
-pub(crate) fn parse_default_tab_stop_bytes(
-    xml_bytes: Option<&[u8]>,
-) -> Result<Option<i32>, String> {
+pub fn parse_default_tab_stop_bytes(xml_bytes: Option<&[u8]>) -> Result<Option<i32>, String> {
     let Some(root) = parse_settings_root_bytes(xml_bytes)? else {
         return Ok(None);
     };
@@ -208,16 +206,85 @@ pub(crate) fn parse_default_tab_stop_bytes(
             xmltree::XMLNode::Element(el) => el,
             _ => continue,
         };
-        if local_name(&el.name) == "defaultTabStop" {
+        if crate::word_xml::is_w_tag(el, "defaultTabStop") {
             let val = crate::xml_attrs::attr_get(el, "val")
                 .ok_or_else(|| "word/settings.xml defaultTabStop missing w:val".to_string())?;
-            let parsed = val.parse::<i32>().map_err(|err| {
-                format!("word/settings.xml defaultTabStop has invalid w:val '{val}': {err}")
-            })?;
+            let parsed = match crate::import::parse_measurement_or_percent(
+                val,
+                "word/settings.xml defaultTabStop",
+            )
+            .map_err(|err| err.message)?
+            {
+                crate::import::MeasurementOrPercent::Number(value)
+                | crate::import::MeasurementOrPercent::UniversalTwips(value) => {
+                    i32::try_from(value).map_err(|_| {
+                        format!(
+                            "word/settings.xml defaultTabStop value '{val}' is outside the i32 twips range"
+                        )
+                    })?
+                }
+                crate::import::MeasurementOrPercent::Percent { .. } => {
+                    return Err(format!(
+                        "word/settings.xml defaultTabStop has invalid percentage w:val '{val}'"
+                    ));
+                }
+            };
             return Ok(Some(parsed));
         }
     }
     Ok(None)
+}
+
+/// Author one exact positive `w:defaultTabStop` interval on a validated
+/// settings root.
+///
+/// This writer is intentionally strict: duplicate elements are ambiguous and
+/// a non-positive interval cannot define Word's default tab grid. Callers use
+/// it to construct a temporary semantic projection, not to repair malformed
+/// input.
+pub fn set_default_tab_stop(
+    root: &mut xmltree::Element,
+    interval_twips: i32,
+) -> Result<(), String> {
+    if interval_twips <= 0 {
+        return Err(format!(
+            "word/settings.xml defaultTabStop must be positive, got {interval_twips}"
+        ));
+    }
+    let matching: Vec<_> = root
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| match child {
+            xmltree::XMLNode::Element(element)
+                if crate::word_xml::is_w_tag(element, "defaultTabStop") =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect();
+    if matching.len() > 1 {
+        return Err(format!(
+            "word/settings.xml contains {} defaultTabStop elements; expected at most one",
+            matching.len()
+        ));
+    }
+    if let Some(index) = matching.first().copied() {
+        let xmltree::XMLNode::Element(element) = &mut root.children[index] else {
+            unreachable!("matching index was selected from an element")
+        };
+        crate::xml_attrs::attr_set(element, "w:val", interval_twips.to_string());
+        return Ok(());
+    }
+
+    let mut element = xmltree::Element::new("w:defaultTabStop");
+    element.prefix = Some("w".to_string());
+    element.namespace =
+        Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main".to_string());
+    crate::xml_attrs::attr_set(&mut element, "w:val", interval_twips.to_string());
+    root.children.insert(0, xmltree::XMLNode::Element(element));
+    Ok(())
 }
 
 /// Parse compatibility settings from `w:compat/w:compatSetting` in `word/settings.xml`.
@@ -361,31 +428,41 @@ pub fn parse_document_protection(
         if local_name(&el.name) != "documentProtection" {
             continue;
         }
-
-        let edit = match crate::xml_attrs::attr_get(el, "edit") {
-            None => None,
-            Some(val) => Some(parse_doc_protect_edit(val)?),
-        };
-
-        let enforcement = match crate::xml_attrs::attr_get(el, "enforcement") {
-            None => None,
-            Some(val) => Some(parse_on_off_value(
-                val,
-                "word/settings.xml documentProtection enforcement",
-            )?),
-        };
-
-        let has_credential = ["hash", "salt", "hashValue", "saltValue"]
-            .iter()
-            .any(|name| crate::xml_attrs::attr_get(el, name).is_some());
-
-        return Ok(Some(DocumentProtection {
-            edit,
-            enforcement,
-            has_credential,
-        }));
+        return parse_document_protection_element(el).map(Some);
     }
     Ok(None)
+}
+
+/// Parse one already-identified `w:documentProtection` element.
+///
+/// Keeping this edge parser shared prevents the active-package projection and
+/// the imported document model from assigning different meanings to the same
+/// protection declaration.
+pub fn parse_document_protection_element(
+    element: &xmltree::Element,
+) -> Result<DocumentProtection, String> {
+    let edit = match crate::xml_attrs::attr_get(element, "edit") {
+        None => None,
+        Some(value) => Some(parse_doc_protect_edit(value)?),
+    };
+
+    let enforcement = match crate::xml_attrs::attr_get(element, "enforcement") {
+        None => None,
+        Some(value) => Some(parse_on_off_value(
+            value,
+            "word/settings.xml documentProtection enforcement",
+        )?),
+    };
+
+    let has_credential = ["hash", "salt", "hashValue", "saltValue"]
+        .iter()
+        .any(|name| crate::xml_attrs::attr_get(element, name).is_some());
+
+    Ok(DocumentProtection {
+        edit,
+        enforcement,
+        has_credential,
+    })
 }
 
 #[cfg(test)]
@@ -445,6 +522,27 @@ mod tests {
         let archive = archive_with_settings(xml);
         let err = parse_default_tab_stop(&archive).expect_err("invalid defaultTabStop must error");
         assert!(err.contains("defaultTabStop"));
+    }
+
+    #[test]
+    fn test_parse_default_tab_stop_converts_universal_measure_to_twips() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:settings xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main">
+  <w:defaultTabStop w:val="36pt"/>
+</w:settings>"#;
+        let archive = archive_with_settings(xml);
+        assert_eq!(parse_default_tab_stop(&archive).unwrap(), Some(720));
+    }
+
+    #[test]
+    fn test_parse_default_tab_stop_rejects_percentage() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:settings xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main">
+  <w:defaultTabStop w:val="50%"/>
+</w:settings>"#;
+        let archive = archive_with_settings(xml);
+        let err = parse_default_tab_stop(&archive).expect_err("percentage is not a twips measure");
+        assert!(err.contains("percentage"), "unexpected error: {err}");
     }
 
     // ── evenAndOddHeaders tests ─────────────────────────────────────────
@@ -821,5 +919,57 @@ mod tests {
             err.contains("enforcement"),
             "error must name enforcement: {err}"
         );
+    }
+
+    #[test]
+    fn default_tab_stop_writer_authors_one_positive_interval() {
+        let mut root = xmltree::Element::parse(
+            br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="720"/></w:settings>"#
+                .as_slice(),
+        )
+        .expect("settings XML");
+        set_default_tab_stop(&mut root, 360).expect("positive interval");
+        let mut bytes = Vec::new();
+        root.write(&mut bytes).expect("serialize settings");
+        assert_eq!(
+            parse_default_tab_stop_bytes(Some(&bytes)).expect("parse rewritten interval"),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn default_tab_stop_writer_refuses_invalid_or_ambiguous_state() {
+        let mut empty = xmltree::Element::parse(
+            br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#
+                .as_slice(),
+        )
+        .expect("settings XML");
+        assert!(set_default_tab_stop(&mut empty, 0).is_err());
+
+        let mut duplicate = xmltree::Element::parse(
+            br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:defaultTabStop w:val="720"/><w:defaultTabStop w:val="360"/></w:settings>"#
+                .as_slice(),
+        )
+        .expect("settings XML");
+        let error = set_default_tab_stop(&mut duplicate, 180)
+            .expect_err("duplicate defaultTabStop is ambiguous");
+        assert!(error.contains("2 defaultTabStop"));
+    }
+
+    #[test]
+    fn default_tab_stop_ignores_a_foreign_same_local_name() {
+        let mut root = xmltree::Element::parse(
+            br#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:x="urn:extension"><x:defaultTabStop x:val="999"/></w:settings>"#
+                .as_slice(),
+        )
+        .expect("settings XML");
+        set_default_tab_stop(&mut root, 360).expect("foreign extension is not a Word setting");
+        let mut bytes = Vec::new();
+        root.write(&mut bytes).expect("serialize settings");
+        assert_eq!(
+            parse_default_tab_stop_bytes(Some(&bytes)).expect("parse Word setting"),
+            Some(360)
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("x:defaultTabStop"));
     }
 }

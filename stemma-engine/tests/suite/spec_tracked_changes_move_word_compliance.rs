@@ -564,7 +564,6 @@ fn move_in_math_treated_as_ins_del_not_move() {
     );
 }
 
-#[ignore = "open question: inverted post-condition asserts !report.ok for w:moveFrom nested in w:moveFrom (Word forbids nesting), but stemma opens it leniently (ok=true, 0 issues) — confirmed Word-compliance gap (best-efforts a Word-forbidden nesting) — MS-OI29500 §2.1.338 / §17.13.5.22"]
 #[test]
 fn nested_movefrom_rejected_at_parse() {
     let body = r#"<w:p><w:moveFromRangeStart w:id="2" w:author="A" w:date="2024-01-01T00:00:00Z" w:name="m1"/><w:moveFrom w:id="3" w:author="A" w:date="2024-01-01T00:00:00Z"><w:moveFrom w:id="4" w:author="A" w:date="2024-01-01T00:00:00Z"><w:r><w:t>nested</w:t></w:r></w:moveFrom></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p><w:sectPr/>"#;

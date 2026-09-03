@@ -425,11 +425,15 @@ fn accepting_a_body_sectpr_change_by_id_keeps_the_new_margins() {
 }
 
 #[test]
-fn rejecting_a_body_sectpr_change_by_id_restores_the_previous_margins() {
+fn rejecting_a_body_sectpr_change_by_id_restores_words_previous_default_margins() {
     const TWO_PARAS: &str =
         r#"<w:p><w:r><w:t>Alpha.</w:t></w:r></w:p><w:p><w:r><w:t>Beta.</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(TWO_PARAS)).expect("parse");
-    let original_top = body_margins(&doc);
+    assert_eq!(
+        body_margins(&doc),
+        None,
+        "fixture starts with an empty sectPr"
+    );
     let doc = doc
         .apply(&EditTransaction {
             steps: vec![set_page_setup_step(SectionTarget::Body)],
@@ -452,8 +456,8 @@ fn rejecting_a_body_sectpr_change_by_id_restores_the_previous_margins() {
         .expect("selective reject of the sectPrChange");
     assert_eq!(
         body_margins(&resolved),
-        original_top,
-        "reject restores the ORIGINAL margins exactly"
+        Some(1440),
+        "Word makes an empty previous sectPr revisionable by materializing its default margin"
     );
     assert!(
         resolved
@@ -639,7 +643,11 @@ fn reject_all_agrees_with_resolving_every_id_selectively_for_footnotes_and_sectp
         &footnote_part_xml("L. Marsh", "2026-06-05T10:00:00Z"),
     );
     let doc = Document::parse(&bytes).expect("parse");
-    let original_top = body_margins(&doc);
+    assert_eq!(
+        body_margins(&doc),
+        None,
+        "fixture starts with an empty sectPr"
+    );
     let doc = doc
         .apply(&EditTransaction {
             steps: vec![set_page_setup_step(SectionTarget::Body)],
@@ -654,7 +662,11 @@ fn reject_all_agrees_with_resolving_every_id_selectively_for_footnotes_and_sectp
         .expect("reject_all resolves the mixed doc");
     assert!(enumerate_revisions(&via_reject_all.snapshot().canonical).is_empty());
     assert_eq!(footnote_text(&via_reject_all), " Based on the 2024 survey.");
-    assert_eq!(body_margins(&via_reject_all), original_top);
+    assert_eq!(
+        body_margins(&via_reject_all),
+        Some(1440),
+        "Reject follows Word's materialized previous-section carrier"
+    );
 
     let all_ids: HashSet<u32> = enumerate_revisions(&doc.snapshot().canonical)
         .into_iter()

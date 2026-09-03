@@ -16,9 +16,10 @@
 //! no corpus dependency. The non-conventional part name is `word/document2.xml`.
 
 use std::io::{Cursor, Write};
+use stemma_diff::test_support::{diff_documents, merge_diff};
 
 use stemma::{
-    DocxRuntime, ExportMode, RevisionInfo, SimpleRuntime, accept_all, diff_documents, merge_diff,
+    DocxRuntime, ExportMode, ExportOptions, Resolution, RevisionInfo, SimpleRuntime, accept_all,
     reject_all_with_styles,
 };
 use zip::{ZipWriter, write::FileOptions};
@@ -32,6 +33,11 @@ const OFFICE_DOCUMENT_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
 const STYLES_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+const STRICT_OFFICE_DOCUMENT_REL: &str =
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument";
+const STRICT_STYLES_REL: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships/styles";
+const TRANSITIONAL_WML_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const STRICT_WML_NS: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
 
 /// A minimal `word/styles.xml` with one built-in style, so import has a style
 /// table to read.
@@ -45,6 +51,22 @@ const STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes
 /// body text is a single paragraph containing `body_text`. A `styles.xml`
 /// sibling is present and referenced from the main part's `.rels`.
 fn docx_with_main_part(main_part: &str, body_text: &str) -> Vec<u8> {
+    docx_with_dialect(
+        main_part,
+        body_text,
+        OFFICE_DOCUMENT_REL,
+        STYLES_REL,
+        TRANSITIONAL_WML_NS,
+    )
+}
+
+fn docx_with_dialect(
+    main_part: &str,
+    body_text: &str,
+    office_document_rel: &str,
+    styles_rel: &str,
+    wml_ns: &str,
+) -> Vec<u8> {
     let file = main_part.rsplit('/').next().expect("part filename");
     let dir = &main_part[..main_part.len() - file.len()]; // e.g. "word/"
     let doc_rels_path = format!("{dir}_rels/{file}.rels");
@@ -62,23 +84,30 @@ fn docx_with_main_part(main_part: &str, body_text: &str) -> Vec<u8> {
     let root_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="{OFFICE_DOCUMENT_REL}" Target="/{main_part}"/>
+  <Relationship Id="rId1" Type="{office_document_rel}" Target="/{main_part}"/>
 </Relationships>"#
     );
 
     let doc_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="{STYLES_REL}" Target="styles.xml"/>
+  <Relationship Id="rId1" Type="{styles_rel}" Target="styles.xml"/>
 </Relationships>"#
     );
 
+    let page_size = if wml_ns == STRICT_WML_NS {
+        // Strict ST_UniversalMeasure values. Replacing only the namespace URI
+        // would make these invalid Transitional integer attributes.
+        r#"w:w="612pt" w:h="792pt""#
+    } else {
+        r#"w:w="12240" w:h="15840""#
+    };
     let document = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:document xmlns:w="{wml_ns}">
   <w:body>
     <w:p><w:r><w:t xml:space="preserve">{body_text}</w:t></w:r></w:p>
-    <w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>
+    <w:sectPr><w:pgSz {page_size}/></w:sectPr>
   </w:body>
 </w:document>"#
     );
@@ -87,9 +116,22 @@ fn docx_with_main_part(main_part: &str, body_text: &str) -> Vec<u8> {
         ("[Content_Types].xml", &content_types),
         ("_rels/.rels", &root_rels),
         (&doc_rels_path, &doc_rels),
-        (&format!("{dir}styles.xml"), STYLES_XML),
+        (
+            &format!("{dir}styles.xml"),
+            &STYLES_XML.replace(TRANSITIONAL_WML_NS, wml_ns),
+        ),
         (main_part, &document),
     ])
+}
+
+fn strict_docx(body_text: &str) -> Vec<u8> {
+    docx_with_dialect(
+        "word/document.xml",
+        body_text,
+        STRICT_OFFICE_DOCUMENT_REL,
+        STRICT_STYLES_REL,
+        STRICT_WML_NS,
+    )
 }
 
 fn zip_parts(parts: &[(&str, &str)]) -> Vec<u8> {
@@ -221,6 +263,85 @@ fn tracked_edit_accept_reject_text_identity_holds() {
     assert_eq!(rejected_text, want_a, "reject_all must equal A text");
 }
 
+#[test]
+fn strict_ooxml_unedited_export_preserves_the_original_dialect() {
+    let bytes = strict_docx("Strict input");
+    let rt = SimpleRuntime::new();
+    let import = rt.import_docx(&bytes).expect("Strict OOXML must import");
+    let exported = rt
+        .export_docx(&import.doc_handle, ExportMode::Redline)
+        .expect("Strict OOXML must export");
+
+    assert_eq!(body_text(&exported).trim(), "Strict input");
+    assert_eq!(
+        exported, bytes,
+        "an untouched Strict package must not be partially converted"
+    );
+    let report = stemma::validate_docx_report(&exported).expect("validate");
+    assert!(
+        report.ok,
+        "preserved Strict export must validate: {:?}",
+        report.issues
+    );
+
+    let document = stemma::api::Document::parse(&bytes).expect("public facade imports Strict");
+    let facade_export = document
+        .serialize(&ExportOptions::default())
+        .expect("public facade preserves untouched Strict bytes");
+    assert_eq!(facade_export, bytes);
+}
+
+#[test]
+fn strict_ooxml_resolution_refuses_partial_transitional_conversion() {
+    let bytes = strict_docx("Strict input");
+    let document = stemma::api::Document::parse(&bytes).expect("Strict OOXML remains readable");
+    let error = match document.project(Resolution::AcceptAll) {
+        Ok(_) => panic!("resolution must not emit a namespace-only Strict conversion"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit, "{error:?}");
+    assert!(error.message.contains("Strict OOXML mutation"), "{error:?}");
+}
+
+#[test]
+fn strict_ooxml_tracked_edit_preserves_accept_reject_identity() {
+    let a_bytes = strict_docx("Hello world");
+    let b_bytes = strict_docx("Hello strict world");
+    let rt = SimpleRuntime::new();
+    let a = std::sync::Arc::unwrap_or_clone(rt.import_docx(&a_bytes).expect("import A").canonical);
+    let b = std::sync::Arc::unwrap_or_clone(rt.import_docx(&b_bytes).expect("import B").canonical);
+    let merged = merge_diff(
+        &a,
+        &b,
+        &diff_documents(&a, &b).expect("diff A→B"),
+        &revision(),
+    )
+    .expect("merge")
+    .doc;
+
+    let mut accepted = merged.clone();
+    accept_all(&mut accepted);
+    assert_eq!(
+        common::all_paragraphs(&accepted)
+            .iter()
+            .map(|p| common::paragraph_text(p))
+            .collect::<Vec<_>>()
+            .join(" "),
+        body_text(&b_bytes)
+    );
+
+    let mut rejected = merged;
+    reject_all_with_styles(&mut rejected, None);
+    assert_eq!(
+        common::all_paragraphs(&rejected)
+            .iter()
+            .map(|p| common::paragraph_text(p))
+            .collect::<Vec<_>>()
+            .join(" "),
+        body_text(&a_bytes)
+    );
+}
+
 // ── negative cases: distinct, actionable errors ────────────────────────────
 
 #[test]
@@ -256,6 +377,26 @@ fn rels_without_office_document_relationship_is_a_specific_error() {
     assert!(
         err.message.contains("officeDocument relationship"),
         "error must name the missing officeDocument relationship; got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn near_match_strict_relationship_uri_is_not_accepted() {
+    let bytes = docx_with_dialect(
+        "word/document.xml",
+        "not discoverable",
+        "http://purl.oclc.org/ooxml/officeDocument/relationshipsX/officeDocument",
+        STYLES_REL,
+        TRANSITIONAL_WML_NS,
+    );
+    let rt = SimpleRuntime::new();
+    let err = rt
+        .import_docx(&bytes)
+        .expect_err("an unrecognized relationship URI must fail closed");
+    assert!(
+        err.message.contains("officeDocument relationship"),
+        "unexpected error: {}",
         err.message
     );
 }

@@ -19,6 +19,8 @@
 //! because stemma materializes the effective edge from the typed model.
 
 use std::io::Write;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 use zip::write::FileOptions;
 
 use stemma::api::Document;

@@ -90,8 +90,9 @@ Suite-wide invariants, gated on every lane:
   graded output of waves 1 through 3 and the v2.2 re-runs was additionally opened in
   real Word; see the
   [clean-open record](benchmarks-history.md#word-clean-open-real-word-all-outputs-all-waves);
-- all agent-authored revisions carry a single consistent author identity,
-  distinct from any pre-existing reviewer;
+- all agent-authored revisions carry a single consistent Word author label,
+  separate from every pre-existing reviewer label unless continuation was
+  explicitly requested;
 - no untracked mutations in any task that requests tracked changes.
 
 ### Replication policy
@@ -483,7 +484,8 @@ What survives:
    counterexample: auth6, where vanilla is ~2× cheaper.
 3. **Ingest robustness at scale** (98.5% end-to-end Word-clean, fail-loud on
    the rest), a property raw-XML editing does not even have a notion of.
-4. **Enforced guarantees vs. best-effort:** refusing author impersonation,
+4. **Enforced guarantees vs. best-effort:** requiring confirmation before an
+   existing Word author label is reused,
    refusing silent destruction of opaque objects, validating every output
    before write. In these runs competitors did not commit those failures;
    the claim is "guaranteed vs. usually right", not "we don't corrupt and

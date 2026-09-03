@@ -60,6 +60,7 @@ promise across power loss or protection from a hostile same-user local process.
 ```
 stemma apply    <input.docx> --worklist <changes.json> -o <redline.docx>
                 [--receipt <receipt.json>] [--emit-partial]
+                [--allow-existing-author]
 stemma inspect  <input.docx> [--format markdown|json]
 stemma execute  <input.docx> --plan <changes.json> -o <redline.docx>
 stemma verify   <before.docx> <after.docx> [--policy tracked-delivery-v0]
@@ -93,19 +94,22 @@ stemma validate <file.docx> [--format text|json]
   The producer section identifies the exact running executable by SHA-256 and
   byte size; optional compile-time `STEMMA_BUILD_STAMP` is only a readable
   build label.
-- `compare` produces a redline whose reject-all reading is the base and whose
-  accept-all reading is the target. `--author NAME` attributes every discovered
-  revision to `NAME`; omit it for an anonymous redline (an empty `--author ""`
-  is refused, not silently anonymized).
+- `compare` diffs each input's accepted reading. The output's reject-all reading
+  is the accepted base and its accept-all reading is the accepted target;
+  pre-existing pending revisions are disclosed as flattened input history.
+  `--author NAME` attributes every discovered revision to `NAME`; omit it for
+  an anonymous redline (an empty `--author ""` is refused, not silently
+  anonymized).
 - `verify-task` recomputes every artifact identity, audit binding, and claimed
   revision identity. It exits `0` for verified complete, `1` for verified
   partial, `2` for a mismatch, and `3` for usage/I/O/schema failure. The
   manifest is unsigned evidence and cannot prove undeclared intent.
 - `extract --format json` gives blocks plus a `revisions` array (pending tracked
   changes with `revision_id` / `kind` / `author` / `block_id` / `excerpt`).
-- `read` emits the full structured read model (`stemma.read.v0`) in one call:
-  typed blocks with per-segment tracked status, plus the complete revision
-  census — the machine surface for rendering a redline.
+- `read` emits the complete structured lean view (`stemma.read.v0`) in one
+  call: typed blocks with per-segment tracked status, plus the complete
+  revision census — the machine surface for rendering a lean redline. The
+  separately defined full render view remains an engine-embedding surface.
 - `resolve` requires exactly one disposition; a selection that matches nothing
   (unknown id, author with no changes) fails loudly instead of writing an
   unchanged file. `--plan` takes a `stemma.resolution_plan.v0` mixed

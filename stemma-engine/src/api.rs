@@ -17,7 +17,8 @@ use crate::domain::CanonDoc;
 pub use crate::domain::{DocProtectEdit, DocumentProtection};
 pub use crate::edit::EditTransaction;
 use crate::runtime::{
-    serialize_snapshot, snapshot_from_docx_bytes, style_table_from_docx, validate_docx_report,
+    serialize_snapshot, snapshot_and_diagnostics_from_docx_bytes, snapshot_from_docx_bytes,
+    style_table_from_docx, validate_docx_report,
 };
 // Everything a `Document` signature names is importable from HERE, next to
 // `Document` itself — an embedder writes `use stemma::api::{Document,
@@ -26,8 +27,8 @@ use crate::runtime::{
 // but as a PRIVATE alias whose `E0603` error reads as "selective resolution is
 // not public" to anyone importing from where `Document` lives.
 pub use crate::runtime::{
-    EditSnapshot, ExportOptions, Resolution, RuntimeError, ValidationIssue, ValidationIssueCode,
-    ValidationReport,
+    Diagnostic, DiagnosticLevel, EditSnapshot, ExportOptions, Resolution, RuntimeError,
+    ValidationIssue, ValidationIssueCode, ValidationReport,
 };
 pub use crate::tracked_model::{ResolveSelectionAction, RevisionKind, RevisionRecord};
 use crate::view::build_document_view;
@@ -84,6 +85,10 @@ pub use crate::view::{
 /// ```
 pub struct Document {
     snapshot: EditSnapshot,
+    /// Disclosed, deterministic normalizations performed at the DOCX import
+    /// boundary. Immutable across derived edits; parsing a new artifact starts
+    /// a new diagnostic scope.
+    diagnostics: Arc<Vec<Diagnostic>>,
     /// The open-time canonical tree, retained for [`Document::review`]
     /// (RFC 0001). An `Arc` share of the IR ONLY — the package scaffold is
     /// deliberately NOT retained, so this is a refcount bump at parse, not
@@ -118,9 +123,13 @@ impl Document {
     /// assert!(!doc.read().blocks.is_empty());
     /// ```
     pub fn parse(bytes: &[u8]) -> Result<Document, RuntimeError> {
-        let snapshot = snapshot_from_docx_bytes(bytes)?;
+        let (snapshot, diagnostics) = snapshot_and_diagnostics_from_docx_bytes(bytes)?;
         let baseline = Arc::clone(&snapshot.canonical);
-        Ok(Document { snapshot, baseline })
+        Ok(Document {
+            snapshot,
+            diagnostics: Arc::new(diagnostics),
+            baseline,
+        })
     }
 
     /// A verb result: new snapshot, SAME baseline. Verbs never reset the
@@ -128,8 +137,19 @@ impl Document {
     fn derived(&self, snapshot: EditSnapshot) -> Document {
         Document {
             snapshot,
+            diagnostics: Arc::clone(&self.diagnostics),
             baseline: Arc::clone(&self.baseline),
         }
+    }
+
+    /// Import-time diagnostics, including every deterministic package
+    /// normalization applied before this document became editable.
+    ///
+    /// Diagnostics are immutable provenance: derived edits retain them, while
+    /// parsing the serialized result begins a new scope and therefore reports
+    /// only issues present in that new artifact.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        self.diagnostics.as_slice()
     }
 
     /// Author new deltas by applying a transaction. Precondition-checked and
@@ -155,14 +175,15 @@ impl Document {
         Ok(self.derived(self.snapshot.apply(txn)?))
     }
 
-    /// [`Document::apply`], but refusing a write whose `txn.revision.author`
-    /// impersonates one of the document's ORIGIN authors — the authors
-    /// already present in the redline this `Document` was parsed from (see
+    /// [`Document::apply`], but refusing a tracked write whose `txn.revision.author`
+    /// collides with one of the document's ORIGIN Word author labels — the
+    /// labels already present in the redline this `Document` was parsed from (see
     /// [`crate::runtime::EditSnapshot::guard_author`]). Transports that
     /// attribute a write to a caller-supplied author (an HTTP `/apply`
     /// endpoint, an MCP tool call) should call this instead of `apply`;
     /// `allow_existing_author=true` deliberately continues an existing
-    /// author's own work.
+    /// reviewer group. Direct materialization creates no Word
+    /// revisions, so the label policy does not apply to it.
     pub fn apply_authored(
         &self,
         txn: &EditTransaction,
@@ -237,47 +258,6 @@ impl Document {
     /// verbs (no verb edits it); re-parsing is the only reset.
     pub fn document_protection(&self) -> Option<&DocumentProtection> {
         self.baseline.document_protection.as_ref()
-    }
-
-    /// Discover the deltas between this document and `other`, materialized as
-    /// tracked changes in the returned document.
-    ///
-    /// ```
-    /// # use stemma::api::Document;
-    /// let base = Document::parse(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simple-text/before.docx"))).unwrap();
-    /// let target = Document::parse(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simple-text/after.docx"))).unwrap();
-    /// let redline = base.diff(&target).unwrap();
-    /// // The redline round-trips: reject-all == base, accept-all == target.
-    /// assert_eq!(redline.read_rejected().unwrap().to_text(), base.to_text());
-    /// assert_eq!(redline.read_accepted().unwrap().to_text(), target.to_text());
-    /// ```
-    pub fn diff(&self, other: &Document) -> Result<Document, RuntimeError> {
-        Ok(self.derived(self.snapshot.diff(&other.snapshot)?))
-    }
-
-    /// Attributed twin of [`Document::diff`]: discover the deltas between this
-    /// document and `target` and materialize them as tracked changes, exactly
-    /// like [`diff`](Document::diff) — but attribute every produced revision to
-    /// `author` rather than leaving it anonymous. Same return type, same
-    /// round-trip contract (reject-all == this document, accept-all ==
-    /// `target`); attribution is the only difference.
-    ///
-    /// An empty `author` is refused (no silent fallback to anonymous — that is
-    /// what [`diff`](Document::diff) is for).
-    ///
-    /// ```
-    /// # use stemma::api::Document;
-    /// let base = Document::parse(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simple-text/before.docx"))).unwrap();
-    /// let target = Document::parse(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simple-text/after.docx"))).unwrap();
-    /// let redline = base.diff_as(&target, "Reviewer").unwrap();
-    /// // Same round-trip as `diff`: reject-all == base, accept-all == target.
-    /// assert_eq!(redline.read_rejected().unwrap().to_text(), base.to_text());
-    /// assert_eq!(redline.read_accepted().unwrap().to_text(), target.to_text());
-    /// // An empty author is refused rather than attributed to no one.
-    /// assert!(base.diff_as(&target, "").is_err());
-    /// ```
-    pub fn diff_as(&self, target: &Document, author: &str) -> Result<Document, RuntimeError> {
-        Ok(self.derived(self.snapshot.diff_as(&target.snapshot, author)?))
     }
 
     /// Resolve tracked deltas: accept-all, reject-all, or a selective set.
@@ -460,6 +440,15 @@ impl Document {
     /// and [`Document::read`].
     pub fn snapshot(&self) -> &EditSnapshot {
         &self.snapshot
+    }
+
+    /// Construct a new document value from a snapshot produced by a
+    /// downstream compiler while retaining this document's open-time review
+    /// baseline. This is an unstable engine integration point; ordinary
+    /// callers should use the product-level verbs.
+    #[doc(hidden)]
+    pub fn with_derived_snapshot(&self, snapshot: EditSnapshot) -> Document {
+        self.derived(snapshot)
     }
 
     /// Session review (RFC 0001): audit everything this document changed
@@ -772,41 +761,46 @@ mod tests {
 
     /// THE CONTRACT: `apply_authored` refuses a write whose `revision.author`
     /// already authors a pending revision in the document's redline at parse
-    /// time — editing under that identity would make the new write
-    /// indistinguishable from the existing reviewer's and defeat layered
-    /// review. `allow_existing_author=true` is the deliberate override; a
-    /// distinct author is never refused; plain `apply` (no author check) is
-    /// unaffected.
+    /// time. Word groups revisions carrying the same label, so reuse requires
+    /// an explicit attribution choice. `allow_existing_author=true` continues
+    /// the existing reviewer group; a new label is never refused; plain
+    /// `apply` (no author check) is unaffected.
     #[test]
-    fn apply_authored_refuses_to_impersonate_the_documents_origin_author() {
+    fn apply_authored_requires_confirmation_for_an_origin_author_label() {
         let docx = docx_with_existing_author("AuthorA");
         let doc = Document::parse(&docx).expect("parse redlined doc");
         let id = first_block_id(&doc);
 
-        let impersonating = replace_paragraph_txn_by(&id, "Seeded change", "x", "AuthorA");
-        let err = match doc.apply_authored(&impersonating, false) {
-            Ok(_) => panic!("impersonating the origin author must be refused"),
+        let colliding = replace_paragraph_txn_by(&id, "Seeded change", "x", "AuthorA");
+        let err = match doc.apply_authored(&colliding, false) {
+            Ok(_) => panic!("reusing an origin author label must require confirmation"),
             Err(e) => e,
         };
-        assert_eq!(err.code, ErrorCode::AuthorImpersonation);
+        assert_eq!(err.code, ErrorCode::AuthorLabelCollision);
         assert!(
             err.message.contains("AuthorA"),
-            "the error names the impersonated author: {}",
+            "the error names the colliding author label: {}",
             err.message
         );
+        let details = err
+            .details
+            .author_label_collision()
+            .expect("author-label collision details");
+        assert_eq!(details.author_label, "AuthorA");
+        assert!(details.existing_revision_count > 0);
 
-        // The override deliberately continues that author's own work.
-        doc.apply_authored(&impersonating, true)
+        // The override deliberately continues that reviewer group.
+        doc.apply_authored(&colliding, true)
             .expect("allow_existing_author=true bypasses the refusal");
 
-        // A distinct author is never impersonation.
+        // A new author label never collides.
         let distinct = replace_paragraph_txn_by(&id, "Seeded change", "y", "Reviewer");
         doc.apply_authored(&distinct, false)
-            .expect("a distinct author is accepted");
+            .expect("a new author label is accepted");
 
         // Plain `apply` enforces no author policy at all — it is the
         // guard-free primitive `apply_authored` wraps.
-        doc.apply(&impersonating)
+        doc.apply(&colliding)
             .expect("bare apply is guard-free by design");
     }
 
@@ -987,129 +981,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_discovers_change_between_two_documents() {
-        let base = Document::parse(&make_test_docx(&["Hello world"])).expect("base");
-        let target = Document::parse(&make_test_docx(&["Hello brave world"])).expect("target");
-        let redlined = base.diff(&target).expect("diff");
-        // Reject-all reconstructs the base; accept-all reconstructs the target.
-        let rejected = redlined.project(Resolution::RejectAll).expect("reject");
-        let accepted = redlined.project(Resolution::AcceptAll).expect("accept");
-        assert!(
-            all_text(&rejected).contains("Hello world"),
-            "reject-all = base"
-        );
-        assert!(
-            all_text(&accepted).contains("Hello brave world"),
-            "accept-all = target"
-        );
-    }
-
-    /// The distinct authors carried by the tracked segments of a document's
-    /// read view — both inserted and deleted spans, across every block. Used to
-    /// assert diff attribution survives a serialize→reparse round-trip.
-    fn revision_authors(doc: &Document) -> std::collections::BTreeSet<Option<String>> {
-        use crate::view::{SegmentView, TrackStatus};
-        let mut authors = std::collections::BTreeSet::new();
-        let mut note = |st: &TrackStatus| match st {
-            TrackStatus::Normal => {}
-            TrackStatus::Inserted(rev) | TrackStatus::Deleted(rev) => {
-                authors.insert(rev.author.clone());
-            }
-            TrackStatus::InsertedThenDeleted { inserted, deleted } => {
-                authors.insert(inserted.author.clone());
-                authors.insert(deleted.author.clone());
-            }
-        };
-        for block in &doc.read().blocks {
-            for seg in &block.segments {
-                match seg {
-                    SegmentView::Text { status, .. } => note(status),
-                    SegmentView::Opaque { status, .. } => note(status),
-                }
-            }
-        }
-        authors
-    }
-
-    #[test]
-    fn diff_as_attributes_discovered_revisions_and_round_trips() {
-        // Domain rule: `diff_as` is `diff` plus attribution — every revision it
-        // materializes carries the supplied author, and that author survives a
-        // serialize→reparse round-trip (it is real tracked-change markup, not an
-        // in-memory annotation). Plain `diff` leaves the author anonymous; the
-        // two differ ONLY in attribution.
-        let base = Document::parse(&make_test_docx(&["Hello world"])).expect("base");
-        let target = Document::parse(&make_test_docx(&["Hello brave world"])).expect("target");
-
-        let attributed = base.diff_as(&target, "Reviewer").expect("diff_as");
-        // Round-trip through DOCX bytes and re-parse: the author must be on the
-        // reparsed revisions, not lost at the serialize edge.
-        let bytes = attributed
-            .serialize(&ExportOptions::default())
-            .expect("serialize");
-        let reparsed = Document::parse(&bytes).expect("re-parse redline");
-        assert_eq!(
-            revision_authors(&reparsed),
-            std::collections::BTreeSet::from([Some("Reviewer".to_string())]),
-            "every discovered revision must be attributed to the supplied author after round-trip"
-        );
-
-        // Contrast: anonymous `diff` attributes the same pair to no one. (The
-        // serializer emits an empty `w:author=""` for an anonymous revision, so
-        // the round-tripped author is the empty string, not `None` — the point
-        // here is only that it is NOT the named "Reviewer".)
-        let anon = base.diff(&target).expect("diff");
-        let anon_bytes = anon
-            .serialize(&ExportOptions::default())
-            .expect("serialize");
-        let anon_reparsed = Document::parse(&anon_bytes).expect("re-parse");
-        assert!(
-            !revision_authors(&anon_reparsed).contains(&Some("Reviewer".to_string())),
-            "plain diff must not attribute revisions to the diff_as author, got {:?}",
-            revision_authors(&anon_reparsed)
-        );
-    }
-
-    #[test]
-    fn diff_as_preserves_accept_reject_round_trip() {
-        // Attribution must not disturb the diff round-trip: reject-all == base,
-        // accept-all == target, exactly as for `diff`.
-        let base = Document::parse(&make_test_docx(&["Hello world"])).expect("base");
-        let target = Document::parse(&make_test_docx(&["Hello brave world"])).expect("target");
-        let redlined = base.diff_as(&target, "Reviewer").expect("diff_as");
-
-        let rejected = redlined.project(Resolution::RejectAll).expect("reject");
-        let accepted = redlined.project(Resolution::AcceptAll).expect("accept");
-        assert!(
-            all_text(&rejected).contains("Hello world") && !all_text(&rejected).contains("brave"),
-            "reject-all = base"
-        );
-        assert!(
-            all_text(&accepted).contains("Hello brave world"),
-            "accept-all = target"
-        );
-    }
-
-    #[test]
-    fn diff_as_rejects_empty_author() {
-        // No silent fallback to anonymous: an empty author is refused, so a
-        // caller that means "unattributed" reaches for `diff` deliberately.
-        let base = Document::parse(&make_test_docx(&["Hello world"])).expect("base");
-        let target = Document::parse(&make_test_docx(&["Hello brave world"])).expect("target");
-        match base.diff_as(&target, "") {
-            Err(e) => {
-                assert_eq!(e.code, ErrorCode::ValidationFailed);
-                assert!(
-                    e.message.contains("author"),
-                    "the error names the missing author: {}",
-                    e.message
-                );
-            }
-            Ok(_) => panic!("empty author must be refused"),
-        }
-    }
-
-    #[test]
     fn selective_resolution_rejects_empty_id_set() {
         let doc = Document::parse(&make_test_docx(&["Hello world"])).expect("parse");
         let err = doc.project(Resolution::Selective {
@@ -1129,6 +1000,207 @@ mod tests {
         let report = validate(b"not a zip file");
         assert!(!report.ok);
         assert!(!report.issues.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_package_part_without_content_type() {
+        let bytes = make_test_docx(&["Hello world"]);
+        let mut archive = crate::docx::DocxArchive::read(&bytes).expect("test package");
+        archive.upsert("word/media/orphan.png", vec![1, 2, 3]);
+        let invalid = archive.write().expect("test package serializes");
+
+        let report = validate(&invalid);
+
+        assert!(!report.ok);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == ValidationIssueCode::PackageInvariant
+                && issue.message.contains("word/media/orphan.png")
+                && issue.message.contains("no declared OPC content type")
+        }));
+    }
+
+    #[test]
+    fn dangling_package_thumbnail_is_disclosed_and_normalized_on_save() {
+        let bytes = make_test_docx(&["Hello world"]);
+        let mut archive = crate::docx::DocxArchive::read(&bytes).expect("test package");
+        let relationships = String::from_utf8(
+            archive
+                .get("_rels/.rels")
+                .expect("root relationships")
+                .to_vec(),
+        )
+        .expect("test XML is UTF-8");
+        let dangling = r#"<Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>"#;
+        let relationships = relationships.replacen(
+            "</Relationships>",
+            &format!("{dangling}</Relationships>"),
+            1,
+        );
+        archive.upsert("_rels/.rels", relationships.into_bytes());
+        let invalid = archive.write().expect("test package serializes");
+
+        let report = validate(&invalid);
+
+        assert!(!report.ok);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == ValidationIssueCode::WordprocessingInvariant
+                && issue.message.contains("rIdThumbnail")
+                && issue.message.contains("docProps/thumbnail.jpeg")
+                && issue.message.contains("does not exist in the package")
+        }));
+
+        let parsed = Document::parse(&invalid).expect("known Word-safe normalization imports");
+        assert!(parsed.diagnostics().iter().any(|diagnostic| {
+            diagnostic.level == crate::runtime::DiagnosticLevel::Warning
+                && diagnostic.message.contains("rIdThumbnail")
+                && diagnostic.message.contains("docProps/thumbnail.jpeg")
+                && diagnostic.message.contains("Microsoft Word")
+                && diagnostic.context.as_deref() == Some("_rels/.rels")
+        }));
+
+        let normalized = parsed
+            .serialize(&ExportOptions::default())
+            .expect("missing package thumbnail is safe to normalize");
+        assert!(validate(&normalized).ok);
+        let normalized_archive =
+            crate::docx::DocxArchive::read(&normalized).expect("normalized package");
+        let root_relationships = std::str::from_utf8(
+            normalized_archive
+                .get("_rels/.rels")
+                .expect("root relationships"),
+        )
+        .expect("relationships XML is UTF-8");
+        assert!(!root_relationships.contains("rIdThumbnail"));
+
+        let reopened = Document::parse(&normalized).expect("normalized output reopens");
+        assert!(
+            reopened.diagnostics().is_empty(),
+            "normalization provenance belongs to the import that performed it"
+        );
+    }
+
+    #[test]
+    fn missing_actively_referenced_story_remains_a_hard_failure() {
+        let bytes = make_test_docx(&["Hello world"]);
+        let mut archive = crate::docx::DocxArchive::read(&bytes).expect("test package");
+        let relationships = String::from_utf8(
+            archive
+                .get("word/_rels/document.xml.rels")
+                .expect("document relationships")
+                .to_vec(),
+        )
+        .expect("test XML is UTF-8");
+        let dangling = r#"<Relationship Id="rIdMissingHeader" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header-missing.xml"/>"#;
+        let relationships = relationships.replacen(
+            "</Relationships>",
+            &format!("{dangling}</Relationships>"),
+            1,
+        );
+        archive.upsert("word/_rels/document.xml.rels", relationships.into_bytes());
+        let document = String::from_utf8(
+            archive
+                .get("word/document.xml")
+                .expect("main document")
+                .to_vec(),
+        )
+        .expect("test XML is UTF-8");
+        let document = document
+            .replace(
+                r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#,
+                r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#,
+            )
+            .replace(
+                "<w:sectPr/>",
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="rIdMissingHeader"/></w:sectPr>"#,
+            );
+        archive.upsert("word/document.xml", document.into_bytes());
+        let invalid = archive.write().expect("test package serializes");
+
+        let parsed = Document::parse(&invalid).expect("read projection remains inspectable");
+        assert!(parsed.diagnostics().is_empty());
+        let error = parsed
+            .serialize(&ExportOptions::default())
+            .expect_err("active missing story targets must fail before output");
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        assert!(
+            error.message.contains("I-REL-001") || error.message.contains("I-REL-003"),
+            "a relationship invariant must name the refusal: {}",
+            error.message
+        );
+        assert!(error.message.contains("rIdMissingHeader"));
+    }
+
+    #[test]
+    fn package_thumbnail_relationship_with_present_target_is_preserved() {
+        let bytes = make_test_docx(&["Hello world"]);
+        let mut archive = crate::docx::DocxArchive::read(&bytes).expect("test package");
+        let relationships = String::from_utf8(
+            archive
+                .get("_rels/.rels")
+                .expect("root relationships")
+                .to_vec(),
+        )
+        .expect("test XML is UTF-8");
+        let thumbnail = r#"<Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="word/document.xml"/>"#;
+        let relationships = relationships.replacen(
+            "</Relationships>",
+            &format!("{thumbnail}</Relationships>"),
+            1,
+        );
+        archive.upsert("_rels/.rels", relationships.into_bytes());
+        let input = archive.write().expect("test package serializes");
+
+        let parsed = Document::parse(&input).expect("present thumbnail target imports");
+        assert!(parsed.diagnostics().is_empty());
+        let output = parsed
+            .serialize(&ExportOptions::default())
+            .expect("present target remains valid");
+        let output_archive = crate::docx::DocxArchive::read(&output).expect("output package");
+        let root_relationships = std::str::from_utf8(
+            output_archive
+                .get("_rels/.rels")
+                .expect("root relationships"),
+        )
+        .expect("relationships XML is UTF-8");
+        assert!(root_relationships.contains("rIdThumbnail"));
+    }
+
+    #[test]
+    fn validate_rejects_one_comment_id_used_for_multiple_ranges() {
+        let bytes = make_test_docx(&["commented text"]);
+        let mut archive = crate::docx::DocxArchive::read(&bytes).expect("test package");
+        let document = String::from_utf8(
+            archive
+                .get("word/document.xml")
+                .expect("test document part")
+                .to_vec(),
+        )
+        .expect("test XML is UTF-8");
+        let duplicate_range = r#"<w:commentRangeStart w:id="9"/>
+            <w:commentRangeEnd w:id="9"/>
+            <w:r><w:commentReference w:id="9"/></w:r>
+            <w:commentRangeStart w:id="9"/>
+            <w:commentRangeEnd w:id="9"/>
+            <w:r><w:commentReference w:id="9"/></w:r>"#;
+        let document = document.replacen("<w:body>", &format!("<w:body>{duplicate_range}"), 1);
+        archive.upsert("word/document.xml", document.into_bytes());
+        let invalid = archive.write().expect("test package serializes");
+
+        let report = validate(&invalid);
+
+        assert!(!report.ok);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == ValidationIssueCode::WordprocessingInvariant
+                && issue.message.contains("I-ANN-010")
+                && issue.message.contains("multiple ranges")
+        }));
+
+        let parsed = Document::parse(&invalid).expect("parse preserves the malformed input");
+        let error = parsed
+            .serialize(&ExportOptions::default())
+            .expect_err("the checked export boundary must refuse bytes Word repairs");
+        assert_eq!(error.code, ErrorCode::ValidationFailed);
+        assert!(error.message.contains("I-ANN-010"));
     }
 
     /// Collapse runs of ASCII whitespace to single spaces and trim, so a
@@ -1164,29 +1236,6 @@ mod tests {
             !accepted.to_text().contains("Hello"),
             "accept-all dropped the deleted word: {:?}",
             accepted.to_text()
-        );
-    }
-
-    #[test]
-    fn read_rejected_text_equals_baseline_and_accepted_equals_target() {
-        // Domain rule (reject-all == baseline, accept-all == target) observed at
-        // the TEXT layer: diff(base, target) is a redline whose reject-all text
-        // equals base's text and whose accept-all text equals target's text.
-        let base = Document::parse(&make_test_docx(&["Hello world"])).expect("base");
-        let target = Document::parse(&make_test_docx(&["Hello brave world"])).expect("target");
-        let redlined = base.diff(&target).expect("diff");
-
-        let rejected = redlined.read_rejected().expect("reject-all");
-        let accepted = redlined.read_accepted().expect("accept-all");
-        assert_eq!(
-            normalize_ws(&rejected.to_text()),
-            normalize_ws(&base.to_text()),
-            "reject-all text == baseline text"
-        );
-        assert_eq!(
-            normalize_ws(&accepted.to_text()),
-            normalize_ws(&target.to_text()),
-            "accept-all text == target text"
         );
     }
 

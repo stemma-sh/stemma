@@ -55,14 +55,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::diff::diff_documents;
+use crate::audit_delta::{AuditDelta, audit_changes};
 use crate::domain::{
-    BlockNode, CanonDoc, DiffChange, HeaderFooterKind, InlineNode, NodeId, OpaqueKind, StoryScope,
+    BlockNode, CanonDoc, HeaderFooterKind, InlineNode, NodeId, OpaqueKind, StoryScope,
     TrackedBlock, TrackingStatus,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, RuntimeError, ValidationReport, first_quarantined_block,
-    first_unparseable_opaque_with_revisions, map_diff_error,
+    first_unparseable_opaque_with_revisions,
 };
 use crate::styles::StyleTable;
 use crate::tracked_model::{
@@ -255,9 +255,8 @@ pub fn audit_documents(
     reject_all_with_styles(&mut before_committed, before_styles);
     let mut after_committed = after.clone();
     reject_all_with_styles(&mut after_committed, after_styles);
-    let committed_diff =
-        diff_documents(&before_committed, &after_committed).map_err(map_diff_error)?;
-    let mut direct_changes = direct_rows(&committed_diff.changes);
+    let committed_changes = audit_changes(&before_committed, &after_committed);
+    let mut direct_changes = direct_rows(&committed_changes);
     append_hyperlink_metadata_rows(&before_committed, &after_committed, &mut direct_changes);
     if before_committed.body_section_properties != after_committed.body_section_properties {
         direct_changes.push(DirectChange {
@@ -275,11 +274,11 @@ pub fn audit_documents(
     // revisions and all): the raw diff explains every sequence difference;
     // whatever it leaves unmentioned must pair 1:1 and be structurally
     // identical, except pairs a census row already accounts for.
-    let raw_diff = diff_documents(before, after).map_err(map_diff_error)?;
+    let raw_changes = audit_changes(before, after);
     let untouched = untouched_proof(
         before,
         after,
-        &raw_diff.changes,
+        &raw_changes,
         &direct_changes,
         &new_revisions,
         &preexisting_revisions,
@@ -405,7 +404,7 @@ fn match_census(
 /// Flatten a committed-projection diff into direct-change rows. Story
 /// `Modified` variants recurse into their block-level changes under the
 /// story's scope; story insert/delete become single story-level rows.
-fn direct_rows(changes: &[DiffChange]) -> Vec<DirectChange> {
+fn direct_rows(changes: &[AuditDelta]) -> Vec<DirectChange> {
     let mut rows = Vec::new();
     for change in changes {
         push_direct_rows(&mut rows, change, &StoryScope::Body);
@@ -422,7 +421,7 @@ fn blocks_text(blocks: &[BlockNode]) -> String {
     out.trim_end().to_string()
 }
 
-fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &StoryScope) {
+fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &AuditDelta, story: &StoryScope) {
     let row = |kind: DirectChangeKind,
                block_id: Option<NodeId>,
                old_excerpt: Option<String>,
@@ -435,7 +434,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
         coincides_with_resolution: Vec::new(),
     };
     match change {
-        DiffChange::BlockDeleted {
+        AuditDelta::BlockDeleted {
             block_id, old_text, ..
         } => rows.push(row(
             DirectChangeKind::BlockDeleted,
@@ -443,13 +442,13 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             Some(old_text.clone()),
             None,
         )),
-        DiffChange::BlockInserted { block, .. } => rows.push(row(
+        AuditDelta::BlockInserted { block, .. } => rows.push(row(
             DirectChangeKind::BlockInserted,
             Some(block_node_id(block)),
             None,
             Some(extract_block_text_for_hash(block)),
         )),
-        DiffChange::BlockModified {
+        AuditDelta::BlockModified {
             block_id,
             old_text,
             new_text,
@@ -460,13 +459,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             Some(old_text.clone()),
             Some(new_text.clone()),
         )),
-        DiffChange::TableStructureChanged {
-            table_id,
-            old_text,
-            new_text,
-            ..
-        }
-        | DiffChange::TableCellsModified {
+        AuditDelta::TableStructureChanged {
             table_id,
             old_text,
             new_text,
@@ -478,7 +471,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             Some(new_text.clone()),
         )),
 
-        DiffChange::HeaderModified {
+        AuditDelta::HeaderModified {
             kind,
             base_part_name,
             block_changes,
@@ -492,7 +485,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
                 push_direct_rows(rows, inner, &scope);
             }
         }
-        DiffChange::HeaderDeleted {
+        AuditDelta::HeaderDeleted {
             kind,
             part_name,
             blocks,
@@ -508,7 +501,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             new_excerpt: None,
             coincides_with_resolution: Vec::new(),
         }),
-        DiffChange::HeaderInserted {
+        AuditDelta::HeaderInserted {
             kind,
             part_name,
             blocks,
@@ -525,7 +518,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             coincides_with_resolution: Vec::new(),
         }),
 
-        DiffChange::FooterModified {
+        AuditDelta::FooterModified {
             kind,
             base_part_name,
             block_changes,
@@ -539,7 +532,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
                 push_direct_rows(rows, inner, &scope);
             }
         }
-        DiffChange::FooterDeleted {
+        AuditDelta::FooterDeleted {
             kind,
             part_name,
             blocks,
@@ -555,7 +548,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             new_excerpt: None,
             coincides_with_resolution: Vec::new(),
         }),
-        DiffChange::FooterInserted {
+        AuditDelta::FooterInserted {
             kind,
             part_name,
             blocks,
@@ -572,7 +565,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             coincides_with_resolution: Vec::new(),
         }),
 
-        DiffChange::FootnoteModified {
+        AuditDelta::FootnoteModified {
             id, block_changes, ..
         } => {
             let scope = StoryScope::Footnote { id: id.clone() };
@@ -580,7 +573,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
                 push_direct_rows(rows, inner, &scope);
             }
         }
-        DiffChange::FootnoteDeleted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::FootnoteDeleted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Footnote { id: id.clone() },
             kind: DirectChangeKind::StoryDeleted,
             block_id: None,
@@ -588,7 +581,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             new_excerpt: None,
             coincides_with_resolution: Vec::new(),
         }),
-        DiffChange::FootnoteInserted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::FootnoteInserted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Footnote { id: id.clone() },
             kind: DirectChangeKind::StoryInserted,
             block_id: None,
@@ -597,7 +590,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             coincides_with_resolution: Vec::new(),
         }),
 
-        DiffChange::EndnoteModified {
+        AuditDelta::EndnoteModified {
             id, block_changes, ..
         } => {
             let scope = StoryScope::Endnote { id: id.clone() };
@@ -605,7 +598,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
                 push_direct_rows(rows, inner, &scope);
             }
         }
-        DiffChange::EndnoteDeleted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::EndnoteDeleted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Endnote { id: id.clone() },
             kind: DirectChangeKind::StoryDeleted,
             block_id: None,
@@ -613,7 +606,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             new_excerpt: None,
             coincides_with_resolution: Vec::new(),
         }),
-        DiffChange::EndnoteInserted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::EndnoteInserted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Endnote { id: id.clone() },
             kind: DirectChangeKind::StoryInserted,
             block_id: None,
@@ -622,7 +615,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             coincides_with_resolution: Vec::new(),
         }),
 
-        DiffChange::CommentModified {
+        AuditDelta::CommentModified {
             id, block_changes, ..
         } => {
             let scope = StoryScope::Comment { id: id.clone() };
@@ -630,7 +623,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
                 push_direct_rows(rows, inner, &scope);
             }
         }
-        DiffChange::CommentDeleted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::CommentDeleted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Comment { id: id.clone() },
             kind: DirectChangeKind::StoryDeleted,
             block_id: None,
@@ -638,7 +631,7 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &DiffChange, story: &S
             new_excerpt: None,
             coincides_with_resolution: Vec::new(),
         }),
-        DiffChange::CommentInserted { id, blocks, .. } => rows.push(DirectChange {
+        AuditDelta::CommentInserted { id, blocks, .. } => rows.push(DirectChange {
             story: StoryScope::Comment { id: id.clone() },
             kind: DirectChangeKind::StoryInserted,
             block_id: None,
@@ -769,7 +762,7 @@ type Implicated = HashSet<(StoryScope, NodeId)>;
 fn untouched_proof(
     before: &CanonDoc,
     after: &CanonDoc,
-    raw_changes: &[DiffChange],
+    raw_changes: &[AuditDelta],
     direct_changes: &[DirectChange],
     new_revisions: &[RevisionRecord],
     preexisting: &[PreexistingRevision],
@@ -809,10 +802,10 @@ fn untouched_proof(
     // misreport the correctly anchored paragraph as an unexplained mutation.
     for change in raw_changes {
         match change {
-            DiffChange::CommentInserted { id, .. } => {
+            AuditDelta::CommentInserted { id, .. } => {
                 implicate_comment_anchor_blocks(after, id, &mut implicated_after);
             }
-            DiffChange::CommentDeleted { id, .. } => {
+            AuditDelta::CommentDeleted { id, .. } => {
                 implicate_comment_anchor_blocks(before, id, &mut implicated_before);
             }
             _ => {}
@@ -849,7 +842,7 @@ fn untouched_proof(
     let mut note_touched: HashMap<&'static str, HashSet<String>> = HashMap::new();
     for change in raw_changes {
         match change {
-            DiffChange::HeaderModified {
+            AuditDelta::HeaderModified {
                 base_part_name,
                 target_part_name,
                 ..
@@ -857,13 +850,13 @@ fn untouched_proof(
                 header_touched_before.insert(base_part_name.clone());
                 header_touched_after.insert(target_part_name.clone());
             }
-            DiffChange::HeaderDeleted { part_name, .. } => {
+            AuditDelta::HeaderDeleted { part_name, .. } => {
                 header_touched_before.insert(part_name.clone());
             }
-            DiffChange::HeaderInserted { part_name, .. } => {
+            AuditDelta::HeaderInserted { part_name, .. } => {
                 header_touched_after.insert(part_name.clone());
             }
-            DiffChange::FooterModified {
+            AuditDelta::FooterModified {
                 base_part_name,
                 target_part_name,
                 ..
@@ -871,31 +864,31 @@ fn untouched_proof(
                 footer_touched_before.insert(base_part_name.clone());
                 footer_touched_after.insert(target_part_name.clone());
             }
-            DiffChange::FooterDeleted { part_name, .. } => {
+            AuditDelta::FooterDeleted { part_name, .. } => {
                 footer_touched_before.insert(part_name.clone());
             }
-            DiffChange::FooterInserted { part_name, .. } => {
+            AuditDelta::FooterInserted { part_name, .. } => {
                 footer_touched_after.insert(part_name.clone());
             }
-            DiffChange::FootnoteModified { id, .. }
-            | DiffChange::FootnoteDeleted { id, .. }
-            | DiffChange::FootnoteInserted { id, .. } => {
+            AuditDelta::FootnoteModified { id, .. }
+            | AuditDelta::FootnoteDeleted { id, .. }
+            | AuditDelta::FootnoteInserted { id, .. } => {
                 note_touched
                     .entry("footnotes")
                     .or_default()
                     .insert(id.clone());
             }
-            DiffChange::EndnoteModified { id, .. }
-            | DiffChange::EndnoteDeleted { id, .. }
-            | DiffChange::EndnoteInserted { id, .. } => {
+            AuditDelta::EndnoteModified { id, .. }
+            | AuditDelta::EndnoteDeleted { id, .. }
+            | AuditDelta::EndnoteInserted { id, .. } => {
                 note_touched
                     .entry("endnotes")
                     .or_default()
                     .insert(id.clone());
             }
-            DiffChange::CommentModified { id, .. }
-            | DiffChange::CommentDeleted { id, .. }
-            | DiffChange::CommentInserted { id, .. } => {
+            AuditDelta::CommentModified { id, .. }
+            | AuditDelta::CommentDeleted { id, .. }
+            | AuditDelta::CommentInserted { id, .. } => {
                 note_touched
                     .entry("comments")
                     .or_default()
@@ -1273,18 +1266,18 @@ fn tracked_block_has_revision_identity(block: &TrackedBlock, identity: u32) -> b
 
 /// Before-side / after-side block ids the raw diff's BODY-level rows
 /// mention. Story-level rows are handled per family.
-fn raw_removed_block_ids(changes: &[DiffChange]) -> (HashSet<NodeId>, HashSet<NodeId>) {
+fn raw_removed_block_ids(changes: &[AuditDelta]) -> (HashSet<NodeId>, HashSet<NodeId>) {
     let mut before_removed = HashSet::new();
     let mut after_removed = HashSet::new();
     for change in changes {
         match change {
-            DiffChange::BlockDeleted { block_id, .. } => {
+            AuditDelta::BlockDeleted { block_id, .. } => {
                 before_removed.insert(block_id.clone());
             }
-            DiffChange::BlockInserted { block, .. } => {
+            AuditDelta::BlockInserted { block, .. } => {
                 after_removed.insert(block_node_id(block));
             }
-            DiffChange::BlockModified {
+            AuditDelta::BlockModified {
                 block_id,
                 new_block,
                 ..
@@ -1292,12 +1285,7 @@ fn raw_removed_block_ids(changes: &[DiffChange]) -> (HashSet<NodeId>, HashSet<No
                 before_removed.insert(block_id.clone());
                 after_removed.insert(block_node_id(new_block));
             }
-            DiffChange::TableStructureChanged {
-                table_id,
-                target_table_id,
-                ..
-            }
-            | DiffChange::TableCellsModified {
+            AuditDelta::TableStructureChanged {
                 table_id,
                 target_table_id,
                 ..

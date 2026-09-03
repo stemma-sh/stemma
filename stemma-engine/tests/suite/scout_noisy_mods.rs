@@ -15,8 +15,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::panic;
 use std::path::PathBuf;
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
-use stemma::{DiffChange, DocxRuntime, InlineChange, SimpleRuntime};
+use stemma::{DocxRuntime, InlineChange, SimpleRuntime};
 
 struct Hit {
     sample: String,

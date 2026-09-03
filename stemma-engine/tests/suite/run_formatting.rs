@@ -819,6 +819,7 @@ fn span_refuses_when_any_covered_run_has_an_independent_format_revision() {
         _ => unreachable!(),
     };
     beta.formatting_change = Some(FormattingChange {
+        carrier: stemma::RunFormattingChangeCarrier::RunProperties,
         revision_id: 41,
         identity: 4100,
         previous_marks: Vec::new(),

@@ -76,6 +76,13 @@ pub enum RedlineExtractError {
     MissingPart(String),
     /// XML parsing failed for a specific part.
     XmlParse { part: String, source: String },
+    /// Numbering markup or synthesis failed for one paragraph projection.
+    Numbering {
+        part: String,
+        paragraph_index: usize,
+        projection: &'static str,
+        source: String,
+    },
 }
 
 impl fmt::Display for RedlineExtractError {
@@ -84,6 +91,15 @@ impl fmt::Display for RedlineExtractError {
             Self::Zip(msg) => write!(f, "ZIP error: {msg}"),
             Self::MissingPart(part) => write!(f, "missing required part: {part}"),
             Self::XmlParse { part, source } => write!(f, "XML parse error in {part}: {source}"),
+            Self::Numbering {
+                part,
+                paragraph_index,
+                projection,
+                source,
+            } => write!(
+                f,
+                "numbering error in {part} paragraph {paragraph_index} ({projection} projection): {source}"
+            ),
         }
     }
 }
@@ -106,7 +122,7 @@ pub fn extract_redline(docx_bytes: &[u8]) -> Result<RedlineExtract, RedlineExtra
             part: "word/document.xml".to_string(),
             source: "no <w:body> element found".to_string(),
         })?;
-        extract_paragraphs(body_el, numbering_defs.as_ref())
+        extract_paragraphs(body_el, numbering_defs.as_ref(), "word/document.xml")?
     };
 
     // Extract story parts referenced from document relationships.
@@ -114,7 +130,7 @@ pub fn extract_redline(docx_bytes: &[u8]) -> Result<RedlineExtract, RedlineExtra
     for part_path in collect_referenced_story_parts(&mut zip)? {
         let xml = read_zip_entry(&mut zip, &part_path)?;
         let root = parse_xml(&part_path, &xml)?;
-        let paragraphs = extract_paragraphs(&root, numbering_defs.as_ref());
+        let paragraphs = extract_paragraphs(&root, numbering_defs.as_ref(), &part_path)?;
         if paragraphs.is_empty() && has_element_children(&root) {
             tracing::warn!(
                 part = %part_path,
@@ -373,13 +389,21 @@ fn read_numbering_definitions(
 
     let mut file = match zip.by_name(NUMBERING_PART) {
         Ok(file) => file,
-        Err(_) => return Ok(None),
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => {
+            return Err(RedlineExtractError::Zip(format!(
+                "open {NUMBERING_PART}: {error}"
+            )));
+        }
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|e| RedlineExtractError::Zip(format!("read {NUMBERING_PART}: {e}")))?;
     if bytes.is_empty() {
-        return Ok(None);
+        return Err(RedlineExtractError::XmlParse {
+            part: NUMBERING_PART.to_string(),
+            source: "part is present but empty".to_string(),
+        });
     }
     NumberingDefinitions::parse(&bytes)
         .map(Some)
@@ -475,6 +499,12 @@ fn attr<'a>(element: &'a Element, key: &str) -> Option<&'a str> {
     attr_get(element, key).map(String::as_str)
 }
 
+fn is_word_value_attribute(name: &xmltree::AttributeName) -> bool {
+    name.local_name == "val"
+        && (name.namespace.as_deref() == Some(WORD_NS)
+            || (name.namespace.is_none() && matches!(name.prefix.as_deref(), None | Some("w"))))
+}
+
 /// Extract all paragraphs from an element, recursively descending into tables.
 ///
 /// Numbering prefixes are computed separately for reject and accept views so
@@ -483,7 +513,8 @@ fn attr<'a>(element: &'a Element, key: &str) -> Option<&'a str> {
 fn extract_paragraphs(
     root: &Element,
     numbering_defs: Option<&NumberingDefinitions>,
-) -> Vec<RedlineParagraph> {
+    part: &str,
+) -> Result<Vec<RedlineParagraph>, RedlineExtractError> {
     let mut elements = Vec::new();
     collect_paragraph_elements(root, &mut elements, SpanContext::Normal);
 
@@ -502,13 +533,17 @@ fn extract_paragraphs(
     // paragraph's numbering was changed by a tracked change, the reject view
     // (base state) uses the previous numbering from pPrChange.
     let mut reject_state = NumberingState::new();
-    for (para, para_ctx, el) in &mut paras {
+    for (paragraph_index, (para, para_ctx, el)) in paras.iter_mut().enumerate() {
         if matches!(para_ctx, SpanContext::Inserted) {
             continue;
         }
-        if let Some(prefix) =
-            synthesize_reject_numbering_prefix(el, numbering_defs, &mut reject_state)
-            && !prefix.is_empty()
+        if let Some(prefix) = synthesize_reject_numbering_prefix(
+            el,
+            numbering_defs,
+            &mut reject_state,
+            part,
+            paragraph_index,
+        )? && !prefix.is_empty()
         {
             para.reject_prefix = Some(prefix);
         }
@@ -516,18 +551,23 @@ fn extract_paragraphs(
 
     // Phase 3: accept-view numbering (skip Deleted paragraphs).
     let mut accept_state = NumberingState::new();
-    for (para, para_ctx, el) in &mut paras {
+    for (paragraph_index, (para, para_ctx, el)) in paras.iter_mut().enumerate() {
         if matches!(para_ctx, SpanContext::Deleted) {
             continue;
         }
-        if let Some(prefix) = synthesize_numbering_prefix(el, numbering_defs, &mut accept_state)
-            && !prefix.is_empty()
+        if let Some(prefix) = synthesize_numbering_prefix(
+            el,
+            numbering_defs,
+            &mut accept_state,
+            part,
+            paragraph_index,
+        )? && !prefix.is_empty()
         {
             para.accept_prefix = Some(prefix);
         }
     }
 
-    paras.into_iter().map(|(para, _, _)| para).collect()
+    Ok(paras.into_iter().map(|(para, _, _)| para).collect())
 }
 
 /// Recursively collect all `<w:p>` elements, including inside tables.
@@ -989,21 +1029,23 @@ fn synthesize_numbering_prefix(
     paragraph: &Element,
     numbering_defs: Option<&NumberingDefinitions>,
     numbering_state: &mut NumberingState,
-) -> Option<String> {
-    let defs = numbering_defs?;
-    let (num_id, ilvl) = extract_num_props(paragraph)?;
-    match numbering_state.synthesize(defs, num_id, ilvl) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            tracing::warn!(
-                "failed to synthesize numbering for numId={}, ilvl={}: {}",
-                num_id,
-                ilvl,
-                e
-            );
-            None
-        }
-    }
+    part: &str,
+    paragraph_index: usize,
+) -> Result<Option<String>, RedlineExtractError> {
+    let direct = extract_num_props(paragraph).map_err(|source| RedlineExtractError::Numbering {
+        part: part.to_string(),
+        paragraph_index,
+        projection: "accept",
+        source,
+    })?;
+    synthesize_direct_numbering(
+        direct,
+        numbering_defs,
+        numbering_state,
+        part,
+        paragraph_index,
+        "accept",
+    )
 }
 
 /// Synthesize a numbering prefix for the **reject view** of a paragraph.
@@ -1028,40 +1070,108 @@ fn synthesize_reject_numbering_prefix(
     paragraph: &Element,
     numbering_defs: Option<&NumberingDefinitions>,
     numbering_state: &mut NumberingState,
-) -> Option<String> {
-    let defs = numbering_defs?;
-    let reject_props = extract_reject_num_props(paragraph);
+    part: &str,
+    paragraph_index: usize,
+) -> Result<Option<String>, RedlineExtractError> {
+    let current =
+        extract_num_props(paragraph).map_err(|source| RedlineExtractError::Numbering {
+            part: part.to_string(),
+            paragraph_index,
+            projection: "reject",
+            source,
+        })?;
+    let reject =
+        extract_reject_num_props(paragraph).map_err(|source| RedlineExtractError::Numbering {
+            part: part.to_string(),
+            paragraph_index,
+            projection: "reject",
+            source,
+        })?;
 
     // Detect the "numbering removed + materialized" case: current pPr has no
     // numPr, but pPrChange records previous numbering. The merge pipeline
     // materialized the old prefix as deleted inline text, so we must advance
     // the counter but NOT emit a prefix (it would double with the text).
-    if let Some((num_id, ilvl)) = reject_props
-        && extract_num_props(paragraph).is_none()
-    {
-        // Advance the counter (ignore the returned text).
-        let _ = numbering_state.synthesize(defs, num_id, ilvl);
-        return None;
-    }
-
-    let (num_id, ilvl) = reject_props?;
-    match numbering_state.synthesize(defs, num_id, ilvl) {
-        Ok(text) => Some(text),
-        Err(e) => {
-            tracing::warn!(
-                "failed to synthesize reject numbering for numId={}, ilvl={}: {}",
-                num_id,
-                ilvl,
-                e
-            );
-            None
-        }
+    let removed_and_materialized = matches!(reject, DirectNumbering::Active { .. })
+        && !matches!(current, DirectNumbering::Active { .. });
+    let prefix = synthesize_direct_numbering(
+        reject,
+        numbering_defs,
+        numbering_state,
+        part,
+        paragraph_index,
+        "reject",
+    )?;
+    if removed_and_materialized {
+        Ok(None)
+    } else {
+        Ok(prefix)
     }
 }
 
-fn extract_num_props(paragraph: &Element) -> Option<(u32, u32)> {
-    let ppr = find_w_child(paragraph, "pPr")?;
-    extract_num_props_from_ppr(ppr)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectNumbering {
+    Absent,
+    Suppressed,
+    Partial {
+        num_id: Option<u32>,
+        ilvl: Option<u32>,
+    },
+    Active {
+        num_id: u32,
+        ilvl: u32,
+    },
+}
+
+fn synthesize_direct_numbering(
+    direct: DirectNumbering,
+    numbering_defs: Option<&NumberingDefinitions>,
+    numbering_state: &mut NumberingState,
+    part: &str,
+    paragraph_index: usize,
+    projection: &'static str,
+) -> Result<Option<String>, RedlineExtractError> {
+    let DirectNumbering::Active { num_id, ilvl } = direct else {
+        if let DirectNumbering::Partial { num_id, ilvl } = direct {
+            return Err(RedlineExtractError::Numbering {
+                part: part.to_string(),
+                paragraph_index,
+                projection,
+                source: format!(
+                    "schema-valid partial numPr numId={num_id:?} ilvl={ilvl:?} has no frozen effective-numbering rule"
+                ),
+            });
+        }
+        return Ok(None);
+    };
+    let defs = numbering_defs.ok_or_else(|| RedlineExtractError::Numbering {
+        part: part.to_string(),
+        paragraph_index,
+        projection,
+        source: format!(
+            "active numPr numId={num_id} ilvl={ilvl} cannot be synthesized without numbering.xml"
+        ),
+    })?;
+    numbering_state
+        .synthesize(defs, num_id, ilvl)
+        .map(Some)
+        .map_err(|source| RedlineExtractError::Numbering {
+            part: part.to_string(),
+            paragraph_index,
+            projection,
+            source: format!("numId={num_id} ilvl={ilvl}: {source}"),
+        })
+}
+
+fn extract_num_props(paragraph: &Element) -> Result<DirectNumbering, String> {
+    let mut numbering = DirectNumbering::Absent;
+    for ppr in find_w_children(paragraph, "pPr") {
+        let candidate = extract_num_props_from_ppr(ppr)?;
+        if candidate != DirectNumbering::Absent {
+            numbering = candidate;
+        }
+    }
+    Ok(numbering)
 }
 
 /// Extract numbering properties for the **reject view**.
@@ -1070,76 +1180,120 @@ fn extract_num_props(paragraph: &Element) -> Option<(u32, u32)> {
 /// different numbering than the current `numPr`:
 ///
 /// 1. pPrChange has different `numPr` → use previous (reject = base state).
-/// 2. pPrChange has `numId=0` → numbering was explicitly absent in the base.
-///    The merge pipeline emits `numId=0` when the base had no numbering at all
-///    (no numPr AND no literal prefix). Return `None` to skip in reject view.
-/// 3. pPrChange has no `numPr` element → the base may have had a literal prefix
-///    that was replaced by structural numbering. Use the current numPr (it
-///    produces the same text as the old literal prefix).
+/// 2. pPrChange has `numId=0` → the base explicitly suppressed numbering.
+/// 3. pPrChange has no `numPr` element → the base had no direct structural
+///    numbering. Any prior literal prefix is source content materialized by
+///    the edit plan; this extractor must not guess it from current numbering.
 /// 4. No pPrChange → unchanged; use current `numPr`.
-fn extract_reject_num_props(paragraph: &Element) -> Option<(u32, u32)> {
-    let ppr = find_w_child(paragraph, "pPr")?;
-    let current = extract_num_props_from_ppr(ppr);
-
-    // Check for pPrChange with different numbering.
-    if let Some(ppr_change) = find_w_child(ppr, "pPrChange")
-        && let Some(inner_ppr) = find_w_child(ppr_change, "pPr")
-    {
-        // Check if pPrChange explicitly has numPr (even numId=0).
-        let has_numpr_element = find_w_child(inner_ppr, "numPr").is_some();
-        let previous = extract_num_props_from_ppr(inner_ppr);
-
-        match (current, previous, has_numpr_element) {
-            // Both present and same → use current (no change).
-            (Some(c), Some(p), _) if c == p => return current,
-            // Both present but different → use previous (reject = base state).
-            (Some(_), Some(p), _) => return Some(p),
-            // Current has numbering, pPrChange has numId=0 → numbering was
-            // explicitly absent in the base. Skip in reject view.
-            (Some(_), None, true) => return None,
-            // Current has numbering, pPrChange has NO numPr element at all →
-            // the base may have had a literal prefix replaced by structural
-            // numbering. Use the current numPr (produces same prefix text).
-            (Some(_), None, false) => return current,
-            // Current has no numbering, previous did → numbering was removed.
-            // In the reject view (base state), this paragraph had numbering.
-            (None, Some(p), _) => return Some(p),
-            // Neither has numbering → no numbering in either view.
-            (None, None, _) => return None,
-        }
+fn extract_reject_num_props(paragraph: &Element) -> Result<DirectNumbering, String> {
+    let pprs = find_w_children(paragraph, "pPr");
+    let ppr_changes = pprs
+        .iter()
+        .flat_map(|ppr| find_w_children(ppr, "pPrChange"))
+        .collect::<Vec<_>>();
+    if ppr_changes.len() > 1 {
+        return Err(format!(
+            "paragraph contains {} w:pPrChange elements; reject numbering cannot choose one history",
+            ppr_changes.len()
+        ));
     }
-
-    // No pPrChange → unchanged; use current numPr.
-    current
+    if let Some(ppr_change) = ppr_changes.first() {
+        let previous_pprs = find_w_children(ppr_change, "pPr");
+        if previous_pprs.len() > 1 {
+            return Err(format!(
+                "w:pPrChange contains {} previous w:pPr children; reject numbering cannot choose one snapshot",
+                previous_pprs.len()
+            ));
+        }
+        return match previous_pprs.first() {
+            Some(previous_ppr) => extract_num_props_from_ppr(previous_ppr),
+            // LibreOffice can omit the empty previous-pPr child. Its declared
+            // meaning is an empty previous direct state, not the current pPr.
+            None => Ok(DirectNumbering::Absent),
+        };
+    }
+    extract_num_props(paragraph)
 }
 
 /// Extract numId and ilvl from a pPr element (works for both main pPr and
 /// the inner pPr inside pPrChange).
-fn extract_num_props_from_ppr(ppr: &Element) -> Option<(u32, u32)> {
-    let num_pr = find_w_child(ppr, "numPr")?;
-    let num_id = find_w_child(num_pr, "numId")
-        .and_then(|e| attr(e, "val"))
-        .and_then(|v| v.parse::<u32>().ok())?;
-    // numId=0 means "no numbering" (§17.9.18) — treat as absent.
-    if num_id == 0 {
-        return None;
+fn extract_num_props_from_ppr(ppr: &Element) -> Result<DirectNumbering, String> {
+    let num_prs = find_w_children(ppr, "numPr");
+    let Some(num_pr) = num_prs.first() else {
+        return Ok(DirectNumbering::Absent);
+    };
+    if num_prs.len() != 1 {
+        return Err(format!(
+            "w:pPr contains {} w:numPr children; refusing first-wins numbering extraction",
+            num_prs.len()
+        ));
     }
-    let ilvl = find_w_child(num_pr, "ilvl")
-        .and_then(|e| attr(e, "val"))
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
-    Some((num_id, ilvl))
-}
-
-fn find_w_child<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
-    for child in &element.children {
-        if let XMLNode::Element(el) = child
-            && is_w_tag(el, name)
+    if !num_pr.attributes.is_empty() {
+        return Err("w:numPr carries unmodeled attributes".to_string());
+    }
+    for child in &num_pr.children {
+        if let XMLNode::Element(element) = child
+            && !is_w_tag(element, "numId")
+            && !is_w_tag(element, "ilvl")
         {
-            return Some(el);
+            return Err(format!(
+                "w:numPr contains unsupported child {}; tracked numbering cannot be flattened",
+                element.name
+            ));
         }
     }
-    None
+    let parse_coordinate = |name: &str| -> Result<Option<u32>, String> {
+        let elements = find_w_children(num_pr, name);
+        if elements.len() > 1 {
+            return Err(format!(
+                "w:numPr contains {} w:{name} children; refusing first-wins extraction",
+                elements.len()
+            ));
+        }
+        elements
+            .first()
+            .map(|element| {
+                let raw = attr(element, "val")
+                    .ok_or_else(|| format!("{name} is present without required w:val"))?;
+                if element
+                    .attributes
+                    .keys()
+                    .any(|attribute| !is_word_value_attribute(attribute))
+                {
+                    return Err(format!("w:{name} carries unmodeled attributes"));
+                }
+                if element.children.iter().any(|child| match child {
+                    XMLNode::Element(_) => true,
+                    XMLNode::Text(text) | XMLNode::CData(text) => !text.trim().is_empty(),
+                    _ => false,
+                }) {
+                    return Err(format!("w:{name} carries unmodeled child payload"));
+                }
+                raw.parse::<u32>()
+                    .map_err(|_| format!("{name} has invalid w:val {raw:?}"))
+            })
+            .transpose()
+    };
+    let num_id = parse_coordinate("numId")?;
+    let ilvl = parse_coordinate("ilvl")?;
+    if num_id == Some(0) {
+        return Ok(DirectNumbering::Suppressed);
+    }
+    match (num_id, ilvl) {
+        (Some(num_id), Some(ilvl)) => Ok(DirectNumbering::Active { num_id, ilvl }),
+        (num_id, ilvl) => Ok(DirectNumbering::Partial { num_id, ilvl }),
+    }
+}
+
+fn find_w_children<'a>(element: &'a Element, name: &str) -> Vec<&'a Element> {
+    element
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, name) => Some(element),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Push a span, merging with the previous span if they have the same variant.
@@ -1259,6 +1413,208 @@ mod tests {
         };
         assert_eq!(para.accept_text(), "the quick red fox");
         assert_eq!(para.reject_text(), "the quick brown fox");
+    }
+
+    #[test]
+    fn reject_numbering_does_not_infer_previous_lineage_from_current_numpr() {
+        let paragraph = parse_xml(
+            "word/document.xml",
+            r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr><w:pPrChange w:id="1" w:author=""><w:pPr/></w:pPrChange></w:pPr></w:p>"#,
+        )
+        .expect("paragraph XML");
+
+        assert_eq!(
+            extract_reject_num_props(&paragraph),
+            Ok(DirectNumbering::Absent),
+            "previous direct numPr absence is structural absence; a prior literal prefix is carried as source content"
+        );
+    }
+
+    #[test]
+    fn malformed_or_unresolved_present_numpr_is_a_contextual_extraction_error() {
+        for (num_pr, expected) in [
+            ("<w:numPr/>", "schema-valid partial numPr"),
+            (
+                "<w:numPr><w:numId/></w:numPr>",
+                "numId is present without required w:val",
+            ),
+            (
+                "<w:numPr><w:numId w:val=\"bad\"/></w:numPr>",
+                "numId has invalid w:val",
+            ),
+            (
+                "<w:numPr><w:ilvl/><w:numId w:val=\"1\"/></w:numPr>",
+                "ilvl is present without required w:val",
+            ),
+            (
+                "<w:numPr><w:ilvl w:val=\"bad\"/><w:numId w:val=\"1\"/></w:numPr>",
+                "ilvl has invalid w:val",
+            ),
+        ] {
+            let root = parse_xml(
+                "word/header1.xml",
+                &format!(
+                    r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr>{num_pr}</w:pPr><w:r><w:t>item</w:t></w:r></w:p></w:hdr>"#
+                ),
+            )
+            .expect("test XML");
+            let error = extract_paragraphs(&root, None, "word/header1.xml")
+                .expect_err("unresolved or malformed present numbering must fail extraction");
+
+            assert!(
+                matches!(
+                    &error,
+                    RedlineExtractError::Numbering {
+                        part,
+                        paragraph_index: 0,
+                        source,
+                        ..
+                    } if part == "word/header1.xml" && source.contains(expected)
+                ),
+                "unexpected extraction error for {num_pr}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_redline_propagates_contextual_numbering_error() {
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .start_file("word/document.xml", FileOptions::default())
+                .unwrap();
+            writer
+                .write_all(
+                    br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:numPr/></w:pPr><w:r><w:t>item</w:t></w:r></w:p></w:body></w:document>"#,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let error =
+            extract_redline(&bytes).expect_err("unresolved partial numPr must reach public API");
+        assert!(matches!(
+            error,
+            RedlineExtractError::Numbering {
+                part,
+                paragraph_index: 0,
+                projection: "reject",
+                source,
+            } if part == "word/document.xml" && source.contains("schema-valid partial numPr")
+        ));
+    }
+
+    #[test]
+    fn absent_and_suppressed_numbering_are_explicit_non_errors() {
+        for ppr in [
+            "<w:pPr/>",
+            "<w:pPr><w:numPr><w:numId w:val=\"0\"/></w:numPr></w:pPr>",
+        ] {
+            let root = parse_xml(
+                "word/document.xml",
+                &format!(
+                    r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p>{ppr}<w:r><w:t>item</w:t></w:r></w:p></w:body>"#
+                ),
+            )
+            .expect("test XML");
+            let paragraphs = extract_paragraphs(&root, None, "word/document.xml")
+                .expect("absence and suppression need no numbering table");
+
+            assert_eq!(paragraphs[0].accept_text(), "item");
+            assert_eq!(paragraphs[0].reject_text(), "item");
+        }
+    }
+
+    #[test]
+    fn active_numbering_without_definitions_is_not_silently_dropped() {
+        let root = parse_xml(
+            "word/document.xml",
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p></w:body>"#,
+        )
+        .expect("test XML");
+        let error = extract_paragraphs(&root, None, "word/document.xml")
+            .expect_err("active numbering without numbering.xml must fail");
+
+        assert!(matches!(
+            error,
+            RedlineExtractError::Numbering {
+                paragraph_index: 0,
+                projection: "reject",
+                source,
+                ..
+            } if source.contains("cannot be synthesized without numbering.xml")
+        ));
+    }
+
+    #[test]
+    fn undefined_active_numbering_is_not_silently_dropped() {
+        let definitions = NumberingDefinitions::parse(
+            br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#,
+        )
+        .expect("empty numbering table is valid XML");
+        let root = parse_xml(
+            "word/document.xml",
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p></w:body>"#,
+        )
+        .expect("test XML");
+        let error = extract_paragraphs(&root, Some(&definitions), "word/document.xml")
+            .expect_err("undefined numbering reference must fail synthesis");
+
+        assert!(matches!(
+            error,
+            RedlineExtractError::Numbering {
+                paragraph_index: 0,
+                projection: "reject",
+                source,
+                ..
+            } if source.contains("numId=7 ilvl=0")
+        ));
+    }
+
+    #[test]
+    fn redline_numbering_refuses_duplicates_and_tracked_children() {
+        let witnesses = [
+            r#"<w:pPr>
+                <w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>
+                <w:numPr><w:ilvl w:val="1"/><w:numId w:val="8"/></w:numPr>
+            </w:pPr>"#,
+            r#"<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/><w:numId w:val="8"/></w:numPr></w:pPr>"#,
+            r#"<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/><w:ins w:id="3" w:author="A"/></w:numPr></w:pPr>"#,
+        ];
+        for ppr in witnesses {
+            let root = parse_xml(
+                "word/document.xml",
+                &format!(
+                    r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p>{ppr}<w:r><w:t>item</w:t></w:r></w:p></w:body>"#
+                ),
+            )
+            .expect("test XML");
+            extract_paragraphs(&root, None, "word/document.xml")
+                .expect_err("alternate numbering state must not be flattened");
+        }
+    }
+
+    #[test]
+    fn reject_numbering_refuses_multiple_previous_histories() {
+        let root = parse_xml(
+            "word/document.xml",
+            r#"<w:body xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr>
+                <w:pPrChange w:id="1" w:author="A"><w:pPr/></w:pPrChange>
+                <w:pPrChange w:id="2" w:author="B"><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr></w:pPrChange>
+            </w:pPr><w:r><w:t>item</w:t></w:r></w:p></w:body>"#,
+        )
+        .expect("test XML");
+        let error = extract_paragraphs(&root, None, "word/document.xml")
+            .expect_err("reject projection cannot choose between histories");
+        assert!(matches!(
+            error,
+            RedlineExtractError::Numbering { source, .. }
+                if source.contains("2 w:pPrChange elements")
+        ));
     }
 
     #[test]
@@ -1439,7 +1795,7 @@ mod tests {
             </w:p>
         </w:body>"#;
         let root = Element::parse(Cursor::new(doc as &[u8])).unwrap();
-        let paras = extract_paragraphs(&root, Some(&defs));
+        let paras = extract_paragraphs(&root, Some(&defs), "test-body").unwrap();
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].accept_text(), "•\tIncludes all shares.");
         assert_eq!(paras[0].reject_text(), "•\tIncludes all shares.");
@@ -1824,7 +2180,7 @@ mod tests {
             </w:p>
         </w:body>"#;
         let root = Element::parse(Cursor::new(doc as &[u8])).unwrap();
-        let paras = extract_paragraphs(&root, Some(&defs));
+        let paras = extract_paragraphs(&root, Some(&defs), "test-body").unwrap();
         assert_eq!(paras.len(), 3);
 
         assert_eq!(paras[0].reject_text(), "1.\tFirst item");
@@ -1874,7 +2230,7 @@ mod tests {
             </w:p>
         </w:body>"#;
         let root = Element::parse(Cursor::new(doc as &[u8])).unwrap();
-        let paras = extract_paragraphs(&root, Some(&defs));
+        let paras = extract_paragraphs(&root, Some(&defs), "test-body").unwrap();
         assert_eq!(paras.len(), 3);
 
         assert_eq!(paras[0].reject_text(), "1.\tFirst item");
@@ -1995,7 +2351,7 @@ mod tests {
             </w:footnote>
         </w:footnotes>"#;
         let root = parse_xml("word/footnotes.xml", xml).unwrap();
-        let paras = extract_paragraphs(&root, None);
+        let paras = extract_paragraphs(&root, None, "word/footnotes.xml").unwrap();
         // Only the real footnote (id=1) should produce a paragraph.
         // Separator and continuationSeparator footnotes must be excluded.
         assert_eq!(paras.len(), 1);

@@ -7,6 +7,8 @@ use std::thread;
 use rayon::prelude::*;
 use serde::Deserialize;
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 mod common;
 

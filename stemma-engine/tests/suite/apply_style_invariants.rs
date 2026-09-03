@@ -125,7 +125,12 @@ fn apply_style_reject_restores_previous_accept_keeps_new() {
             "tracked style change must record a pPrChange"
         );
         assert_eq!(
-            p.formatting_change.as_ref().unwrap().previous_style_id,
+            p.formatting_change
+                .as_ref()
+                .unwrap()
+                .previous
+                .direct
+                .style_id,
             base_style,
             "pPrChange must record the prior style for reject-restore"
         );

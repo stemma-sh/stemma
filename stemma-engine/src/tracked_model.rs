@@ -3,16 +3,13 @@ use std::collections::{HashMap, HashSet};
 use sha2::{Digest, Sha256};
 use similar::{Algorithm, DiffOp};
 
-use crate::diff::{diff_block_content_with_marks, diff_nested_tables};
 use crate::domain::{
-    Alignment, BlockNode, BlockProvenance, CanonDoc, CellFormatting, CellFormattingChange,
-    CommentStory, DiffChange, EndnoteStory, FieldData, FieldKind, FooterStory, FootnoteStory,
-    HeaderStory, InlineChange, InlineChangeSegmentType, InlineNode, Mark, MaterializedPrefixKind,
-    NestedTableDiffKind, NodeId, OpaqueKind, ParagraphFormattingChange, ParagraphNode,
-    RevisionInfo, RunRprAuthored, SectionProperties, SectionPropertyChange, StackedRevision,
-    StoryScope, StyleProps, TableCellNode, TableDiffResult, TableNode, TableRowAlignment, TextNode,
-    TextRole, TrackedBlock, TrackedSegment, TrackingStatus, is_materialized_prefix_text,
-    materialized_prefix_node_id,
+    BlockNode, CanonDoc, CellFormatting, CommentStory, FieldData, FieldKind, InlineChange,
+    InlineChangeSegmentType, InlineNode, MaterializedPrefixKind, NestedTableDiffKind, NodeId,
+    OpaqueKind, ParagraphFormattingChange, ParagraphNode, RevisionInfo, RunRprAuthored,
+    SectionProperties, StackedRevision, StoryScope, StyleProps, TableCellNode, TableDiffResult,
+    TableNode, TableRowAlignment, TextNode, TextRole, TrackedBlock, TrackedSegment, TrackingStatus,
+    is_materialized_prefix_text, materialized_prefix_node_id,
 };
 use crate::import::strip_literal_prefix;
 use crate::table::extract_inlines_text;
@@ -23,123 +20,104 @@ pub struct MergeError {
     pub context: String,
 }
 
-/// Result of merging two documents with tracked changes.
+/// Completes local before/after regions that a caller's edit plan leaves
+/// unresolved.
 ///
-/// Contains the merged document (with TrackedSegments) and a provenance map
-/// linking each changed merged block back to its source-document identities.
-pub struct MergeResult {
-    pub doc: CanonDoc,
-    /// Provenance for every merged block derived from a DiffChange.
-    /// Keyed by merged block ID. Unchanged blocks are absent.
-    pub block_provenance: BlockProvenanceMap,
+/// The engine owns native tracked-change materialization, but it does not own
+/// document comparison. A caller that inferred a whole-document change plan
+/// must therefore supply the two local inference operations needed while
+/// materializing nested table stories. Explicit-edit callers can provide the
+/// same operations without introducing a dependency from the engine back to a
+/// comparison subsystem.
+pub(crate) trait ChangePlanResolver {
+    fn paragraph_changes(&self, before: &[InlineNode], after: &[InlineNode]) -> Vec<InlineChange>;
+
+    fn nested_table_change(
+        &self,
+        before: &TableNode,
+        after: &TableNode,
+        block_index: usize,
+    ) -> Result<Option<crate::domain::NestedTableDiff>, String>;
 }
 
-/// Maps merged block IDs to their source-document provenance.
-///
-/// Typed wrapper enforcing invariants: modified blocks have both IDs,
-/// deleted blocks have base only, inserted blocks have target only.
-pub struct BlockProvenanceMap(HashMap<NodeId, BlockProvenance>);
-
-impl Default for BlockProvenanceMap {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellContentRelation {
+    Related,
+    UnrelatedReplacement,
 }
 
-impl BlockProvenanceMap {
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
+struct UnrelatedContentResolver<'a>(&'a dyn ChangePlanResolver);
 
-    /// Record provenance for a modified block (exists in both base and target).
-    pub fn insert_modified(&mut self, merged_id: NodeId, base_id: NodeId, target_id: NodeId) {
-        self.0.insert(
-            merged_id,
-            BlockProvenance {
-                base_block_id: Some(base_id),
-                target_block_id: Some(target_id),
-            },
-        );
-    }
-
-    /// Record provenance for a deleted block (exists in base only).
-    pub fn insert_deleted(&mut self, merged_id: NodeId, base_id: NodeId) {
-        self.0.insert(
-            merged_id,
-            BlockProvenance {
-                base_block_id: Some(base_id),
-                target_block_id: None,
-            },
-        );
-    }
-
-    /// Record provenance for an inserted block (exists in target only).
-    pub fn insert_inserted(&mut self, merged_id: NodeId, target_id: NodeId) {
-        self.0.insert(
-            merged_id,
-            BlockProvenance {
-                base_block_id: None,
-                target_block_id: Some(target_id),
-            },
-        );
-    }
-
-    /// Get the base (original) document block ID for anchoring delete atoms.
-    pub fn base_block_id(&self, merged_id: &NodeId) -> Option<&NodeId> {
-        self.0.get(merged_id).and_then(|p| p.base_block_id.as_ref())
-    }
-
-    /// Get the target (modified) document block ID for anchoring insert atoms.
-    pub fn target_block_id(&self, merged_id: &NodeId) -> Option<&NodeId> {
+impl ChangePlanResolver for UnrelatedContentResolver<'_> {
+    fn paragraph_changes(&self, before: &[InlineNode], after: &[InlineNode]) -> Vec<InlineChange> {
         self.0
-            .get(merged_id)
-            .and_then(|p| p.target_block_id.as_ref())
+            .paragraph_changes(before, after)
+            .into_iter()
+            .flat_map(|change| match change {
+                InlineChange::Unchanged {
+                    text,
+                    marks,
+                    style_props,
+                    formatting_change,
+                } => {
+                    let (previous_marks, previous_style_props) =
+                        formatting_change.as_ref().map_or_else(
+                            || (marks.clone(), style_props.clone()),
+                            |change| {
+                                (
+                                    change.previous_marks.clone(),
+                                    change.previous_style_props.clone(),
+                                )
+                            },
+                        );
+                    vec![
+                        InlineChange::Deleted {
+                            text: text.clone(),
+                            marks: previous_marks,
+                            style_props: previous_style_props,
+                            formatting_change: None,
+                            rev_id: 0,
+                        },
+                        InlineChange::Inserted {
+                            text,
+                            marks,
+                            style_props,
+                            formatting_change: None,
+                            rev_id: 0,
+                        },
+                    ]
+                }
+                InlineChange::Opaque {
+                    segment_type: InlineChangeSegmentType::Equal,
+                    ..
+                } => {
+                    let mut deleted = change.clone();
+                    let InlineChange::Opaque { segment_type, .. } = &mut deleted else {
+                        unreachable!("matched opaque change must remain opaque")
+                    };
+                    *segment_type = InlineChangeSegmentType::Delete;
+                    let mut inserted = change;
+                    let InlineChange::Opaque { segment_type, .. } = &mut inserted else {
+                        unreachable!("matched opaque change must remain opaque")
+                    };
+                    *segment_type = InlineChangeSegmentType::Insert;
+                    vec![deleted, inserted]
+                }
+                other => vec![other],
+            })
+            .collect()
     }
 
-    /// Check whether a merged block has provenance recorded.
-    pub fn contains(&self, merged_id: &NodeId) -> bool {
-        self.0.contains_key(merged_id)
+    fn nested_table_change(
+        &self,
+        _before: &TableNode,
+        _after: &TableNode,
+        block_index: usize,
+    ) -> Result<Option<crate::domain::NestedTableDiff>, String> {
+        Err(format!(
+            "unrelated cell replacement unexpectedly shared nested table block {block_index}"
+        ))
     }
-
-    /// Build an identity provenance map from a tracked CanonDoc.
-    ///
-    /// For the single-doc pipeline, there is no base/target distinction — every
-    /// block maps to itself.  Inserted blocks get target-only provenance,
-    /// deleted blocks get base-only, and Normal blocks (which may contain inline
-    /// tracked changes) get both.  This lets `extract_tracked_atoms_from_merged`
-    /// work unchanged for the single-doc case.
-    pub fn identity_from_tracked_doc(doc: &CanonDoc) -> Self {
-        let mut map = Self::new();
-        for tb in &doc.blocks {
-            let id = match &tb.block {
-                BlockNode::Paragraph(p) => &p.id,
-                BlockNode::Table(t) => &t.id,
-                BlockNode::OpaqueBlock(o) => &o.id,
-            };
-            match &tb.status {
-                TrackingStatus::Inserted(_) => {
-                    map.insert_inserted(id.clone(), id.clone());
-                }
-                TrackingStatus::Deleted(_) => {
-                    map.insert_deleted(id.clone(), id.clone());
-                }
-                TrackingStatus::InsertedThenDeleted(_) => unreachable!(
-                    "block-level stacked status is never constructed (3a is inline-only; \
-                     nested body containers quarantine at import)"
-                ),
-                TrackingStatus::Normal => {
-                    map.insert_modified(id.clone(), id.clone(), id.clone());
-                }
-            }
-        }
-        map
-    }
-}
-
-#[derive(Default)]
-struct InsertOrderState {
-    start_tail: Option<NodeId>,
-    by_anchor: HashMap<NodeId, NodeId>,
 }
 
 fn block_id(block: &BlockNode) -> &NodeId {
@@ -149,15 +127,6 @@ fn block_id(block: &BlockNode) -> &NodeId {
         BlockNode::OpaqueBlock(o) => &o.id,
     }
 }
-
-fn set_block_id(block: &mut BlockNode, id: NodeId) {
-    match block {
-        BlockNode::Paragraph(p) => p.id = id,
-        BlockNode::Table(t) => t.id = id,
-        BlockNode::OpaqueBlock(o) => o.id = id,
-    }
-}
-
 fn find_block_index(blocks: &[TrackedBlock], id: &NodeId) -> Option<usize> {
     blocks.iter().position(|tb| block_id(&tb.block) == id)
 }
@@ -177,55 +146,6 @@ pub(crate) fn next_revision(base: &RevisionInfo, counter: &mut u32) -> RevisionI
     *counter += 1;
     rev
 }
-
-fn unique_inserted_block_id(blocks: &[TrackedBlock], original_id: &NodeId) -> NodeId {
-    if find_block_index(blocks, original_id).is_none() {
-        return original_id.clone();
-    }
-    let mut suffix = 1usize;
-    loop {
-        let candidate = NodeId::from(format!("{}__ins{}", original_id.0, suffix));
-        if find_block_index(blocks, &candidate).is_none() {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-fn insert_after_index(blocks: &[TrackedBlock], id: &NodeId) -> Option<usize> {
-    find_block_index(blocks, id).map(|idx| idx + 1)
-}
-
-fn normalize_insert_position(
-    anchor: &Option<NodeId>,
-    order_state: &InsertOrderState,
-) -> Option<NodeId> {
-    match anchor {
-        None => order_state.start_tail.clone(),
-        Some(anchor_id) => order_state
-            .by_anchor
-            .get(anchor_id)
-            .cloned()
-            .or_else(|| Some(anchor_id.clone())),
-    }
-}
-
-fn note_insert_position(
-    original_anchor: &Option<NodeId>,
-    inserted_id: NodeId,
-    order_state: &mut InsertOrderState,
-) {
-    match original_anchor {
-        None => order_state.start_tail = Some(inserted_id),
-        Some(anchor) => {
-            order_state.by_anchor.insert(anchor.clone(), inserted_id);
-        }
-    }
-}
-
-/// Like the former `paragraph_text_to_inlines` but carries style_props and formatting_change
-/// through to the created TextNodes. Used when the diff detects formatting-only
-/// changes (rPrChange) on unchanged text.
 fn paragraph_text_to_inlines_with_formatting(
     paragraph_id: &NodeId,
     segment_index: usize,
@@ -291,6 +211,7 @@ fn paragraph_text_to_inlines_with_formatting(
                     &style_props,
                 ),
                 source_run_attrs: Vec::new(),
+                formatting_change: formatting_change.clone(),
                 joins_following_text_run: false,
             }));
             inline_index += 1;
@@ -771,6 +692,74 @@ pub(crate) fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> V
 /// in order. When a `U+FFFC` appears in Unchanged/Deleted text, the next
 /// opaque from `base_opaques` is used. For Inserted text, the next from
 /// `target_opaques`. For Unchanged, both cursors advance.
+fn push_opaque_replacement_segments(
+    segments: &mut Vec<TrackedSegment>,
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) {
+    let drawing_replacement =
+        matches!(base.kind, OpaqueKind::Drawing) && matches!(target.kind, OpaqueKind::Drawing);
+
+    // Word emits drawing replacements with the target first. The order is
+    // visually significant for overlapping inline/block drawings: consumers
+    // paint the later deleted drawing over the inserted drawing when the
+    // source is emitted first. Other opaque kinds retain their established
+    // delete-then-insert ordering.
+    if drawing_replacement {
+        segments.push(TrackedSegment {
+            status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
+            inlines: vec![InlineNode::from(target.clone())],
+        });
+        segments.push(TrackedSegment {
+            status: TrackingStatus::Deleted(next_revision(revision, rev_counter)),
+            inlines: vec![InlineNode::from(base.clone())],
+        });
+    } else {
+        segments.push(TrackedSegment {
+            status: TrackingStatus::Deleted(next_revision(revision, rev_counter)),
+            inlines: vec![InlineNode::from(base.clone())],
+        });
+        segments.push(TrackedSegment {
+            status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
+            inlines: vec![InlineNode::from(target.clone())],
+        });
+    }
+}
+
+/// Whether two positionally aligned opaque nodes carry different semantic
+/// payloads and therefore need a tracked replacement pair.
+///
+/// `content_hash` is authoritative when both nodes have one. Hyperlinks are
+/// modeled without that hash, so compare their semantic fields while excluding
+/// the package-local relationship id. A one-sided hash is not evidence of
+/// equality and is conservatively represented as a replacement.
+fn opaque_payload_changed(
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+) -> bool {
+    let kinds_equal = match (&base.kind, &target.kind) {
+        (OpaqueKind::Hyperlink(base), OpaqueKind::Hyperlink(target)) => {
+            base.url == target.url
+                && base.anchor == target.anchor
+                && base.text == target.text
+                && base.runs == target.runs
+                && base.extra_attrs == target.extra_attrs
+        }
+        (base, target) => base == target,
+    };
+    if !kinds_equal {
+        return true;
+    }
+
+    match (&base.content_hash, &target.content_hash) {
+        (Some(base), Some(target)) => base != target,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 fn inline_changes_to_segments_with_opaques(
     paragraph_id: &NodeId,
     inline_changes: &[InlineChange],
@@ -799,6 +788,7 @@ fn inline_changes_to_segments_with_opaques(
                 let fc = formatting_change
                     .as_ref()
                     .map(|fc| crate::domain::FormattingChange {
+                        carrier: fc.carrier,
                         previous_marks: fc.previous_marks.clone(),
                         previous_style_props: fc.previous_style_props.clone(),
                         previous_rpr_authored: fc.previous_rpr_authored,
@@ -833,7 +823,18 @@ fn inline_changes_to_segments_with_opaques(
                 style_props,
                 None,
             ),
-            InlineChange::Opaque { segment_type, .. } => {
+            InlineChange::Opaque {
+                segment_type, kind, ..
+            } => {
+                // The public diff projection represents both zero-width comment
+                // range starts and comment references as CommentReference
+                // opaque segments. They are not OpaqueInlineNodes and therefore
+                // must not consume either opaque cursor. The structural-marker
+                // reconciliation below re-injects the lossless start/end/ref
+                // nodes from the base and target paragraphs at their offsets.
+                if *kind == crate::domain::OpaqueSegmentKind::CommentReference {
+                    continue;
+                }
                 // Opaque changes (images, equations, fields) are handled directly
                 // here rather than through the text+U+FFFC path.
                 match segment_type {
@@ -911,11 +912,7 @@ fn inline_changes_to_segments_with_opaques(
                         base_opaque_idx += 1;
                         target_opaque_idx += 1;
 
-                        let content_changed =
-                            match (&base_opaque.content_hash, &target_opaque.content_hash) {
-                                (Some(bh), Some(th)) => bh != th,
-                                _ => false,
-                            };
+                        let content_changed = opaque_payload_changed(base_opaque, target_opaque);
 
                         if content_changed {
                             if matches!(
@@ -936,20 +933,13 @@ fn inline_changes_to_segments_with_opaques(
                                     inlines: vec![InlineNode::from(target_opaque.clone())],
                                 });
                             } else {
-                                segments.push(TrackedSegment {
-                                    status: TrackingStatus::Deleted(next_revision(
-                                        revision,
-                                        rev_counter,
-                                    )),
-                                    inlines: vec![InlineNode::from(base_opaque.clone())],
-                                });
-                                segments.push(TrackedSegment {
-                                    status: TrackingStatus::Inserted(next_revision(
-                                        revision,
-                                        rev_counter,
-                                    )),
-                                    inlines: vec![InlineNode::from(target_opaque.clone())],
-                                });
+                                push_opaque_replacement_segments(
+                                    &mut segments,
+                                    base_opaque,
+                                    target_opaque,
+                                    revision,
+                                    rev_counter,
+                                );
                             }
                         } else {
                             // Content is the same — emit as Normal
@@ -1252,8 +1242,8 @@ fn reconstruct_inlines_with_opaques(
 ///
 /// For each `U+FFFC` placeholder, compares `content_hash` between the base and
 /// target opaque. If they match, emits a single Normal segment. If they differ,
-/// emits a Deleted segment (with the base opaque) followed by an Inserted segment
-/// (with the target opaque), producing proper tracked changes in the output.
+/// emits a tracked replacement pair. Drawing replacements follow Word's
+/// insertion-then-deletion order; other opaque kinds retain deletion-then-insertion.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_opaques_with_change_detection(
     paragraph_id: &NodeId,
@@ -1273,7 +1263,7 @@ fn reconstruct_opaques_with_change_detection(
     let mut segments: Vec<TrackedSegment> = Vec::new();
 
     // We accumulate normal inlines until we encounter a changed opaque,
-    // at which point we flush the accumulated normal inlines, emit del+ins,
+    // at which point we flush the accumulated normal inlines, emit the pair,
     // and start a new normal accumulator.
     let mut normal_inlines: Vec<InlineNode> = Vec::new();
 
@@ -1301,10 +1291,7 @@ fn reconstruct_opaques_with_change_detection(
             *target_opaque_idx += 1;
 
             let content_changed = match (&base_opaque, &target_opaque) {
-                (Some(b), Some(t)) => match (&b.content_hash, &t.content_hash) {
-                    (Some(bh), Some(th)) => bh != th,
-                    _ => false,
-                },
+                (Some(base), Some(target)) => opaque_payload_changed(base, target),
                 _ => false,
             };
 
@@ -1317,22 +1304,17 @@ fn reconstruct_opaques_with_change_detection(
                     });
                 }
 
-                // Emit deleted base opaque + inserted target opaque.
+                // Emit the tracked opaque replacement pair.
                 // Note: paragraph-level opaques (OmmlBlock) should never
                 // reach here — the diff layer reclassifies wholly-opaque
                 // paragraph changes as BlockDeleted + BlockInserted.
-                if let Some(bo) = base_opaque {
-                    segments.push(TrackedSegment {
-                        status: TrackingStatus::Deleted(next_revision(revision, rev_counter)),
-                        inlines: vec![InlineNode::from(bo)],
-                    });
-                }
-                if let Some(to) = target_opaque {
-                    segments.push(TrackedSegment {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        inlines: vec![InlineNode::from(to)],
-                    });
-                }
+                let bo = base_opaque
+                    .as_ref()
+                    .expect("content_changed requires a base opaque");
+                let to = target_opaque
+                    .as_ref()
+                    .expect("content_changed requires a target opaque");
+                push_opaque_replacement_segments(&mut segments, bo, to, revision, rev_counter);
             } else {
                 // Same opaque payload — keep it as normal content, but adopt the
                 // target wrapper formatting so accept-all matches the target's
@@ -1354,80 +1336,26 @@ fn reconstruct_opaques_with_change_detection(
 
     segments
 }
-
-fn apply_block_deleted(
-    blocks: &mut [TrackedBlock],
-    block_id_to_delete: &NodeId,
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    context: &str,
-) -> Result<(), MergeError> {
-    let Some(idx) = find_block_index(blocks, block_id_to_delete) else {
-        return Err(MergeError {
-            message: "block_id for deletion not found in base model".to_string(),
-            context: format!("{context}:{}", block_id_to_delete.0),
-        });
-    };
-    mark_whole_block_deleted(&mut blocks[idx], revision, rev_counter);
-    Ok(())
-}
-
-/// Mark one complete block deleted in the public canonical model.
 pub(crate) fn mark_whole_block_deleted(
     tracked_block: &mut TrackedBlock,
     revision: &RevisionInfo,
     rev_counter: &mut u32,
 ) {
     tracked_block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-    if let BlockNode::Paragraph(paragraph) = &mut tracked_block.block {
-        paragraph.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-            revision,
-            rev_counter,
-        )));
+    match &mut tracked_block.block {
+        BlockNode::Paragraph(paragraph) => {
+            paragraph.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
+                revision,
+                rev_counter,
+            )));
+        }
+        BlockNode::Table(table) => mark_table_deleted(table, revision, rev_counter),
+        // Body/story opaque blocks use the enclosing TrackedBlock status as
+        // their whole-object carrier. Cell-story blocks are bare BlockNode
+        // values and have separate fail-fast lowering helpers below.
+        BlockNode::OpaqueBlock(_) => {}
     }
 }
-
-fn apply_block_inserted(
-    blocks: &mut Vec<TrackedBlock>,
-    after_block_id: &Option<NodeId>,
-    block: &BlockNode,
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    order_state: &mut InsertOrderState,
-    context: &str,
-) -> Result<(), MergeError> {
-    let normalized_anchor = normalize_insert_position(after_block_id, order_state);
-    let insert_idx = match normalized_anchor {
-        None => 0usize,
-        Some(anchor) => insert_after_index(blocks, &anchor).ok_or_else(|| MergeError {
-            message: "insert anchor not found in base model".to_string(),
-            context: format!("{context}:{}", anchor.0),
-        })?,
-    };
-    let mut inserted_block = block.clone();
-    // Numbering definitions are now merged from the target DOCX into the base
-    // by `merge_target_numbering` in serialize_canonical_docx, so inserted
-    // paragraphs keep their w:numPr references. We no longer materialize
-    // numbering as literal text since the definitions will be available.
-    let inserted_id = unique_inserted_block_id(blocks, block_id(&inserted_block));
-    set_block_id(&mut inserted_block, inserted_id.clone());
-    blocks.insert(
-        insert_idx,
-        TrackedBlock {
-            status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-            block: inserted_block,
-            move_id: None,
-            block_sdt_wrap: None,
-        },
-    );
-    note_insert_position(after_block_id, inserted_id, order_state);
-    Ok(())
-}
-
-/// Compute the effective user-visible text prefix for a paragraph.
-///
-/// Returns the synthesized numbering text (from auto-numbering) or literal prefix,
-/// whichever is present. This is what appears before the paragraph body text.
 fn effective_text_prefix(p: &ParagraphNode) -> Option<&str> {
     if let Some(n) = &p.numbering
         && !n.synthesized_text.is_empty()
@@ -1452,8 +1380,8 @@ fn plan_prefix_materialization(
     source: &ParagraphNode,
     target: &ParagraphNode,
 ) -> Option<PrefixMaterializationPlan> {
-    let source_uses_structural_numbering = source.numbering.is_some();
-    let target_uses_structural_numbering = target.numbering.is_some();
+    let source_uses_structural_numbering = source.has_resolved_numbering();
+    let target_uses_structural_numbering = target.has_resolved_numbering();
     let both_structural = source_uses_structural_numbering && target_uses_structural_numbering;
     let source_has_prefix = source_uses_structural_numbering || source.literal_prefix.is_some();
     let target_adds_structural = !source_has_prefix && target_uses_structural_numbering;
@@ -1466,18 +1394,16 @@ fn plan_prefix_materialization(
     let prefix_text_changed = old_prefix != new_prefix;
 
     // Word accept/reject needs explicit inline prefix text when the visible
-    // prefix lives in paragraph text on one side but in w:numPr on the other.
-    // Comparing the label text alone is not enough; representation changes are
-    // semantic for redline because reject cannot recover a baked prefix from
-    // a dropped numPr, and accept cannot recover a baked target prefix from
-    // paragraph properties alone.
-    let emit_deleted_prefix = if source.literal_prefix.is_some() {
-        prefix_text_changed || target_uses_structural_numbering || target.literal_prefix.is_none()
-    } else if source_uses_structural_numbering {
-        !target_uses_structural_numbering
-    } else {
-        false
-    };
+    // prefix is literal paragraph text on either terminal side. Structural
+    // source numbering is different: the complete previous w:numPr lives in
+    // w:pPrChange, so materializing that label as deleted text would represent
+    // it twice. Reject would restore both the numPr and the inline label.
+    // Comparing label text alone is therefore not enough; representation is
+    // part of the redline semantics.
+    let emit_deleted_prefix = source.literal_prefix.is_some()
+        && (prefix_text_changed
+            || target_uses_structural_numbering
+            || target.literal_prefix.is_none());
     let emit_inserted_prefix = target.literal_prefix.is_some()
         && (prefix_text_changed
             || source_uses_structural_numbering
@@ -1561,6 +1487,11 @@ fn inline_text_width(inline: &InlineNode) -> usize {
     match inline {
         InlineNode::Text(t) => t.text.chars().count(),
         InlineNode::HardBreak(_) => 1,
+        InlineNode::OpaqueInline(opaque)
+            if matches!(opaque.kind, OpaqueKind::CommentReference(_)) =>
+        {
+            0
+        }
         InlineNode::OpaqueInline(_) => 1,
         InlineNode::Decoration(_)
         | InlineNode::CommentRangeStart { .. }
@@ -1575,6 +1506,10 @@ fn is_comment_marker(inline: &InlineNode) -> bool {
         InlineNode::CommentRangeStart { .. }
             | InlineNode::CommentRangeEnd { .. }
             | InlineNode::CommentReference { .. }
+    ) || matches!(
+        inline,
+        InlineNode::OpaqueInline(opaque)
+            if matches!(opaque.kind, OpaqueKind::CommentReference(_))
     )
 }
 
@@ -1587,6 +1522,12 @@ fn structural_marker_identity(inline: &InlineNode, offset: usize) -> Option<Stri
         InlineNode::CommentRangeStart { id } => Some(format!("comment-start:{offset}:{id}")),
         InlineNode::CommentRangeEnd { id } => Some(format!("comment-end:{offset}:{id}")),
         InlineNode::CommentReference { id } => Some(format!("comment-ref:{offset}:{id}")),
+        InlineNode::OpaqueInline(opaque) => match &opaque.kind {
+            OpaqueKind::CommentReference(reference) => {
+                Some(format!("comment-ref:{offset}:{}", reference.reference_id))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1603,6 +1544,14 @@ fn collect_positioned_structural_markers(
                 | InlineNode::CommentRangeStart { .. }
                 | InlineNode::CommentRangeEnd { .. }
                 | InlineNode::CommentReference { .. } => {
+                    markers.push(PositionedStructuralMarker {
+                        offset,
+                        inline: inline.clone(),
+                    });
+                }
+                InlineNode::OpaqueInline(opaque)
+                    if matches!(opaque.kind, OpaqueKind::CommentReference(_)) =>
+                {
                     markers.push(PositionedStructuralMarker {
                         offset,
                         inline: inline.clone(),
@@ -1727,6 +1676,195 @@ pub(crate) fn inject_structural_markers_at_offsets(
     }
 }
 
+/// Materialize structural-marker changes for one already-selected local region.
+///
+/// Comment ids have already been reconciled across the two package namespaces.
+/// A marker present on both sides is therefore the same surviving annotation;
+/// a base-only marker is deleted and a target-only marker is inserted. Keeping
+/// that polarity on the marker itself is essential at zero-width boundaries:
+/// borrowing whichever text segment happens to be adjacent cross-wires
+/// colliding comments and leaves orphan anchors after accept/reject.
+fn inject_structural_marker_changes(
+    final_segments: &mut Vec<TrackedSegment>,
+    original_segments: &[TrackedSegment],
+    target_segments: &[TrackedSegment],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) {
+    #[derive(Clone)]
+    struct TrackedMarker {
+        offset: usize,
+        inline: InlineNode,
+        status: Option<TrackingStatus>,
+    }
+
+    fn push(out: &mut Vec<TrackedSegment>, inline: InlineNode, status: TrackingStatus) {
+        if let Some(last) = out.last_mut()
+            && last.status == status
+        {
+            last.inlines.push(inline);
+        } else {
+            out.push(TrackedSegment {
+                status,
+                inlines: vec![inline],
+            });
+        }
+    }
+
+    let base_markers = collect_positioned_structural_markers(original_segments);
+    let target_markers = collect_positioned_structural_markers(target_segments);
+    if !base_markers
+        .iter()
+        .chain(&target_markers)
+        .any(|marker| is_comment_marker(&marker.inline))
+    {
+        inject_structural_markers_at_offsets(
+            final_segments,
+            original_segments,
+            Some(target_segments),
+        );
+        return;
+    }
+    let base_keys: HashSet<String> = base_markers
+        .iter()
+        .filter_map(|marker| structural_marker_identity(&marker.inline, marker.offset))
+        .collect();
+    let target_keys: HashSet<String> = target_markers
+        .iter()
+        .filter_map(|marker| structural_marker_identity(&marker.inline, marker.offset))
+        .collect();
+
+    let mut markers = Vec::new();
+    for marker in base_markers {
+        let key = structural_marker_identity(&marker.inline, marker.offset);
+        let status = if is_comment_marker(&marker.inline) {
+            if key.as_ref().is_some_and(|key| target_keys.contains(key)) {
+                Some(TrackingStatus::Normal)
+            } else {
+                Some(TrackingStatus::Deleted(next_revision(
+                    revision,
+                    rev_counter,
+                )))
+            }
+        } else {
+            None
+        };
+        markers.push(TrackedMarker {
+            offset: marker.offset,
+            inline: marker.inline,
+            status,
+        });
+    }
+    for marker in target_markers {
+        let Some(key) = structural_marker_identity(&marker.inline, marker.offset) else {
+            continue;
+        };
+        if base_keys.contains(&key) {
+            continue;
+        }
+        let mut inline = marker.inline;
+        let status = if is_comment_marker(&inline) {
+            Some(TrackingStatus::Inserted(next_revision(
+                revision,
+                rev_counter,
+            )))
+        } else {
+            if let InlineNode::Decoration(ref mut decoration) = inline {
+                decoration.origin = Some("target".to_string());
+            }
+            None
+        };
+        markers.push(TrackedMarker {
+            offset: marker.offset,
+            inline,
+            status,
+        });
+    }
+
+    if markers.is_empty() {
+        return;
+    }
+    markers.sort_by_key(|marker| marker.offset);
+    let mut pending = std::collections::VecDeque::from(markers);
+
+    // Inline conversion intentionally omits these markers before this pass.
+    // Removing defensively makes the producer idempotent if a future path
+    // starts carrying one through directly.
+    for segment in final_segments.iter_mut() {
+        segment.inlines.retain(|inline| !is_comment_marker(inline));
+    }
+
+    let old_segments = std::mem::take(final_segments);
+    let mut rebuilt = Vec::new();
+    let mut text_offset = 0usize;
+    let mut last_status = TrackingStatus::Normal;
+
+    for segment in old_segments {
+        last_status = segment.status.clone();
+        for inline in segment.inlines {
+            while pending
+                .front()
+                .is_some_and(|marker| marker.offset <= text_offset)
+            {
+                let marker = pending.pop_front().expect("front existed");
+                push(
+                    &mut rebuilt,
+                    marker.inline,
+                    marker.status.unwrap_or_else(|| segment.status.clone()),
+                );
+            }
+
+            let width = inline_text_width(&inline);
+            let marker_is_inside = |marker: &TrackedMarker| {
+                marker.offset > text_offset && marker.offset < text_offset + width
+            };
+            if let InlineNode::Text(text) = &inline
+                && pending.front().is_some_and(marker_is_inside)
+            {
+                let chars: Vec<char> = text.text.chars().collect();
+                let mut consumed = 0usize;
+                while pending.front().is_some_and(marker_is_inside) {
+                    let marker = pending.pop_front().expect("front existed");
+                    let cut = marker.offset - text_offset;
+                    if cut > consumed {
+                        let mut piece = (**text).clone();
+                        piece.id = NodeId::new(format!("{}_cm{consumed}", text.id));
+                        piece.text = chars[consumed..cut].iter().collect();
+                        push(
+                            &mut rebuilt,
+                            InlineNode::Text(Box::new(piece)),
+                            segment.status.clone(),
+                        );
+                    }
+                    push(
+                        &mut rebuilt,
+                        marker.inline,
+                        marker.status.unwrap_or_else(|| segment.status.clone()),
+                    );
+                    consumed = cut;
+                }
+                let mut tail = (**text).clone();
+                tail.id = NodeId::new(format!("{}_cm{consumed}", text.id));
+                tail.text = chars[consumed..].iter().collect();
+                push(
+                    &mut rebuilt,
+                    InlineNode::Text(Box::new(tail)),
+                    segment.status.clone(),
+                );
+            } else {
+                push(&mut rebuilt, inline, segment.status.clone());
+            }
+            text_offset += width;
+        }
+    }
+
+    while let Some(marker) = pending.pop_front() {
+        let status = marker.status.unwrap_or_else(|| last_status.clone());
+        push(&mut rebuilt, marker.inline, status);
+    }
+    *final_segments = rebuilt;
+}
+
 fn strip_materialized_prefix_geometry(text: &str) -> (String, String, String, u8, bool) {
     // Split the SAME way `materialized_prefix_text` composed: it emits
     // `literal_prefix_leading_ws` verbatim — spaces or tabs — ahead of the
@@ -1807,585 +1945,25 @@ fn make_prefix_text_node(
         },
     }
 }
-
-fn apply_block_modified(
-    blocks: &mut [TrackedBlock],
-    block_id_to_modify: &NodeId,
-    inline_changes: &[InlineChange],
-    new_block: &BlockNode,
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    context: &str,
-) -> Result<(), MergeError> {
-    let Some(idx) = find_block_index(blocks, block_id_to_modify) else {
-        return Err(MergeError {
-            message: "block_id for modification not found in base model".to_string(),
-            context: format!("{context}:{}", block_id_to_modify.0),
-        });
-    };
-
-    // Collect opaque nodes and original segments before taking the mutable borrow on paragraph
-    let base_opaques = collect_opaques(&blocks[idx].block);
-    let target_opaques = collect_opaques(new_block);
-    let original_segments: Vec<TrackedSegment> = match &blocks[idx].block {
-        BlockNode::Paragraph(p) => p.segments.clone(),
-        _ => Vec::new(),
-    };
-
-    let tb = &mut blocks[idx];
-    let paragraph = match &mut tb.block {
-        BlockNode::Paragraph(p) => p,
-        _ => {
-            return Err(MergeError {
-                message: "BlockModified references non-paragraph block".to_string(),
-                context: format!("{context}:{}", block_id_to_modify.0),
-            });
-        }
-    };
-
-    let mut new_segments = inline_changes_to_segments_with_opaques(
-        &paragraph.id,
-        inline_changes,
-        revision,
-        rev_counter,
-        &base_opaques,
-        &target_opaques,
-    )?;
-
-    // Save original numbering before prefix handling may clear it — we need
-    // the original value for formatting change comparison below.
-    let original_numbering = paragraph.numbering.clone();
-    let original_has_prefix = paragraph.numbering.is_some() || paragraph.literal_prefix.is_some();
-    let mut prefix_was_materialized = false;
-
-    // Prefix materialization: only needed when `literal_prefix` (baked text)
-    // is involved.  When both sides have structural numbering (w:numPr), the
-    // prefix is generated by Word from the numbering definition — no inline
-    // text to track.  Counter drift (same numId/ilvl, different counter value)
-    // is handled implicitly by list reordering.
-    let new_para = match new_block {
-        BlockNode::Paragraph(p) => Some(p),
-        _ => None,
-    };
-    if let Some(new_para) = new_para {
-        // Prefix materialization is only needed when paragraph properties
-        // alone cannot preserve the visible prefix through redline export:
-        // literal prefixes on either side, or a source-side structural
-        // numbering prefix that disappears on the target side. When both
-        // sides retain structural numbering, Word can synthesize the counter
-        // from numPr. When the target only adds structural numbering, let
-        // pPrChange record it so the numbering counter stays structural.
-        if let Some(plan) = plan_prefix_materialization(paragraph, new_para) {
-            let mut prefix_segments = Vec::new();
-            if plan.emit_deleted_prefix
-                && let Some(old_p) = &plan.old_prefix
-                && let Some(kind) = plan.deleted_kind
-            {
-                prefix_segments.push(TrackedSegment {
-                    status: TrackingStatus::Deleted(next_revision(revision, rev_counter)),
-                    inlines: vec![InlineNode::from(make_prefix_text_node(
-                        materialized_prefix_node_id(&paragraph.id, kind),
-                        kind,
-                        materialized_prefix_text(old_p, paragraph),
-                        paragraph,
-                    ))],
-                });
-            }
-            if plan.emit_inserted_prefix
-                && let Some(new_p) = &plan.new_prefix
-                && let Some(kind) = plan.inserted_kind
-            {
-                prefix_segments.push(TrackedSegment {
-                    status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                    inlines: vec![InlineNode::from(make_prefix_text_node(
-                        materialized_prefix_node_id(&paragraph.id, kind),
-                        kind,
-                        materialized_prefix_text(new_p, new_para),
-                        new_para,
-                    ))],
-                });
-            }
-            // INVARIANT: prefix segments are always first in the segment list.
-            // `changelet::is_prefix_segment` depends on this ordering to
-            // filter prefix segments during tracked atom extraction.
-            prefix_segments.append(&mut new_segments);
-            new_segments = prefix_segments;
-
-            paragraph.literal_prefix = None;
-            sync_literal_prefix_geometry(new_para, paragraph);
-            if plan.target_uses_structural_numbering {
-                // Keep the target's structural numbering in pPr. The old baked
-                // prefix still needs to be visible as deleted text, but
-                // materializing the new prefix would degrade accept-all back
-                // into literal text instead of the target numPr.
-                paragraph.materialized_numbering = None;
-            } else {
-                // Clear metadata to prevent the serializer from double-emitting
-                // the prefix. Save materialized_numbering so accept_all can
-                // restore structural numbering when the new prefix was
-                // synthesized from numbering.
-                paragraph.materialized_numbering = new_para.numbering.clone();
-                paragraph.numbering = None;
-                prefix_was_materialized = true;
-            }
-        }
-    }
-
-    // Detect paragraph formatting changes (pPrChange): compare ALL formatting
-    // properties between the base and target paragraphs. Per §17.13.5.29 the
-    // snapshot must be COMPLETE, so we capture every property the old paragraph had.
-    // Use `original_numbering` for comparison because the prefix handling above
-    // may have cleared `paragraph.numbering`.
-    // Numbering comparison is structural (num_id + ilvl only) — counter drift
-    // from list reordering is not a formatting change.
-    if let Some(new_para) = new_para {
-        let align_changed = paragraph.align != new_para.align;
-        let indent_changed = paragraph.indent != new_para.indent;
-        let spacing_changed = paragraph.spacing != new_para.spacing;
-        let numbering_changed =
-            !crate::domain::numbering_structurally_eq(&original_numbering, &new_para.numbering);
-        let style_changed = paragraph.style_id != new_para.style_id;
-        let keep_next_changed = paragraph.keep_next != new_para.keep_next;
-        let keep_lines_changed = paragraph.keep_lines != new_para.keep_lines;
-        let page_break_before_changed = paragraph.page_break_before != new_para.page_break_before;
-        let widow_control_changed = paragraph.widow_control != new_para.widow_control;
-        let contextual_spacing_changed =
-            paragraph.contextual_spacing != new_para.contextual_spacing;
-        let shading_changed = paragraph.shading != new_para.shading;
-        let borders_changed = paragraph.borders != new_para.borders;
-        let tab_stops_changed = paragraph.tab_stops != new_para.tab_stops;
-        let text_direction_changed = paragraph.text_direction != new_para.text_direction;
-        let text_alignment_changed = paragraph.text_alignment != new_para.text_alignment;
-        let mirror_indents_changed = paragraph.mirror_indents != new_para.mirror_indents;
-        let bidi_changed = paragraph.bidi != new_para.bidi;
-        let suppress_auto_hyphens_changed =
-            paragraph.suppress_auto_hyphens != new_para.suppress_auto_hyphens;
-        let snap_to_grid_changed = paragraph.snap_to_grid != new_para.snap_to_grid;
-        let overflow_punct_changed = paragraph.overflow_punct != new_para.overflow_punct;
-        let adjust_right_ind_changed = paragraph.adjust_right_ind != new_para.adjust_right_ind;
-        let word_wrap_changed = paragraph.word_wrap != new_para.word_wrap;
-        let frame_pr_changed = paragraph.frame_pr != new_para.frame_pr;
-        let section_properties_changed =
-            paragraph.section_properties != new_para.section_properties;
-        let cnf_style_changed = paragraph.cnf_style != new_para.cnf_style;
-        let heading_level_changed = paragraph.heading_level != new_para.heading_level;
-
-        let any_changed = align_changed
-            || indent_changed
-            || spacing_changed
-            || numbering_changed
-            || style_changed
-            || keep_next_changed
-            || keep_lines_changed
-            || page_break_before_changed
-            || widow_control_changed
-            || contextual_spacing_changed
-            || shading_changed
-            || borders_changed
-            || tab_stops_changed
-            || text_direction_changed
-            || text_alignment_changed
-            || mirror_indents_changed
-            || bidi_changed
-            || suppress_auto_hyphens_changed
-            || snap_to_grid_changed
-            || overflow_punct_changed
-            || adjust_right_ind_changed
-            || word_wrap_changed
-            || frame_pr_changed
-            || section_properties_changed
-            || cnf_style_changed
-            || heading_level_changed;
-
-        if any_changed {
-            // Signal "base had no numbering at all" when the base paragraph had
-            // neither structural numbering nor a literal prefix, and numbering is
-            // being added. The serializer emits numId=0 in pPrChange so the
-            // extraction can distinguish this from "base had a literal prefix
-            // replaced by structural numbering" (where the current numPr should
-            // still be counted in the reject view).
-            let numbering_explicitly_absent = paragraph.numbering_suppressed
-                || (original_numbering.is_none()
-                    && new_para.numbering.is_some()
-                    && !original_has_prefix);
-            paragraph.formatting_change = Some(ParagraphFormattingChange {
-                revision_id: revision.revision_id,
-                identity: 0,
-                previous_alignment: paragraph.align.clone(),
-                // Snapshot AUTHORED-direct indent/spacing (previous DIRECT pPr),
-                // not resolved effective — see snapshot_paragraph_formatting.
-                previous_indentation: paragraph
-                    .has_direct_indent
-                    .then(|| {
-                        paragraph
-                            .authored_indent
-                            .clone()
-                            .or_else(|| paragraph.indent.clone())
-                    })
-                    .flatten(),
-                previous_spacing: paragraph
-                    .has_direct_spacing
-                    .then(|| {
-                        paragraph
-                            .authored_spacing
-                            .clone()
-                            .or_else(|| paragraph.spacing.clone())
-                    })
-                    .flatten(),
-                previous_numbering: original_numbering.clone(),
-                previous_numbering_explicitly_absent: numbering_explicitly_absent,
-                previous_style_id: paragraph.style_id.clone(),
-                previous_keep_next: paragraph.keep_next,
-                previous_keep_lines: paragraph.keep_lines,
-                previous_page_break_before: paragraph.page_break_before,
-                previous_widow_control: paragraph.widow_control,
-                previous_contextual_spacing: paragraph.contextual_spacing,
-                previous_shading: paragraph.shading.clone(),
-                previous_borders: paragraph.borders.clone(),
-                previous_tab_stops: paragraph.tab_stops.clone(),
-                previous_literal_prefix_leading_tab_twips: paragraph
-                    .literal_prefix_leading_tab_twips,
-                previous_literal_prefix_trailing_tab_stop_twips: paragraph
-                    .literal_prefix_trailing_tab_stop_twips,
-                previous_paragraph_mark_marks: paragraph.paragraph_mark_marks.clone(),
-                previous_paragraph_mark_style_props: paragraph.paragraph_mark_style_props.clone(),
-                previous_paragraph_mark_rfonts: paragraph.paragraph_mark_rfonts.clone(),
-                previous_paragraph_mark_rpr_off: paragraph.paragraph_mark_rpr_off,
-                previous_text_direction: paragraph.text_direction.clone(),
-                previous_text_alignment: paragraph.text_alignment.clone(),
-                previous_mirror_indents: paragraph.mirror_indents,
-                previous_auto_space_de: paragraph.auto_space_de,
-                previous_auto_space_dn: paragraph.auto_space_dn,
-                previous_bidi: paragraph.bidi,
-                previous_suppress_auto_hyphens: paragraph.suppress_auto_hyphens,
-                previous_snap_to_grid: paragraph.snap_to_grid,
-                previous_overflow_punct: paragraph.overflow_punct,
-                previous_adjust_right_ind: paragraph.adjust_right_ind,
-                previous_word_wrap: paragraph.word_wrap,
-                previous_frame_pr: paragraph.frame_pr.clone(),
-                previous_preserved_ppr: paragraph.preserved_ppr.clone(),
-                author: revision.author.clone().unwrap_or_default(),
-                date: revision.date.clone(),
-            });
-
-            // Update paragraph properties to new values
-            paragraph.align = new_para.align.clone();
-            paragraph.has_direct_align = new_para.has_direct_align;
-            paragraph.indent = new_para.indent.clone();
-            paragraph.has_direct_indent = new_para.has_direct_indent;
-            paragraph.authored_indent = new_para.authored_indent.clone();
-            paragraph.spacing = new_para.spacing.clone();
-            paragraph.has_direct_spacing = new_para.has_direct_spacing;
-            paragraph.authored_spacing = new_para.authored_spacing.clone();
-            paragraph.style_id = new_para.style_id.clone();
-            paragraph.keep_next = new_para.keep_next;
-            paragraph.keep_lines = new_para.keep_lines;
-            paragraph.page_break_before = new_para.page_break_before;
-            paragraph.widow_control = new_para.widow_control;
-            paragraph.contextual_spacing = new_para.contextual_spacing;
-            paragraph.shading = new_para.shading.clone();
-            paragraph.borders = new_para.borders.clone();
-            paragraph.has_direct_keep_next = new_para.has_direct_keep_next;
-            paragraph.has_direct_keep_lines = new_para.has_direct_keep_lines;
-            paragraph.has_direct_page_break_before = new_para.has_direct_page_break_before;
-            paragraph.has_direct_widow_control = new_para.has_direct_widow_control;
-            paragraph.has_direct_contextual_spacing = new_para.has_direct_contextual_spacing;
-            paragraph.has_direct_shading = new_para.has_direct_shading;
-            paragraph.has_direct_borders = new_para.has_direct_borders;
-            paragraph.tab_stops = new_para.tab_stops.clone();
-            paragraph.effective_tab_stops_rel = new_para.effective_tab_stops_rel.clone();
-            paragraph.text_direction = new_para.text_direction.clone();
-            paragraph.text_alignment = new_para.text_alignment.clone();
-            paragraph.mirror_indents = new_para.mirror_indents;
-            paragraph.bidi = new_para.bidi;
-            paragraph.suppress_auto_hyphens = new_para.suppress_auto_hyphens;
-            paragraph.snap_to_grid = new_para.snap_to_grid;
-            paragraph.overflow_punct = new_para.overflow_punct;
-            paragraph.adjust_right_ind = new_para.adjust_right_ind;
-            paragraph.word_wrap = new_para.word_wrap;
-            paragraph.frame_pr = new_para.frame_pr.clone();
-            paragraph.cnf_style = new_para.cnf_style.clone();
-            paragraph.heading_level = new_para.heading_level.clone();
-            paragraph.section_property_change = new_para.section_property_change.clone();
-            paragraph.section_properties = new_para.section_properties.clone();
-            paragraph.paragraph_mark_marks = new_para.paragraph_mark_marks.clone();
-            paragraph.paragraph_mark_style_props = new_para.paragraph_mark_style_props.clone();
-            paragraph.paragraph_mark_rfonts = new_para.paragraph_mark_rfonts.clone();
-            paragraph.paragraph_mark_rpr_off = new_para.paragraph_mark_rpr_off;
-            sync_literal_prefix_geometry(new_para, paragraph);
-            // Only update numbering when the prefix was not already materialized
-            // as tracked inline content — otherwise we'd re-introduce the numPr.
-            if numbering_changed && !prefix_was_materialized {
-                paragraph.numbering = new_para.numbering.clone();
-                // Carry the target's numbering PROVENANCE so the emission gate
-                // matches the new numbering (a target that authored a direct
-                // numPr emits one; inherited numbering does not).
-                paragraph.has_direct_numbering = new_para.has_direct_numbering;
-                // Clear literal_prefix when gaining structural numbering to
-                // prevent the serializer from writing both a text run for the
-                // literal prefix AND a numPr in pPr.
-                if new_para.numbering.is_some() {
-                    paragraph.literal_prefix = None;
-                    paragraph.literal_prefix_leading_tab_twips = None;
-                    paragraph.literal_prefix_leading_tab_count = 0;
-                    paragraph.literal_prefix_has_trailing_tab = false;
-                    paragraph.literal_prefix_trailing_tab_stop_twips = None;
-                }
-            }
-        }
-    }
-
-    // Sync literal_prefix to target value. literal_prefix is a model
-    // property (prefix text stripped from inline content during import),
-    // not a tracked formatting property. When the diff detects a prefix
-    // change, the inline diff handles the text change; literal_prefix
-    // must match the target so accept_all produces the target state.
-    if !prefix_was_materialized && let BlockNode::Paragraph(new_p) = new_block {
-        paragraph.literal_prefix = new_p.literal_prefix.clone();
-        sync_literal_prefix_geometry(new_p, paragraph);
-        paragraph.paragraph_mark_marks = new_p.paragraph_mark_marks.clone();
-        paragraph.paragraph_mark_style_props = new_p.paragraph_mark_style_props.clone();
-        paragraph.paragraph_mark_rfonts = new_p.paragraph_mark_rfonts.clone();
-        paragraph.paragraph_mark_rpr_off = new_p.paragraph_mark_rpr_off;
-    }
-
-    inject_structural_markers_at_offsets(
-        &mut new_segments,
-        &original_segments,
-        new_para.map(|p| p.segments.as_slice()),
-    );
-
-    prune_empty_text_inlines(&mut new_segments);
-    paragraph.segments = new_segments;
-    Ok(())
-}
-
-/// Record a cell formatting change (tcPrChange) on a cell when the new
-/// formatting differs. Captures the previous formatting as a snapshot, then
-/// updates the cell to the new formatting.
 fn apply_cell_formatting_change(
     cell: &mut TableCellNode,
     new_formatting: &CellFormatting,
     revision: &RevisionInfo,
+    rev_counter: &mut u32,
 ) {
     if cell.formatting != *new_formatting {
-        cell.formatting_change = Some(CellFormattingChange {
-            revision_id: revision.revision_id,
-            identity: 0,
-            previous_width: cell.formatting.width.clone(),
-            previous_borders: cell.formatting.borders.clone(),
-            previous_shading: cell.formatting.shading.clone(),
-            previous_v_align: cell.formatting.v_align.clone(),
-            previous_margins: cell.formatting.margins.clone(),
-            previous_no_wrap: cell.formatting.no_wrap,
-            previous_text_direction: cell.formatting.text_direction.clone(),
-            previous_tc_fit_text: cell.formatting.tc_fit_text,
-            author: revision.author.clone().unwrap_or_default(),
-            date: revision.date.clone(),
-        });
+        let carrier = next_revision(revision, rev_counter);
+        cell.formatting_change = Some(crate::edit::snapshot_cell_formatting(cell, &carrier));
         cell.formatting = new_formatting.clone();
     }
 }
-
-/// Apply per-cell inline changes to a table in-place.
-///
-/// The table stays as a single `TrackingStatus::Normal` block. For each
-/// changed cell, the affected paragraphs get their segments replaced with
-/// tracked inline changes (same logic as `apply_block_modified`).
-fn apply_table_cells_modified(
-    blocks: &mut [TrackedBlock],
-    table_id: &NodeId,
-    cell_changes: &[crate::domain::TableCellChange],
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    context: &str,
-) -> Result<(), MergeError> {
-    let idx = find_block_index(blocks, table_id).ok_or_else(|| MergeError {
-        message: "table_id for cell modification not found in base model".to_string(),
-        context: format!("{context}:{}", table_id.0),
-    })?;
-    let table = match &mut blocks[idx].block {
-        BlockNode::Table(t) => t,
-        _ => {
-            return Err(MergeError {
-                message: "TableCellsModified references non-table block".to_string(),
-                context: format!("{context}:{}", table_id.0),
-            });
-        }
-    };
-
-    for cell_change in cell_changes {
-        let n_rows = table.rows.len();
-        let row = table
-            .rows
-            .get_mut(cell_change.row_index)
-            .ok_or_else(|| MergeError {
-                message: format!(
-                    "row index {} out of bounds (table has {n_rows} rows)",
-                    cell_change.row_index,
-                ),
-                context: format!("{context}:{}:row{}", table_id.0, cell_change.row_index),
-            })?;
-        let n_cells = row.cells.len();
-        let cell = row
-            .cells
-            .get_mut(cell_change.cell_index)
-            .ok_or_else(|| MergeError {
-                message: format!(
-                    "cell index {} out of bounds (row has {n_cells} cells)",
-                    cell_change.cell_index,
-                ),
-                context: format!(
-                    "{context}:{}:row{}:cell{}",
-                    table_id.0, cell_change.row_index, cell_change.cell_index
-                ),
-            })?;
-
-        // Apply cell formatting change (tcPrChange) if formatting differs.
-        if let Some(new_formatting) = &cell_change.new_cell_formatting {
-            apply_cell_formatting_change(cell, new_formatting, revision);
-        }
-
-        for para_change in &cell_change.paragraph_changes {
-            let n_blocks = cell.blocks.len();
-            let block = cell
-                .blocks
-                .get_mut(para_change.block_index)
-                .ok_or_else(|| MergeError {
-                    message: format!(
-                        "block index {} out of bounds (cell has {n_blocks} blocks)",
-                        para_change.block_index,
-                    ),
-                    context: format!(
-                        "{context}:{}:row{}:cell{}:block{}",
-                        table_id.0,
-                        cell_change.row_index,
-                        cell_change.cell_index,
-                        para_change.block_index
-                    ),
-                })?;
-
-            let old_block = block.clone();
-            let paragraph = match block {
-                BlockNode::Paragraph(p) => p,
-                _ => {
-                    return Err(MergeError {
-                        message:
-                            "TableCellsModified paragraph change references non-paragraph block"
-                                .to_string(),
-                        context: format!(
-                            "{context}:{}:row{}:cell{}:block{}",
-                            table_id.0,
-                            cell_change.row_index,
-                            cell_change.cell_index,
-                            para_change.block_index
-                        ),
-                    });
-                }
-            };
-            let new_para = match &para_change.new_block {
-                BlockNode::Paragraph(p) => p,
-                _ => unreachable!("validated paragraph target block"),
-            };
-            apply_paragraph_diff_in_cell(
-                paragraph,
-                new_para,
-                &old_block,
-                &para_change.new_block,
-                revision,
-                rev_counter,
-                context,
-            )?;
-        }
-
-        // Apply nested table diffs within this cell.
-        for nested_diff in &cell_change.nested_table_diffs {
-            let n_blocks = cell.blocks.len();
-            let block = cell
-                .blocks
-                .get_mut(nested_diff.block_index)
-                .ok_or_else(|| MergeError {
-                    message: format!(
-                        "nested table block index {} out of bounds (cell has {n_blocks} blocks)",
-                        nested_diff.block_index,
-                    ),
-                    context: format!(
-                        "{context}:{}:row{}:cell{}:nested_tbl{}",
-                        table_id.0,
-                        cell_change.row_index,
-                        cell_change.cell_index,
-                        nested_diff.block_index
-                    ),
-                })?;
-
-            let inner_table = match block {
-                BlockNode::Table(t) => t,
-                _ => {
-                    return Err(MergeError {
-                        message: "nested table diff references non-table block".to_string(),
-                        context: format!(
-                            "{context}:{}:row{}:cell{}:block{}",
-                            table_id.0,
-                            cell_change.row_index,
-                            cell_change.cell_index,
-                            nested_diff.block_index
-                        ),
-                    });
-                }
-            };
-
-            match &nested_diff.diff {
-                NestedTableDiffKind::StructureChanged {
-                    table_diff,
-                    new_table,
-                } => {
-                    apply_nested_table_structure_changed(
-                        inner_table,
-                        new_table,
-                        table_diff,
-                        revision,
-                        rev_counter,
-                        &format!(
-                            "{context}:{}:row{}:cell{}:nested_tbl{}",
-                            table_id.0,
-                            cell_change.row_index,
-                            cell_change.cell_index,
-                            nested_diff.block_index
-                        ),
-                    )?;
-                }
-                NestedTableDiffKind::CellsModified { cell_changes } => {
-                    apply_nested_table_cells_modified(
-                        inner_table,
-                        cell_changes,
-                        revision,
-                        rev_counter,
-                        &format!(
-                            "{context}:{}:row{}:cell{}:nested_tbl{}",
-                            table_id.0,
-                            cell_change.row_index,
-                            cell_change.cell_index,
-                            nested_diff.block_index
-                        ),
-                    )?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Apply per-cell inline changes to a nested table in-place.
-///
-/// Same logic as `apply_table_cells_modified` but operates directly on a
-/// `&mut TableNode` instead of looking up a table by ID in the block list.
 fn apply_nested_table_cells_modified(
     table: &mut TableNode,
     cell_changes: &[crate::domain::TableCellChange],
     revision: &RevisionInfo,
     rev_counter: &mut u32,
     context: &str,
+    resolver: &dyn ChangePlanResolver,
 ) -> Result<(), MergeError> {
     for cell_change in cell_changes {
         let n_rows = table.rows.len();
@@ -2416,7 +1994,7 @@ fn apply_nested_table_cells_modified(
 
         // Apply cell formatting change (tcPrChange) if formatting differs.
         if let Some(new_formatting) = &cell_change.new_cell_formatting {
-            apply_cell_formatting_change(cell, new_formatting, revision);
+            apply_cell_formatting_change(cell, new_formatting, revision, rev_counter);
         }
 
         for para_change in &cell_change.paragraph_changes {
@@ -2511,6 +2089,7 @@ fn apply_nested_table_cells_modified(
                             "{context}:row{}:cell{}:nested_tbl{}",
                             cell_change.row_index, cell_change.cell_index, nested_diff.block_index
                         ),
+                        resolver,
                     )?;
                 }
                 NestedTableDiffKind::CellsModified {
@@ -2525,6 +2104,7 @@ fn apply_nested_table_cells_modified(
                             "{context}:row{}:cell{}:nested_tbl{}",
                             cell_change.row_index, cell_change.cell_index, nested_diff.block_index
                         ),
+                        resolver,
                     )?;
                 }
             }
@@ -2544,6 +2124,7 @@ fn apply_nested_table_structure_changed(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
     context: &str,
+    resolver: &dyn ChangePlanResolver,
 ) -> Result<(), MergeError> {
     let base_table = table.clone();
 
@@ -2564,7 +2145,14 @@ fn apply_nested_table_structure_changed(
                 mark_whole_row_inserted(&mut row, revision, rev_counter);
                 merged_rows.push(row);
             }
-            TableRowAlignment::Matched { old_row, new_row } => {
+            TableRowAlignment::Matched { old_row, new_row }
+            | TableRowAlignment::Replacement { old_row, new_row } => {
+                let content_relation = if matches!(alignment, TableRowAlignment::Replacement { .. })
+                {
+                    CellContentRelation::UnrelatedReplacement
+                } else {
+                    CellContentRelation::Related
+                };
                 let mut row = base_table.rows[*old_row].clone();
                 let new_row_ref = &target_table.rows[*new_row];
                 let max_cells = row.cells.len().max(new_row_ref.cells.len());
@@ -2582,13 +2170,20 @@ fn apply_nested_table_structure_changed(
                         // <w:vMerge/> continue cells.
                         cell.grid_span = new_cell_ref.grid_span;
                         cell.v_merge = new_cell_ref.v_merge.clone();
-                        apply_cell_formatting_change(&mut cell, &new_cell_ref.formatting, revision);
+                        apply_cell_formatting_change(
+                            &mut cell,
+                            &new_cell_ref.formatting,
+                            revision,
+                            rev_counter,
+                        );
                         reconcile_cell_blocks(
                             &mut cell,
                             new_cell_ref,
                             revision,
                             rev_counter,
                             context,
+                            resolver,
+                            content_relation,
                         )?;
                         merged_cells.push(cell);
                     } else if cell_idx < row.cells.len() {
@@ -2619,319 +2214,6 @@ fn apply_nested_table_structure_changed(
     table.structure_hash = target_table.structure_hash.clone();
     Ok(())
 }
-
-fn apply_changes_to_blocks(
-    blocks: &mut Vec<TrackedBlock>,
-    changes: &[DiffChange],
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    context: &str,
-    target_tables_by_id: Option<&mut HashMap<String, BlockNode>>,
-    provenance: &mut BlockProvenanceMap,
-) -> Result<(), MergeError> {
-    let mut insert_order = InsertOrderState::default();
-    let mut target_tables_by_id = target_tables_by_id;
-    for change in changes {
-        match change {
-            DiffChange::BlockDeleted {
-                block_id, move_id, ..
-            } => {
-                apply_block_deleted(blocks, block_id, revision, rev_counter, context)?;
-                provenance.insert_deleted(block_id.clone(), block_id.clone());
-                if let Some(mid) = move_id
-                    && let Some(idx) = find_block_index(blocks, block_id)
-                {
-                    blocks[idx].move_id = Some(mid.clone());
-                }
-            }
-            DiffChange::BlockInserted {
-                after_block_id,
-                block,
-                move_id,
-            } => {
-                let original_target_id = block_id(block).clone();
-                apply_block_inserted(
-                    blocks,
-                    after_block_id,
-                    block,
-                    revision,
-                    rev_counter,
-                    &mut insert_order,
-                    context,
-                )?;
-                // The merged block may have been renamed (original_id → original_id__insN).
-                // Find its actual merged ID by scanning backwards for the just-inserted block.
-                let merged_id = blocks
-                    .iter()
-                    .rev()
-                    .find(|tb| {
-                        matches!(&tb.status, TrackingStatus::Inserted(_))
-                            && block_id(&tb.block).0.starts_with(&*original_target_id.0)
-                    })
-                    .map(|tb| block_id(&tb.block).clone())
-                    .unwrap_or_else(|| original_target_id.clone());
-                provenance.insert_inserted(merged_id, original_target_id);
-                if let Some(mid) = move_id {
-                    for tb in blocks.iter_mut().rev() {
-                        if matches!(&tb.status, TrackingStatus::Inserted(_))
-                            && tb.move_id.is_none()
-                            && block_id(&tb.block).0.starts_with(&*block_id(block).0)
-                        {
-                            tb.move_id = Some(mid.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-            DiffChange::BlockModified {
-                block_id,
-                inline_changes,
-                new_block,
-                para_split,
-                ..
-            } => {
-                let target_id = match new_block {
-                    BlockNode::Paragraph(p) => p.id.clone(),
-                    BlockNode::Table(t) => t.id.clone(),
-                    BlockNode::OpaqueBlock(o) => o.id.clone(),
-                };
-                apply_block_modified(
-                    blocks,
-                    block_id,
-                    inline_changes,
-                    new_block,
-                    revision,
-                    rev_counter,
-                    context,
-                )?;
-                provenance.insert_modified(block_id.clone(), block_id.clone(), target_id);
-                if *para_split
-                    && let Some(idx) = find_block_index(blocks, block_id)
-                    && let BlockNode::Paragraph(p) = &mut blocks[idx].block
-                {
-                    p.para_split = true;
-                    p.para_mark_status = Some(TrackingStatus::Inserted(next_revision(
-                        revision,
-                        rev_counter,
-                    )));
-                }
-            }
-            DiffChange::TableStructureChanged {
-                table_id: base_table_id,
-                target_table_id,
-                table_diff,
-                ..
-            } => {
-                provenance.insert_modified(
-                    base_table_id.clone(),
-                    base_table_id.clone(),
-                    target_table_id.clone(),
-                );
-
-                let Some(target_tables_by_id) = target_tables_by_id.as_deref_mut() else {
-                    return Err(MergeError {
-                        message: "table structure merge requires target table lookup".to_string(),
-                        context: format!("{context}:{}", base_table_id.0),
-                    });
-                };
-
-                let inserted_table =
-                    target_tables_by_id
-                        .remove(&*target_table_id.0)
-                        .ok_or_else(|| MergeError {
-                            message: format!(
-                                "target table for structure change not found (base={}, target={})",
-                                base_table_id.0, target_table_id.0
-                            ),
-                            context: format!("{context}:{}", base_table_id.0),
-                        })?;
-
-                let target_table = match &inserted_table {
-                    BlockNode::Table(t) => Some(t),
-                    _ => None,
-                };
-
-                if let (Some(diff), Some(target_tbl)) = (table_diff, target_table) {
-                    apply_table_structure_changed(
-                        blocks,
-                        base_table_id,
-                        target_tbl,
-                        diff,
-                        revision,
-                        rev_counter,
-                        context,
-                    )?;
-                } else {
-                    apply_block_deleted(blocks, base_table_id, revision, rev_counter, context)?;
-                    apply_block_inserted(
-                        blocks,
-                        &Some(base_table_id.clone()),
-                        &inserted_table,
-                        revision,
-                        rev_counter,
-                        &mut insert_order,
-                        context,
-                    )?;
-                }
-            }
-            DiffChange::TableCellsModified {
-                table_id,
-                target_table_id,
-                cell_changes,
-                ..
-            } => {
-                provenance.insert_modified(
-                    table_id.clone(),
-                    table_id.clone(),
-                    target_table_id.clone(),
-                );
-                apply_table_cells_modified(
-                    blocks,
-                    table_id,
-                    cell_changes,
-                    revision,
-                    rev_counter,
-                    context,
-                )?;
-            }
-            // Story-level diff changes never reach this match: this function
-            // only merges a body/cell block list. Header/footer stories are
-            // applied by `apply_story_changes`; footnote/endnote/comment
-            // stories by `apply_note_changes`. Enumerated explicitly (not
-            // `_`) so a future `DiffChange` variant fails to compile here
-            // instead of silently no-op'ing.
-            DiffChange::HeaderModified { .. }
-            | DiffChange::HeaderDeleted { .. }
-            | DiffChange::HeaderInserted { .. }
-            | DiffChange::FooterModified { .. }
-            | DiffChange::FooterDeleted { .. }
-            | DiffChange::FooterInserted { .. }
-            | DiffChange::FootnoteModified { .. }
-            | DiffChange::FootnoteDeleted { .. }
-            | DiffChange::FootnoteInserted { .. }
-            | DiffChange::EndnoteModified { .. }
-            | DiffChange::EndnoteDeleted { .. }
-            | DiffChange::EndnoteInserted { .. }
-            | DiffChange::CommentModified { .. }
-            | DiffChange::CommentDeleted { .. }
-            | DiffChange::CommentInserted { .. } => {}
-        }
-    }
-    annotate_paragraph_mark_status(blocks, revision, rev_counter);
-    Ok(())
-}
-
-/// Annotate `para_mark_status` on the last Normal paragraph when all blocks
-/// after it to the end of the list are non-Normal (Inserted or Deleted).
-///
-/// OOXML rule: a paragraph's mark status reflects what happens to the boundary
-/// between it and its successor. When a Normal paragraph is the last Normal
-/// block and only tracked-change blocks follow it to the end, Word marks its ¶
-/// with the status of the immediately following block.
-///
-/// Only applies to `BlockNode::Paragraph` — tables and opaque blocks are skipped.
-fn annotate_paragraph_mark_status(
-    blocks: &mut [TrackedBlock],
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-) {
-    fn paragraph_has_visible_content(paragraph: &ParagraphNode) -> bool {
-        paragraph
-            .literal_prefix
-            .as_deref()
-            .is_some_and(|prefix| !prefix.is_empty())
-            || !extract_inlines_text(&paragraph.all_inlines_owned()).is_empty()
-    }
-
-    fn is_empty_trailing_paragraph(block: &TrackedBlock, inserted: bool) -> bool {
-        let status_matches = if inserted {
-            matches!(block.status, TrackingStatus::Inserted(_))
-        } else {
-            matches!(block.status, TrackingStatus::Deleted(_))
-        };
-        if !status_matches {
-            return false;
-        }
-        match &block.block {
-            BlockNode::Paragraph(paragraph) => !paragraph_has_visible_content(paragraph),
-            _ => false,
-        }
-    }
-
-    // Scan backwards to find the last Normal paragraph.
-    // "Normal" at the block level means TrackedBlock.status is Normal
-    // (Modified paragraphs also have Normal block status).
-    let mut last_normal_para_idx: Option<usize> = None;
-    for i in (0..blocks.len()).rev() {
-        if matches!(blocks[i].status, TrackingStatus::Normal) {
-            if matches!(blocks[i].block, BlockNode::Paragraph(_)) {
-                last_normal_para_idx = Some(i);
-            }
-            // Whether it's a paragraph, table, or opaque — we found a Normal
-            // block, so all earlier Normal blocks have a Normal block after them.
-            break;
-        }
-    }
-
-    let Some(idx) = last_normal_para_idx else {
-        return;
-    };
-
-    // The next block must exist and be non-Normal.
-    let next_idx = idx + 1;
-    if next_idx >= blocks.len() {
-        return;
-    }
-
-    let is_inserted = matches!(blocks[next_idx].status, TrackingStatus::Inserted(_));
-    let is_deleted = matches!(blocks[next_idx].status, TrackingStatus::Deleted(_));
-    if !is_inserted && !is_deleted {
-        return;
-    }
-
-    // A trailing run of empty inserted/deleted paragraphs at story end should
-    // disappear independently on reject/accept. They do not imply that the
-    // preceding surviving paragraph's mark changed.
-    if blocks[next_idx..]
-        .iter()
-        .all(|block| is_empty_trailing_paragraph(block, is_inserted))
-    {
-        return;
-    }
-
-    if let BlockNode::Paragraph(p) = &mut blocks[idx].block {
-        // Don't overwrite an existing annotation (e.g., from apply_block_deleted
-        // or the para_split path which sets its own mark).
-        if p.para_mark_status.is_none() {
-            let mark = if is_inserted {
-                TrackingStatus::Inserted(next_revision(revision, rev_counter))
-            } else {
-                TrackingStatus::Deleted(next_revision(revision, rev_counter))
-            };
-            p.para_mark_status = Some(mark);
-        }
-    }
-}
-
-/// Enforce the invariant that the DOCUMENT-FINAL paragraph mark never carries a
-/// tracked mark insertion or deletion.
-///
-/// Word cannot resolve a revision on the document-final paragraph mark: accept
-/// of a paragraph-mark *insertion* merges the paragraph with the FOLLOWING one,
-/// and the final mark has no follower, so accept-all leaves the revision pending
-/// forever (the reviewer sees "accept all changes" fail to clear the document);
-/// the mark-*deletion* twin has the same defect. The attribution belongs on the
-/// PRECEDING mark instead — which is exactly what Word itself produces when you
-/// press Enter at, or delete, the end of the last paragraph: the newly created
-/// mark terminates the OLD text and the pre-existing final mark slides down to
-/// terminate the new final paragraph.
-///
-/// This runs once per tracked-change edit, after the mint sites, on the BODY
-/// block list only (a header/footer/cell final mark is not the document-final
-/// mark). It preserves the accept/reject TEXT the engine projects — only the
-/// physical mark that carries the marker moves (and, in the non-default case,
-/// the pilcrow rPr that terminates the final paragraph, matching Word's
-/// physical rotation).
 pub(crate) fn normalize_final_mark_attribution(
     blocks: &mut [TrackedBlock],
     revision: &RevisionInfo,
@@ -2989,7 +2271,7 @@ pub(crate) fn normalize_final_mark_attribution(
 /// pilcrow, so skip only those identified range markers. A trailing table,
 /// content control, or unknown opaque block is not silently treated as
 /// zero-width: its final-mark semantics are not established here.
-fn document_final_paragraph_index(blocks: &[TrackedBlock]) -> Option<usize> {
+pub(crate) fn document_final_paragraph_index(blocks: &[TrackedBlock]) -> Option<usize> {
     for (index, block) in blocks.iter().enumerate().rev() {
         match &block.block {
             BlockNode::Paragraph(_) => return Some(index),
@@ -3071,22 +2353,17 @@ fn normalize_inserted_final_mark(
     if is_move_from_shadow(&blocks[anchor_idx]) {
         return; // resolved by its own moveFromRange pairing — see is_move_from_shadow
     }
-    let BlockNode::Paragraph(anchor) = &blocks[anchor_idx].block else {
+    let BlockNode::Paragraph(_anchor) = &blocks[anchor_idx].block else {
         return; // anchor is a table/opaque — cannot carry a paragraph mark.
     };
-    let anchor_marks = anchor.paragraph_mark_marks.clone();
-    let anchor_style = anchor.paragraph_mark_style_props.clone();
-    let anchor_rfonts = anchor.paragraph_mark_rfonts.clone();
-    let anchor_off = anchor.paragraph_mark_rpr_off;
-    // Final paragraph: suppress its own mark marker and adopt the original final
-    // mark's formatting. It stays a block-level Inserted paragraph (runs remain
-    // inserted); only the pilcrow is untracked.
+    // Final paragraph: suppress its own mark marker. Its CURRENT pilcrow
+    // formatting remains target-owned; `record_displaced_final_mark_properties`
+    // records the source anchor as the previous pPr state. That is the exact
+    // Word shape documented below: current target properties plus a previous
+    // source snapshot. Overwriting the current pilcrow first would make Accept
+    // unable to reach the target when the two marks differ.
     if let BlockNode::Paragraph(p) = &mut blocks[last].block {
         p.para_mark_status = Some(TrackingStatus::Normal);
-        p.paragraph_mark_marks = anchor_marks;
-        p.paragraph_mark_style_props = anchor_style;
-        p.paragraph_mark_rfonts = anchor_rfonts;
-        p.paragraph_mark_rpr_off = anchor_off;
     }
 
     // Intermediate inserted paragraphs keep their own inserted break (driven by
@@ -3184,7 +2461,16 @@ fn record_displaced_final_mark_properties(
     let BlockNode::Paragraph(anchor) = &blocks[anchor_idx].block else {
         return;
     };
-    let previous = crate::edit::snapshot_paragraph_formatting(anchor, &carrier);
+    let mut previous = crate::edit::snapshot_paragraph_formatting(anchor, &carrier);
+    // The anchor may already carry the paragraph-property delta produced by
+    // this comparison. Rejecting a tail insertion merges the tail into that
+    // anchor, so the displaced final mark must restore the anchor's SOURCE
+    // projection, not its target-current properties. Otherwise Reject All
+    // resolves the anchor's pPrChange and then immediately overwrites that
+    // restoration with the target-current snapshot copied onto the tail.
+    if let Some(anchor_change) = &anchor.formatting_change {
+        previous.previous = anchor_change.previous.clone();
+    }
     let BlockNode::Paragraph(final_para) = &blocks[last].block else {
         return;
     };
@@ -3235,23 +2521,15 @@ fn normalize_moved_final_mark(
     if is_move_from_shadow(&blocks[anchor_idx]) {
         return; // resolved by its own moveFromRange pairing — see is_move_from_shadow
     }
-    let BlockNode::Paragraph(anchor) = &blocks[anchor_idx].block else {
+    let BlockNode::Paragraph(_anchor) = &blocks[anchor_idx].block else {
         return; // anchor is a table/opaque — cannot carry a paragraph mark.
     };
-    let anchor_marks = anchor.paragraph_mark_marks.clone();
-    let anchor_style = anchor.paragraph_mark_style_props.clone();
-    let anchor_rfonts = anchor.paragraph_mark_rfonts.clone();
-    let anchor_off = anchor.paragraph_mark_rpr_off;
 
-    // Final moved-in paragraph: suppress its own pilcrow marker and adopt the
-    // original final mark's formatting. It stays a block-level moveTo insertion
-    // (runs remain moved); only the pilcrow is untracked.
+    // Final moved-in paragraph: suppress its own pilcrow marker while retaining
+    // its target-current pilcrow formatting. The source anchor is carried as
+    // the previous state by `record_displaced_final_mark_properties`.
     if let BlockNode::Paragraph(p) = &mut blocks[last].block {
         p.para_mark_status = Some(TrackingStatus::Normal);
-        p.paragraph_mark_marks = anchor_marks;
-        p.paragraph_mark_style_props = anchor_style;
-        p.paragraph_mark_rfonts = anchor_rfonts;
-        p.paragraph_mark_rpr_off = anchor_off;
     }
 
     // The anchor's mark is now the newly-inserted break — a plain insertion (the
@@ -3286,16 +2564,29 @@ fn normalize_deleted_final_mark(
     if !matches!(blocks[last].status, TrackingStatus::Deleted(_)) {
         return;
     }
+    let deleted_revision = match &blocks[last].status {
+        TrackingStatus::Deleted(revision) => revision.clone(),
+        _ => unreachable!("validated deleted final paragraph"),
+    };
+    let BlockNode::Paragraph(original_final) = &blocks[last].block else {
+        unreachable!("document-final paragraph index must reference a paragraph");
+    };
+    let original_final_properties =
+        crate::edit::snapshot_paragraph_formatting(original_final, &deleted_revision);
     let mut run_start = last;
     while run_start > 0
-        && matches!(blocks[run_start - 1].status, TrackingStatus::Deleted(_))
-        && matches!(blocks[run_start - 1].block, BlockNode::Paragraph(_))
         && blocks[run_start - 1].move_id.is_none()
+        && (tracked_block_removed_by_accept_reject(&blocks[run_start - 1], true)
+            || is_zero_width_marker_block(&blocks[run_start - 1].block))
     {
         run_start -= 1;
     }
 
-    // Convert the final paragraph into the surviving final mark.
+    // Convert the final paragraph into the surviving final mark. A hoisted
+    // literal prefix is source body text too; materialize it before the block
+    // tombstone is lowered to segment deletions, otherwise the label remains a
+    // Normal run and survives Accept while the rest of the paragraph vanishes.
+    materialize_numbering_prefix_in_place(&mut blocks[last].block);
     if let BlockNode::Paragraph(p) = &mut blocks[last].block {
         mark_final_paragraph_runs_deleted(p, revision, rev_counter);
         p.para_mark_status = None;
@@ -3304,13 +2595,65 @@ fn normalize_deleted_final_mark(
 
     if run_start > 0 && blocks[run_start - 1].move_id.is_none() {
         let anchor_idx = run_start - 1;
-        if let BlockNode::Paragraph(a) = &mut blocks[anchor_idx].block
-            && !matches!(a.para_mark_status, Some(TrackingStatus::Deleted(_)))
-        {
-            a.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                revision,
-                rev_counter,
-            )));
+        let accepted_final_properties = match &blocks[anchor_idx].block {
+            BlockNode::Paragraph(paragraph) => Some(paragraph.clone()),
+            BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => None,
+        };
+        let block_insertion = match &blocks[anchor_idx].status {
+            TrackingStatus::Inserted(inserted) => Some(inserted.clone()),
+            _ => None,
+        };
+        if let BlockNode::Paragraph(anchor) = &mut blocks[anchor_idx].block {
+            anchor.para_mark_status = match anchor.para_mark_status.take() {
+                Some(TrackingStatus::Deleted(deleted)) => Some(TrackingStatus::Deleted(deleted)),
+                Some(TrackingStatus::InsertedThenDeleted(stacked)) => {
+                    Some(TrackingStatus::InsertedThenDeleted(stacked))
+                }
+                Some(TrackingStatus::Inserted(inserted)) => Some(
+                    TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+                        inserted,
+                        deleted: next_revision(revision, rev_counter),
+                    })),
+                ),
+                None if block_insertion.is_some() => Some(TrackingStatus::InsertedThenDeleted(
+                    Box::new(StackedRevision {
+                        inserted: block_insertion.expect("matched inserted block status"),
+                        deleted: next_revision(revision, rev_counter),
+                    }),
+                )),
+                Some(TrackingStatus::Normal) | None => Some(TrackingStatus::Deleted(
+                    next_revision(revision, rev_counter),
+                )),
+            };
+        }
+
+        // A source-only deleted tail can follow a target-current paragraph in
+        // a replacement region. The physical final paragraph must retain the
+        // source's pre-existing final mark, but its CURRENT pPr must be the
+        // accepted terminal's final pPr. Otherwise Accept leaves an empty
+        // source-formatted sentinel after the target reading. Carry the source
+        // final pPr as the exact previous snapshot and copy the anchor's
+        // target-current pPr onto the sentinel; Reject restores the former,
+        // Accept keeps the latter. This is the delete-tail dual of
+        // `record_displaced_final_mark_properties`.
+        if let Some(accepted_final_properties) = accepted_final_properties {
+            let BlockNode::Paragraph(final_paragraph) = &mut blocks[last].block else {
+                unreachable!("validated final paragraph");
+            };
+            apply_target_non_numbering_paragraph_properties(
+                final_paragraph,
+                &accepted_final_properties,
+            );
+            final_paragraph.numbering = accepted_final_properties.numbering.clone();
+            final_paragraph.has_direct_numbering = accepted_final_properties.has_direct_numbering;
+            final_paragraph.numbering_suppressed = accepted_final_properties.numbering_suppressed;
+            final_paragraph.materialized_numbering =
+                accepted_final_properties.materialized_numbering.clone();
+
+            let current =
+                crate::edit::snapshot_paragraph_formatting(final_paragraph, &deleted_revision);
+            final_paragraph.formatting_change =
+                (current != original_final_properties).then_some(original_final_properties);
         }
     }
 }
@@ -3529,6 +2872,10 @@ fn collect_body_block_ids(block: &BlockNode, used: &mut HashSet<NodeId>) {
 /// - Inserted rows are taken from the target table with `tracking_status = Inserted`.
 /// - Matched rows are preserved, with cell-level inline tracked changes applied
 ///   for cells whose text differs.
+// The explicit resolver is the compile-time dependency-inversion seam. Keeping
+// these domain inputs named is clearer than hiding mutable revision state and
+// location context in a generic parameter bag.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_table_structure_changed(
     blocks: &mut [TrackedBlock],
     table_id: &NodeId,
@@ -3537,6 +2884,7 @@ pub(crate) fn apply_table_structure_changed(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
     context: &str,
+    resolver: &dyn ChangePlanResolver,
 ) -> Result<(), MergeError> {
     let idx = find_block_index(blocks, table_id).ok_or_else(|| MergeError {
         message: "table for structure change not found in base model".to_string(),
@@ -3552,6 +2900,21 @@ pub(crate) fn apply_table_structure_changed(
             });
         }
     };
+
+    // Row insertion/deletion carriers do not switch the owning table's
+    // `w:tblPr`. Keeping the source table shell while adopting target rows is
+    // therefore exact only when both readings have the same outer table
+    // properties. A separate, Word-qualified `w:tblPrChange` must be composed
+    // before this boundary can accept differing formatting.
+    if base_table.formatting != target_table.formatting {
+        return Err(MergeError {
+            message: "table structure change cannot also switch outer table properties".to_string(),
+            context: format!(
+                "{context}:{}: an independent table-property carrier is required",
+                table_id.0
+            ),
+        });
+    }
 
     // Build merged rows following the row alignment order.
     let mut merged_rows = Vec::new();
@@ -3572,7 +2935,14 @@ pub(crate) fn apply_table_structure_changed(
                 mark_whole_row_inserted(&mut row, revision, rev_counter);
                 merged_rows.push(row);
             }
-            TableRowAlignment::Matched { old_row, new_row } => {
+            TableRowAlignment::Matched { old_row, new_row }
+            | TableRowAlignment::Replacement { old_row, new_row } => {
+                let content_relation = if matches!(alignment, TableRowAlignment::Replacement { .. })
+                {
+                    CellContentRelation::UnrelatedReplacement
+                } else {
+                    CellContentRelation::Related
+                };
                 // Start from the base row and apply cell-level changes.
                 let mut row = base_table.rows[*old_row].clone();
                 let new_row_ref = &target_table.rows[*new_row];
@@ -3597,13 +2967,20 @@ pub(crate) fn apply_table_structure_changed(
                         // grid). See canonicalize_table's restart-anchor check.
                         cell.grid_span = new_cell_ref.grid_span;
                         cell.v_merge = new_cell_ref.v_merge.clone();
-                        apply_cell_formatting_change(&mut cell, &new_cell_ref.formatting, revision);
+                        apply_cell_formatting_change(
+                            &mut cell,
+                            &new_cell_ref.formatting,
+                            revision,
+                            rev_counter,
+                        );
                         reconcile_cell_blocks(
                             &mut cell,
                             new_cell_ref,
                             revision,
                             rev_counter,
                             context,
+                            resolver,
+                            content_relation,
                         )?;
                         merged_cells.push(cell);
                     } else if cell_idx < row.cells.len() {
@@ -3679,6 +3056,7 @@ fn block_fingerprint(block: &BlockNode) -> String {
 /// inline diff → segment conversion → prefix handling → structural markers.
 ///
 /// Operates on a mutable paragraph + immutable new paragraph reference.
+#[allow(clippy::too_many_arguments)]
 fn apply_paragraph_diff_in_cell(
     paragraph: &mut ParagraphNode,
     new_para: &ParagraphNode,
@@ -3687,10 +3065,13 @@ fn apply_paragraph_diff_in_cell(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
     context: &str,
+    resolver: &dyn ChangePlanResolver,
 ) -> Result<(), MergeError> {
+    refuse_unstable_cnf_style_change(paragraph, new_para, context)?;
+
     let old_inlines = paragraph.all_inlines_owned();
     let new_inlines = new_para.all_inlines_owned();
-    let inline_changes = diff_block_content_with_marks(&old_inlines, &new_inlines);
+    let inline_changes = resolver.paragraph_changes(&old_inlines, &new_inlines);
 
     let base_opaques = collect_opaques(old_block);
     let target_opaques = collect_opaques(new_block);
@@ -3709,9 +3090,11 @@ fn apply_paragraph_diff_in_cell(
         context: context.to_string(),
     })?;
 
-    // Save original numbering before prefix handling may clear it.
-    let original_numbering = paragraph.numbering.clone();
-    let original_has_prefix = paragraph.numbering.is_some() || paragraph.literal_prefix.is_some();
+    let numbering_changed = !crate::domain::paragraph_numbering_state_eq(paragraph, new_para);
+    let paragraph_properties_changed =
+        !crate::domain::paragraph_property_state_eq(paragraph, new_para);
+    let original_formatting_snapshot = paragraph_properties_changed
+        .then(|| crate::edit::snapshot_paragraph_formatting(paragraph, revision));
     let mut prefix_was_materialized = false;
 
     // Prefix materialization is only needed when paragraph properties cannot
@@ -3760,191 +3143,122 @@ fn apply_paragraph_diff_in_cell(
             paragraph.materialized_numbering = None;
         } else {
             paragraph.numbering = None;
+            paragraph.has_direct_numbering = new_para.has_direct_numbering;
+            paragraph.numbering_suppressed = new_para.numbering_suppressed;
             prefix_was_materialized = true;
         }
     }
 
     // Paragraph formatting changes (same as apply_block_modified).
-    // Use original_numbering for comparison (prefix handling may have cleared numbering).
-    // Structural comparison (num_id + ilvl only) — counter drift is not a formatting change.
-    let align_changed = paragraph.align != new_para.align;
-    let indent_changed = paragraph.indent != new_para.indent;
-    let spacing_changed = paragraph.spacing != new_para.spacing;
-    let numbering_changed =
-        !crate::domain::numbering_structurally_eq(&original_numbering, &new_para.numbering);
-    let style_changed = paragraph.style_id != new_para.style_id;
-    let keep_next_changed = paragraph.keep_next != new_para.keep_next;
-    let keep_lines_changed = paragraph.keep_lines != new_para.keep_lines;
-    let page_break_before_changed = paragraph.page_break_before != new_para.page_break_before;
-    let widow_control_changed = paragraph.widow_control != new_para.widow_control;
-    let contextual_spacing_changed = paragraph.contextual_spacing != new_para.contextual_spacing;
-    let shading_changed = paragraph.shading != new_para.shading;
-    let borders_changed = paragraph.borders != new_para.borders;
-    let tab_stops_changed = paragraph.tab_stops != new_para.tab_stops;
-    let text_direction_changed = paragraph.text_direction != new_para.text_direction;
-    let text_alignment_changed = paragraph.text_alignment != new_para.text_alignment;
-    let mirror_indents_changed = paragraph.mirror_indents != new_para.mirror_indents;
-    let bidi_changed = paragraph.bidi != new_para.bidi;
-    let suppress_auto_hyphens_changed =
-        paragraph.suppress_auto_hyphens != new_para.suppress_auto_hyphens;
-    let snap_to_grid_changed = paragraph.snap_to_grid != new_para.snap_to_grid;
-    let overflow_punct_changed = paragraph.overflow_punct != new_para.overflow_punct;
-    let adjust_right_ind_changed = paragraph.adjust_right_ind != new_para.adjust_right_ind;
-    let word_wrap_changed = paragraph.word_wrap != new_para.word_wrap;
-    let frame_pr_changed = paragraph.frame_pr != new_para.frame_pr;
-    let section_properties_changed = paragraph.section_properties != new_para.section_properties;
-
-    let any_changed = align_changed
-        || indent_changed
-        || spacing_changed
-        || numbering_changed
-        || style_changed
-        || keep_next_changed
-        || keep_lines_changed
-        || page_break_before_changed
-        || widow_control_changed
-        || contextual_spacing_changed
-        || shading_changed
-        || borders_changed
-        || tab_stops_changed
-        || text_direction_changed
-        || text_alignment_changed
-        || mirror_indents_changed
-        || bidi_changed
-        || suppress_auto_hyphens_changed
-        || snap_to_grid_changed
-        || overflow_punct_changed
-        || adjust_right_ind_changed
-        || word_wrap_changed
-        || frame_pr_changed
-        || section_properties_changed;
-
-    if any_changed {
-        // §17.13.5.29: the inner pPr is the COMPLETE previous direct state. A
-        // paragraph that explicitly suppressed its style's numbering
-        // (`numId=0`, §17.9.18) carried that suppression in its direct pPr —
-        // dropping it from the record makes a reject resurrect the style's
-        // list and swap the paragraph's rendered label (wild witness: a
-        // literal "64." label became an auto-numbered "1." after an
-        // alignment-only edit was rejected).
-        let numbering_explicitly_absent = paragraph.numbering_suppressed
-            || (original_numbering.is_none()
-                && new_para.numbering.is_some()
-                && !original_has_prefix);
-        paragraph.formatting_change = Some(ParagraphFormattingChange {
-            revision_id: revision.revision_id,
-            identity: 0,
-            previous_alignment: paragraph.align.clone(),
-            // Snapshot AUTHORED-direct indent/spacing (previous DIRECT pPr),
-            // not resolved effective — see snapshot_paragraph_formatting.
-            previous_indentation: paragraph
-                .has_direct_indent
-                .then(|| {
-                    paragraph
-                        .authored_indent
-                        .clone()
-                        .or_else(|| paragraph.indent.clone())
-                })
-                .flatten(),
-            previous_spacing: paragraph
-                .has_direct_spacing
-                .then(|| {
-                    paragraph
-                        .authored_spacing
-                        .clone()
-                        .or_else(|| paragraph.spacing.clone())
-                })
-                .flatten(),
-            previous_numbering: original_numbering.clone(),
-            previous_numbering_explicitly_absent: numbering_explicitly_absent,
-            previous_style_id: paragraph.style_id.clone(),
-            previous_keep_next: paragraph.keep_next,
-            previous_keep_lines: paragraph.keep_lines,
-            previous_page_break_before: paragraph.page_break_before,
-            previous_widow_control: paragraph.widow_control,
-            previous_contextual_spacing: paragraph.contextual_spacing,
-            previous_shading: paragraph.shading.clone(),
-            previous_borders: paragraph.borders.clone(),
-            previous_tab_stops: paragraph.tab_stops.clone(),
-            previous_literal_prefix_leading_tab_twips: paragraph.literal_prefix_leading_tab_twips,
-            previous_literal_prefix_trailing_tab_stop_twips: paragraph
-                .literal_prefix_trailing_tab_stop_twips,
-            previous_paragraph_mark_marks: paragraph.paragraph_mark_marks.clone(),
-            previous_paragraph_mark_style_props: paragraph.paragraph_mark_style_props.clone(),
-            previous_paragraph_mark_rfonts: paragraph.paragraph_mark_rfonts.clone(),
-            previous_paragraph_mark_rpr_off: paragraph.paragraph_mark_rpr_off,
-            previous_text_direction: paragraph.text_direction.clone(),
-            previous_text_alignment: paragraph.text_alignment.clone(),
-            previous_mirror_indents: paragraph.mirror_indents,
-            previous_auto_space_de: paragraph.auto_space_de,
-            previous_auto_space_dn: paragraph.auto_space_dn,
-            previous_bidi: paragraph.bidi,
-            previous_suppress_auto_hyphens: paragraph.suppress_auto_hyphens,
-            previous_snap_to_grid: paragraph.snap_to_grid,
-            previous_overflow_punct: paragraph.overflow_punct,
-            previous_adjust_right_ind: paragraph.adjust_right_ind,
-            previous_word_wrap: paragraph.word_wrap,
-            previous_frame_pr: paragraph.frame_pr.clone(),
-            previous_preserved_ppr: paragraph.preserved_ppr.clone(),
-            author: revision.author.clone().unwrap_or_default(),
-            date: revision.date.clone(),
-        });
-        paragraph.align = new_para.align.clone();
-        paragraph.has_direct_align = new_para.has_direct_align;
-        paragraph.indent = new_para.indent.clone();
-        paragraph.has_direct_indent = new_para.has_direct_indent;
-        paragraph.authored_indent = new_para.authored_indent.clone();
-        paragraph.spacing = new_para.spacing.clone();
-        paragraph.has_direct_spacing = new_para.has_direct_spacing;
-        paragraph.authored_spacing = new_para.authored_spacing.clone();
-        paragraph.style_id = new_para.style_id.clone();
-        paragraph.keep_next = new_para.keep_next;
-        paragraph.keep_lines = new_para.keep_lines;
-        paragraph.page_break_before = new_para.page_break_before;
-        paragraph.widow_control = new_para.widow_control;
-        paragraph.contextual_spacing = new_para.contextual_spacing;
-        paragraph.shading = new_para.shading.clone();
-        paragraph.borders = new_para.borders.clone();
-        paragraph.has_direct_keep_next = new_para.has_direct_keep_next;
-        paragraph.has_direct_keep_lines = new_para.has_direct_keep_lines;
-        paragraph.has_direct_page_break_before = new_para.has_direct_page_break_before;
-        paragraph.has_direct_widow_control = new_para.has_direct_widow_control;
-        paragraph.has_direct_contextual_spacing = new_para.has_direct_contextual_spacing;
-        paragraph.has_direct_shading = new_para.has_direct_shading;
-        paragraph.has_direct_borders = new_para.has_direct_borders;
-        paragraph.tab_stops = new_para.tab_stops.clone();
-        paragraph.effective_tab_stops_rel = new_para.effective_tab_stops_rel.clone();
-        paragraph.text_direction = new_para.text_direction.clone();
-        paragraph.text_alignment = new_para.text_alignment.clone();
-        paragraph.mirror_indents = new_para.mirror_indents;
-        paragraph.bidi = new_para.bidi;
-        paragraph.suppress_auto_hyphens = new_para.suppress_auto_hyphens;
-        paragraph.snap_to_grid = new_para.snap_to_grid;
-        paragraph.overflow_punct = new_para.overflow_punct;
-        paragraph.adjust_right_ind = new_para.adjust_right_ind;
-        paragraph.word_wrap = new_para.word_wrap;
-        paragraph.frame_pr = new_para.frame_pr.clone();
-        paragraph.section_property_change = new_para.section_property_change.clone();
-        paragraph.section_properties = new_para.section_properties.clone();
+    // Captured before prefix handling; includes authored direct/suppressed state.
+    if paragraph_properties_changed {
+        paragraph.formatting_change = original_formatting_snapshot;
+        apply_target_non_numbering_paragraph_properties(paragraph, new_para);
         if numbering_changed && !prefix_was_materialized {
             paragraph.numbering = new_para.numbering.clone();
             // Carry the target's numbering provenance (see apply_block_modified).
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
-            if new_para.numbering.is_some() {
+            paragraph.numbering_suppressed = new_para.numbering_suppressed;
+            if new_para.has_resolved_numbering() {
                 paragraph.literal_prefix = None;
             }
         }
     }
 
-    inject_structural_markers_at_offsets(
+    inject_structural_marker_changes(
         &mut final_segments,
         &original_segments,
-        Some(new_para.segments.as_slice()),
+        new_para.segments.as_slice(),
+        revision,
+        rev_counter,
     );
 
     prune_empty_text_inlines(&mut final_segments);
     paragraph.segments = final_segments;
     Ok(())
+}
+
+/// Apply the complete non-numbering `w:pPr` state from `target`.
+///
+/// Numbering is deliberately excluded because prefix lowering may represent
+/// that state partly as tracked inline content. Keeping the remaining
+/// paragraph-property transition in one concrete helper prevents body and
+/// table-cell materialization from drifting apart.
+fn apply_target_non_numbering_paragraph_properties(
+    paragraph: &mut ParagraphNode,
+    target: &ParagraphNode,
+) {
+    paragraph.style_id = target.style_id.clone();
+    paragraph.align = target.align.clone();
+    paragraph.has_direct_align = target.has_direct_align;
+    paragraph.indent = target.indent.clone();
+    paragraph.has_direct_indent = target.has_direct_indent;
+    paragraph.authored_indent = target.authored_indent.clone();
+    paragraph.spacing = target.spacing.clone();
+    paragraph.has_direct_spacing = target.has_direct_spacing;
+    paragraph.authored_spacing = target.authored_spacing.clone();
+    paragraph.borders = target.borders.clone();
+    paragraph.has_direct_borders = target.has_direct_borders;
+    paragraph.keep_next = target.keep_next;
+    paragraph.has_direct_keep_next = target.has_direct_keep_next;
+    paragraph.keep_lines = target.keep_lines;
+    paragraph.has_direct_keep_lines = target.has_direct_keep_lines;
+    paragraph.page_break_before = target.page_break_before;
+    paragraph.has_direct_page_break_before = target.has_direct_page_break_before;
+    paragraph.widow_control = target.widow_control;
+    paragraph.has_direct_widow_control = target.has_direct_widow_control;
+    paragraph.contextual_spacing = target.contextual_spacing;
+    paragraph.has_direct_contextual_spacing = target.has_direct_contextual_spacing;
+    paragraph.shading = target.shading.clone();
+    paragraph.has_direct_shading = target.has_direct_shading;
+    paragraph.tab_stops = target.tab_stops.clone();
+    paragraph.effective_tab_stops_rel = target.effective_tab_stops_rel.clone();
+    paragraph.outline_lvl = target.outline_lvl;
+    paragraph.heading_level = target.heading_level.clone();
+    paragraph.mirror_indents = target.mirror_indents;
+    paragraph.auto_space_de = target.auto_space_de;
+    paragraph.auto_space_dn = target.auto_space_dn;
+    paragraph.bidi = target.bidi;
+    paragraph.text_alignment = target.text_alignment.clone();
+    paragraph.text_direction = target.text_direction.clone();
+    paragraph.suppress_auto_hyphens = target.suppress_auto_hyphens;
+    paragraph.snap_to_grid = target.snap_to_grid;
+    paragraph.overflow_punct = target.overflow_punct;
+    paragraph.adjust_right_ind = target.adjust_right_ind;
+    paragraph.word_wrap = target.word_wrap;
+    paragraph.frame_pr = target.frame_pr.clone();
+    paragraph.paragraph_mark_marks = target.paragraph_mark_marks.clone();
+    paragraph.paragraph_mark_style_props = target.paragraph_mark_style_props.clone();
+    paragraph.paragraph_mark_rfonts = target.paragraph_mark_rfonts.clone();
+    paragraph.paragraph_mark_rpr_off = target.paragraph_mark_rpr_off;
+    paragraph.section_property_change = target.section_property_change.clone();
+    paragraph.section_properties = target.section_properties.clone();
+    paragraph.cnf_style = target.cnf_style.clone();
+    paragraph.preserved_ppr = target.preserved_ppr.clone();
+}
+
+/// A distinct prior/current `w:cnfStyle` cannot be carried by a stable Word
+/// `w:pPrChange`: Word normalizes the previous snapshot to the current value
+/// when saving. Refuse before constructing a redline whose Reject projection
+/// cannot remain equal to the source document.
+fn refuse_unstable_cnf_style_change(
+    source: &ParagraphNode,
+    target: &ParagraphNode,
+    context: &str,
+) -> Result<(), MergeError> {
+    if source.cnf_style == target.cnf_style {
+        return Ok(());
+    }
+
+    Err(MergeError {
+        message: "paragraph cnfStyle change has no stable Word pPrChange encoding".to_string(),
+        context: format!(
+            "{context}: source paragraph {} and target paragraph {} have distinct cnfStyle; \
+             Word rewrites the previous cnfStyle to the current value, so Accept/Reject \
+             equivalence cannot be guaranteed",
+            source.id.0, target.id.0
+        ),
+    })
 }
 
 /// Mark a single paragraph block as deleted: wrap all inlines in a Deleted
@@ -4071,16 +3385,33 @@ fn reconcile_cell_blocks(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
     context: &str,
+    resolver: &dyn ChangePlanResolver,
+    content_relation: CellContentRelation,
 ) -> Result<(), MergeError> {
     let old_fps: Vec<String> = cell.blocks.iter().map(block_fingerprint).collect();
     let new_fps: Vec<String> = new_cell.blocks.iter().map(block_fingerprint).collect();
 
     // Fast path: identical fingerprints means no changes.
-    if old_fps == new_fps {
+    if content_relation == CellContentRelation::Related && old_fps == new_fps {
         return Ok(());
     }
 
-    let ops = similar::capture_diff_slices_deadline(Algorithm::Patience, &old_fps, &new_fps, None);
+    let ops = match content_relation {
+        CellContentRelation::Related => {
+            similar::capture_diff_slices_deadline(Algorithm::Patience, &old_fps, &new_fps, None)
+        }
+        CellContentRelation::UnrelatedReplacement => vec![DiffOp::Replace {
+            old_index: 0,
+            old_len: cell.blocks.len(),
+            new_index: 0,
+            new_len: new_cell.blocks.len(),
+        }],
+    };
+    let unrelated_resolver = UnrelatedContentResolver(resolver);
+    let content_resolver: &dyn ChangePlanResolver = match content_relation {
+        CellContentRelation::Related => resolver,
+        CellContentRelation::UnrelatedReplacement => &unrelated_resolver,
+    };
 
     // Post-diff invariant: no base-side index should appear in both Equal and
     // Delete/Replace ops. If it does, the diff alignment is broken and we must
@@ -4217,13 +3548,15 @@ fn reconcile_cell_blocks(
                                 revision,
                                 rev_counter,
                                 &ctx,
+                                content_resolver,
                             )?;
                             merged_blocks.push(BlockNode::Paragraph(para));
                         }
                         (BlockNode::Table(old_t), BlockNode::Table(new_t)) => {
                             let mut inner = old_t.clone();
-                            if let Some(nested_diff) =
-                                diff_nested_tables(old_t, new_t, 0).map_err(|e| MergeError {
+                            if let Some(nested_diff) = content_resolver
+                                .nested_table_change(old_t, new_t, 0)
+                                .map_err(|e| MergeError {
                                     message: format!("nested table diff failed: {e}"),
                                     context: format!(
                                         "{context}:cell:{}:table:{}",
@@ -4243,6 +3576,7 @@ fn reconcile_cell_blocks(
                                             revision,
                                             rev_counter,
                                             context,
+                                            content_resolver,
                                         )?;
                                     }
                                     NestedTableDiffKind::CellsModified { cell_changes: nc } => {
@@ -4252,6 +3586,7 @@ fn reconcile_cell_blocks(
                                             revision,
                                             rev_counter,
                                             context,
+                                            content_resolver,
                                         )?;
                                     }
                                 }
@@ -4300,7 +3635,32 @@ fn reconcile_cell_blocks(
                 new_index,
                 new_len,
             } => {
-                for i in 0..*old_len {
+                let shares_required_final_paragraph = content_relation
+                    == CellContentRelation::UnrelatedReplacement
+                    && *old_len > 0
+                    && *new_len > 0
+                    && old_index + old_len == cell.blocks.len()
+                    && new_index + new_len == new_cell.blocks.len()
+                    && matches!(
+                        cell.blocks[old_index + old_len - 1],
+                        BlockNode::Paragraph(_)
+                    )
+                    && matches!(
+                        new_cell.blocks[new_index + new_len - 1],
+                        BlockNode::Paragraph(_)
+                    );
+                let old_side_only_len = if shares_required_final_paragraph {
+                    old_len - 1
+                } else {
+                    *old_len
+                };
+                let new_side_only_len = if shares_required_final_paragraph {
+                    new_len - 1
+                } else {
+                    *new_len
+                };
+
+                for i in 0..old_side_only_len {
                     let mut block = cell.blocks[old_index + i].clone();
                     match &mut block {
                         BlockNode::Paragraph(p) => mark_paragraph_deleted(p, revision, rev_counter),
@@ -4309,7 +3669,7 @@ fn reconcile_cell_blocks(
                     }
                     merged_blocks.push(block);
                 }
-                for i in 0..*new_len {
+                for i in 0..new_side_only_len {
                     let mut block = new_cell.blocks[new_index + i].clone();
                     match &mut block {
                         BlockNode::Paragraph(p) => {
@@ -4319,6 +3679,32 @@ fn reconcile_cell_blocks(
                         BlockNode::OpaqueBlock(_) => {}
                     }
                     merged_blocks.push(block);
+                }
+
+                if shares_required_final_paragraph {
+                    let old_block = &cell.blocks[old_index + old_len - 1];
+                    let new_block = &new_cell.blocks[new_index + new_len - 1];
+                    let (BlockNode::Paragraph(old_paragraph), BlockNode::Paragraph(new_paragraph)) =
+                        (old_block, new_block)
+                    else {
+                        unreachable!("qualified cell-final boundary must contain paragraphs")
+                    };
+                    let mut paragraph = old_paragraph.clone();
+                    let paragraph_context = format!(
+                        "{context}:cell:{}:final-paragraph:{}",
+                        cell.id.0, old_paragraph.id.0
+                    );
+                    apply_paragraph_diff_in_cell(
+                        &mut paragraph,
+                        new_paragraph,
+                        old_block,
+                        new_block,
+                        revision,
+                        rev_counter,
+                        &paragraph_context,
+                        content_resolver,
+                    )?;
+                    merged_blocks.push(BlockNode::Paragraph(paragraph));
                 }
             }
         }
@@ -4415,668 +3801,229 @@ pub(crate) fn mark_cell_content_deleted(
         }
     }
 }
-
-#[allow(clippy::too_many_arguments)]
-fn apply_story_changes<T>(
-    base_stories: &mut Vec<T>,
-    target_stories: &[T],
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    changes: &[DiffChange],
-    story_name: &str,
-    get_key: impl Fn(&T) -> &str,
-    set_key: impl Fn(&mut T, String),
-    get_blocks_mut: impl Fn(&mut T) -> &mut Vec<TrackedBlock>,
-    get_blocks: impl Fn(&T) -> &Vec<TrackedBlock>,
-) -> Result<(), MergeError>
-where
-    T: Clone,
-{
-    fn story_will_move_away(
-        pending_renames: &[(usize, String)],
-        story_idx: usize,
-        part_name: &str,
-    ) -> bool {
-        pending_renames
-            .iter()
-            .any(|(idx, target)| *idx == story_idx && target != part_name)
-    }
-
-    let mut pending_renames: Vec<(usize, String)> = Vec::new();
-
-    for change in changes {
-        match change {
-            DiffChange::HeaderModified {
-                base_part_name,
-                target_part_name,
-                block_changes,
-                ..
-            } => {
-                if story_name != "header" {
-                    continue;
-                }
-                let Some(story_idx) = base_stories
-                    .iter()
-                    .position(|s| get_key(s) == base_part_name)
-                else {
-                    return Err(MergeError {
-                        message: format!("{story_name} story part not found for modification"),
-                        context: base_part_name.clone(),
-                    });
-                };
-                let story = &mut base_stories[story_idx];
-                apply_changes_to_blocks(
-                    get_blocks_mut(story),
-                    block_changes,
-                    revision,
-                    rev_counter,
-                    &format!("{story_name}:{base_part_name}"),
-                    None,
-                    &mut BlockProvenanceMap::new(),
-                )?;
-                pending_renames.push((story_idx, target_part_name.clone()));
-            }
-            DiffChange::FooterModified {
-                base_part_name,
-                target_part_name,
-                block_changes,
-                ..
-            } => {
-                if story_name != "footer" {
-                    continue;
-                }
-                let Some(story_idx) = base_stories
-                    .iter()
-                    .position(|s| get_key(s) == base_part_name)
-                else {
-                    return Err(MergeError {
-                        message: format!("{story_name} story part not found for modification"),
-                        context: base_part_name.clone(),
-                    });
-                };
-                let story = &mut base_stories[story_idx];
-                apply_changes_to_blocks(
-                    get_blocks_mut(story),
-                    block_changes,
-                    revision,
-                    rev_counter,
-                    &format!("{story_name}:{base_part_name}"),
-                    None,
-                    &mut BlockProvenanceMap::new(),
-                )?;
-                pending_renames.push((story_idx, target_part_name.clone()));
-            }
-            DiffChange::HeaderDeleted { part_name, .. } => {
-                if story_name != "header" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_key(s) == part_name) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} story part not found for deletion"),
-                        context: part_name.clone(),
-                    });
-                };
-                for block in get_blocks_mut(story).iter_mut() {
-                    block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-                    if let BlockNode::Paragraph(p) = &mut block.block {
-                        p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                            revision,
-                            rev_counter,
-                        )));
-                    }
-                }
-            }
-            DiffChange::FooterDeleted { part_name, .. } => {
-                if story_name != "footer" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_key(s) == part_name) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} story part not found for deletion"),
-                        context: part_name.clone(),
-                    });
-                };
-                for block in get_blocks_mut(story).iter_mut() {
-                    block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-                    if let BlockNode::Paragraph(p) = &mut block.block {
-                        p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                            revision,
-                            rev_counter,
-                        )));
-                    }
-                }
-            }
-            DiffChange::HeaderInserted { part_name, .. } => {
-                if story_name != "header" {
-                    continue;
-                }
-                let Some(target_story) = target_stories.iter().find(|s| get_key(s) == part_name)
-                else {
-                    return Err(MergeError {
-                        message: format!(
-                            "{story_name} story part not found in target for insertion"
-                        ),
-                        context: part_name.clone(),
-                    });
-                };
-                let inserted_blocks: Vec<TrackedBlock> = get_blocks(target_story)
-                    .iter()
-                    .map(|tb| TrackedBlock {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        block: tb.block.clone(),
-                        move_id: None,
-                        block_sdt_wrap: None,
-                    })
-                    .collect();
-                let reusable_story_idx = base_stories
-                    .iter()
-                    .enumerate()
-                    .find(|(idx, s)| {
-                        get_key(s) == part_name
-                            && !story_will_move_away(&pending_renames, *idx, part_name)
-                    })
-                    .map(|(idx, _)| idx);
-                if let Some(story_idx) = reusable_story_idx {
-                    let base_story = &mut base_stories[story_idx];
-                    *get_blocks_mut(base_story) = inserted_blocks;
-                } else {
-                    let mut inserted_story = target_story.clone();
-                    *get_blocks_mut(&mut inserted_story) = inserted_blocks;
-                    base_stories.push(inserted_story);
-                }
-            }
-            DiffChange::FooterInserted { part_name, .. } => {
-                if story_name != "footer" {
-                    continue;
-                }
-                let Some(target_story) = target_stories.iter().find(|s| get_key(s) == part_name)
-                else {
-                    return Err(MergeError {
-                        message: format!(
-                            "{story_name} story part not found in target for insertion"
-                        ),
-                        context: part_name.clone(),
-                    });
-                };
-                let inserted_blocks: Vec<TrackedBlock> = get_blocks(target_story)
-                    .iter()
-                    .map(|tb| TrackedBlock {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        block: tb.block.clone(),
-                        move_id: None,
-                        block_sdt_wrap: None,
-                    })
-                    .collect();
-                let reusable_story_idx = base_stories
-                    .iter()
-                    .enumerate()
-                    .find(|(idx, s)| {
-                        get_key(s) == part_name
-                            && !story_will_move_away(&pending_renames, *idx, part_name)
-                    })
-                    .map(|(idx, _)| idx);
-                if let Some(story_idx) = reusable_story_idx {
-                    let base_story = &mut base_stories[story_idx];
-                    *get_blocks_mut(base_story) = inserted_blocks;
-                } else {
-                    let mut inserted_story = target_story.clone();
-                    *get_blocks_mut(&mut inserted_story) = inserted_blocks;
-                    base_stories.push(inserted_story);
-                }
-            }
-            // Block/table changes never appear at this level: they're
-            // nested inside `HeaderModified`/`FooterModified.block_changes`
-            // and applied via the `apply_changes_to_blocks` call above.
-            // Footnote/endnote/comment stories are applied by the sibling
-            // `apply_note_changes`. Enumerated explicitly (not `_`) so a
-            // future `DiffChange` variant fails to compile here instead of
-            // silently no-op'ing.
-            DiffChange::BlockDeleted { .. }
-            | DiffChange::BlockInserted { .. }
-            | DiffChange::BlockModified { .. }
-            | DiffChange::TableStructureChanged { .. }
-            | DiffChange::TableCellsModified { .. }
-            | DiffChange::FootnoteModified { .. }
-            | DiffChange::FootnoteDeleted { .. }
-            | DiffChange::FootnoteInserted { .. }
-            | DiffChange::EndnoteModified { .. }
-            | DiffChange::EndnoteDeleted { .. }
-            | DiffChange::EndnoteInserted { .. }
-            | DiffChange::CommentModified { .. }
-            | DiffChange::CommentDeleted { .. }
-            | DiffChange::CommentInserted { .. } => {}
-        }
-    }
-
-    for (story_idx, to) in pending_renames {
-        let Some(story) = base_stories.get_mut(story_idx) else {
-            return Err(MergeError {
-                message: format!("{story_name} story index not found for rename"),
-                context: story_idx.to_string(),
-            });
-        };
-        if get_key(story) != to {
-            set_key(story, to);
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_note_changes<T>(
-    base_stories: &mut Vec<T>,
-    target_stories: &[T],
-    revision: &RevisionInfo,
-    rev_counter: &mut u32,
-    changes: &[DiffChange],
-    story_name: &str,
-    get_id: impl Fn(&T) -> &str,
-    get_blocks_mut: impl Fn(&mut T) -> &mut Vec<TrackedBlock>,
-    get_blocks: impl Fn(&T) -> &Vec<TrackedBlock>,
-) -> Result<(), MergeError>
-where
-    T: Clone,
-{
-    for change in changes {
-        match change {
-            DiffChange::FootnoteModified {
-                id, block_changes, ..
-            } => {
-                if story_name != "footnote" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found for modification"),
-                        context: id.clone(),
-                    });
-                };
-                apply_changes_to_blocks(
-                    get_blocks_mut(story),
-                    block_changes,
-                    revision,
-                    rev_counter,
-                    &format!("{story_name}:{id}"),
-                    None,
-                    &mut BlockProvenanceMap::new(),
-                )?;
-            }
-            DiffChange::EndnoteModified {
-                id, block_changes, ..
-            } => {
-                if story_name != "endnote" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found for modification"),
-                        context: id.clone(),
-                    });
-                };
-                apply_changes_to_blocks(
-                    get_blocks_mut(story),
-                    block_changes,
-                    revision,
-                    rev_counter,
-                    &format!("{story_name}:{id}"),
-                    None,
-                    &mut BlockProvenanceMap::new(),
-                )?;
-            }
-            DiffChange::CommentModified {
-                id, block_changes, ..
-            } => {
-                if story_name != "comment" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found for modification"),
-                        context: id.clone(),
-                    });
-                };
-                apply_changes_to_blocks(
-                    get_blocks_mut(story),
-                    block_changes,
-                    revision,
-                    rev_counter,
-                    &format!("{story_name}:{id}"),
-                    None,
-                    &mut BlockProvenanceMap::new(),
-                )?;
-            }
-            DiffChange::FootnoteDeleted { id, .. } => {
-                if story_name != "footnote" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found for deletion"),
-                        context: id.clone(),
-                    });
-                };
-                for block in get_blocks_mut(story).iter_mut() {
-                    block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-                    if let BlockNode::Paragraph(p) = &mut block.block {
-                        p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                            revision,
-                            rev_counter,
-                        )));
-                    }
-                }
-            }
-            DiffChange::EndnoteDeleted { id, .. } => {
-                if story_name != "endnote" {
-                    continue;
-                }
-                let Some(story) = base_stories.iter_mut().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found for deletion"),
-                        context: id.clone(),
-                    });
-                };
-                for block in get_blocks_mut(story).iter_mut() {
-                    block.status = TrackingStatus::Deleted(next_revision(revision, rev_counter));
-                    if let BlockNode::Paragraph(p) = &mut block.block {
-                        p.para_mark_status = Some(TrackingStatus::Deleted(next_revision(
-                            revision,
-                            rev_counter,
-                        )));
-                    }
-                }
-            }
-            DiffChange::CommentDeleted { .. } => {
-                // Handled at the call site (merge_diff) by setting
-                // CommentStory::tracking_status, not by marking blocks.
-            }
-            DiffChange::FootnoteInserted { id, .. } => {
-                if story_name != "footnote" {
-                    continue;
-                }
-                let Some(target_story) = target_stories.iter().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found in target for insertion"),
-                        context: id.clone(),
-                    });
-                };
-                let inserted_blocks: Vec<TrackedBlock> = get_blocks(target_story)
-                    .iter()
-                    .map(|tb| TrackedBlock {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        block: tb.block.clone(),
-                        move_id: None,
-                        block_sdt_wrap: None,
-                    })
-                    .collect();
-                if let Some(base_story) = base_stories.iter_mut().find(|s| get_id(s) == id) {
-                    *get_blocks_mut(base_story) = inserted_blocks;
-                } else {
-                    let mut inserted_story = target_story.clone();
-                    *get_blocks_mut(&mut inserted_story) = inserted_blocks;
-                    base_stories.push(inserted_story);
-                }
-            }
-            DiffChange::EndnoteInserted { id, .. } => {
-                if story_name != "endnote" {
-                    continue;
-                }
-                let Some(target_story) = target_stories.iter().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found in target for insertion"),
-                        context: id.clone(),
-                    });
-                };
-                let inserted_blocks: Vec<TrackedBlock> = get_blocks(target_story)
-                    .iter()
-                    .map(|tb| TrackedBlock {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        block: tb.block.clone(),
-                        move_id: None,
-                        block_sdt_wrap: None,
-                    })
-                    .collect();
-                if let Some(base_story) = base_stories.iter_mut().find(|s| get_id(s) == id) {
-                    *get_blocks_mut(base_story) = inserted_blocks;
-                } else {
-                    let mut inserted_story = target_story.clone();
-                    *get_blocks_mut(&mut inserted_story) = inserted_blocks;
-                    base_stories.push(inserted_story);
-                }
-            }
-            DiffChange::CommentInserted { id, .. } => {
-                if story_name != "comment" {
-                    continue;
-                }
-                let Some(target_story) = target_stories.iter().find(|s| get_id(s) == id) else {
-                    return Err(MergeError {
-                        message: format!("{story_name} not found in target for insertion"),
-                        context: id.clone(),
-                    });
-                };
-                let inserted_blocks: Vec<TrackedBlock> = get_blocks(target_story)
-                    .iter()
-                    .map(|tb| TrackedBlock {
-                        status: TrackingStatus::Inserted(next_revision(revision, rev_counter)),
-                        block: tb.block.clone(),
-                        move_id: None,
-                        block_sdt_wrap: None,
-                    })
-                    .collect();
-                if let Some(base_story) = base_stories.iter_mut().find(|s| get_id(s) == id) {
-                    *get_blocks_mut(base_story) = inserted_blocks;
-                } else {
-                    let mut inserted_story = target_story.clone();
-                    *get_blocks_mut(&mut inserted_story) = inserted_blocks;
-                    base_stories.push(inserted_story);
-                }
-            }
-            // Block/table changes never appear at this level: they're
-            // nested inside `Footnote`/`Endnote`/`CommentModified.block_changes`
-            // and applied via the `apply_changes_to_blocks` call above.
-            // Header/footer stories are applied by the sibling
-            // `apply_story_changes`. Enumerated explicitly (not `_`) so a
-            // future `DiffChange` variant fails to compile here instead of
-            // silently no-op'ing.
-            DiffChange::BlockDeleted { .. }
-            | DiffChange::BlockInserted { .. }
-            | DiffChange::BlockModified { .. }
-            | DiffChange::TableStructureChanged { .. }
-            | DiffChange::TableCellsModified { .. }
-            | DiffChange::HeaderModified { .. }
-            | DiffChange::HeaderDeleted { .. }
-            | DiffChange::HeaderInserted { .. }
-            | DiffChange::FooterModified { .. }
-            | DiffChange::FooterDeleted { .. }
-            | DiffChange::FooterInserted { .. } => {}
-        }
-    }
-    Ok(())
-}
-
-pub fn merge_diff(
+pub fn reconcile_target_comment_ids(
     base: &CanonDoc,
-    target: &CanonDoc,
-    diff: &crate::domain::DocumentDiff,
-    revision: &RevisionInfo,
-) -> Result<MergeResult, MergeError> {
-    // Single counter for the entire merge operation. Every tracked change
-    // element (w:ins, w:del, w:moveFrom, w:moveTo) must receive a unique
-    // revision ID (ISO 29500-1 §17.13.5). Starting from revision.revision_id
-    // and threading this counter through all sub-functions prevents reuse.
-    let mut rev_counter = revision.revision_id;
+    target: &mut CanonDoc,
+) -> Result<(), MergeError> {
+    reconcile_target_comment_ids_with_map(base, target).map(|_| ())
+}
 
-    let mut merged = base.clone();
-    let mut provenance = BlockProvenanceMap::new();
-    let mut target_tables_by_id: HashMap<String, BlockNode> = HashMap::new();
-    for tracked in &target.blocks {
-        if let BlockNode::Table(table) = &tracked.block {
-            target_tables_by_id.insert(table.id.0.to_string(), BlockNode::Table(table.clone()));
+pub(crate) fn reconcile_target_comment_ids_with_map(
+    base: &CanonDoc,
+    target: &mut CanonDoc,
+) -> Result<HashMap<String, String>, MergeError> {
+    fn unique_comment_ids(
+        stories: &[CommentStory],
+        side: &str,
+    ) -> Result<HashSet<String>, MergeError> {
+        let mut ids = HashSet::new();
+        for story in stories {
+            if !ids.insert(story.id.clone()) {
+                return Err(MergeError {
+                    message: format!("{side} document has duplicate comment ids"),
+                    context: format!("comment_id={}", story.id),
+                });
+            }
         }
-    }
-    apply_changes_to_blocks(
-        &mut merged.blocks,
-        &diff.changes,
-        revision,
-        &mut rev_counter,
-        "body",
-        Some(&mut target_tables_by_id),
-        &mut provenance,
-    )?;
-    // The document-final paragraph mark can never carry a resolvable tracked
-    // insertion/deletion (Word leaves it pending on accept-all): re-attribute a
-    // trailing append/delete to the preceding mark. Body only.
-    normalize_final_mark_attribution(&mut merged.blocks, revision, &mut rev_counter);
-
-    apply_story_changes(
-        &mut merged.headers,
-        &target.headers,
-        revision,
-        &mut rev_counter,
-        &diff.changes,
-        "header",
-        |story: &HeaderStory| &story.part_name,
-        |story: &mut HeaderStory, part_name| story.part_name = part_name,
-        |story: &mut HeaderStory| &mut story.blocks,
-        |story: &HeaderStory| &story.blocks,
-    )?;
-    apply_story_changes(
-        &mut merged.footers,
-        &target.footers,
-        revision,
-        &mut rev_counter,
-        &diff.changes,
-        "footer",
-        |story: &FooterStory| &story.part_name,
-        |story: &mut FooterStory, part_name| story.part_name = part_name,
-        |story: &mut FooterStory| &mut story.blocks,
-        |story: &FooterStory| &story.blocks,
-    )?;
-    apply_note_changes(
-        &mut merged.footnotes,
-        &target.footnotes,
-        revision,
-        &mut rev_counter,
-        &diff.changes,
-        "footnote",
-        |story: &FootnoteStory| &story.id,
-        |story: &mut FootnoteStory| &mut story.blocks,
-        |story: &FootnoteStory| &story.blocks,
-    )?;
-    apply_note_changes(
-        &mut merged.endnotes,
-        &target.endnotes,
-        revision,
-        &mut rev_counter,
-        &diff.changes,
-        "endnote",
-        |story: &EndnoteStory| &story.id,
-        |story: &mut EndnoteStory| &mut story.blocks,
-        |story: &EndnoteStory| &story.blocks,
-    )?;
-    apply_note_changes(
-        &mut merged.comments,
-        &target.comments,
-        revision,
-        &mut rev_counter,
-        &diff.changes,
-        "comment",
-        |story: &CommentStory| &story.id,
-        |story: &mut CommentStory| &mut story.blocks,
-        |story: &CommentStory| &story.blocks,
-    )?;
-    // Mark deleted comment stories at the story level (not block level) so
-    // accept_all removes them without causing w:del/w:delText in serialized XML.
-    for change in &diff.changes {
-        if let DiffChange::CommentDeleted { id, .. } = change
-            && let Some(story) = merged.comments.iter_mut().find(|s| s.id == *id)
-        {
-            story.tracking_status = Some(TrackingStatus::Deleted(next_revision(
-                revision,
-                &mut rev_counter,
-            )));
-        }
+        Ok(ids)
     }
 
-    // Post-processing: fix numbering drift for Normal paragraphs whose auto-
-    // numbering prefix shifted due to insertions/deletions between base and
-    // target. Uses the diff changes to find each merged block's target
-    // counterpart by ID rather than positional walk.
-    fix_numbering_drift_for_normal_blocks(
-        &mut merged.blocks,
-        &diff.changes,
-        revision,
-        &mut rev_counter,
-    );
+    fn rewrite_raw_comment_reference(
+        raw_xml: &mut Vec<u8>,
+        old_id: &str,
+        new_id: &str,
+    ) -> Result<(), MergeError> {
+        fn rewrite(element: &mut xmltree::Element, old_id: &str, new_id: &str) -> bool {
+            let mut changed = false;
+            if crate::import::local_element_name(element) == "commentReference"
+                && crate::xml_attrs::attr_get(element, "id").is_some_and(|id| id == old_id)
+            {
+                crate::xml_attrs::attr_set(element, "w:id", new_id);
+                changed = true;
+            }
+            for child in &mut element.children {
+                if let xmltree::XMLNode::Element(child) = child {
+                    changed |= rewrite(child, old_id, new_id);
+                }
+            }
+            changed
+        }
 
-    // Materialize numbering in story blocks (headers, footers, footnotes,
-    // endnotes) so w:numPr never survives into serialized redline XML.
-    materialize_numbering_in_story_blocks(&mut merged);
-
-    // A merge can combine a retained manual label with a deletion whose first
-    // source run begins at the label/body separator. `literal_prefix` cannot
-    // represent that mixed tracking boundary by itself: serialization rejoins
-    // the separator to the deleted body, and reopen otherwise sees a different
-    // segment shape. Restore the explicit normal-prefix + tracked-body model at
-    // the producer boundary.
-    // Only paragraphs this merge PUT INTO that shape qualify. A paragraph the
-    // diff merely edited keeps its label in `literal_prefix`, where the
-    // serializer and the redline reader both expect it; materializing every
-    // changed paragraph moves the label into the body run stream and changes
-    // run grouping the caller never asked to change. One already split in the
-    // base is the source document's own state and is likewise left alone.
-    let mut base_split_ids = HashSet::new();
-    collect_split_tracking_boundary_prefix_ids(&base.blocks, &mut base_split_ids);
-    let mut merged_split_ids = HashSet::new();
-    collect_split_tracking_boundary_prefix_ids(&merged.blocks, &mut merged_split_ids);
-    let produced_split_ids: HashSet<NodeId> = merged_split_ids
-        .difference(&base_split_ids)
-        .cloned()
-        .collect();
-    materialize_split_tracking_boundary_prefixes(&mut merged.blocks, &produced_split_ids);
-    materialize_block_tracked_prefixes(&mut merged.blocks);
-
-    // Track section property changes (w:sectPrChange §17.13.5.32).
-    //
-    // Clear the base's parsed sectPrChange — if the base archive already had one,
-    // it lives inside the raw sectPr element and will be preserved opaquely by the
-    // serializer when we don't set a new change here.
-    merged.body_section_property_change = None;
-
-    // When the target's body section properties differ from the base, record
-    // the change so the serializer can emit a sectPrChange element.
-    if base.body_section_properties != target.body_section_properties {
-        if let Some(ref base_sp) = base.body_section_properties {
-            // CT_SectPrBase does not include EG_HdrFtrReferences, so
-            // header/footer refs are excluded when freezing the previous
-            // state for a sectPrChange.
-            let mut sp_for_change = base_sp.clone();
-            sp_for_change.header_refs.clear();
-            sp_for_change.footer_refs.clear();
-            let element =
-                crate::runtime::section_properties_to_element(&sp_for_change, None, None, None);
-            let mut previous_properties_raw = Vec::new();
-            let config = xmltree::EmitterConfig::new().write_document_declaration(false);
-            let _ = element.write_with_config(&mut previous_properties_raw, config);
-            merged.body_section_properties = target.body_section_properties.clone();
-            merged.body_section_property_change = Some(SectionPropertyChange {
-                revision: next_revision(revision, &mut rev_counter),
-                previous_properties_raw,
+        let mut element =
+            crate::word_xml::parse_raw_fragment(raw_xml).map_err(|source| MergeError {
+                message: "target comment reference raw XML could not be parsed".to_string(),
+                context: format!("comment_id={old_id} error={source}"),
+            })?;
+        if !rewrite(&mut element, old_id, new_id) {
+            return Err(MergeError {
+                message: "target comment reference raw XML did not contain its modeled id"
+                    .to_string(),
+                context: format!("comment_id={old_id}"),
             });
-        } else if target.body_section_properties.is_some() {
-            // Base had no section properties but target does — use target's values.
-            // No previous properties to record (sectPrChange requires a previous state).
-            merged.body_section_properties = target.body_section_properties.clone();
         }
+        let mut rewritten = Vec::new();
+        element
+            .write_with_config(
+                &mut rewritten,
+                xmltree::EmitterConfig::new().write_document_declaration(false),
+            )
+            .map_err(|source| MergeError {
+                message: "target comment reference raw XML could not be serialized".to_string(),
+                context: format!("comment_id={old_id} error={source}"),
+            })?;
+        *raw_xml = rewritten;
+        Ok(())
     }
 
-    // H2: one unified body-state validator after the diff/redline merge
-    // producer (post normalize_final_mark_attribution).
-    debug_assert_body_invariants(&merged, "merge_diff");
-    Ok(MergeResult {
-        doc: merged,
-        block_provenance: provenance,
-    })
+    fn rewrite_inline(
+        inline: &mut InlineNode,
+        remap: &HashMap<String, String>,
+    ) -> Result<(), MergeError> {
+        let id = match inline {
+            InlineNode::CommentRangeStart { id }
+            | InlineNode::CommentRangeEnd { id }
+            | InlineNode::CommentReference { id } => Some(id),
+            InlineNode::OpaqueInline(opaque) => {
+                if let OpaqueKind::CommentReference(reference) = &mut opaque.kind {
+                    let old_id = reference.reference_id.clone();
+                    if let Some(replacement) = remap.get(&old_id)
+                        && replacement != &old_id
+                    {
+                        reference.reference_id = replacement.clone();
+                        if let Some(raw_xml) = &mut opaque.raw_xml {
+                            rewrite_raw_comment_reference(raw_xml, &old_id, replacement)?;
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(id) = id
+            && let Some(replacement) = remap.get(id)
+        {
+            *id = replacement.clone();
+        }
+        Ok(())
+    }
+
+    fn rewrite_block(
+        block: &mut BlockNode,
+        remap: &HashMap<String, String>,
+    ) -> Result<(), MergeError> {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    for inline in &mut segment.inlines {
+                        rewrite_inline(inline, remap)?;
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for block in &mut cell.blocks {
+                            rewrite_block(block, remap)?;
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(opaque) => {
+                // A range half may legally be a direct child of w:body rather
+                // than an inline child of w:p. It is still part of the same
+                // package-local comment-id namespace as the target comment
+                // story and inline anchors. Leaving this modeled half on the
+                // old id after remapping the story tears the triple during
+                // compare serialization.
+                if let Some(marker) = &mut opaque.range_marker
+                    && marker.family == crate::domain::RangeMarkerFamily::CommentRange
+                    && let Some(replacement) = remap.get(&marker.id)
+                {
+                    marker.id = replacement.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_blocks(
+        blocks: &mut [TrackedBlock],
+        remap: &HashMap<String, String>,
+    ) -> Result<(), MergeError> {
+        for tracked in blocks {
+            rewrite_block(&mut tracked.block, remap)?;
+        }
+        Ok(())
+    }
+
+    let base_ids = unique_comment_ids(&base.comments, "base")?;
+    unique_comment_ids(&target.comments, "target")?;
+
+    let mut available_base: std::collections::BTreeSet<usize> = (0..base.comments.len()).collect();
+    let mut reserved = base_ids;
+    let mut remap = HashMap::new();
+
+    for target_story in &target.comments {
+        // A comment body's last paraId is the modern comment-sidecar identity.
+        // When it is unavailable, byte-independent body content plus matching
+        // author/date metadata is the only safe cross-package evidence. A bare
+        // numeric w:id is never evidence.
+        let para_match = target_story.last_para_id().and_then(|target_para_id| {
+            available_base.iter().copied().find(|base_index| {
+                base.comments[*base_index].last_para_id() == Some(target_para_id)
+            })
+        });
+        let content_match = || {
+            available_base.iter().copied().find(|base_index| {
+                let base_story = &base.comments[*base_index];
+                base_story.content_hash == target_story.content_hash
+                    && base_story.author == target_story.author
+                    && base_story.date == target_story.date
+            })
+        };
+
+        let replacement = if let Some(base_index) = para_match.or_else(content_match) {
+            available_base.remove(&base_index);
+            base.comments[base_index].id.clone()
+        } else if !reserved.contains(&target_story.id) {
+            target_story.id.clone()
+        } else {
+            // There are N reserved non-negative decimal strings at most, so
+            // one of 0..=N must be free. This avoids numeric overflow and is
+            // deterministic across runs.
+            (0..=reserved.len())
+                .map(|candidate| candidate.to_string())
+                .find(|candidate| !reserved.contains(candidate))
+                .expect("a free comment id exists in 0..=reserved.len()")
+        };
+        reserved.insert(replacement.clone());
+        remap.insert(target_story.id.clone(), replacement);
+    }
+
+    for story in &mut target.comments {
+        story.id = remap
+            .get(&story.id)
+            .expect("every target comment id was reconciled")
+            .clone();
+    }
+    rewrite_blocks(&mut target.blocks, &remap)?;
+    for story in &mut target.headers {
+        rewrite_blocks(&mut story.blocks, &remap)?;
+    }
+    for story in &mut target.footers {
+        rewrite_blocks(&mut story.blocks, &remap)?;
+    }
+    for story in &mut target.footnotes {
+        rewrite_blocks(&mut story.blocks, &remap)?;
+    }
+    for story in &mut target.endnotes {
+        rewrite_blocks(&mut story.blocks, &remap)?;
+    }
+    for story in &mut target.comments {
+        rewrite_blocks(&mut story.blocks, &remap)?;
+    }
+
+    Ok(remap)
 }
 
 fn collect_split_tracking_boundary_prefix_ids(blocks: &[TrackedBlock], ids: &mut HashSet<NodeId>) {
@@ -5339,513 +4286,25 @@ pub(crate) fn canonicalize_split_tracking_boundary_prefix_ids(
         materialize_split_tracking_boundary_prefixes(&mut story.blocks, ids);
     }
 }
-
-/// Process numbering prefixes in story blocks (headers, footers,
-/// footnotes, endnotes) that contain tracked changes.  Structural `w:numPr`
-/// is preserved; only `literal_prefix` text is materialized as inline content.
-/// Stories without any inserted/deleted blocks are left untouched.
-fn materialize_numbering_in_story_blocks(doc: &mut CanonDoc) {
-    fn has_tracked_changes(blocks: &[TrackedBlock]) -> bool {
-        blocks
-            .iter()
-            .any(|b| !matches!(b.status, TrackingStatus::Normal))
-    }
-
-    fn materialize_blocks(blocks: &mut [TrackedBlock]) {
-        for tb in blocks.iter_mut() {
-            materialize_numbering_prefix_in_place(&mut tb.block);
-        }
-    }
-
-    for story in &mut doc.headers {
-        if has_tracked_changes(&story.blocks) {
-            materialize_blocks(&mut story.blocks);
-        }
-    }
-    for story in &mut doc.footers {
-        if has_tracked_changes(&story.blocks) {
-            materialize_blocks(&mut story.blocks);
-        }
-    }
-    for story in &mut doc.footnotes {
-        if has_tracked_changes(&story.blocks) {
-            materialize_blocks(&mut story.blocks);
-        }
-    }
-    for story in &mut doc.endnotes {
-        if has_tracked_changes(&story.blocks) {
-            materialize_blocks(&mut story.blocks);
-        }
-    }
-}
-
-/// Sync paragraph-level properties from target, excluding numbering,
-/// literal_prefix, and inline formatting.
-///
-/// Used for BlockModified paragraphs that were already processed by
-/// `apply_block_modified`. Those paragraphs have:
-/// - Correct numbering state (cleared if prefix was materialized)
-/// - Correct inline segments (with tracked changes from the inline diff)
-///
-/// Re-syncing numbering would undo prefix materialization (double prefix).
-/// Re-syncing inline formatting would corrupt tracked segments (the
-/// character-by-character walk assumes both sides have identical text).
-fn sync_non_numbering_properties(para: &mut ParagraphNode, target_para: &ParagraphNode) {
-    para.style_id = target_para.style_id.clone();
-    para.align = target_para.align.clone();
-    para.has_direct_align = target_para.has_direct_align;
-    para.indent = target_para.indent.clone();
-    para.has_direct_indent = target_para.has_direct_indent;
-    para.spacing = target_para.spacing.clone();
-    para.has_direct_spacing = target_para.has_direct_spacing;
-    para.borders = target_para.borders.clone();
-    para.keep_next = target_para.keep_next;
-    para.keep_lines = target_para.keep_lines;
-    para.page_break_before = target_para.page_break_before;
-    para.widow_control = target_para.widow_control;
-    para.contextual_spacing = target_para.contextual_spacing;
-    para.shading = target_para.shading.clone();
-    para.tab_stops = target_para.tab_stops.clone();
-    para.heading_level = target_para.heading_level.clone();
-    para.mirror_indents = target_para.mirror_indents;
-    para.bidi = target_para.bidi;
-    para.text_alignment = target_para.text_alignment.clone();
-    para.text_direction = target_para.text_direction.clone();
-    para.suppress_auto_hyphens = target_para.suppress_auto_hyphens;
-    para.snap_to_grid = target_para.snap_to_grid;
-    para.overflow_punct = target_para.overflow_punct;
-    para.adjust_right_ind = target_para.adjust_right_ind;
-    para.word_wrap = target_para.word_wrap;
-    para.frame_pr = target_para.frame_pr.clone();
-    para.cnf_style = target_para.cnf_style.clone();
-    para.section_property_change = target_para.section_property_change.clone();
-    para.section_properties = target_para.section_properties.clone();
-    para.paragraph_mark_marks = target_para.paragraph_mark_marks.clone();
-    para.paragraph_mark_style_props = target_para.paragraph_mark_style_props.clone();
-    para.paragraph_mark_rfonts = target_para.paragraph_mark_rfonts.clone();
-    para.paragraph_mark_rpr_off = target_para.paragraph_mark_rpr_off;
-    para.auto_space_de = target_para.auto_space_de;
-    para.auto_space_dn = target_para.auto_space_dn;
-    // Numbering structure (num_id, ilvl) intentionally NOT synced —
-    // apply_block_modified already set them correctly and may have
-    // intentionally cleared numbering during prefix materialization.
-    // However, sync the counter value (synthesized_text) which can
-    // differ even for structurally-identical numbering because it
-    // depends on the paragraph's position in the numbering sequence.
-    if let (Some(num), Some(target_num)) = (&mut para.numbering, &target_para.numbering) {
-        num.synthesized_text = target_num.synthesized_text.clone();
-    }
-
-    // Keep visible text runs aligned with the target's formatting even when
-    // the paragraph also contains Deleted segments. `sync_inline_formatting`
-    // skips Deleted text and bails out if visible character counts diverge.
-    sync_inline_formatting(&mut para.segments, &target_para.segments);
-}
-
-/// Sync inline formatting from target segments onto base segments.
-///
-/// Walks both segment lists in parallel by character offset. For each character
-/// position, looks up the target TextNode's marks and style_props and applies
-/// them to the base TextNode. When run boundaries differ between base and target,
-/// the base keeps its run structure but each run gets the target formatting for
-/// its character range.
-fn sync_inline_formatting(
-    base_segments: &mut [TrackedSegment],
-    target_segments: &[TrackedSegment],
-) {
-    // Build a flat list of (marks, style_props, has_direct_*) from target text nodes.
-    struct TargetFmt {
-        text: String,
-        marks: Vec<Mark>,
-        style_props: StyleProps,
-        rpr_authored: crate::domain::RunRprAuthored,
-    }
-    let target_fmt: Vec<TargetFmt> = target_segments
-        .iter()
-        .flat_map(|seg| seg.inlines.iter())
-        .filter_map(|inline| match inline {
-            InlineNode::Text(t) => Some(TargetFmt {
-                text: t.text.clone(),
-                marks: t.marks.clone(),
-                style_props: t.style_props.clone(),
-                rpr_authored: t.rpr_authored,
-            }),
-            _ => None,
-        })
-        .collect();
-
-    fn apply_target_fmt(text: &mut TextNode, fmt: &TargetFmt) {
-        text.marks = fmt.marks.clone();
-        text.style_props = fmt.style_props.clone();
-        text.rpr_authored = fmt.rpr_authored;
-    }
-
-    fn split_prefix_chars(text: &str, chars: usize) -> (String, String) {
-        if chars == 0 {
-            return (String::new(), text.to_string());
-        }
-        let split_byte = text
-            .char_indices()
-            .nth(chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(text.len());
-        (
-            text[..split_byte].to_string(),
-            text[split_byte..].to_string(),
-        )
-    }
-
-    // If there's exactly one target text node and the visible base text is
-    // identical, apply its formatting to the visible base text nodes.
-    let base_visible_char_count: usize = base_segments
-        .iter()
-        .filter(|seg| matches!(seg.status, TrackingStatus::Normal))
-        .flat_map(|seg| seg.inlines.iter())
-        .filter_map(|inline| match inline {
-            InlineNode::Text(t) => Some(t.text.chars().count()),
-            _ => None,
-        })
-        .sum();
-
-    if target_fmt.len() == 1
-        && base_segments
-            .iter()
-            .all(|seg| matches!(seg.status, TrackingStatus::Normal))
-        && base_visible_char_count == target_fmt[0].text.chars().count()
-    {
-        let fmt = &target_fmt[0];
-        for seg in base_segments.iter_mut() {
-            for inline in &mut seg.inlines {
-                if let InlineNode::Text(t) = inline {
-                    apply_target_fmt(t, fmt);
-                }
-            }
-        }
-        return;
-    }
-
-    // When run counts match AND text at each position matches, sync 1:1 by position.
-    // Run boundaries can differ between merged (diff-engine tokens) and target (import-time
-    // runs) even when overall text is identical. When counts match by coincidence but text
-    // doesn't align, the 1:1 path would apply marks from the wrong target run. Fall through
-    // to character-offset sync in that case.
-    let base_texts: Vec<&str> = base_segments
-        .iter()
-        .flat_map(|seg| seg.inlines.iter())
-        .filter_map(|inline| match inline {
-            InlineNode::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    let boundaries_align = base_texts.len() == target_fmt.len()
-        && base_texts
-            .iter()
-            .zip(target_fmt.iter())
-            .all(|(b, t)| *b == t.text);
-
-    if boundaries_align {
-        let mut target_idx = 0;
-        for seg in base_segments.iter_mut() {
-            for inline in &mut seg.inlines {
-                if let InlineNode::Text(t) = inline
-                    && target_idx < target_fmt.len()
-                {
-                    let fmt = &target_fmt[target_idx];
-                    apply_target_fmt(t, fmt);
-                    target_idx += 1;
-                }
-            }
-        }
-        return;
-    }
-
-    // Run counts differ — do character-offset based sync.
-    // Build a per-character formatting map from target, then apply to base.
-    let mut target_char_fmt: Vec<usize> = Vec::new(); // index into target_fmt for each char
-    let mut fmt_idx = 0;
-    for seg in target_segments.iter() {
-        for inline in &seg.inlines {
-            if let InlineNode::Text(t) = inline {
-                for _ in t.text.chars() {
-                    target_char_fmt.push(fmt_idx);
-                }
-                fmt_idx += 1;
-            }
-        }
-    }
-
-    // Only count characters from the accept-all projection (Normal + Inserted
-    // segments). Deleted segments contain base text that has no target counterpart,
-    // so including them would inflate the count and cause a mismatch bail-out.
-    let base_accept_char_count: usize = base_segments
-        .iter()
-        .filter(|seg| !matches!(seg.status, TrackingStatus::Deleted(_)))
-        .flat_map(|seg| seg.inlines.iter())
-        .filter_map(|inline| match inline {
-            InlineNode::Text(t) => Some(t.text.chars().count()),
-            _ => None,
-        })
-        .sum();
-
-    if base_accept_char_count != target_char_fmt.len() {
-        // Character counts don't match even after excluding Deleted segments.
-        // Bail out safely rather than corrupt formatting.
-        return;
-    }
-
-    // Split visible base text nodes to the target's run boundaries and apply the
-    // corresponding target formatting to each chunk. Deleted segments keep their
-    // original text and formatting because they have no target counterpart.
-    let mut target_idx = 0usize;
-    let mut chars_consumed_in_target = 0usize;
-    for seg in base_segments.iter_mut() {
-        let is_deleted = matches!(seg.status, TrackingStatus::Deleted(_));
-        if is_deleted {
-            continue;
-        }
-
-        let mut rewritten = Vec::with_capacity(seg.inlines.len());
-        for inline in std::mem::take(&mut seg.inlines) {
-            match inline {
-                InlineNode::Text(text) => {
-                    let mut remaining = text.text.clone();
-                    let mut chunk_index = 0usize;
-                    while !remaining.is_empty() {
-                        if target_idx >= target_fmt.len() {
-                            seg.inlines = rewritten;
-                            return;
-                        }
-                        let fmt = &target_fmt[target_idx];
-                        let fmt_len = fmt.text.chars().count();
-                        let remaining_in_fmt = fmt_len.saturating_sub(chars_consumed_in_target);
-                        if remaining_in_fmt == 0 {
-                            target_idx += 1;
-                            chars_consumed_in_target = 0;
-                            continue;
-                        }
-
-                        let remaining_chars = remaining.chars().count();
-                        let take_chars = remaining_chars.min(remaining_in_fmt);
-                        let (chunk_text, tail) = split_prefix_chars(&remaining, take_chars);
-                        remaining = tail;
-
-                        let mut chunk = text.clone();
-                        chunk.text = chunk_text;
-                        if chunk_index > 0 {
-                            chunk.id = NodeId::from(format!("{}__fmt{}", text.id, chunk_index));
-                            chunk.formatting_change = None;
-                        }
-                        apply_target_fmt(&mut chunk, fmt);
-                        rewritten.push(InlineNode::Text(chunk));
-
-                        chars_consumed_in_target += take_chars;
-                        if chars_consumed_in_target == fmt_len {
-                            target_idx += 1;
-                            chars_consumed_in_target = 0;
-                        }
-                        chunk_index += 1;
-                    }
-                }
-                other => rewritten.push(other),
-            }
-        }
-        seg.inlines = rewritten;
-    }
-
-    if target_idx != target_fmt.len() || chars_consumed_in_target != 0 {
-        // Visible text did not fully align with the target text runs.
-        // Preserve the partially-updated segments rather than guessing further.
-        return;
-    }
-
-    // Sanity-check that the first character of each visible chunk still maps to
-    // the same target formatting we consumed above. This keeps the previous
-    // offset-based invariant explicit for debugging.
-    let mut char_offset = 0usize;
-    for seg in base_segments.iter_mut() {
-        if matches!(seg.status, TrackingStatus::Deleted(_)) {
-            continue;
-        }
-        for inline in &mut seg.inlines {
-            if let InlineNode::Text(t) = inline {
-                let len = t.text.chars().count();
-                if len > 0 && char_offset < target_char_fmt.len() {
-                    let target_fmt_idx = target_char_fmt[char_offset];
-                    if target_fmt_idx < target_fmt.len() {
-                        apply_target_fmt(t, &target_fmt[target_fmt_idx]);
-                    }
-                }
-                char_offset += len;
-            }
-        }
-    }
-}
-
-/// Sync target formatting for paragraphs inside table cells.
-///
-/// Walks base and target tables in parallel (rows → cells → blocks) and calls
-/// `sync_target_formatting` for each matched paragraph pair. Gracefully skips
-/// when structures don't align (different row/cell/block counts).
-fn sync_target_formatting_in_table(table: &mut TableNode, target_table: &TableNode) {
-    if table.rows.len() != target_table.rows.len() {
-        return;
-    }
-    for (row, target_row) in table.rows.iter_mut().zip(target_table.rows.iter()) {
-        if matches!(
-            &row.tracking_status,
-            Some(TrackingStatus::Inserted(_)) | Some(TrackingStatus::Deleted(_))
-        ) {
-            continue;
-        }
-        if row.cells.len() != target_row.cells.len() {
-            continue;
-        }
-        for (cell, target_cell) in row.cells.iter_mut().zip(target_row.cells.iter()) {
-            if matches!(
-                &cell.tracking_status,
-                Some(TrackingStatus::Inserted(_)) | Some(TrackingStatus::Deleted(_))
-            ) {
-                continue;
-            }
-            if cell.blocks.len() != target_cell.blocks.len() {
-                continue;
-            }
-            for (block, target_block) in cell.blocks.iter_mut().zip(target_cell.blocks.iter()) {
-                match (block, target_block) {
-                    (BlockNode::Paragraph(para), BlockNode::Paragraph(target_para)) => {
-                        // Use sync_non_numbering_properties (not sync_target_formatting)
-                        // to avoid restoring numPr from the target when the base didn't
-                        // have it. Cell-paragraph diffs are handled by
-                        // apply_paragraph_diff_in_cell; non-modified paragraphs should
-                        // keep their base numbering state.
-                        sync_non_numbering_properties(para, target_para);
-                    }
-                    (BlockNode::Table(nested), BlockNode::Table(nested_target)) => {
-                        sync_target_formatting_in_table(nested, nested_target);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-/// Fix numbering drift for Normal (unchanged) paragraphs.
-///
-/// When paragraphs are inserted or deleted, auto-numbering on surrounding Normal
-/// paragraphs may shift (e.g., section "3." becomes "4."). The diff doesn't emit
-/// changes for these since the body text is identical. This function walks merged
-/// blocks alongside target blocks to detect and materialize prefix differences as
-/// tracked inline content.
-fn fix_numbering_drift_for_normal_blocks(
-    merged_blocks: &mut [TrackedBlock],
-    changes: &[DiffChange],
-    _revision: &RevisionInfo,
-    _rev_counter: &mut u32,
-) {
-    // Build an ID-based lookup from diff changes: for each BlockModified or
-    // TableStructureChanged/TableCellsModified, we know which target block
-    // corresponds to each base block. This replaces the previous positional
-    // walk which broke when paragraph splits shifted block indices.
-    let mut target_block_by_id: HashMap<NodeId, BlockNode> = HashMap::new();
-    for change in changes {
-        if let DiffChange::BlockModified {
-            block_id,
-            new_block,
-            ..
-        } = change
-        {
-            target_block_by_id.insert(block_id.clone(), new_block.clone());
-        }
-    }
-
-    for merged in merged_blocks.iter_mut() {
-        // Skip OpaqueBlocks — they are not serialized into the redline
-        // and don't carry numbering.
-        if matches!(merged.block, BlockNode::OpaqueBlock(_)) {
-            continue;
-        }
-        match &merged.status {
-            TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_) => {
-                // Deleted (and stacked, which is pending-deleted) blocks have
-                // no target counterpart. Materialize numbering prefix so the
-                // serializer doesn't emit w:numPr (which extraction would
-                // re-synthesize with a drifted counter in the reject view).
-                materialize_numbering_prefix_in_place(&mut merged.block);
-            }
-            TrackingStatus::Inserted(_) => {
-                // Inserted blocks are target blocks — materialize numbering
-                // prefix so the serializer doesn't emit w:numPr.
-                materialize_numbering_prefix_in_place(&mut merged.block);
-            }
-            TrackingStatus::Normal => {
-                let block_id = match &merged.block {
-                    BlockNode::Paragraph(p) => &p.id,
-                    BlockNode::Table(t) => &t.id,
-                    BlockNode::OpaqueBlock(o) => &o.id,
-                };
-
-                if let Some(target_block) = target_block_by_id.get(block_id) {
-                    // BlockModified blocks were already processed by
-                    // apply_block_modified (inline diffs, prefix materialization,
-                    // formatting changes). Sync remaining paragraph properties
-                    // that apply_block_modified doesn't cover, but do NOT
-                    // overwrite numbering — apply_block_modified intentionally
-                    // cleared it when materializing the prefix. Also skip
-                    // sync_inline_formatting (it would corrupt post-merge
-                    // tracked segments).
-                    match (&mut merged.block, target_block) {
-                        (BlockNode::Paragraph(para), BlockNode::Paragraph(target_para)) => {
-                            sync_non_numbering_properties(para, target_para);
-                        }
-                        (BlockNode::Table(table), BlockNode::Table(target_table)) => {
-                            sync_target_formatting_in_table(table, target_table);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Block was not modified by the diff — preserve it exactly.
-                    // In particular, keep a hoisted literal prefix structural:
-                    // materializing it here replaces its imported source-run
-                    // witness with one synthetic TextNode, so a later rebuild
-                    // cannot retain the original w:r boundaries. Prefixes only
-                    // need materialization when a changed/inserted/deleted block
-                    // must express them as revision content.
-                }
-            }
-        }
-    }
-}
-
-/// Materialize numbering prefix for a block in-place, without comparing to a
-/// target.  Used for Deleted and Inserted blocks where there is no target
-/// counterpart to compare against.
-///
-/// Structural numbering (`w:numPr`) is preserved — Word handles counter
-/// synthesis, and `extract_redline`'s two-phase approach produces correct
-/// numbers.  Only `literal_prefix` (baked text) is materialized as inline text.
 fn materialize_numbering_prefix_in_place(block: &mut BlockNode) {
     match block {
         BlockNode::Paragraph(para) => {
-            if para.numbering.is_none() && para.literal_prefix.is_none() {
+            if !para.has_resolved_numbering() && para.literal_prefix.is_none() {
                 return;
             }
-            // Structural numbering is preserved (including bullets).
-            // Word generates the label from the numbering definition.
-            if para.numbering.is_some() {
+            if para.has_resolved_numbering() {
                 return;
             }
-            // Only literal_prefix remains — materialize it as inline text.
             let prefix = effective_text_prefix(para).map(str::to_owned);
-            if let Some(pfx) = &prefix
-                && !pfx.trim().is_empty()
+            if let Some(prefix) = &prefix
+                && !prefix.trim().is_empty()
             {
                 let prefix_segment = TrackedSegment {
                     status: TrackingStatus::Normal,
                     inlines: vec![InlineNode::from(make_prefix_text_node(
                         materialized_prefix_node_id(&para.id, MaterializedPrefixKind::Structural),
                         MaterializedPrefixKind::Structural,
-                        materialized_prefix_text(pfx, para),
+                        materialized_prefix_text(prefix, para),
                         para,
                     ))],
                 };
@@ -5856,9 +4315,7 @@ fn materialize_numbering_prefix_in_place(block: &mut BlockNode) {
             para.materialized_numbering = para.numbering.take();
             para.literal_prefix = None;
         }
-        BlockNode::Table(table) => {
-            materialize_numbering_in_table_cells(table);
-        }
+        BlockNode::Table(table) => materialize_numbering_in_table_cells(table),
         BlockNode::OpaqueBlock(_) => {}
     }
 }
@@ -5886,11 +4343,11 @@ fn materialize_numbering_in_table_cells(table: &mut TableNode) {
                 let BlockNode::Paragraph(para) = block else {
                     continue;
                 };
-                if para.numbering.is_none() && para.literal_prefix.is_none() {
+                if !para.has_resolved_numbering() && para.literal_prefix.is_none() {
                     continue;
                 }
                 // Structural numbering is preserved.
-                if para.numbering.is_some() {
+                if para.has_resolved_numbering() {
                     continue;
                 }
                 // Only literal_prefix — materialize as inline text.
@@ -5944,6 +4401,233 @@ fn custom_xml_range_marker_local(deco: &crate::domain::DecorationNode) -> Option
     }
 }
 
+fn custom_xml_range_marker_id(deco: &crate::domain::DecorationNode) -> Option<String> {
+    custom_xml_range_marker_local(deco)?;
+    deco.raw_xml
+        .as_deref()
+        .and_then(|raw| crate::word_xml::parse_raw_fragment(raw).ok())
+        .and_then(|el| crate::xml_attrs::attr_get(&el, "id").cloned())
+}
+
+/// Return the one selectable deletion id carried by the exact bounded inline
+/// SDT deletion shape emitted by `append_tracked_inline_sdt`.
+///
+/// A generic SDT containing a deletion is not enough: only one direct
+/// `sdtContent` whose sole meaningful child is one direct `w:del` belongs to
+/// the structural range that deletes the control itself.
+struct QualifiedInlineSdtDeletion {
+    revision_id: u32,
+    incoming_range_end: Option<String>,
+    outgoing_range_start: Option<String>,
+}
+
+fn qualified_inline_sdt_deletion(
+    opaque: &crate::domain::OpaqueInlineNode,
+) -> Option<QualifiedInlineSdtDeletion> {
+    if !matches!(opaque.kind, crate::domain::OpaqueKind::Sdt) {
+        return None;
+    }
+    let root = crate::word_xml::parse_raw_fragment(opaque.raw_xml.as_deref()?).ok()?;
+    if !crate::word_xml::is_w_tag(&root, "sdt") {
+        return None;
+    }
+    let mut contents = root.children.iter().filter_map(|child| {
+        child
+            .as_element()
+            .filter(|child| crate::word_xml::is_w_tag(child, "sdtContent"))
+    });
+    let content = contents.next()?;
+    if contents.next().is_some() {
+        return None;
+    }
+    let meaningful = content
+        .children
+        .iter()
+        .filter(|child| match child {
+            xmltree::XMLNode::Text(text) | xmltree::XMLNode::CData(text) => !text.trim().is_empty(),
+            xmltree::XMLNode::Comment(_) => false,
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    let (deletion, incoming_range_end, outgoing_range_start) = match meaningful.as_slice() {
+        [xmltree::XMLNode::Element(deletion)] if crate::word_xml::is_w_tag(deletion, "del") => {
+            (deletion, None, None)
+        }
+        [
+            xmltree::XMLNode::Element(incoming_end),
+            xmltree::XMLNode::Element(deletion),
+            xmltree::XMLNode::Element(outgoing_start),
+        ] if crate::word_xml::is_w_tag(incoming_end, "customXmlDelRangeEnd")
+            && crate::word_xml::is_w_tag(deletion, "del")
+            && crate::word_xml::is_w_tag(outgoing_start, "customXmlDelRangeStart") =>
+        {
+            (
+                deletion,
+                crate::xml_attrs::attr_get(incoming_end, "w:id").cloned(),
+                crate::xml_attrs::attr_get(outgoing_start, "w:id").cloned(),
+            )
+        }
+        _ => return None,
+    };
+    let revision_id = crate::xml_attrs::attr_get(deletion, "w:id")
+        .and_then(|id| id.parse::<u32>().ok())
+        .filter(|id| *id != 0)?;
+    Some(QualifiedInlineSdtDeletion {
+        revision_id,
+        incoming_range_end,
+        outgoing_range_start,
+    })
+}
+
+fn strip_inline_sdt_internal_deletion_ranges(opaque: &mut crate::domain::OpaqueInlineNode) {
+    let Some(raw) = opaque.raw_xml.as_deref() else {
+        return;
+    };
+    let Ok(mut root) = crate::word_xml::parse_raw_fragment(raw) else {
+        return;
+    };
+    let Some(content) = root.children.iter_mut().find_map(|child| {
+        child
+            .as_mut_element()
+            .filter(|child| crate::word_xml::is_w_tag(child, "sdtContent"))
+    }) else {
+        return;
+    };
+    let before = content.children.len();
+    content.children.retain(|child| {
+        !matches!(child, xmltree::XMLNode::Element(element)
+            if crate::word_xml::is_w_tag(element, "customXmlDelRangeStart")
+                || crate::word_xml::is_w_tag(element, "customXmlDelRangeEnd"))
+    });
+    if content.children.len() != before {
+        let bytes = crate::word_xml::serialize_raw_fragment(&root);
+        opaque.content_hash = Some(crate::import::sha256_hex(&bytes));
+        opaque.raw_xml = Some(bytes);
+    }
+}
+
+/// Resolve the structural half of the Word-qualified inline-SDT deletion as
+/// one logical operation in canonical space.
+///
+/// Import intentionally represents the two range markers as decorations and
+/// the SDT as an opaque inline. Without this typed join, accepting the inner
+/// `w:del` leaves an empty live SDT and both range markers behind. Only the
+/// exact adjacent `start → qualified SDT → matching end` form is admitted.
+fn settle_inline_sdt_deletion_ranges(
+    paragraph: &mut ParagraphNode,
+    accept: bool,
+    selected: Option<&HashSet<u32>>,
+) {
+    #[derive(Default)]
+    enum Candidate {
+        #[default]
+        None,
+        Start(String),
+        Control {
+            end_range_id: String,
+            range_ids: Vec<String>,
+            node_id: crate::domain::NodeId,
+            word_normalized: bool,
+        },
+    }
+
+    let mut candidate = Candidate::None;
+    let mut qualified_ranges = HashSet::new();
+    let mut qualified_controls = std::collections::HashMap::new();
+
+    for inline in paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+    {
+        match inline {
+            InlineNode::Decoration(deco)
+                if custom_xml_range_marker_local(deco).as_deref()
+                    == Some("customXmlDelRangeStart") =>
+            {
+                candidate = custom_xml_range_marker_id(deco)
+                    .map(Candidate::Start)
+                    .unwrap_or_default();
+            }
+            InlineNode::OpaqueInline(opaque) => {
+                let Candidate::Start(range_id) = &candidate else {
+                    candidate = Candidate::None;
+                    continue;
+                };
+                let Some(deletion) = qualified_inline_sdt_deletion(opaque) else {
+                    candidate = Candidate::None;
+                    continue;
+                };
+                if selected.is_some_and(|selected| !selected.contains(&deletion.revision_id)) {
+                    candidate = Candidate::None;
+                    continue;
+                }
+                let (end_range_id, range_ids, word_normalized) =
+                    match (deletion.incoming_range_end, deletion.outgoing_range_start) {
+                        (None, None) => (range_id.clone(), vec![range_id.clone()], false),
+                        (Some(incoming), Some(outgoing)) if incoming == *range_id => {
+                            (outgoing.clone(), vec![range_id.clone(), outgoing], true)
+                        }
+                        _ => {
+                            candidate = Candidate::None;
+                            continue;
+                        }
+                    };
+                candidate = Candidate::Control {
+                    end_range_id,
+                    range_ids,
+                    node_id: opaque.id.clone(),
+                    word_normalized,
+                };
+            }
+            InlineNode::Decoration(deco)
+                if custom_xml_range_marker_local(deco).as_deref()
+                    == Some("customXmlDelRangeEnd") =>
+            {
+                let end_id = custom_xml_range_marker_id(deco);
+                if let Candidate::Control {
+                    end_range_id,
+                    range_ids,
+                    node_id,
+                    word_normalized,
+                } = &candidate
+                    && end_id.as_deref() == Some(end_range_id.as_str())
+                {
+                    qualified_ranges.extend(range_ids.iter().cloned());
+                    qualified_controls.insert(node_id.clone(), *word_normalized);
+                }
+                candidate = Candidate::None;
+            }
+            _ => candidate = Candidate::None,
+        }
+    }
+
+    if qualified_ranges.is_empty() {
+        return;
+    }
+    for segment in &mut paragraph.segments {
+        segment.inlines.retain_mut(|inline| match inline {
+            InlineNode::Decoration(deco) => {
+                custom_xml_range_marker_id(deco).is_none_or(|id| !qualified_ranges.contains(&id))
+            }
+            InlineNode::OpaqueInline(opaque) => {
+                let Some(word_normalized) = qualified_controls.get(&opaque.id) else {
+                    return true;
+                };
+                if accept {
+                    false
+                } else {
+                    if *word_normalized {
+                        strip_inline_sdt_internal_deletion_ranges(opaque);
+                    }
+                    true
+                }
+            }
+            _ => true,
+        });
+    }
+}
+
 /// Word's rule for what happens to a `customXml`/`smartTag` wrapper and the
 /// `customXml*Range` markers around it when a tracked change is resolved
 /// (accept or reject). The single named decision point for §17.13.5.6/.7,
@@ -5985,14 +4669,6 @@ fn resolve_custom_xml_range_governed_wrappers(p: &mut ParagraphNode) {
     }
 
     // Helper: the range marker's id, if this decoration is one.
-    let range_id = |deco: &crate::domain::DecorationNode| -> Option<String> {
-        custom_xml_range_marker_local(deco)?;
-        deco.raw_xml
-            .as_deref()
-            .and_then(|raw| crate::word_xml::parse_raw_fragment(raw).ok())
-            .and_then(|el| crate::xml_attrs::attr_get(&el, "id").cloned())
-    };
-
     // PASS 1: determine which range ids actually GOVERN a CustomXmlWrapper —
     // i.e. enclose at least one wrapper marker. Only those ranges (and their
     // wrappers) collapse on resolution. A customXml*Range that encloses no
@@ -6007,7 +4683,7 @@ fn resolve_custom_xml_range_governed_wrappers(p: &mut ParagraphNode) {
                 continue;
             };
             if let Some(local) = custom_xml_range_marker_local(deco) {
-                let id = range_id(deco).unwrap_or_default();
+                let id = custom_xml_range_marker_id(deco).unwrap_or_default();
                 if local.ends_with("RangeStart") {
                     open.push(id);
                 } else if let Some(pos) = open.iter().rposition(|x| *x == id) {
@@ -6049,7 +4725,7 @@ fn resolve_custom_xml_range_governed_wrappers(p: &mut ParagraphNode) {
                 return true;
             };
             if let Some(local) = custom_xml_range_marker_local(deco) {
-                let id = range_id(deco).unwrap_or_default();
+                let id = custom_xml_range_marker_id(deco).unwrap_or_default();
                 let is_governing = governing.contains(&id);
                 if local.ends_with("RangeStart") {
                     open.push(id);
@@ -6130,7 +4806,7 @@ fn normalize_paragraph_after_projection(
             .drain(..)
             .flat_map(|s| s.inlines)
             .collect();
-        if paragraph.numbering.is_some() {
+        if paragraph.has_resolved_numbering() {
             // Numbering is present — strip materialized prefix nodes without
             // promoting them to literal_prefix (numbering already carries the
             // prefix semantics).
@@ -6175,7 +4851,7 @@ fn normalize_paragraph_after_projection(
             // matching for truly literal prefixes (inline text that happens to
             // look like enumeration labels).
             if paragraph.literal_prefix.is_none()
-                && paragraph.numbering.is_none()
+                && !paragraph.has_resolved_numbering()
                 && let Some(prefix) = strip_literal_prefix(&mut all_inlines)
             {
                 paragraph.literal_prefix = Some(prefix.label);
@@ -6253,7 +4929,9 @@ fn normalize_paragraph_after_projection(
             })
             .collect();
         paragraph.rendered_text = Some(format!("{pfx}\t{body}"));
-    } else if let Some(ref num) = paragraph.numbering {
+    } else if let Some(ref num) = paragraph.numbering
+        && num.is_resolved()
+    {
         // Structural numbering — reconstruct rendered_text from the
         // synthesized text.  When numbering was restored from
         // materialized_numbering the import-time rendered_text is stale
@@ -6328,12 +5006,12 @@ fn settle_full_resolution_decorations(inlines: &mut Vec<InlineNode>) {
     *inlines = settled;
 }
 
-fn leading_materialized_prefix_text_index(inlines: &[InlineNode]) -> Option<usize> {
-    let mut prefix_idx = None;
+fn leading_materialized_prefix_text_indices(inlines: &[InlineNode]) -> Vec<usize> {
+    let mut prefix_indices = Vec::new();
     for (idx, inline) in inlines.iter().enumerate() {
         match inline {
             InlineNode::Text(t) if is_materialized_prefix_text(t) => {
-                prefix_idx.get_or_insert(idx);
+                prefix_indices.push(idx);
             }
             InlineNode::Decoration(_)
             | InlineNode::CommentRangeStart { .. }
@@ -6342,7 +5020,7 @@ fn leading_materialized_prefix_text_index(inlines: &[InlineNode]) -> Option<usiz
             _ => break,
         }
     }
-    prefix_idx
+    prefix_indices
 }
 
 /// Strip a materialized numbering prefix identified by its explicit prefix kind.
@@ -6352,15 +5030,43 @@ fn leading_materialized_prefix_text_index(inlines: &[InlineNode]) -> Option<usiz
 /// When `strip_literal_prefix` can't detect the prefix via pattern matching
 /// (e.g. Roman numerals, multi-level numbering), we fall back to that marker.
 fn strip_materialized_prefix_by_id(inlines: &mut Vec<InlineNode>, paragraph: &mut ParagraphNode) {
-    let Some(prefix_idx) = leading_materialized_prefix_text_index(inlines) else {
+    let prefix_indices = leading_materialized_prefix_text_indices(inlines);
+    let Some(&first_prefix_idx) = prefix_indices.first() else {
         return;
     };
-    // Extract the prefix label (materialization adds trailing space: "{pfx_trimmed} ")
-    if let Some(InlineNode::Text(t)) = inlines.get(prefix_idx) {
+    let InlineNode::Text(first) = &inlines[first_prefix_idx] else {
+        unreachable!("prefix indices contain only materialized prefix text")
+    };
+    let mut text = String::new();
+    for &prefix_idx in &prefix_indices {
+        let InlineNode::Text(fragment) = &inlines[prefix_idx] else {
+            unreachable!("prefix indices contain only materialized prefix text")
+        };
+        assert_eq!(
+            (
+                fragment.marks.as_slice(),
+                &fragment.style_props,
+                fragment.rpr_authored
+            ),
+            (
+                first.marks.as_slice(),
+                &first.style_props,
+                first.rpr_authored
+            ),
+            "one projected materialized prefix must have one exact formatting payload"
+        );
+        text.push_str(&fragment.text);
+    }
+    // Materialization may split the prefix at atom/revision boundaries. Rejoin
+    // every surviving prefix fragment before recovering its hoisted geometry.
+    {
         let (label, leading_ws, trailing_ws, leading_tab_count, has_trailing_tab) =
-            strip_materialized_prefix_geometry(&t.text);
+            strip_materialized_prefix_geometry(&text);
         if !label.is_empty() {
             paragraph.literal_prefix = Some(label);
+            paragraph.literal_prefix_marks = first.marks.clone();
+            paragraph.literal_prefix_style_props = first.style_props.clone();
+            paragraph.literal_prefix_rpr_authored = first.rpr_authored;
             paragraph.literal_prefix_leading_ws = leading_ws;
             paragraph.literal_prefix_trailing_ws = trailing_ws;
             paragraph.literal_prefix_leading_tab_twips = if leading_tab_count > 0 {
@@ -6377,7 +5083,9 @@ fn strip_materialized_prefix_by_id(inlines: &mut Vec<InlineNode>, paragraph: &mu
             };
         }
     }
-    inlines.remove(prefix_idx);
+    for prefix_idx in prefix_indices.into_iter().rev() {
+        inlines.remove(prefix_idx);
+    }
 }
 
 /// Strip a materialized numbering prefix identified by its explicit prefix kind,
@@ -6387,7 +5095,10 @@ fn strip_materialized_prefix_by_id(inlines: &mut Vec<InlineNode>, paragraph: &mu
 /// redundant and keeping it would violate the invariant that a projected
 /// paragraph never has both `numbering` and materialized prefix inline nodes.
 fn strip_materialized_prefix_by_id_discard(inlines: &mut Vec<InlineNode>) {
-    if let Some(prefix_idx) = leading_materialized_prefix_text_index(inlines) {
+    for prefix_idx in leading_materialized_prefix_text_indices(inlines)
+        .into_iter()
+        .rev()
+    {
         inlines.remove(prefix_idx);
     }
 }
@@ -6481,7 +5192,10 @@ fn merge_marked_paragraphs_bare(blocks: &mut Vec<BlockNode>, keep_inserted: bool
             // No join target (a surviving table follows, or this is the last
             // block). Drop a donor the resolution leaves empty — an empty husk
             // is not what Word keeps; a donor with surviving content stays.
-            let drop_empty = i + 1 < blocks.len()
+            let another_paragraph_survives = blocks[..i]
+                .iter()
+                .any(|block| matches!(block, BlockNode::Paragraph(_)));
+            let drop_empty = (i + 1 < blocks.len() || another_paragraph_survives)
                 && matches!(&blocks[i],
                     BlockNode::Paragraph(p) if paragraph_emptied_by_accept_reject(p, keep_inserted));
             if drop_empty {
@@ -6586,10 +5300,9 @@ fn tracked_block_removed_by_accept_reject(tb: &TrackedBlock, keep_inserted: bool
 /// after it) is base content: rejecting the insertion removes what was appended,
 /// not the base paragraph, so it must survive.
 ///
-/// The caller also suppresses the drop when the donor is the LAST block in its
-/// container: removing a non-last block never changes what the container ends
-/// with (a valid input stays valid), but a cell / body must still END with a
-/// paragraph, so an emptied terminal husk is kept as that terminating paragraph.
+/// A terminal donor is kept only when it is the container's sole surviving
+/// paragraph. If an earlier paragraph survives, keeping the emptied terminal
+/// donor would manufacture an extra blank paragraph in the resolved reading.
 fn paragraph_emptied_by_accept_reject(p: &ParagraphNode, keep_inserted: bool) -> bool {
     if p.literal_prefix.is_some() || p.section_properties.is_some() {
         return false;
@@ -6622,7 +5335,8 @@ fn paragraph_emptied_by_accept_reject(p: &ParagraphNode, keep_inserted: bool) ->
 /// same rule on the transaction producer, which kept them hoisted and so built
 /// a state import cannot reconstruct: the model says block-tracked with normal
 /// segments, the reopened document says normal block with tracked segments.
-pub(crate) fn materialize_block_tracked_prefixes(blocks: &mut [TrackedBlock]) {
+#[doc(hidden)]
+pub fn materialize_block_tracked_prefixes(blocks: &mut [TrackedBlock]) {
     // Only top-level blocks carry a tracking status; cell content is untracked
     // `BlockNode`s, so there is no block-level proposal to disagree about
     // inside a table.
@@ -6894,7 +5608,11 @@ fn merge_marked_paragraphs_tracked(blocks: &mut Vec<TrackedBlock>, keep_inserted
             // paragraph rejected / fully-deleted accepted) rather than keeping an
             // empty husk; a donor with surviving content stays as its own
             // paragraph.
-            let drop_empty = i + 1 < blocks.len()
+            let another_paragraph_survives = blocks[..i].iter().any(|tracked| {
+                block_survives_retain(&tracked.status, keep_inserted)
+                    && matches!(tracked.block, BlockNode::Paragraph(_))
+            });
+            let drop_empty = (i + 1 < blocks.len() || another_paragraph_survives)
                 && matches!(&blocks[i].block,
                     BlockNode::Paragraph(p) if paragraph_emptied_by_accept_reject(p, keep_inserted));
             if drop_empty {
@@ -6924,10 +5642,12 @@ fn merge_marked_paragraphs_tracked(blocks: &mut Vec<TrackedBlock>, keep_inserted
 /// runs to `Normal`. On reject (`keep_inserted = false`): drop `Inserted`
 /// runs, clear `Deleted` runs to `Normal`.
 ///
-/// The hyperlink envelope (URL, anchor, r_id, extra_attrs) is preserved.
-/// `HyperlinkData.text` is refreshed from the surviving run texts so it
-/// stays in sync with `runs` (see `HyperlinkData.text` docstring).
+/// `HyperlinkData.text` is refreshed from the surviving run texts so it stays
+/// in sync with `runs` (see `HyperlinkData.text` docstring). The caller
+/// preserves the hyperlink envelope when any run survives, and removes the
+/// envelope when this projection empties a previously non-empty run set.
 fn project_hyperlink_runs(data: &mut crate::domain::HyperlinkData, keep_inserted: bool) {
+    let had_runs = !data.runs.is_empty();
     data.runs.retain(|run| match &run.status {
         TrackingStatus::Normal => true,
         TrackingStatus::Inserted(_) => keep_inserted,
@@ -6938,7 +5658,12 @@ fn project_hyperlink_runs(data: &mut crate::domain::HyperlinkData, keep_inserted
     for run in &mut data.runs {
         run.status = TrackingStatus::Normal;
     }
-    data.text = data.runs.iter().map(|r| r.text.as_str()).collect();
+    // A clean hyperlink may carry only its summarized `text`, with no typed
+    // interior-run projection. In that state there is nothing to resolve and
+    // rebuilding from the empty run list would silently erase display text.
+    if had_runs {
+        data.text = data.runs.iter().map(|r| r.text.as_str()).collect();
+    }
 }
 
 pub(crate) fn project_block_for_accept_reject(block: &mut BlockNode, keep_inserted: bool) {
@@ -6951,6 +5676,7 @@ pub(crate) fn project_block_for_accept_reject(block: &mut BlockNode, keep_insert
         // needed to re-resolve style-inherited run marks. The reject paths that
         // DO change the style thread their `StyleDefinitions` in explicitly.
         ResolutionDefinitions::NONE,
+        DerivedGeometryPolicy::Resolve,
     );
 }
 
@@ -6976,19 +5702,20 @@ pub(crate) fn project_block_for_text_edit_prep(block: &mut BlockNode) {
         // formatting-change record and never alters `style_id` — nothing to
         // re-resolve.
         ResolutionDefinitions::NONE,
+        DerivedGeometryPolicy::PreserveVerified,
     );
 }
 
-/// The package data a projection re-resolves inherited paragraph geometry
-/// against. A resolution that restores a numbering prefix (rejecting a
-/// pPrChange, accepting a deletion that owned the label) must recompute the
-/// indent Word would compute: the style chain's effective indent, the
-/// numbering level's own indent, and the document default tab stop that
-/// positions the label. The three travel together because any one of them
-/// alone resolves a *different* geometry than Word does — passing only the
-/// styles is how the no-styles case (W8-F2) silently produced a wrong indent.
-/// `None` means the package genuinely has no such part, never "unavailable
-/// here".
+/// Package data used when a content/boundary projection invalidates derived
+/// paragraph geometry (for example, accepting a deletion that owned a label).
+/// The style chain, numbering levels, and default tab stop travel together
+/// because any subset resolves a different geometry than Word does.
+///
+/// This is deliberately NOT applied after rejecting a pPrChange: that change
+/// carries its own verified previous effective projection, which is
+/// authoritative even if the package's current style definitions would now
+/// resolve differently. `None` means the package genuinely has no such part,
+/// never "unavailable here".
 #[derive(Clone, Copy)]
 pub(crate) struct ResolutionDefinitions<'a> {
     pub(crate) styles: Option<&'a crate::styles::StyleDefinitions>,
@@ -7029,6 +5756,7 @@ fn project_block_inner(
     keep_inserted: bool,
     preserve_formatting_change: bool,
     defs: ResolutionDefinitions<'_>,
+    geometry_policy: DerivedGeometryPolicy,
 ) {
     match block {
         BlockNode::Paragraph(p) => {
@@ -7114,12 +5842,23 @@ fn project_block_inner(
                 .preserved
                 .retain(|property| property.name != "w:moveFrom" && property.name != "w:moveTo");
 
+            // The Word-qualified inline-SDT deletion is one logical carrier
+            // split across two typed representations by import: range-marker
+            // decorations and an opaque SDT containing the deletion. Resolve
+            // that structural join before descending into opaque interiors so
+            // Accept cannot leave an empty live control behind.
+            if !preserve_formatting_change {
+                settle_inline_sdt_deletion_ranges(p, keep_inserted, None);
+            }
+
             // Handle run-level formatting changes (rPrChange) on text nodes,
             // and project tracked changes inside hyperlink display text
-            // (`HyperlinkData.runs[*].status`). The hyperlink envelope is
-            // preserved; only its inner runs are filtered by status.
+            // (`HyperlinkData.runs[*].status`). The hyperlink envelope survives
+            // with any retained run, but goes with the proposal when resolution
+            // removes its final run.
             for segment in &mut p.segments {
-                for inline in &mut segment.inlines {
+                segment.inlines.retain_mut(|inline| {
+                    let mut keep_inline = true;
                     match inline {
                         InlineNode::Text(t) => {
                             if !keep_inserted {
@@ -7132,10 +5871,36 @@ fn project_block_inner(
                                     .retain(|(name, _)| name.rsplit(':').next() != Some("rsidDel"));
                             }
                         }
+                        InlineNode::HardBreak(hard_break) => {
+                            if !keep_inserted {
+                                reject_hard_break_formatting(hard_break);
+                            } else if !preserve_formatting_change {
+                                hard_break.formatting_change = None;
+                            }
+                            if !preserve_formatting_change {
+                                hard_break
+                                    .source_run_attrs
+                                    .retain(|(name, _)| name.rsplit(':').next() != Some("rsidDel"));
+                            }
+                        }
                         InlineNode::OpaqueInline(opaque) => {
                             match &mut opaque.kind {
                                 crate::domain::OpaqueKind::Hyperlink(data) => {
+                                    let had_runs = !data.runs.is_empty();
                                     project_hyperlink_runs(data, keep_inserted);
+                                    // A paragraph-level hyperlink cannot itself
+                                    // carry w:ins/w:del, so serialization puts a
+                                    // segment-level proposal on its inner runs.
+                                    // When resolution drops the final proposed
+                                    // run, the envelope belongs to that proposal
+                                    // too. Keeping it would make the serializer's
+                                    // empty-hyperlink fallback manufacture an
+                                    // untracked empty run that exists in neither
+                                    // terminal document. Do not conflate this
+                                    // with an input hyperlink that was already
+                                    // empty: only a non-empty run set emptied by
+                                    // this projection is removed.
+                                    keep_inline = !(had_runs && data.runs.is_empty());
                                     // The opaque carries its own raw_xml cache.
                                     // Clear it so the next serialize rebuilds from
                                     // the projected `runs` rather than re-emitting
@@ -7192,7 +5957,8 @@ fn project_block_inner(
                         }
                         _ => {}
                     }
-                }
+                    keep_inline
+                });
             }
 
             if !preserve_formatting_change {
@@ -7244,10 +6010,11 @@ fn project_block_inner(
             if let Some(style_defs) = defs.styles
                 && (!keep_inserted || p.style_id != style_before)
             {
-                if rejected_paragraph_formatting {
-                    reresolve_paragraph_alignment(p, style_defs);
-                    reresolve_paragraph_numbering(p, style_defs, defs.numbering);
-                }
+                // A rejected pPrChange already restored its captured effective
+                // paragraph projection. That historical projection is proof
+                // state and may legitimately differ from what the package's
+                // CURRENT style table resolves today. Only run formatting is
+                // re-resolved here: pPr values remain authoritative.
                 reresolve_paragraph_style_inherited_marks(p, style_defs);
             }
 
@@ -7264,14 +6031,20 @@ fn project_block_inner(
             // idempotent when nothing changed, so recompute unconditionally;
             // without it (degraded public entry points) recomputing would
             // DROP style-resolved values, so keep the narrow triggers.
-            if defs.styles.is_some() || rejected_paragraph_formatting || restored_literal_prefix {
+            if !rejected_paragraph_formatting
+                && (defs.styles.is_some()
+                    || (restored_literal_prefix
+                        && geometry_policy == DerivedGeometryPolicy::Resolve))
+            {
                 reresolve_paragraph_indent(p, defs);
             }
             // Spacing is the same kind of view (§17.3.1.33 per-attribute over
             // direct + style chain) and goes stale the same ways; unlike
             // indent it has no text-dependent absorption, so only the style
             // table gates it.
-            if let Some(styles) = defs.styles {
+            if let Some(styles) = defs.styles
+                && !rejected_paragraph_formatting
+            {
                 reresolve_paragraph_spacing(p, styles);
                 // The pPr toggles are the same per-attribute cascades: a
                 // pPrChange reject restores the authored-direct snapshot, and
@@ -7334,8 +6107,10 @@ fn project_block_inner(
                 // Handle row formatting change (trPrChange, §17.13.5.36).
                 if !keep_inserted {
                     reject_row_formatting(row);
+                    reject_table_property_exception_formatting(row);
                 } else if !preserve_formatting_change {
                     row.formatting_change = None;
+                    row.tbl_pr_ex_change = None;
                 }
 
                 // Filter cells by tracking status (same logic).
@@ -7389,6 +6164,7 @@ fn project_block_inner(
                             keep_inserted,
                             preserve_formatting_change,
                             defs,
+                            geometry_policy,
                         );
                     }
                     drop_emptied_nested_tables(&mut cell.blocks, &nested_had_rows);
@@ -7502,10 +6278,41 @@ fn drop_emptied_nested_tables(blocks: &mut Vec<BlockNode>, had_rows: &[bool]) {
     });
 }
 
+/// Project one already-selected story without fabricating a [`CanonDoc`].
+///
+/// This is the proof materializer's block-vector verifier. It deliberately
+/// performs no package-level story retention or body-section handling, and it
+/// preserves the already-verified effective paragraph frame because no style,
+/// numbering, or settings definitions exist at this isolated story boundary.
+/// Serialized terminal verification later re-resolves that frame from the full
+/// package and remains the independent end-to-end proof.
+#[cfg(test)]
+fn project_story_blocks_for_accept_reject(
+    blocks: &mut Vec<TrackedBlock>,
+    action: ResolveSelectionAction,
+) {
+    project_blocks_for_accept_reject(
+        blocks,
+        matches!(action, ResolveSelectionAction::Accept),
+        ResolutionDefinitions::NONE,
+        DerivedGeometryPolicy::PreserveVerified,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DerivedGeometryPolicy {
+    Resolve,
+    /// The proof materializer already selected an exact source/target frame.
+    /// Preserve that effective projection while checking the content and
+    /// boundary weave independently of the surrounding package.
+    PreserveVerified,
+}
+
 fn project_blocks_for_accept_reject(
     blocks: &mut Vec<TrackedBlock>,
     keep_inserted: bool,
     defs: ResolutionDefinitions<'_>,
+    geometry_policy: DerivedGeometryPolicy,
 ) {
     // Resolve the two Word-reachable move mixtures through the same explicit
     // origin transitions as selective projection. Full projection otherwise
@@ -7591,6 +6398,7 @@ fn project_blocks_for_accept_reject(
             keep_inserted,
             /*preserve_formatting_change=*/ false,
             defs,
+            geometry_policy,
         );
     }
     let mut idx = 0;
@@ -7636,6 +6444,9 @@ fn renumber_projected_blocks(
                     let Some(numbering) = &mut paragraph.numbering else {
                         return;
                     };
+                    if !numbering.is_resolved() {
+                        return;
+                    }
                     let Ok(label) =
                         state.synthesize(numbering_defs, numbering.num_id, numbering.ilvl)
                     else {
@@ -8499,6 +7310,8 @@ pub enum RevisionKind {
     FormatRun,
     /// `w:pPrChange` — paragraph formatting change (§17.13.5.29).
     FormatParagraph,
+    /// `w:pPr/w:rPr/w:rPrChange` — paragraph-mark run formatting change.
+    FormatParagraphMark,
     /// `w:tblPrChange` — table formatting change (§17.13.5.34).
     FormatTable,
     /// `w:trPrChange` — table row formatting change (§17.13.5.37).
@@ -8537,6 +7350,7 @@ impl RevisionKind {
             RevisionKind::Delete => "delete",
             RevisionKind::FormatRun => "format_run",
             RevisionKind::FormatParagraph => "format_paragraph",
+            RevisionKind::FormatParagraphMark => "format_paragraph_mark",
             RevisionKind::FormatTable => "format_table",
             RevisionKind::FormatRow => "format_row",
             RevisionKind::FormatCell => "format_cell",
@@ -8554,6 +7368,7 @@ impl RevisionKind {
             "delete" => RevisionKind::Delete,
             "format_run" => RevisionKind::FormatRun,
             "format_paragraph" => RevisionKind::FormatParagraph,
+            "format_paragraph_mark" => RevisionKind::FormatParagraphMark,
             "format_table" => RevisionKind::FormatTable,
             "format_row" => RevisionKind::FormatRow,
             "format_cell" => RevisionKind::FormatCell,
@@ -8572,6 +7387,7 @@ impl RevisionKind {
             self,
             RevisionKind::FormatRun
                 | RevisionKind::FormatParagraph
+                | RevisionKind::FormatParagraphMark
                 | RevisionKind::FormatTable
                 | RevisionKind::FormatRow
                 | RevisionKind::FormatCell
@@ -9024,6 +7840,18 @@ fn enumerate_table_revisions(
                 excerpt: format!("row[{row_label}] formatting"),
             });
         }
+        if let Some(fc) = &row.tbl_pr_ex_change {
+            out.push(RevisionRecord {
+                revision_id: fc.identity,
+                wire_id: fc.revision_id,
+                author: some_author(&fc.author),
+                date: fc.date.clone(),
+                kind: RevisionKind::FormatRow,
+                block_id: block_id.clone(),
+                location: location.clone(),
+                excerpt: format!("row[{row_label}] table-property exception"),
+            });
+        }
         for (ci, cell) in row.cells.iter().enumerate() {
             if let Some(status) = &cell.tracking_status {
                 push_status_records(out, status, block_id, location, &format!("cell[{ri},{ci}]"));
@@ -9097,7 +7925,9 @@ fn enumerate_paragraph_revisions(
         for inline in &segment.inlines {
             match inline {
                 InlineNode::Text(t) => {
-                    if let Some(fc) = &t.formatting_change {
+                    if let Some(fc) = &t.formatting_change
+                        && fc.is_physical_revision()
+                    {
                         out.push(RevisionRecord {
                             revision_id: fc.identity,
                             wire_id: fc.revision_id,
@@ -9107,6 +7937,22 @@ fn enumerate_paragraph_revisions(
                             block_id: block_id.clone(),
                             location: location.clone(),
                             excerpt: format!("run formatting: {}", t.text),
+                        });
+                    }
+                }
+                InlineNode::HardBreak(hard_break) => {
+                    if let Some(fc) = &hard_break.formatting_change
+                        && fc.is_physical_revision()
+                    {
+                        out.push(RevisionRecord {
+                            revision_id: fc.identity,
+                            wire_id: fc.revision_id,
+                            author: some_author(&fc.author),
+                            date: fc.date.clone(),
+                            kind: RevisionKind::FormatRun,
+                            block_id: block_id.clone(),
+                            location: location.clone(),
+                            excerpt: "hard-break run formatting".to_string(),
                         });
                     }
                 }
@@ -9157,10 +8003,22 @@ fn enumerate_paragraph_revisions(
             wire_id: fc.revision_id,
             author: some_author(&fc.author),
             date: fc.date.clone(),
-            kind: RevisionKind::FormatParagraph,
+            kind: if fc.carrier
+                == crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties
+            {
+                RevisionKind::FormatParagraphMark
+            } else {
+                RevisionKind::FormatParagraph
+            },
             block_id: block_id.clone(),
             location: location.clone(),
-            excerpt: "paragraph formatting".to_string(),
+            excerpt: if fc.carrier
+                == crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties
+            {
+                "paragraph-mark formatting".to_string()
+            } else {
+                "paragraph formatting".to_string()
+            },
         });
     }
     // A mid-document section break's own w:sectPrChange (§17.13.5.32) — the
@@ -9567,135 +8425,175 @@ fn row_text_excerpt(row: &crate::domain::TableRowNode) -> String {
 // reversibility contract for tracked formatting changes (§17.13.5.29/.34/.36/.37):
 // reject restores the prior state EXACTLY. (Same compiler-enforced discipline as
 // the exhaustive roundtrip comparator.)
-pub(crate) fn reject_paragraph_formatting(p: &mut ParagraphNode) {
+#[doc(hidden)]
+pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
     let Some(fc) = p.formatting_change.take() else {
         return;
     };
-    // Effective paragraph values can differ from the authored-direct snapshot
-    // Word stores inside pPrChange (style cascade, numbering indentation, and
-    // tab absorption all contribute). If this formatting change did not alter
-    // the paragraph's direct indent/spacing, retain the already-correct
-    // effective value rather than replacing it with the raw snapshot on reject.
-    let effective_indent_before = p.indent.clone();
-    let effective_spacing_before = p.spacing.clone();
-    let direct_indent_before = p.authored_indent.clone();
-    let direct_spacing_before = p.authored_spacing.clone();
     let crate::domain::ParagraphFormattingChange {
-        previous_alignment,
-        previous_indentation,
-        previous_spacing,
-        previous_numbering,
-        previous_numbering_explicitly_absent,
-        previous_style_id,
-        previous_keep_next,
-        previous_keep_lines,
-        previous_page_break_before,
-        previous_widow_control,
-        previous_contextual_spacing,
-        previous_shading,
-        previous_borders,
-        previous_tab_stops,
-        previous_literal_prefix_leading_tab_twips,
-        previous_literal_prefix_trailing_tab_stop_twips,
-        previous_paragraph_mark_marks,
-        previous_paragraph_mark_style_props,
-        previous_paragraph_mark_rfonts,
-        previous_paragraph_mark_rpr_off,
-        previous_text_direction,
-        previous_text_alignment,
-        previous_mirror_indents,
-        previous_auto_space_de,
-        previous_auto_space_dn,
-        previous_bidi,
-        previous_suppress_auto_hyphens,
-        previous_snap_to_grid,
-        previous_overflow_punct,
-        previous_adjust_right_ind,
-        previous_word_wrap,
-        previous_frame_pr,
-        previous_preserved_ppr,
+        previous,
         // Revision identity/attribution — not restorable formatting state.
         revision_id: _,
         identity: _,
         author: _,
         date: _,
+        carrier: _,
     } = fc;
-    // The snapshot is the previous DIRECT formatting (§17.13.5.29), so a
-    // present previous value IS direct authorship: the has_direct_* emission
-    // gates must be re-derived from the restored values, or the serializer
-    // drops a restored property the current (discarded) state didn't author.
-    p.has_direct_align = previous_alignment.is_some();
-    p.has_direct_indent = previous_indentation.is_some();
-    p.has_direct_spacing = previous_spacing.is_some();
-    p.has_direct_keep_next = previous_keep_next.is_some();
-    p.has_direct_keep_lines = previous_keep_lines.is_some();
-    p.has_direct_page_break_before = previous_page_break_before;
-    p.has_direct_widow_control = previous_widow_control.is_some();
-    p.has_direct_contextual_spacing = previous_contextual_spacing.is_some();
-    p.has_direct_shading = previous_shading.is_some();
-    p.has_direct_borders = previous_borders.is_some();
-    p.align = previous_alignment;
-    // `previous_indentation`/`previous_spacing` are the previous AUTHORED-direct
-    // pPr (from the snapshot or the inner-pPr parse), so they restore BOTH the
-    // authored field the serializer emits AND the effective projection — for a
-    // reject the two coincide (there is no live cascade to re-resolve here, same
-    // as import of a direct-only paragraph).
-    p.authored_indent = previous_indentation.clone();
-    p.authored_spacing = previous_spacing.clone();
-    p.indent = if direct_indent_before == previous_indentation {
-        effective_indent_before
-    } else {
-        previous_indentation
-    };
-    p.spacing = if direct_spacing_before == previous_spacing {
-        effective_spacing_before
-    } else {
-        previous_spacing
-    };
-    // Restore the numbering emission gate to match the base numbering. Like the
-    // authored_indent restore above, reject treats the restored value as direct
-    // (there is no live cascade to re-resolve here — the pPrChange inner pPr is
-    // the previous DIRECT pPr).
-    p.has_direct_numbering = previous_numbering.is_some();
-    // The inner pPr carries `numId=0` when the base had no numbering
-    // (§17.9.18), and every consumer — Word, and our own byte path — reads
-    // that back as EXPLICIT suppression. The model has to say the same thing,
-    // or rejecting the change leaves the archive claiming suppression while
-    // the typed projection claims inherited numbering.
-    p.numbering_suppressed = previous_numbering.is_none() && previous_numbering_explicitly_absent;
-    p.numbering = previous_numbering;
-    p.style_id = previous_style_id;
-    p.keep_next = previous_keep_next;
-    p.keep_lines = previous_keep_lines;
-    p.page_break_before = previous_page_break_before;
-    p.widow_control = previous_widow_control;
-    p.contextual_spacing = previous_contextual_spacing;
-    p.shading = previous_shading;
-    p.borders = previous_borders;
-    p.tab_stops = previous_tab_stops;
-    p.literal_prefix_leading_tab_twips = previous_literal_prefix_leading_tab_twips;
-    p.literal_prefix_trailing_tab_stop_twips = previous_literal_prefix_trailing_tab_stop_twips;
-    p.paragraph_mark_marks = previous_paragraph_mark_marks;
-    p.paragraph_mark_style_props = previous_paragraph_mark_style_props;
-    p.paragraph_mark_rfonts = previous_paragraph_mark_rfonts;
-    p.paragraph_mark_rpr_off = previous_paragraph_mark_rpr_off;
-    p.text_direction = previous_text_direction;
-    p.text_alignment = previous_text_alignment;
-    p.mirror_indents = previous_mirror_indents;
-    p.auto_space_de = previous_auto_space_de;
-    p.auto_space_dn = previous_auto_space_dn;
-    p.bidi = previous_bidi;
-    p.suppress_auto_hyphens = previous_suppress_auto_hyphens;
-    p.snap_to_grid = previous_snap_to_grid;
-    p.overflow_punct = previous_overflow_punct;
-    p.adjust_right_ind = previous_adjust_right_ind;
-    p.word_wrap = previous_word_wrap;
-    p.frame_pr = previous_frame_pr;
-    // Replace, not merge: the pPrChange snapshot IS the complete previous pPr
-    // (§17.13.5.29), so its preserved remainder is the paragraph's ENTIRE
-    // unmodeled remainder after reject — not the union with whatever the
-    // about-to-be-discarded current state happened to carry.
-    p.preserved_ppr = previous_preserved_ppr;
+    let crate::domain::PreviousParagraphProperties {
+        direct,
+        effective,
+        paragraph_mark,
+    } = previous;
+    let crate::domain::DirectParagraphProperties {
+        style_id,
+        alignment: direct_alignment,
+        indentation: direct_indentation,
+        spacing: direct_spacing,
+        numbering: direct_numbering,
+        keep_next: direct_keep_next,
+        keep_lines: direct_keep_lines,
+        page_break_before: direct_page_break_before,
+        widow_control: direct_widow_control,
+        contextual_spacing: direct_contextual_spacing,
+        shading: direct_shading,
+        borders: direct_borders,
+        tab_stops,
+        text_direction,
+        text_alignment,
+        mirror_indents,
+        auto_space_de,
+        auto_space_dn,
+        bidi,
+        suppress_auto_hyphens,
+        snap_to_grid,
+        overflow_punct,
+        adjust_right_ind,
+        word_wrap,
+        frame_pr,
+        outline_lvl,
+        cnf_style,
+        preserved,
+    } = direct;
+    let crate::domain::EffectiveParagraphProperties {
+        alignment,
+        indentation,
+        spacing,
+        numbering,
+        keep_next,
+        keep_lines,
+        page_break_before,
+        widow_control,
+        contextual_spacing,
+        shading,
+        borders,
+        tab_stops_rel,
+        heading_level,
+        literal_prefix_leading_tab_twips,
+        literal_prefix_trailing_tab_stop_twips,
+    } = effective;
+    let crate::domain::ParagraphMarkProperties {
+        marks,
+        style_props,
+        rfonts,
+        rpr_off,
+    } = paragraph_mark;
+
+    p.style_id = style_id;
+    p.has_direct_align = direct_alignment.is_some();
+    p.align = alignment;
+    p.has_direct_indent = direct_indentation.is_some();
+    p.authored_indent = direct_indentation;
+    p.indent = indentation;
+    p.has_direct_spacing = direct_spacing.is_some();
+    p.authored_spacing = direct_spacing;
+    p.spacing = spacing;
+    match direct_numbering {
+        crate::domain::DirectParagraphNumbering::Absent => {
+            p.has_direct_numbering = false;
+            p.numbering_suppressed = false;
+        }
+        crate::domain::DirectParagraphNumbering::Present(direct) => {
+            let simple_active = direct.num_id.is_some_and(|num_id| num_id > 0)
+                && direct.ilvl.is_some()
+                && direct.extra_attrs.is_empty()
+                && direct.preserved.is_empty();
+            let simple_suppression = direct.num_id == Some(0)
+                && direct.ilvl == Some(0)
+                && direct.extra_attrs.is_empty()
+                && direct.preserved.is_empty();
+            if simple_suppression {
+                assert!(
+                    numbering.is_none(),
+                    "pPrChange previous state cannot be both numbering-suppressed and effectively numbered"
+                );
+                p.has_direct_numbering = false;
+                p.numbering_suppressed = true;
+            } else if simple_active {
+                let effective = numbering.as_ref().expect(
+                    "pPrChange previous direct active numbering must have an effective projection",
+                );
+                assert_eq!(Some(effective.num_id), direct.num_id);
+                assert_eq!(Some(effective.ilvl), direct.ilvl);
+                p.has_direct_numbering = true;
+                p.numbering_suppressed = false;
+            } else {
+                // ParagraphNode's legacy direct-numbering fields cannot encode
+                // a partial CT_NumPr. Retain that valid authored container in
+                // the explicit preserved-pPr remainder so reject and a later
+                // serialization stay wire-exact without inventing children.
+                p.has_direct_numbering = false;
+                p.numbering_suppressed = false;
+                let element = crate::serialize::serialize_direct_num_pr(&direct);
+                p.preserved_ppr.push(crate::domain::PreservedProp {
+                    name: "w:numPr".to_string(),
+                    raw_xml: String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+                        .expect("numPr serialization is UTF-8"),
+                });
+            }
+        }
+    }
+    p.numbering = numbering;
+    // A restored effective numbering value supersedes the transient hoisted
+    // representation; keeping both violates ParagraphNode's numbering invariant.
+    p.materialized_numbering = None;
+    p.has_direct_keep_next = direct_keep_next.is_some();
+    p.keep_next = keep_next;
+    p.has_direct_keep_lines = direct_keep_lines.is_some();
+    p.keep_lines = keep_lines;
+    p.has_direct_page_break_before = direct_page_break_before.is_some();
+    p.page_break_before = page_break_before;
+    p.has_direct_widow_control = direct_widow_control.is_some();
+    p.widow_control = widow_control;
+    p.has_direct_contextual_spacing = direct_contextual_spacing.is_some();
+    p.contextual_spacing = contextual_spacing;
+    p.has_direct_shading = direct_shading.is_some();
+    p.shading = shading;
+    p.has_direct_borders = direct_borders.is_some();
+    p.borders = borders;
+    p.tab_stops = tab_stops.unwrap_or_default();
+    p.effective_tab_stops_rel = tab_stops_rel;
+    p.heading_level = heading_level;
+    p.outline_lvl = outline_lvl;
+    p.literal_prefix_leading_tab_twips = literal_prefix_leading_tab_twips;
+    p.literal_prefix_trailing_tab_stop_twips = literal_prefix_trailing_tab_stop_twips;
+    p.paragraph_mark_marks = marks;
+    p.paragraph_mark_style_props = style_props;
+    p.paragraph_mark_rfonts = rfonts;
+    p.paragraph_mark_rpr_off = rpr_off;
+    p.text_direction = text_direction;
+    p.text_alignment = text_alignment;
+    p.mirror_indents = mirror_indents;
+    p.auto_space_de = auto_space_de;
+    p.auto_space_dn = auto_space_dn;
+    p.bidi = bidi;
+    p.suppress_auto_hyphens = suppress_auto_hyphens;
+    p.snap_to_grid = snap_to_grid;
+    p.overflow_punct = overflow_punct;
+    p.adjust_right_ind = adjust_right_ind;
+    p.word_wrap = word_wrap;
+    p.frame_pr = frame_pr;
+    p.cnf_style = cnf_style;
+    p.preserved_ppr = preserved;
 }
 
 /// Re-resolve every run in `p` against the paragraph's CURRENT `style_id`.
@@ -9759,113 +8657,6 @@ fn reresolve_paragraph_style_inherited_marks(
         )
         .expect(expect_ctx);
     }
-}
-
-/// Re-resolve the effective alignment after rejecting a pPrChange. The inner
-/// pPr stores only the previous direct `w:jc`; when it is absent, the paragraph
-/// must regain alignment from its restored/default style rather than collapsing
-/// to the raw absence.
-fn reresolve_paragraph_alignment(
-    paragraph: &mut ParagraphNode,
-    style_defs: &crate::styles::StyleDefinitions,
-) {
-    let style_id = paragraph
-        .style_id
-        .as_deref()
-        .or_else(|| style_defs.default_para_style_id());
-    let direct = paragraph
-        .has_direct_align
-        .then_some(paragraph.align.as_ref())
-        .flatten()
-        .map(crate::serialize::alignment_to_string);
-    paragraph.align = style_defs
-        .resolve_effective_alignment(style_id, direct)
-        .as_deref()
-        .map(|value| match value {
-            "left" | "start" => Alignment::Left,
-            "center" => Alignment::Center,
-            "right" | "end" => Alignment::Right,
-            "both" | "justify" => Alignment::Justify,
-            "distribute" => Alignment::Distribute,
-            "highKashida" => Alignment::HighKashida,
-            "lowKashida" => Alignment::LowKashida,
-            "mediumKashida" => Alignment::MediumKashida,
-            "numTab" => Alignment::NumTab,
-            "thaiDistribute" => Alignment::ThaiDistribute,
-            other => panic!("imported style table produced unknown alignment {other:?}"),
-        })
-        .or(Some(Alignment::Left));
-}
-
-/// Re-resolve effective numbering after rejecting a `w:pPrChange`.
-///
-/// The change record restores the previous DIRECT pPr. When its inner pPr has
-/// no `w:numPr`, numbering must fall through to the restored paragraph style
-/// (and then to §17.9.23's pStyle reverse binding), exactly as a fresh import
-/// does. Treating the direct absence as an effective absence makes an in-memory
-/// reject lose a label that returns as soon as the projection is saved and
-/// reopened.
-fn reresolve_paragraph_numbering(
-    paragraph: &mut ParagraphNode,
-    styles: &crate::styles::StyleDefinitions,
-    numbering_defs: Option<&crate::numbering::NumberingDefinitions>,
-) {
-    let Some(numbering_defs) = numbering_defs else {
-        // The public style-only projection entry point explicitly has no
-        // numbering table and therefore cannot construct NumberingInfo's
-        // presentation fields. Keep its documented degraded behavior.
-        return;
-    };
-
-    // An unmodeled direct numPr (for example, a dangling numId) remains in the
-    // preserved pPr. It still blocks style inheritance on a fresh import, so it
-    // must also block it here even though it cannot become typed NumberingInfo.
-    if paragraph
-        .preserved_ppr
-        .iter()
-        .any(|property| property.name == "numPr" || property.name == "w:numPr")
-    {
-        paragraph.numbering = None;
-        return;
-    }
-
-    let direct = if paragraph.numbering_suppressed {
-        crate::word_ir::DirectNumPr::Suppressed
-    } else if paragraph.has_direct_numbering {
-        let numbering = paragraph
-            .numbering
-            .as_ref()
-            .expect("direct numbering emission gate requires typed numbering");
-        crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps {
-            num_id: numbering.num_id,
-            ilvl: numbering.ilvl,
-        })
-    } else {
-        crate::word_ir::DirectNumPr::Absent
-    };
-
-    let mut effective = styles.resolve_effective_num_props(paragraph.style_id.as_deref(), &direct);
-    if effective.is_none()
-        && direct == crate::word_ir::DirectNumPr::Absent
-        && let Some(style_id) = paragraph.style_id.as_deref()
-        && let Some(&(num_id, ilvl)) = numbering_defs.build_pstyle_reverse_map().get(style_id)
-    {
-        effective = Some(crate::word_ir::NumProps { num_id, ilvl });
-    }
-
-    paragraph.numbering = effective.and_then(|num_props| {
-        let level = numbering_defs.get_level(num_props.num_id, num_props.ilvl)?;
-        Some(crate::domain::NumberingInfo {
-            num_id: num_props.num_id,
-            ilvl: num_props.ilvl,
-            // `project_blocks_for_accept_reject` replays the complete story in
-            // document order immediately after this paragraph pass and fills
-            // the exact counter-derived label.
-            synthesized_text: String::new(),
-            is_bullet: level.num_fmt == crate::numbering::NumFormat::Bullet,
-            restart_numbering: false,
-        })
-    });
 }
 
 /// Re-resolve effective paragraph spacing after projection: the spacing
@@ -10207,6 +8998,7 @@ pub(crate) fn reject_text_formatting(t: &mut crate::domain::TextNode) {
         previous_marks,
         previous_style_props,
         previous_rpr_authored,
+        carrier: _,
         revision_id: _,
         identity: _,
         author: _,
@@ -10217,24 +9009,41 @@ pub(crate) fn reject_text_formatting(t: &mut crate::domain::TextNode) {
     t.rpr_authored = previous_rpr_authored;
 }
 
-pub(crate) fn reject_table_formatting(t: &mut crate::domain::TableNode) {
-    let Some(fc) = t.formatting_change.take() else {
+pub(crate) fn reject_hard_break_formatting(hard_break: &mut crate::domain::HardBreakNode) {
+    let Some(fc) = hard_break.formatting_change.take() else {
         return;
     };
-    let crate::domain::TableFormattingChange {
-        previous_width,
-        previous_borders,
-        previous_default_cell_margins,
+    let crate::domain::FormattingChange {
+        previous_marks,
+        previous_style_props,
+        previous_rpr_authored,
+        carrier: _,
         revision_id: _,
         identity: _,
         author: _,
         date: _,
     } = fc;
-    t.formatting.width = previous_width;
-    t.formatting.borders = previous_borders;
-    t.formatting.default_cell_margins = previous_default_cell_margins;
+    hard_break.wrapper_marks = previous_marks;
+    hard_break.wrapper_style_props = previous_style_props;
+    hard_break.wrapper_rpr_authored = previous_rpr_authored;
 }
 
+#[doc(hidden)]
+pub(crate) fn reject_table_formatting(t: &mut crate::domain::TableNode) {
+    let Some(fc) = t.formatting_change.take() else {
+        return;
+    };
+    let crate::domain::TableFormattingChange {
+        previous,
+        revision_id: _,
+        identity: _,
+        author: _,
+        date: _,
+    } = fc;
+    t.formatting = previous;
+}
+
+#[doc(hidden)]
 pub(crate) fn reject_row_formatting(row: &mut crate::domain::TableRowNode) {
     let Some(fc) = row.formatting_change.take() else {
         return;
@@ -10242,6 +9051,7 @@ pub(crate) fn reject_row_formatting(row: &mut crate::domain::TableRowNode) {
     let crate::domain::RowFormattingChange {
         previous_height,
         previous_height_rule,
+        previous_cnf_style,
         revision_id: _,
         identity: _,
         author: _,
@@ -10249,8 +9059,18 @@ pub(crate) fn reject_row_formatting(row: &mut crate::domain::TableRowNode) {
     } = fc;
     row.height = previous_height;
     row.height_rule = previous_height_rule;
+    row.cnf_style = previous_cnf_style;
 }
 
+#[doc(hidden)]
+pub(crate) fn reject_table_property_exception_formatting(row: &mut crate::domain::TableRowNode) {
+    let Some(change) = row.tbl_pr_ex_change.take() else {
+        return;
+    };
+    row.tbl_pr_ex = change.previous;
+}
+
+#[doc(hidden)]
 pub(crate) fn reject_cell_formatting(cell: &mut crate::domain::TableCellNode) {
     let Some(fc) = cell.formatting_change.take() else {
         return;
@@ -10264,6 +9084,7 @@ pub(crate) fn reject_cell_formatting(cell: &mut crate::domain::TableCellNode) {
         previous_no_wrap,
         previous_text_direction,
         previous_tc_fit_text,
+        previous_cnf_style,
         revision_id: _,
         identity: _,
         author: _,
@@ -10277,11 +9098,13 @@ pub(crate) fn reject_cell_formatting(cell: &mut crate::domain::TableCellNode) {
     cell.formatting.no_wrap = previous_no_wrap;
     cell.formatting.text_direction = previous_text_direction;
     cell.formatting.tc_fit_text = previous_tc_fit_text;
+    cell.cnf_style = previous_cnf_style;
 }
 
 fn project_block_for_selected_resolution(
     block: &mut BlockNode,
     outer_tracking_resolved: bool,
+    resolves_enclosing_table_style: bool,
     action: ResolveSelectionAction,
     selected_revision_ids: &HashSet<u32>,
     interior_selected: &HashSet<u32>,
@@ -10298,10 +9121,12 @@ fn project_block_for_selected_resolution(
             // Snapshot the style so a selectively-rejected pPrChange that swaps
             // it triggers run re-resolution below, exactly like the full path.
             let style_before = p.style_id.clone();
-            let rejects_paragraph_formatting = action == ResolveSelectionAction::Reject
-                && p.formatting_change.as_ref().is_some_and(|change| {
+            let resolves_paragraph_formatting =
+                p.formatting_change.as_ref().is_some_and(|change| {
                     change.revision_id != 0 && selected_revision_ids.contains(&change.identity)
                 });
+            let rejects_paragraph_formatting =
+                action == ResolveSelectionAction::Reject && resolves_paragraph_formatting;
             p.segments.retain(|segment| {
                 selected_tracking_outcome(&segment.status, action, selected_revision_ids)
                     != SelectedTrackingOutcome::Drop
@@ -10346,8 +9171,10 @@ fn project_block_for_selected_resolution(
                 SelectedTrackingOutcome::KeepTracked => {}
             }
 
-            // Tracked formatting changes resolve by id too: the paragraph's
-            // pPrChange and each text node's rPrChange.
+            // Physical formatting changes resolve by id too: the paragraph's
+            // pPrChange and each text node's rPrChange. Effective run snapshots
+            // owned by a paragraph- or enclosing-table-style change resolve
+            // with that owning proposal below.
             if let Some(fc) = &p.formatting_change
                 && fc.revision_id != 0
                 && selected_revision_ids.contains(&fc.identity)
@@ -10392,17 +9219,64 @@ fn project_block_for_selected_resolution(
             // writes to, see the type-level docs on `HyperlinkData`) resolve by id
             // too, mirroring the full-projection handling in
             // `project_hyperlink_runs` so the two paths cannot diverge.
+            settle_inline_sdt_deletion_ranges(
+                p,
+                action == ResolveSelectionAction::Accept,
+                Some(interior_selected),
+            );
             for segment in &mut p.segments {
-                for inline in &mut segment.inlines {
+                segment.inlines.retain_mut(|inline| {
+                    let mut keep_inline = true;
                     match inline {
                         InlineNode::Text(t) => {
-                            if let Some(fc) = &t.formatting_change
-                                && fc.revision_id != 0
-                                && selected_revision_ids.contains(&fc.identity)
+                            let resolves = t.formatting_change.as_ref().is_some_and(|change| {
+                                match change.carrier {
+                                    crate::domain::RunFormattingChangeCarrier::RunProperties => {
+                                        change.revision_id != 0
+                                            && selected_revision_ids.contains(&change.identity)
+                                    }
+                                    crate::domain::RunFormattingChangeCarrier::ParagraphStyleCascade => {
+                                        resolves_paragraph_formatting
+                                    }
+                                    crate::domain::RunFormattingChangeCarrier::TableStyleCascade => {
+                                        resolves_enclosing_table_style
+                                    }
+                                }
+                            });
+                            if resolves
                             {
                                 match action {
                                     ResolveSelectionAction::Accept => t.formatting_change = None,
                                     ResolveSelectionAction::Reject => reject_text_formatting(t),
+                                }
+                            }
+                        }
+                        InlineNode::HardBreak(hard_break) => {
+                            let resolves = hard_break.formatting_change.as_ref().is_some_and(
+                                |change| {
+                                    match change.carrier {
+                                        crate::domain::RunFormattingChangeCarrier::RunProperties => {
+                                            change.revision_id != 0
+                                                && selected_revision_ids.contains(&change.identity)
+                                        }
+                                        crate::domain::RunFormattingChangeCarrier::ParagraphStyleCascade => {
+                                            resolves_paragraph_formatting
+                                        }
+                                        crate::domain::RunFormattingChangeCarrier::TableStyleCascade => {
+                                            resolves_enclosing_table_style
+                                        }
+                                    }
+                                },
+                            );
+                            if resolves
+                            {
+                                match action {
+                                    ResolveSelectionAction::Accept => {
+                                        hard_break.formatting_change = None;
+                                    }
+                                    ResolveSelectionAction::Reject => {
+                                        reject_hard_break_formatting(hard_break);
+                                    }
                                 }
                             }
                         }
@@ -10412,11 +9286,13 @@ fn project_block_for_selected_resolution(
                                     status_carries_selected_id(&run.status, selected_revision_ids)
                                 })
                             {
+                                let had_runs = !data.runs.is_empty();
                                 project_hyperlink_runs_for_selected_resolution(
                                     data,
                                     action,
                                     selected_revision_ids,
                                 );
+                                keep_inline = !(had_runs && data.runs.is_empty());
                                 // Same cache-invalidation rule as the full path
                                 // (`project_block_inner`): the opaque's raw_xml
                                 // cache is stale once `runs` changed under it.
@@ -10469,7 +9345,8 @@ fn project_block_for_selected_resolution(
                         }
                         _ => {}
                     }
-                }
+                    keep_inline
+                });
             }
 
             // A selectively-rejected paragraph-style change swaps `style_id`
@@ -10478,10 +9355,8 @@ fn project_block_for_selected_resolution(
             if let Some(style_defs) = defs.styles
                 && (rejects_paragraph_formatting || p.style_id != style_before)
             {
-                if rejects_paragraph_formatting {
-                    reresolve_paragraph_alignment(p, style_defs);
-                    reresolve_paragraph_numbering(p, style_defs, defs.numbering);
-                }
+                // Paragraph effective state comes from the rejected change's
+                // proof snapshot; only run-style inheritance is recomputed.
                 reresolve_paragraph_style_inherited_marks(p, style_defs);
             }
 
@@ -10498,12 +9373,15 @@ fn project_block_for_selected_resolution(
                 let restored_literal_prefix = normalize_paragraph_after_projection(
                     p, /*preserve_formatting_change=*/ false,
                 );
-                if rejects_paragraph_formatting || restored_literal_prefix {
+                if !rejects_paragraph_formatting && restored_literal_prefix {
                     reresolve_paragraph_indent(p, defs);
                 }
             }
         }
         BlockNode::Table(t) => {
+            let resolves_table_formatting = t.formatting_change.as_ref().is_some_and(|change| {
+                change.revision_id != 0 && selected_revision_ids.contains(&change.identity)
+            });
             if let Some(fc) = &t.formatting_change
                 && fc.revision_id != 0
                 && selected_revision_ids.contains(&fc.identity)
@@ -10542,6 +9420,17 @@ fn project_block_for_selected_resolution(
                     match action {
                         ResolveSelectionAction::Accept => row.formatting_change = None,
                         ResolveSelectionAction::Reject => reject_row_formatting(row),
+                    }
+                }
+                if let Some(fc) = &row.tbl_pr_ex_change
+                    && fc.revision_id != 0
+                    && selected_revision_ids.contains(&fc.identity)
+                {
+                    match action {
+                        ResolveSelectionAction::Accept => row.tbl_pr_ex_change = None,
+                        ResolveSelectionAction::Reject => {
+                            reject_table_property_exception_formatting(row)
+                        }
                     }
                 }
 
@@ -10604,6 +9493,7 @@ fn project_block_for_selected_resolution(
                         project_block_for_selected_resolution(
                             nested,
                             false,
+                            resolves_table_formatting,
                             action,
                             selected_revision_ids,
                             interior_selected,
@@ -10670,6 +9560,7 @@ fn project_blocks_for_selected_resolution(
         project_block_for_selected_resolution(
             &mut tb.block,
             outer_tracking_resolved,
+            false,
             action,
             selected_revision_ids,
             interior_selected,
@@ -11421,7 +10312,9 @@ pub fn cascaded_resolution_ids(
 /// trPrChange/tcPrChange, hyperlink run status, comment-story tracking
 /// status, and section-property changes (the body-level `w:sectPrChange`
 /// resolved in `resolve_selected_revisions`'s tail, and the mid-document
-/// paragraph-level sibling). Membership here is action-independent (matching
+/// paragraph-level sibling). A ParagraphStyleCascade run snapshot is excluded:
+/// it is proof state owned and resolved by the enclosing pPrChange, not a
+/// second physical revision. Membership here is action-independent (matching
 /// `selected_tracking_outcome`'s membership check, which is evaluated before
 /// the accept/reject branch), so "present here" and "the resolver will touch
 /// it" are the same fact.
@@ -11482,7 +10375,16 @@ fn body_resolvable_revision_ids(doc: &CanonDoc) -> HashSet<u32> {
             for inline in &segment.inlines {
                 match inline {
                     InlineNode::Text(t) => {
-                        if let Some(fc) = &t.formatting_change {
+                        if let Some(fc) = &t.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_formatting_change_id(fc.identity, out);
+                        }
+                    }
+                    InlineNode::HardBreak(hard_break) => {
+                        if let Some(fc) = &hard_break.formatting_change
+                            && fc.is_physical_revision()
+                        {
                             visit_formatting_change_id(fc.identity, out);
                         }
                     }
@@ -11524,6 +10426,9 @@ fn body_resolvable_revision_ids(doc: &CanonDoc) -> HashSet<u32> {
                 for row in &t.rows {
                     visit_optional_status(&row.tracking_status, out);
                     if let Some(fc) = &row.formatting_change {
+                        visit_formatting_change_id(fc.identity, out);
+                    }
+                    if let Some(fc) = &row.tbl_pr_ex_change {
                         visit_formatting_change_id(fc.identity, out);
                     }
                     for cell in &row.cells {
@@ -11648,6 +10553,7 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
     defs: ResolutionDefinitions<'_>,
 ) -> Result<Option<bool>, Vec<u32>> {
     let referenced_stories_before = section_referenced_part_paths(doc);
+    let referenced_comments_before = comment_reference_ids(doc);
     let resolvable = resolvable_revision_ids(doc);
     let mut unresolved: Vec<u32> = selected_revision_ids
         .difference(&resolvable)
@@ -11762,6 +10668,7 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
         );
         story_outcome != SelectedTrackingOutcome::Drop && !story.blocks.is_empty()
     });
+    prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     // Same orphan cleanup as accept_all/reject_all: a selective resolution
     // can empty a footnote/endnote story's blocks (e.g. resolving a tracked
     // InsertNote's story-body revision) with no story-level tracking field to
@@ -11901,8 +10808,7 @@ pub(crate) fn extract_block_text_for_hash(block: &BlockNode) -> String {
     }
 }
 
-/// One author's share of a document's PENDING revisions — the disclosure
-/// unit for compare's flatten contract (see `ViewResult::flattened_pending_revisions`).
+/// One author's share of a document's pending revisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingRevisionAuthor {
     /// `w:author` of the revisions; `None` when the markup carried none.
@@ -11915,8 +10821,7 @@ pub struct PendingRevisionAuthor {
     pub revision_count: u32,
 }
 
-/// Summarize the pending revisions a document carries, grouped by author —
-/// what an accept-all flattening (e.g. `view()` feeding compare) consumes.
+/// Summarize the pending revisions a document carries, grouped by author.
 /// Quarantined opaque blocks are excluded: the model preserves their raw
 /// bytes verbatim, revisions included, so nothing in them is consumed.
 pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
@@ -11963,7 +10868,16 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
                         for inline in &seg.inlines {
                             match inline {
                                 InlineNode::Text(t) => {
-                                    if let Some(fc) = &t.formatting_change {
+                                    if let Some(fc) = &t.formatting_change
+                                        && fc.is_physical_revision()
+                                    {
+                                        self.formatting_record(&fc.author);
+                                    }
+                                }
+                                InlineNode::HardBreak(hard_break) => {
+                                    if let Some(fc) = &hard_break.formatting_change
+                                        && fc.is_physical_revision()
+                                    {
                                         self.formatting_record(&fc.author);
                                     }
                                 }
@@ -11988,6 +10902,9 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
                             self.status(s);
                         }
                         if let Some(fc) = &row.formatting_change {
+                            self.formatting_record(&fc.author);
+                        }
+                        if let Some(fc) = &row.tbl_pr_ex_change {
                             self.formatting_record(&fc.author);
                         }
                         for cell in &row.cells {
@@ -12051,29 +10968,55 @@ pub fn accept_all(doc: &mut CanonDoc) {
 
 pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
     let referenced_stories_before = section_referenced_part_paths(doc);
+    let referenced_comments_before = comment_reference_ids(doc);
     // Accept keeps each paragraph's current style, but resolving inserted text
     // can restore a materialized literal prefix. That changes derived indent
     // and tab geometry and therefore needs the package definitions to match a
     // save/reopen projection.
-    project_blocks_for_accept_reject(&mut doc.blocks, true, defs);
+    project_blocks_for_accept_reject(&mut doc.blocks, true, defs, DerivedGeometryPolicy::Resolve);
     for story in &mut doc.headers {
-        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            true,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footers {
-        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            true,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            true,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.endnotes {
-        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            true,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.comments {
-        project_blocks_for_accept_reject(&mut story.blocks, true, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            true,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     // Remove comment stories whose blocks were all projected away, or that
@@ -12081,6 +11024,7 @@ pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     doc.comments.retain(|s| {
         !s.blocks.is_empty() && !matches!(s.tracking_status, Some(TrackingStatus::Deleted(_)))
     });
+    prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     // Same cleanup for footnote/endnote stories: a tracked `DeleteNote`
     // (accept) or an `InsertNote` (reject) can project a story's only block
     // away, leaving `blocks: []` with no comment-style story-level tracking
@@ -12105,26 +11049,33 @@ pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
 /// Accept/reject a body-level `w:sectPrChange` (§17.13.5.32) at the model layer.
 ///
 /// On accept (`keep_new = true`) the new `body_section_properties` are kept and
-/// the change record is dropped. On reject the previous `w:sectPr` recorded in
-/// `previous_properties_raw` is parsed back into `SectionProperties` and
-/// restored. This is the model-level counterpart to the byte-level
-/// accept/reject `normalize.rs` does on the serialized wrapper, so the
-/// reject-all == baseline / accept-all == target invariant holds on the IR too.
+/// the change record is dropped. On reject, Word interprets the previous
+/// `w:sectPr` RELATIVE to the current section: children present in the previous
+/// payload overlay the current state and omitted children keep their current
+/// values. This prevents in-memory proof from approving an absolute-snapshot
+/// carrier that native Word resolves differently.
 fn project_body_section_for_accept_reject(doc: &mut CanonDoc, keep_new: bool) {
     let Some(change) = doc.body_section_property_change.take() else {
         return;
     };
     if keep_new {
-        // Accept: keep doc.body_section_properties as-is; the change is gone.
+        // Word normalizes an explicit disabled titlePg carrier back to ordinary
+        // absence after resolving the section revision.
+        if let Some(current) = doc.body_section_properties.as_mut()
+            && current.title_page == Some(false)
+        {
+            current.title_page = None;
+        }
         return;
     }
-    // Reject: restore the previous section properties from the raw snapshot.
-    if let Some(prev) = parse_previous_section_properties(&change.previous_properties_raw) {
-        doc.body_section_properties = Some(prev);
-    }
-    // If the raw failed to parse we leave the current props in place rather than
-    // dropping the section entirely — but a sectPrChange we authored always
-    // round-trips, so this is a defensive branch, not an expected path.
+    let current = doc
+        .body_section_properties
+        .as_ref()
+        .expect("an authored body section-property change must have a current section");
+    let previous =
+        apply_previous_section_properties_relative(current, &change.previous_properties_raw)
+            .expect("an authored body section-property change must contain valid previous XML");
+    doc.body_section_properties = Some(previous);
 
     // Prune the BLANK, now-unreferenced header/footer stories whose creating
     // reference this reject just removed. `CreateHeader`/`CreateFooter` author a
@@ -12196,6 +11147,87 @@ pub(crate) fn prune_newly_unreferenced_stories(
         .retain(|story| !newly_unreferenced.contains(&story.part_name));
 }
 
+/// Remove comment definitions that have no surviving anchor anywhere in an
+/// active story. Comment insertion/deletion is represented on the wire by
+/// tracking its range markers and reference together with the anchored text;
+/// the `w:comment` definition itself cannot carry a story-level insertion or
+/// deletion marker. A terminal projection must therefore close the package
+/// graph explicitly after it resolves those anchors.
+fn comment_reference_ids(doc: &CanonDoc) -> HashSet<String> {
+    fn collect_block(block: &BlockNode, ids: &mut HashSet<String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &paragraph.segments {
+                    for inline in &segment.inlines {
+                        match inline {
+                            InlineNode::CommentRangeStart { id }
+                            | InlineNode::CommentRangeEnd { id }
+                            | InlineNode::CommentReference { id } => {
+                                ids.insert(id.clone());
+                            }
+                            InlineNode::OpaqueInline(opaque) => {
+                                if let OpaqueKind::CommentReference(reference) = &opaque.kind {
+                                    ids.insert(reference.reference_id.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for block in &cell.blocks {
+                            collect_block(block, ids);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+
+    fn collect_blocks(blocks: &[TrackedBlock], ids: &mut HashSet<String>) {
+        for tracked in blocks {
+            collect_block(&tracked.block, ids);
+        }
+    }
+
+    let mut referenced = HashSet::new();
+    collect_blocks(&doc.blocks, &mut referenced);
+    for story in &doc.headers {
+        collect_blocks(&story.blocks, &mut referenced);
+    }
+    for story in &doc.footers {
+        collect_blocks(&story.blocks, &mut referenced);
+    }
+    for story in &doc.footnotes {
+        collect_blocks(&story.blocks, &mut referenced);
+    }
+    for story in &doc.endnotes {
+        collect_blocks(&story.blocks, &mut referenced);
+    }
+    for story in &doc.comments {
+        collect_blocks(&story.blocks, &mut referenced);
+    }
+    referenced
+}
+
+/// Remove only comment definitions whose last anchor was removed by this
+/// projection. Pre-existing unanchored definitions are input state and remain
+/// untouched; treating them as newly-created garbage would make Accept/Reject
+/// silently destructive for documents that already contain such stories.
+fn prune_newly_unreferenced_comment_stories(
+    doc: &mut CanonDoc,
+    referenced_before: &HashSet<String>,
+) {
+    let referenced_after = comment_reference_ids(doc);
+    doc.comments.retain(|story| {
+        !referenced_before.contains(&story.id) || referenced_after.contains(&story.id)
+    });
+}
+
 /// Every header/footer part path referenced by the body section or by any
 /// paragraph-level (mid-document) section break.
 pub(crate) fn section_referenced_part_paths(doc: &CanonDoc) -> std::collections::HashSet<String> {
@@ -12255,6 +11287,107 @@ fn parse_previous_section_properties(raw: &[u8]) -> Option<SectionProperties> {
     let mut rel_lookup = std::collections::HashMap::new();
     collect_identity_story_rids(&el, &mut rel_lookup);
     Some(crate::word_ir::parse_section_properties(&el, &rel_lookup))
+}
+
+/// Apply Word's relative previous-section semantics at the typed model layer.
+///
+/// A child present in the previous CT_SectPrBase replaces the corresponding
+/// current property group. An absent child leaves the current group untouched.
+/// Header/footer references remain on the live outer sectPr and are never read
+/// from the previous payload.
+fn apply_previous_section_properties_relative(
+    current: &SectionProperties,
+    raw: &[u8],
+) -> Option<SectionProperties> {
+    let mut element = crate::word_xml::parse_raw_fragment(raw).ok()?;
+    // The serializer widens an empty previous sectPr to the explicit page
+    // geometry Word requires for the revision to exist at all. Project that
+    // same physical carrier here: keeping the raw empty model would leave the
+    // new page geometry active on Reject even though the bytes we emit restore
+    // Word's defaults.
+    crate::runtime::materialize_empty_sect_pr_snapshot(&mut element);
+    let materialized_raw = crate::word_xml::serialize_raw_fragment(&element);
+    let parsed = parse_previous_section_properties(&materialized_raw)?;
+    let has = |name: &str| {
+        element.children.iter().any(|child| {
+            matches!(child, xmltree::XMLNode::Element(child) if crate::word_xml::is_w_tag(child, name))
+        })
+    };
+    let mut result = current.clone();
+
+    if has("footnotePr") {
+        result.footnote_pr = parsed.footnote_pr;
+    }
+    if has("endnotePr") {
+        result.endnote_pr = parsed.endnote_pr;
+    }
+    if has("type") {
+        result.section_type = parsed.section_type;
+    }
+    if has("pgSz") {
+        result.page_width = parsed.page_width;
+        result.page_height = parsed.page_height;
+        result.orientation = parsed.orientation;
+        result.paper_size_code = parsed.paper_size_code;
+    }
+    if has("pgMar") {
+        result.margin_top = parsed.margin_top;
+        result.margin_bottom = parsed.margin_bottom;
+        result.margin_left = parsed.margin_left;
+        result.margin_right = parsed.margin_right;
+        result.header_distance = parsed.header_distance;
+        result.footer_distance = parsed.footer_distance;
+        result.gutter = parsed.gutter;
+    }
+    if has("paperSrc") {
+        result.paper_source = parsed.paper_source;
+    }
+    if has("pgBorders") {
+        result.page_borders = parsed.page_borders;
+    }
+    if has("lnNumType") {
+        result.line_numbering = parsed.line_numbering;
+    }
+    if has("pgNumType") {
+        result.page_number_type = parsed.page_number_type;
+    }
+    if has("cols") {
+        result.columns = parsed.columns;
+        result.column_space = parsed.column_space;
+        result.column_defs = parsed.column_defs;
+        result.column_separator = parsed.column_separator;
+        result.equal_width = parsed.equal_width;
+    }
+    if has("formProt") {
+        result.form_prot = parsed.form_prot;
+    }
+    if has("vAlign") {
+        result.v_align = parsed.v_align;
+    }
+    if has("noEndnote") {
+        result.no_endnote = parsed.no_endnote;
+    }
+    if has("titlePg") {
+        result.title_page = parsed.title_page.filter(|value| *value);
+    }
+    if has("textDirection") {
+        result.text_direction = parsed.text_direction;
+    }
+    if has("bidi") {
+        result.bidi = parsed.bidi;
+    }
+    if has("rtlGutter") {
+        result.rtl_gutter = parsed.rtl_gutter;
+    }
+    if has("docGrid") {
+        result.doc_grid_type = parsed.doc_grid_type;
+        result.doc_grid_line_pitch = parsed.doc_grid_line_pitch;
+        result.doc_grid_char_space = parsed.doc_grid_char_space;
+    }
+    if has("printerSettings") {
+        result.printer_settings_rid = parsed.printer_settings_rid;
+    }
+    Some(result)
 }
 
 /// Walk a raw `w:sectPr` element's `headerReference` / `footerReference` children
@@ -12325,18 +11458,34 @@ pub(crate) fn reject_all_with_style_defs(
 
 pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
     let referenced_stories_before = section_referenced_part_paths(doc);
-    project_blocks_for_accept_reject(&mut doc.blocks, false, defs);
+    let referenced_comments_before = comment_reference_ids(doc);
+    project_blocks_for_accept_reject(&mut doc.blocks, false, defs, DerivedGeometryPolicy::Resolve);
     for story in &mut doc.headers {
-        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            false,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footers {
-        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            false,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     for story in &mut doc.footnotes {
         let rejected_insert = note_story_insert_identity(&story.blocks).is_some();
-        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            false,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         if rejected_insert && !note_story_has_body_content(&story.blocks) {
             story.blocks.clear();
         }
@@ -12344,7 +11493,12 @@ pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     }
     for story in &mut doc.endnotes {
         let rejected_insert = note_story_insert_identity(&story.blocks).is_some();
-        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            false,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         if rejected_insert && !note_story_has_body_content(&story.blocks) {
             story.blocks.clear();
         }
@@ -12353,11 +11507,17 @@ pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     for story in &mut doc.comments {
         // On reject, clear story-level deletion tracking (keep the comment).
         story.tracking_status = None;
-        project_blocks_for_accept_reject(&mut story.blocks, false, defs);
+        project_blocks_for_accept_reject(
+            &mut story.blocks,
+            false,
+            defs,
+            DerivedGeometryPolicy::Resolve,
+        );
         story.content_hash = recompute_content_hash(&story.blocks);
     }
     // Remove comment stories whose blocks were all projected away.
     doc.comments.retain(|s| !s.blocks.is_empty());
+    prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     // Same cleanup for footnote/endnote stories (see accept_all's identical
     // retain for why an empty story must not survive resolution): a tracked
     // `InsertNote`, on reject, projects its Inserted story block away,
@@ -12418,13 +11578,11 @@ pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
 //  4. MARK-SUPPRESSION CONSISTENCY — a `para_mark_status == Some(Normal)`
 //     pilcrow suppression appears only on a shape that legitimately carries it:
 //     a tracked block (block-`Inserted`/`Deleted`) or a move half. Minted only
-//     by the tail normalizers (`normalize_inserted_final_mark`,
-//     `normalize_moved_final_mark`, `renormalize_final_mark_after_selective`).
+//     by the final-mark normalizers.
 //
 //  5. STACKED-STATE COHERENCE — `InsertedThenDeleted` is an inline/run state
 //     (a `w:del` nested in a `w:ins` on runs); it is never constructed at BLOCK
-//     level. Authoritative: `diff::project_tracked_document`'s
-//     `unreachable!("block-level stacked status is never constructed")`.
+//     level; the model validator rejects it there.
 //
 // # Narrowings made during calibration
 //
@@ -12585,7 +11743,8 @@ fn assert_resolution_body_invariants(doc: &CanonDoc) -> Result<(), Vec<Invariant
 /// costs a shipped build zero — the release check is the explicit
 /// `api::validate` surface.
 #[cfg(debug_assertions)]
-pub(crate) fn debug_assert_body_invariants(doc: &CanonDoc, producer: &str) {
+#[doc(hidden)]
+pub fn debug_assert_body_invariants(doc: &CanonDoc, producer: &str) {
     if let Err(violations) = assert_body_invariants(doc) {
         let rendered = violations
             .iter()
@@ -12598,7 +11757,8 @@ pub(crate) fn debug_assert_body_invariants(doc: &CanonDoc, producer: &str) {
 
 #[cfg(not(debug_assertions))]
 #[inline(always)]
-pub(crate) fn debug_assert_body_invariants(_doc: &CanonDoc, _producer: &str) {}
+#[doc(hidden)]
+pub fn debug_assert_body_invariants(_doc: &CanonDoc, _producer: &str) {}
 
 /// Resolution-scoped twin of [`debug_assert_body_invariants`]: the universal set
 /// PLUS the final-mark rule (see [`assert_resolution_body_invariants`]). Wired
@@ -12903,8 +12063,7 @@ fn check_mark_suppression(blocks: &[TrackedBlock], out: &mut Vec<InvariantViolat
 }
 
 /// Invariant 5: `InsertedThenDeleted` is inline/run-only and is never
-/// constructed at block level (see `diff::project_tracked_document`'s
-/// `unreachable!`).
+/// constructed at block level.
 fn check_stacked_state(blocks: &[TrackedBlock], out: &mut Vec<InvariantViolation>) {
     for tb in blocks {
         if matches!(tb.status, TrackingStatus::InsertedThenDeleted(_)) {
@@ -12922,18 +12081,16 @@ fn check_stacked_state(blocks: &[TrackedBlock], out: &mut Vec<InvariantViolation
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
 
     use super::*;
     use crate::domain::{
-        CompatSettings, DecorationNode, DecorationType, DocFingerprint, DocMeta, DocPart,
-        DocumentDiff, FieldData, FieldKind, HyperlinkData, HyperlinkRun, INTERNAL_IDS_VERSION_V0,
-        IStr, Mark, MaterializedPrefixKind, NumberingInfo, OpaqueInlineNode, OpaqueKind, ProofRef,
-        RevisionInfo, SCHEMA_VERSION_V0, StackedRevision, StyleProps, TextNode, TextRole,
-        TrackingStatus, is_materialized_prefix_text, materialized_prefix_node_id, normal_segment,
+        Alignment, CompatSettings, DocFingerprint, DocMeta, DocPart, FieldData, FieldKind,
+        HyperlinkData, HyperlinkRun, INTERNAL_IDS_VERSION_V0, IStr, Mark, MaterializedPrefixKind,
+        NumberingInfo, OpaqueInlineNode, OpaqueKind, ProofRef, RevisionInfo, SCHEMA_VERSION_V0,
+        StackedRevision, StyleProps, TextNode, TextRole, TrackingStatus,
+        is_materialized_prefix_text, materialized_prefix_node_id, normal_segment,
         normal_tracked_block,
     };
-    use crate::{DocxRuntime, SimpleRuntime};
 
     /// §17.13.5.37: rejecting a `w:tcPrChange` must restore the prior cell
     /// properties EXACTLY — including no-wrap, text-direction, and fit-text,
@@ -12966,6 +12123,7 @@ mod tests {
                 previous_no_wrap: Some(true),
                 previous_text_direction: Some(TextDirection::TbRl),
                 previous_tc_fit_text: Some(true),
+                previous_cnf_style: None,
                 revision_id: 7,
                 identity: 7,
                 author: "A".to_string(),
@@ -13006,7 +12164,6 @@ mod tests {
     /// restored (audit #17).
     #[test]
     fn reject_paragraph_formatting_restores_para_mark_and_literal_prefix_tabs() {
-        use crate::domain::ParagraphFormattingChange;
         let BlockNode::Paragraph(mut p) = make_paragraph("p1", "x") else {
             panic!("make_paragraph returns a paragraph");
         };
@@ -13014,45 +12171,21 @@ mod tests {
         p.paragraph_mark_marks = vec![];
         p.literal_prefix_leading_tab_twips = None;
         p.literal_prefix_trailing_tab_stop_twips = None;
-        p.formatting_change = Some(ParagraphFormattingChange {
-            previous_alignment: None,
-            previous_indentation: None,
-            previous_spacing: None,
-            previous_numbering: None,
-            previous_numbering_explicitly_absent: false,
-            previous_style_id: None,
-            previous_keep_next: None,
-            previous_keep_lines: None,
-            previous_page_break_before: false,
-            previous_widow_control: None,
-            previous_contextual_spacing: None,
-            previous_shading: None,
-            previous_borders: None,
-            previous_tab_stops: vec![],
-            previous_literal_prefix_leading_tab_twips: Some(720),
-            previous_literal_prefix_trailing_tab_stop_twips: Some(1440),
-            previous_paragraph_mark_marks: vec![Mark::Bold],
-            previous_paragraph_mark_style_props: StyleProps::default(),
-            previous_paragraph_mark_rfonts: Default::default(),
-            previous_paragraph_mark_rpr_off: Default::default(),
-            previous_text_direction: None,
-            previous_text_alignment: None,
-            previous_mirror_indents: None,
-            previous_auto_space_de: None,
-            previous_auto_space_dn: None,
-            previous_bidi: None,
-            previous_suppress_auto_hyphens: None,
-            previous_snap_to_grid: None,
-            previous_overflow_punct: None,
-            previous_adjust_right_ind: None,
-            previous_word_wrap: None,
-            previous_frame_pr: None,
-            previous_preserved_ppr: vec![],
+        let revision = RevisionInfo {
             revision_id: 3,
             identity: 3,
-            author: "A".to_string(),
+            author: Some("A".to_string()),
             date: None,
-        });
+            apply_op_id: None,
+        };
+        let mut change = crate::edit::snapshot_paragraph_formatting(&p, &revision);
+        change.previous.effective.literal_prefix_leading_tab_twips = Some(720);
+        change
+            .previous
+            .effective
+            .literal_prefix_trailing_tab_stop_twips = Some(1440);
+        change.previous.paragraph_mark.marks = vec![Mark::Bold];
+        p.formatting_change = Some(change);
         reject_paragraph_formatting(&mut p);
         assert_eq!(
             p.paragraph_mark_marks,
@@ -13090,13 +12223,13 @@ mod tests {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments: normal_segment(vec![InlineNode::from(TextNode {
@@ -13111,7 +12244,7 @@ mod tests {
             })]),
             block_text_hash: None,
             numbering: None,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -13155,6 +12288,57 @@ mod tests {
             cnf_style: None,
             preserved_ppr: Vec::new(),
         })
+    }
+
+    #[test]
+    fn standalone_story_projection_applies_both_terminal_resolutions() {
+        let inserted = RevisionInfo {
+            revision_id: 71,
+            identity: 71,
+            author: Some("author".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let blocks = vec![
+            TrackedBlock {
+                status: TrackingStatus::Normal,
+                block: make_paragraph("base", "base"),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+            TrackedBlock {
+                status: TrackingStatus::Inserted(inserted),
+                block: make_paragraph("inserted", "target"),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+        ];
+
+        let mut accepted = blocks.clone();
+        project_story_blocks_for_accept_reject(&mut accepted, ResolveSelectionAction::Accept);
+        assert_eq!(accepted.len(), 2);
+        assert!(
+            accepted
+                .iter()
+                .all(|block| block.status == TrackingStatus::Normal)
+        );
+
+        let mut rejected = blocks;
+        project_story_blocks_for_accept_reject(&mut rejected, ResolveSelectionAction::Reject);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].status, TrackingStatus::Normal);
+        assert!(matches!(
+            &rejected[0].block,
+            BlockNode::Paragraph(paragraph) if paragraph.id == NodeId::from("base")
+        ));
+    }
+
+    #[test]
+    fn standalone_empty_story_projection_stays_empty() {
+        let mut blocks = Vec::new();
+        project_story_blocks_for_accept_reject(&mut blocks, ResolveSelectionAction::Accept);
+        project_story_blocks_for_accept_reject(&mut blocks, ResolveSelectionAction::Reject);
+        assert!(blocks.is_empty());
     }
 
     fn make_field_inline(
@@ -13230,6 +12414,99 @@ mod tests {
         })
     }
 
+    #[test]
+    fn accept_all_removes_hyperlink_emptied_by_deleted_runs() {
+        let deleted = TrackingStatus::Deleted(RevisionInfo {
+            revision_id: 41,
+            identity: 41,
+            author: Some("AI".to_string()),
+            date: None,
+            apply_op_id: None,
+        });
+        let mut block = make_paragraph("p1", "");
+        let paragraph = match &mut block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        paragraph.segments = normal_segment(vec![make_hyperlink_inline(
+            "h1",
+            "https://example.com",
+            vec![HyperlinkRun {
+                text: "removed".to_string(),
+                rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
+                source_run_attrs: Vec::new(),
+                status: deleted,
+            }],
+        )]);
+
+        project_block_for_accept_reject(&mut block, true);
+
+        let BlockNode::Paragraph(paragraph) = block else {
+            unreachable!()
+        };
+        assert!(
+            paragraph
+                .segments
+                .iter()
+                .all(|segment| segment.inlines.is_empty()),
+            "accepting the deletion must remove the hyperlink envelope with its last run"
+        );
+    }
+
+    #[test]
+    fn accept_all_preserves_hyperlink_that_was_already_empty() {
+        let mut block = make_paragraph("p1", "");
+        let paragraph = match &mut block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        paragraph.segments = normal_segment(vec![make_hyperlink_inline(
+            "h1",
+            "https://example.com",
+            Vec::new(),
+        )]);
+
+        project_block_for_accept_reject(&mut block, true);
+
+        let BlockNode::Paragraph(paragraph) = block else {
+            unreachable!()
+        };
+        assert_eq!(paragraph.segments[0].inlines.len(), 1);
+    }
+
+    #[test]
+    fn accept_all_drops_emptied_terminal_paragraph_when_an_earlier_paragraph_survives() {
+        let deleted = TrackingStatus::Deleted(RevisionInfo {
+            revision_id: 52,
+            identity: 52,
+            author: Some("AI".to_string()),
+            date: None,
+            apply_op_id: None,
+        });
+        let first = make_paragraph("p1", "target");
+        let mut terminal = make_paragraph("p2", "");
+        let paragraph = match &mut terminal {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        paragraph.segments = vec![tracked_text_segment("p2_t1", "removed", deleted.clone())];
+        paragraph.para_mark_status = Some(deleted);
+        let mut doc = make_doc(vec![first, terminal]);
+
+        accept_all(&mut doc);
+
+        assert_eq!(doc.blocks.len(), 1);
+        let BlockNode::Paragraph(paragraph) = &doc.blocks[0].block else {
+            unreachable!()
+        };
+        assert_eq!(
+            extract_inlines_text(&paragraph.all_inlines_owned()),
+            "target"
+        );
+    }
+
     fn make_simple_field_inline(id: &str, instruction_text: &str, result_text: &str) -> InlineNode {
         InlineNode::from(OpaqueInlineNode {
             id: NodeId::from(id.to_string()),
@@ -13252,6 +12529,85 @@ mod tests {
             raw_xml: None,
             content_hash: Some(format!("field:{instruction_text}:{result_text}")),
         })
+    }
+
+    fn drawing_opaque(id: &str, content_hash: &str) -> OpaqueInlineNode {
+        OpaqueInlineNode {
+            id: NodeId::from(id),
+            kind: OpaqueKind::Drawing,
+            opaque_ref: format!("{id}:drawing"),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("p1"),
+                docx_anchor: id.to_string(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
+            raw_xml: Some(format!("<w:drawing id=\"{id}\"/>").into_bytes()),
+            content_hash: Some(content_hash.to_string()),
+        }
+    }
+
+    fn assert_drawing_replacement_is_insertion_first(inline_changes: Vec<InlineChange>) {
+        let revision = RevisionInfo {
+            revision_id: 0,
+            identity: 0,
+            author: Some("tester".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let mut rev_counter = 0;
+        let segments = inline_changes_to_segments_with_opaques(
+            &NodeId::from("p1"),
+            &inline_changes,
+            &revision,
+            &mut rev_counter,
+            &[drawing_opaque("base-drawing", "base-hash")],
+            &[drawing_opaque("target-drawing", "target-hash")],
+        )
+        .expect("drawing replacement materializes");
+
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(segments[0].status, TrackingStatus::Inserted(_)));
+        assert!(matches!(segments[1].status, TrackingStatus::Deleted(_)));
+        let opaque_id = |segment: &TrackedSegment| match &segment.inlines[0] {
+            InlineNode::OpaqueInline(opaque) => opaque.id.0.to_string(),
+            other => panic!("expected drawing opaque, got {other:?}"),
+        };
+        assert_eq!(opaque_id(&segments[0]), "target-drawing");
+        assert_eq!(opaque_id(&segments[1]), "base-drawing");
+    }
+
+    #[test]
+    fn explicit_drawing_replacement_materializes_target_before_source() {
+        assert_drawing_replacement_is_insertion_first(vec![InlineChange::Opaque {
+            segment_type: InlineChangeSegmentType::Equal,
+            kind: crate::domain::OpaqueSegmentKind::Drawing,
+            opaque_id: "drawing".to_string(),
+            inline_index: 0,
+            text: None,
+            reference_id: None,
+            field_kind: None,
+            field_instruction: None,
+            asset_ref: None,
+            asset_width_emu: None,
+            asset_height_emu: None,
+            alt_text: None,
+            url: None,
+            content_hash: None,
+        }]);
+    }
+
+    #[test]
+    fn placeholder_drawing_replacement_materializes_target_before_source() {
+        assert_drawing_replacement_is_insertion_first(vec![InlineChange::Unchanged {
+            text: "\u{FFFC}".to_string(),
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            formatting_change: None,
+        }]);
     }
 
     fn segment_debug(segments: &[TrackedSegment]) -> Vec<String> {
@@ -13409,146 +12765,6 @@ mod tests {
                 "I:text:\" is now in force\"".to_string(),
             ]
         );
-    }
-
-    /// Wrap a `<w:body>` inner fragment in a minimal, self-contained OPC
-    /// package. Hermetic: builds the bytes in-process so the daily gate never
-    /// depends on the gitignored corpus. Must NOT embed corpus content.
-    fn build_minimal_docx(body_inner: &str) -> Vec<u8> {
-        use std::io::Write;
-        use zip::write::FileOptions;
-
-        let document_xml = format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
-        );
-        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
-        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
-        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
-
-        let mut buf = Vec::new();
-        {
-            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            let opts: FileOptions = FileOptions::default();
-            zip.start_file("[Content_Types].xml", opts).unwrap();
-            zip.write_all(content_types.as_bytes()).unwrap();
-            zip.start_file("_rels/.rels", opts).unwrap();
-            zip.write_all(rels.as_bytes()).unwrap();
-            zip.start_file("word/_rels/document.xml.rels", opts)
-                .unwrap();
-            zip.write_all(doc_rels.as_bytes()).unwrap();
-            zip.start_file("word/document.xml", opts).unwrap();
-            zip.write_all(document_xml.as_bytes()).unwrap();
-            zip.finish().unwrap();
-        }
-        buf
-    }
-
-    #[test]
-    fn opaque_roundtrip_field_segments_are_canonical_in_merged_model() {
-        // Synthetic single-field fixture, built in-process so the daily gate is
-        // genuinely corpus-free. The before/after paragraphs share an identical
-        // `fldSimple DATE` opaque inline, surrounded by text that is fully
-        // replaced. The diff/merge pipeline must keep the shared field as a
-        // single Normal segment, delete the old surrounding text, and insert the
-        // new surrounding text — the canonical 5-segment field window.
-        let field =
-            r#"<w:fldSimple w:instr=" DATE "><w:r><w:t>January 15, 2025</w:t></w:r></w:fldSimple>"#;
-        let before_body = format!(
-            r#"<w:p><w:r><w:t xml:space="preserve">Contract dated </w:t></w:r>{field}<w:r><w:t xml:space="preserve"> is hereby executed</w:t></w:r></w:p>"#
-        );
-        let after_body = format!(
-            r#"<w:p><w:r><w:t xml:space="preserve">Agreement effective </w:t></w:r>{field}<w:r><w:t xml:space="preserve"> is now in force</w:t></w:r></w:p>"#
-        );
-        let before = build_minimal_docx(&before_body);
-        let after = build_minimal_docx(&after_body);
-        let runtime = SimpleRuntime::new();
-        let before_import = runtime.import_docx(&before).expect("import before");
-        let after_import = runtime.import_docx(&after).expect("import after");
-
-        let diff = crate::diff::diff_documents(&before_import.canonical, &after_import.canonical)
-            .expect("diff documents");
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("tester".to_string()),
-            date: None,
-            apply_op_id: None,
-        };
-        let merged = merge_diff(
-            &before_import.canonical,
-            &after_import.canonical,
-            &diff,
-            &revision,
-        )
-        .expect("merge diff")
-        .doc;
-
-        let paragraph = merged
-            .blocks
-            .iter()
-            .find_map(|tracked| match &tracked.block {
-                BlockNode::Paragraph(paragraph)
-                    if paragraph
-                        .segments
-                        .iter()
-                        .flat_map(|segment| segment.inlines.iter())
-                        .any(|inline| {
-                            matches!(
-                                inline,
-                                InlineNode::OpaqueInline(o)
-                                    if matches!(
-                                        o.kind,
-                                        OpaqueKind::Field(FieldData {
-                                            field_kind: FieldKind::Simple,
-                                            ..
-                                        })
-                                    )
-                            )
-                        }) =>
-                {
-                    Some(paragraph)
-                }
-                _ => None,
-            })
-            .expect("merged fldSimple paragraph");
-
-        let summary = segment_debug(&paragraph.segments);
-        // Canonical 5-segment field window:
-        //   0: deleted divergent leading text
-        //   1: inserted divergent leading text
-        //   2: the shared `fldSimple` stays Normal, carrying the common
-        //      surrounding whitespace the word-diff matched on both sides
-        //   3: deleted divergent trailing text
-        //   4: inserted divergent trailing text
-        // The load-bearing invariant is that the opaque field is preserved as a
-        // single Normal segment and is never split across delete/insert sides.
-        assert_eq!(
-            summary.len(),
-            5,
-            "expected canonical 5-segment field window: {summary:?}"
-        );
-        assert_eq!(summary[0], "D:text:\"Contract dated\"");
-        assert_eq!(summary[1], "I:text:\"Agreement effective\"");
-        assert!(
-            summary[2].starts_with("N:"),
-            "third segment should be Normal (shared content): {summary:?}"
-        );
-        assert!(
-            summary[2].contains("fldSimple:Some(\" DATE \"):Some(\"January 15, 2025\")"),
-            "third segment must carry the shared normal fldSimple intact: {summary:?}"
-        );
-        assert!(
-            !summary[0].contains("fldSimple")
-                && !summary[1].contains("fldSimple")
-                && !summary[3].contains("fldSimple")
-                && !summary[4].contains("fldSimple"),
-            "the opaque field must never leak onto a delete/insert segment: {summary:?}"
-        );
-        assert_eq!(summary[3], "D:text:\"hereby executed\"");
-        assert_eq!(summary[4], "I:text:\"now in force\"");
     }
 
     #[test]
@@ -13818,146 +13034,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn safe_footer_page_field_result_is_normalized_in_fixture_path() {
-        let before = fs::read("testdata/safe-us-vs-singapore/before.docx").expect("read before");
-        let after = fs::read("testdata/safe-us-vs-singapore/after.docx").expect("read after");
-        let runtime = SimpleRuntime::new();
-        let before_import = runtime.import_docx(&before).expect("import before");
-        let after_import = runtime.import_docx(&after).expect("import after");
-
-        let before_para = before_import
-            .canonical
-            .footers
-            .iter()
-            .find(|footer| footer.part_name == "footer1.xml")
-            .and_then(|footer| {
-                footer
-                    .blocks
-                    .iter()
-                    .find_map(|tracked| match &tracked.block {
-                        BlockNode::Paragraph(p) => Some(p),
-                        _ => None,
-                    })
-            })
-            .expect("before footer page-number paragraph");
-        let after_para = after_import
-            .canonical
-            .footers
-            .iter()
-            .find(|footer| footer.part_name == "footer1.xml")
-            .and_then(|footer| {
-                footer
-                    .blocks
-                    .iter()
-                    .find_map(|tracked| match &tracked.block {
-                        BlockNode::Paragraph(p) => Some(p),
-                        _ => None,
-                    })
-            })
-            .expect("after footer page-number paragraph");
-
-        let inline_changes = crate::diff::diff_block_content_with_marks(
-            &before_para.all_inlines_owned(),
-            &after_para.all_inlines_owned(),
-        );
-        let base_opaques = collect_opaques(&BlockNode::Paragraph(before_para.clone()));
-        let target_opaques = collect_opaques(&BlockNode::Paragraph(after_para.clone()));
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("tester".to_string()),
-            date: None,
-            apply_op_id: None,
-        };
-        let mut rev_counter = 2;
-        let segments = inline_changes_to_segments_with_opaques(
-            &before_para.id,
-            &inline_changes,
-            &revision,
-            &mut rev_counter,
-            &base_opaques,
-            &target_opaques,
-        )
-        .expect("segments");
-
-        let inserted_texts: Vec<String> = segments
-            .iter()
-            .filter(|segment| matches!(segment.status, TrackingStatus::Inserted(_)))
-            .flat_map(|segment| segment.inlines.iter())
-            .filter_map(|inline| match inline {
-                InlineNode::Text(text) => Some(text.text.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let repaired = coalesce_split_field_sequences(segments.clone());
-        let repaired_inserted_texts: Vec<String> = repaired
-            .iter()
-            .filter(|segment| matches!(segment.status, TrackingStatus::Inserted(_)))
-            .flat_map(|segment| segment.inlines.iter())
-            .filter_map(|inline| match inline {
-                InlineNode::Text(text) => Some(text.text.clone()),
-                _ => None,
-            })
-            .collect();
-        let flat_debug: Vec<String> = segments
-            .iter()
-            .flat_map(|segment| {
-                segment.inlines.iter().map(move |inline| match inline {
-                    InlineNode::Text(text) => format!("{:?}:text:{}", segment.status, text.text),
-                    InlineNode::OpaqueInline(opaque) => match &opaque.kind {
-                        OpaqueKind::Field(data) => format!(
-                            "{:?}:field:{:?}:{:?}",
-                            segment.status, data.field_kind, data.instruction_text
-                        ),
-                        _ => format!("{:?}:opaque", segment.status),
-                    },
-                    _ => format!("{:?}:other", segment.status),
-                })
-            })
-            .collect();
-        let flat_pairs: Vec<(InlineNode, TrackingStatus)> = segments
-            .iter()
-            .flat_map(|segment| {
-                segment
-                    .inlines
-                    .iter()
-                    .cloned()
-                    .map(move |inline| (inline, segment.status.clone()))
-            })
-            .collect();
-        let mut stack = Vec::new();
-        let mut field_ranges = Vec::new();
-        for (idx, (inline, _)) in flat_pairs.iter().enumerate() {
-            if let Some(kind) = inline_field_kind(inline) {
-                match kind {
-                    FieldKind::Begin => stack.push(idx),
-                    FieldKind::End => {
-                        if let Some(begin_idx) = stack.pop() {
-                            field_ranges.push((begin_idx, idx));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let range_debug: Vec<String> = field_ranges
-            .iter()
-            .map(|&(start, end)| {
-                format!(
-                    "{start}-{end}:auto={}",
-                    range_contains_auto_field_instruction(&flat_pairs, start, end)
-                )
-            })
-            .collect();
-
-        assert!(
-            !inserted_texts.iter().any(|text| text == "6"),
-            "auto PAGE field result should be normalized, got inserted texts {inserted_texts:?}; explicit coalesce => {repaired_inserted_texts:?}; flat={flat_debug:?}; ranges={range_debug:?}"
-        );
-    }
-
     fn make_doc(blocks: Vec<BlockNode>) -> CanonDoc {
         CanonDoc {
             id: NodeId::from("doc"),
@@ -14014,6 +13090,22 @@ mod tests {
         ParagraphNode::new_story_body(id, "x", None)
     }
 
+    #[test]
+    fn paragraph_cnf_style_change_refuses_unstable_word_lowering() {
+        let source = h2_para("source");
+        let mut target = h2_para("target");
+        target.cnf_style = Some(crate::domain::CnfStyle {
+            first_row: Some(true),
+            ..Default::default()
+        });
+
+        let error = refuse_unstable_cnf_style_change(&source, &target, "body")
+            .expect_err("Word cannot retain a distinct previous cnfStyle snapshot");
+        assert!(error.message.contains("no stable Word pPrChange encoding"));
+        assert!(error.context.contains("source paragraph source"));
+        assert!(error.context.contains("target paragraph target"));
+    }
+
     fn h2_cell(
         id: &str,
         blocks: Vec<BlockNode>,
@@ -14058,6 +13150,7 @@ mod tests {
             w_after: None,
             cnf_style: None,
             tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
             cell_spacing: None,
             preserved: Vec::new(),
         }
@@ -14071,6 +13164,59 @@ mod tests {
             formatting: crate::domain::TableFormatting::default(),
             formatting_change: None,
         })
+    }
+
+    /// A table has no block-level OOXML revision wrapper. Deleting the whole
+    /// block therefore has to materialize the deletion on every row and on the
+    /// content of every cell. The outer `TrackedBlock` status remains the
+    /// canonical-model tombstone used by Accept/Reject projection.
+    #[test]
+    fn whole_table_block_deletion_marks_rows_and_cell_content_deleted() {
+        let mut block = normal_tracked_block(h2_table(
+            "tbl",
+            vec![h2_row(
+                "row",
+                vec![h2_cell(
+                    "cell",
+                    vec![BlockNode::from(h2_para("cell_p"))],
+                    None,
+                )],
+                None,
+            )],
+        ));
+        let revision = h2_rev(1);
+        let mut rev_counter = 2;
+
+        mark_whole_block_deleted(&mut block, &revision, &mut rev_counter);
+
+        assert!(matches!(block.status, TrackingStatus::Deleted(_)));
+        let BlockNode::Table(table) = &block.block else {
+            panic!("expected table");
+        };
+        let row = &table.rows[0];
+        assert!(matches!(
+            row.tracking_status,
+            Some(TrackingStatus::Deleted(_))
+        ));
+        let cell = &row.cells[0];
+        assert_eq!(
+            cell.tracking_status, None,
+            "whole-row deletion must not emit independently resolvable cellDel markers"
+        );
+        let BlockNode::Paragraph(paragraph) = &cell.blocks[0] else {
+            panic!("expected cell paragraph");
+        };
+        assert_eq!(
+            paragraph.para_mark_status, None,
+            "the cell's final paragraph mark cannot be deleted across a cell boundary"
+        );
+        assert!(
+            paragraph
+                .segments
+                .iter()
+                .all(|segment| matches!(segment.status, TrackingStatus::Deleted(_))),
+            "all cell content must be tracked as deleted"
+        );
     }
 
     #[test]
@@ -14133,6 +13279,184 @@ mod tests {
             matches!(new_final.para_mark_status, Some(TrackingStatus::Normal)),
             "the new document-final pilcrow must be suppressed"
         );
+    }
+
+    #[test]
+    fn deleted_final_paragraph_tracks_its_hoisted_literal_prefix() {
+        let anchor = h2_para("anchor");
+        let mut deleted_final = h2_para("deleted_final");
+        deleted_final.literal_prefix = Some("14.11".to_string());
+        deleted_final.literal_prefix_leading_ws = "\t".to_string();
+        deleted_final.literal_prefix_trailing_ws = "\t".to_string();
+        let mut blocks = vec![
+            normal_tracked_block(BlockNode::from(anchor)),
+            TrackedBlock {
+                block: BlockNode::from(deleted_final),
+                status: TrackingStatus::Deleted(h2_rev(1)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+        ];
+        let mut next_revision_id = 2;
+
+        normalize_final_mark_attribution(&mut blocks, &h2_rev(1), &mut next_revision_id);
+
+        assert!(matches!(blocks[1].status, TrackingStatus::Normal));
+        let BlockNode::Paragraph(final_paragraph) = &blocks[1].block else {
+            panic!("final block remains a paragraph");
+        };
+        assert!(
+            final_paragraph.literal_prefix.is_none(),
+            "the hoisted label must move into the tracked body"
+        );
+        assert!(
+            final_paragraph
+                .segments
+                .iter()
+                .all(|segment| matches!(segment.status, TrackingStatus::Deleted(_))),
+            "every run in the lowered final-paragraph tombstone must be deleted"
+        );
+        let deleted_text = final_paragraph
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                InlineNode::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            deleted_text.contains("14.11"),
+            "the manual label must not outlive its deleted paragraph"
+        );
+    }
+
+    #[test]
+    fn deleted_source_tail_carries_accepted_final_properties_and_source_previous() {
+        let target_final = h2_para("target_final");
+        let mut source_final = h2_para("source_final");
+        let source_spacing = crate::domain::ParagraphSpacing {
+            before: None,
+            after: None,
+            before_lines: None,
+            after_lines: None,
+            before_autospacing: None,
+            after_autospacing: None,
+            line: Some(360),
+            line_rule: Some(crate::domain::LineSpacingRule::Auto),
+        };
+        source_final.spacing = Some(source_spacing.clone());
+        source_final.authored_spacing = Some(source_spacing.clone());
+        source_final.has_direct_spacing = true;
+
+        let mut blocks = vec![
+            TrackedBlock {
+                block: BlockNode::from(target_final),
+                status: TrackingStatus::Inserted(h2_rev(1)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+            TrackedBlock {
+                block: BlockNode::from(source_final),
+                status: TrackingStatus::Deleted(h2_rev(2)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+        ];
+        let mut next_revision_id = 3;
+
+        normalize_final_mark_attribution(&mut blocks, &h2_rev(1), &mut next_revision_id);
+
+        let BlockNode::Paragraph(physical_final) = &blocks[1].block else {
+            panic!("final block remains a paragraph");
+        };
+        assert_eq!(physical_final.authored_spacing, None);
+        assert_eq!(
+            physical_final
+                .formatting_change
+                .as_ref()
+                .and_then(|change| change.previous.direct.spacing.clone()),
+            Some(source_spacing.clone()),
+            "the source final pPr is the exact Reject snapshot"
+        );
+
+        let mut accepted = blocks.clone();
+        project_story_blocks_for_accept_reject(&mut accepted, ResolveSelectionAction::Accept);
+        assert_eq!(accepted.len(), 1);
+        let BlockNode::Paragraph(accepted_final) = &accepted[0].block else {
+            panic!("accepted terminal remains a paragraph");
+        };
+        assert_eq!(accepted_final.authored_spacing, None);
+
+        let mut rejected = blocks;
+        project_story_blocks_for_accept_reject(&mut rejected, ResolveSelectionAction::Reject);
+        assert_eq!(rejected.len(), 1);
+        let BlockNode::Paragraph(rejected_final) = &rejected[0].block else {
+            panic!("rejected terminal remains a paragraph");
+        };
+        assert_eq!(rejected_final.authored_spacing, Some(source_spacing));
+    }
+
+    #[test]
+    fn deleted_final_paragraph_anchors_across_a_table_that_accept_removes() {
+        let mut anchor = h2_para("anchor");
+        anchor.segments.clear();
+        let deleted_paragraph = h2_para("deleted_paragraph");
+        let deleted_table = h2_table(
+            "deleted_table",
+            vec![h2_row(
+                "deleted_row",
+                vec![h2_cell(
+                    "cell",
+                    vec![BlockNode::from(h2_para("cell_paragraph"))],
+                    None,
+                )],
+                Some(TrackingStatus::Deleted(h2_rev(3))),
+            )],
+        );
+        let mut deleted_final = h2_para("deleted_final");
+        deleted_final.segments.clear();
+        let mut blocks = vec![
+            normal_tracked_block(BlockNode::from(anchor)),
+            TrackedBlock {
+                block: BlockNode::from(deleted_paragraph),
+                status: TrackingStatus::Deleted(h2_rev(2)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+            normal_tracked_block(deleted_table),
+            TrackedBlock {
+                block: BlockNode::from(deleted_final),
+                status: TrackingStatus::Deleted(h2_rev(4)),
+                move_id: None,
+                block_sdt_wrap: None,
+            },
+        ];
+        let mut next_revision_id = 5;
+
+        normalize_final_mark_attribution(&mut blocks, &h2_rev(4), &mut next_revision_id);
+
+        let BlockNode::Paragraph(anchor) = &blocks[0].block else {
+            panic!("anchor must remain a paragraph");
+        };
+        assert!(
+            matches!(anchor.para_mark_status, Some(TrackingStatus::Deleted(_))),
+            "the surviving paragraph must own the break removed across the vanishing suffix"
+        );
+
+        let mut accepted = blocks.clone();
+        project_story_blocks_for_accept_reject(&mut accepted, ResolveSelectionAction::Accept);
+        assert_eq!(
+            accepted.len(),
+            1,
+            "Accept must collapse the deleted paragraph/table suffix into one final paragraph"
+        );
+        assert!(matches!(accepted[0].block, BlockNode::Paragraph(_)));
+
+        let mut rejected = blocks;
+        project_story_blocks_for_accept_reject(&mut rejected, ResolveSelectionAction::Reject);
+        assert_eq!(rejected.len(), 4, "Reject must restore the complete suffix");
+        assert!(matches!(rejected[2].block, BlockNode::Table(_)));
     }
 
     #[test]
@@ -14403,24 +13727,6 @@ mod tests {
             caught.is_err(),
             "debug_assert_body_invariants must panic on a violating doc"
         );
-    }
-
-    fn flatten_text(doc: &CanonDoc) -> String {
-        doc.blocks
-            .iter()
-            .flat_map(|tb| match &tb.block {
-                BlockNode::Paragraph(p) => p
-                    .all_inlines()
-                    .filter_map(|inline| match inline {
-                        InlineNode::Text(t) => Some(t.text.clone()),
-                        InlineNode::HardBreak(_) => Some("\n".to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("")
     }
 
     fn tracked_text_segment(id: &str, text: &str, status: TrackingStatus) -> TrackedSegment {
@@ -14805,6 +14111,54 @@ mod tests {
         assert_eq!(data.runs[0].status, TrackingStatus::Normal);
     }
 
+    #[test]
+    fn resolve_selected_revisions_removes_hyperlink_emptied_by_selected_run() {
+        let rev = RevisionInfo {
+            revision_id: 43,
+            identity: 43,
+            author: Some("AI".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let mut block = make_paragraph("p1", "");
+        let paragraph = match &mut block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        paragraph.segments = normal_segment(vec![make_hyperlink_inline(
+            "h1",
+            "https://example.com",
+            vec![HyperlinkRun {
+                text: "removed".to_string(),
+                rpr_xml: None,
+                additional_rpr_xml: Vec::new(),
+                source_xml: None,
+                source_run_attrs: Vec::new(),
+                status: TrackingStatus::Deleted(rev),
+            }],
+        )]);
+        let mut doc = make_doc(vec![block]);
+
+        resolve_selected_revisions_with_styles(
+            &mut doc,
+            &HashSet::from([43_u32]),
+            ResolveSelectionAction::Accept,
+            None,
+        )
+        .unwrap();
+
+        let BlockNode::Paragraph(paragraph) = &doc.blocks[0].block else {
+            unreachable!()
+        };
+        assert!(
+            paragraph
+                .segments
+                .iter()
+                .all(|segment| segment.inlines.is_empty()),
+            "selective acceptance must remove the hyperlink envelope with its last run"
+        );
+    }
+
     /// Reject counterpart: the deleted run is restored, the inserted run
     /// (and its markup) is dropped.
     #[test]
@@ -15000,7 +14354,7 @@ mod tests {
     /// hyperlink-run status, paragraph-mark status, row/cell tracking status,
     /// cell-interior content recursing into a nested table, EVERY story
     /// (header, footer, footnote, endnote, comment interior + whole-comment
-    /// status), and the body-level `w:sectPrChange`. Ids are 1..=24 and all
+    /// status), and the body-level `w:sectPrChange`. Ids are 1..=25 and all
     /// NONZERO on purpose — so `resolvable_revision_ids`'s `!= 0` sentinel skip
     /// can never mask a structural coverage difference between the walks.
     fn doc_with_every_revision_carrier() -> CanonDoc {
@@ -15038,6 +14392,7 @@ mod tests {
                     unreachable!()
                 };
                 t.formatting_change = Some(crate::domain::FormattingChange {
+                    carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                     previous_marks: vec![],
                     previous_style_props: StyleProps::default(),
                     previous_rpr_authored: crate::domain::RunRprAuthored::default(),
@@ -15073,51 +14428,18 @@ mod tests {
             .remove(0),
         ];
         top_para.para_mark_status = Some(TrackingStatus::Inserted(rev(7)));
-        top_para.formatting_change = Some(ParagraphFormattingChange {
-            previous_alignment: None,
-            previous_indentation: None,
-            previous_spacing: None,
-            previous_numbering: None,
-            previous_numbering_explicitly_absent: false,
-            previous_style_id: None,
-            previous_keep_next: None,
-            previous_keep_lines: None,
-            previous_page_break_before: false,
-            previous_widow_control: None,
-            previous_contextual_spacing: None,
-            previous_shading: None,
-            previous_borders: None,
-            previous_tab_stops: vec![],
-            previous_literal_prefix_leading_tab_twips: None,
-            previous_literal_prefix_trailing_tab_stop_twips: None,
-            previous_paragraph_mark_marks: vec![],
-            previous_paragraph_mark_style_props: StyleProps::default(),
-            previous_paragraph_mark_rfonts: Default::default(),
-            previous_paragraph_mark_rpr_off: Default::default(),
-            previous_text_direction: None,
-            previous_text_alignment: None,
-            previous_mirror_indents: None,
-            previous_auto_space_de: None,
-            previous_auto_space_dn: None,
-            previous_bidi: None,
-            previous_suppress_auto_hyphens: None,
-            previous_snap_to_grid: None,
-            previous_overflow_punct: None,
-            previous_adjust_right_ind: None,
-            previous_word_wrap: None,
-            previous_frame_pr: None,
-            previous_preserved_ppr: vec![],
-            revision_id: 8,
-            identity: 8,
-            author: "AI".to_string(),
-            date: None,
-        });
+        let formatting_revision = rev(8);
+        let mut formatting_change =
+            crate::edit::snapshot_paragraph_formatting(&top_para, &formatting_revision);
+        formatting_change.identity = 8;
+        top_para.formatting_change = Some(formatting_change);
 
         // --- A table exercising every table-level carrier, plus a nested
         // paragraph and a nested table inside a cell. ---
         use crate::domain::{
             CellFormatting, CellFormattingChange, RowFormattingChange, TableFormatting,
-            TableFormattingChange, TableNode, TableRowNode, VerticalMerge,
+            TableFormattingChange, TableNode, TablePropertyExceptionChange, TableRowNode,
+            VerticalMerge,
         };
 
         fn make_simple_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
@@ -15155,6 +14477,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }
@@ -15173,9 +14496,7 @@ mod tests {
             structure_hash: "nested-hash".to_string(),
             formatting: TableFormatting::default(),
             formatting_change: Some(TableFormattingChange {
-                previous_width: None,
-                previous_borders: None,
-                previous_default_cell_margins: None,
+                previous: TableFormatting::default(),
                 revision_id: 15,
                 identity: 15,
                 author: "AI".to_string(),
@@ -15212,6 +14533,7 @@ mod tests {
             previous_no_wrap: None,
             previous_text_direction: None,
             previous_tc_fit_text: None,
+            previous_cnf_style: None,
             revision_id: 13,
             identity: 13,
             author: "AI".to_string(),
@@ -15223,8 +14545,16 @@ mod tests {
         top_row.formatting_change = Some(RowFormattingChange {
             previous_height: None,
             previous_height_rule: None,
+            previous_cnf_style: None,
             revision_id: 11,
             identity: 11,
+            author: "AI".to_string(),
+            date: None,
+        });
+        top_row.tbl_pr_ex_change = Some(TablePropertyExceptionChange {
+            previous: None,
+            revision_id: 25,
+            identity: 25,
             author: "AI".to_string(),
             date: None,
         });
@@ -15235,9 +14565,7 @@ mod tests {
             structure_hash: "top-hash".to_string(),
             formatting: TableFormatting::default(),
             formatting_change: Some(TableFormattingChange {
-                previous_width: None,
-                previous_borders: None,
-                previous_default_cell_margins: None,
+                previous: TableFormatting::default(),
                 revision_id: 9,
                 identity: 9,
                 author: "AI".to_string(),
@@ -15394,7 +14722,7 @@ mod tests {
             .collect();
         let resolvable = resolvable_revision_ids(&doc);
 
-        let mut expected: HashSet<u32> = (1..=24).collect();
+        let mut expected: HashSet<u32> = (1..=25).collect();
         expected.insert(900); // the textbox interior insert — now resolvable
         assert_eq!(
             resolvable_enumerated, expected,
@@ -15959,6 +15287,7 @@ mod tests {
             unreachable!()
         };
         t.formatting_change = Some(crate::domain::FormattingChange {
+            carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
             previous_marks: vec![],
             previous_style_props: StyleProps::default(),
             previous_rpr_authored: crate::domain::RunRprAuthored::default(),
@@ -15986,69 +15315,275 @@ mod tests {
     }
 
     #[test]
-    fn merge_diff_marks_inline_insert_delete_segments() {
-        let base = make_doc(vec![make_paragraph("p1", "hello world")]);
-        let target = make_doc(vec![make_paragraph("p1", "hello brave world")]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello world".to_string(),
-                new_text: "hello brave world".to_string(),
-                inline_changes: vec![
-                    InlineChange::Unchanged {
-                        text: "hello ".to_string(),
-                        marks: vec![Mark::Bold],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Inserted {
-                        text: "brave ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: "world".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                ],
-                old_block: make_paragraph("p1", "hello world"),
-                new_block: make_paragraph("p1", "hello brave world"),
-                para_split: false,
-            }],
+    fn hard_break_run_formatting_is_selectively_resolvable() {
+        let source_marks = vec![Mark::Italic];
+        let target_marks = vec![Mark::Bold];
+        let style_props = StyleProps::default();
+        let hard_break = InlineNode::HardBreak(crate::domain::HardBreakNode {
+            id: NodeId::from("break"),
+            break_type: crate::domain::BreakType::TextWrapping,
+            type_is_explicit: false,
+            clear: None,
+            wrapper_marks: target_marks.clone(),
+            wrapper_style_props: style_props.clone(),
+            wrapper_rpr_authored: crate::domain::RunRprAuthored::from_effective(
+                &target_marks,
+                &style_props,
+            ),
+            source_run_attrs: Vec::new(),
+            formatting_change: Some(crate::domain::FormattingChange {
+                carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
+                previous_marks: source_marks.clone(),
+                previous_style_props: style_props.clone(),
+                previous_rpr_authored: crate::domain::RunRprAuthored::from_effective(
+                    &source_marks,
+                    &style_props,
+                ),
+                revision_id: 41,
+                identity: 41,
+                author: "AI".to_string(),
+                date: None,
+            }),
+            joins_following_text_run: false,
+        });
+        let mut paragraph = match make_paragraph("p1", "") {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
         };
+        paragraph.segments = normal_segment(vec![hard_break]);
+        let document = make_doc(vec![BlockNode::Paragraph(paragraph)]);
+
+        let mut accepted = document.clone();
+        resolve_selected_revisions_with_styles(
+            &mut accepted,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Accept,
+            None,
+        )
+        .expect("hard-break formatting revision is selectable");
+        let BlockNode::Paragraph(accepted_paragraph) = &accepted.blocks[0].block else {
+            unreachable!()
+        };
+        let InlineNode::HardBreak(accepted_break) = &accepted_paragraph.segments[0].inlines[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(accepted_break.wrapper_marks, target_marks);
+        assert!(accepted_break.formatting_change.is_none());
+
+        let mut rejected = document;
+        resolve_selected_revisions_with_styles(
+            &mut rejected,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Reject,
+            None,
+        )
+        .expect("hard-break formatting revision is selectively rejectable");
+        let BlockNode::Paragraph(rejected_paragraph) = &rejected.blocks[0].block else {
+            unreachable!()
+        };
+        let InlineNode::HardBreak(rejected_break) = &rejected_paragraph.segments[0].inlines[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(rejected_break.wrapper_marks, source_marks);
+        assert!(rejected_break.formatting_change.is_none());
+    }
+
+    #[test]
+    fn paragraph_style_cascade_resolves_only_with_its_paragraph_change() {
+        let source_marks = vec![Mark::Italic];
+        let target_marks = vec![Mark::Bold];
+        let mut source = match make_paragraph("p1", "styled") {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            _ => unreachable!(),
+        };
+        source.style_id = Some(IStr::from("SourceStyle"));
+        let InlineNode::Text(source_text) = &mut source.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        source_text.marks = source_marks.clone();
+
         let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2026-02-12T00:00:00Z".to_string()),
+            revision_id: 41,
+            identity: 41,
+            author: Some("AI".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let mut paragraph_change = crate::edit::snapshot_paragraph_formatting(&source, &revision);
+        paragraph_change.identity = 41;
+
+        let mut current = source;
+        current.style_id = Some(IStr::from("TargetStyle"));
+        current.formatting_change = Some(paragraph_change);
+        let InlineNode::Text(current_text) = &mut current.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        current_text.marks = target_marks.clone();
+        current_text.formatting_change = Some(crate::domain::FormattingChange {
+            carrier: crate::domain::RunFormattingChangeCarrier::ParagraphStyleCascade,
+            previous_marks: source_marks.clone(),
+            previous_style_props: StyleProps::default(),
+            previous_rpr_authored: crate::domain::RunRprAuthored::default(),
+            revision_id: 41,
+            identity: 0,
+            author: "AI".to_string(),
+            date: None,
+        });
+        let document = make_doc(vec![BlockNode::Paragraph(current)]);
+
+        let records = enumerate_revisions(&document);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, RevisionKind::FormatParagraph);
+        assert_eq!(resolvable_revision_ids(&document), HashSet::from([41]));
+
+        let mut accepted = document.clone();
+        resolve_selected_revisions_with_styles(
+            &mut accepted,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Accept,
+            None,
+        )
+        .expect("the paragraph change accepts its cascade-owned proof snapshot");
+        let BlockNode::Paragraph(accepted_paragraph) = &accepted.blocks[0].block else {
+            unreachable!()
+        };
+        let InlineNode::Text(accepted_text) = &accepted_paragraph.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        assert_eq!(accepted_paragraph.style_id.as_deref(), Some("TargetStyle"));
+        assert_eq!(accepted_text.marks, target_marks);
+        assert!(accepted_paragraph.formatting_change.is_none());
+        assert!(accepted_text.formatting_change.is_none());
+
+        let mut rejected = document;
+        resolve_selected_revisions_with_styles(
+            &mut rejected,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Reject,
+            None,
+        )
+        .expect("the paragraph change rejects its cascade-owned proof snapshot");
+        let BlockNode::Paragraph(rejected_paragraph) = &rejected.blocks[0].block else {
+            unreachable!()
+        };
+        let InlineNode::Text(rejected_text) = &rejected_paragraph.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        assert_eq!(rejected_paragraph.style_id.as_deref(), Some("SourceStyle"));
+        assert_eq!(rejected_text.marks, source_marks);
+        assert!(rejected_paragraph.formatting_change.is_none());
+        assert!(rejected_text.formatting_change.is_none());
+    }
+
+    #[test]
+    fn table_style_cascade_resolves_only_with_its_enclosing_table_change() {
+        let source_marks = vec![Mark::Italic];
+        let target_marks = vec![Mark::Bold];
+        let revision = RevisionInfo {
+            revision_id: 41,
+            identity: 41,
+            author: Some("AI".to_string()),
+            date: None,
             apply_op_id: None,
         };
 
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-        let paragraph = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
+        let mut source_table = match h2_table(
+            "table",
+            vec![h2_row(
+                "row",
+                vec![h2_cell("cell", vec![make_paragraph("p1", "styled")], None)],
+                None,
+            )],
+        ) {
+            BlockNode::Table(table) => table,
+            _ => unreachable!(),
         };
-        assert_eq!(paragraph.segments.len(), 3);
-        assert!(matches!(
-            paragraph.segments[1].status,
-            TrackingStatus::Inserted(_)
-        ));
+        source_table.formatting.style_id = Some(IStr::from("SourceTableStyle"));
+        let mut table_change = crate::edit::snapshot_table_formatting(&source_table, &revision);
+        table_change.identity = 41;
+
+        let mut current_table = source_table;
+        current_table.formatting.style_id = Some(IStr::from("TargetTableStyle"));
+        current_table.formatting_change = Some(table_change);
+        let BlockNode::Paragraph(paragraph) = &mut current_table.rows[0].cells[0].blocks[0] else {
+            unreachable!()
+        };
+        let InlineNode::Text(text) = &mut paragraph.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        text.marks = target_marks.clone();
+        text.formatting_change = Some(crate::domain::FormattingChange {
+            carrier: crate::domain::RunFormattingChangeCarrier::TableStyleCascade,
+            previous_marks: source_marks.clone(),
+            previous_style_props: StyleProps::default(),
+            previous_rpr_authored: crate::domain::RunRprAuthored::default(),
+            revision_id: 41,
+            identity: 0,
+            author: "AI".to_string(),
+            date: None,
+        });
+        let document = make_doc(vec![BlockNode::Table(current_table)]);
+
+        let records = enumerate_revisions(&document);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, RevisionKind::FormatTable);
+        assert_eq!(resolvable_revision_ids(&document), HashSet::from([41]));
+
+        let mut accepted = document.clone();
+        resolve_selected_revisions_with_styles(
+            &mut accepted,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Accept,
+            None,
+        )
+        .expect("the table change accepts its cascade-owned proof snapshot");
+        let BlockNode::Table(accepted_table) = &accepted.blocks[0].block else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(accepted_paragraph) = &accepted_table.rows[0].cells[0].blocks[0]
+        else {
+            unreachable!()
+        };
+        let InlineNode::Text(accepted_text) = &accepted_paragraph.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            accepted_table.formatting.style_id.as_deref(),
+            Some("TargetTableStyle")
+        );
+        assert_eq!(accepted_text.marks, target_marks);
+        assert!(accepted_table.formatting_change.is_none());
+        assert!(accepted_text.formatting_change.is_none());
+
+        let mut rejected = document;
+        resolve_selected_revisions_with_styles(
+            &mut rejected,
+            &HashSet::from([41]),
+            ResolveSelectionAction::Reject,
+            None,
+        )
+        .expect("the table change rejects its cascade-owned proof snapshot");
+        let BlockNode::Table(rejected_table) = &rejected.blocks[0].block else {
+            unreachable!()
+        };
+        let BlockNode::Paragraph(rejected_paragraph) = &rejected_table.rows[0].cells[0].blocks[0]
+        else {
+            unreachable!()
+        };
+        let InlineNode::Text(rejected_text) = &rejected_paragraph.segments[0].inlines[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            rejected_table.formatting.style_id.as_deref(),
+            Some("SourceTableStyle")
+        );
+        assert_eq!(rejected_text.marks, source_marks);
+        assert!(rejected_table.formatting_change.is_none());
+        assert!(rejected_text.formatting_change.is_none());
     }
 
-    /// A paragraph label may have shared its source run with the body before a
-    /// later edit wrapped that body in a tracked insertion. Rejecting an
-    /// inserted paragraph mark then moves the labeled paragraph into the
-    /// middle of its predecessor. The base label must become a separate Normal
-    /// run; it cannot cross into (or acquire) the body's tracked wrapper.
     #[test]
     fn paragraph_mark_merge_splits_prefix_source_run_before_tracked_body() {
         let BlockNode::Paragraph(mut donor) = make_paragraph("donor", "Left ") else {
@@ -16354,135 +15889,6 @@ mod tests {
     /// prefix therefore stays in its structural slot, including the imported
     /// source-run witness needed to reproduce its original w:r boundaries.
     #[test]
-    fn merge_identity_preserves_literal_prefix_source_runs() {
-        let mut paragraph = match make_paragraph("p1", "Body") {
-            BlockNode::Paragraph(paragraph) => paragraph,
-            _ => unreachable!(),
-        };
-        paragraph.literal_prefix = Some("2.1.1.".to_string());
-        paragraph.literal_prefix_trailing_ws = " ".to_string();
-        paragraph.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
-            marks: Vec::new(),
-            style_props: StyleProps::default(),
-            rpr_authored: crate::domain::RunRprAuthored::default(),
-            source_runs: vec![
-                crate::domain::LiteralPrefixSourceRun {
-                    text: "2.1.".to_string(),
-                    marks: Vec::new(),
-                    style_props: StyleProps::default(),
-                    rpr_authored: crate::domain::RunRprAuthored::default(),
-                    source_run_attrs: vec![("w:rsidR".to_string(), "00112233".to_string())],
-                    joins_body: false,
-                },
-                crate::domain::LiteralPrefixSourceRun {
-                    text: "1. ".to_string(),
-                    marks: Vec::new(),
-                    style_props: StyleProps::default(),
-                    rpr_authored: crate::domain::RunRprAuthored::default(),
-                    source_run_attrs: vec![("w:rsidRPr".to_string(), "00445566".to_string())],
-                    joins_body: false,
-                },
-            ],
-        }));
-        let base = make_doc(vec![BlockNode::Paragraph(paragraph.clone())]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: base.meta.docx_fingerprint.clone(),
-            changes: Vec::new(),
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2026-07-21T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &base, &diff, &revision)
-            .expect("identity merge")
-            .doc;
-        let actual = match &merged.blocks[0].block {
-            BlockNode::Paragraph(paragraph) => paragraph,
-            _ => panic!("expected paragraph"),
-        };
-
-        assert_eq!(actual, &paragraph);
-        assert!(
-            actual
-                .segments
-                .iter()
-                .flat_map(|segment| &segment.inlines)
-                .all(|inline| !matches!(
-                    inline,
-                    InlineNode::Text(text)
-                        if text.text_role
-                            == Some(TextRole::MaterializedPrefix(
-                                MaterializedPrefixKind::Structural,
-                            ))
-                )),
-            "identity merge must not synthesize a materialized-prefix text node"
-        );
-    }
-
-    #[test]
-    fn accept_reject_projection_roundtrip_text() {
-        let base = make_doc(vec![make_paragraph("p1", "hello world")]);
-        let target = make_doc(vec![make_paragraph("p1", "hello brave world")]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello world".to_string(),
-                new_text: "hello brave world".to_string(),
-                inline_changes: vec![
-                    InlineChange::Unchanged {
-                        text: "hello ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Inserted {
-                        text: "brave ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: "world".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                ],
-                old_block: make_paragraph("p1", "hello world"),
-                new_block: make_paragraph("p1", "hello brave world"),
-                para_split: false,
-            }],
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2026-02-12T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-
-        let mut accepted = merged.clone();
-        accept_all(&mut accepted);
-        assert_eq!(flatten_text(&accepted), "hello brave world");
-
-        let mut rejected = merged;
-        reject_all_with_styles(&mut rejected, None);
-        assert_eq!(flatten_text(&rejected), "hello world");
-    }
-
-    #[test]
     fn normalize_projection_promotes_decorated_materialized_literal_prefix() {
         let mut paragraph = match make_paragraph("p1", "hello world") {
             BlockNode::Paragraph(p) => p,
@@ -16616,7 +16022,13 @@ mod tests {
         ];
 
         let mut block = BlockNode::Paragraph(paragraph);
-        project_block_inner(&mut block, false, false, ResolutionDefinitions::NONE);
+        project_block_inner(
+            &mut block,
+            false,
+            false,
+            ResolutionDefinitions::NONE,
+            DerivedGeometryPolicy::Resolve,
+        );
         let BlockNode::Paragraph(projected) = block else {
             panic!("expected paragraph");
         };
@@ -16648,7 +16060,13 @@ mod tests {
             },
         ];
         let mut block = BlockNode::Paragraph(unrelated);
-        project_block_inner(&mut block, false, false, ResolutionDefinitions::NONE);
+        project_block_inner(
+            &mut block,
+            false,
+            false,
+            ResolutionDefinitions::NONE,
+            DerivedGeometryPolicy::Resolve,
+        );
         let BlockNode::Paragraph(projected) = block else {
             panic!("expected paragraph");
         };
@@ -16692,7 +16110,13 @@ mod tests {
         ];
 
         let mut block = BlockNode::Paragraph(paragraph);
-        project_block_inner(&mut block, true, false, ResolutionDefinitions::NONE);
+        project_block_inner(
+            &mut block,
+            true,
+            false,
+            ResolutionDefinitions::NONE,
+            DerivedGeometryPolicy::Resolve,
+        );
         let BlockNode::Paragraph(projected) = block else {
             panic!("expected paragraph");
         };
@@ -16900,6 +16324,7 @@ mod tests {
         let numbering = NumberingInfo {
             num_id: 7,
             ilvl: 0,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: "1.".to_string(),
             is_bullet: false,
             restart_numbering: false,
@@ -16959,1118 +16384,234 @@ mod tests {
         );
     }
 
-    #[test]
-    fn block_modified_materializes_deleted_structural_prefix_when_numbering_is_removed() {
-        let mut source = match make_paragraph("p1", "Instructions concerning specific positions") {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
+    fn historical_effective_ppr_witness() -> (
+        BlockNode,
+        crate::styles::StyleDefinitions,
+        crate::domain::PreviousParagraphProperties,
+    ) {
+        let BlockNode::Paragraph(mut previous) = make_paragraph("p1", "same") else {
+            panic!("make_paragraph returns a paragraph")
         };
-        source.style_id = Some(IStr::from("Numberedtitlelevel3"));
+        previous.style_id = Some(IStr::from("BaseStyle"));
+        previous.align = Some(Alignment::Center);
+        previous.has_direct_align = false;
+        previous.indent = Some(crate::domain::Indentation {
+            left: Some(888),
+            right: None,
+            effective_first_line_twips: None,
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+        previous.spacing = Some(crate::domain::ParagraphSpacing {
+            before: Some(999),
+            after: None,
+            before_lines: None,
+            after_lines: None,
+            before_autospacing: None,
+            after_autospacing: None,
+            line: None,
+            line_rule: None,
+        });
+        previous.widow_control = Some(false);
+        previous.contextual_spacing = Some(false);
+        previous.keep_next = Some(false);
+        previous.keep_lines = Some(false);
+        previous.has_direct_indent = false;
+        previous.authored_indent = None;
+        previous.has_direct_spacing = false;
+        previous.authored_spacing = None;
+        previous.has_direct_widow_control = false;
+        previous.has_direct_contextual_spacing = false;
+        previous.has_direct_keep_next = false;
+        previous.has_direct_keep_lines = false;
+
+        let revision = RevisionInfo {
+            revision_id: 71,
+            identity: 71,
+            author: Some("A".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let mut change = crate::edit::snapshot_paragraph_formatting(&previous, &revision);
+        change.identity = 71;
+        let expected = change.previous.clone();
+
+        let mut current = previous;
+        current.style_id = Some(IStr::from("CurrentStyle"));
+        current.align = Some(Alignment::Right);
+        current.indent.as_mut().expect("witness indent").left = Some(222);
+        current.spacing.as_mut().expect("witness spacing").before = Some(333);
+        current.widow_control = Some(true);
+        current.contextual_spacing = Some(true);
+        current.keep_next = Some(true);
+        current.keep_lines = Some(true);
+        current.formatting_change = Some(change);
+
+        let styles = crate::styles::StyleDefinitions::parse(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="BaseStyle">
+    <w:pPr>
+      <w:keepNext/><w:keepLines/><w:spacing w:before="120"/>
+      <w:ind w:left="120"/><w:contextualSpacing/><w:jc w:val="left"/><w:widowControl/>
+    </w:pPr>
+  </w:style>
+</w:styles>"#,
+        )
+        .expect("parse deliberately conflicting current style table");
+        (BlockNode::Paragraph(current), styles, expected)
+    }
+
+    fn assert_previous_effective_projection_restored(
+        block: &BlockNode,
+        expected: &crate::domain::PreviousParagraphProperties,
+    ) {
+        let BlockNode::Paragraph(paragraph) = block else {
+            panic!("witness remains a paragraph")
+        };
+        assert_eq!(paragraph.style_id, expected.direct.style_id);
+        assert_eq!(paragraph.align, expected.effective.alignment);
+        assert_eq!(paragraph.indent, expected.effective.indentation);
+        assert_eq!(paragraph.spacing, expected.effective.spacing);
+        assert_eq!(paragraph.widow_control, expected.effective.widow_control);
+        assert_eq!(
+            paragraph.contextual_spacing,
+            expected.effective.contextual_spacing
+        );
+        assert_eq!(paragraph.keep_next, expected.effective.keep_next);
+        assert_eq!(paragraph.keep_lines, expected.effective.keep_lines);
+        assert!(paragraph.formatting_change.is_none());
+    }
+
+    #[test]
+    fn full_reject_keeps_historical_effective_ppr_projection_authoritative() {
+        let (mut block, styles, expected) = historical_effective_ppr_witness();
+        project_block_inner(
+            &mut block,
+            false,
+            false,
+            ResolutionDefinitions::styles_only(Some(&styles)),
+            DerivedGeometryPolicy::Resolve,
+        );
+        assert_previous_effective_projection_restored(&block, &expected);
+    }
+
+    #[test]
+    fn selective_reject_keeps_historical_effective_ppr_projection_authoritative() {
+        let (mut block, styles, expected) = historical_effective_ppr_witness();
+        project_block_for_selected_resolution(
+            &mut block,
+            false,
+            false,
+            ResolveSelectionAction::Reject,
+            &HashSet::from([71]),
+            &HashSet::new(),
+            ResolutionDefinitions::styles_only(Some(&styles)),
+        );
+        assert_previous_effective_projection_restored(&block, &expected);
+    }
+
+    fn prior_numeric_change_witness(id: &str, identity: u32) -> BlockNode {
+        let BlockNode::Paragraph(mut source) = make_paragraph(id, "item") else {
+            unreachable!()
+        };
         source.numbering = Some(NumberingInfo {
-            num_id: 210,
+            num_id: 5,
             ilvl: 0,
-            synthesized_text: "(3)".to_string(),
+            resolution: crate::domain::NumberingResolution::Resolved,
+            // Import is allowed to leave this document-order derived view
+            // pending. Projection must fill it before returning a terminal.
+            synthesized_text: String::new(),
             is_bullet: false,
             restart_numbering: false,
         });
-        source.rendered_text = Some("(3)\tInstructions concerning specific positions".to_string());
-
-        let target = match make_paragraph("p1", "Instructions concerning specific positions") {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-        let inline_changes = crate::diff::diff_block_content_with_marks(
-            &source.all_inlines_owned(),
-            &target.all_inlines_owned(),
-        );
-
-        let mut blocks = vec![TrackedBlock {
-            status: TrackingStatus::Normal,
-            block: BlockNode::Paragraph(source),
-            move_id: None,
-            block_sdt_wrap: None,
-        }];
+        source.has_direct_numbering = true;
         let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("tester".to_string()),
-            date: Some("2026-04-10T00:00:00Z".to_string()),
+            revision_id: identity,
+            identity,
+            author: Some("author".to_string()),
+            date: None,
             apply_op_id: None,
         };
-        let mut rev_counter = 2;
+        let mut change = crate::edit::snapshot_paragraph_formatting(&source, &revision);
+        change.identity = identity;
 
-        apply_block_modified(
-            &mut blocks,
-            &NodeId::from("p1"),
-            &inline_changes,
-            &BlockNode::Paragraph(target),
-            &revision,
-            &mut rev_counter,
-            "test",
+        let mut current = source;
+        current.numbering = None;
+        current.has_direct_numbering = false;
+        current.formatting_change = Some(change);
+        BlockNode::Paragraph(current)
+    }
+
+    fn prior_numeric_definitions() -> crate::numbering::NumberingDefinitions {
+        crate::numbering::NumberingDefinitions::parse(
+            br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="5"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="5"/></w:num></w:numbering>"#,
         )
-        .expect("apply_block_modified");
+        .expect("numbering definitions")
+    }
 
-        let paragraph = match &blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        assert_eq!(paragraph.numbering, None);
-        assert_eq!(
-            paragraph
-                .formatting_change
-                .as_ref()
-                .and_then(|change| change.previous_numbering.as_ref())
-                .map(|numbering| numbering.synthesized_text.as_str()),
-            Some("(3)")
-        );
-        assert_eq!(
-            paragraph.segments.len(),
-            2,
-            "deleted prefix + unchanged body"
-        );
-        assert!(matches!(
-            paragraph.segments[0].status,
-            TrackingStatus::Deleted(_)
-        ));
-        let prefix_text = match &paragraph.segments[0].inlines[0] {
-            InlineNode::Text(text) => text,
-            other => panic!("expected prefix text, got {other:?}"),
-        };
-        assert_eq!(
-            prefix_text.text_role,
-            Some(TextRole::MaterializedPrefix(
-                MaterializedPrefixKind::StructuralDeleted
-            ))
-        );
-        assert_eq!(prefix_text.text, "(3) ");
-        assert!(matches!(
-            paragraph.segments[1].status,
-            TrackingStatus::Normal
-        ));
-        assert_eq!(
-            crate::table::extract_inlines_text(&paragraph.segments[1].inlines),
-            "Instructions concerning specific positions"
-        );
+    fn assert_projected_numeric_labels(document: &CanonDoc) {
+        let labels: Vec<&str> = document
+            .blocks
+            .iter()
+            .map(|tracked| {
+                let BlockNode::Paragraph(paragraph) = &tracked.block else {
+                    panic!("witness contains paragraphs")
+                };
+                paragraph
+                    .numbering
+                    .as_ref()
+                    .expect("reject restores numbering")
+                    .synthesized_text
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(labels, ["1.", "2."]);
     }
 
     #[test]
-    fn table_cells_modified_materializes_deleted_structural_prefix_when_numbering_is_removed() {
-        use crate::domain::{
-            CellFormatting, CellParagraphChange, TableCellChange, TableCellNode, TableFormatting,
-            TableNode, TableRowNode, VerticalMerge,
-        };
+    fn full_reject_derives_pending_previous_numeric_labels_in_document_order() {
+        let numbering = prior_numeric_definitions();
+        let mut document = make_doc(vec![
+            prior_numeric_change_witness("p1", 71),
+            prior_numeric_change_witness("p2", 72),
+        ]);
 
-        fn make_simple_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
-            TableCellNode {
-                id: NodeId::from(id.to_string()),
-                blocks,
-                grid_span: 1,
-                v_merge: VerticalMerge::None,
-                formatting: CellFormatting::default(),
-                formatting_change: None,
-                tracking_status: None,
-                row_sdt_wrapper: None,
-                content_sdt_wraps: Vec::new(),
-                cnf_style: None,
-                hide_mark: false,
-                preserved: Vec::new(),
-            }
-        }
-
-        let mut source = match make_paragraph("p1", "Instructions concerning specific positions") {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-        source.style_id = Some(IStr::from("Numberedtitlelevel3"));
-        source.numbering = Some(NumberingInfo {
-            num_id: 210,
-            ilvl: 0,
-            synthesized_text: "(3)".to_string(),
-            is_bullet: false,
-            restart_numbering: false,
-        });
-        source.rendered_text = Some("(3)\tInstructions concerning specific positions".to_string());
-
-        let mut target = match make_paragraph("p1", "Instructions concerning specific positions") {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-        target.style_id = Some(IStr::from("Numberedtitlelevel3"));
-
-        let inline_changes = crate::diff::diff_block_content_with_marks(
-            &source.all_inlines_owned(),
-            &target.all_inlines_owned(),
+        reject_all_with_definitions(
+            &mut document,
+            ResolutionDefinitions {
+                numbering: Some(&numbering),
+                ..ResolutionDefinitions::NONE
+            },
         );
 
-        let table = TableNode {
-            id: NodeId::from("tbl1"),
-            rows: vec![TableRowNode {
-                id: NodeId::from("tbl1_r0"),
-                cells: vec![make_simple_cell("c0", vec![BlockNode::Paragraph(source)])],
-                grid_before: 0,
-                grid_after: 0,
-                tracking_status: None,
-                is_header: false,
-                height: None,
-                height_rule: None,
-                formatting_change: None,
-                para_id: None,
-                text_id: None,
-                cant_split: false,
-                jc: None,
-                w_before: None,
-                w_after: None,
-                cnf_style: None,
-                tbl_pr_ex: None,
-                cell_spacing: None,
-                preserved: Vec::new(),
-            }],
-            structure_hash: "tbl-hash".to_string(),
-            formatting: TableFormatting::default(),
-            formatting_change: None,
-        };
+        assert_projected_numeric_labels(&document);
+    }
 
-        let mut blocks = vec![TrackedBlock {
-            status: TrackingStatus::Normal,
-            block: BlockNode::from(table),
-            move_id: None,
-            block_sdt_wrap: None,
-        }];
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("tester".to_string()),
-            date: Some("2026-04-10T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-        let mut rev_counter = 2;
+    #[test]
+    fn selective_reject_derives_pending_previous_numeric_labels_in_document_order() {
+        let numbering = prior_numeric_definitions();
+        let mut document = make_doc(vec![
+            prior_numeric_change_witness("p1", 71),
+            prior_numeric_change_witness("p2", 72),
+        ]);
 
-        apply_table_cells_modified(
-            &mut blocks,
-            &NodeId::from("tbl1"),
-            &[TableCellChange {
-                row_index: 0,
-                cell_index: 0,
-                paragraph_changes: vec![CellParagraphChange {
-                    block_index: 0,
-                    inline_changes,
-                    new_block: BlockNode::Paragraph(target),
-                }],
-                nested_table_diffs: vec![],
-                new_cell_formatting: None,
-            }],
-            &revision,
-            &mut rev_counter,
-            "test",
+        resolve_selected_revisions_with_definitions(
+            &mut document,
+            &HashSet::from([71, 72]),
+            ResolveSelectionAction::Reject,
+            ResolutionDefinitions {
+                numbering: Some(&numbering),
+                ..ResolutionDefinitions::NONE
+            },
         )
-        .expect("apply_table_cells_modified");
+        .expect("both formatting revisions resolve");
 
-        let paragraph = match &blocks[0].block {
-            BlockNode::Table(table) => match &table.rows[0].cells[0].blocks[0] {
-                BlockNode::Paragraph(p) => p,
-                _ => panic!("expected paragraph"),
-            },
-            _ => panic!("expected table"),
-        };
-
-        assert_eq!(paragraph.numbering, None);
-        assert_eq!(
-            paragraph
-                .formatting_change
-                .as_ref()
-                .and_then(|change| change.previous_numbering.as_ref())
-                .map(|numbering| numbering.synthesized_text.as_str()),
-            Some("(3)")
-        );
-        assert_eq!(
-            paragraph.segments.len(),
-            2,
-            "deleted prefix + unchanged body"
-        );
-        let prefix_text = match &paragraph.segments[0].inlines[0] {
-            InlineNode::Text(text) => text,
-            other => panic!("expected prefix text, got {other:?}"),
-        };
-        assert_eq!(
-            prefix_text.text_role,
-            Some(TextRole::MaterializedPrefix(
-                MaterializedPrefixKind::StructuralDeleted
-            ))
-        );
-        assert_eq!(prefix_text.text, "(3) ");
-        assert!(matches!(
-            paragraph.segments[1].status,
-            TrackingStatus::Normal
-        ));
-        assert_eq!(
-            crate::table::extract_inlines_text(&paragraph.segments[1].inlines),
-            "Instructions concerning specific positions"
-        );
+        assert_projected_numeric_labels(&document);
     }
 
-    #[test]
-    fn ppr_change_detected_on_alignment_change() {
-        use crate::domain::Alignment;
-
-        let mut base_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut base_para {
-            p.align = Some(Alignment::Left);
-            p.has_direct_align = true;
-        }
-        let mut target_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut target_para {
-            p.align = Some(Alignment::Center);
-            p.has_direct_align = true;
-        }
-
-        let base = make_doc(vec![base_para.clone()]);
-        let target = make_doc(vec![target_para.clone()]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello".to_string(),
-                new_text: "hello".to_string(),
-                inline_changes: vec![InlineChange::Unchanged {
-                    text: "hello".to_string(),
-                    marks: vec![],
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                }],
-                old_block: base_para,
-                new_block: target_para,
-                para_split: false,
-            }],
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test-author".to_string()),
-            date: Some("2026-02-28T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-        let para = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        // Paragraph should now have Center alignment
-        assert_eq!(para.align, Some(Alignment::Center));
-        // And a formatting_change recording the old Left alignment
-        let fc = para.formatting_change.as_ref().expect("expected pPrChange");
-        assert_eq!(fc.previous_alignment, Some(Alignment::Left));
-        assert_eq!(fc.previous_indentation, None);
-        assert_eq!(fc.previous_spacing, None);
-        assert_eq!(fc.author, "test-author");
-        assert_eq!(fc.date, Some("2026-02-28T00:00:00Z".to_string()));
-    }
-
-    #[test]
-    fn no_ppr_change_when_formatting_identical() {
-        use crate::domain::Alignment;
-
-        let mut base_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut base_para {
-            p.align = Some(Alignment::Left);
-        }
-        let mut target_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut target_para {
-            p.align = Some(Alignment::Left);
-        }
-
-        let base = make_doc(vec![base_para.clone()]);
-        let target = make_doc(vec![target_para.clone()]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello".to_string(),
-                new_text: "hello".to_string(),
-                inline_changes: vec![InlineChange::Unchanged {
-                    text: "hello".to_string(),
-                    marks: vec![],
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                }],
-                old_block: base_para,
-                new_block: target_para,
-                para_split: false,
-            }],
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test-author".to_string()),
-            date: Some("2026-02-28T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-        let para = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        // No formatting change when alignment is the same
-        assert!(para.formatting_change.is_none());
-    }
-
-    #[test]
-    fn ppr_change_detected_on_spacing_change() {
-        use crate::domain::ParagraphSpacing;
-
-        let mut base_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut base_para {
-            p.spacing = Some(ParagraphSpacing {
-                before: Some(240),
-                after: Some(120),
-                before_lines: None,
-                after_lines: None,
-                before_autospacing: None,
-                after_autospacing: None,
-                line: None,
-                line_rule: None,
-            });
-            p.has_direct_spacing = true;
-        }
-        let mut target_para = make_paragraph("p1", "hello");
-        if let BlockNode::Paragraph(p) = &mut target_para {
-            p.spacing = Some(ParagraphSpacing {
-                before: Some(480),
-                after: Some(120),
-                before_lines: None,
-                after_lines: None,
-                before_autospacing: None,
-                after_autospacing: None,
-                line: None,
-                line_rule: None,
-            });
-            p.has_direct_spacing = true;
-        }
-
-        let base = make_doc(vec![base_para.clone()]);
-        let target = make_doc(vec![target_para.clone()]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello".to_string(),
-                new_text: "hello".to_string(),
-                inline_changes: vec![InlineChange::Unchanged {
-                    text: "hello".to_string(),
-                    marks: vec![],
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                }],
-                old_block: base_para,
-                new_block: target_para,
-                para_split: false,
-            }],
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test-author".to_string()),
-            date: Some("2026-02-28T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-        let para = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        // Paragraph should now have the new spacing
-        assert_eq!(para.spacing.as_ref().unwrap().before, Some(480));
-        // And a formatting_change recording the old spacing
-        let fc = para.formatting_change.as_ref().expect("expected pPrChange");
-        assert_eq!(fc.previous_spacing.as_ref().unwrap().before, Some(240));
-        assert_eq!(fc.previous_alignment, None);
-        assert_eq!(fc.author, "test-author");
-    }
-
-    /// Bookmarks (Decoration nodes) must survive the diff/merge pipeline when
-    /// a paragraph's text is modified. The diff algorithm operates on text
-    /// and drops zero-width decorations; merge_diff must re-inject them.
-    #[test]
-    fn merge_diff_preserves_bookmark_decorations() {
-        // Build a base paragraph with a bookmark decoration alongside text.
-        let bookmark_raw = b"<w:bookmarkStart xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" w:id=\"5\" w:name=\"_Ref_Clause_4_2\"/>";
-        let bookmark_end_raw = b"<w:bookmarkEnd xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" w:id=\"5\"/>";
-        let bookmark_start = InlineNode::from(DecorationNode {
-            id: NodeId::from("p1_deco_1"),
-            kind: DecorationType::Bookmark,
-            opaque_ref: "paragraph:p1:deco:1".to_string(),
-            proof_ref: ProofRef {
-                part: DocPart::DocumentXml,
-                block_id: NodeId::from("p1_deco_1"),
-                docx_anchor: "paragraph:p1:deco:1".to_string(),
-            },
-            wrapper_marks: Vec::new(),
-            wrapper_style_props: StyleProps::default(),
-            joins_following_text_run: false,
-            raw_xml: Some(bookmark_raw.to_vec()),
-            origin: None,
-        });
-        let bookmark_end = InlineNode::from(DecorationNode {
-            id: NodeId::from("p1_deco_2"),
-            kind: DecorationType::Bookmark,
-            opaque_ref: "paragraph:p1:deco:2".to_string(),
-            proof_ref: ProofRef {
-                part: DocPart::DocumentXml,
-                block_id: NodeId::from("p1_deco_2"),
-                docx_anchor: "paragraph:p1:deco:2".to_string(),
-            },
-            wrapper_marks: Vec::new(),
-            wrapper_style_props: StyleProps::default(),
-            joins_following_text_run: false,
-            raw_xml: Some(bookmark_end_raw.to_vec()),
-            origin: None,
-        });
-
-        let base_para = BlockNode::from(ParagraphNode {
-            id: NodeId::from("p1"),
-            style_id: None,
-            align: None,
-            has_direct_align: false,
-            indent: None,
-            has_direct_indent: false,
-            authored_indent: None,
-            spacing: None,
-            has_direct_spacing: false,
-            authored_spacing: None,
-            borders: None,
-            keep_next: None,
-            keep_lines: None,
-            page_break_before: false,
-            widow_control: None,
-            contextual_spacing: None,
-            shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
-            tab_stops: vec![],
-            effective_tab_stops_rel: vec![],
-            segments: vec![TrackedSegment {
-                status: TrackingStatus::Normal,
-                inlines: vec![
-                    bookmark_start,
-                    InlineNode::from(TextNode {
-                        id: NodeId::from("p1_t1"),
-                        text_role: None,
-                        text: "hello world".to_string(),
-                        marks: Vec::new(),
-                        style_props: StyleProps::default(),
-                        rpr_authored: RunRprAuthored::default(),
-                        source_run_attrs: Vec::new(),
-                        formatting_change: None,
-                    }),
-                    bookmark_end,
-                ],
-            }],
-            block_text_hash: None,
-            numbering: None,
-            has_direct_numbering: true,
-            numbering_suppressed: false,
-            materialized_numbering: None,
-            rendered_text: None,
-            literal_prefix: None,
-            literal_prefix_marks: Vec::new(),
-            literal_prefix_style_props: crate::domain::StyleProps::default(),
-            literal_prefix_rpr_authored: crate::domain::RunRprAuthored::default(),
-            literal_prefix_leading_rpr: None,
-            literal_prefix_trailing_rpr: None,
-            literal_prefix_leading_tab_twips: None,
-            literal_prefix_leading_tab_count: 0,
-            literal_prefix_leading_ws: String::new(),
-            literal_prefix_trailing_ws: String::new(),
-            literal_prefix_has_trailing_tab: false,
-            literal_prefix_trailing_tab_stop_twips: None,
-            outline_lvl: None,
-            heading_level: None,
-            para_mark_status: None,
-            paragraph_mark_marks: vec![],
-            paragraph_mark_style_props: StyleProps::default(),
-            paragraph_mark_rfonts: Default::default(),
-            paragraph_mark_rpr_off: Default::default(),
-            para_split: false,
-            section_property_change: None,
-            formatting_change: None,
-            section_properties: None,
-            mirror_indents: None,
-            auto_space_de: None,
-            auto_space_dn: None,
-            bidi: None,
-            text_alignment: None,
-            suppress_auto_hyphens: None,
-            snap_to_grid: None,
-            overflow_punct: None,
-            adjust_right_ind: None,
-            word_wrap: None,
-            frame_pr: None,
-            para_id: None,
-            text_id: None,
-            text_direction: None,
-            cnf_style: None,
-            preserved_ppr: Vec::new(),
-        });
-
-        let base = make_doc(vec![base_para]);
-        let target = make_doc(vec![make_paragraph("p1", "hello brave world")]);
-
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "hello world".to_string(),
-                new_text: "hello brave world".to_string(),
-                inline_changes: vec![
-                    InlineChange::Unchanged {
-                        text: "hello ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Inserted {
-                        text: "brave ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: "world".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                ],
-                old_block: make_paragraph("p1", "hello world"),
-                new_block: make_paragraph("p1", "hello brave world"),
-                para_split: false,
-            }],
-        };
-
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2026-01-01T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-        let paragraph = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        // Count bookmark decorations in the merged paragraph.
-        let bookmark_count = paragraph
-            .all_inlines()
-            .filter(
-                |i| matches!(i, InlineNode::Decoration(d) if d.kind == DecorationType::Bookmark),
-            )
-            .count();
-
-        assert_eq!(
-            bookmark_count,
-            2,
-            "Both bookmarkStart and bookmarkEnd decorations must survive the diff/merge \
-             pipeline. Found {} bookmark decoration(s) in merged paragraph. \
-             Segments: {:?}",
-            bookmark_count,
-            paragraph
-                .segments
-                .iter()
-                .map(|s| s.inlines.len())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn merge_diff_tracks_nested_table_cell_changes() {
-        use crate::domain::{
-            CellFormatting, TableCellNode, TableFormatting, TableNode, TableRowNode, VerticalMerge,
-        };
-
-        fn make_simple_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
-            TableCellNode {
-                id: NodeId::from(id.to_string()),
-                blocks,
-                grid_span: 1,
-                v_merge: VerticalMerge::None,
-                formatting: CellFormatting::default(),
-                formatting_change: None,
-                tracking_status: None,
-                row_sdt_wrapper: None,
-                content_sdt_wraps: Vec::new(),
-                cnf_style: None,
-                hide_mark: false,
-                preserved: Vec::new(),
-            }
-        }
-
-        fn make_simple_table(id: &str, rows: Vec<Vec<TableCellNode>>) -> TableNode {
-            TableNode {
-                id: NodeId::from(id.to_string()),
-                rows: rows
-                    .into_iter()
-                    .enumerate()
-                    .map(|(r, cells)| TableRowNode {
-                        id: NodeId::from(format!("{id}_r{r}")),
-                        cells,
-                        grid_before: 0,
-                        grid_after: 0,
-                        tracking_status: None,
-                        is_header: false,
-                        height: None,
-                        height_rule: None,
-                        formatting_change: None,
-                        para_id: None,
-                        text_id: None,
-                        cant_split: false,
-                        jc: None,
-                        w_before: None,
-                        w_after: None,
-                        cnf_style: None,
-                        tbl_pr_ex: None,
-                        cell_spacing: None,
-                        preserved: Vec::new(),
-                    })
-                    .collect(),
-                structure_hash: "hash1".to_string(),
-                formatting: TableFormatting::default(),
-                formatting_change: None,
-            }
-        }
-
-        // Build inner table (base): 1 row, 1 cell with "old text"
-        let inner_base = make_simple_table(
-            "inner",
-            vec![vec![make_simple_cell(
-                "inner_c0",
-                vec![make_paragraph("inner_p0", "old text")],
-            )]],
-        );
-
-        // Build outer table (base): 1 row, 1 cell containing a paragraph + the inner table
-        let outer_base = make_simple_table(
-            "outer",
-            vec![vec![make_simple_cell(
-                "outer_c0",
-                vec![
-                    make_paragraph("outer_p0", "outer text"),
-                    BlockNode::from(inner_base),
-                ],
-            )]],
-        );
-
-        // Build inner table (target): same structure, different text
-        let inner_target = make_simple_table(
-            "inner",
-            vec![vec![make_simple_cell(
-                "inner_c0",
-                vec![make_paragraph("inner_p0", "new text")],
-            )]],
-        );
-
-        // Build outer table (target): same structure, same outer text
-        let outer_target = make_simple_table(
-            "outer",
-            vec![vec![make_simple_cell(
-                "outer_c0",
-                vec![
-                    make_paragraph("outer_p0", "outer text"),
-                    BlockNode::from(inner_target),
-                ],
-            )]],
-        );
-
-        let base = make_doc(vec![BlockNode::from(outer_base)]);
-        let target = make_doc(vec![BlockNode::from(outer_target)]);
-
-        let diff = crate::diff::diff_documents(&base, &target).expect("diff should succeed");
-
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2024-01-01T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge should succeed")
-            .doc;
-
-        // Find the outer table in the merged doc
-        let outer_table = match &merged.blocks[0].block {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected outer table"),
-        };
-
-        // Get the first cell of the outer table
-        let outer_cell = &outer_table.rows[0].cells[0];
-
-        // The second block should be the inner table
-        let inner_table = match &outer_cell.blocks[1] {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected inner table at block index 1"),
-        };
-
-        // Get the paragraph in the inner table's first cell
-        let inner_para = match &inner_table.rows[0].cells[0].blocks[0] {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph in inner table cell"),
-        };
-
-        // The inner paragraph should have tracked changes (not just old text unchanged)
-        let has_tracked_changes = inner_para.segments.iter().any(|s| {
-            matches!(
-                s.status,
-                TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_)
-            )
-        });
-
-        assert!(
-            has_tracked_changes,
-            "inner table paragraph should have tracked changes (ins/del segments), \
-             but found only: {:?}",
-            inner_para
-                .segments
-                .iter()
-                .map(|s| format!(
-                    "{:?}: {}",
-                    s.status,
-                    s.inlines
-                        .iter()
-                        .filter_map(|i| match i {
-                            InlineNode::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                ))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn merge_diff_generates_sect_pr_change_on_margin_change() {
-        use crate::domain::SectionProperties;
-
-        let base_sp = SectionProperties {
-            page_width: Some(12240),
-            page_height: Some(15840),
-            orientation: None,
-            columns: None,
-            column_space: None,
-            column_defs: Vec::new(),
-            margin_top: Some(1440),
-            margin_bottom: Some(1440),
-            margin_left: Some(1440),
-            margin_right: Some(1440),
-            header_distance: None,
-            footer_distance: None,
-            gutter: None,
-            rtl_gutter: None,
-            section_type: None,
-            page_borders: None,
-            line_numbering: None,
-            v_align: None,
-            text_direction: None,
-            page_number_type: None,
-            doc_grid_type: None,
-            doc_grid_line_pitch: None,
-            doc_grid_char_space: None,
-            title_page: None,
-            bidi: None,
-            form_prot: None,
-            no_endnote: None,
-            paper_size_code: None,
-            column_separator: None,
-            equal_width: None,
-            footnote_pr: None,
-            endnote_pr: None,
-            header_refs: Vec::new(),
-            footer_refs: Vec::new(),
-            paper_source: None,
-            printer_settings_rid: None,
-        };
-
-        let mut target_sp = base_sp.clone();
-        target_sp.margin_top = Some(720); // Changed from 1440 to 720
-
-        let mut base = make_doc(vec![make_paragraph("p1", "hello")]);
-        base.body_section_properties = Some(base_sp.clone());
-
-        let mut target = make_doc(vec![make_paragraph("p1", "hello")]);
-        target.body_section_properties = Some(target_sp.clone());
-
-        let diff = crate::diff::diff_documents(&base, &target).expect("diff should succeed");
-
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2024-01-01T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge should succeed")
-            .doc;
-
-        // The merged doc should have target's section properties
-        assert_eq!(
-            merged.body_section_properties,
-            Some(target_sp),
-            "merged doc should have target section properties"
-        );
-
-        // The merged doc should have a sectPrChange recording the base state
-        assert!(
-            merged.body_section_property_change.is_some(),
-            "merged doc should have body_section_property_change when margins differ"
-        );
-
-        let change = merged.body_section_property_change.unwrap();
-        assert_eq!(change.revision.author.as_deref(), Some("test"));
-        assert!(
-            !change.previous_properties_raw.is_empty(),
-            "previous_properties_raw should contain the base sectPr XML"
-        );
-    }
-
-    /// When a nested table has rows added/deleted (structure changed), the merge
-    /// should produce row-level tracking on the inner table AND accept_all should
-    /// produce output matching the target.
-    #[test]
-    fn nested_table_structure_changed_accept_all_projects_correctly() {
-        use crate::domain::{
-            CellFormatting, TableCellNode, TableFormatting, TableNode, TableRowNode, VerticalMerge,
-        };
-
-        fn make_simple_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
-            TableCellNode {
-                id: NodeId::from(id.to_string()),
-                blocks,
-                grid_span: 1,
-                v_merge: VerticalMerge::None,
-                formatting: CellFormatting::default(),
-                formatting_change: None,
-                tracking_status: None,
-                row_sdt_wrapper: None,
-                content_sdt_wraps: Vec::new(),
-                cnf_style: None,
-                hide_mark: false,
-                preserved: Vec::new(),
-            }
-        }
-
-        fn make_table(id: &str, rows: Vec<Vec<TableCellNode>>, hash: &str) -> TableNode {
-            TableNode {
-                id: NodeId::from(id.to_string()),
-                rows: rows
-                    .into_iter()
-                    .enumerate()
-                    .map(|(r, cells)| TableRowNode {
-                        id: NodeId::from(format!("{id}_r{r}")),
-                        cells,
-                        grid_before: 0,
-                        grid_after: 0,
-                        tracking_status: None,
-                        is_header: false,
-                        height: None,
-                        height_rule: None,
-                        formatting_change: None,
-                        para_id: None,
-                        text_id: None,
-                        cant_split: false,
-                        jc: None,
-                        w_before: None,
-                        w_after: None,
-                        cnf_style: None,
-                        tbl_pr_ex: None,
-                        cell_spacing: None,
-                        preserved: Vec::new(),
-                    })
-                    .collect(),
-                structure_hash: hash.to_string(),
-                formatting: TableFormatting::default(),
-                formatting_change: None,
-            }
-        }
-
-        // Base inner table: 2 rows ("row A", "row B")
-        let inner_base = make_table(
-            "inner",
-            vec![
-                vec![make_simple_cell(
-                    "ic0",
-                    vec![make_paragraph("ip0", "row A")],
-                )],
-                vec![make_simple_cell(
-                    "ic1",
-                    vec![make_paragraph("ip1", "row B")],
-                )],
-            ],
-            "inner_hash_2row",
-        );
-
-        // Target inner table: 3 rows ("row A", "row B changed", "row C" new)
-        let inner_target = make_table(
-            "inner",
-            vec![
-                vec![make_simple_cell(
-                    "ic0",
-                    vec![make_paragraph("ip0", "row A")],
-                )],
-                vec![make_simple_cell(
-                    "ic1",
-                    vec![make_paragraph("ip1", "row B changed")],
-                )],
-                vec![make_simple_cell(
-                    "ic2",
-                    vec![make_paragraph("ip2", "row C")],
-                )],
-            ],
-            "inner_hash_3row",
-        );
-
-        // Outer table (same structure, both base and target have 1 row x 1 cell)
-        let outer_base = make_table(
-            "outer",
-            vec![vec![make_simple_cell(
-                "oc0",
-                vec![
-                    make_paragraph("op0", "heading"),
-                    BlockNode::from(inner_base),
-                ],
-            )]],
-            "outer_hash",
-        );
-
-        let outer_target = make_table(
-            "outer",
-            vec![vec![make_simple_cell(
-                "oc0",
-                vec![
-                    make_paragraph("op0", "heading"),
-                    BlockNode::from(inner_target),
-                ],
-            )]],
-            "outer_hash",
-        );
-
-        let base = make_doc(vec![BlockNode::from(outer_base)]);
-        let target = make_doc(vec![BlockNode::from(outer_target)]);
-
-        let diff = crate::diff::diff_documents(&base, &target).expect("diff should succeed");
-
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2024-01-01T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge should succeed")
-            .doc;
-
-        // The merged inner table should have tracked changes (inserted/deleted rows
-        // or inline tracked segments within matched cells).
-        let outer_table = match &merged.blocks[0].block {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected outer table"),
-        };
-        let inner_table = match &outer_table.rows[0].cells[0].blocks[1] {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected inner table at block index 1"),
-        };
-
-        let has_any_tracking = inner_table.rows.iter().any(|r| {
-            r.tracking_status.is_some()
-                || r.cells.iter().any(|c| {
-                    c.blocks.iter().any(|b| {
-                        if let BlockNode::Paragraph(p) = b {
-                            p.segments.iter().any(|s| {
-                                matches!(
-                                    s.status,
-                                    TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_)
-                                )
-                            })
-                        } else {
-                            false
-                        }
-                    })
-                })
-        });
-        assert!(
-            has_any_tracking,
-            "merged inner table should have tracked changes"
-        );
-
-        // Accept-all should project the table correctly:
-        // - Keep inserted rows (clear tracking status)
-        // - Remove deleted rows
-        // - For matched rows with inline changes, keep inserted text and remove deleted
-        let mut accepted = merged.clone();
-        accept_all(&mut accepted);
-
-        let accepted_outer = match &accepted.blocks[0].block {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected outer table after accept_all"),
-        };
-        let accepted_inner = match &accepted_outer.rows[0].cells[0].blocks[1] {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected inner table after accept_all"),
-        };
-
-        // All rows should have None tracking status after accept.
-        for (i, row) in accepted_inner.rows.iter().enumerate() {
-            assert!(
-                row.tracking_status.is_none(),
-                "accepted row {i} should have no tracking_status, got: {:?}",
-                row.tracking_status
-            );
-            // Cell tracking status should also be cleared.
-            for (ci, cell) in row.cells.iter().enumerate() {
-                assert!(
-                    cell.tracking_status.is_none(),
-                    "accepted row {i} cell {ci} should have no tracking_status, got: {:?}",
-                    cell.tracking_status
-                );
-            }
-        }
-    }
-
-    /// OOXML §17.4.37: tables must have a non-zero number of rows.
-    /// When accept/reject drops all rows from a table, the table block
-    /// must be removed entirely rather than leaving a spec-invalid 0-row table.
     #[test]
     fn reject_all_removes_table_with_all_inserted_rows() {
         use crate::domain::{
@@ -18116,6 +16657,7 @@ mod tests {
             w_after: None,
             cnf_style: None,
             tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
             cell_spacing: None,
             preserved: Vec::new(),
         };
@@ -18158,399 +16700,6 @@ mod tests {
     /// A paragraph with 3+ inline changes must produce tracked segments with
     /// distinct revision IDs — no two tracked segments may share the same ID.
     #[test]
-    fn inline_changes_produce_unique_revision_ids() {
-        let base = make_doc(vec![make_paragraph(
-            "p1",
-            "The quick brown fox jumps over the lazy dog",
-        )]);
-        let target = make_doc(vec![make_paragraph(
-            "p1",
-            "The slow red fox leaps over the sleepy dog",
-        )]);
-
-        // "quick" deleted, "slow" inserted, "brown" deleted, "red" inserted,
-        // "jumps" deleted, "leaps" inserted, "lazy" deleted, "sleepy" inserted.
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![DiffChange::BlockModified {
-                block_id: NodeId::from("p1"),
-                old_text: "The quick brown fox jumps over the lazy dog".to_string(),
-                new_text: "The slow red fox leaps over the sleepy dog".to_string(),
-                inline_changes: vec![
-                    InlineChange::Unchanged {
-                        text: "The ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Deleted {
-                        text: "quick brown".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Inserted {
-                        text: "slow red".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: " fox ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Deleted {
-                        text: "jumps".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Inserted {
-                        text: "leaps".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: " over the ".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                    InlineChange::Deleted {
-                        text: "lazy".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Inserted {
-                        text: "sleepy".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                        rev_id: 0,
-                    },
-                    InlineChange::Unchanged {
-                        text: " dog".to_string(),
-                        marks: vec![],
-                        style_props: StyleProps::default(),
-                        formatting_change: None,
-                    },
-                ],
-                old_block: make_paragraph("p1", "The quick brown fox jumps over the lazy dog"),
-                new_block: make_paragraph("p1", "The slow red fox leaps over the sleepy dog"),
-                para_split: false,
-            }],
-        };
-
-        let revision = RevisionInfo {
-            revision_id: 100,
-            identity: 100,
-            author: Some("test-author".to_string()),
-            date: Some("2026-03-12T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge must succeed")
-            .doc;
-        let paragraph = match &merged.blocks[0].block {
-            BlockNode::Paragraph(p) => p,
-            _ => panic!("expected paragraph"),
-        };
-
-        // Collect revision IDs from all tracked (non-Normal) segments.
-        let tracked_rev_ids: Vec<u32> = paragraph
-            .segments
-            .iter()
-            .filter_map(|seg| match &seg.status {
-                TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => {
-                    Some(rev.revision_id)
-                }
-                TrackingStatus::InsertedThenDeleted(sr) => Some(sr.deleted.revision_id),
-                TrackingStatus::Normal => None,
-            })
-            .collect();
-
-        // We have 6 tracked changes (3 deletions + 3 insertions).
-        assert!(
-            tracked_rev_ids.len() >= 6,
-            "expected at least 6 tracked segments, got {}",
-            tracked_rev_ids.len()
-        );
-
-        // Every revision ID must be unique.
-        let unique: std::collections::HashSet<u32> = tracked_rev_ids.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            tracked_rev_ids.len(),
-            "revision IDs must be unique across tracked segments, but found duplicates: {:?}",
-            tracked_rev_ids
-        );
-    }
-
-    /// Regression: revision IDs must be unique across multiple
-    /// modified paragraphs in the same document, not just within a single
-    /// paragraph. Before the fix, each `apply_block_modified` call reset
-    /// its counter to `revision.revision_id`, causing collisions.
-    #[test]
-    fn revision_ids_unique_across_multiple_paragraphs() {
-        let base = make_doc(vec![
-            make_paragraph("p1", "hello world"),
-            make_paragraph("p2", "foo bar baz"),
-        ]);
-        let target = make_doc(vec![
-            make_paragraph("p1", "hello brave world"),
-            make_paragraph("p2", "foo quux baz"),
-        ]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![
-                DiffChange::BlockModified {
-                    block_id: NodeId::from("p1"),
-                    old_text: "hello world".to_string(),
-                    new_text: "hello brave world".to_string(),
-                    inline_changes: vec![
-                        InlineChange::Unchanged {
-                            text: "hello ".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                        InlineChange::Inserted {
-                            text: "brave ".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        },
-                        InlineChange::Unchanged {
-                            text: "world".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                    ],
-                    old_block: make_paragraph("p1", "hello world"),
-                    new_block: make_paragraph("p1", "hello brave world"),
-                    para_split: false,
-                },
-                DiffChange::BlockModified {
-                    block_id: NodeId::from("p2"),
-                    old_text: "foo bar baz".to_string(),
-                    new_text: "foo quux baz".to_string(),
-                    inline_changes: vec![
-                        InlineChange::Unchanged {
-                            text: "foo ".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                        InlineChange::Deleted {
-                            text: "bar".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        },
-                        InlineChange::Inserted {
-                            text: "quux".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        },
-                        InlineChange::Unchanged {
-                            text: " baz".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                    ],
-                    old_block: make_paragraph("p2", "foo bar baz"),
-                    new_block: make_paragraph("p2", "foo quux baz"),
-                    para_split: false,
-                },
-            ],
-        };
-        let revision = RevisionInfo {
-            revision_id: 10,
-            identity: 10,
-            author: Some("test".to_string()),
-            date: Some("2026-03-12T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-
-        // Collect all revision IDs from every tracked segment in every paragraph.
-        let mut all_rev_ids: Vec<u32> = Vec::new();
-        for tb in &merged.blocks {
-            if let BlockNode::Paragraph(p) = &tb.block {
-                // Block-level tracking status
-                if let TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) = &tb.status {
-                    all_rev_ids.push(rev.revision_id);
-                }
-                // Segment-level tracking status
-                for seg in &p.segments {
-                    if let TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) =
-                        &seg.status
-                    {
-                        all_rev_ids.push(rev.revision_id);
-                    }
-                }
-                // Para mark status
-                if let Some(TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev)) =
-                    &p.para_mark_status
-                {
-                    all_rev_ids.push(rev.revision_id);
-                }
-            }
-        }
-
-        // Should have at least 3 tracked changes (1 insert in p1 + 1 delete + 1 insert in p2).
-        assert!(
-            all_rev_ids.len() >= 3,
-            "expected at least 3 tracked changes, got {}",
-            all_rev_ids.len()
-        );
-
-        // Every revision ID must be unique across the entire document.
-        let unique: std::collections::HashSet<u32> = all_rev_ids.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            all_rev_ids.len(),
-            "revision IDs must be unique across all paragraphs, but found duplicates: {:?}",
-            all_rev_ids
-        );
-    }
-
-    /// Regression: revision IDs must be unique across block-level
-    /// deletions, insertions, and inline modifications in the same diff.
-    #[test]
-    fn revision_ids_unique_across_block_delete_insert_and_modify() {
-        let base = make_doc(vec![
-            make_paragraph("p1", "first paragraph"),
-            make_paragraph("p2", "second paragraph"),
-            make_paragraph("p3", "third paragraph"),
-        ]);
-        let target = make_doc(vec![
-            make_paragraph("p1", "first modified paragraph"),
-            // p2 is deleted
-            make_paragraph("p3", "third paragraph"),
-            make_paragraph("p4", "new fourth paragraph"),
-        ]);
-        let diff = DocumentDiff {
-            base_fingerprint: base.meta.docx_fingerprint.clone(),
-            target_fingerprint: target.meta.docx_fingerprint.clone(),
-            changes: vec![
-                DiffChange::BlockModified {
-                    block_id: NodeId::from("p1"),
-                    old_text: "first paragraph".to_string(),
-                    new_text: "first modified paragraph".to_string(),
-                    inline_changes: vec![
-                        InlineChange::Unchanged {
-                            text: "first ".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                        InlineChange::Inserted {
-                            text: "modified ".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        },
-                        InlineChange::Unchanged {
-                            text: "paragraph".to_string(),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                        },
-                    ],
-                    old_block: make_paragraph("p1", "first paragraph"),
-                    new_block: make_paragraph("p1", "first modified paragraph"),
-                    para_split: false,
-                },
-                DiffChange::BlockDeleted {
-                    block_id: NodeId::from("p2"),
-                    old_text: "second paragraph".to_string(),
-                    old_block: make_paragraph("p2", "second paragraph"),
-                    move_id: None,
-                },
-                DiffChange::BlockInserted {
-                    after_block_id: Some(NodeId::from("p3")),
-                    block: make_paragraph("p4", "new fourth paragraph"),
-                    move_id: None,
-                },
-            ],
-        };
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("test".to_string()),
-            date: Some("2026-03-12T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-
-        let merged = merge_diff(&base, &target, &diff, &revision)
-            .expect("merge")
-            .doc;
-
-        // Collect ALL revision IDs from the entire merged document.
-        let mut all_rev_ids: Vec<u32> = Vec::new();
-        for tb in &merged.blocks {
-            if let TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) = &tb.status {
-                all_rev_ids.push(rev.revision_id);
-            }
-            if let BlockNode::Paragraph(p) = &tb.block {
-                for seg in &p.segments {
-                    if let TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) =
-                        &seg.status
-                    {
-                        all_rev_ids.push(rev.revision_id);
-                    }
-                }
-                if let Some(TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev)) =
-                    &p.para_mark_status
-                {
-                    all_rev_ids.push(rev.revision_id);
-                }
-            }
-        }
-
-        // Should have at least 3: 1 inline insert in p1, block delete for p2
-        // (with para_mark), block insert for p4.
-        assert!(
-            all_rev_ids.len() >= 3,
-            "expected at least 3 tracked changes, got {} => {:?}",
-            all_rev_ids.len(),
-            all_rev_ids
-        );
-
-        // Every revision ID must be unique.
-        let unique: std::collections::HashSet<u32> = all_rev_ids.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            all_rev_ids.len(),
-            "revision IDs must be unique across block-level and inline changes, but found duplicates: {:?}",
-            all_rev_ids
-        );
-    }
-
-    #[test]
     fn block_fingerprint_differentiates_num_id() {
         // Two paragraphs with the same literal_prefix ("i.") but different num_id
         // must produce different fingerprints. Previously they collided because
@@ -18563,6 +16712,7 @@ mod tests {
         p1.numbering = Some(NumberingInfo {
             num_id: 1,
             ilvl: 0,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: "i.".to_string(),
             is_bullet: false,
             restart_numbering: false,
@@ -18576,6 +16726,7 @@ mod tests {
         p2.numbering = Some(NumberingInfo {
             num_id: 2,
             ilvl: 0,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: "i.".to_string(),
             is_bullet: false,
             restart_numbering: false,
@@ -18643,182 +16794,9 @@ mod tests {
     ///
     /// Regression for the edgar-ameren / edgar-nwpx fixpoint failures
     /// ("<w:vMerge/> continue ... has no preceding restart anchor").
-    #[test]
-    fn spec_structure_changed_matched_row_adopts_target_vmerge_anchor() {
-        use crate::domain::{
-            CellFormatting, TableCellNode, TableFormatting, TableRowNode, VerticalMerge,
-        };
-        use crate::table::canonicalize_table;
-
-        fn cell(id: &str, text: &str, v_merge: VerticalMerge) -> TableCellNode {
-            TableCellNode {
-                id: NodeId::from(id.to_string()),
-                blocks: vec![make_paragraph(&format!("{id}_p"), text)],
-                grid_span: 1,
-                v_merge,
-                formatting: CellFormatting::default(),
-                formatting_change: None,
-                tracking_status: None,
-                row_sdt_wrapper: None,
-                content_sdt_wraps: Vec::new(),
-                cnf_style: None,
-                hide_mark: false,
-                preserved: Vec::new(),
-            }
-        }
-
-        fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
-            TableRowNode {
-                id: NodeId::from(id.to_string()),
-                cells,
-                grid_before: 0,
-                grid_after: 0,
-                tracking_status: None,
-                is_header: false,
-                height: None,
-                height_rule: None,
-                formatting_change: None,
-                para_id: None,
-                text_id: None,
-                cant_split: false,
-                jc: None,
-                w_before: None,
-                w_after: None,
-                cnf_style: None,
-                tbl_pr_ex: None,
-                cell_spacing: None,
-                preserved: Vec::new(),
-            }
-        }
-
-        // Base: one row, single column, no vertical merge.
-        let base_table = TableNode {
-            id: NodeId::from("tbl_x"),
-            rows: vec![row("r0", vec![cell("b0", "Anchor", VerticalMerge::None)])],
-            structure_hash: "base".to_string(),
-            formatting: TableFormatting::default(),
-            formatting_change: None,
-        };
-
-        // Target: the matched row's cell becomes a restart anchor, and a new
-        // row below continues the vertical merge.
-        let target_table = TableNode {
-            id: NodeId::from("tbl_x"),
-            rows: vec![
-                row("r0", vec![cell("t0", "Anchor", VerticalMerge::Restart)]),
-                row("r1", vec![cell("t1", "", VerticalMerge::Continue)]),
-            ],
-            structure_hash: "target".to_string(),
-            formatting: TableFormatting::default(),
-            formatting_change: None,
-        };
-
-        let diff = TableDiffResult {
-            old_table: canonicalize_table(&base_table).expect("canon base"),
-            new_table: canonicalize_table(&target_table).expect("canon target"),
-            row_alignment: vec![
-                TableRowAlignment::Matched {
-                    old_row: 0,
-                    new_row: 0,
-                },
-                TableRowAlignment::Inserted { new_row: 1 },
-            ],
-            cell_diffs: Vec::new(),
-        };
-
-        let mut blocks = vec![TrackedBlock {
-            status: TrackingStatus::Normal,
-            block: BlockNode::from(base_table),
-            move_id: None,
-            block_sdt_wrap: None,
-        }];
-        let revision = RevisionInfo {
-            revision_id: 1,
-            identity: 1,
-            author: Some("tester".to_string()),
-            date: Some("2026-05-31T00:00:00Z".to_string()),
-            apply_op_id: None,
-        };
-        let mut rev_counter = 2;
-
-        apply_table_structure_changed(
-            &mut blocks,
-            &NodeId::from("tbl_x"),
-            &target_table,
-            &diff,
-            &revision,
-            &mut rev_counter,
-            "test",
-        )
-        .expect("structure change should apply");
-
-        let merged = match &blocks[0].block {
-            BlockNode::Table(t) => t,
-            _ => panic!("expected table"),
-        };
-
-        // The matched-row cell must carry the target's restart anchor.
-        assert_eq!(
-            merged.rows[0].cells[0].v_merge,
-            VerticalMerge::Restart,
-            "matched row cell must adopt target vMerge=restart anchor"
-        );
-        assert_eq!(
-            merged.rows[1].cells[0].v_merge,
-            VerticalMerge::Continue,
-            "inserted row cell keeps target vMerge=continue"
-        );
-
-        // And the merged table must canonicalize without an orphan-continue error.
-        canonicalize_table(merged).expect("merged table must have a valid vMerge grid");
-    }
-
-    // ─── RFC-0004 §H7: engine-minted revision identity ───────────────────────
-
-    /// A pre-identity paragraph formatting change (pPrChange) carrying the given
-    /// wire id, all "previous" fields empty — the minimal witness of a
-    /// `w:pPrChange` carrier for the collision test. `identity: 0` so the import
-    /// mint walk assigns its real identity.
     fn h7_bare_ppr_change(wire_id: u32, author: &str) -> crate::domain::ParagraphFormattingChange {
-        crate::domain::ParagraphFormattingChange {
-            previous_alignment: None,
-            previous_indentation: None,
-            previous_spacing: None,
-            previous_numbering: None,
-            previous_numbering_explicitly_absent: false,
-            previous_style_id: None,
-            previous_keep_next: None,
-            previous_keep_lines: None,
-            previous_page_break_before: false,
-            previous_widow_control: None,
-            previous_contextual_spacing: None,
-            previous_shading: None,
-            previous_borders: None,
-            previous_tab_stops: vec![],
-            previous_literal_prefix_leading_tab_twips: None,
-            previous_literal_prefix_trailing_tab_stop_twips: None,
-            previous_paragraph_mark_marks: vec![],
-            previous_paragraph_mark_style_props: StyleProps::default(),
-            previous_paragraph_mark_rfonts: Default::default(),
-            previous_paragraph_mark_rpr_off: Default::default(),
-            previous_text_direction: None,
-            previous_text_alignment: None,
-            previous_mirror_indents: None,
-            previous_auto_space_de: None,
-            previous_auto_space_dn: None,
-            previous_bidi: None,
-            previous_suppress_auto_hyphens: None,
-            previous_snap_to_grid: None,
-            previous_overflow_punct: None,
-            previous_adjust_right_ind: None,
-            previous_word_wrap: None,
-            previous_frame_pr: None,
-            previous_preserved_ppr: vec![],
-            revision_id: wire_id,
-            identity: 0,
-            author: author.to_string(),
-            date: None,
-        }
+        let paragraph = h7_para_block("ppr_snapshot", "");
+        crate::edit::snapshot_paragraph_formatting(&paragraph, &h7_rev(wire_id, author))
     }
 
     fn h7_rev(wire_id: u32, author: &str) -> RevisionInfo {

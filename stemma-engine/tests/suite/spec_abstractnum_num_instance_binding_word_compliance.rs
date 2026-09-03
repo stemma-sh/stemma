@@ -21,6 +21,7 @@
 use std::io::Read;
 
 use stemma::api::{Document, validate};
+use stemma::{BlockNode, NumberingResolution};
 
 // ─── Prelude: minimal-DOCX plumbing ─────────────────────────────────────────
 
@@ -326,34 +327,27 @@ fn numid_instance_id_over_32_chars_word_will_not_load() {
 #[test]
 fn abstractnum_not_directly_referenceable_by_content() {
     // numId=7 matches only an abstractNumId=7, with NO num instance carrying
-    // numId=7. The reference is dangling; no marker is synthesized, so accept
-    // and reject text are both exactly the body run text.
+    // numId=7. The reference is unresolved. Word preserves this authored
+    // paragraph-property state without displaying a numbering label, so the
+    // canonical model must type it rather than resolve it through abstractNum
+    // or silently demote it to absent numbering.
     let numbering = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:abstractNum w:abstractNumId=\"7\"><w:multiLevelType w:val=\"singleLevel\"/><w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/><w:lvlJc w:val=\"start\"/></w:lvl></w:abstractNum></w:numbering>";
     let body = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Body text only</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[("word/numbering.xml", numbering)]);
 
-    let accepted = Document::parse(&b)
-        .expect("parse")
-        .read_accepted()
-        .expect("read_accepted")
-        .to_text();
+    let document = Document::parse(&b).expect("Word accepts the unresolved numId");
+    let BlockNode::Paragraph(paragraph) = &document.snapshot().canonical.blocks[0].block else {
+        panic!("fixture must contain one paragraph");
+    };
+    let numbering = paragraph
+        .numbering
+        .as_ref()
+        .expect("authored numPr remains modeled");
+    assert_eq!(numbering.num_id, 7);
+    assert_eq!(numbering.ilvl, 0);
     assert_eq!(
-        accepted.trim(),
-        "Body text only",
-        "ISO 29500-1 §17.9.1: an abstractNum cannot be referenced by content; numId=7 matches only an abstractNumId \
-         (no num instance), so the reference is dangling, no marker is synthesized, and accepted text is exactly the body \
-         run text. got={accepted:?}"
+        numbering.resolution,
+        NumberingResolution::MissingNumberingInstance
     );
-
-    let rejected = Document::parse(&b)
-        .expect("parse")
-        .read_rejected()
-        .expect("read_rejected")
-        .to_text();
-    assert_eq!(
-        rejected.trim(),
-        "Body text only",
-        "ISO 29500-1 §17.9.1/§17.9.18: no tracked changes are present and the dangling numId injects no marker, so reject-all \
-         yields the same body text. got={rejected:?}"
-    );
+    assert!(numbering.synthesized_text.is_empty());
 }

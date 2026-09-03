@@ -54,12 +54,12 @@ fn spec_theme_font_reference_resolves_font_family() {
     );
 }
 
-/// ISO 29500-1 §17.3.2.26: When rFonts has both explicit ascii/hAnsi AND
-/// asciiTheme/hAnsiTheme, the explicit value takes precedence.
-///
-/// POSITIVE: Even without theme resolution, explicit fonts are read correctly.
+/// ISO 29500-1 §17.3.2.26: Within one rFonts element, asciiTheme/hAnsiTheme
+/// supersede the corresponding ascii/hAnsi literal attributes. This differs
+/// from the cascade-level rule where one direct rFonts element replaces an
+/// inherited rFonts element.
 #[test]
-fn spec_explicit_font_wins_over_theme() {
+fn spec_theme_font_wins_over_literal_within_one_rfonts_element() {
     let (_runtime, doc) = common::import_fixture(FIXTURES, "theme-font-references");
     let paras = common::all_paragraphs(&doc);
     let nodes = text_nodes(paras[0]);
@@ -71,8 +71,8 @@ fn spec_explicit_font_wins_over_theme() {
 
     assert_eq!(
         run_b.style_props.font_family.as_deref(),
-        Some("Courier New"),
-        "explicit w:ascii should be used when both explicit and theme are present"
+        Some("Calibri"),
+        "w:asciiTheme should supersede w:ascii when both are authored on one rFonts element"
     );
 }
 

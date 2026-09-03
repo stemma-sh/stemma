@@ -197,6 +197,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         w_after: None,
         cnf_style: None,
         tbl_pr_ex: None,
+        tbl_pr_ex_change: None,
         cell_spacing: None,
         preserved: Vec::new(),
     }
@@ -325,16 +326,16 @@ fn set_table_format_records_a_tracked_tblprchange_not_a_structural_change() {
         .expect("table must carry a tblPrChange");
     // Its inner tblPr is the PREVIOUS state: single borders, no prior margins.
     assert_eq!(
-        fc.previous_borders,
+        fc.previous.borders,
         Some(single_borders()),
         "tblPrChange inner tblPr must capture the prior borders"
     );
     assert_eq!(
-        fc.previous_default_cell_margins, None,
+        fc.previous.default_cell_margins, None,
         "the table had no default cell margins before"
     );
     assert_eq!(
-        fc.previous_width,
+        fc.previous.width,
         Some(TableMeasurement {
             w: 5000,
             width_type: WidthType::Pct,

@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Stable MAJOR.MINOR.PATCH from stemma-mcp/Cargo.toml, without the v prefix"
+        description: "Stable MAJOR.MINOR.PATCH shared by the release manifests, without the v prefix"
         required: true
         type: string
       commit_sha:
@@ -37,9 +37,10 @@ env:
 
 jobs:
   version-guard:
-    # An input that does not match the crate version would publish npm packages
-    # whose version disagrees with --version. Refuse, don't reconcile.
-    name: requested version matches stemma-mcp crate
+    # A mixed workspace version could publish npm packages whose version
+    # disagrees with the Rust crates or plugin manifests. Refuse, don't
+    # reconcile.
+    name: requested version matches release manifests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,11 +58,59 @@ jobs:
             echo "::error::Requested commit must be a full lowercase hexadecimal SHA."
             exit 1
           fi
-          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' stemma-mcp/Cargo.toml | head -1)"
-          if [ "$requested" != "$crate" ]; then
-            echo "::error::Requested version $requested does not match stemma-mcp version $crate."
-            exit 1
-          fi
+          python3 - "$requested" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          import tomllib
+
+          requested = sys.argv[1]
+          cargo_manifests = [
+              Path("stemma-engine/Cargo.toml"),
+              Path("stemma-diff/Cargo.toml"),
+              Path("stemma-artifacts/Cargo.toml"),
+              Path("stemma-cli/Cargo.toml"),
+              Path("stemma-mcp/Cargo.toml"),
+              Path("stemma-api/Cargo.toml"),
+          ]
+          json_manifests = [
+              Path("stemma-mcp/mcpb/manifest.json"),
+              Path("stemma-mcp/plugin/.claude-plugin/plugin.json"),
+          ]
+
+          mismatches = []
+          for path in cargo_manifests:
+              version = tomllib.loads(path.read_text(encoding="utf-8"))["package"]["version"]
+              if version != requested:
+                  mismatches.append(f"{path}: {version}")
+          for path in json_manifests:
+              version = json.loads(path.read_text(encoding="utf-8"))["version"]
+              if version != requested:
+                  mismatches.append(f"{path}: {version}")
+          if mismatches:
+              raise SystemExit(
+                  "requested version " + requested + " does not match:\n  "
+                  + "\n  ".join(mismatches)
+              )
+
+          dependency_checks = {
+              Path("stemma-diff/Cargo.toml"): ["stemma"],
+              Path("stemma-cli/Cargo.toml"): ["stemma", "stemma-diff", "stemma-artifacts"],
+              Path("stemma-mcp/Cargo.toml"): ["stemma", "stemma-diff", "stemma-artifacts"],
+          }
+          dependency_mismatches = []
+          for path, names in dependency_checks.items():
+              dependencies = tomllib.loads(path.read_text(encoding="utf-8"))["dependencies"]
+              for name in names:
+                  version = dependencies[name].get("version")
+                  if version != requested:
+                      dependency_mismatches.append(f"{path} dependency {name}: {version}")
+          if dependency_mismatches:
+              raise SystemExit(
+                  "internal dependency versions do not match " + requested + ":\n  "
+                  + "\n  ".join(dependency_mismatches)
+              )
+          PY
           if [ "$requested_sha" != "$GITHUB_SHA" ]; then
             echo "::error::Requested commit $requested_sha does not match selected ref commit $GITHUB_SHA."
             exit 1
@@ -78,7 +127,7 @@ jobs:
           if [ -n "$tag_sha" ]; then
             echo "Retrying the source already bound by tag v$requested."
           fi
-          echo "Releasing stemma-mcp $crate"
+          echo "Releasing Stemma $requested"
       - name: Verify release environment protection
         env:
           GH_TOKEN: ${{ github.token }}

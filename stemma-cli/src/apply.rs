@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use stemma::api::Document;
+use stemma::api::{Diagnostic, Document};
 use stemma::audit::RevisionDisposition;
 use stemma::edit::{
     BarrierPolicy, EditTransaction, ExpectedMatches, MatchMode, MaterializationMode,
@@ -29,6 +29,11 @@ const BUILD_STAMP: &str = match option_env!("STEMMA_BUILD_STAMP") {
 pub(crate) enum ApplyStatus {
     Complete,
     Incomplete,
+}
+
+pub(crate) struct ApplyOptions {
+    pub emit_partial: bool,
+    pub allow_existing_author: bool,
 }
 
 impl ApplyStatus {
@@ -131,8 +136,11 @@ struct ApplyReceipt {
     status: ReceiptStatus,
     deliverable: bool,
     emit_partial_requested: bool,
+    author_label_policy: &'static str,
     input_binding: InputBindingReceipt,
     input: ArtifactIdentity,
+    /// Import-time normalizations applied to the source before editing.
+    input_diagnostics: Vec<Diagnostic>,
     worklist: ArtifactIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputReceipt>,
@@ -331,7 +339,7 @@ pub(crate) fn apply_worklist(
     worklist_path: &Path,
     output_path: &Path,
     receipt_path: Option<&Path>,
-    emit_partial: bool,
+    options: ApplyOptions,
 ) -> Result<ApplyStatus, String> {
     apply_worklist_with_before_output_commit(
         artifacts,
@@ -339,7 +347,7 @@ pub(crate) fn apply_worklist(
         worklist_path,
         output_path,
         receipt_path,
-        emit_partial,
+        options,
         || Ok(()),
     )
 }
@@ -350,17 +358,23 @@ fn apply_worklist_with_before_output_commit<F>(
     worklist_path: &Path,
     output_path: &Path,
     receipt_path: Option<&Path>,
-    emit_partial: bool,
+    options: ApplyOptions,
     before_output_commit: F,
 ) -> Result<ApplyStatus, String>
 where
     F: FnOnce() -> Result<(), String>,
 {
+    let ApplyOptions {
+        emit_partial,
+        allow_existing_author,
+    } = options;
     let input = artifacts
         .read_source(input_path, "input_docx", None)
         .map_err(|e| e.to_string())?;
     let mut document = Document::parse(input.bytes())
         .map_err(|e| format!("{}: not a valid DOCX ({e})", input_path.display()))?;
+    let input_diagnostics = document.diagnostics().to_vec();
+    crate::report_import_diagnostics("input_docx", input_path, &input_diagnostics);
     let input_identity = input.identity().clone();
 
     let worklist_artifact = artifacts
@@ -548,7 +562,7 @@ where
                 apply_op_id: Some(change.id.clone()),
             },
         };
-        let edited = match document.apply_authored(&transaction, false) {
+        let edited = match document.apply_authored(&transaction, allow_existing_author) {
             Ok(edited) => edited,
             Err(error) => {
                 outcomes.push(refused_engine_item(
@@ -687,8 +701,14 @@ where
         status,
         deliverable,
         emit_partial_requested: emit_partial,
+        author_label_policy: if allow_existing_author {
+            "continue_existing"
+        } else {
+            "require_confirmation_on_collision"
+        },
         input_binding,
         input: input_identity,
+        input_diagnostics,
         worklist: worklist_identity,
         output: output_receipt.clone(),
         summary: SummaryReceipt {
@@ -1021,7 +1041,7 @@ fn runtime_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::InvalidSnapshot => "invalid_snapshot",
         ErrorCode::InternalError => "internal_error",
         ErrorCode::ValidationFailed => "validation_failed",
-        ErrorCode::AuthorImpersonation => "author_impersonation",
+        ErrorCode::AuthorLabelCollision => "author_label_collision",
     }
 }
 
@@ -1235,7 +1255,10 @@ mod tests {
             &worklist_path,
             &output_path,
             Some(&receipt_path),
-            false,
+            ApplyOptions {
+                emit_partial: false,
+                allow_existing_author: false,
+            },
         )
         .expect("verified apply succeeds");
         assert!(matches!(status, ApplyStatus::Complete));
@@ -1294,7 +1317,10 @@ mod tests {
             &worklist_path,
             &output_path,
             Some(&receipt_path),
-            false,
+            ApplyOptions {
+                emit_partial: false,
+                allow_existing_author: false,
+            },
             || Err("injected failure before DOCX commit".to_string()),
         )
         .expect_err("the injected boundary must fail the command");

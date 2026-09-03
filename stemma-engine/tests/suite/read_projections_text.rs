@@ -12,6 +12,8 @@
 
 use stemma::api::{Document, validate};
 use stemma::{ExportOptions, Resolution};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 

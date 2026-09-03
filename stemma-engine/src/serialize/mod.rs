@@ -3,9 +3,9 @@
 //! Extracted from `runtime.rs`. These functions convert canonical document
 //! types into XML nodes for DOCX output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use xmltree::{Element, XMLNode};
+use xmltree::{AttributeName, Element, Namespace, XMLNode};
 
 use crate::domain::{
     Alignment, BlockNode, Border, BorderSet, CanonDoc, CellMargins, CellSdtWrap, CnfStyle,
@@ -86,8 +86,8 @@ fn serialized_tab_stops_for_paragraph(
 
 fn serialized_tab_stops_for_previous_formatting(
     fc: &crate::domain::ParagraphFormattingChange,
-) -> Vec<crate::word_ir::TabStopDef> {
-    fc.previous_tab_stops.clone()
+) -> Option<Vec<crate::word_ir::TabStopDef>> {
+    fc.previous.direct.tab_stops.clone()
 }
 
 /// A bare run carrying a deferred literal-prefix separator VERBATIM (spaces and
@@ -384,150 +384,7 @@ pub(crate) fn direct_run_style_props(
     style_props: &StyleProps,
     directness: RunDirectness,
 ) -> StyleProps {
-    let mut props = style_props.clone();
-    // ascii/hAnsi font slot: literal (w:ascii) and theme (w:asciiTheme) are
-    // independent — a run authoring a literal font must NOT get a theme font
-    // injected (the theme attr would WIN and change the rendered font).
-    if !directness.font_family {
-        props.font_family = None;
-    }
-    if !directness.font_family_theme {
-        props.font_family_theme = None;
-    }
-    if !directness.font_east_asia {
-        props.font_east_asia = None;
-    }
-    if !directness.font_east_asia_theme {
-        props.font_east_asia_theme = None;
-    }
-    if !directness.font_cs {
-        props.font_cs = None;
-    }
-    if !directness.font_cs_theme {
-        props.font_cs_theme = None;
-    }
-    if !directness.font_hint {
-        props.font_hint = None;
-    }
-    if !directness.font_size {
-        props.font_size = None;
-    }
-    if !directness.font_size_cs {
-        props.font_size_cs = None;
-    }
-    // color: literal/auto (w:val) vs theme (w:themeColor) tracked separately —
-    // an authored `w:val="auto"` must not get a themeColor injected (themeColor
-    // would WIN and render e.g. dark blue instead of black).
-    if !directness.color {
-        props.color = None;
-    }
-    if !directness.color_theme {
-        props.color_theme = None;
-    }
-    if !directness.lang {
-        props.lang = None;
-    }
-    if !directness.lang_east_asia {
-        props.lang_east_asia = None;
-    }
-    // kern/spacing carry no precedence inversion; stripping unauthored values is
-    // churn hygiene — an inherited kerning threshold or character spacing must
-    // not be materialized as direct rPr on untouched runs.
-    if !directness.kern {
-        props.kern = None;
-    }
-    if !directness.char_spacing {
-        props.char_spacing = None;
-    }
-    // Toggle marks (H8 directness gap): an inherited toggle re-emitted as
-    // direct rPr both churns untouched markup AND flips rendering when the
-    // style itself toggles it (§17.7.3 toggle semantics). Tri-states reset to
-    // Inherit; value props to None.
-    if !directness.strike {
-        props.strike = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.double_strike {
-        props.double_strike = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.caps {
-        props.caps = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.small_caps {
-        props.small_caps = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.vanish {
-        props.vanish = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.web_hidden {
-        props.web_hidden = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.emboss {
-        props.emboss = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.imprint {
-        props.imprint = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.outline {
-        props.outline = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.shadow {
-        props.shadow = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.bold_cs {
-        props.bold_cs = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.italic_cs {
-        props.italic_cs = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.rtl {
-        props.rtl = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.cs {
-        props.cs = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.no_proof {
-        props.no_proof = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.spec_vanish {
-        props.spec_vanish = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.o_math {
-        props.o_math = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.snap_to_grid {
-        props.snap_to_grid = crate::domain::MarkValue::Inherit;
-    }
-    if !directness.highlight {
-        props.highlight = None;
-    }
-    if !directness.underline_style {
-        props.underline_style = None;
-    }
-    if !directness.position {
-        props.position = None;
-    }
-    if !directness.char_width_scaling {
-        props.char_width_scaling = None;
-    }
-    if !directness.char_style_id {
-        props.char_style_id = None;
-    }
-    if !directness.run_border {
-        props.run_border = None;
-    }
-    if !directness.run_shading {
-        props.run_shading = None;
-    }
-    if !directness.emphasis_mark {
-        props.emphasis_mark = None;
-    }
-    if !directness.text_effect {
-        props.text_effect = None;
-    }
-    if !directness.fit_text {
-        props.fit_text = None;
-    }
-    props
+    directness.direct_style_props(style_props)
 }
 
 /// Emit AUTHORED-OFF forms: a run whose own rPr carried `<w:b w:val="0"/>`
@@ -606,19 +463,7 @@ fn append_authored_off_toggles(rpr: &mut Element, marks: &[Mark], directness: Ru
 /// [`RunRprAuthored`] provenance): a style-inherited Bold/Italic/Underline/
 /// vertAlign must not re-emit as direct rPr — see `direct_run_style_props`.
 pub(crate) fn direct_marks(marks: &[Mark], directness: RunDirectness) -> Vec<Mark> {
-    marks
-        .iter()
-        .filter(|m| match m {
-            // Authored-driven: a mark whose presence came from resolution
-            // (e.g. iCs governing a complex-script run) must not emit when the
-            // run's own rPr said OFF.
-            Mark::Bold => directness.bold && !directness.bold_off,
-            Mark::Italic => directness.italic && !directness.italic_off,
-            Mark::Underline => directness.underline,
-            Mark::Subscript | Mark::Superscript => directness.vert_align,
-        })
-        .cloned()
-        .collect()
+    directness.direct_marks(marks)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,6 +478,9 @@ fn build_text_run_with_leading_tabs(
     leading_separator: Option<&str>,
 ) -> Element {
     let mut run = w_el("r");
+    let formatting_change = formatting_change.filter(|change| {
+        change.carrier == crate::domain::RunFormattingChangeCarrier::RunProperties
+    });
     let has_rpr_change = formatting_change.is_some();
     let direct_props = direct_run_style_props(style_props, directness);
     let resolved_marks = marks;
@@ -700,7 +548,7 @@ fn build_text_run_with_leading_tabs(
 /// `word_ir::TextMarks` recovers the run's DIRECT marks, which are then run
 /// through the SAME `StyleDefinitions::resolve` cascade import uses against a
 /// reverted paragraph style — so the two paths cannot drift apart.
-pub(crate) fn build_run_direct_rpr(
+pub fn build_run_direct_rpr(
     marks: &[Mark],
     style_props: &StyleProps,
     directness: RunDirectness,
@@ -1089,7 +937,7 @@ fn append_single_inline(
                 &hb.wrapper_style_props,
                 hb.wrapper_rpr_authored,
                 deleted_text,
-                None,
+                hb.formatting_change.as_ref(),
                 next_id,
                 None,
             );
@@ -1333,10 +1181,11 @@ fn paragraph_mark_formatting_changed(
     paragraph: &ParagraphNode,
     fc: &crate::domain::ParagraphFormattingChange,
 ) -> bool {
-    paragraph.paragraph_mark_marks != fc.previous_paragraph_mark_marks
-        || paragraph.paragraph_mark_style_props != fc.previous_paragraph_mark_style_props
-        || paragraph.paragraph_mark_rfonts != fc.previous_paragraph_mark_rfonts
-        || paragraph.paragraph_mark_rpr_off != fc.previous_paragraph_mark_rpr_off
+    let previous = &fc.previous.paragraph_mark;
+    paragraph.paragraph_mark_marks != previous.marks
+        || paragraph.paragraph_mark_style_props != previous.style_props
+        || paragraph.paragraph_mark_rfonts != previous.rfonts
+        || paragraph.paragraph_mark_rpr_off != previous.rpr_off
 }
 
 /// Translate a paragraph mark's authored OFF toggles into the `RunRprAuthored`
@@ -1403,10 +1252,10 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
     let has_current = !paragraph.paragraph_mark_marks.is_empty()
         || !paragraph.paragraph_mark_style_props.is_empty()
         || off != crate::domain::ParaMarkRprOff::default();
-    let formatting_change = paragraph
-        .formatting_change
-        .as_ref()
-        .filter(|fc| paragraph_mark_formatting_changed(paragraph, fc));
+    let formatting_change = paragraph.formatting_change.as_ref().filter(|fc| {
+        fc.carrier.has_paragraph_mark_properties()
+            && paragraph_mark_formatting_changed(paragraph, fc)
+    });
 
     if !has_current && formatting_change.is_none() {
         return None;
@@ -1426,29 +1275,29 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
         para_mark_off_directness(off),
     );
     if let Some(fc) = formatting_change {
+        let previous = &fc.previous.paragraph_mark;
         let mut rpr_change = w_el("rPrChange");
+        // Paragraph properties and paragraph-mark run properties are distinct
+        // physical revision elements and therefore require distinct wire IDs.
+        // `next_id` is seeded above every modeled/raw input ID and every
+        // modeled revision ID by the package serializer. The paragraph's
+        // pPrChange retains `fc.revision_id`; allocate the mark carrier from
+        // the disjoint serializer range instead of reusing that ID.
         attr_set(
             &mut rpr_change,
             "w:id",
-            if fc.revision_id != 0 {
-                fc.revision_id.to_string()
-            } else {
-                next_annotation_id(next_id).to_string()
-            },
+            next_annotation_id(next_id).to_string(),
         );
         attr_set(&mut rpr_change, "w:author", fc.author.clone());
         if let Some(ref date) = fc.date {
             attr_set(&mut rpr_change, "w:date", date.clone());
         }
-        let mut prev_rpr = build_rpr(
-            &fc.previous_paragraph_mark_marks,
-            &fc.previous_paragraph_mark_style_props,
-        );
-        apply_authored_rfonts(&mut prev_rpr, &fc.previous_paragraph_mark_rfonts);
+        let mut prev_rpr = build_rpr(&previous.marks, &previous.style_props);
+        apply_authored_rfonts(&mut prev_rpr, &previous.rfonts);
         append_authored_off_toggles(
             &mut prev_rpr,
-            &fc.previous_paragraph_mark_marks,
-            para_mark_off_directness(fc.previous_paragraph_mark_rpr_off),
+            &previous.marks,
+            para_mark_off_directness(previous.rpr_off),
         );
         rpr_change.children.push(XMLNode::Element(prev_rpr));
         rpr.children.push(XMLNode::Element(rpr_change));
@@ -1461,23 +1310,34 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
 // Block-level serialization entry points
 // =============================================================================
 
-pub(crate) fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
+pub fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
     let mut authors = HashSet::new();
+
+    // Word's author is a display label. The empty string is the wire form of
+    // anonymous formatting revisions (whose domain types use String rather
+    // than Option<String>); it does not name a person and must not synthesize
+    // an empty w15:person. This is the same semantic state represented by
+    // `RevisionInfo::author == None` on insertion/deletion carriers.
+    fn insert_author_label(author: &str, out: &mut HashSet<String>) {
+        if !author.is_empty() {
+            out.insert(author.to_string());
+        }
+    }
 
     fn authors_from_status(status: &TrackingStatus, out: &mut HashSet<String>) {
         match status {
             TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => {
                 if let Some(ref author) = rev.author {
-                    out.insert(author.clone());
+                    insert_author_label(author, out);
                 }
             }
             // Both revisions of a stacked segment carry visible attribution.
             TrackingStatus::InsertedThenDeleted(sr) => {
                 if let Some(ref author) = sr.inserted.author {
-                    out.insert(author.clone());
+                    insert_author_label(author, out);
                 }
                 if let Some(ref author) = sr.deleted.author {
-                    out.insert(author.clone());
+                    insert_author_label(author, out);
                 }
             }
             TrackingStatus::Normal => {}
@@ -1490,9 +1350,28 @@ pub(crate) fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
         }
         for seg in &p.segments {
             authors_from_status(&seg.status, out);
+            for inline in &seg.inlines {
+                match inline {
+                    InlineNode::Text(text) => {
+                        if let Some(formatting) = &text.formatting_change
+                            && formatting.is_physical_revision()
+                        {
+                            insert_author_label(&formatting.author, out);
+                        }
+                    }
+                    InlineNode::HardBreak(hard_break) => {
+                        if let Some(formatting) = &hard_break.formatting_change
+                            && formatting.is_physical_revision()
+                        {
+                            insert_author_label(&formatting.author, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         if let Some(ref fc) = p.formatting_change {
-            out.insert(fc.author.clone());
+            insert_author_label(&fc.author, out);
         }
     }
 
@@ -1500,11 +1379,26 @@ pub(crate) fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
         match block {
             BlockNode::Paragraph(p) => authors_from_paragraph(p, out),
             BlockNode::Table(t) => {
+                if let Some(formatting) = &t.formatting_change {
+                    insert_author_label(&formatting.author, out);
+                }
                 for row in &t.rows {
                     if let Some(ref ts) = row.tracking_status {
                         authors_from_status(ts, out);
                     }
+                    if let Some(formatting) = &row.formatting_change {
+                        insert_author_label(&formatting.author, out);
+                    }
+                    if let Some(formatting) = &row.tbl_pr_ex_change {
+                        insert_author_label(&formatting.author, out);
+                    }
                     for cell in &row.cells {
+                        if let Some(status) = &cell.tracking_status {
+                            authors_from_status(status, out);
+                        }
+                        if let Some(formatting) = &cell.formatting_change {
+                            insert_author_label(&formatting.author, out);
+                        }
                         for b in &cell.blocks {
                             authors_from_block(b, out);
                         }
@@ -1563,6 +1457,69 @@ pub(crate) fn build_people_xml(authors: &[String]) -> String {
     }
     xml.push_str("</w15:people>");
     xml
+}
+
+/// Preserve an existing people collection and append only missing revision
+/// authors. Existing person elements are opaque semantic payload: provider
+/// identities, extension children, attributes, and order are retained exactly
+/// in the parsed tree rather than rebuilt from author labels.
+pub(crate) fn merge_people_xml(existing: &[u8], authors: &[String]) -> Result<Vec<u8>, String> {
+    const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+
+    let mut root = Element::parse(existing)
+        .map_err(|error| format!("could not parse existing people.xml: {error}"))?;
+    if root.namespace.as_deref() != Some(W15_NS) || root.name != "people" {
+        return Err("existing people.xml does not have a w15:people root".to_string());
+    }
+    let mut existing_authors = BTreeSet::new();
+    for child in &root.children {
+        let Some(person) = child.as_element() else {
+            continue;
+        };
+        if person.namespace.as_deref() != Some(W15_NS) || person.name != "person" {
+            continue;
+        }
+        let author = person
+            .attributes
+            .iter()
+            .find_map(|(name, value)| {
+                (name.local_name == "author" && name.namespace.as_deref() == Some(W15_NS))
+                    .then_some(value)
+            })
+            .ok_or_else(|| "w15:person has no w15:author".to_string())?;
+        if author.is_empty() {
+            return Err("w15:person has an empty w15:author".to_string());
+        }
+        if !existing_authors.insert(author.clone()) {
+            return Err(format!(
+                "people.xml contains duplicate w15:author {author:?}"
+            ));
+        }
+    }
+
+    let generated = Element::parse(build_people_xml(authors).as_bytes())
+        .map_err(|error| format!("could not parse generated people XML: {error}"))?;
+    for child in generated.children {
+        let Some(person) = child.as_element() else {
+            continue;
+        };
+        let author = person
+            .attributes
+            .iter()
+            .find_map(|(name, value)| {
+                (name.local_name == "author" && name.namespace.as_deref() == Some(W15_NS))
+                    .then_some(value)
+            })
+            .ok_or_else(|| "generated w15:person has no w15:author".to_string())?;
+        if existing_authors.insert(author.clone()) {
+            root.children.push(child);
+        }
+    }
+
+    let mut output = Vec::new();
+    root.write(&mut output)
+        .map_err(|error| format!("could not serialize merged people.xml: {error}"))?;
+    Ok(output)
 }
 
 #[allow(clippy::type_complexity)]
@@ -1663,7 +1620,8 @@ pub(crate) fn serialize_untracked_block(
 // =============================================================================
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn serialize_paragraph_node(
+#[doc(hidden)]
+pub fn serialize_paragraph_node(
     paragraph: &ParagraphNode,
     block_status: Option<&TrackingStatus>,
     is_move: bool,
@@ -1962,7 +1920,7 @@ pub(crate) fn serialize_paragraph_node(
             p.children.push(XMLNode::Element(prefix_container));
         }
         let all: Vec<&InlineNode> = paragraph.all_inlines().collect();
-        let chunks = split_tracked_container_chunks(&all);
+        let chunks = split_tracked_container_chunks(&all, !is_move);
         emit_tracked_chunks(
             &mut p,
             &chunks,
@@ -2025,10 +1983,21 @@ pub(crate) fn serialize_paragraph_node(
             }
             p.children.push(XMLNode::Element(wrapper));
         }
-        let mut emitted_opaques = HashSet::new();
+        // A whole-block insertion is an exact target block. Its
+        // content may legitimately contain the same hyperlink or simple field
+        // more than once, so semantic-key de-duplication would destroy a real
+        // occurrence. Cross-segment de-duplication is only for the normal-block
+        // diff path below, where the same opaque can be copied onto both sides
+        // of a tracked replacement.
         for segment in &paragraph.segments {
             let segment_refs: Vec<&InlineNode> = segment.inlines.iter().collect();
-            let chunks = split_tracked_container_chunks(&segment_refs);
+            let chunks = split_tracked_container_chunks(
+                &segment_refs,
+                matches!(
+                    segment.status,
+                    TrackingStatus::Normal | TrackingStatus::Inserted(_)
+                ) && !is_move,
+            );
             match &segment.status {
                 TrackingStatus::Normal => {
                     let seg_container = if is_move {
@@ -2044,7 +2013,7 @@ pub(crate) fn serialize_paragraph_node(
                         rev_date,
                         None,
                         next_id,
-                        Some(&mut emitted_opaques),
+                        None,
                         bookmark_policy,
                         origin,
                         match resolve_rel_rid.as_mut() {
@@ -2072,7 +2041,7 @@ pub(crate) fn serialize_paragraph_node(
                         seg_date,
                         None,
                         next_id,
-                        Some(&mut emitted_opaques),
+                        None,
                         bookmark_policy,
                         origin,
                         match resolve_rel_rid.as_mut() {
@@ -2095,7 +2064,7 @@ pub(crate) fn serialize_paragraph_node(
                         seg_date,
                         None,
                         next_id,
-                        Some(&mut emitted_opaques),
+                        None,
                         bookmark_policy,
                         origin,
                         match resolve_rel_rid.as_mut() {
@@ -2125,7 +2094,7 @@ pub(crate) fn serialize_paragraph_node(
                         sr.deleted.date.as_deref().unwrap_or(""),
                         None,
                         next_id,
-                        Some(&mut emitted_opaques),
+                        None,
                         bookmark_policy,
                         origin,
                         match resolve_rel_rid.as_mut() {
@@ -2152,6 +2121,33 @@ pub(crate) fn serialize_paragraph_node(
             paragraph.segments.first().map(|segment| &segment.status),
             Some(TrackingStatus::Inserted(_)) | Some(TrackingStatus::Deleted(_))
         );
+    // A hoisted prefix may share its source run with the first body text. Keep
+    // that wire boundary while the first text-bearing segment is untracked, or
+    // when every body character is deleted (the prefix then belongs to the same
+    // complete deletion). Otherwise target-present body text proves that the
+    // prefix survives the edit: joining it into an initial tracked container
+    // would make Accept or Reject remove content common to both terminal sides.
+    let first_text_segment_is_normal = paragraph
+        .segments
+        .iter()
+        .find(|segment| {
+            segment
+                .inlines
+                .iter()
+                .any(|inline| matches!(inline, InlineNode::Text(_)))
+        })
+        .is_none_or(|segment| matches!(segment.status, TrackingStatus::Normal));
+    let body_has_target_text = paragraph.segments.iter().any(|segment| {
+        matches!(
+            segment.status,
+            TrackingStatus::Normal | TrackingStatus::Inserted(_)
+        ) && segment
+            .inlines
+            .iter()
+            .any(|inline| matches!(inline, InlineNode::Text(_)))
+    });
+    let prefix_source_boundary_can_join_body =
+        first_text_segment_is_normal || !body_has_target_text;
     let mut has_source_boundary_witness = false;
     if let Some(prefix) = &literal_prefix {
         has_source_boundary_witness = paragraph
@@ -2165,7 +2161,7 @@ pub(crate) fn serialize_paragraph_node(
             &paragraph.literal_prefix_trailing_ws,
             paragraph.literal_prefix_has_trailing_tab,
             embed_prefix_trailing_tab,
-            true,
+            prefix_source_boundary_can_join_body,
             paragraph_has_text,
             paragraph.literal_prefix_leading_rpr.as_deref(),
             paragraph.literal_prefix_trailing_rpr.as_deref(),
@@ -2821,17 +2817,8 @@ pub(crate) fn build_paragraph_properties(
     if paragraph.has_direct_shading
         && let Some(shading) = &paragraph.shading
     {
-        let mut shd = w_el("shd");
-        if let Some(ref fill) = shading.fill {
-            attr_set(&mut shd, "w:fill", fill.clone());
-        }
-        if let Some(ref val) = shading.val {
-            attr_set(&mut shd, "w:val", val.to_xml_str());
-        }
-        if let Some(ref color) = shading.color {
-            attr_set(&mut shd, "w:color", color.clone());
-        }
-        ppr.children.push(XMLNode::Element(shd));
+        ppr.children
+            .push(XMLNode::Element(serialize_shading(shading)));
         has_any = true;
     }
 
@@ -3067,7 +3054,15 @@ pub(crate) fn build_paragraph_properties(
     // --- Position 35: pPrChange ---
     // Serialize w:pPrChange (§17.13.5.29) — tracked paragraph formatting change.
     // The inner pPr is a COMPLETE snapshot of the previous state per the spec.
-    if let Some(ref fc) = paragraph.formatting_change {
+    if let Some(fc) = paragraph
+        .formatting_change
+        .as_ref()
+        .filter(|change| change.carrier.has_paragraph_properties())
+    {
+        // The wire carries only the authored previous pPr. Resolved/effective
+        // values are model proof state and must never be materialized here.
+        let previous = &fc.previous.direct;
+        let previous_mark = &fc.previous.paragraph_mark;
         let mut ppr_change = w_el("pPrChange");
         attr_set(
             &mut ppr_change,
@@ -3086,14 +3081,14 @@ pub(crate) fn build_paragraph_properties(
         // Inner pPr inside pPrChange follows same CT_PPrBase order as build_paragraph_properties.
 
         // --- Position 0: pStyle ---
-        if let Some(ref style_id) = fc.previous_style_id {
+        if let Some(ref style_id) = previous.style_id {
             let mut pstyle = w_el("pStyle");
             attr_set(&mut pstyle, "w:val", style_id.clone());
             prev_ppr.children.push(XMLNode::Element(pstyle));
         }
 
         // --- Position 1: keepNext ---
-        if let Some(kn) = fc.previous_keep_next {
+        if let Some(kn) = previous.keep_next {
             let mut el = w_el("keepNext");
             if !kn {
                 attr_set(&mut el, "w:val", "0");
@@ -3102,7 +3097,7 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 2: keepLines ---
-        if let Some(kl) = fc.previous_keep_lines {
+        if let Some(kl) = previous.keep_lines {
             let mut el = w_el("keepLines");
             if !kl {
                 attr_set(&mut el, "w:val", "0");
@@ -3111,19 +3106,15 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 3: pageBreakBefore ---
-        if fc.previous_page_break_before {
-            prev_ppr
-                .children
-                .push(XMLNode::Element(w_el("pageBreakBefore")));
-        }
+        push_onoff_flag(&mut prev_ppr, "pageBreakBefore", previous.page_break_before);
 
         // --- Position 4: framePr ---
-        if let Some(ref fp) = fc.previous_frame_pr {
+        if let Some(ref fp) = previous.frame_pr {
             prev_ppr.children.push(XMLNode::Element(build_frame_pr(fp)));
         }
 
         // --- Position 5: widowControl ---
-        if let Some(wc) = fc.previous_widow_control {
+        if let Some(wc) = previous.widow_control {
             let mut el = w_el("widowControl");
             if !wc {
                 attr_set(&mut el, "w:val", "0");
@@ -3132,32 +3123,14 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 6: numPr ---
-        if let Some(ref numbering) = fc.previous_numbering {
-            let mut num_pr = w_el("numPr");
-            let mut ilvl_el = w_el("ilvl");
-            attr_set(&mut ilvl_el, "w:val", numbering.ilvl.to_string());
-            let mut num_id_el = w_el("numId");
-            attr_set(&mut num_id_el, "w:val", numbering.num_id.to_string());
-            num_pr.children.push(XMLNode::Element(ilvl_el));
-            num_pr.children.push(XMLNode::Element(num_id_el));
-            prev_ppr.children.push(XMLNode::Element(num_pr));
-        } else if fc.previous_numbering_explicitly_absent {
-            // Emit numId=0 to signal "base had no numbering at all" (§17.9.18).
-            // The extraction's reject-view state machine uses this to skip the
-            // paragraph — without it, the current numPr would be synthesized in
-            // the reject view, producing a prefix that didn't exist in the base.
-            let mut num_pr = w_el("numPr");
-            let mut ilvl_el = w_el("ilvl");
-            attr_set(&mut ilvl_el, "w:val", "0");
-            let mut num_id_el = w_el("numId");
-            attr_set(&mut num_id_el, "w:val", "0");
-            num_pr.children.push(XMLNode::Element(ilvl_el));
-            num_pr.children.push(XMLNode::Element(num_id_el));
-            prev_ppr.children.push(XMLNode::Element(num_pr));
+        if let crate::domain::DirectParagraphNumbering::Present(numbering) = &previous.numbering {
+            prev_ppr
+                .children
+                .push(XMLNode::Element(serialize_direct_num_pr(numbering)));
         }
 
         // --- Position 8: pBdr ---
-        if let Some(ref borders) = fc.previous_borders {
+        if let Some(ref borders) = previous.borders {
             let mut pbdr = w_el("pBdr");
             if let Some(ref top) = borders.top {
                 pbdr.children
@@ -3187,23 +3160,14 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 9: shd ---
-        if let Some(ref shading) = fc.previous_shading {
-            let mut shd = w_el("shd");
-            if let Some(ref fill) = shading.fill {
-                attr_set(&mut shd, "w:fill", fill.clone());
-            }
-            if let Some(ref val) = shading.val {
-                attr_set(&mut shd, "w:val", val.to_xml_str());
-            }
-            if let Some(ref color) = shading.color {
-                attr_set(&mut shd, "w:color", color.clone());
-            }
-            prev_ppr.children.push(XMLNode::Element(shd));
+        if let Some(ref shading) = previous.shading {
+            prev_ppr
+                .children
+                .push(XMLNode::Element(serialize_shading(shading)));
         }
 
         // --- Position 10: tabs ---
-        let previous_tab_stops = serialized_tab_stops_for_previous_formatting(fc);
-        if !previous_tab_stops.is_empty() {
+        if let Some(previous_tab_stops) = serialized_tab_stops_for_previous_formatting(fc) {
             let mut tabs = w_el("tabs");
             for tab in &previous_tab_stops {
                 let mut tab_el = w_el("tab");
@@ -3222,22 +3186,18 @@ pub(crate) fn build_paragraph_properties(
         push_onoff_flag(
             &mut prev_ppr,
             "suppressAutoHyphens",
-            fc.previous_suppress_auto_hyphens,
+            previous.suppress_auto_hyphens,
         );
-        push_onoff_flag(&mut prev_ppr, "wordWrap", fc.previous_word_wrap);
-        push_onoff_flag(&mut prev_ppr, "overflowPunct", fc.previous_overflow_punct);
-        push_onoff_flag(&mut prev_ppr, "autoSpaceDE", fc.previous_auto_space_de);
-        push_onoff_flag(&mut prev_ppr, "autoSpaceDN", fc.previous_auto_space_dn);
-        push_onoff_flag(&mut prev_ppr, "bidi", fc.previous_bidi);
-        push_onoff_flag(
-            &mut prev_ppr,
-            "adjustRightInd",
-            fc.previous_adjust_right_ind,
-        );
-        push_onoff_flag(&mut prev_ppr, "snapToGrid", fc.previous_snap_to_grid);
+        push_onoff_flag(&mut prev_ppr, "wordWrap", previous.word_wrap);
+        push_onoff_flag(&mut prev_ppr, "overflowPunct", previous.overflow_punct);
+        push_onoff_flag(&mut prev_ppr, "autoSpaceDE", previous.auto_space_de);
+        push_onoff_flag(&mut prev_ppr, "autoSpaceDN", previous.auto_space_dn);
+        push_onoff_flag(&mut prev_ppr, "bidi", previous.bidi);
+        push_onoff_flag(&mut prev_ppr, "adjustRightInd", previous.adjust_right_ind);
+        push_onoff_flag(&mut prev_ppr, "snapToGrid", previous.snap_to_grid);
 
         // --- Position 21: spacing ---
-        if let Some(ref spacing) = fc.previous_spacing {
+        if let Some(ref spacing) = previous.spacing {
             let mut sp = w_el("spacing");
             if let Some(before) = spacing.before {
                 attr_set(&mut sp, "w:before", before.to_string());
@@ -3272,7 +3232,7 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 22: ind ---
-        if let Some(ref indent) = fc.previous_indentation {
+        if let Some(ref indent) = previous.indentation {
             let mut ind = w_el("ind");
             if let Some(left) = indent.left {
                 attr_set(&mut ind, "w:left", left.to_string());
@@ -3305,7 +3265,7 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 23: contextualSpacing ---
-        if let Some(cs) = fc.previous_contextual_spacing {
+        if let Some(cs) = previous.contextual_spacing {
             let mut el = w_el("contextualSpacing");
             if !cs {
                 attr_set(&mut el, "w:val", "0");
@@ -3314,52 +3274,72 @@ pub(crate) fn build_paragraph_properties(
         }
 
         // --- Position 24: mirrorIndents ---
-        push_onoff_flag(&mut prev_ppr, "mirrorIndents", fc.previous_mirror_indents);
+        push_onoff_flag(&mut prev_ppr, "mirrorIndents", previous.mirror_indents);
 
         // --- Position 26: jc ---
-        if let Some(ref align) = fc.previous_alignment {
+        if let Some(ref align) = previous.alignment {
             let mut jc = w_el("jc");
             attr_set(&mut jc, "w:val", alignment_to_string(align));
             prev_ppr.children.push(XMLNode::Element(jc));
         }
 
         // --- Position 27: textDirection ---
-        if let Some(ref td) = fc.previous_text_direction {
+        if let Some(ref td) = previous.text_direction {
             let mut td_el = w_el("textDirection");
             attr_set(&mut td_el, "w:val", td.to_xml_str());
             prev_ppr.children.push(XMLNode::Element(td_el));
         }
 
         // --- Position 28: textAlignment ---
-        if let Some(ref ta) = fc.previous_text_alignment {
+        if let Some(ref ta) = previous.text_alignment {
             let mut ta_el = w_el("textAlignment");
             attr_set(&mut ta_el, "w:val", ta.to_xml_str());
             prev_ppr.children.push(XMLNode::Element(ta_el));
         }
 
-        // --- Position 33: rPr ---
-        if !paragraph_mark_formatting_changed(paragraph, fc)
-            && (!fc.previous_paragraph_mark_marks.is_empty()
-                || !fc.previous_paragraph_mark_style_props.is_empty())
+        // --- Position 29: outlineLvl ---
+        if let Some(level) = previous.outline_lvl {
+            let mut outline = w_el("outlineLvl");
+            attr_set(&mut outline, "w:val", level.to_string());
+            prev_ppr.children.push(XMLNode::Element(outline));
+        }
+
+        // --- Position 31: cnfStyle ---
+        if let Some(cnf_style) = &previous.cnf_style {
+            prev_ppr
+                .children
+                .push(XMLNode::Element(serialize_cnf_style(cnf_style)));
+        }
+
+        if !fc.carrier.has_paragraph_mark_properties()
+            && (!previous_mark.marks.is_empty()
+                || !previous_mark.style_props.is_empty()
+                || !previous_mark.rfonts.is_empty()
+                || previous_mark.rpr_off != crate::domain::ParaMarkRprOff::default())
         {
-            prev_ppr.children.push(XMLNode::Element(build_rpr(
-                &fc.previous_paragraph_mark_marks,
-                &fc.previous_paragraph_mark_style_props,
-            )));
+            // --- Position 33: rPr ---
+            let mut previous_rpr = build_rpr(&previous_mark.marks, &previous_mark.style_props);
+            apply_authored_rfonts(&mut previous_rpr, &previous_mark.rfonts);
+            append_authored_off_toggles(
+                &mut previous_rpr,
+                &previous_mark.marks,
+                para_mark_off_directness(previous_mark.rpr_off),
+            );
+            prev_ppr.children.push(XMLNode::Element(previous_rpr));
         }
 
         // --- Preserved remainder: unmodeled inner-pPr children ---
         //
-        // Content the pPrChange parser doesn't model (e.g.
-        // w:suppressLineNumbers, w:keepNext, w:pBdr) was captured verbatim at
+        // Content the pPrChange parser doesn't model (for example
+        // w:suppressLineNumbers) was captured verbatim at
         // import (`extract_ppr_change`) rather than dropped. Re-insert it
         // here at its Annex-A position (same CT_PPrBase order as the outer
         // pPr) so a pre-existing pPrChange round-trips byte-faithful for
         // content this engine has no typed model for.
-        if !fc.previous_preserved_ppr.is_empty() {
+        if !previous.preserved.is_empty() {
             insert_preserved_children(
                 &mut prev_ppr,
-                &fc.previous_preserved_ppr,
+                &previous.preserved,
                 crate::docx_validate_ordering::PPR_ORDER,
             );
         }
@@ -3413,10 +3393,10 @@ fn build_border_edge(name: &str, border: &Border) -> Element {
 /// Check whether an inline node is a paragraph-level opaque that must NOT
 /// appear inside w:del/w:ins/w:moveFrom/w:moveTo containers.
 ///
-/// Per OOXML (ECMA-376 Annex A, CT_RunTrackChange), tracked-change containers
-/// can only hold EG_ContentRunContent (runs, smartTag, sdt, etc.).
-/// w:hyperlink, w:fldSimple, and m:oMathPara are paragraph-level elements
-/// that must be direct children of w:p.
+/// WordprocessingML paragraph-level elements such as `w:hyperlink` and
+/// `w:fldSimple` cannot be serialized as ordinary run content. Office Math
+/// objects are also direct paragraph/tracked-container children: wrapping
+/// `m:oMath` in `w:r` makes native Reject discard its math payload.
 fn is_paragraph_level_opaque(inline: &InlineNode) -> bool {
     match inline {
         InlineNode::OpaqueInline(opaque) => matches!(
@@ -3426,26 +3406,39 @@ fn is_paragraph_level_opaque(inline: &InlineNode) -> bool {
                     field_kind: FieldKind::Simple,
                     ..
                 })
+                | OpaqueKind::Sdt
                 | OpaqueKind::OmmlBlock
+                | OpaqueKind::OmmlInline
         ),
         _ => false,
     }
 }
 
-fn is_tracked_container_direct_inline(inline: &InlineNode) -> bool {
+/// Whether an inline must interrupt a run-level revision envelope.
+///
+/// Word keeps spelling/grammar boundary markers inside a whole-paragraph
+/// insertion or deletion that shares the tracked pilcrow's identity. Treating
+/// `w:proofErr` as a paragraph-level boundary there fragments one paragraph
+/// proposal into one revision per proofing span. Bookmarks remain qualified in
+/// every tracked container; proofing markers join only the independently proved
+/// paragraph-owned carrier. Every other decoration keeps the conservative
+/// paragraph-level boundary.
+fn is_tracked_container_direct_inline(inline: &InlineNode, keep_proof_errors_inside: bool) -> bool {
     is_paragraph_level_opaque(inline)
         || matches!(
             inline,
-            InlineNode::Decoration(_)
-                | InlineNode::CommentRangeStart { .. }
-                | InlineNode::CommentRangeEnd { .. }
-                | InlineNode::CommentReference { .. }
+            InlineNode::Decoration(decoration)
+                if !matches!(
+                    (keep_proof_errors_inside, &decoration.kind),
+                    (_, crate::domain::DecorationType::Bookmark)
+                        | (true, crate::domain::DecorationType::ProofError)
+                )
         )
 }
 
 fn segment_contains_tracked_container_direct_markers(segment: &TrackedSegment) -> bool {
     segment.inlines.iter().any(|inline| {
-        is_tracked_container_direct_inline(inline) && !is_paragraph_level_opaque(inline)
+        is_tracked_container_direct_inline(inline, false) && !is_paragraph_level_opaque(inline)
     })
 }
 
@@ -3454,77 +3447,7 @@ enum TrackedContentChunk<'a> {
     DirectInline(&'a InlineNode),
 }
 
-fn element_local_name(element: &Element) -> &str {
-    element
-        .name
-        .rsplit_once(':')
-        .map(|(_, local)| local)
-        .unwrap_or(&element.name)
-}
-
-fn is_math_tag(element: &Element, local: &str) -> bool {
-    element_local_name(element) == local
-        && (element.prefix.as_deref() == Some("m")
-            || element.namespace.as_deref()
-                == Some("http://schemas.openxmlformats.org/officeDocument/2006/math"))
-}
-
-fn has_math_track_change_child(element: &Element) -> bool {
-    element.children.iter().any(|child| match child {
-        XMLNode::Element(el) => {
-            matches!(
-                element_local_name(el),
-                "del" | "ins" | "moveFrom" | "moveTo"
-            ) && (el.prefix.as_deref() == Some("w")
-                || el.namespace.as_deref()
-                    == Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main"))
-        }
-        _ => false,
-    })
-}
-
-fn build_math_track_change(
-    container_kind: &TrackedContainer,
-    author: &str,
-    date: &str,
-    next_id: &mut u32,
-) -> Element {
-    match container_kind {
-        TrackedContainer::Del => w_del(next_annotation_id(next_id), author, date),
-        TrackedContainer::Ins => w_ins(next_annotation_id(next_id), author, date),
-        TrackedContainer::MoveFrom => {
-            word_xml::w_move_from(next_annotation_id(next_id), author, date)
-        }
-        TrackedContainer::MoveTo => word_xml::w_move_to(next_annotation_id(next_id), author, date),
-    }
-}
-
-fn wrap_math_track_changes_in_place(
-    element: &mut Element,
-    container_kind: &TrackedContainer,
-    author: &str,
-    date: &str,
-    next_id: &mut u32,
-) {
-    for child in &mut element.children {
-        if let XMLNode::Element(child_el) = child {
-            wrap_math_track_changes_in_place(child_el, container_kind, author, date, next_id);
-        }
-    }
-
-    if !(is_math_tag(element, "r") || is_math_tag(element, "ctrlPr")) {
-        return;
-    }
-    if element.children.is_empty() || has_math_track_change_child(element) {
-        return;
-    }
-
-    let mut track = build_math_track_change(container_kind, author, date, next_id);
-    track.children = std::mem::take(&mut element.children);
-    element.children.push(XMLNode::Element(track));
-}
-
-fn append_tracked_omml_paragraph_opaque(
+fn append_tracked_omml_opaque(
     parent: &mut Element,
     opaque: &OpaqueInlineNode,
     container_kind: &TrackedContainer,
@@ -3544,7 +3467,7 @@ fn append_tracked_omml_paragraph_opaque(
         });
     };
 
-    let mut element =
+    let element =
         crate::word_xml::parse_raw_fragment(raw_xml.as_slice()).map_err(|source| RuntimeError {
             code: ErrorCode::InvalidDocx,
             message: "failed to parse math opaque inline XML".to_string(),
@@ -3553,8 +3476,20 @@ fn append_tracked_omml_paragraph_opaque(
                 ..ErrorDetails::default()
             },
         })?;
-    wrap_math_track_changes_in_place(&mut element, container_kind, author, date, next_id);
-    parent.children.push(XMLNode::Element(element));
+    // CT_RunTrackChange admits Office Math children directly. A w:r wrapper
+    // around m:oMath is not an equivalent carrier: Word can open it, but Reject
+    // discards the equation payload. m:oMathPara also reaches this serializer,
+    // although producers must refuse it until its whole-object carrier is
+    // independently qualified.
+    let annotation_id = next_annotation_id(next_id);
+    let mut container = match container_kind {
+        TrackedContainer::Del => w_del(annotation_id, author, date),
+        TrackedContainer::Ins => w_ins(annotation_id, author, date),
+        TrackedContainer::MoveFrom => word_xml::w_move_from(annotation_id, author, date),
+        TrackedContainer::MoveTo => word_xml::w_move_to(annotation_id, author, date),
+    };
+    container.children.push(XMLNode::Element(element));
+    parent.children.push(XMLNode::Element(container));
     Ok(())
 }
 
@@ -3699,67 +3634,252 @@ fn append_tracked_inserted_complex_field(
     parent.children.push(XMLNode::Element(ins));
 }
 
-/// Emit a paragraph-level `fldSimple` opaque whose DELETION is tracked at the
-/// SEGMENT level, by wrapping the field's RESULT run in the tracked container.
-/// The `<w:fldSimple>` element stays paragraph-level; per I-TC-001 it cannot
-/// be a child of `<w:ins>`/`<w:del>`, so the run goes inside the field (the
-/// same form as the hyperlink). Known gap: Word reads the field shell as
-/// permanent content on reject; lowering the delete path (as the INSERT path
-/// now does via `append_tracked_inserted_complex_field`) needs
-/// `w:delInstrText` and its own oracle pass.
+/// Lower a tracked-DELETED simple field to the Word-qualified complex form,
+/// entirely inside one `w:del`: `begin` + `delInstrText` [+ `separate` +
+/// deleted cached result] + `end`. Keeping the complete balanced field in one
+/// revision makes Accept remove it and Reject restore it without leaving a
+/// permanent `w:fldSimple` shell.
 #[allow(clippy::too_many_arguments)]
-fn append_tracked_simple_field_paragraph_opaque(
+fn append_tracked_deleted_complex_field(
     parent: &mut Element,
     data: &FieldData,
     wrapper_marks: &[Mark],
     wrapper_style_props: &StyleProps,
-    container_kind: &TrackedContainer,
+    kind: &OpaqueKind,
     author: &str,
     date: &str,
     next_id: &mut u32,
 ) {
-    let mut field = w_el("fldSimple");
+    let rpr = build_wrapper_rpr(wrapper_marks, wrapper_style_props, kind, true);
+    let field_run = |child: Element, rpr: &Option<Element>| -> Element {
+        let mut run = w_el("r");
+        if let Some(rpr) = rpr {
+            run.children.push(XMLNode::Element(rpr.clone()));
+        }
+        run.children.push(XMLNode::Element(child));
+        run
+    };
+    let fld_char = |char_type: &str| -> Element {
+        let mut field_char = w_el("fldChar");
+        attr_set(&mut field_char, "w:fldCharType", char_type);
+        field_char
+    };
+
+    let mut deletion = w_del(next_annotation_id(next_id), author, date);
+    deletion
+        .children
+        .push(XMLNode::Element(field_run(fld_char("begin"), &rpr)));
+
     let instruction_text = data
         .semantic
         .as_ref()
         .map(|s| s.to_instruction_text())
         .or_else(|| data.instruction_text.clone());
     if let Some(text) = instruction_text {
-        attr_set(&mut field, "w:instr", text);
+        let mut instruction = w_el("delInstrText");
+        attr_set(&mut instruction, "xml:space", "preserve");
+        instruction.children.push(XMLNode::Text(text));
+        deletion
+            .children
+            .push(XMLNode::Element(field_run(instruction, &rpr)));
     }
     if let Some(result_text) = &data.result_text
         && !result_text.is_empty()
     {
-        let deleted = matches!(container_kind, TrackedContainer::Del);
-        let mut container = match container_kind {
-            TrackedContainer::Del => w_del(next_annotation_id(next_id), author, date),
-            _ => w_ins(next_annotation_id(next_id), author, date),
-        };
-        container.children.push(XMLNode::Element(build_text_run(
+        deletion
+            .children
+            .push(XMLNode::Element(field_run(fld_char("separate"), &rpr)));
+        deletion.children.push(XMLNode::Element(build_text_run(
             result_text,
             wrapper_marks,
             wrapper_style_props,
-            deleted,
+            true,
             None,
             next_id,
         )));
-        field.children.push(XMLNode::Element(container));
     }
-    parent.children.push(XMLNode::Element(field));
+    deletion
+        .children
+        .push(XMLNode::Element(field_run(fld_char("end"), &rpr)));
+    parent.children.push(XMLNode::Element(deletion));
+}
+
+/// Emit the bounded native tracked carrier for one inline content control.
+///
+/// W-SDT-INLINE-DELETE-01 proves the deletion form: a
+/// `customXmlDelRangeStart/End` pair marks the SDT envelope while one `w:del`
+/// inside `w:sdtContent` marks its complete active content. Word canonicalizes
+/// that pair on save, Accept removes the complete control, and Reject restores
+/// it.
+///
+/// Although a complete `w:sdt` is a schema-valid child of `w:ins`, desktop
+/// Word does not reject that shape atomically. The serializer therefore refuses
+/// inserted SDT envelopes instead of emitting an apparently reversible edit.
+fn append_tracked_inline_sdt(
+    parent: &mut Element,
+    opaque: &OpaqueInlineNode,
+    container_kind: &TrackedContainer,
+    author: &str,
+    date: &str,
+    next_id: &mut u32,
+) -> Result<(), RuntimeError> {
+    let Some(raw_xml) = &opaque.raw_xml else {
+        return Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: "inline content control without raw XML cannot be serialized".to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        });
+    };
+    let mut element =
+        crate::word_xml::parse_raw_fragment(raw_xml.as_slice()).map_err(|source| RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "failed to parse inline content control XML".to_string(),
+            details: ErrorDetails {
+                context: Some(format!("opaque_ref={} err={source}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        })?;
+    if !word_xml::is_w_tag(&element, "sdt") {
+        return Err(RuntimeError {
+            code: ErrorCode::InvalidDocx,
+            message: "inline content-control opaque does not contain w:sdt".to_string(),
+            details: ErrorDetails {
+                context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        });
+    }
+
+    match container_kind {
+        TrackedContainer::Ins => Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: "tracked insertion of an inline content-control envelope is not qualified"
+                .to_string(),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!(
+                    "opaque_ref={}: Word Reject All does not remove a complete w:sdt nested in w:ins",
+                    opaque.opaque_ref
+                )),
+                ..ErrorDetails::default()
+            },
+        }),
+        TrackedContainer::Del => {
+            let lock_value = element
+                .children
+                .iter()
+                .filter_map(XMLNode::as_element)
+                .find(|child| word_xml::is_w_tag(child, "sdtPr"))
+                .and_then(|properties| {
+                    properties
+                        .children
+                        .iter()
+                        .filter_map(XMLNode::as_element)
+                        .find(|child| word_xml::is_w_tag(child, "lock"))
+                })
+                .and_then(|lock| attr_get(lock, "w:val"))
+                .cloned();
+            if lock_value
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "unlocked" | "0" | "false" | "off"))
+            {
+                return Err(RuntimeError {
+                    code: ErrorCode::UnsupportedEdit,
+                    message: "tracked deletion of a locked inline content-control envelope is not qualified"
+                        .to_string(),
+                    details: ErrorDetails {
+                        block_id: Some(opaque.id.clone()),
+                        context: Some(format!(
+                            "opaque_ref={} lock={}: native Word Accept All does not reliably settle the deletion carrier",
+                            opaque.opaque_ref,
+                            lock_value.expect("qualified locked value is present")
+                        )),
+                        ..ErrorDetails::default()
+                    },
+                });
+            }
+
+            let content_indexes = element
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    child
+                        .as_element()
+                        .is_some_and(|child| word_xml::is_w_tag(child, "sdtContent"))
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if content_indexes.len() != 1 {
+                return Err(RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: "inline content control must contain exactly one w:sdtContent"
+                        .to_string(),
+                    details: ErrorDetails {
+                        context: Some(format!(
+                            "opaque_ref={} sdtContent_count={}",
+                            opaque.opaque_ref,
+                            content_indexes.len()
+                        )),
+                        ..ErrorDetails::default()
+                    },
+                });
+            }
+            let content_index = content_indexes[0];
+            let XMLNode::Element(content) = &mut element.children[content_index] else {
+                unreachable!("content index was selected from element children")
+            };
+            let mut deletion = w_del(next_annotation_id(next_id), author, date);
+            deletion.children = std::mem::take(&mut content.children);
+            coerce_opaque_run_text(&mut deletion, true);
+            content.children.push(XMLNode::Element(deletion));
+
+            let range_id = next_annotation_id(next_id);
+            let mut start = w_el("customXmlDelRangeStart");
+            attr_set(&mut start, "w:id", range_id.to_string());
+            attr_set(&mut start, "w:author", author);
+            if !date.is_empty() {
+                attr_set(&mut start, "w:date", date);
+            }
+            let mut end = w_el("customXmlDelRangeEnd");
+            attr_set(&mut end, "w:id", range_id.to_string());
+            parent.children.push(XMLNode::Element(start));
+            parent.children.push(XMLNode::Element(element));
+            parent.children.push(XMLNode::Element(end));
+            Ok(())
+        }
+        TrackedContainer::MoveFrom | TrackedContainer::MoveTo => Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: "inline content-control move carrier is not qualified".to_string(),
+            details: ErrorDetails {
+                context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        }),
+    }
 }
 
 /// Split a tracked-container content sequence around inline nodes that are not
 /// allowed inside `w:ins`/`w:del`/`w:moveFrom`/`w:moveTo`.
 ///
 /// Run-level content is grouped into `RunContent` chunks; paragraph-level
-/// structural markers and paragraph-level opaque elements become `DirectInline`
-/// chunks that must be emitted directly on the paragraph to preserve a valid
-/// WordprocessingML content model.
-fn split_tracked_container_chunks<'a>(inlines: &[&'a InlineNode]) -> Vec<TrackedContentChunk<'a>> {
+/// opaque elements and decoration kinds outside the proved tracked subset
+/// become `DirectInline` chunks. Active bookmark markers and typed comment
+/// range markers stay in `RunContent`: CT_RunTrackChange admits them, and
+/// keeping a complete proved range in the same terminal disposition makes
+/// accept/reject remove the semantic range atomically.
+fn split_tracked_container_chunks<'a>(
+    inlines: &[&'a InlineNode],
+    keep_proof_errors_inside: bool,
+) -> Vec<TrackedContentChunk<'a>> {
     let mut chunks = Vec::new();
     let mut acc: Vec<&'a InlineNode> = Vec::new();
     for &inline in inlines {
-        if is_tracked_container_direct_inline(inline) {
+        if is_tracked_container_direct_inline(inline, keep_proof_errors_inside) {
             if !acc.is_empty() {
                 chunks.push(TrackedContentChunk::RunContent(std::mem::take(&mut acc)));
             }
@@ -3874,7 +3994,17 @@ fn emit_tracked_chunks(
             }
             TrackedContentChunk::DirectInline(inline) => {
                 if let InlineNode::OpaqueInline(opaque) = inline
-                    && matches!(opaque.kind, OpaqueKind::OmmlBlock)
+                    && matches!(opaque.kind, OpaqueKind::Sdt)
+                    && matches!(
+                        container_kind,
+                        TrackedContainer::Ins | TrackedContainer::Del
+                    )
+                {
+                    append_tracked_inline_sdt(p, opaque, container_kind, author, date, next_id)?;
+                    continue;
+                }
+                if let InlineNode::OpaqueInline(opaque) = inline
+                    && matches!(opaque.kind, OpaqueKind::OmmlBlock | OpaqueKind::OmmlInline)
                     && matches!(
                         container_kind,
                         TrackedContainer::Del
@@ -3883,14 +4013,7 @@ fn emit_tracked_chunks(
                             | TrackedContainer::MoveTo
                     )
                 {
-                    append_tracked_omml_paragraph_opaque(
-                        p,
-                        opaque,
-                        container_kind,
-                        author,
-                        date,
-                        next_id,
-                    )?;
+                    append_tracked_omml_opaque(p, opaque, container_kind, author, date, next_id)?;
                     continue;
                 }
                 if let Some(set) = emitted_opaques.as_deref_mut()
@@ -3926,12 +4049,9 @@ fn emit_tracked_chunks(
                     );
                     continue;
                 }
-                // A paragraph-level `fldSimple` whose insertion/deletion is tracked
-                // at the segment level must likewise wrap its result run in the
-                // tracked container; `<w:fldSimple>` cannot be a child of
-                // `<w:ins>`/`<w:del>` (I-TC-001), so the run goes inside the field.
-                // Without this Word reads the field as permanent content and
-                // accept/reject of a deleted/inserted field would not revert.
+                // `w:fldSimple` cannot ride inside `w:ins`/`w:del`
+                // (I-TC-001). Lower the qualified shape to one balanced complex
+                // field inside the whole-field revision instead.
                 if let InlineNode::OpaqueInline(opaque) = inline
                     && let OpaqueKind::Field(data) = &opaque.kind
                     && data.field_kind == FieldKind::Simple
@@ -3954,22 +4074,17 @@ fn emit_tracked_chunks(
                             date,
                             next_id,
                         ),
-                        // A DELETED pre-existing field keeps the historical
-                        // shape (field direct on the paragraph, result run
-                        // wrapped in w:del). Known gap: Word reads the field
-                        // shell as permanent content on reject; lowering the
-                        // delete path needs w:delInstrText and its own oracle
-                        // pass.
-                        _ => append_tracked_simple_field_paragraph_opaque(
+                        TrackedContainer::Del => append_tracked_deleted_complex_field(
                             p,
                             data,
                             &opaque.wrapper_marks,
                             &opaque.wrapper_style_props,
-                            container_kind,
+                            &opaque.kind,
                             author,
                             date,
                             next_id,
                         ),
+                        _ => unreachable!("simple field branch admits only insertion/deletion"),
                     }
                     continue;
                 }
@@ -4042,7 +4157,7 @@ fn emit_segment(
         }
         TrackingStatus::Inserted(rev) => {
             let segment_refs: Vec<&InlineNode> = segment.inlines.iter().collect();
-            let chunks = split_tracked_container_chunks(&segment_refs);
+            let chunks = split_tracked_container_chunks(&segment_refs, shared_wire_id.is_some());
             let author = rev.author.as_deref().unwrap_or("");
             let date = rev.date.as_deref().unwrap_or("");
             emit_tracked_chunks(
@@ -4065,7 +4180,7 @@ fn emit_segment(
         }
         TrackingStatus::Deleted(rev) => {
             let segment_refs: Vec<&InlineNode> = segment.inlines.iter().collect();
-            let chunks = split_tracked_container_chunks(&segment_refs);
+            let chunks = split_tracked_container_chunks(&segment_refs, shared_wire_id.is_some());
             let author = rev.author.as_deref().unwrap_or("");
             let date = rev.date.as_deref().unwrap_or("");
             emit_tracked_chunks(
@@ -4095,7 +4210,7 @@ fn emit_segment(
             // text as pending-inserted and pending-deleted, resolving per the
             // origin rules (verified against real Word).
             let segment_refs: Vec<&InlineNode> = segment.inlines.iter().collect();
-            let chunks = split_tracked_container_chunks(&segment_refs);
+            let chunks = split_tracked_container_chunks(&segment_refs, false);
             let mut ins_wrapper = w_ins(
                 next_annotation_id(next_id),
                 sr.inserted.author.as_deref().unwrap_or(""),
@@ -4156,8 +4271,8 @@ fn emit_interleaved_del_ins(
 
     let del_refs: Vec<&InlineNode> = del_segment.inlines.iter().collect();
     let ins_refs: Vec<&InlineNode> = ins_segment.inlines.iter().collect();
-    let del_chunks = split_tracked_container_chunks(&del_refs);
-    let ins_chunks = split_tracked_container_chunks(&ins_refs);
+    let del_chunks = split_tracked_container_chunks(&del_refs, false);
+    let ins_chunks = split_tracked_container_chunks(&ins_refs, false);
 
     // Walk both chunk lists. At each opaque boundary:
     // 1. Emit del RunContent in <w:del>
@@ -4342,7 +4457,7 @@ fn opaque_raw_element_requires_run_wrapper(element: &Element) -> bool {
     // were run widgets on import but missing from this list, so they were emitted
     // bare at paragraph level and Word refused the file. See the invariant test
     // `every_run_widget_requires_a_run_wrapper`.
-    crate::word_ir::is_run_widget(name)
+    (name != "oMath" && crate::word_ir::is_run_widget(name))
         // Serializer-only run-inner content that word_ir models as atoms (text,
         // breaks, tabs) rather than opaque widgets, plus the mc:AlternateContent
         // choice wrapper — none are in RUN_WIDGET_NAMES but all are still only
@@ -4386,8 +4501,8 @@ fn rename_w_local(element: &mut Element, new_local: &str) {
 /// `w:txbxContent` is deliberately NOT descended into: a textbox is a separate
 /// story whose runs stay `w:t` even when the drawing that holds it is deleted
 /// (Word accepts that — verified against real Word).
-fn coerce_opaque_run_text(element: &mut Element, deleted: bool) {
-    let local = local_element_name(element);
+pub(crate) fn coerce_opaque_run_text(element: &mut Element, deleted: bool) {
+    let local = local_element_name(element).to_string();
     // Boundaries where descent stops because the run-content text form is
     // governed by the nested container, not the one being emitted:
     // - `w:txbxContent` is a separate story (its runs stay `w:t`), both ways.
@@ -4404,12 +4519,24 @@ fn coerce_opaque_run_text(element: &mut Element, deleted: bool) {
     // handed in — not only its descendants — may be the one to rewrite. A
     // matched element is a text leaf; there is nothing further to descend into.
     let mapped = if deleted {
-        crate::normalize::deleted_run_content_name(local)
+        crate::normalize::deleted_run_content_name(&local)
     } else {
-        crate::normalize::plain_run_content_name(local)
+        crate::normalize::plain_run_content_name(&local)
     };
     if let Some(new_local) = mapped {
+        if matches!(local.as_str(), "t" | "delText") {
+            crate::word_xml::normalize_word_text_boundary_space(element);
+        }
         rename_w_local(element, new_local);
+        // Field-instruction spacing is syntax. Existing implicit instruction
+        // whitespace remains explicit when its tracked content form changes.
+        if matches!(local.as_str(), "instrText" | "delInstrText")
+            && element.get_text().is_some_and(|text| {
+                text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace)
+            })
+        {
+            attr_set(element, "xml:space", "preserve");
+        }
         return;
     }
     for child in element.children.iter_mut() {
@@ -4667,8 +4794,8 @@ impl BookmarkScan {
         }
     }
 
-    /// Scan a raw body-template node (raw-preserved body children are always
-    /// base content: target-origin opaque blocks are never emitted).
+    /// Scan a raw base body-template node. Target-origin opaque blocks use a
+    /// separate target scaffold and are not passed through this method.
     pub(crate) fn scan_raw_node(&mut self, node: &XMLNode) {
         if let XMLNode::Element(el) = node {
             self.record_element_tree(el, "base");
@@ -4808,7 +4935,8 @@ impl BookmarkScan {
 /// = "no target/authored markers in this part": base markers always pass
 /// through untouched.
 #[derive(Default)]
-pub(crate) struct BookmarkIdPolicy {
+#[doc(hidden)]
+pub struct BookmarkIdPolicy {
     actions: HashMap<(OriginClass, RangeFamily, String), RangeIdAction>,
 }
 
@@ -5415,11 +5543,11 @@ fn serialize_border_edge(edge_name: &str, border: &Border) -> Element {
 fn serialize_cnf_style(cnf: &CnfStyle) -> Element {
     let mut cnf_el = w_el("cnfStyle");
     if let Some(ref val) = cnf.val {
-        attr_set(&mut cnf_el, "w:val", val.clone());
+        attr_set(&mut cnf_el, "w:val", val.as_str());
     }
-    let set_bool = |el: &mut Element, name: &str, val: bool| {
-        if val {
-            attr_set(el, &format!("w:{name}"), "1");
+    let set_bool = |el: &mut Element, name: &str, val: Option<bool>| {
+        if let Some(val) = val {
+            attr_set(el, &format!("w:{name}"), if val { "1" } else { "0" });
         }
     };
     set_bool(&mut cnf_el, "firstRow", cnf.first_row);
@@ -5438,7 +5566,58 @@ fn serialize_cnf_style(cnf: &CnfStyle) -> Element {
     set_bool(&mut cnf_el, "firstRowLastColumn", cnf.first_row_last_column);
     set_bool(&mut cnf_el, "lastRowFirstColumn", cnf.last_row_first_column);
     set_bool(&mut cnf_el, "lastRowLastColumn", cnf.last_row_last_column);
+    insert_qualified_attributes(&mut cnf_el, &cnf.extra_attrs);
     cnf_el
+}
+
+fn insert_qualified_attributes(
+    element: &mut Element,
+    attributes: &[crate::domain::QualifiedAttribute],
+) {
+    for attribute in attributes {
+        match (&attribute.prefix, &attribute.namespace) {
+            (Some(prefix), Some(namespace)) => {
+                element
+                    .namespaces
+                    .get_or_insert_with(Namespace::empty)
+                    .put(prefix, namespace);
+            }
+            (None, None) => {}
+            _ => panic!(
+                "qualified extra attribute {} must carry prefix and namespace together",
+                attribute.local_name
+            ),
+        }
+        element.attributes.insert(
+            AttributeName {
+                local_name: attribute.local_name.clone(),
+                namespace: attribute.namespace.clone(),
+                prefix: attribute.prefix.clone(),
+            },
+            attribute.value.clone(),
+        );
+    }
+}
+
+pub(crate) fn serialize_direct_num_pr(numbering: &crate::domain::DirectParagraphNumPr) -> Element {
+    let mut num_pr = w_el("numPr");
+    insert_qualified_attributes(&mut num_pr, &numbering.extra_attrs);
+    if let Some(ilvl) = numbering.ilvl {
+        let mut ilvl_element = w_el("ilvl");
+        attr_set(&mut ilvl_element, "w:val", ilvl.to_string());
+        num_pr.children.push(XMLNode::Element(ilvl_element));
+    }
+    if let Some(num_id) = numbering.num_id {
+        let mut num_id_element = w_el("numId");
+        attr_set(&mut num_id_element, "w:val", num_id.to_string());
+        num_pr.children.push(XMLNode::Element(num_id_element));
+    }
+    for preserved in &numbering.preserved {
+        let element = crate::word_xml::parse_raw_fragment(preserved.raw_xml.as_bytes())
+            .expect("validated previous numPr remainder must remain parseable");
+        num_pr.children.push(XMLNode::Element(element));
+    }
+    num_pr
 }
 
 /// Serialize a `w:tblPrEx` element (§17.4.61, CT_TblPrEx) from a TableFormatting.
@@ -5492,6 +5671,11 @@ fn serialize_tbl_pr_ex(fmt: &TableFormatting) -> Element {
             borders,
         )));
     }
+    // shd
+    if let Some(ref shading) = fmt.shading {
+        el.children
+            .push(XMLNode::Element(serialize_shading(shading)));
+    }
     // tblLayout
     if let Some(ref layout) = fmt.layout {
         let mut tbl_layout = w_el("tblLayout");
@@ -5543,7 +5727,36 @@ fn serialize_tbl_pr_ex(fmt: &TableFormatting) -> Element {
         );
         el.children.push(XMLNode::Element(look_el));
     }
+    insert_preserved_children(
+        &mut el,
+        &fmt.preserved,
+        crate::docx_validate_ordering::TBLPREX_ORDER,
+    );
     el
+}
+
+fn unsupported_tbl_pr_ex_field(formatting: &TableFormatting) -> Option<&'static str> {
+    if formatting.style_id.is_some() {
+        Some("style_id")
+    } else if !formatting.grid_cols.is_empty() {
+        Some("grid_cols")
+    } else if formatting.positioning.is_some() {
+        Some("positioning")
+    } else if formatting.overlap.is_some() {
+        Some("overlap")
+    } else if formatting.row_band_size.is_some() {
+        Some("row_band_size")
+    } else if formatting.col_band_size.is_some() {
+        Some("col_band_size")
+    } else if formatting.bidi_visual {
+        Some("bidi_visual")
+    } else if formatting.caption.is_some() {
+        Some("caption")
+    } else if formatting.description.is_some() {
+        Some("description")
+    } else {
+        None
+    }
 }
 
 fn serialize_border_set(container_name: &str, borders: &BorderSet) -> Element {
@@ -5595,10 +5808,9 @@ fn serialize_shading(shading: &Shading) -> Element {
     if let Some(ref fill) = shading.fill {
         attr_set(&mut el, "w:fill", fill.clone());
     }
-    // Re-emit preserved theme fills/colors verbatim (RFC-0003).
-    for (qname, value) in &shading.extra_attrs {
-        attr_set(&mut el, qname, value);
-    }
+    // Re-emit preserved theme/extension attributes with their namespace
+    // identity, including a foreign attribute sharing a modeled local name.
+    insert_qualified_attributes(&mut el, &shading.extra_attrs);
     el
 }
 
@@ -5647,6 +5859,178 @@ fn serialize_cell_margins(container_name: &str, margins: &CellMargins) -> Elemen
         el.children.push(XMLNode::Element(m));
     }
     el
+}
+
+/// Serialize the complete authored `CT_TblPr` projection used inside
+/// `w:tblPrChange`. Resolved style values are emitted only when their matching
+/// directness flag proves the table itself authored that property. `grid_cols`
+/// is intentionally excluded: `w:tblGrid` is a sibling and is not revisioned
+/// by `w:tblPrChange`.
+fn serialize_previous_table_properties(fmt: &TableFormatting) -> Element {
+    let mut tbl_pr = w_el("tblPr");
+    if let Some(ref style_id) = fmt.style_id {
+        let mut element = w_el("tblStyle");
+        attr_set(&mut element, "w:val", style_id.clone());
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if let Some(ref position) = fmt.positioning {
+        let mut element = w_el("tblpPr");
+        if let Some(value) = position.left_from_text {
+            attr_set(&mut element, "w:leftFromText", value.to_string());
+        }
+        if let Some(value) = position.right_from_text {
+            attr_set(&mut element, "w:rightFromText", value.to_string());
+        }
+        if let Some(value) = position.top_from_text {
+            attr_set(&mut element, "w:topFromText", value.to_string());
+        }
+        if let Some(value) = position.bottom_from_text {
+            attr_set(&mut element, "w:bottomFromText", value.to_string());
+        }
+        if let Some(ref value) = position.vert_anchor {
+            attr_set(&mut element, "w:vertAnchor", value.to_xml_str());
+        }
+        if let Some(ref value) = position.horz_anchor {
+            attr_set(&mut element, "w:horzAnchor", value.to_xml_str());
+        }
+        if let Some(value) = position.tblp_x {
+            attr_set(&mut element, "w:tblpX", value.to_string());
+        }
+        if let Some(ref value) = position.tblp_x_spec {
+            attr_set(&mut element, "w:tblpXSpec", value.to_xml_str());
+        }
+        if let Some(value) = position.tblp_y {
+            attr_set(&mut element, "w:tblpY", value.to_string());
+        }
+        if let Some(ref value) = position.tblp_y_spec {
+            attr_set(&mut element, "w:tblpYSpec", value.to_xml_str());
+        }
+        for (qname, value) in &position.extra_attrs {
+            attr_set(&mut element, qname, value);
+        }
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if let Some(ref overlap) = fmt.overlap {
+        let mut element = w_el("tblOverlap");
+        attr_set(&mut element, "w:val", overlap.to_xml_str());
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if fmt.bidi_visual {
+        tbl_pr.children.push(XMLNode::Element(w_el("bidiVisual")));
+    }
+    for (name, value) in [
+        ("tblStyleRowBandSize", fmt.row_band_size),
+        ("tblStyleColBandSize", fmt.col_band_size),
+    ] {
+        if let Some(value) = value {
+            let mut element = w_el(name);
+            attr_set(&mut element, "w:val", value.to_string());
+            tbl_pr.children.push(XMLNode::Element(element));
+        }
+    }
+    if let Some(ref width) = fmt.width {
+        tbl_pr
+            .children
+            .push(XMLNode::Element(serialize_table_measurement("tblW", width)));
+    }
+    if fmt.has_direct_alignment
+        && let Some(ref alignment) = fmt.alignment
+    {
+        let mut element = w_el("jc");
+        let value = match alignment {
+            Alignment::Left => "left",
+            Alignment::Center => "center",
+            Alignment::Right => "right",
+            Alignment::Justify => "left",
+            Alignment::Distribute => "distribute",
+            Alignment::HighKashida => "highKashida",
+            Alignment::LowKashida => "lowKashida",
+            Alignment::MediumKashida => "mediumKashida",
+            Alignment::NumTab => "numTab",
+            Alignment::ThaiDistribute => "thaiDistribute",
+        };
+        attr_set(&mut element, "w:val", value);
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if let Some(cell_spacing) = fmt.cell_spacing {
+        let mut element = w_el("tblCellSpacing");
+        attr_set(&mut element, "w:w", cell_spacing.to_string());
+        attr_set(&mut element, "w:type", "dxa");
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if fmt.has_direct_indent
+        && let Some(indent) = fmt.indent
+    {
+        let mut element = w_el("tblInd");
+        attr_set(&mut element, "w:w", indent.to_string());
+        attr_set(&mut element, "w:type", "dxa");
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if fmt.has_direct_borders
+        && let Some(ref borders) = fmt.borders
+    {
+        tbl_pr.children.push(XMLNode::Element(serialize_border_set(
+            "tblBorders",
+            borders,
+        )));
+    }
+    if let Some(ref shading) = fmt.shading {
+        tbl_pr
+            .children
+            .push(XMLNode::Element(serialize_shading(shading)));
+    }
+    if let Some(ref layout) = fmt.layout {
+        let mut element = w_el("tblLayout");
+        attr_set(&mut element, "w:type", layout.to_xml_str());
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    if fmt.has_direct_cell_margins
+        && let Some(ref margins) = fmt.default_cell_margins
+    {
+        tbl_pr
+            .children
+            .push(XMLNode::Element(serialize_cell_margins(
+                "tblCellMar",
+                margins,
+            )));
+    }
+    if fmt.has_direct_tbl_look
+        && let Some(ref look) = fmt.tbl_look
+    {
+        let mut element = w_el("tblLook");
+        if let Some(ref value) = look.val {
+            attr_set(&mut element, "w:val", value.clone());
+        }
+        for (name, value) in [
+            ("w:firstRow", look.first_row),
+            ("w:lastRow", look.last_row),
+            ("w:firstColumn", look.first_column),
+            ("w:lastColumn", look.last_column),
+            ("w:noHBand", look.no_h_band),
+            ("w:noVBand", look.no_v_band),
+        ] {
+            attr_set(&mut element, name, if value { "1" } else { "0" });
+        }
+        tbl_pr.children.push(XMLNode::Element(element));
+    }
+    for (name, value) in [
+        ("tblCaption", fmt.caption.as_ref()),
+        ("tblDescription", fmt.description.as_ref()),
+    ] {
+        if let Some(value) = value {
+            let mut element = w_el(name);
+            attr_set(&mut element, "w:val", value.clone());
+            tbl_pr.children.push(XMLNode::Element(element));
+        }
+    }
+    if !fmt.preserved.is_empty() {
+        insert_preserved_children(
+            &mut tbl_pr,
+            &fmt.preserved,
+            crate::docx_validate_ordering::TBLPR_ORDER,
+        );
+    }
+    tbl_pr
 }
 
 fn serialize_table_node(
@@ -5917,28 +6301,7 @@ fn serialize_table_node(
             if let Some(ref date) = fc.date {
                 attr_set(&mut tbl_pr_change, "w:date", date.clone());
             }
-            let mut prev_tbl_pr = w_el("tblPr");
-            if let Some(ref width) = fc.previous_width {
-                prev_tbl_pr
-                    .children
-                    .push(XMLNode::Element(serialize_table_measurement("tblW", width)));
-            }
-            if let Some(ref borders) = fc.previous_borders {
-                prev_tbl_pr
-                    .children
-                    .push(XMLNode::Element(serialize_border_set(
-                        "tblBorders",
-                        borders,
-                    )));
-            }
-            if let Some(ref margins) = fc.previous_default_cell_margins {
-                prev_tbl_pr
-                    .children
-                    .push(XMLNode::Element(serialize_cell_margins(
-                        "tblCellMar",
-                        margins,
-                    )));
-            }
+            let prev_tbl_pr = serialize_previous_table_properties(&fc.previous);
             tbl_pr_change.children.push(XMLNode::Element(prev_tbl_pr));
             tbl_pr.children.push(XMLNode::Element(tbl_pr_change));
         }
@@ -5967,7 +6330,7 @@ fn serialize_table_node(
         tbl.children.push(XMLNode::Element(tbl_grid));
     }
 
-    for row in &table.rows {
+    for (row_index, row) in table.rows.iter().enumerate() {
         // Invariant backstop (§17.4.72 `CT_Row` requires `tc+`): a `<w:tr>` must
         // carry at least one `<w:tc>`. A cell-less row is never a legal wire
         // shape — the engine's own importer refuses it — so emitting one would
@@ -6010,6 +6373,7 @@ fn serialize_table_node(
             w_after: _,           // → trPr (wAfter)
             cnf_style: _,         // → trPr (cnfStyle)
             tbl_pr_ex: _,         // → tblPrEx (row's first child, before trPr)
+            tbl_pr_ex_change: _,  // → tblPrEx/tblPrExChange
             cell_spacing: _,      // → trPr (tblCellSpacing)
             preserved: _,         // → trPr (preserved remainder: divId/hidden/vendor)
         } = row;
@@ -6021,8 +6385,57 @@ fn serialize_table_node(
             attr_set(&mut tr, "w14:textId", id.clone());
         }
         // w:tblPrEx is the row's FIRST child (before w:trPr), §17.4.61.
-        if let Some(ref ex) = row.tbl_pr_ex {
-            tr.children.push(XMLNode::Element(serialize_tbl_pr_ex(ex)));
+        if row.tbl_pr_ex.is_some() || row.tbl_pr_ex_change.is_some() {
+            for (projection, formatting) in [
+                ("current", row.tbl_pr_ex.as_ref()),
+                (
+                    "previous",
+                    row.tbl_pr_ex_change
+                        .as_ref()
+                        .and_then(|change| change.previous.as_ref()),
+                ),
+            ] {
+                if let Some(field) = formatting.and_then(unsupported_tbl_pr_ex_field) {
+                    return Err(RuntimeError {
+                        code: ErrorCode::InternalError,
+                        message: format!(
+                            "serializer refused {projection} row tblPrEx field {field:?} outside CT_TblPrEx"
+                        ),
+                        details: ErrorDetails {
+                            block_id: Some(table.id.clone()),
+                            context: Some(format!("table {} row {row_index} tblPrEx", table.id.0)),
+                            ..ErrorDetails::default()
+                        },
+                    });
+                }
+            }
+            let mut tbl_pr_ex = row
+                .tbl_pr_ex
+                .as_ref()
+                .map_or_else(|| w_el("tblPrEx"), serialize_tbl_pr_ex);
+            if let Some(ref change) = row.tbl_pr_ex_change {
+                let mut change_el = w_el("tblPrExChange");
+                attr_set(
+                    &mut change_el,
+                    "w:id",
+                    if change.revision_id != 0 {
+                        change.revision_id.to_string()
+                    } else {
+                        next_annotation_id(next_id).to_string()
+                    },
+                );
+                attr_set(&mut change_el, "w:author", change.author.clone());
+                if let Some(ref date) = change.date {
+                    attr_set(&mut change_el, "w:date", date.clone());
+                }
+                let previous = change
+                    .previous
+                    .as_ref()
+                    .map_or_else(|| w_el("tblPrEx"), serialize_tbl_pr_ex);
+                change_el.children.push(XMLNode::Element(previous));
+                tbl_pr_ex.children.push(XMLNode::Element(change_el));
+            }
+            tr.children.push(XMLNode::Element(tbl_pr_ex));
         }
         let mut tr_pr = w_el("trPr");
         let mut has_tr_pr = false;
@@ -6162,6 +6575,11 @@ fn serialize_table_node(
                 attr_set(&mut tr_pr_change, "w:date", date.clone());
             }
             let mut prev_tr_pr = w_el("trPr");
+            if let Some(ref cnf_style) = fc.previous_cnf_style {
+                prev_tr_pr
+                    .children
+                    .push(XMLNode::Element(serialize_cnf_style(cnf_style)));
+            }
             if let Some(height) = fc.previous_height {
                 let mut tr_height = w_el("trHeight");
                 attr_set(&mut tr_height, "w:val", height.to_string());
@@ -6367,6 +6785,11 @@ fn serialize_table_node(
                     attr_set(&mut tc_pr_change, "w:date", date.clone());
                 }
                 let mut prev_tc_pr = w_el("tcPr");
+                if let Some(ref cnf_style) = fc.previous_cnf_style {
+                    prev_tc_pr
+                        .children
+                        .push(XMLNode::Element(serialize_cnf_style(cnf_style)));
+                }
                 if let Some(ref width) = fc.previous_width {
                     prev_tc_pr
                         .children
@@ -6597,9 +7020,10 @@ fn cell_sdt_wrap_error(cell_id: &NodeId, why: &str, w: &CellSdtWrap, n: usize) -
 // `crate::serialize::serialize_*_part` / `sync_note_like_part` call sites
 // resolve unchanged.
 mod notes;
+#[doc(hidden)]
+pub use notes::{serialize_comments_extended_part, serialize_comments_ids_part};
 pub(crate) use notes::{
-    serialize_comments_extended_part, serialize_comments_ids_part, serialize_comments_part,
-    serialize_endnotes_part, serialize_footnotes_part,
+    serialize_comments_part, serialize_endnotes_part, serialize_footnotes_part,
 };
 
 // SDT (content control) `w:sdtPr` builder — owned by the WrapInContentControl
@@ -6757,12 +7181,358 @@ fn build_hyperlink_run(run: &HyperlinkRun, deleted: bool) -> Element {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::{Cursor, Read};
 
-    use zip::ZipArchive;
+    use crate::domain::{
+        CellFormatting, CellFormattingChange, DocFingerprint, DocMeta, NoteType,
+        RowFormattingChange, TableFormattingChange, TablePropertyExceptionChange, WidthType,
+        normal_tracked_block,
+    };
+    use crate::{DocxRuntime, SimpleRuntime};
 
-    use crate::domain::NoteType;
-    use crate::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
+    fn tracked_chunk_test_text(id: &str, text: &str) -> InlineNode {
+        InlineNode::from(TextNode {
+            id: NodeId::from(id),
+            text_role: None,
+            text: text.to_string(),
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: crate::domain::RunRprAuthored::default(),
+            source_run_attrs: Vec::new(),
+            formatting_change: None,
+        })
+    }
+
+    fn tracked_chunk_test_decoration(
+        id: &str,
+        kind: crate::domain::DecorationType,
+        raw_xml: &[u8],
+    ) -> InlineNode {
+        InlineNode::from(crate::domain::DecorationNode {
+            id: NodeId::from(id),
+            kind,
+            opaque_ref: format!("test:{id}"),
+            proof_ref: crate::domain::ProofRef {
+                part: crate::domain::DocPart::DocumentXml,
+                block_id: NodeId::from(id),
+                docx_anchor: format!("test:{id}"),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
+            raw_xml: Some(raw_xml.to_vec()),
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn proof_error_stays_inside_one_tracked_content_chunk() {
+        let left = tracked_chunk_test_text("left", "before");
+        let proof = tracked_chunk_test_decoration(
+            "proof",
+            crate::domain::DecorationType::ProofError,
+            br#"<w:proofErr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:type="spellStart"/>"#,
+        );
+        let right = tracked_chunk_test_text("right", "after");
+        let chunks = split_tracked_container_chunks(&[&left, &proof, &right], true);
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [TrackedContentChunk::RunContent(content)] if content.len() == 3
+        ));
+
+        let local_chunks = split_tracked_container_chunks(&[&left, &proof, &right], false);
+        assert!(matches!(
+            local_chunks.as_slice(),
+            [
+                TrackedContentChunk::RunContent(left),
+                TrackedContentChunk::DirectInline(_),
+                TrackedContentChunk::RunContent(right)
+            ] if left.len() == 1 && right.len() == 1
+        ));
+    }
+
+    #[test]
+    fn unqualified_range_still_interrupts_tracked_content_chunks() {
+        let left = tracked_chunk_test_text("left", "before");
+        let permission = tracked_chunk_test_decoration(
+            "permission",
+            crate::domain::DecorationType::PermissionRange,
+            br#"<w:permStart xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="1" w:ed="everyone"/>"#,
+        );
+        let right = tracked_chunk_test_text("right", "after");
+        let chunks = split_tracked_container_chunks(&[&left, &permission, &right], true);
+
+        assert!(matches!(
+            chunks.as_slice(),
+            [
+                TrackedContentChunk::RunContent(left),
+                TrackedContentChunk::DirectInline(_),
+                TrackedContentChunk::RunContent(right)
+            ] if left.len() == 1 && right.len() == 1
+        ));
+    }
+
+    #[test]
+    fn deleted_simple_field_is_one_balanced_complex_field_revision() {
+        let data = FieldData {
+            field_kind: FieldKind::Simple,
+            instruction_text: Some("NUMWORDS".to_string()),
+            result_text: Some("12".to_string()),
+            semantic: Some(
+                crate::domain::parse_field_instruction("NUMWORDS")
+                    .expect("test instruction is modeled"),
+            ),
+        };
+        let kind = OpaqueKind::Field(data.clone());
+        let mut paragraph = w_el("p");
+        let mut next_id = 1;
+
+        append_tracked_deleted_complex_field(
+            &mut paragraph,
+            &data,
+            &[],
+            &StyleProps::default(),
+            &kind,
+            "Stemma",
+            "2026-08-25T00:00:00Z",
+            &mut next_id,
+        );
+
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&paragraph))
+            .expect("serialized paragraph is UTF-8");
+        assert_eq!(xml.matches("<w:del ").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<w:fldChar ").count(), 3, "{xml}");
+        assert!(
+            xml.contains("<w:delInstrText xml:space=\"preserve\">NUMWORDS</w:delInstrText>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<w:delText>12</w:delText>"), "{xml}");
+        assert!(!xml.contains("fldSimple"), "{xml}");
+        assert!(!xml.contains("<w:instrText"), "{xml}");
+    }
+
+    fn author_test_revision(id: u32, author: &str) -> RevisionInfo {
+        RevisionInfo {
+            revision_id: id,
+            author: Some(author.to_string()),
+            date: None,
+            apply_op_id: None,
+            identity: id,
+        }
+    }
+
+    fn author_test_document(blocks: Vec<TrackedBlock>) -> CanonDoc {
+        CanonDoc {
+            id: NodeId::from("author-test"),
+            blocks,
+            meta: DocMeta {
+                schema_version: "test".to_string(),
+                docx_fingerprint: DocFingerprint("test".to_string()),
+                internal_ids_version: "test".to_string(),
+            },
+            headers: Vec::new(),
+            footers: Vec::new(),
+            footnotes: Vec::new(),
+            endnotes: Vec::new(),
+            comments: Vec::new(),
+            comments_extended: Vec::new(),
+            body_section_properties: None,
+            body_section_property_change: None,
+            compat_settings: Default::default(),
+            even_and_odd_headers: None,
+            document_background: None,
+            document_protection: None,
+        }
+    }
+
+    fn author_test_paragraph(paragraph_author: &str, run_author: &str) -> TrackedBlock {
+        let mut paragraph = ParagraphNode::new_story_body("p", "text", None);
+        paragraph.formatting_change = Some(crate::edit::snapshot_paragraph_formatting(
+            &paragraph,
+            &author_test_revision(1, paragraph_author),
+        ));
+        let InlineNode::Text(text) = &mut paragraph.segments[0].inlines[0] else {
+            unreachable!("new_story_body emits text")
+        };
+        text.formatting_change = Some(FormattingChange {
+            carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
+            previous_marks: Vec::new(),
+            previous_style_props: StyleProps::default(),
+            previous_rpr_authored: Default::default(),
+            revision_id: 2,
+            author: run_author.to_string(),
+            date: None,
+            identity: 2,
+        });
+        normal_tracked_block(BlockNode::from(paragraph))
+    }
+
+    fn author_test_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
+        TableCellNode {
+            id: NodeId::from(id),
+            blocks,
+            grid_span: 1,
+            v_merge: VerticalMerge::None,
+            formatting: CellFormatting::default(),
+            formatting_change: None,
+            tracking_status: None,
+            row_sdt_wrapper: None,
+            content_sdt_wraps: Vec::new(),
+            cnf_style: None,
+            hide_mark: false,
+            preserved: Vec::new(),
+        }
+    }
+
+    fn author_test_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
+        TableRowNode {
+            id: NodeId::from(id),
+            cells,
+            grid_before: 0,
+            grid_after: 0,
+            tracking_status: None,
+            is_header: false,
+            height: None,
+            height_rule: None,
+            formatting_change: None,
+            para_id: None,
+            text_id: None,
+            cant_split: false,
+            jc: None,
+            w_before: None,
+            w_after: None,
+            cnf_style: None,
+            tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
+            cell_spacing: None,
+            preserved: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn author_census_omits_anonymous_inline_and_paragraph_formatting() {
+        let document = author_test_document(vec![author_test_paragraph("", "")]);
+        assert!(collect_tracked_change_authors(&document).is_empty());
+    }
+
+    #[test]
+    fn row_table_property_exception_change_serializes_required_nested_snapshot() {
+        let paragraph = ParagraphNode::new_story_body("cell-p", "same", None);
+        let mut row = author_test_row(
+            "row",
+            vec![author_test_cell("cell", vec![BlockNode::from(paragraph)])],
+        );
+        row.tbl_pr_ex_change = Some(TablePropertyExceptionChange {
+            previous: Some(TableFormatting {
+                width: Some(TableMeasurement {
+                    w: 2_400,
+                    width_type: WidthType::Dxa,
+                    pct_literal: None,
+                }),
+                ..TableFormatting::default()
+            }),
+            revision_id: 7,
+            identity: 7,
+            author: "A".to_string(),
+            date: None,
+        });
+        let table = TableNode {
+            id: NodeId::from("table"),
+            structure_hash: crate::import::compute_table_structure_hash(&[row.clone()]),
+            rows: vec![row],
+            formatting: TableFormatting::default(),
+            formatting_change: None,
+        };
+        let mut next_id = 100;
+        let element = serialize_table_node(
+            &table,
+            &TrackingStatus::Normal,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "test",
+        )
+        .expect("valid table-property-exception revision");
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+            .expect("serialized XML is UTF-8");
+        assert!(xml.contains("<w:tblPrEx><w:tblPrExChange"));
+        assert!(xml.contains("w:id=\"7\""));
+        assert!(xml.contains("<w:tblPrEx><w:tblW"));
+        assert!(xml.contains("w:w=\"2400\""));
+    }
+
+    #[test]
+    fn author_census_includes_named_formatting_sorted_and_unique() {
+        let mut block = author_test_paragraph("Zulu", "Alpha");
+        block.status = TrackingStatus::Inserted(author_test_revision(3, "Alpha"));
+        let document = author_test_document(vec![block]);
+        assert_eq!(
+            collect_tracked_change_authors(&document),
+            vec!["Alpha".to_string(), "Zulu".to_string()]
+        );
+    }
+
+    #[test]
+    fn author_census_descends_into_nested_table_row_and_cell_carriers() {
+        let mut inner_cell = author_test_cell("inner-cell", Vec::new());
+        inner_cell.tracking_status =
+            Some(TrackingStatus::Deleted(author_test_revision(3, "Bravo")));
+        inner_cell.formatting_change = Some(CellFormattingChange {
+            previous_width: None,
+            previous_borders: None,
+            previous_shading: None,
+            previous_v_align: None,
+            previous_margins: None,
+            previous_no_wrap: None,
+            previous_text_direction: None,
+            previous_tc_fit_text: None,
+            previous_cnf_style: None,
+            revision_id: 4,
+            author: "Charlie".to_string(),
+            date: None,
+            identity: 4,
+        });
+        let mut inner_row = author_test_row("inner-row", vec![inner_cell]);
+        inner_row.tracking_status =
+            Some(TrackingStatus::Inserted(author_test_revision(1, "Alpha")));
+        inner_row.formatting_change = Some(RowFormattingChange {
+            previous_height: None,
+            previous_height_rule: None,
+            previous_cnf_style: None,
+            revision_id: 5,
+            author: "Echo".to_string(),
+            date: None,
+            identity: 5,
+        });
+        let inner_table = TableNode {
+            id: NodeId::from("inner-table"),
+            rows: vec![inner_row],
+            structure_hash: "inner".to_string(),
+            formatting: TableFormatting::default(),
+            formatting_change: Some(TableFormattingChange {
+                previous: TableFormatting::default(),
+                revision_id: 6,
+                author: "Delta".to_string(),
+                date: None,
+                identity: 6,
+            }),
+        };
+        let outer_cell = author_test_cell("outer-cell", vec![BlockNode::from(inner_table)]);
+        let outer_row = author_test_row("outer-row", vec![outer_cell]);
+        let outer_table = TableNode {
+            id: NodeId::from("outer-table"),
+            rows: vec![outer_row],
+            structure_hash: "outer".to_string(),
+            formatting: TableFormatting::default(),
+            formatting_change: None,
+        };
+        let document =
+            author_test_document(vec![normal_tracked_block(BlockNode::from(outer_table))]);
+
+        assert_eq!(
+            collect_tracked_change_authors(&document),
+            ["Alpha", "Bravo", "Charlie", "Delta", "Echo"].map(str::to_string)
+        );
+    }
 
     // ── bookmark id policy ───────────────────────────────────────────────
     //
@@ -6811,6 +7581,7 @@ mod tests {
             w_after: None,
             cnf_style: None,
             tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
             cell_spacing: None,
             preserved: Vec::new(),
         };
@@ -6870,15 +7641,19 @@ mod tests {
     // ── run-wrapper predicate cannot drift from word_ir's widget list ────
     //
     // Every element word_ir classifies as a run widget is a member of
-    // EG_RunInnerContent and is only legal inside `w:r`. If the serializer
-    // emits such an element bare at paragraph level, Word refuses the file
-    // entirely. This test pins the invariant at the whitelist level so the
-    // whole drift class (not just the pgNum/contentPart instance that first
-    // exposed it) can never regress silently.
+    // EG_RunInnerContent. With the one explicit Office Math exception below,
+    // those elements are only legal inside `w:r`; emitting one bare at
+    // paragraph level makes Word refuse the file. `m:oMath` is also admitted
+    // directly by paragraph and tracked-run containers, and Word Reject loses
+    // its payload when it is placed inside a synthetic `w:r`.
     #[test]
     fn every_run_widget_requires_a_run_wrapper() {
         for name in crate::word_ir::RUN_WIDGET_NAMES {
             let element = w_el(name);
+            if *name == "oMath" {
+                assert!(!opaque_raw_element_requires_run_wrapper(&element));
+                continue;
+            }
             assert!(
                 opaque_raw_element_requires_run_wrapper(&element),
                 "run widget `{name}` (EG_RunInnerContent) must be re-wrapped in \
@@ -6918,6 +7693,36 @@ mod tests {
         assert!(
             !out.contains("<w:delText>caption</w:delText>"),
             "textbox run text must NOT be converted to w:delText: {out}"
+        );
+    }
+
+    #[test]
+    fn coerce_opaque_run_text_deleted_discards_unpreserved_boundary_spaces() {
+        let raw = br#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:t>Click </w:t></w:r>"#;
+        let mut element =
+            crate::word_xml::parse_raw_fragment(raw).expect("witness run fragment parses");
+        coerce_opaque_run_text(&mut element, /*deleted=*/ true);
+        let out = String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+            .expect("serialized fragment is utf-8");
+
+        assert!(
+            out.contains("<w:delText>Click</w:delText>"),
+            "deleted-form coercion must not activate ignored source whitespace: {out}"
+        );
+    }
+
+    #[test]
+    fn coerce_opaque_run_text_deleted_preserves_explicit_boundary_spaces() {
+        let raw = br#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:t xml:space="preserve">Click </w:t></w:r>"#;
+        let mut element =
+            crate::word_xml::parse_raw_fragment(raw).expect("witness run fragment parses");
+        coerce_opaque_run_text(&mut element, /*deleted=*/ true);
+        let out = String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+            .expect("serialized fragment is utf-8");
+
+        assert!(
+            out.contains(r#"<w:delText xml:space="preserve">Click </w:delText>"#),
+            "explicitly preserved source whitespace must remain active: {out}"
         );
     }
 
@@ -7186,6 +7991,226 @@ mod tests {
             cnf_style: None,
             preserved_ppr: Vec::new(),
         }
+    }
+
+    fn paragraph_formatting_change_for_ppr_test() -> crate::domain::ParagraphFormattingChange {
+        let mut source = minimal_paragraph_for_ppr_test();
+        source.has_direct_numbering = false;
+        crate::edit::snapshot_paragraph_formatting(
+            &source,
+            &crate::domain::RevisionInfo {
+                revision_id: 17,
+                author: Some("tester".to_string()),
+                date: None,
+                apply_op_id: None,
+                identity: 17,
+            },
+        )
+    }
+
+    fn serialized_ppr_xml(paragraph: &ParagraphNode) -> String {
+        let mut next_id = 1;
+        let ppr = build_paragraph_properties(paragraph, &mut next_id, None)
+            .expect("tracked paragraph properties serialize");
+        String::from_utf8(crate::word_xml::serialize_raw_fragment(&ppr)).expect("pPr is UTF-8")
+    }
+
+    #[test]
+    fn ppr_change_serializes_only_previous_direct_not_effective_defaults() {
+        let mut change = paragraph_formatting_change_for_ppr_test();
+        change.previous.direct.widow_control = None;
+        change.previous.effective.widow_control = Some(true);
+        let paragraph = ParagraphNode {
+            formatting_change: Some(change),
+            ..minimal_paragraph_for_ppr_test()
+        };
+
+        let xml = serialized_ppr_xml(&paragraph);
+        assert!(xml.contains("pPrChange"));
+        assert!(
+            !xml.contains("widowControl"),
+            "effective spec default must not become authored previous pPr: {xml}"
+        );
+    }
+
+    #[test]
+    fn unchanged_previous_paragraph_mark_emits_authored_rfonts_and_off_toggles() {
+        let rfonts = crate::domain::AuthoredRFonts {
+            ascii: Some("MarkFont".into()),
+            ..crate::domain::AuthoredRFonts::default()
+        };
+        let rpr_off = crate::domain::ParaMarkRprOff {
+            bold_off: true,
+            ..crate::domain::ParaMarkRprOff::default()
+        };
+        let mut change = paragraph_formatting_change_for_ppr_test();
+        change.previous.paragraph_mark.rfonts = rfonts.clone();
+        change.previous.paragraph_mark.rpr_off = rpr_off;
+        let paragraph = ParagraphNode {
+            paragraph_mark_rfonts: rfonts,
+            paragraph_mark_rpr_off: rpr_off,
+            formatting_change: Some(change),
+            ..minimal_paragraph_for_ppr_test()
+        };
+
+        let xml = serialized_ppr_xml(&paragraph);
+        assert!(xml.contains(r#"<w:rFonts w:ascii="MarkFont""#), "{xml}");
+        assert!(xml.contains(r#"<w:b w:val="0""#), "{xml}");
+    }
+
+    #[test]
+    fn combined_paragraph_and_mark_change_uses_disjoint_previous_snapshots() {
+        let mut change = paragraph_formatting_change_for_ppr_test();
+        change.carrier =
+            crate::domain::ParagraphFormattingChangeCarrier::ParagraphAndMarkProperties;
+        change.previous.direct.alignment = Some(crate::domain::Alignment::Center);
+        change.previous.paragraph_mark.marks = vec![crate::domain::Mark::Italic];
+        let paragraph = ParagraphNode {
+            align: Some(crate::domain::Alignment::Right),
+            has_direct_align: true,
+            paragraph_mark_marks: vec![crate::domain::Mark::Bold],
+            formatting_change: Some(change),
+            ..minimal_paragraph_for_ppr_test()
+        };
+
+        let xml = serialized_ppr_xml(&paragraph);
+        assert!(xml.contains("<w:rPrChange"), "{xml}");
+        assert!(xml.contains("<w:i"), "{xml}");
+        let previous_ppr = xml
+            .split("<w:pPrChange")
+            .nth(1)
+            .expect("serialized previous paragraph properties");
+        assert!(previous_ppr.contains(r#"<w:jc w:val="center""#), "{xml}");
+        assert!(
+            !previous_ppr.contains("<w:rPr"),
+            "the previous pilcrow belongs only to rPrChange: {xml}"
+        );
+    }
+
+    #[test]
+    fn combined_paragraph_and_mark_change_uses_distinct_wire_ids() {
+        let mut change = paragraph_formatting_change_for_ppr_test();
+        change.revision_id = 17;
+        change.carrier =
+            crate::domain::ParagraphFormattingChangeCarrier::ParagraphAndMarkProperties;
+        change.previous.paragraph_mark.marks = vec![crate::domain::Mark::Italic];
+        let paragraph = ParagraphNode {
+            paragraph_mark_marks: vec![crate::domain::Mark::Bold],
+            formatting_change: Some(change),
+            ..minimal_paragraph_for_ppr_test()
+        };
+        // The package serializer guarantees that this counter starts above
+        // every modeled revision ID; model that precondition directly here.
+        let mut next_id = 18;
+        let ppr = build_paragraph_properties(&paragraph, &mut next_id, None)
+            .expect("combined property change should serialize");
+        let xml =
+            String::from_utf8(crate::word_xml::serialize_raw_fragment(&ppr)).expect("pPr is UTF-8");
+
+        assert!(xml.contains(r#"<w:rPrChange w:id="18""#), "{xml}");
+        assert!(xml.contains(r#"<w:pPrChange w:id="17""#), "{xml}");
+        assert_eq!(next_id, 19, "the mark carrier consumes one fresh wire ID");
+    }
+
+    #[test]
+    fn paragraph_mark_only_change_does_not_emit_ppr_change() {
+        let mut change = paragraph_formatting_change_for_ppr_test();
+        change.revision_id = 17;
+        change.carrier = crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties;
+        change.previous.paragraph_mark.marks = vec![crate::domain::Mark::Italic];
+        let paragraph = ParagraphNode {
+            paragraph_mark_marks: vec![crate::domain::Mark::Bold],
+            formatting_change: Some(change),
+            ..minimal_paragraph_for_ppr_test()
+        };
+        let mut next_id = 18;
+        let ppr = build_paragraph_properties(&paragraph, &mut next_id, None)
+            .expect("mark-only formatting change should serialize a pPr/rPr carrier");
+        let xml =
+            String::from_utf8(crate::word_xml::serialize_raw_fragment(&ppr)).expect("pPr is UTF-8");
+
+        assert!(xml.contains(r#"<w:rPrChange w:id="18""#), "{xml}");
+        assert!(!xml.contains("<w:pPrChange"), "{xml}");
+        assert_eq!(next_id, 19);
+    }
+
+    #[test]
+    fn ppr_change_numbering_lowering_covers_absent_suppressed_and_active() {
+        use crate::domain::DirectParagraphNumbering;
+
+        let mut absent = paragraph_formatting_change_for_ppr_test();
+        absent.previous.direct.numbering = DirectParagraphNumbering::Absent;
+        let absent_xml = serialized_ppr_xml(&ParagraphNode {
+            formatting_change: Some(absent),
+            ..minimal_paragraph_for_ppr_test()
+        });
+        assert!(!absent_xml.contains("<w:numPr"));
+
+        let mut suppressed = paragraph_formatting_change_for_ppr_test();
+        suppressed.previous.direct.numbering = DirectParagraphNumbering::suppressed();
+        let suppressed_xml = serialized_ppr_xml(&ParagraphNode {
+            formatting_change: Some(suppressed),
+            ..minimal_paragraph_for_ppr_test()
+        });
+        assert!(suppressed_xml.contains(r#"<w:numId w:val="0""#));
+
+        let mut active = paragraph_formatting_change_for_ppr_test();
+        active.previous.direct.numbering = DirectParagraphNumbering::active(7, 2);
+        let active_xml = serialized_ppr_xml(&ParagraphNode {
+            formatting_change: Some(active),
+            ..minimal_paragraph_for_ppr_test()
+        });
+        assert!(active_xml.contains(r#"<w:ilvl w:val="2""#));
+        assert!(active_xml.contains(r#"<w:numId w:val="7""#));
+
+        let mut partial = paragraph_formatting_change_for_ppr_test();
+        partial.previous.direct.numbering = DirectParagraphNumbering::Present(
+            crate::domain::DirectParagraphNumPr {
+                num_id: None,
+                ilvl: Some(3),
+                extra_attrs: vec![crate::domain::QualifiedAttribute {
+                    local_name: "proof".into(),
+                    prefix: Some("x".into()),
+                    namespace: Some("urn:numbering-proof".into()),
+                    value: "kept".into(),
+                }],
+                preserved: vec![crate::domain::PreservedProp {
+                    name: "w:ins".into(),
+                    raw_xml: r#"<w:ins xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="4" w:author="A"/>"#.into(),
+                }],
+            },
+        );
+        let partial_xml = serialized_ppr_xml(&ParagraphNode {
+            formatting_change: Some(partial),
+            ..minimal_paragraph_for_ppr_test()
+        });
+        assert!(partial_xml.contains(r#"<w:ilvl w:val="3""#));
+        assert!(!partial_xml.contains("<w:numId"));
+        assert!(partial_xml.contains(r#"xmlns:x="urn:numbering-proof""#));
+        assert!(partial_xml.contains("<w:ins"));
+    }
+
+    #[test]
+    fn cnf_extra_attribute_reemits_its_namespace_binding() {
+        let cnf = CnfStyle {
+            first_row: Some(false),
+            extra_attrs: vec![crate::domain::QualifiedAttribute {
+                local_name: "firstRow".into(),
+                prefix: Some("x".into()),
+                namespace: Some("urn:foreign".into()),
+                value: "true".into(),
+            }],
+            ..CnfStyle::default()
+        };
+
+        let bytes = crate::word_xml::serialize_raw_fragment(&serialize_cnf_style(&cnf));
+        let xml = String::from_utf8(bytes.clone()).expect("cnfStyle is UTF-8");
+        assert!(xml.contains(r#"xmlns:x="urn:foreign""#), "{xml}");
+        let reparsed = crate::word_xml::parse_raw_fragment(&bytes).expect("valid cnfStyle XML");
+        assert_eq!(
+            crate::word_ir::parse_cnf_style_element(&reparsed).expect("typed cnfStyle"),
+            cnf
+        );
     }
 
     /// A preserved `w:suppressLineNumbers` (Annex A position between
@@ -7569,47 +8594,6 @@ mod tests {
     }
 
     #[test]
-    fn singapore_redline_note_separators_stay_wrapped_in_runs() {
-        let before = fs::read("testdata/safe-us-vs-singapore/before.docx").expect("read before");
-        let after = fs::read("testdata/safe-us-vs-singapore/after.docx").expect("read after");
-        let runtime = SimpleRuntime::new();
-        let import_before = runtime.import_docx(&before).expect("import before");
-        let import_after = runtime.import_docx(&after).expect("import after");
-        runtime
-            .diff_and_redline(
-                &import_before.doc_handle,
-                &import_after.doc_handle,
-                TransactionMeta {
-                    author: "serialize_test".to_string(),
-                    reason: Some("separator note serialization regression".to_string()),
-                    timestamp_utc: Some("2026-03-26T00:00:00Z".to_string()),
-                },
-            )
-            .expect("diff_and_redline");
-        let redline = runtime
-            .export_docx(&import_before.doc_handle, ExportMode::Redline)
-            .expect("export redline");
-        let mut zip = ZipArchive::new(Cursor::new(redline)).expect("open redline zip");
-
-        for part_name in ["word/footnotes.xml", "word/endnotes.xml"] {
-            let mut file = zip
-                .by_name(part_name)
-                .unwrap_or_else(|e| panic!("{part_name}: {e}"));
-            let mut xml = String::new();
-            file.read_to_string(&mut xml)
-                .unwrap_or_else(|e| panic!("read {part_name}: {e}"));
-            assert!(
-                xml.contains("<w:r><w:separator"),
-                "{part_name} should wrap separator notes in w:r, xml={xml}"
-            );
-            assert!(
-                xml.contains("<w:r><w:continuationSeparator"),
-                "{part_name} should wrap continuationSeparator notes in w:r, xml={xml}"
-            );
-        }
-    }
-
-    #[test]
     fn append_literal_prefix_runs_emits_space_separator_with_leading_tab() {
         fn collect_run_text(run: &Element) -> String {
             let mut out = String::new();
@@ -7757,6 +8741,111 @@ mod tests {
         assert!(
             xml.contains("w:rsidR=\"00112233\""),
             "source run provenance must remain: {xml}"
+        );
+    }
+
+    #[test]
+    fn literal_prefix_tracking_follows_terminal_body_presence() {
+        fn body_text(id: &str, value: &str) -> InlineNode {
+            InlineNode::from(crate::domain::TextNode {
+                id: NodeId::from(id),
+                text_role: None,
+                text: value.to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunDirectness::default(),
+                source_run_attrs: Vec::new(),
+                formatting_change: None,
+            })
+        }
+
+        let revision = crate::domain::RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("tester".to_string()),
+            date: Some("2026-08-16T00:00:00Z".to_string()),
+            apply_op_id: None,
+        };
+        let mut paragraph = minimal_paragraph_for_ppr_test();
+        paragraph.literal_prefix = Some("A)".to_string());
+        paragraph.literal_prefix_trailing_ws = " ".to_string();
+        paragraph.literal_prefix_leading_rpr = Some(Box::new(crate::domain::PrefixLeadingRpr {
+            marks: Vec::new(),
+            style_props: StyleProps::default(),
+            rpr_authored: RunDirectness::default(),
+            source_runs: vec![crate::domain::LiteralPrefixSourceRun {
+                text: "A) ".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                rpr_authored: RunDirectness::default(),
+                source_run_attrs: Vec::new(),
+                joins_body: true,
+            }],
+        }));
+        paragraph.segments = vec![
+            TrackedSegment {
+                status: TrackingStatus::Deleted(revision.clone()),
+                inlines: vec![body_text("old", "Direct values")],
+            },
+            TrackedSegment {
+                status: TrackingStatus::Inserted(revision.clone()),
+                inlines: vec![body_text("new", "Highlight values")],
+            },
+        ];
+
+        let mut next_id = 1;
+        let serialized = serialize_paragraph_node(
+            &paragraph,
+            None,
+            false,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "base",
+            None,
+        )
+        .expect("tracked body with an unchanged prefix is serializable");
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&serialized))
+            .expect("serialized paragraph is utf-8");
+
+        assert_eq!(xml.matches("A)").count(), 1, "prefix appears once: {xml}");
+        assert!(
+            xml.find("A)").expect("prefix") < xml.find("<w:del").expect("deletion"),
+            "unchanged prefix must precede the tracked body containers: {xml}"
+        );
+        let deleted = xml
+            .split_once("<w:del")
+            .and_then(|(_, rest)| rest.split_once("</w:del>"))
+            .map(|(body, _)| body)
+            .expect("deletion container");
+        assert!(
+            !deleted.contains("A)"),
+            "unchanged prefix must not inherit deletion status: {xml}"
+        );
+
+        paragraph.segments = vec![TrackedSegment {
+            status: TrackingStatus::Deleted(revision),
+            inlines: vec![body_text("removed", "Direct values")],
+        }];
+        let serialized = serialize_paragraph_node(
+            &paragraph,
+            None,
+            false,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "base",
+            None,
+        )
+        .expect("complete tracked deletion with a prefix is serializable");
+        let xml = String::from_utf8(crate::word_xml::serialize_raw_fragment(&serialized))
+            .expect("serialized paragraph is utf-8");
+        let deleted = xml
+            .split_once("<w:del")
+            .and_then(|(_, rest)| rest.split_once("</w:del>"))
+            .map(|(body, _)| body)
+            .expect("deletion container");
+        assert!(
+            deleted.contains("A)"),
+            "prefix must share the status of a complete body deletion: {xml}"
         );
     }
 
@@ -8437,6 +9526,138 @@ mod tests {
         assert_eq!(
             del_text_local, "delText",
             "runs inside <w:del> must use <w:delText>, not <w:t>"
+        );
+    }
+
+    #[test]
+    fn deleted_hyperlink_source_run_keeps_unpreserved_boundary_whitespace_ignored() {
+        let run = HyperlinkRun {
+            text: "Click ".to_string(),
+            rpr_xml: None,
+            additional_rpr_xml: Vec::new(),
+            // Word ignores the final space because xml:space does not preserve
+            // it. Changing the carrier must not activate that raw whitespace.
+            source_xml: Some(
+                br#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:t>Click </w:t></w:r>"#
+                    .to_vec(),
+            ),
+            source_run_attrs: Vec::new(),
+            status: TrackingStatus::Normal,
+        };
+
+        let element = build_hyperlink_run(&run, /*deleted=*/ true);
+        let out = String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+            .expect("serialized run is utf-8");
+        assert!(
+            out.contains("<w:delText>Click</w:delText>"),
+            "deleting a hyperlink run must preserve its active text semantics: {out}"
+        );
+    }
+
+    #[test]
+    fn deleted_hyperlink_source_run_preserves_explicit_boundary_whitespace() {
+        let run = HyperlinkRun {
+            text: "Click ".to_string(),
+            rpr_xml: None,
+            additional_rpr_xml: Vec::new(),
+            source_xml: Some(
+                br#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:t xml:space="preserve">Click </w:t></w:r>"#
+                    .to_vec(),
+            ),
+            source_run_attrs: Vec::new(),
+            status: TrackingStatus::Normal,
+        };
+
+        let element = build_hyperlink_run(&run, /*deleted=*/ true);
+        let out = String::from_utf8(crate::word_xml::serialize_raw_fragment(&element))
+            .expect("serialized run is utf-8");
+        assert!(
+            out.contains(r#"<w:delText xml:space="preserve">Click </w:delText>"#),
+            "explicitly preserved hyperlink whitespace must survive deletion: {out}"
+        );
+    }
+
+    /// Whole-block tracking changes the status of content; it does not change
+    /// the target block's multiplicity. Two semantically identical hyperlinks
+    /// are two ordered document occurrences and both must survive serialization.
+    #[test]
+    fn inserted_paragraph_preserves_duplicate_hyperlink_occurrences() {
+        use crate::domain::{DocPart, OpaqueInlineNode, OpaqueKind, ProofRef, RevisionInfo};
+
+        fn link(id: &str) -> InlineNode {
+            InlineNode::from(OpaqueInlineNode {
+                id: crate::domain::NodeId::from(id),
+                kind: OpaqueKind::Hyperlink(HyperlinkData {
+                    url: None,
+                    anchor: Some("same-target".to_string()),
+                    text: "[1]".to_string(),
+                    r_id: None,
+                    runs: vec![HyperlinkRun {
+                        text: "[1]".to_string(),
+                        rpr_xml: None,
+                        additional_rpr_xml: Vec::new(),
+                        source_xml: None,
+                        source_run_attrs: Vec::new(),
+                        status: TrackingStatus::Normal,
+                    }],
+                    extra_attrs: Vec::new(),
+                }),
+                opaque_ref: format!("p1:{id}"),
+                proof_ref: ProofRef {
+                    part: DocPart::DocumentXml,
+                    block_id: crate::domain::NodeId::from("p1"),
+                    docx_anchor: format!("p1:{id}"),
+                },
+                wrapper_marks: Vec::new(),
+                wrapper_style_props: StyleProps::default(),
+                source_run_attrs: Vec::new(),
+                joins_following_text_run: false,
+                raw_xml: None,
+                content_hash: None,
+            })
+        }
+
+        fn count_hyperlinks(element: &Element) -> usize {
+            usize::from(local_element_name(element) == "hyperlink")
+                + element
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        XMLNode::Element(child) => Some(count_hyperlinks(child)),
+                        _ => None,
+                    })
+                    .sum::<usize>()
+        }
+
+        let mut paragraph = minimal_paragraph_for_ppr_test();
+        paragraph.segments = vec![TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: vec![link("link-1"), link("link-2")],
+        }];
+        let inserted = TrackingStatus::Inserted(RevisionInfo {
+            revision_id: 42,
+            identity: 0,
+            author: Some("Test".to_string()),
+            date: Some("2026-01-01T00:00:00Z".to_string()),
+            apply_op_id: None,
+        });
+        let mut next_id = 100;
+
+        let serialized = serialize_paragraph_node(
+            &paragraph,
+            Some(&inserted),
+            false,
+            &mut next_id,
+            &BookmarkIdPolicy::default(),
+            "target",
+            None,
+        )
+        .expect("a whole-inserted paragraph with duplicate hyperlinks is serializable");
+
+        assert_eq!(
+            count_hyperlinks(&serialized),
+            2,
+            "serialization must preserve both ordered hyperlink occurrences"
         );
     }
 

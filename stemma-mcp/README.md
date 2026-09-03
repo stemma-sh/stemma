@@ -77,9 +77,9 @@ startup rather than silently selecting a surface.
 
 | Tool | What it does |
 |---|---|
-| `open_docx` | Open a workspace-confined `.docx`; returns a `doc_id`, exact `input_artifact` identity, and a compact `index`. It also hosts the optional complete task declaration (`task`) or a later target binding (`task_id`). |
+| `open_docx` | Open a workspace-confined `.docx`; returns a `doc_id`, exact `input_artifact` identity, import `diagnostics`, and a compact `index`. It also hosts the optional complete task declaration (`task`) or a later target binding (`task_id`). |
 | `save_docx` | Export an open doc (including tracked changes) to a new `.docx` path. Gates the bytes through the engine's post-serialization OOXML linker and refuses an existing destination or input alias. |
-| `compare_docx` | Diff two `.docx` files and commit a redline to a new path (target with tracked changes vs base). |
+| `compare_docx` | Diff two `.docx` files and commit a redline to a new path (target with tracked changes vs base). Reports semantic `change_count`, pending Word `revision_count`, and source-labelled import diagnostics. |
 
 ### Read / navigate (comprehension)
 

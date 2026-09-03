@@ -147,6 +147,70 @@ fn explicit_vmerge_continue_value_roundtrips_verbatim() {
 }
 
 #[test]
+fn vmerge_continue_below_gridbefore_is_word_lenient_standalone_cell() {
+    // Word extension to ISO §17.4.84: a continuation without an aligned active
+    // restart remains visible as a standalone cell and Word preserves the
+    // marker on save. gridBefore makes this a useful alignment witness but does
+    // not invent a merge owner in the omitted slot.
+    let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:trPr><w:gridBefore w:val="1"/></w:trPr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>RIGHT</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:vMerge/></w:tcPr><w:p><w:r><w:t>IMPLICIT</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>RIGHT 2</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
+    let input = make_docx(body, &[]);
+
+    let document = Document::parse(&input).expect("Word-lenient continuation parses");
+    let reading = document
+        .read_accepted()
+        .expect("accepted reading")
+        .to_text();
+    assert!(reading.contains("IMPLICIT"));
+    assert!(reading.contains("RIGHT"));
+    let serialized = document
+        .serialize(&ExportOptions::default())
+        .expect("standalone continuation serializes through the blocking gate");
+    assert_eq!(
+        document_xml_of(&serialized),
+        document_xml_of(&input),
+        "reading Word's standalone continuation must not re-author the untouched table"
+    );
+    assert_opens_clean(
+        &serialized,
+        "Word's orphan vMerge marker below gridBefore remains package-valid after serialization",
+    );
+}
+
+/// Word's own save normalization may remove a row-level gridBefore/gridAfter
+/// declaration and write `w:gridSpan w:val="0"` on the continuation instead.
+/// Word treats zero as one active column, but the exact sentinel is part of its
+/// authored physical form and must survive a no-op Stemma round trip.
+#[test]
+fn word_saved_zero_gridspan_vmerge_sentinel_roundtrips() {
+    let bodies = [
+        r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>RIGHT</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:gridSpan w:val="0"/><w:vMerge/></w:tcPr><w:p><w:r><w:t>IMPLICIT</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>RIGHT 2</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#,
+        r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>LEFT</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>LEFT 2</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:gridSpan w:val="0"/><w:vMerge/></w:tcPr><w:p><w:r><w:t>IMPLICIT</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#,
+    ];
+
+    for body in bodies {
+        let input = make_docx(body, &[]);
+        let document = Document::parse(&input).expect("Word-saved sentinel parses");
+        let reading = document
+            .read_accepted()
+            .expect("accepted reading")
+            .to_text();
+        assert!(reading.contains("IMPLICIT"));
+        let serialized = document
+            .serialize(&ExportOptions::default())
+            .expect("Word-saved sentinel serializes");
+        assert_eq!(
+            document_xml_of(&serialized),
+            document_xml_of(&input),
+            "Word's zero gridSpan sentinel must survive an untouched round trip"
+        );
+        assert_opens_clean(
+            &serialized,
+            "Word-saved zero-gridSpan vMerge sentinel remains package-valid",
+        );
+    }
+}
+
+#[test]
 fn gridspan_exceeding_grid_augments_grid_serializer_preserves_span() {
     // ISO 29500-1 §17.4.17 (gridSpan); §17.18.10 (ST_DecimalNumber); §17.4.70.
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:gridSpan w:val="3"/></w:tcPr><w:p><w:r><w:t>WIDE</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
@@ -283,7 +347,6 @@ fn gridafter_exceeding_remaining_grid_is_ignored_not_truncating() {
     );
 }
 
-#[ignore = "open question: ISO §17.4.84 — substantive merge-consumption gap: stemma surfaces the vMerge continuation cell's stored text as a separate visible cell ('ANCHOR HIDDEN') instead of suppressing it into the anchor's merged region ('ANCHOR'); pending confirmation against real Word for the suppression-on-read behaviour"]
 #[test]
 fn vmerge_continue_content_suppressed_on_accepted_read() {
     // ISO 29500-1 §17.4.84 (vMerge); §17.18.57 (ST_Merge).

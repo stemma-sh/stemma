@@ -1,7 +1,7 @@
 //! Stemma: a typed-IR DOCX compiler.
 //!
-//! Parses DOCX into a canonical IR, diffs and merges with tracked-change
-//! semantics, applies typed edit transactions, and serializes back to DOCX.
+//! Parses DOCX into a canonical IR, applies typed edits with native tracked-
+//! change semantics, and serializes back to DOCX.
 //!
 //! # Entity model
 //!
@@ -17,7 +17,7 @@
 //! | edit/refactor spec | [`crate::edit::EditTransaction`] | **durable** — small JSON |
 //! | code generator | [`crate::serialize`] / [`SimpleRuntime::export_docx`] | pure function |
 //! | build cache | [`SimpleRuntime`]'s handle store | in-memory only |
-//! | diff output | [`DocumentDiff`], [`ApplyResult`] | derived |
+//! | edit output | [`ApplyResult`] | derived |
 //!
 //! ## What's durable, what isn't
 //!
@@ -47,7 +47,7 @@
 //! Either way, the engine itself owns no durable state.
 
 // ===========================================================================
-// Public surface — semver scope for v0.1.0
+// Public surface — semver scope for the current 0.x minor line
 // ===========================================================================
 //
 // Stemma's *intended* public surface is the [`api::Document`] facade. Build a
@@ -56,14 +56,15 @@
 //
 // Modules live in four tiers:
 //
-// 1. **The facade** — [`mod@api`]. The stable, documented v0.1.0 surface.
+// 1. **The facade** — [`mod@api`]. The supported, documented facade for the
+//    current 0.x minor line.
 //
-// 2. **The typed IR / domain model** — [`mod@domain`], [`mod@diff`],
-//    [`mod@table`], [`mod@table_diff`], [`mod@tracked_model`],
+// 2. **The typed IR / domain model** — [`mod@domain`], [`mod@table`],
+//    [`mod@tracked_model`],
 //    [`mod@vocabulary`], [`mod@semantic_hash`], [`mod@redline_extract`],
-//    [`mod@roundtrip_compare`]. The typed CanonDoc and its derived/diff
-//    views. Downstream redline/diff pipelines
-//    build on these directly. They are public but engine-version-bound: do
+//    [`mod@roundtrip_compare`]. The typed CanonDoc and its derived views.
+//    Downstream compilers such as `stemma-diff` build on these directly.
+//    They are public but engine-version-bound: do
 //    not persist the IR (see the crate docs above).
 //
 // 3. **The engine API (UNSTABLE)** — [`mod@edit`], [`mod@edit_v4`],
@@ -89,15 +90,16 @@
 // --- Tier 1: the facade ---------------------------------------------------
 pub mod api;
 pub mod audit;
+mod audit_delta;
 
 // --- Tier 2: the typed IR / domain model ----------------------------------
-pub mod diff;
 pub mod domain;
+mod local_change;
 pub mod redline_extract;
 pub mod roundtrip_compare;
 pub mod semantic_hash;
 pub mod table;
-pub mod table_diff;
+mod table_edit;
 pub mod tracked_model;
 pub mod vocabulary;
 
@@ -131,6 +133,7 @@ pub(crate) mod docx_package;
 pub(crate) mod docx_validate_namespaces;
 pub(crate) mod docx_validate_ordering;
 pub(crate) mod docx_validate_xref;
+pub(crate) mod package_ops;
 pub(crate) mod serialize;
 pub(crate) mod settings;
 pub(crate) mod styles;
@@ -147,35 +150,16 @@ pub(crate) mod xml_write;
 // namespace), which holds the report types.
 pub use api::audit;
 pub use audit::*;
-pub use diff::*;
 pub use domain::*;
 pub use import::{build_canonical_from_docx_preserving_tracked, build_image_data_lookup};
 pub use runtime::*;
 pub use semantic_hash::*;
+#[doc(hidden)]
+pub use word_ir::TabStopDef;
 // Opaque style-table handle for re-resolving style-inherited run marks on
 // accept/reject outside the runtime projection (see `reject_all_with_styles`).
 // The `styles` module stays crate-private; only this token is public.
 pub use styles::StyleTable;
 pub use table::*;
-pub use table_diff::*;
+pub use table_edit::*;
 pub use tracked_model::*;
-
-// Compile-check the Rust snippets embedded in the narrative docs pages: each
-// page is included as a hidden doctest carrier, so its `rust,no_run` fences
-// build against the real facade in `cargo test --doc` (part of the gate)
-// instead of silently drifting from the API they document.
-#[cfg(doctest)]
-#[doc = include_str!("../../docs/reference/embedding.md")]
-pub struct EmbeddingPageSnippets;
-
-#[cfg(doctest)]
-#[doc = include_str!("../../docs/guide/persistence.md")]
-pub struct PersistencePageSnippets;
-
-#[cfg(doctest)]
-#[doc = include_str!("../../docs/guide/concepts.md")]
-pub struct ConceptsPageSnippets;
-
-#[cfg(doctest)]
-#[doc = include_str!("../../docs/guide/revisions.md")]
-pub struct RevisionsPageSnippets;

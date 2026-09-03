@@ -126,6 +126,20 @@ pub(crate) const TBLPR_ORDER: &[&str] = &[
     "tblPrChange",
 ];
 
+/// CT_TblPrExBase + CT_TblPrEx sequence (§17.4.61 / Annex A).
+pub(crate) const TBLPREX_ORDER: &[&str] = &[
+    "tblW",
+    "jc",
+    "tblCellSpacing",
+    "tblInd",
+    "tblBorders",
+    "shd",
+    "tblLayout",
+    "tblCellMar",
+    "tblLook",
+    "tblPrExChange",
+];
+
 /// CT_TrPrBase + CT_TrPr sequence (§17.4.82 / Annex A).
 pub(crate) const TRPR_ORDER: &[&str] = &[
     "cnfStyle",
@@ -217,6 +231,14 @@ fn check_element_ordering_recursive(
             TBLPR_ORDER,
             "I-ORD-003",
             "w:tblPr",
+            part_name,
+            findings,
+        ),
+        "tblPrEx" => check_children_order(
+            element,
+            TBLPREX_ORDER,
+            "I-ORD-006",
+            "w:tblPrEx",
             part_name,
             findings,
         ),

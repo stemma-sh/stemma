@@ -11,8 +11,8 @@
 //! insert/delete, so it bypasses segment lowering entirely.
 //!
 //! The existing accept/reject projection already resolves `formatting_change`
-//! (`tracked_model.rs`: reject restores `previous_alignment` /
-//! `previous_indentation` / `previous_spacing`; accept clears the change,
+//! (`tracked_model.rs`: reject restores the separate previous direct/effective
+//! projections; accept clears the change,
 //! keeping the new pPr), and the serializer already emits the complete inner
 //! pPr snapshot for `w:pPrChange`. So this verb is a pure authoring-side lift.
 //!

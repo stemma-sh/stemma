@@ -413,7 +413,7 @@ fn new_comments_root() -> Element {
 /// `w14:paraId` referenced here (set by the comments verb at authoring time);
 /// the paraIds are not allocated here, so there is no collision with the
 /// serializer's annotation-id allocator.
-pub(crate) fn serialize_comments_extended_part(
+pub fn serialize_comments_extended_part(
     base_pkg: &mut DocxPackage,
     records: &[CommentExtended],
 ) -> Result<(), RuntimeError> {
@@ -477,7 +477,7 @@ pub(crate) fn serialize_comments_extended_part(
 /// consistent with the whole-thread delete contract. Word does not require the
 /// part, so we NEVER create it where it was absent — a document without it is
 /// left untouched.
-pub(crate) fn serialize_comments_ids_part(
+pub fn serialize_comments_ids_part(
     base_pkg: &mut DocxPackage,
     comments: &[CommentStory],
 ) -> Result<(), RuntimeError> {

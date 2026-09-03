@@ -1,9 +1,11 @@
 //! Integration tests for `InsertEquation` (Verb A) — inserting an OMML
-//! equation (inline `m:oMath` / block `m:oMathPara`) as a tracked change.
+//! equation (inline `m:oMath` tracked, block `m:oMathPara` direct).
 //!
 //! Contract under test (CLAUDE.md "no silent fallbacks"; domain-model §11):
-//!  - the equation is added as a tracked insert: accept-all has the OMML opaque,
-//!    reject-all reconstructs the baseline;
+//!  - inline equations are added as tracked inserts: accept-all has the OMML
+//!    opaque and reject-all reconstructs the baseline;
+//!  - tracked block equations refuse because native Word has no qualified
+//!    carrier; direct block equations remain supported;
 //!  - fail-loud at the edge: garbage XML ⇒ `EquationXmlInvalid`; a non-math
 //!    fragment ⇒ `EquationNotMath`; a placement/root mismatch ⇒ `EquationNotMath`;
 //!  - the opaque round-trips through serialize → reparse;
@@ -152,15 +154,16 @@ fn inline_equation_accept_has_omml_reject_is_baseline() {
     );
 }
 
-/// Block equation: tracked insert via the existing `m:oMathPara` tracked
-/// container. accept-all keeps it; reject-all restores the baseline.
+/// Block equation: tracked insertion refuses before mutation because native
+/// Word does not reliably resolve a direct `w:ins > m:oMathPara` carrier.
 #[test]
-fn block_equation_accept_has_omml_reject_is_baseline() {
-    let doc = Document::parse(&make_docx("Einstein famously wrote")).expect("parse");
-    let block_id = first_block_id(&doc.snapshot().canonical);
-
-    let edited = doc
-        .apply(&txn(
+fn tracked_block_equation_refuses() {
+    let base = Document::parse(&make_docx("Einstein famously wrote")).expect("parse");
+    let canon = base.snapshot().canonical.clone();
+    let block_id = first_block_id(&canon);
+    let err = apply_transaction(
+        &canon,
+        &txn(
             vec![step(
                 block_id,
                 "wrote",
@@ -168,21 +171,12 @@ fn block_equation_accept_has_omml_reject_is_baseline() {
                 EquationPlacement::Block,
             )],
             MaterializationMode::TrackedChange,
-        ))
-        .expect("apply");
-
-    let accepted = edited.project(Resolution::AcceptAll).expect("accept");
-    assert_eq!(
-        omml_anchor_count(&accepted.snapshot().canonical),
-        1,
-        "accept-all must keep the inserted block equation"
-    );
-
-    let rejected = edited.project(Resolution::RejectAll).expect("reject");
-    assert_eq!(
-        omml_anchor_count(&rejected.snapshot().canonical),
-        0,
-        "reject-all must reconstruct the baseline (no equation)"
+        ),
+    )
+    .expect_err("tracked block math must refuse");
+    assert!(
+        matches!(err, EditError::TrackedBlockEquationUnsupported { .. }),
+        "got {err:?}"
     );
 }
 
@@ -317,7 +311,7 @@ fn block_equation_roundtrips_and_validates() {
                 omath_para(),
                 EquationPlacement::Block,
             )],
-            MaterializationMode::TrackedChange,
+            MaterializationMode::Direct,
         ))
         .expect("apply");
 

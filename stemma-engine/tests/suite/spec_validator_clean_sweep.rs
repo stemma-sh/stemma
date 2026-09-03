@@ -33,6 +33,10 @@ const EXPECTED_IMPORT_FAILURES: &[&str] = &[
     "testdata/spec-compliance/edge-cases/empty-table-cells/input.docx",
     // Empty table (zero rows) violates §17.4.37 (requires non-zero rows).
     "testdata/spec-compliance/edge-cases/empty-table-zero-rows/input.docx",
+    // A continuation without a preceding vMerge restart is non-conformant.
+    "testdata/spec-compliance/table-borders-audit/vmerge-continue-no-restart/input.docx",
+    // Row 2 continues a two-column vMerge with a one-column cell.
+    "testdata/spec-compliance/table-content-model/vmerge-grid/input.docx",
 ];
 
 /// Exemption is by fixture identity, not by host path spelling: discovered
