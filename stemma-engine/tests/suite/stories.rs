@@ -3,6 +3,8 @@
 use std::fs;
 use stemma::docx::DocxArchive;
 use stemma::{DocxRuntime, ExportMode, NoteType, SimpleRuntime, TransactionMeta};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 /// Test that headers and footers are parsed from safe-us-vs-canada.
 #[test]
@@ -376,34 +378,23 @@ fn redline_preserves_notes_for_wc020() {
     );
 }
 
-/// The safe-us-vs-cayman target has footer4.xml and footer5.xml that the base
-/// doesn't. The redline output must include all header/footer files from both
-/// source documents.
+/// The natural Cayman pair reaches an active document-default difference after
+/// story planning. It must refuse that exact package-global boundary rather
+/// than report an unrelated property-history limit.
 #[test]
-fn redline_preserves_all_headers_footers_from_target() {
-    let exported = run_redline(
-        "testdata/safe-us-vs-cayman/before.docx",
-        "testdata/safe-us-vs-cayman/after.docx",
-    );
-    let archive = DocxArchive::read(&exported).expect("read redline archive");
+fn redline_refuses_header_footer_case_with_differing_document_defaults() {
+    let before = fs::read("testdata/safe-us-vs-cayman/before.docx").expect("read before");
+    let after = fs::read("testdata/safe-us-vs-cayman/after.docx").expect("read after");
+    let runtime = SimpleRuntime::new();
+    let base = runtime.import_docx(&before).expect("import before");
+    let target = runtime.import_docx(&after).expect("import after");
 
-    // Target has headers 1-3, footers 1-5, endnotes
-    for i in 1..=3 {
-        assert!(
-            archive.get(&format!("word/header{i}.xml")).is_some(),
-            "redline must contain word/header{i}.xml"
-        );
-    }
-    for i in 1..=5 {
-        assert!(
-            archive.get(&format!("word/footer{i}.xml")).is_some(),
-            "redline must contain word/footer{i}.xml"
-        );
-    }
-    assert!(
-        archive.get("word/endnotes.xml").is_some(),
-        "redline must contain word/endnotes.xml"
-    );
+    let error = runtime
+        .diff_and_redline(&base.doc_handle, &target.doc_handle, redline_meta())
+        .expect_err("unqualified document-default difference must refuse");
+
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(error.message.contains("document defaults"));
 }
 
 /// When a footnote is added in the target, the footnote reference run in the

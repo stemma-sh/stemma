@@ -3,10 +3,10 @@
 A typed-IR DOCX compiler with tracked-change semantics.
 
 Stemma parses a `.docx` into a canonical, typed intermediate representation
-(`CanonDoc`), diffs and merges documents with first-class tracked-change
-semantics, applies typed edit transactions, and serializes back to a `.docx`
-that opens cleanly in Word. A post-serialization OOXML linker checks the output
-for structural violations before bytes leave the engine.
+(`CanonDoc`), applies typed edits with native tracked-change semantics, and
+serializes back to a `.docx` that opens cleanly in Word. A post-serialization
+OOXML linker checks the output for structural violations before bytes leave the
+engine.
 
 > **Pre-1.0.** A `0.x` minor release may break API and wire contracts —
 > deliberately, with changelog notice. The
@@ -14,7 +14,7 @@ for structural violations before bytes leave the engine.
 > states exactly what you can depend on today.
 
 ```
-DOCX bytes -> import -> CanonDoc -> edit / diff -> Transaction -> apply -> CanonDoc -> serialize -> DOCX bytes
+DOCX bytes -> import -> CanonDoc -> Transaction -> apply -> CanonDoc -> serialize -> DOCX bytes
 ```
 
 ## Entity model (the one-paragraph version)
@@ -29,7 +29,7 @@ Think of stemma as a compiler over a long-lived document:
 | compilation unit | `EditSnapshot` (IR + package scaffold) | ephemeral |
 | edit/refactor spec | `edit::EditTransaction` | **durable** — small JSON |
 | code generator | `serialize` / `SimpleRuntime::export_docx` | pure function |
-| diff output | `DocumentDiff`, `ApplyResult` | derived |
+| edit output | `ApplyResult` | derived |
 
 **Persist the DOCX bytes plus the edit transactions.** Together they
 reconstruct any past state: replay the transactions from a stored baseline.
@@ -51,8 +51,13 @@ use stemma::edit_v4::parse_transaction;
 use stemma::{ExportMode, ExportOptions, ValidatorLevel};
 
 // 1. Parse DOCX bytes into the typed model. Fails fast on anything unrecognized
-//    (encrypted package, missing word/document.xml, ...).
+//    (encrypted package, missing officeDocument relationship, ...).
 let doc = Document::parse(&docx_bytes).expect("parse");
+
+// Import-time Word-compatible normalizations are explicit provenance.
+for diagnostic in doc.diagnostics() {
+    eprintln!("import: {}", diagnostic.message);
+}
 
 // 2. Read the designed projection (block ids, roles, visible text, tracked
 //    status, opaque anchors, and the per-block staleness `guard`) — no raw IR
@@ -94,15 +99,15 @@ durable state.
 
 ### Validator levels and the perf tradeoff
 
-The built-in linker (`docx_validate::validate_docx`) re-parses every story part
-multiple times and dominates serialize time (~29s out of ~33s for large
-documents). So `ExportOptions::default()` uses `ValidatorLevel::Off` to keep the
-hot export path fast. Paths that write a file to disk or hand bytes to an
-external surface (the MCP `save_docx` / `compare_docx` tools) opt into
-`ValidatorLevel::Blocking`, which refuses output that violates a structural
-blocking rule (Word would reject the file or lose data). `ValidatorLevel::Full`
-refuses on any error-severity finding. All three share one gate implementation
-(`gate_serialized_bytes`) and the same `BLOCKING_RULES` set.
+The built-in linker (`docx_validate::validate_docx`) re-parses the emitted
+package and is deliberately part of the default correctness boundary.
+`ExportOptions::default()` uses `ValidatorLevel::Blocking`, which refuses
+output that violates a structural blocking rule (Word would reject the file or
+lose data). `ValidatorLevel::Full` refuses on any error-severity finding.
+`ValidatorLevel::Off` is available only through the explicit
+`ExportOptions::unchecked()` constructor for internal bytes that do not leave
+the engine. All three share one gate implementation (`gate_serialized_bytes`)
+and the same `BLOCKING_RULES` set.
 
 ## Public surface
 
@@ -113,10 +118,10 @@ bytes back. New consumers should depend on `api` and nothing else.
 The crate exposes more than the facade, in deliberate tiers (declared and
 documented at the top of [`src/lib.rs`](src/lib.rs)):
 
-1. **Facade** — `api`. The stable, documented v0.2.0 surface.
-2. **Typed IR / domain model** — `domain`, `diff`, `table`, `table_diff`,
-   `tracked_model`, `vocabulary`, `semantic_hash`, `redline_extract`,
-   `roundtrip_compare`. The typed `CanonDoc` and its diff/redline views. These
+1. **Facade** — `api`. The supported surface for the current `0.x` minor line.
+2. **Typed IR / domain model** — `domain`, `table`, `tracked_model`,
+   `vocabulary`, `semantic_hash`, `redline_extract`, `roundtrip_compare`. The
+   typed `CanonDoc` and its native revision views. These
    are public but **engine-version-bound** — do not persist the IR.
 3. **Engine API (UNSTABLE)** — `edit`, `edit_v4`, `view`, `html`,
    `extended_markdown`, `import`, `runtime`, plus the OOXML part-level modules
@@ -129,10 +134,9 @@ documented at the top of [`src/lib.rs`](src/lib.rs)):
    Treat them as "use only if you are inside the workspace and need
    transaction / view / part plumbing the facade does not yet route."
 
-Everything else — the OOXML (de)serializer plumbing, the validator's
-xref/namespace/ordering sub-checks, the styles/settings/word_ir part builders,
-the OPC package writer — is sealed to `pub(crate)`. This keeps the v0.2.0
-semver surface to the tiers above rather than freezing every internal helper.
+Everything else is implementation plumbing. A small set of doc-hidden,
+unstable native/package operations is exposed for downstream Stemma
+subsystems such as `stemma-diff`; it is not part of the supported facade.
 
 ### Why `stemma-mcp` reaches the engine API directly
 

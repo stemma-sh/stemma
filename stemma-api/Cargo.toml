@@ -1,6 +1,6 @@
 [package]
 name = "stemma-api"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # Uniform workspace toolchain floor (see stemma-engine/Cargo.toml for the full
 # derivation). Enforced by the MSRV job in CI.
@@ -22,3 +22,4 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 stemma = { path = "../stemma-engine" }
+stemma-diff = { path = "../stemma-diff" }

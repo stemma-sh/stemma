@@ -110,6 +110,10 @@ pub enum WordIrError {
     UnknownParagraphElement(String),
     UnknownRunElement(String),
     MissingTrackedChangeAttribute(&'static str),
+    InvalidTrackedChangeAttribute {
+        attribute: &'static str,
+        value: String,
+    },
     MissingRequiredAttribute {
         element: String,
         attribute: &'static str,
@@ -117,6 +121,43 @@ pub enum WordIrError {
     InvalidBreakAttribute {
         attribute: &'static str,
         value: String,
+    },
+    InvalidCnfStyleAttribute {
+        attribute: &'static str,
+        value: String,
+    },
+    InvalidCnfStyleMask {
+        value: String,
+    },
+    InvalidParagraphPropertyAttribute {
+        element: &'static str,
+        attribute: &'static str,
+        value: String,
+    },
+    ParagraphPropertyAttributeOutOfRange {
+        element: &'static str,
+        attribute: &'static str,
+        value: String,
+        model: &'static str,
+    },
+    /// `w:numPr` is schema-valid with either coordinate omitted, but the
+    /// standard does not define an effective numbering pair for that partial
+    /// direct state. Preserve/refuse it at this parse boundary rather than
+    /// inventing a coordinate from style state or a positional default.
+    IncompleteDirectNumbering {
+        num_id: Option<u32>,
+        ilvl: Option<u32>,
+    },
+    DuplicateParagraphPropertyElement {
+        parent: &'static str,
+        element: &'static str,
+        count: usize,
+    },
+    UnsupportedDirectNumberingChild {
+        element: String,
+    },
+    UnmodeledDirectNumberingPayload {
+        detail: String,
     },
     /// A tracked-change container nested inside another tracked-change
     /// container reached atom extraction. Silently skipping it (the
@@ -174,6 +215,9 @@ impl fmt::Display for WordIrError {
             WordIrError::MissingTrackedChangeAttribute(attr) => {
                 write!(f, "missing required tracked change attribute: {attr}")
             }
+            WordIrError::InvalidTrackedChangeAttribute { attribute, value } => {
+                write!(f, "invalid tracked change attribute {attribute}: {value:?}")
+            }
             WordIrError::MissingRequiredAttribute { element, attribute } => {
                 write!(
                     f,
@@ -183,6 +227,52 @@ impl fmt::Display for WordIrError {
             WordIrError::InvalidBreakAttribute { attribute, value } => {
                 write!(f, "invalid {attribute} value on w:br: {value:?}")
             }
+            WordIrError::InvalidCnfStyleAttribute { attribute, value } => {
+                write!(f, "invalid w:cnfStyle/@w:{attribute} value: {value:?}")
+            }
+            WordIrError::InvalidCnfStyleMask { value } => {
+                write!(f, "invalid w:cnfStyle/@w:val ST_Cnf mask: {value:?}")
+            }
+            WordIrError::InvalidParagraphPropertyAttribute {
+                element,
+                attribute,
+                value,
+            } => write!(f, "invalid w:{element}/@w:{attribute} value: {value:?}"),
+            WordIrError::ParagraphPropertyAttributeOutOfRange {
+                element,
+                attribute,
+                value,
+                model,
+            } => write!(
+                f,
+                "w:{element}/@w:{attribute} value {value:?} is schema-valid but outside the {model} canonical model"
+            ),
+            WordIrError::IncompleteDirectNumbering { num_id, ilvl } => write!(
+                f,
+                "w:numPr has an incomplete direct numbering pair (numId={num_id:?}, \
+                 ilvl={ilvl:?}); this shape is schema-valid, but no frozen rule proves an \
+                 effective pair, so refusing rather than inheriting a missing coordinate \
+                 or defaulting ilvl to zero"
+            ),
+            WordIrError::DuplicateParagraphPropertyElement {
+                parent,
+                element,
+                count,
+            } => write!(
+                f,
+                "w:{parent} contains {count} w:{element} children; the direct paragraph \
+                 property model requires at most one and refuses first-wins parsing"
+            ),
+            WordIrError::UnsupportedDirectNumberingChild { element } => write!(
+                f,
+                "w:numPr contains unsupported child {element}; tracked numbering children \
+                 must be modeled before they can participate in Accept/Reject projection"
+            ),
+            WordIrError::UnmodeledDirectNumberingPayload { detail } => write!(
+                f,
+                "w:numPr contains unmodeled payload ({detail}); refusing because rebuilding \
+                 the paragraph would otherwise drop authored numbering state"
+            ),
             WordIrError::NestedTrackedChange { outer, inner } => {
                 write!(
                     f,
@@ -528,14 +618,12 @@ pub struct RprChange {
 /// Tracked paragraph formatting change metadata from w:pPrChange (§17.13.5.29).
 /// Contains the previous paragraph properties before a tracked formatting change.
 ///
-/// `extract_ppr_change` parses the inner w:pPr with the same direct
-/// `extract_*` calls the outer paragraph uses, one per inner-pPr child that
-/// has a `previous_*` field on `domain::ParagraphFormattingChange` (see
-/// `PPR_CHANGE_MODELED_CHILDREN`) — so reject can restore the snapshot as
-/// MODEL state, not just as raw XML. Any other inner-pPr child (e.g.
-/// w:suppressLineNumbers, w:numPr, w:outlineLvl) is captured verbatim into
-/// `preserved` rather than dropped — the same discipline
-/// `ParagraphView::preserved` applies to the outer paragraph's pPr.
+/// `extract_ppr_change` parses the inner `w:pPr` into exact authored fields
+/// which are converted into `domain::PreviousParagraphProperties::direct`, so
+/// reject restores model state rather than relying on duplicate raw XML.
+/// Children listed in `PPR_CHANGE_MODELED_CHILDREN` are owned exclusively by
+/// those typed fields; every other inner-pPr child is captured in `preserved`,
+/// following the same remainder discipline as the outer paragraph pPr.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PprChange {
     /// Revision id (`w:id`); 0 when the markup carried none.
@@ -546,6 +634,8 @@ pub struct PprChange {
     pub previous_indentation: Option<IndentProps>,
     /// Previous spacing from the inner w:pPr.
     pub previous_spacing: Option<SpacingProps>,
+    /// Raw previous numbering state from the inner w:pPr/w:numPr.
+    pub previous_numbering: RawPreviousNumPr,
     /// Previous style ID from the inner w:pPr/w:pStyle.
     pub previous_style_id: Option<IStr>,
     /// Previous paragraph borders from the inner w:pPr/w:pBdr.
@@ -560,9 +650,11 @@ pub struct PprChange {
     pub previous_widow_control: Option<bool>,
     /// Previous contextualSpacing from the inner w:pPr.
     pub previous_contextual_spacing: Option<bool>,
-    /// Previous paragraph shading from the inner w:pPr/w:shd: (fill, val, color).
-    pub previous_shading: Option<(Option<String>, Option<String>, Option<String>)>,
-    /// Previous direct tab stops from the inner w:pPr/w:tabs.
+    /// Exact previous paragraph shading from the inner w:pPr/w:shd, including
+    /// theme and extension attributes.
+    pub previous_shading: Option<crate::domain::Shading>,
+    /// Previous direct tab-stop container. `Some([])` preserves an authored
+    /// present-empty `w:tabs`; `None` means the container was absent.
     pub previous_tab_stops: Option<Vec<TabStopDef>>,
     /// Previous mirrorIndents from the inner w:pPr (three-state, matching
     /// `ParagraphNode::mirror_indents`).
@@ -575,9 +667,9 @@ pub struct PprChange {
     /// `ParagraphNode::bidi`).
     pub previous_bidi: Option<bool>,
     /// Previous textAlignment from the inner w:pPr.
-    pub previous_text_alignment: Option<TextAlignment>,
+    pub previous_text_alignment: Option<String>,
     /// Previous textDirection from the inner w:pPr.
-    pub previous_text_direction: Option<crate::domain::TextDirection>,
+    pub previous_text_direction: Option<String>,
     /// Previous suppressAutoHyphens from the inner w:pPr.
     pub previous_suppress_auto_hyphens: Option<bool>,
     /// Previous snapToGrid from the inner w:pPr.
@@ -590,6 +682,10 @@ pub struct PprChange {
     pub previous_word_wrap: Option<bool>,
     /// Previous framePr from the inner w:pPr.
     pub previous_frame_pr: Option<FrameProperties>,
+    /// Raw previous directly-authored outline level.
+    pub previous_outline_lvl: Option<RawRequiredValue>,
+    /// Previous exact conditional-formatting attributes from the inner w:pPr.
+    pub previous_cnf_style: Option<crate::domain::CnfStyle>,
     /// Previous paragraph mark run properties from the inner w:pPr/w:rPr.
     /// The previous paragraph-mark run properties (`w:pPrChange/w:pPr/w:rPr`).
     /// `None` when the inner pPr carries NO rPr — which is how this
@@ -612,16 +708,11 @@ pub struct PprChange {
 /// typed `PprChange` field. Mirrors `MODELED_PPR_CHILDREN`'s role for the
 /// outer paragraph: anything NOT in this list falls through to `preserved`.
 ///
-/// Deliberately absent (they stay in `preserved` because
-/// `ParagraphFormattingChange` has no `previous_*` field for them):
-/// - `numPr` — `previous_numbering` needs the document-order numbering
-///   counter state to synthesize `NumberingInfo`; import can't produce it
-///   here, so the snapshot's numPr round-trips verbatim instead.
-/// - `outlineLvl`, `cnfStyle` — no previous_* domain field (yet).
 const PPR_CHANGE_MODELED_CHILDREN: &[&str] = &[
     "jc",
     "ind",
     "spacing",
+    "numPr",
     "rPr",
     "pStyle",
     "pBdr",
@@ -644,6 +735,8 @@ const PPR_CHANGE_MODELED_CHILDREN: &[&str] = &[
     "adjustRightInd",
     "wordWrap",
     "framePr",
+    "outlineLvl",
+    "cnfStyle",
 ];
 
 /// Numbering properties extracted from w:pPr/w:numPr.
@@ -667,6 +760,29 @@ pub enum DirectNumPr {
     Suppressed,
     /// Active numbering: numId > 0 with an ilvl.
     Active(NumProps),
+}
+
+/// Raw required `w:val` payload retained at the package edge so a present but
+/// malformed element cannot collapse into semantic absence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawRequiredValue {
+    pub value: Option<String>,
+}
+
+/// Raw previous `w:numPr` from inside `w:pPrChange`.
+///
+/// Unlike the live paragraph parser's historical `DirectNumPr` projection,
+/// this preserves element and attribute presence until the importing edge can
+/// return a contextual typed error for malformed tracked state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawPreviousNumPr {
+    Absent,
+    Present {
+        num_id: Option<RawRequiredValue>,
+        ilvl: Option<RawRequiredValue>,
+        extra_attrs: Vec<crate::domain::QualifiedAttribute>,
+        preserved: Vec<crate::domain::PreservedProp>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,7 +815,7 @@ pub struct ParagraphView {
     /// None = absent (inherit from style), Some(false) = explicitly off, Some(true) = on.
     pub contextual_spacing: Option<bool>,
     /// Paragraph shading from w:pPr/w:shd: (fill, val, color).
-    pub paragraph_shading: Option<(Option<String>, Option<String>, Option<String>)>,
+    pub paragraph_shading: Option<crate::domain::Shading>,
     /// Outline level from w:pPr/w:outlineLvl (0-based, 0 = level 1).
     pub outline_lvl: Option<u8>,
     /// Direct tab stops from w:pPr/w:tabs (before style resolution).
@@ -817,7 +933,7 @@ pub struct FrameProperties {
 }
 
 /// Indentation properties extracted from w:pPr/w:ind.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndentProps {
     pub left: Option<i32>,
     pub right: Option<i32>,
@@ -834,7 +950,7 @@ pub struct IndentProps {
 }
 
 /// Spacing properties extracted from w:pPr/w:spacing (§17.3.1.33).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpacingProps {
     pub before: Option<u32>,
     pub after: Option<u32>,
@@ -855,7 +971,7 @@ pub struct SpacingProps {
 }
 
 /// Paragraph border properties extracted from w:pPr/w:pBdr (§17.3.1.24).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParagraphBorderProps {
     pub top: Option<BorderEdge>,
     pub bottom: Option<BorderEdge>,
@@ -939,6 +1055,23 @@ impl ParagraphView {
         let mut cnf_style = None;
         let mut preserved = Vec::new();
 
+        let paragraph_ppr_change_count = paragraph
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                XMLNode::Element(element) if is_w_tag(element, "pPr") => Some(element),
+                _ => None,
+            })
+            .map(|p_pr| w_children_named(p_pr, "pPrChange").len())
+            .sum::<usize>();
+        if paragraph_ppr_change_count > 1 {
+            return Err(WordIrError::DuplicateParagraphPropertyElement {
+                parent: "p",
+                element: "pPrChange",
+                count: paragraph_ppr_change_count,
+            });
+        }
+
         for (index, child) in paragraph.children.iter().enumerate() {
             let element = match child {
                 XMLNode::Element(el) => el,
@@ -947,43 +1080,59 @@ impl ParagraphView {
 
             // Extract paragraph properties from pPr
             if is_w_tag(element, "pPr") {
-                num_props = extract_num_props(element);
-                style_id = extract_style_id(element);
-                alignment = extract_alignment(element);
-                indentation = extract_indentation(element);
-                spacing = extract_spacing(element);
-                borders = extract_paragraph_borders(element);
-                keep_next = extract_keep_next(element);
-                keep_lines = extract_keep_lines(element);
-                page_break_before = extract_page_break_before(element);
-                widow_control = extract_widow_control(element);
-                contextual_spacing = extract_contextual_spacing(element);
-                paragraph_shading = extract_paragraph_shading(element);
-                outline_lvl = extract_outline_lvl(element);
-                tab_stops = extract_tab_stops(element);
-                section_property_change = extract_section_property_change(element);
-                ppr_change = extract_ppr_change(element);
-                section_properties = extract_section_properties(element, rel_lookup);
-                para_mark_status = extract_para_mark_status(element);
+                // Non-conformant producers sometimes emit more than one sibling
+                // pPr. Word consumes their children as one property set: a later
+                // child overrides the same property, while its absence does not
+                // erase a property found in an earlier pPr. Merge field-by-field
+                // to match that load behavior instead of replacing the entire
+                // accumulated set on every pPr.
+                let direct_numbering = extract_num_props(element)?;
+                if direct_numbering != DirectNumPr::Absent {
+                    num_props = direct_numbering;
+                }
+                style_id = extract_style_id(element).or(style_id);
+                alignment = extract_alignment(element).or(alignment);
+                indentation = extract_indentation(element)?.or(indentation);
+                spacing = extract_spacing(element)?.or(spacing);
+                borders = extract_paragraph_borders(element)?.or(borders);
+                keep_next = extract_keep_next(element).or(keep_next);
+                keep_lines = extract_keep_lines(element).or(keep_lines);
+                page_break_before = extract_page_break_before(element).or(page_break_before);
+                widow_control = extract_widow_control(element).or(widow_control);
+                contextual_spacing = extract_contextual_spacing(element).or(contextual_spacing);
+                paragraph_shading = extract_paragraph_shading(element)?.or(paragraph_shading);
+                outline_lvl = extract_outline_lvl(element).or(outline_lvl);
+                tab_stops = extract_tab_stops(element)?.or(tab_stops);
+                section_property_change =
+                    extract_section_property_change(element).or(section_property_change);
+                ppr_change = extract_ppr_change(element)?.or(ppr_change);
+                section_properties =
+                    extract_section_properties(element, rel_lookup).or(section_properties);
+                para_mark_status = extract_para_mark_status(element).or(para_mark_status);
                 // For the LIVE mark, an absent rPr genuinely means "no direct
                 // mark properties" — only the pPrChange SNAPSHOT distinguishes
                 // absent (= unchanged) from empty.
-                paragraph_mark_rpr = extract_paragraph_mark_rpr(element).unwrap_or_default();
-                mirror_indents = extract_optional_bool(element, "mirrorIndents");
-                auto_space_de = extract_optional_bool(element, "autoSpaceDE");
-                auto_space_dn = extract_optional_bool(element, "autoSpaceDN");
-                bidi = extract_optional_bool(element, "bidi");
-                text_alignment = extract_text_alignment(element);
+                if let Some(marks) = extract_paragraph_mark_rpr(element) {
+                    paragraph_mark_rpr = marks;
+                }
+                mirror_indents = extract_optional_bool(element, "mirrorIndents").or(mirror_indents);
+                auto_space_de = extract_optional_bool(element, "autoSpaceDE").or(auto_space_de);
+                auto_space_dn = extract_optional_bool(element, "autoSpaceDN").or(auto_space_dn);
+                bidi = extract_optional_bool(element, "bidi").or(bidi);
+                text_alignment = extract_text_alignment(element).or(text_alignment);
                 text_direction = find_w_child(element, "textDirection")
                     .and_then(|el| attr_value(el, "val"))
-                    .and_then(|s| crate::domain::TextDirection::from_xml_str(s).ok());
-                suppress_auto_hyphens = extract_optional_bool(element, "suppressAutoHyphens");
-                snap_to_grid = extract_optional_bool(element, "snapToGrid");
-                overflow_punct = extract_optional_bool(element, "overflowPunct");
-                adjust_right_ind = extract_optional_bool(element, "adjustRightInd");
-                word_wrap = extract_optional_bool(element, "wordWrap");
-                frame_pr = extract_frame_pr(element);
-                cnf_style = extract_cnf_style(element);
+                    .and_then(|s| crate::domain::TextDirection::from_xml_str(s).ok())
+                    .or(text_direction);
+                suppress_auto_hyphens =
+                    extract_optional_bool(element, "suppressAutoHyphens").or(suppress_auto_hyphens);
+                snap_to_grid = extract_optional_bool(element, "snapToGrid").or(snap_to_grid);
+                overflow_punct = extract_optional_bool(element, "overflowPunct").or(overflow_punct);
+                adjust_right_ind =
+                    extract_optional_bool(element, "adjustRightInd").or(adjust_right_ind);
+                word_wrap = extract_optional_bool(element, "wordWrap").or(word_wrap);
+                frame_pr = extract_frame_pr(element).or(frame_pr);
+                cnf_style = extract_cnf_style(element)?.or(cnf_style);
 
                 // --- Preserved remainder: unmodeled pPr child ---
                 //
@@ -1034,19 +1183,25 @@ impl ParagraphView {
 
             // Check if it's a paragraph-level widget (container that we can't edit across)
             if is_paragraph_widget(&local_name) {
+                let (marks, source_run_attrs) = if local_name == "fldSimple" {
+                    simple_field_result_run_context(element)
+                        .unwrap_or_else(|| (TextMarks::default(), Vec::new()))
+                } else {
+                    (TextMarks::default(), Vec::new())
+                };
                 atoms.push(Atom {
                     kind: AtomKind::Widget {
                         name: element.name.clone(),
                         raw_xml: serialize_element(element),
                     },
                     utf16_len: 1, // Occupies space as a single barrier
-                    source_run_attrs: Vec::new(),
+                    source_run_attrs,
                     origin: AtomOrigin {
                         run_index: None,
                         child_index: None,
                         paragraph_child_index: Some(index),
                     },
-                    marks: TextMarks::default(),
+                    marks,
                     tracking: None,
                 });
                 continue;
@@ -1642,6 +1797,33 @@ fn is_paragraph_widget(local_name: &str) -> bool {
     // ordinary document text; §17.5.1.3 / §17.5.1.9).
 }
 
+/// Project the formatting carrier of the one-run `fldSimple` subset into the
+/// widget atom. The complete field remains raw-preserved; returning `None`
+/// for richer shapes does not reinterpret them and the proof lowerer refuses
+/// those shapes before it could rebuild them.
+fn simple_field_result_run_context(
+    element: &Element,
+) -> Option<(TextMarks, Vec<(String, String)>)> {
+    let runs = element
+        .children
+        .iter()
+        .filter_map(XMLNode::as_element)
+        .filter(|child| is_w_tag(child, "r"))
+        .collect::<Vec<_>>();
+    let [run] = runs.as_slice() else {
+        return None;
+    };
+    if element.children.iter().any(|child| match child {
+        XMLNode::Element(child) => !is_w_tag(child, "r"),
+        XMLNode::Text(text) | XMLNode::CData(text) => !text.trim().is_empty(),
+        XMLNode::Comment(_) => false,
+        XMLNode::ProcessingInstruction(_, _) => true,
+    }) {
+        return None;
+    }
+    Some((extract_text_marks(run), source_run_attrs(run)))
+}
+
 /// Local names of run-level widget elements (members of EG_RunInnerContent that
 /// occupy space and block editing). This is the **single source of truth** for
 /// "this element is only legal inside `w:r`": both the serializer's re-wrap
@@ -1685,7 +1867,7 @@ pub(crate) fn is_run_widget(local_name: &str) -> bool {
 }
 
 /// Run-level elements that are decorations (zero-width markers).
-fn is_run_decoration(local_name: &str) -> bool {
+pub(crate) fn is_run_decoration(local_name: &str) -> bool {
     matches!(
         local_name,
         "lastRenderedPageBreak"
@@ -1838,7 +2020,7 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
         }
 
         // Decorations (zero-width markers)
-        if is_run_decoration(&local_name) {
+        if is_paragraph_decoration(&local_name) || is_run_decoration(&local_name) {
             atoms.push(Atom {
                 kind: AtomKind::Decoration {
                     name: element.name.clone(),
@@ -1940,10 +2122,7 @@ fn stacked_atoms(
     run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
     fn rev_fields(el: &Element) -> Result<(u32, String, Option<String>), WordIrError> {
-        let revision_id: u32 = attr_value(el, "id")
-            .ok_or(WordIrError::MissingTrackedChangeAttribute("id"))?
-            .parse()
-            .map_err(|_| WordIrError::MissingTrackedChangeAttribute("id"))?;
+        let revision_id = tracked_change_revision_id(el)?;
         let author = attr_value(el, "author")
             .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
             .to_string();
@@ -1995,6 +2174,33 @@ fn stacked_atoms(
         atom.tracking = Some(ctx.clone());
     }
     Ok(atoms)
+}
+
+/// Parse a tracked-change annotation id at the OOXML edge.
+///
+/// The schema's decimal lexical space is wider than the engine's disposable
+/// `u32` wire-annotation slot. A syntactically valid value outside that slot is
+/// normalized to the reserved `0` marker; the document import pass replaces
+/// every such marker with a deterministic in-range id before identities are
+/// minted. Missing and non-decimal values remain hard errors.
+fn tracked_change_revision_id(element: &Element) -> Result<u32, WordIrError> {
+    let raw = attr_value(element, "id").ok_or(WordIrError::MissingTrackedChangeAttribute("id"))?;
+    if let Ok(value) = raw.parse::<u32>() {
+        return Ok(value);
+    }
+
+    let digits = raw
+        .strip_prefix('+')
+        .or_else(|| raw.strip_prefix('-'))
+        .unwrap_or(raw);
+    if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(0);
+    }
+
+    Err(WordIrError::InvalidTrackedChangeAttribute {
+        attribute: "id",
+        value: raw.clone(),
+    })
 }
 
 /// Resolve every `mc:AlternateContent` directly inside a tracked-change container
@@ -2114,10 +2320,7 @@ fn tracked_change_atoms(
         || is_w_tag(container, "moveTo")
     {
         let is_insertion = is_w_tag(container, "ins") || is_w_tag(container, "moveTo");
-        let revision_id: u32 = attr_value(container, "id")
-            .ok_or(WordIrError::MissingTrackedChangeAttribute("id"))?
-            .parse()
-            .map_err(|_| WordIrError::MissingTrackedChangeAttribute("id"))?;
+        let revision_id = tracked_change_revision_id(container)?;
         let author = attr_value(container, "author")
             .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
             .to_string();
@@ -2235,19 +2438,25 @@ fn tracked_change_atoms(
         // Silently skipping (the earlier behavior) dropped the math from
         // the IR entirely.
         if is_paragraph_widget(&local_name) {
+            let (marks, source_run_attrs) = if local_name == "fldSimple" {
+                simple_field_result_run_context(element)
+                    .unwrap_or_else(|| (TextMarks::default(), Vec::new()))
+            } else {
+                (TextMarks::default(), Vec::new())
+            };
             atoms.push(Atom {
                 kind: AtomKind::Widget {
                     name: element.name.clone(),
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 1, // Occupies space as a single barrier
-                source_run_attrs: Vec::new(),
+                source_run_attrs,
                 origin: AtomOrigin {
                     run_index: None,
                     child_index: None,
                     paragraph_child_index: Some(container_index),
                 },
-                marks: TextMarks::default(),
+                marks,
                 tracking: None,
             });
             continue;
@@ -3162,6 +3371,9 @@ pub fn is_mc_alternate_content(element: &Element) -> bool {
 /// - The Word 2010 wordml namespace `w14` (MS-DOCX §2.6) — confirmed against real Word
 ///   (`Requires="w14"` Choices are selected); its rPr/run extensions are either
 ///   baseline WML we parse or opaque markup we preserve.
+/// - The Word 2013 wordml namespace `w15` (MS-DOCX §2.6) — confirmed against real
+///   Word (`Requires="w15"` Choices are selected); Stemma models its repeating
+///   section and comment extensions and preserves its remaining markup.
 /// - The drawing namespaces wps/wpg/wpc/wpi (MS-DOCX §2.2 extension mechanism):
 ///   their content lives inside w:drawing/w:pict, which we preserve as opaque
 ///   widgets.
@@ -3170,10 +3382,16 @@ pub fn is_mc_alternate_content(element: &Element) -> bool {
 /// selectable (skip it, try the next Choice or the Fallback). A token with NO
 /// in-scope binding is non-conformant per §7.6 and is a hard error
 /// ([`WordIrError::UnresolvableMcRequiresPrefix`]), never a silent skip.
+const LEGACY_WORDPROCESSING_SHAPE_NS: &str =
+    "http://schemas.microsoft.com/office/word/2008/6/28/wordprocessingShape";
+const WORD_2013_WORDML_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+
 const UNDERSTOOD_MC_NAMESPACES: &[&str] = &[
     "http://schemas.openxmlformats.org/wordprocessingml/2006/main", // WML main
     "http://schemas.microsoft.com/office/word/2010/wordml",         // w14 (MS-DOCX §2.6)
+    WORD_2013_WORDML_NS,                                            // w15 (MS-DOCX §2.6)
     "http://schemas.microsoft.com/office/word/2010/wordprocessingShape", // wps
+    LEGACY_WORDPROCESSING_SHAPE_NS, // wps from the Office 2010 pre-release wire format
     "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup", // wpg
     "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas", // wpc
     "http://schemas.microsoft.com/office/word/2010/wordprocessingInk", // wpi
@@ -3245,11 +3463,12 @@ fn mc_choice_is_selectable(choice: &Element) -> Result<bool, WordIrError> {
 /// set of OOXML namespaces it can faithfully round-trip — the WML core plus every
 /// Microsoft/OOXML extension namespace it preserves (`KNOWN_OOXML_NAMESPACES` +
 /// the core list). This is deliberately BROADER than [`UNDERSTOOD_MC_NAMESPACES`]
-/// (the Choice-selection set): w15/w16/etc. content is not *selected* by a
+/// (the Choice-selection set): w16 and later content is not *selected* by a
 /// Requires, but it is preserved opaquely, so it must NEVER be dropped as
 /// "ignored". Only genuinely-foreign namespaces (unknown extensions) are dropped.
 fn mce_namespace_understood(ns_uri: &str) -> bool {
-    crate::word_xml::CORE_NAMESPACE_URIS.contains(&ns_uri)
+    ns_uri == LEGACY_WORDPROCESSING_SHAPE_NS
+        || crate::word_xml::CORE_NAMESPACE_URIS.contains(&ns_uri)
         || crate::word_xml::KNOWN_OOXML_NAMESPACES
             .iter()
             .any(|(_, uri)| *uri == ns_uri)
@@ -3261,7 +3480,7 @@ fn mce_namespace_understood(ns_uri: &str) -> bool {
 /// resolve the prefix tokens those attributes carry. Cloned and extended on
 /// descent so each element sees its ancestors' declarations.
 #[derive(Clone, Default)]
-pub(crate) struct MceScope {
+pub struct MceScope {
     ignorable: Vec<String>,
     process_content: Vec<(String, String)>,
     ns_bindings: HashMap<String, String>,
@@ -3545,6 +3764,86 @@ fn find_w_child<'a>(element: &'a Element, local: &str) -> Option<&'a Element> {
     })
 }
 
+fn w_children_named<'a>(element: &'a Element, local: &str) -> Vec<&'a Element> {
+    element
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) if is_w_tag(element, local) => Some(element),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_word_value_attribute(name: &xmltree::AttributeName) -> bool {
+    name.local_name == "val"
+        && (name.namespace.as_deref() == Some(WORD_NS)
+            || (name.namespace.is_none() && matches!(name.prefix.as_deref(), None | Some("w"))))
+}
+
+fn validate_numbering_coordinate_payload(
+    element: &Element,
+    element_name: &'static str,
+) -> Result<(), WordIrError> {
+    for name in element.attributes.keys() {
+        if !is_word_value_attribute(name) {
+            let qualified = name.prefix.as_deref().map_or_else(
+                || name.local_name.clone(),
+                |prefix| format!("{prefix}:{}", name.local_name),
+            );
+            return Err(WordIrError::UnmodeledDirectNumberingPayload {
+                detail: format!("w:{element_name} attribute {qualified}"),
+            });
+        }
+    }
+    for child in &element.children {
+        match child {
+            XMLNode::Element(child) => {
+                return Err(WordIrError::UnmodeledDirectNumberingPayload {
+                    detail: format!("w:{element_name} child {}", qualified_element_name(child)),
+                });
+            }
+            XMLNode::Text(text) | XMLNode::CData(text) if !text.trim().is_empty() => {
+                return Err(WordIrError::UnmodeledDirectNumberingPayload {
+                    detail: format!("w:{element_name} text {text:?}"),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_num_pr_container_payload(num_pr: &Element) -> Result<(), WordIrError> {
+    if let Some(name) = num_pr.attributes.keys().next() {
+        let qualified = name.prefix.as_deref().map_or_else(
+            || name.local_name.clone(),
+            |prefix| format!("{prefix}:{}", name.local_name),
+        );
+        return Err(WordIrError::UnmodeledDirectNumberingPayload {
+            detail: format!("w:numPr attribute {qualified}"),
+        });
+    }
+    for child in &num_pr.children {
+        match child {
+            XMLNode::Element(element)
+                if is_w_tag(element, "numId") || is_w_tag(element, "ilvl") => {}
+            XMLNode::Element(element) => {
+                return Err(WordIrError::UnsupportedDirectNumberingChild {
+                    element: qualified_element_name(element),
+                });
+            }
+            XMLNode::Text(text) | XMLNode::CData(text) if !text.trim().is_empty() => {
+                return Err(WordIrError::UnmodeledDirectNumberingPayload {
+                    detail: format!("w:numPr text {text:?}"),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn attr_value<'a>(element: &'a Element, local: &str) -> Option<&'a String> {
     attr_get(element, local)
 }
@@ -3553,30 +3852,117 @@ fn attr_value<'a>(element: &'a Element, local: &str) -> Option<&'a String> {
 ///
 /// Returns `DirectNumPr::Absent` when no w:numPr is present,
 /// `DirectNumPr::Suppressed` when numId=0 (§17.9.18: remove inherited numbering),
-/// or `DirectNumPr::Active(NumProps)` for an active numbering reference.
-fn extract_num_props(p_pr: &Element) -> DirectNumPr {
-    let Some(num_pr) = find_w_child(p_pr, "numPr") else {
-        return DirectNumPr::Absent;
+/// or `DirectNumPr::Active(NumProps)` for a complete active numbering reference.
+///
+/// Both children are schema-optional. A partial direct pair therefore is not
+/// malformed OOXML, but its effective meaning is not defined by our frozen
+/// model. It is a typed refusal rather than a guessed style merge or `ilvl=0`.
+fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
+    let num_prs = w_children_named(p_pr, "numPr");
+    let Some(num_pr) = num_prs.first().copied() else {
+        return Ok(DirectNumPr::Absent);
     };
-    let Some(num_id_elem) = find_w_child(num_pr, "numId") else {
-        return DirectNumPr::Absent;
-    };
-    let Some(num_id) = attr_value(num_id_elem, "val").and_then(|v| v.parse::<u32>().ok()) else {
-        return DirectNumPr::Absent;
-    };
-
-    // §17.9.18: numId=0 means "remove inherited numbering from this paragraph."
-    if num_id == 0 {
-        return DirectNumPr::Suppressed;
+    if num_prs.len() != 1 {
+        return Err(WordIrError::DuplicateParagraphPropertyElement {
+            parent: "pPr",
+            element: "numPr",
+            count: num_prs.len(),
+        });
     }
 
-    // ilvl defaults to 0 if not specified
-    let ilvl = find_w_child(num_pr, "ilvl")
-        .and_then(|el| attr_value(el, "val"))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    validate_num_pr_container_payload(num_pr)?;
 
-    DirectNumPr::Active(NumProps { num_id, ilvl })
+    let parse_coordinate = |element_name: &'static str| -> Result<Option<u32>, WordIrError> {
+        let elements = w_children_named(num_pr, element_name);
+        let Some(element) = elements.first().copied() else {
+            return Ok(None);
+        };
+        if elements.len() != 1 {
+            return Err(WordIrError::DuplicateParagraphPropertyElement {
+                parent: "numPr",
+                element: element_name,
+                count: elements.len(),
+            });
+        }
+        validate_numbering_coordinate_payload(element, element_name)?;
+        let raw =
+            attr_value(element, "val").ok_or_else(|| WordIrError::MissingRequiredAttribute {
+                element: format!("w:{element_name}"),
+                attribute: "w:val",
+            })?;
+        let parsed =
+            raw.parse::<u32>()
+                .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+                    element: element_name,
+                    attribute: "val",
+                    value: raw.clone(),
+                })?;
+        Ok(Some(parsed))
+    };
+
+    let num_id = parse_coordinate("numId")?;
+    let ilvl = parse_coordinate("ilvl")?;
+    // §17.9.18: numId=0 means "remove inherited numbering from this paragraph."
+    if num_id == Some(0) {
+        return Ok(DirectNumPr::Suppressed);
+    }
+
+    match (num_id, ilvl) {
+        (Some(num_id), Some(ilvl)) => Ok(DirectNumPr::Active(NumProps { num_id, ilvl })),
+        (num_id, ilvl) => Err(WordIrError::IncompleteDirectNumbering { num_id, ilvl }),
+    }
+}
+
+fn extract_raw_previous_num_props(p_pr: &Element) -> Result<RawPreviousNumPr, WordIrError> {
+    let num_prs = w_children_named(p_pr, "numPr");
+    let Some(num_pr) = num_prs.first().copied() else {
+        return Ok(RawPreviousNumPr::Absent);
+    };
+    if num_prs.len() != 1 {
+        return Err(WordIrError::DuplicateParagraphPropertyElement {
+            parent: "pPr",
+            element: "numPr",
+            count: num_prs.len(),
+        });
+    }
+    validate_num_pr_container_payload(num_pr)?;
+    let raw_value = |name: &'static str| -> Result<Option<RawRequiredValue>, WordIrError> {
+        let elements = w_children_named(num_pr, name);
+        if elements.len() > 1 {
+            return Err(WordIrError::DuplicateParagraphPropertyElement {
+                parent: "numPr",
+                element: name,
+                count: elements.len(),
+            });
+        }
+        if let Some(element) = elements.first() {
+            validate_numbering_coordinate_payload(element, name)?;
+        }
+        Ok(elements.first().map(|element| RawRequiredValue {
+            value: attr_value(element, "val").cloned(),
+        }))
+    };
+    let extra_attrs = num_pr
+        .attributes
+        .iter()
+        .filter_map(|(name, value)| {
+            if name.prefix.as_deref() == Some("xmlns") || name.local_name == "xmlns" {
+                return None;
+            }
+            Some(crate::domain::QualifiedAttribute {
+                local_name: name.local_name.clone(),
+                prefix: name.prefix.clone(),
+                namespace: name.namespace.clone(),
+                value: value.clone(),
+            })
+        })
+        .collect();
+    Ok(RawPreviousNumPr::Present {
+        num_id: raw_value("numId")?,
+        ilvl: raw_value("ilvl")?,
+        extra_attrs,
+        preserved: Vec::new(),
+    })
 }
 
 /// Extract style ID from w:pPr/w:pStyle element.
@@ -3607,24 +3993,76 @@ fn extract_alignment(p_pr: &Element) -> Option<String> {
 }
 
 /// Extract indentation from w:pPr/w:ind element.
-fn extract_indentation(p_pr: &Element) -> Option<IndentProps> {
-    let ind = find_w_child(p_pr, "ind")?;
+fn extract_indentation(p_pr: &Element) -> Result<Option<IndentProps>, WordIrError> {
+    let Some(ind) = find_w_child(p_pr, "ind") else {
+        return Ok(None);
+    };
 
-    let left = attr_value(ind, "left")
-        .or_else(|| attr_value(ind, "start"))
-        .and_then(|v| v.parse().ok());
+    let parse_twips_i32 = |attribute: &'static str, schema_allows_negative: bool| {
+        let Some(twips) =
+            parse_paragraph_twip_measure(ind, "ind", attribute, schema_allows_negative)?
+        else {
+            return Ok(None);
+        };
+        i32::try_from(twips).map(Some).map_err(|_| {
+            WordIrError::ParagraphPropertyAttributeOutOfRange {
+                element: "ind",
+                attribute,
+                value: attr_value(ind, attribute).cloned().unwrap_or_default(),
+                model: "signed i32 twips",
+            }
+        })
+    };
+    let parse_decimal_i32 = |attribute: &'static str| {
+        attr_value(ind, attribute)
+            .map(|value| {
+                value
+                    .parse::<i32>()
+                    .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+                        element: "ind",
+                        attribute,
+                        value: value.clone(),
+                    })
+            })
+            .transpose()
+    };
 
-    let right = attr_value(ind, "right")
-        .or_else(|| attr_value(ind, "end"))
-        .and_then(|v| v.parse().ok());
+    let left = if attr_value(ind, "left").is_some() {
+        parse_twips_i32("left", true)?
+    } else {
+        parse_twips_i32("start", true)?
+    };
+
+    let right = if attr_value(ind, "right").is_some() {
+        parse_twips_i32("right", true)?
+    } else {
+        parse_twips_i32("end", true)?
+    };
 
     // §17.3.1.12: "The firstLine and hanging attributes are mutually
     // exclusive, if both are specified, then the firstLine value is ignored."
     // hanging wins when both are present.
-    let first_line = if let Some(hanging) = attr_value(ind, "hanging") {
-        hanging.parse::<i32>().ok().map(|v| -v)
-    } else if let Some(first) = attr_value(ind, "firstLine") {
-        first.parse().ok()
+    let first_line = if attr_value(ind, "hanging").is_some() {
+        let hanging = parse_paragraph_twip_measure(ind, "ind", "hanging", false)?
+            .expect("the authored hanging attribute was already observed");
+        Some(
+            i32::try_from(hanging.checked_neg().ok_or_else(|| {
+                WordIrError::ParagraphPropertyAttributeOutOfRange {
+                    element: "ind",
+                    attribute: "hanging",
+                    value: attr_value(ind, "hanging").cloned().unwrap_or_default(),
+                    model: "signed i32 first-line twips",
+                }
+            })?)
+            .map_err(|_| WordIrError::ParagraphPropertyAttributeOutOfRange {
+                element: "ind",
+                attribute: "hanging",
+                value: attr_value(ind, "hanging").cloned().unwrap_or_default(),
+                model: "signed i32 first-line twips",
+            })?,
+        )
+    } else if attr_value(ind, "firstLine").is_some() {
+        parse_twips_i32("firstLine", false)?
     } else {
         None
     };
@@ -3638,46 +4076,37 @@ fn extract_indentation(p_pr: &Element) -> Option<IndentProps> {
     // by resolve_effective_indent, not at parse time — so do not filter zeros
     // here. leftChars/rightChars are the transitional-schema aliases of
     // startChars/endChars.
-    let start_chars = attr_value(ind, "startChars")
-        .or_else(|| attr_value(ind, "leftChars"))
-        .and_then(|v| v.parse().ok());
-    let end_chars = attr_value(ind, "endChars")
-        .or_else(|| attr_value(ind, "rightChars"))
-        .and_then(|v| v.parse().ok());
+    let start_chars = if attr_value(ind, "startChars").is_some() {
+        parse_decimal_i32("startChars")?
+    } else {
+        parse_decimal_i32("leftChars")?
+    };
+    let end_chars = if attr_value(ind, "endChars").is_some() {
+        parse_decimal_i32("endChars")?
+    } else {
+        parse_decimal_i32("rightChars")?
+    };
     // §17.3.1.12: "The firstLineChars and hangingChars attributes are mutually
     // exclusive, if both are specified, then the firstLineChars value is
     // ignored." A NON-ZERO hangingChars wins; hangingChars="0" is not a real
     // hanging indent and does not suppress firstLineChars.
-    let raw_first_line_chars: Option<i32> =
-        attr_value(ind, "firstLineChars").and_then(|v| v.parse().ok());
-    let hanging_chars: Option<i32> = attr_value(ind, "hangingChars").and_then(|v| v.parse().ok());
+    let raw_first_line_chars = parse_decimal_i32("firstLineChars")?;
+    let hanging_chars = parse_decimal_i32("hangingChars")?;
     let first_line_chars = if hanging_chars.is_some_and(|h| h != 0) {
         None // non-zero hangingChars wins, firstLineChars is ignored
     } else {
         raw_first_line_chars
     };
 
-    // Only return Some if at least one property is set
-    if left.is_some()
-        || right.is_some()
-        || first_line.is_some()
-        || start_chars.is_some()
-        || end_chars.is_some()
-        || first_line_chars.is_some()
-        || hanging_chars.is_some()
-    {
-        Some(IndentProps {
-            left,
-            right,
-            effective_first_line_twips: first_line,
-            start_chars,
-            end_chars,
-            first_line_chars,
-            hanging_chars,
-        })
-    } else {
-        None
-    }
+    Ok(Some(IndentProps {
+        left,
+        right,
+        effective_first_line_twips: first_line,
+        start_chars,
+        end_chars,
+        first_line_chars,
+        hanging_chars,
+    }))
 }
 
 /// Extract w:textAlignment from w:pPr (§17.3.1.39).
@@ -3767,26 +4196,111 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
     })
 }
 
-/// Extract conditional formatting flags from w:pPr/w:cnfStyle (§17.3.1.8).
-fn extract_cnf_style(p_pr: &Element) -> Option<crate::domain::CnfStyle> {
-    let el = find_w_child(p_pr, "cnfStyle")?;
-    let bool_attr =
-        |name: &str| -> bool { attr_value(el, name).is_some_and(|v| v == "1" || v == "true") };
-    Some(crate::domain::CnfStyle {
-        val: attr_value(el, "val").cloned(),
-        first_row: bool_attr("firstRow"),
-        last_row: bool_attr("lastRow"),
-        first_column: bool_attr("firstColumn"),
-        last_column: bool_attr("lastColumn"),
-        odd_v_band: bool_attr("oddVBand"),
-        even_v_band: bool_attr("evenVBand"),
-        odd_h_band: bool_attr("oddHBand"),
-        even_h_band: bool_attr("evenHBand"),
-        first_row_first_column: bool_attr("firstRowFirstColumn"),
-        first_row_last_column: bool_attr("firstRowLastColumn"),
-        last_row_first_column: bool_attr("lastRowFirstColumn"),
-        last_row_last_column: bool_attr("lastRowLastColumn"),
+/// Parse one exact `w:cnfStyle` attribute set (§17.3.1.8 / §17.4.7 / §17.4.8).
+///
+/// Shared by paragraph, row, cell, and previous-pPr import so every carrier has
+/// the same strict edge contract. Named flags preserve authored absence versus
+/// explicit OFF. The transitional legacy mask is validated independently; it
+/// may coexist with named flags because Word's precedence does not erase either
+/// authored representation.
+pub(crate) fn parse_cnf_style_element(
+    el: &Element,
+) -> Result<crate::domain::CnfStyle, WordIrError> {
+    fn word_attribute<'a>(el: &'a Element, local_name: &str) -> Option<&'a String> {
+        el.attributes.iter().find_map(|(name, value)| {
+            if name.local_name != local_name {
+                return None;
+            }
+            let is_word_attribute = match name.namespace.as_deref() {
+                Some(namespace) => namespace == WORD_NS,
+                None => name.prefix.as_deref() == Some("w"),
+            };
+            is_word_attribute.then_some(value)
+        })
+    }
+
+    fn on_off(el: &Element, attribute: &'static str) -> Result<Option<bool>, WordIrError> {
+        word_attribute(el, attribute)
+            .map(|value| match value.as_str() {
+                "1" | "true" | "on" => Ok(true),
+                "0" | "false" | "off" => Ok(false),
+                _ => Err(WordIrError::InvalidCnfStyleAttribute {
+                    attribute,
+                    value: value.clone(),
+                }),
+            })
+            .transpose()
+    }
+
+    let val = word_attribute(el, "val")
+        .map(|value| {
+            crate::domain::CnfMask::try_from(value.clone()).map_err(|_| {
+                WordIrError::InvalidCnfStyleMask {
+                    value: value.clone(),
+                }
+            })
+        })
+        .transpose()?;
+    const KNOWN_ATTRIBUTES: &[&str] = &[
+        "val",
+        "firstRow",
+        "lastRow",
+        "firstColumn",
+        "lastColumn",
+        "oddVBand",
+        "evenVBand",
+        "oddHBand",
+        "evenHBand",
+        "firstRowFirstColumn",
+        "firstRowLastColumn",
+        "lastRowFirstColumn",
+        "lastRowLastColumn",
+    ];
+    let extra_attrs = el
+        .attributes
+        .iter()
+        .filter_map(|(name, value)| {
+            if name.prefix.as_deref() == Some("xmlns") || name.local_name == "xmlns" {
+                return None;
+            }
+            let is_word_attribute = match name.namespace.as_deref() {
+                Some(namespace) => namespace == WORD_NS,
+                None => name.prefix.as_deref() == Some("w"),
+            };
+            if is_word_attribute && KNOWN_ATTRIBUTES.contains(&name.local_name.as_str()) {
+                return None;
+            }
+            Some(crate::domain::QualifiedAttribute {
+                local_name: name.local_name.clone(),
+                prefix: name.prefix.clone(),
+                namespace: name.namespace.clone(),
+                value: value.clone(),
+            })
+        })
+        .collect();
+    Ok(crate::domain::CnfStyle {
+        val,
+        first_row: on_off(el, "firstRow")?,
+        last_row: on_off(el, "lastRow")?,
+        first_column: on_off(el, "firstColumn")?,
+        last_column: on_off(el, "lastColumn")?,
+        odd_v_band: on_off(el, "oddVBand")?,
+        even_v_band: on_off(el, "evenVBand")?,
+        odd_h_band: on_off(el, "oddHBand")?,
+        even_h_band: on_off(el, "evenHBand")?,
+        first_row_first_column: on_off(el, "firstRowFirstColumn")?,
+        first_row_last_column: on_off(el, "firstRowLastColumn")?,
+        last_row_first_column: on_off(el, "lastRowFirstColumn")?,
+        last_row_last_column: on_off(el, "lastRowLastColumn")?,
+        extra_attrs,
     })
+}
+
+/// Extract conditional formatting flags from w:pPr/w:cnfStyle (§17.3.1.8).
+fn extract_cnf_style(p_pr: &Element) -> Result<Option<crate::domain::CnfStyle>, WordIrError> {
+    find_w_child(p_pr, "cnfStyle")
+        .map(parse_cnf_style_element)
+        .transpose()
 }
 
 /// Parse section-level footnote or endnote properties (§17.11.3 / §17.11.2).
@@ -3815,79 +4329,165 @@ fn parse_note_properties(el: &Element) -> Result<crate::domain::NoteProperties, 
 }
 
 /// Extract spacing from w:pPr/w:spacing element (§17.3.1.33).
-fn extract_spacing(p_pr: &Element) -> Option<SpacingProps> {
-    let sp = find_w_child(p_pr, "spacing")?;
+fn extract_spacing(p_pr: &Element) -> Result<Option<SpacingProps>, WordIrError> {
+    let Some(sp) = find_w_child(p_pr, "spacing") else {
+        return Ok(None);
+    };
+    let parse_decimal_u32 = |attribute: &'static str| {
+        attr_value(sp, attribute)
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+                        element: "spacing",
+                        attribute,
+                        value: value.clone(),
+                    })
+            })
+            .transpose()
+    };
+    let parse_on_off = |attribute: &'static str| {
+        attr_value(sp, attribute)
+            .map(|value| match value.as_str() {
+                "1" | "true" | "on" => Ok(true),
+                "0" | "false" | "off" => Ok(false),
+                _ => Err(WordIrError::InvalidParagraphPropertyAttribute {
+                    element: "spacing",
+                    attribute,
+                    value: value.clone(),
+                }),
+            })
+            .transpose()
+    };
 
-    let before = attr_value(sp, "before").and_then(|v| v.parse().ok());
-    let after = attr_value(sp, "after").and_then(|v| v.parse().ok());
-    let before_lines = attr_value(sp, "beforeLines").and_then(|v| v.parse().ok());
-    let after_lines = attr_value(sp, "afterLines").and_then(|v| v.parse().ok());
+    let before = parse_spacing_twips(sp, "before", false)?;
+    let after = parse_spacing_twips(sp, "after", false)?;
+    let before_lines = parse_decimal_u32("beforeLines")?;
+    let after_lines = parse_decimal_u32("afterLines")?;
     // §17.3.1.33: beforeAutospacing/afterAutospacing — ST_OnOff attribute.
     // When true, before/beforeLines (or after/afterLines) are ignored and spacing
     // is automatically determined by the consumer.
-    let before_autospacing =
-        attr_value(sp, "beforeAutospacing").map(|v| !matches!(v.as_str(), "0" | "false" | "off"));
-    let after_autospacing =
-        attr_value(sp, "afterAutospacing").map(|v| !matches!(v.as_str(), "0" | "false" | "off"));
-    let line = attr_value(sp, "line").and_then(|v| v.parse().ok());
+    let before_autospacing = parse_on_off("beforeAutospacing")?;
+    let after_autospacing = parse_on_off("afterAutospacing")?;
+    let line = parse_spacing_twips(sp, "line", true)?;
     // Per §17.3.1.33: "If [lineRule] is omitted, then it shall be assumed
     // to be of a value auto if a line attribute value is present."
     let line_rule = attr_value(sp, "lineRule")
-        .cloned()
-        .or_else(|| line.map(|_| "auto".to_string()));
-
-    if before.is_some()
-        || after.is_some()
-        || before_lines.is_some()
-        || after_lines.is_some()
-        || before_autospacing.is_some()
-        || after_autospacing.is_some()
-        || line.is_some()
-    {
-        Some(SpacingProps {
-            before,
-            after,
-            before_lines,
-            after_lines,
-            before_autospacing,
-            after_autospacing,
-            line,
-            line_rule,
+        .map(|value| match value.as_str() {
+            "auto" | "exact" | "atLeast" => Ok(value.clone()),
+            _ => Err(WordIrError::InvalidParagraphPropertyAttribute {
+                element: "spacing",
+                attribute: "lineRule",
+                value: value.clone(),
+            }),
         })
-    } else {
-        None
+        .transpose()?;
+
+    Ok(Some(SpacingProps {
+        before,
+        after,
+        before_lines,
+        after_lines,
+        before_autospacing,
+        after_autospacing,
+        line,
+        line_rule,
+    }))
+}
+
+/// Parse a paragraph-property twip-measure union into normalized twips.
+///
+/// Both paragraph spacing and indentation use `ST_TwipsMeasure` or
+/// `ST_SignedTwipsMeasure`. Each admits universal measures such as `12pt` in
+/// addition to decimal twips; percentages are not members of either union.
+fn parse_paragraph_twip_measure(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+    schema_allows_negative: bool,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    let parsed = crate::import::parse_measurement_or_percent(
+        value,
+        &format!("w:{element_name}/@w:{attribute}"),
+    )
+    .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+        element: element_name,
+        attribute,
+        value: value.clone(),
+    })?;
+    let twips = match parsed {
+        crate::import::MeasurementOrPercent::Number(twips)
+        | crate::import::MeasurementOrPercent::UniversalTwips(twips) => twips,
+        crate::import::MeasurementOrPercent::Percent { .. } => {
+            return Err(WordIrError::InvalidParagraphPropertyAttribute {
+                element: element_name,
+                attribute,
+                value: value.clone(),
+            });
+        }
+    };
+    if twips < 0 && !schema_allows_negative {
+        return Err(WordIrError::InvalidParagraphPropertyAttribute {
+            element: element_name,
+            attribute,
+            value: value.clone(),
+        });
     }
+    Ok(Some(twips))
+}
+
+/// Parse one of the twip-valued `w:spacing` attributes into its canonical
+/// non-negative `u32` representation.
+fn parse_spacing_twips(
+    spacing: &Element,
+    attribute: &'static str,
+    schema_allows_negative: bool,
+) -> Result<Option<u32>, WordIrError> {
+    let Some(twips) =
+        parse_paragraph_twip_measure(spacing, "spacing", attribute, schema_allows_negative)?
+    else {
+        return Ok(None);
+    };
+    u32::try_from(twips)
+        .map(Some)
+        .map_err(|_| WordIrError::ParagraphPropertyAttributeOutOfRange {
+            element: "spacing",
+            attribute,
+            value: attr_value(spacing, attribute).cloned().unwrap_or_default(),
+            model: "non-negative u32 twips",
+        })
 }
 
 /// Extract paragraph borders from w:pPr/w:pBdr element (§17.3.1.24).
-fn extract_paragraph_borders(p_pr: &Element) -> Option<ParagraphBorderProps> {
-    let pbdr = find_w_child(p_pr, "pBdr")?;
+fn extract_paragraph_borders(p_pr: &Element) -> Result<Option<ParagraphBorderProps>, WordIrError> {
+    let Some(pbdr) = find_w_child(p_pr, "pBdr") else {
+        return Ok(None);
+    };
 
-    let top = extract_border_edge(pbdr, "top");
-    let bottom = extract_border_edge(pbdr, "bottom");
-    let left = extract_border_edge(pbdr, "left").or_else(|| extract_border_edge(pbdr, "start"));
-    let right = extract_border_edge(pbdr, "right").or_else(|| extract_border_edge(pbdr, "end"));
-    let between = extract_border_edge(pbdr, "between");
-    let bar = extract_border_edge(pbdr, "bar");
+    let top = extract_border_edge(pbdr, "top")?;
+    let bottom = extract_border_edge(pbdr, "bottom")?;
+    let left = match extract_border_edge(pbdr, "left")? {
+        Some(edge) => Some(edge),
+        None => extract_border_edge(pbdr, "start")?,
+    };
+    let right = match extract_border_edge(pbdr, "right")? {
+        Some(edge) => Some(edge),
+        None => extract_border_edge(pbdr, "end")?,
+    };
+    let between = extract_border_edge(pbdr, "between")?;
+    let bar = extract_border_edge(pbdr, "bar")?;
 
-    if top.is_some()
-        || bottom.is_some()
-        || left.is_some()
-        || right.is_some()
-        || between.is_some()
-        || bar.is_some()
-    {
-        Some(ParagraphBorderProps {
-            top,
-            bottom,
-            left,
-            right,
-            between,
-            bar,
-        })
-    } else {
-        None
-    }
+    Ok(Some(ParagraphBorderProps {
+        top,
+        bottom,
+        left,
+        right,
+        between,
+        bar,
+    }))
 }
 
 /// Extract w:keepNext from pPr (§17.3.1.14).
@@ -3944,29 +4544,122 @@ fn extract_contextual_spacing(p_pr: &Element) -> Option<bool> {
 /// Extract w:shd from pPr (§17.3.1.31) — paragraph shading.
 fn extract_paragraph_shading(
     p_pr: &Element,
-) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let shd = find_w_child(p_pr, "shd")?;
-    let fill = attr_value(shd, "fill").cloned();
-    let val = attr_value(shd, "val").cloned();
-    let color = attr_value(shd, "color").cloned();
-    Some((fill, val, color))
+) -> Result<Option<crate::domain::Shading>, WordIrError> {
+    let Some(shd) = find_w_child(p_pr, "shd") else {
+        return Ok(None);
+    };
+    let word_attribute = |local_name: &str| {
+        shd.attributes.iter().find_map(|(name, value)| {
+            if name.local_name != local_name {
+                return None;
+            }
+            let is_word_attribute = match name.namespace.as_deref() {
+                Some(namespace) => namespace == WORD_NS,
+                None => name.prefix.as_deref() == Some("w"),
+            };
+            is_word_attribute.then_some(value)
+        })
+    };
+    let parse_color = |attribute: &'static str| {
+        word_attribute(attribute)
+            .map(|value| {
+                (value == "auto"
+                    || (value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_hexdigit())))
+                .then(|| value.clone())
+                .ok_or_else(|| WordIrError::InvalidParagraphPropertyAttribute {
+                    element: "shd",
+                    attribute,
+                    value: value.clone(),
+                })
+            })
+            .transpose()
+    };
+    let fill = parse_color("fill")?;
+    let val = word_attribute("val")
+        .map(|value| {
+            crate::domain::ShadingPattern::from_xml_str(value).map_err(|_| {
+                WordIrError::InvalidParagraphPropertyAttribute {
+                    element: "shd",
+                    attribute: "val",
+                    value: value.clone(),
+                }
+            })
+        })
+        .transpose()?;
+    let color = parse_color("color")?;
+    let extra_attrs = shd
+        .attributes
+        .iter()
+        .filter_map(|(name, value)| {
+            if name.prefix.as_deref() == Some("xmlns") || name.local_name == "xmlns" {
+                return None;
+            }
+            let is_word_attribute = match name.namespace.as_deref() {
+                Some(namespace) => namespace == WORD_NS,
+                None => name.prefix.as_deref() == Some("w"),
+            };
+            if is_word_attribute && ["val", "fill", "color"].contains(&name.local_name.as_str()) {
+                return None;
+            }
+            Some(crate::domain::QualifiedAttribute {
+                local_name: name.local_name.clone(),
+                prefix: name.prefix.clone(),
+                namespace: name.namespace.clone(),
+                value: value.clone(),
+            })
+        })
+        .collect();
+    Ok(Some(crate::domain::Shading {
+        fill,
+        val,
+        color,
+        extra_attrs,
+    }))
 }
 
 /// Extract a single border edge element from a border container.
-fn extract_border_edge(container: &Element, edge_name: &str) -> Option<BorderEdge> {
-    let edge = find_w_child(container, edge_name)?;
+fn extract_border_edge(
+    container: &Element,
+    edge_name: &'static str,
+) -> Result<Option<BorderEdge>, WordIrError> {
+    let Some(edge) = find_w_child(container, edge_name) else {
+        return Ok(None);
+    };
     let style = attr_value(edge, "val")
-        .cloned()
-        .unwrap_or_else(|| "none".to_string());
+        .ok_or_else(|| WordIrError::MissingRequiredAttribute {
+            element: format!("w:{edge_name}"),
+            attribute: "w:val",
+        })?
+        .clone();
+    crate::domain::BorderStyle::from_xml_str(&style).map_err(|_| {
+        WordIrError::InvalidParagraphPropertyAttribute {
+            element: edge_name,
+            attribute: "val",
+            value: style.clone(),
+        }
+    })?;
     let color = attr_value(edge, "color").cloned();
-    let size = attr_value(edge, "sz").and_then(|v| v.parse().ok());
-    let space = attr_value(edge, "space").and_then(|v| v.parse().ok());
-    Some(BorderEdge {
+    let parse_u32 = |attribute: &'static str| {
+        attr_value(edge, attribute)
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+                        element: edge_name,
+                        attribute,
+                        value: value.clone(),
+                    })
+            })
+            .transpose()
+    };
+    let size = parse_u32("sz")?;
+    let space = parse_u32("space")?;
+    Ok(Some(BorderEdge {
         style,
         color,
         size,
         space,
-    })
+    }))
 }
 
 /// Extract w:sectPrChange from w:pPr > w:sectPr.
@@ -4003,8 +4696,18 @@ fn extract_section_property_change(p_pr: &Element) -> Option<SectionPropertyChan
 
 /// Extract tracked paragraph property change from w:pPr/w:pPrChange (§17.13.5.29).
 /// The inner w:pPr contains the previous paragraph properties before the change.
-fn extract_ppr_change(p_pr: &Element) -> Option<PprChange> {
-    let ppr_change_el = find_w_child(p_pr, "pPrChange")?;
+fn extract_ppr_change(p_pr: &Element) -> Result<Option<PprChange>, WordIrError> {
+    let ppr_changes = w_children_named(p_pr, "pPrChange");
+    let Some(ppr_change_el) = ppr_changes.first().copied() else {
+        return Ok(None);
+    };
+    if ppr_changes.len() != 1 {
+        return Err(WordIrError::DuplicateParagraphPropertyElement {
+            parent: "pPr",
+            element: "pPrChange",
+            count: ppr_changes.len(),
+        });
+    }
     let author = attr_value(ppr_change_el, "author")
         .cloned()
         .unwrap_or_default();
@@ -4014,7 +4717,15 @@ fn extract_ppr_change(p_pr: &Element) -> Option<PprChange> {
     // direct properties. An absent child is an EMPTY previous state, never a
     // reason to drop the tracked change (same rule as the rPrChange parse).
     let empty_previous = Element::new("pPr");
-    let inner_ppr = find_w_child(ppr_change_el, "pPr").unwrap_or(&empty_previous);
+    let previous_pprs = w_children_named(ppr_change_el, "pPr");
+    if previous_pprs.len() > 1 {
+        return Err(WordIrError::DuplicateParagraphPropertyElement {
+            parent: "pPrChange",
+            element: "pPr",
+            count: previous_pprs.len(),
+        });
+    }
+    let inner_ppr = previous_pprs.first().copied().unwrap_or(&empty_previous);
     let revision_id = attr_value(ppr_change_el, "id")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -4046,39 +4757,48 @@ fn extract_ppr_change(p_pr: &Element) -> Option<PprChange> {
         });
     }
 
-    Some(PprChange {
+    Ok(Some(PprChange {
         revision_id,
         previous_alignment: extract_alignment(inner_ppr),
-        previous_indentation: extract_indentation(inner_ppr),
-        previous_spacing: extract_spacing(inner_ppr),
+        previous_indentation: extract_indentation(inner_ppr)?,
+        previous_spacing: extract_spacing(inner_ppr)?,
+        previous_numbering: extract_raw_previous_num_props(inner_ppr)?,
         previous_style_id: extract_style_id(inner_ppr),
-        previous_borders: extract_paragraph_borders(inner_ppr),
+        previous_borders: extract_paragraph_borders(inner_ppr)?,
         previous_keep_next: extract_keep_next(inner_ppr),
         previous_keep_lines: extract_keep_lines(inner_ppr),
         previous_page_break_before: extract_page_break_before(inner_ppr),
         previous_widow_control: extract_widow_control(inner_ppr),
         previous_contextual_spacing: extract_contextual_spacing(inner_ppr),
-        previous_shading: extract_paragraph_shading(inner_ppr),
-        previous_tab_stops: extract_tab_stops(inner_ppr),
+        previous_shading: extract_paragraph_shading(inner_ppr)?,
+        previous_tab_stops: extract_tab_stops(inner_ppr)?,
         previous_mirror_indents: extract_optional_bool(inner_ppr, "mirrorIndents"),
         previous_auto_space_de: extract_optional_bool(inner_ppr, "autoSpaceDE"),
         previous_auto_space_dn: extract_optional_bool(inner_ppr, "autoSpaceDN"),
         previous_bidi: extract_optional_bool(inner_ppr, "bidi"),
-        previous_text_alignment: extract_text_alignment(inner_ppr),
+        previous_text_alignment: find_w_child(inner_ppr, "textAlignment")
+            .and_then(|el| attr_value(el, "val"))
+            .cloned(),
         previous_text_direction: find_w_child(inner_ppr, "textDirection")
             .and_then(|el| attr_value(el, "val"))
-            .and_then(|s| crate::domain::TextDirection::from_xml_str(s).ok()),
+            .cloned(),
         previous_suppress_auto_hyphens: extract_optional_bool(inner_ppr, "suppressAutoHyphens"),
         previous_snap_to_grid: extract_optional_bool(inner_ppr, "snapToGrid"),
         previous_overflow_punct: extract_optional_bool(inner_ppr, "overflowPunct"),
         previous_adjust_right_ind: extract_optional_bool(inner_ppr, "adjustRightInd"),
         previous_word_wrap: extract_optional_bool(inner_ppr, "wordWrap"),
         previous_frame_pr: extract_frame_pr(inner_ppr),
+        previous_outline_lvl: find_w_child(inner_ppr, "outlineLvl").map(|element| {
+            RawRequiredValue {
+                value: attr_value(element, "val").cloned(),
+            }
+        }),
+        previous_cnf_style: extract_cnf_style(inner_ppr)?,
         previous_paragraph_mark_rpr: extract_paragraph_mark_rpr(inner_ppr),
         preserved,
         author,
         date,
-    })
+    }))
 }
 
 fn extract_paragraph_mark_rpr(p_pr: &Element) -> Option<TextMarks> {
@@ -4490,50 +5210,65 @@ fn extract_section_properties(
 /// Parses `<w:tab>` children, extracting position (`w:pos`), alignment (`w:val`),
 /// and leader (`w:leader`). Includes `clear` stops — they're needed for
 /// inheritance resolution in the style chain.
-fn extract_tab_stops(p_pr: &Element) -> Option<Vec<TabStopDef>> {
-    let tabs_el = find_w_child(p_pr, "tabs")?;
+fn extract_tab_stops(p_pr: &Element) -> Result<Option<Vec<TabStopDef>>, WordIrError> {
+    let Some(tabs_el) = find_w_child(p_pr, "tabs") else {
+        return Ok(None);
+    };
     let mut stops = Vec::new();
     for child in &tabs_el.children {
         let el = match child {
             XMLNode::Element(el) if is_w_tag(el, "tab") => el,
             _ => continue,
         };
-        let position = match attr_value(el, "pos").and_then(|v| v.parse::<i32>().ok()) {
-            // MS-OI29500 2.1.95 §17.3.1.37 describes Word's LOAD-time clamp to
-            // ±31680 — a consumption rule, NOT a save rewrite: Word preserves an
-            // out-of-range w:pos verbatim in the markup. Clamping here rewrote
-            // authored positions and collided them with real stops at the
-            // boundary (silent value corruption). Keep the authored value; a
-            // consumer that needs Word's effective behavior clamps at read.
-            Some(pos) => pos,
-            None => continue, // position is required
-        };
+        let raw_position =
+            attr_value(el, "pos").ok_or_else(|| WordIrError::MissingRequiredAttribute {
+                element: "w:tab".to_string(),
+                attribute: "w:pos",
+            })?;
+        // MS-OI29500 2.1.95 §17.3.1.37 describes Word's LOAD-time clamp to
+        // ±31680 — a consumption rule, NOT a save rewrite. Keep the authored
+        // value; a consumer that needs Word's effective behavior clamps at read.
+        let position = raw_position.parse::<i32>().map_err(|_| {
+            WordIrError::InvalidParagraphPropertyAttribute {
+                element: "tab",
+                attribute: "pos",
+                value: raw_position.clone(),
+            }
+        })?;
         // w:val — parse tab alignment (ST_TabJc §17.18.81).
         // MS-OI29500 §17.18.84: "start" is an alias for "left", "end" for "right".
-        let alignment = match attr_value(el, "val") {
-            Some(v) => match v.as_str() {
-                "start" => crate::domain::TabAlignment::Left,
-                "end" => crate::domain::TabAlignment::Right,
-                other => match crate::domain::TabAlignment::from_xml_str(other) {
-                    Ok(a) => a,
-                    Err(_) => crate::domain::TabAlignment::Left, // spec: default to left
-                },
-            },
-            None => crate::domain::TabAlignment::Left,
-        };
+        let raw_alignment =
+            attr_value(el, "val").ok_or_else(|| WordIrError::MissingRequiredAttribute {
+                element: "w:tab".to_string(),
+                attribute: "w:val",
+            })?;
+        let alignment = crate::domain::TabAlignment::from_xml_str(raw_alignment).map_err(|_| {
+            WordIrError::InvalidParagraphPropertyAttribute {
+                element: "tab",
+                attribute: "val",
+                value: raw_alignment.clone(),
+            }
+        })?;
         // w:leader — parse tab leader (ST_TabTlc §17.18.82).
         // "none" means no leader (same as absent).
-        let leader = attr_value(el, "leader").and_then(|v| match v.as_str() {
-            "none" => None,
-            other => crate::domain::TabLeader::from_xml_str(other).ok(),
-        });
+        let leader = attr_value(el, "leader")
+            .map(|value| {
+                crate::domain::TabLeader::from_xml_str(value).map_err(|_| {
+                    WordIrError::InvalidParagraphPropertyAttribute {
+                        element: "tab",
+                        attribute: "leader",
+                        value: value.clone(),
+                    }
+                })
+            })
+            .transpose()?;
         stops.push(TabStopDef {
             position,
             alignment,
             leader,
         });
     }
-    if stops.is_empty() { None } else { Some(stops) }
+    Ok(Some(stops))
 }
 
 /// If a paragraph has `\t` characters but fewer explicit stops than tabs,
@@ -4829,11 +5564,7 @@ fn extract_text_recursive(element: &Element, out: &mut String) {
             let local_name = local_element_name(el);
             // w:t is the text element
             if local_name == "t" || local_name == "delText" {
-                for text_child in &el.children {
-                    if let XMLNode::Text(text) = text_child {
-                        out.push_str(text);
-                    }
-                }
+                out.push_str(&crate::word_xml::active_word_text(el));
             } else if local_name == "noBreakHyphen" {
                 // Non-text run leaf: project to its Unicode character so it is
                 // not silently dropped. U+2011 NON-BREAKING HYPHEN is the exact
@@ -5116,6 +5847,31 @@ mod tests {
         assert_eq!(
             local, "Choice",
             "w14 is in Word's MCE configuration, so the Choice wins over the Fallback"
+        );
+    }
+
+    #[test]
+    fn test_select_mc_branch_prefers_first_satisfied_w15_choice() {
+        // Word 2013's w15 namespace is in modern Word's application
+        // configuration. MCE selects the FIRST satisfied Choice, so a later w14
+        // choice must not displace an earlier w15 choice.
+        let xml = r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">
+            <mc:Choice Requires="w15">
+                <w:r><w:t>w15 content</w:t></w:r>
+            </mc:Choice>
+            <mc:Choice Requires="w14">
+                <w:r><w:t>w14 content</w:t></w:r>
+            </mc:Choice>
+            <mc:Fallback>
+                <w:r><w:t>fallback content</w:t></w:r>
+            </mc:Fallback>
+        </mc:AlternateContent>"#;
+        let element = parse_with_whitespace(xml);
+        let branch = select_mc_branch(&element).unwrap().unwrap();
+        assert_eq!(
+            attr_value(branch, "Requires").map(String::as_str),
+            Some("w15"),
+            "the first satisfied w15 Choice must win over later alternatives"
         );
     }
 
@@ -5408,6 +6164,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_wps_namespace_is_understood_when_preserved_as_drawing_markup() {
+        // Older Word producers used the Office 2010 pre-release WPS namespace
+        // and marked it MustUnderstand on w:drawing. Drawings are opaque widgets
+        // in the model, so preserving this namespace and its subtree satisfies
+        // that requirement just as it does for the finalized 2010 WPS URI.
+        let drawing = parse_with_whitespace(
+            r#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                           xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                           xmlns:wps="http://schemas.microsoft.com/office/word/2008/6/28/wordprocessingShape"
+                           mc:MustUnderstand="wps"><wps:wsp/></w:drawing>"#,
+        );
+        let transformed = mce_preprocess_element(&drawing, &MceScope::default())
+            .expect("legacy opaque WPS drawing is understood")
+            .expect("drawing remains in the model");
+        assert!(String::from_utf8_lossy(&serialize_element(&transformed)).contains("wps:wsp"));
+
+        let choice = parse_with_whitespace(
+            r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                    xmlns:wps="http://schemas.microsoft.com/office/word/2008/6/28/wordprocessingShape">
+                  <mc:Choice Requires="wps"><w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/></mc:Choice>
+                  <mc:Fallback><fallback/></mc:Fallback>
+                </mc:AlternateContent>"#,
+        );
+        let selected = select_mc_branch(&choice)
+            .expect("legacy WPS choice is valid")
+            .expect("legacy WPS choice is selected");
+        assert_eq!(local_element_name(selected), "Choice");
+    }
+
+    #[test]
     fn test_mc_alternate_content_run_level_falls_back_to_text() {
         // A run-level AlternateContent whose only Choice requires a namespace we
         // do NOT understand (w16se) resolves to its Fallback (§9.3). Here the
@@ -5489,6 +6275,33 @@ mod tests {
             "known elements in MC branch should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn run_level_bookmark_markers_are_hoisted_as_zero_width_decorations() {
+        // Some Word-open-clean producers place EG_RangeMarkupElements inside
+        // w:r. Normalize that wire diversity into the same atom sequence as
+        // schema-canonical paragraph-level markers; the serializer then emits
+        // the markers at paragraph level without losing their position.
+        let run = parse_with_whitespace(
+            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:bookmarkStart w:id="7" w:name="Clause"/><w:t>text</w:t><w:bookmarkEnd w:id="7"/></w:r>"#,
+        );
+        let atoms = run_atoms(&run, 0).expect("Word-tolerated bookmark run should normalize");
+        assert_eq!(atoms.len(), 3);
+        assert!(matches!(atoms[0].kind, AtomKind::Decoration { .. }));
+        assert!(matches!(&atoms[1].kind, AtomKind::Text(text) if text == "text"));
+        assert!(matches!(atoms[2].kind, AtomKind::Decoration { .. }));
+    }
+
+    #[test]
+    fn unknown_run_child_still_fails_after_bookmark_normalization() {
+        let run = parse_with_whitespace(
+            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:unmodeledContent/></w:r>"#,
+        );
+        assert!(matches!(
+            run_atoms(&run, 0),
+            Err(WordIrError::UnknownRunElement(name)) if name == "unmodeledContent"
+        ));
     }
 
     #[test]
@@ -5641,6 +6454,271 @@ mod tests {
     // --- Spacing extraction tests ---
 
     #[test]
+    fn duplicate_ppr_containers_merge_distinct_properties() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr>
+                <w:numPr><w:ilvl w:val="2"/><w:numId w:val="7"/></w:numPr>
+                <w:jc w:val="left"/>
+            </w:pPr>
+            <w:pPr>
+                <w:spacing w:before="120" w:after="240"/>
+                <w:jc w:val="right"/>
+            </w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+
+        let view = ParagraphView::from_paragraph(&element, &Default::default()).unwrap();
+
+        assert_eq!(
+            view.num_props,
+            DirectNumPr::Active(NumProps { num_id: 7, ilvl: 2 }),
+            "a later pPr without numPr must not erase earlier direct numbering"
+        );
+        assert_eq!(
+            view.alignment.as_deref(),
+            Some("right"),
+            "a later occurrence of the same property wins"
+        );
+        let spacing = view.spacing.expect("later pPr spacing is merged");
+        assert_eq!(spacing.before, Some(120));
+        assert_eq!(spacing.after, Some(240));
+    }
+
+    #[test]
+    fn partial_direct_numbering_is_a_typed_refusal() {
+        let witnesses = [
+            ("<w:numPr/>", None, None),
+            ("<w:numPr><w:numId w:val=\"7\"/></w:numPr>", Some(7), None),
+            ("<w:numPr><w:ilvl w:val=\"2\"/></w:numPr>", None, Some(2)),
+        ];
+
+        for (num_pr, expected_num_id, expected_ilvl) in witnesses {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr>{num_pr}</w:pPr>
+                    <w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let element = parse_with_whitespace(&xml);
+            let error = ParagraphView::from_paragraph(&element, &Default::default())
+                .expect_err("a partial direct numbering pair has no frozen effective rule");
+            assert!(matches!(
+                error,
+                WordIrError::IncompleteDirectNumbering { num_id, ilvl }
+                    if num_id == expected_num_id && ilvl == expected_ilvl
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_direct_numbering_never_collapses_to_absence() {
+        let witnesses = [
+            "<w:numPr><w:ilvl w:val=\"0\"/><w:numId/></w:numPr>",
+            "<w:numPr><w:ilvl w:val=\"bad\"/><w:numId w:val=\"7\"/></w:numPr>",
+        ];
+
+        for num_pr in witnesses {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr>{num_pr}</w:pPr>
+                    <w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let element = parse_with_whitespace(&xml);
+            ParagraphView::from_paragraph(&element, &Default::default())
+                .expect_err("malformed direct numbering must fail at the package edge");
+        }
+    }
+
+    #[test]
+    fn num_id_zero_suppresses_without_inventing_an_ilvl() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&element, &Default::default()).unwrap();
+        assert_eq!(view.num_props, DirectNumPr::Suppressed);
+    }
+
+    #[test]
+    fn duplicate_numbering_elements_refuse_first_wins_parsing() {
+        let witnesses = [
+            r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>
+                <w:numPr><w:ilvl w:val="1"/><w:numId w:val="8"/></w:numPr>"#,
+            r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/><w:numId w:val="8"/></w:numPr>"#,
+        ];
+        for numbering in witnesses {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr>{numbering}</w:pPr><w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let element = parse_with_whitespace(&xml);
+            let error = ParagraphView::from_paragraph(&element, &Default::default())
+                .expect_err("duplicate numbering elements must not select the first");
+            assert!(matches!(
+                error,
+                WordIrError::DuplicateParagraphPropertyElement { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_later_partial_numbering_container_cannot_hide_behind_an_earlier_pair() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr>
+            <w:pPr><w:numPr><w:numId w:val="8"/></w:numPr></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&element, &Default::default())
+            .expect_err("every authored pPr occurrence must validate");
+        assert!(matches!(
+            error,
+            WordIrError::IncompleteDirectNumbering {
+                num_id: Some(8),
+                ilvl: None
+            }
+        ));
+    }
+
+    #[test]
+    fn sibling_paragraph_property_histories_are_ambiguous() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:pPrChange w:id="1" w:author="A"><w:pPr/></w:pPrChange></w:pPr>
+            <w:pPr><w:pPrChange w:id="2" w:author="B"><w:pPr/></w:pPrChange></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&element, &Default::default())
+            .expect_err("multiple paragraph-property histories have no unique prior state");
+        assert!(matches!(
+            error,
+            WordIrError::DuplicateParagraphPropertyElement {
+                parent: "p",
+                element: "pPrChange",
+                count: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn tracked_numbering_children_are_an_explicit_capability_refusal() {
+        for tracked_child in [
+            r#"<w:ins w:id="3" w:author="A"/>"#,
+            r#"<w:numberingChange w:id="3" w:author="A"/>"#,
+        ] {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/>{tracked_child}</w:numPr></w:pPr>
+                    <w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let element = parse_with_whitespace(&xml);
+            let error = ParagraphView::from_paragraph(&element, &Default::default())
+                .expect_err("tracked numbering state must not collapse to plain active state");
+            assert!(matches!(
+                error,
+                WordIrError::UnsupportedDirectNumberingChild { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn tracked_numbering_inside_previous_ppr_is_not_hidden_in_raw_remainder() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:pPrChange w:id="4" w:author="A"><w:pPr>
+                <w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/><w:ins w:id="3" w:author="B"/></w:numPr>
+            </w:pPr></w:pPrChange></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&element, &Default::default())
+            .expect_err("nested pending numbering cannot be projected by the current model");
+        assert!(matches!(
+            error,
+            WordIrError::UnsupportedDirectNumberingChild { .. }
+        ));
+    }
+
+    #[test]
+    fn extract_indentation_accepts_strict_universal_twip_measures() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:ind w:start="36pt" w:end="-0.5in" w:firstLine="12pt"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let el = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&el, &Default::default()).unwrap();
+        assert_eq!(
+            view.indentation,
+            Some(IndentProps {
+                left: Some(720),
+                right: Some(-720),
+                effective_first_line_twips: Some(240),
+                ..IndentProps::default()
+            })
+        );
+
+        let hanging_xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:ind w:hanging="12pt"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let hanging =
+            ParagraphView::from_paragraph(&parse_with_whitespace(hanging_xml), &Default::default())
+                .unwrap();
+        assert_eq!(
+            hanging
+                .indentation
+                .expect("indentation should be present")
+                .effective_first_line_twips,
+            Some(-240)
+        );
+    }
+
+    #[test]
+    fn extract_indentation_refuses_invalid_or_unrepresentable_twip_measures() {
+        for (attribute, value, out_of_range) in [
+            ("start", "10%", false),
+            ("firstLine", "-1pt", false),
+            ("start", "2147483648", true),
+        ] {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr><w:ind w:{attribute}="{value}"/></w:pPr>
+                    <w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let error =
+                ParagraphView::from_paragraph(&parse_with_whitespace(&xml), &Default::default())
+                    .expect_err(
+                        "invalid or unrepresentable indentation must fail at the parse edge",
+                    );
+            if out_of_range {
+                assert!(matches!(
+                    error,
+                    WordIrError::ParagraphPropertyAttributeOutOfRange {
+                        element: "ind",
+                        attribute: actual_attribute,
+                        model: "signed i32 twips",
+                        ..
+                    } if actual_attribute == attribute
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    WordIrError::InvalidParagraphPropertyAttribute {
+                        element: "ind",
+                        attribute: actual_attribute,
+                        ..
+                    } if actual_attribute == attribute
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn extract_spacing_full() {
         let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pPr>
@@ -5687,6 +6765,67 @@ mod tests {
         let sp = view.spacing.expect("spacing should be present");
         assert_eq!(sp.line, Some(240));
         assert_eq!(sp.line_rule.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn extract_spacing_accepts_strict_universal_twip_measures() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr>
+                <w:spacing w:before="0pt" w:after="1in" w:line="12pt"/>
+            </w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let el = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&el, &Default::default()).unwrap();
+        let sp = view.spacing.expect("spacing should be present");
+        assert_eq!(sp.before, Some(0));
+        assert_eq!(sp.after, Some(1_440));
+        assert_eq!(sp.line, Some(240));
+        assert_eq!(sp.line_rule, None);
+    }
+
+    #[test]
+    fn extract_spacing_rejects_percent_and_negative_unsigned_measures() {
+        for (attribute, value) in [("before", "10%"), ("after", "-1pt")] {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                    <w:pPr><w:spacing w:{attribute}="{value}"/></w:pPr>
+                    <w:r><w:t>text</w:t></w:r>
+                </w:p>"#
+            );
+            let el = parse_with_whitespace(&xml);
+            let error = ParagraphView::from_paragraph(&el, &Default::default())
+                .expect_err("invalid unsigned twip measure must fail at the parse edge");
+            assert!(matches!(
+                error,
+                WordIrError::InvalidParagraphPropertyAttribute {
+                    element: "spacing",
+                    attribute: actual_attribute,
+                    ..
+                } if actual_attribute == attribute
+            ));
+        }
+    }
+
+    #[test]
+    fn extract_spacing_distinguishes_schema_valid_negative_line_from_malformed_input() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:spacing w:line="-1pt"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let el = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&el, &Default::default()).expect_err(
+            "the unsigned canonical spacing model cannot represent negative line twips",
+        );
+        assert!(matches!(
+            error,
+            WordIrError::ParagraphPropertyAttributeOutOfRange {
+                element: "spacing",
+                attribute: "line",
+                model: "non-negative u32 twips",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5944,9 +7083,8 @@ mod tests {
         assert!(view.section_properties.is_none());
     }
 
-    /// MS-OI29500 §17.18.84: "start" and "end" are bidi-aware aliases for
-    /// "left" and "right". Our parser normalizes them so downstream code only
-    /// needs to handle the canonical forms.
+    /// MS-OI29500 §17.18.84: "start" and "end" are bidi-aware values. Preserve
+    /// the authored token; resolving it to a physical side is a layout concern.
     #[test]
     fn tab_stop_start_end_aliases() {
         let xml = r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -5958,17 +7096,19 @@ mod tests {
             </w:tabs>
         </w:pPr>"#;
         let el = parse_with_whitespace(xml);
-        let stops = extract_tab_stops(&el).expect("should parse tab stops");
+        let stops = extract_tab_stops(&el)
+            .expect("valid tab stops")
+            .expect("tabs element should be present");
         assert_eq!(stops.len(), 4);
         assert_eq!(
             stops[0].alignment,
-            crate::domain::TabAlignment::Left,
-            "start should normalize to left"
+            crate::domain::TabAlignment::Start,
+            "start must remain authored start"
         );
         assert_eq!(
             stops[1].alignment,
-            crate::domain::TabAlignment::Right,
-            "end should normalize to right"
+            crate::domain::TabAlignment::End,
+            "end must remain authored end"
         );
         assert_eq!(
             stops[2].alignment,
@@ -6140,10 +7280,178 @@ mod tests {
         let view = ParagraphView::from_paragraph(&el, &Default::default()).unwrap();
 
         let cnf = view.cnf_style.expect("cnfStyle should be parsed");
-        assert_eq!(cnf.val.as_deref(), Some("100000000000"));
-        assert!(cnf.first_row);
-        assert!(!cnf.last_row);
-        assert!(!cnf.first_column);
+        assert_eq!(
+            cnf.val.as_ref().map(|mask| mask.as_str()),
+            Some("100000000000")
+        );
+        assert_eq!(cnf.first_row, Some(true));
+        assert_eq!(cnf.last_row, Some(false));
+        assert_eq!(cnf.first_column, Some(false));
+    }
+
+    #[test]
+    fn parse_cnf_style_preserves_element_and_named_attribute_presence() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                 xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+                 xmlns:x="urn:foreign">
+                <w:pPr>
+                    <w:cnfStyle w:firstRow="false" x:firstRow="true" w14:custom="kept"/>
+                </w:pPr>
+                <w:r><w:t>Test</w:t></w:r>
+            </w:p>"#;
+        let el = Element::parse(xml.as_bytes()).unwrap();
+        let view = ParagraphView::from_paragraph(&el, &Default::default()).unwrap();
+        let cnf = view
+            .cnf_style
+            .expect("present-empty and present-OFF are modeled");
+
+        assert_eq!(cnf.first_row, Some(false));
+        assert_eq!(cnf.last_row, None);
+        assert_eq!(cnf.val, None);
+        assert_eq!(
+            cnf.extra_attrs,
+            vec![
+                crate::domain::QualifiedAttribute {
+                    local_name: "firstRow".into(),
+                    prefix: Some("x".into()),
+                    namespace: Some("urn:foreign".into()),
+                    value: "true".into(),
+                },
+                crate::domain::QualifiedAttribute {
+                    local_name: "custom".into(),
+                    prefix: Some("w14".into()),
+                    namespace: Some("http://schemas.microsoft.com/office/word/2010/wordml".into()),
+                    value: "kept".into(),
+                }
+            ]
+        );
+
+        let empty_xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:cnfStyle/></w:pPr></w:p>"#;
+        let empty = Element::parse(empty_xml.as_bytes()).unwrap();
+        let empty_view = ParagraphView::from_paragraph(&empty, &Default::default()).unwrap();
+        assert_eq!(
+            empty_view.cnf_style,
+            Some(crate::domain::CnfStyle::default())
+        );
+
+        let absent_xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr/></w:p>"#;
+        let absent = Element::parse(absent_xml.as_bytes()).unwrap();
+        let absent_view = ParagraphView::from_paragraph(&absent, &Default::default()).unwrap();
+        assert_eq!(absent_view.cnf_style, None);
+    }
+
+    #[test]
+    fn parse_cnf_style_rejects_invalid_named_values_and_legacy_masks() {
+        for (attribute, value, expected) in [
+            ("firstRow", "yes", "@w:firstRow"),
+            ("val", "10000000000", "ST_Cnf mask"),
+            ("val", "10000000000x", "ST_Cnf mask"),
+        ] {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:cnfStyle w:{attribute}="{value}"/></w:pPr></w:p>"#
+            );
+            let paragraph = Element::parse(xml.as_bytes()).unwrap();
+            let error = ParagraphView::from_paragraph(&paragraph, &Default::default())
+                .expect_err("malformed cnfStyle must fail at the package edge");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn parse_cnf_style_accepts_strict_and_transitional_on_off_spellings() {
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("off", false),
+        ] {
+            let xml = format!(
+                r#"<w:cnfStyle xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:firstRow="{value}"/>"#
+            );
+            let element = Element::parse(xml.as_bytes()).unwrap();
+            let cnf = parse_cnf_style_element(&element).unwrap();
+            assert_eq!(cnf.first_row, Some(expected), "spelling {value:?}");
+        }
+    }
+
+    #[test]
+    fn previous_ppr_composites_preserve_empty_presence_and_exact_shading_attributes() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                            xmlns:x="urn:foreign">
+            <w:pPr>
+                <w:pPrChange w:id="1" w:author="tester">
+                    <w:pPr>
+                        <w:pBdr/>
+                        <w:shd w:themeFill="accent1" x:fill="foreign"/>
+                        <w:tabs/>
+                        <w:spacing/>
+                        <w:ind/>
+                    </w:pPr>
+                </w:pPrChange>
+            </w:pPr>
+            <w:r><w:t>same</w:t></w:r>
+        </w:p>"#;
+        let paragraph = Element::parse(xml.as_bytes()).unwrap();
+        let view = ParagraphView::from_paragraph(&paragraph, &Default::default()).unwrap();
+        let previous = view.ppr_change.expect("pPrChange");
+
+        assert_eq!(previous.previous_indentation, Some(IndentProps::default()));
+        assert_eq!(previous.previous_spacing, Some(SpacingProps::default()));
+        assert_eq!(
+            previous.previous_borders,
+            Some(ParagraphBorderProps::default())
+        );
+        assert_eq!(previous.previous_tab_stops, Some(Vec::new()));
+        let shading = previous.previous_shading.expect("present empty shading");
+        assert_eq!(shading.fill, None);
+        assert_eq!(shading.val, None);
+        assert_eq!(shading.color, None);
+        assert_eq!(
+            shading.extra_attrs,
+            vec![
+                crate::domain::QualifiedAttribute {
+                    local_name: "themeFill".into(),
+                    prefix: Some("w".into()),
+                    namespace: Some(WORD_NS.into()),
+                    value: "accent1".into(),
+                },
+                crate::domain::QualifiedAttribute {
+                    local_name: "fill".into(),
+                    prefix: Some("x".into()),
+                    namespace: Some("urn:foreign".into()),
+                    value: "foreign".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn paragraph_composites_reject_invalid_modeled_values() {
+        for (property, expected) in [
+            (r#"<w:ind w:left="no"/>"#, "w:ind/@w:left"),
+            (r#"<w:spacing w:before="no"/>"#, "w:spacing/@w:before"),
+            (
+                r#"<w:pBdr><w:top w:val="invented"/></w:pBdr>"#,
+                "w:top/@w:val",
+            ),
+            (
+                r#"<w:tabs><w:tab w:val="left" w:pos="no"/></w:tabs>"#,
+                "w:tab/@w:pos",
+            ),
+            (r#"<w:shd w:val="invented"/>"#, "w:shd/@w:val"),
+            (r#"<w:shd w:fill="xyz"/>"#, "w:shd/@w:fill"),
+        ] {
+            let xml = format!(
+                r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr>{property}</w:pPr></w:p>"#
+            );
+            let paragraph = Element::parse(xml.as_bytes()).unwrap();
+            let error = ParagraphView::from_paragraph(&paragraph, &Default::default())
+                .expect_err("invalid modeled value must fail at the XML edge");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
@@ -6271,6 +7579,26 @@ mod tests {
         );
     }
 
+    /// WordprocessingML text leaves preserve boundary whitespace only when
+    /// `xml:space="preserve"` says that the whitespace is authored content.
+    /// The hyperlink edge must project that active text meaning rather than
+    /// the parser's raw character buffer.
+    #[test]
+    fn test_extract_hyperlink_data_honors_xml_space_at_text_boundaries() {
+        let xml = r#"<w:hyperlink xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:r><w:t> Click </w:t></w:r>
+            <w:r><w:t xml:space="preserve"> kept </w:t></w:r>
+            <w:r><w:t>inner space</w:t></w:r>
+        </w:hyperlink>"#;
+
+        let data = extract_hyperlink_data(&parse_with_whitespace(xml));
+
+        assert_eq!(data.runs[0].text, "Click");
+        assert_eq!(data.runs[1].text, " kept ");
+        assert_eq!(data.runs[2].text, "inner space");
+        assert_eq!(data.text, "Click kept inner space");
+    }
+
     /// Runs inside `<w:ins>` and `<w:del>` envelopes within a hyperlink are
     /// imported with the corresponding `Inserted` / `Deleted` status (with
     /// revision metadata captured from the envelope attributes), so the IR
@@ -6280,14 +7608,14 @@ mod tests {
         let xml = r#"<w:hyperlink xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                                    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
                                    r:id="rId1">
-            <w:r><w:t>before </w:t></w:r>
+            <w:r><w:t xml:space="preserve">before </w:t></w:r>
             <w:del w:id="42" w:author="Test" w:date="2026-05-19T10:00:00Z">
                 <w:r><w:delText>old</w:delText></w:r>
             </w:del>
             <w:ins w:id="43" w:author="Test" w:date="2026-05-19T10:00:00Z">
                 <w:r><w:t>new</w:t></w:r>
             </w:ins>
-            <w:r><w:t> after</w:t></w:r>
+            <w:r><w:t xml:space="preserve"> after</w:t></w:r>
         </w:hyperlink>"#;
         let element = parse_with_whitespace(xml);
         let data = extract_hyperlink_data(&element);
@@ -6339,5 +7667,41 @@ mod tests {
             data.runs[0].status
         );
         assert_eq!(data.runs[0].text, "untracked-ins");
+    }
+
+    #[test]
+    fn tracked_container_normalizes_schema_decimal_id_wider_than_u32() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:ins w:id="42949672960" w:author="Word">
+                <w:r><w:t>inserted</w:t></w:r>
+            </w:ins>
+        </w:p>"#;
+        let paragraph = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&paragraph, &Default::default())
+            .expect("a schema-valid decimal revision id must import");
+
+        let tracking = view.atoms[0].tracking.as_ref().expect("tracked atom");
+        assert_eq!(tracking.revision_id, 0, "wide ids enter the minting lane");
+        assert_eq!(tracking.author, "Word");
+    }
+
+    #[test]
+    fn tracked_container_refuses_non_decimal_id() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:ins w:id="not-decimal" w:author="Word">
+                <w:r><w:t>inserted</w:t></w:r>
+            </w:ins>
+        </w:p>"#;
+        let paragraph = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&paragraph, &Default::default())
+            .expect_err("non-decimal revision ids are invalid input");
+
+        assert!(matches!(
+            error,
+            WordIrError::InvalidTrackedChangeAttribute {
+                attribute: "id",
+                ref value,
+            } if value == "not-decimal"
+        ));
     }
 }

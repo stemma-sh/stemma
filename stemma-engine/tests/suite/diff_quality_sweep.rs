@@ -6,11 +6,14 @@
 //! ```
 
 use crate::common;
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use std::fs;
 use std::panic;
 
-use stemma::{DiffChange, DocxRuntime, InlineChange, SimpleRuntime};
+use stemma::{DocxRuntime, InlineChange, SimpleRuntime};
 
 /// Per-sample quality metrics.
 struct SampleMetrics {

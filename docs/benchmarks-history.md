@@ -161,7 +161,7 @@ deterministic gate passed.
 | res8 | selective formatting-change resolution (v1 prompt) | 6 KB, 47 markers | 2/5 · $0.28 | **5/5**† · $0.40 | **inversion: vanilla wins** under the v1 prompt (see the main report's corrections) |
 | f5 | edits adjacent to opaque objects (figures, footnote-in-sentence, hyperlink, term replace) | 43 KB, ~8 pp, images/equation/fields | 5/5 · $0.74 | 5/5 · $0.84 | **tie** |
 | auth6 | layer a tracked edit inside another author's pending insertion | 129 KB, 367 markers | 5/5 · $0.65 | 5/5 · **$0.34** | stable tie; **vanilla cheapest** |
-| safe6 | tighten a redline without an author identity while never impersonating the existing reviewer | 129 KB, 367 markers | 4/5 · $0.69 | 3/4\* · n/p | tie (both flippy); no clean run ever impersonated |
+| safe6 | tighten a redline without a supplied author label while never reusing the existing reviewer label | 129 KB, 367 markers | 4/5 · $0.69 | 3/4\* · n/p | tie (both flippy); no clean run reused the label |
 
 † corrected 2026-07-02: originally published as vanilla 0/5. The gate
 string-compared serialized XML instead of the properties it encodes. This had
@@ -191,12 +191,14 @@ Notes, in honesty order:
   19-gates-vs-18 for stemma; re-graded against the committed frozen ground
   truth, every stemma *and* vanilla run on record passes all 19 gates (5/5
   each).
-- **safe6's "impersonation moat" dissolved.** Across the 9 clean tighten runs,
-  neither arm ever authored edits as the existing reviewer. stemma's one miss
-  was under-scoping (it added no authored edits that run), not impersonation;
+- **safe6's author-label moat dissolved.** Across the 9 clean tighten runs,
+  neither arm ever authored edits with the existing reviewer label. stemma's
+  one miss was under-scoping (it added no authored edits that run), not a label
+  collision;
   vanilla's one miss was a suite-invariant violation (it edited the input file
-  in place), not impersonation either.
-  stemma's write surface does refuse author impersonation *by construction*,
+  in place), not a label collision either.
+  stemma's write surface requires explicit confirmation before reusing a Word
+  author label *by construction*,
   but this benchmark never caught a competitor committing that failure, so it
   is reported as an engine property, not a demonstrated competitive failure.
   The vanilla cost for this lane is not published: the underlying task's

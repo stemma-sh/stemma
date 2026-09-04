@@ -22,6 +22,8 @@
 //!     question, asserted via `stemma::api::validate`.
 
 use std::io::{Cursor, Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 use zip::write::FileOptions;
 
 // ─── Prelude: minimal-docx plumbing (mirrors the shared spec-suite prelude) ───

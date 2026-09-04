@@ -134,6 +134,8 @@ const ENDNOTES_REL_TYPE: &str =
 const COMMENTS_REL_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
 const PEOPLE_REL_TYPE: &str = "http://schemas.microsoft.com/office/2011/relationships/people";
+const HYPERLINK_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 
 /// Relationship namespace used in officeDocument relationships.
 const REL_ATTR_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -229,6 +231,7 @@ pub fn validate_docx(bytes: &[u8]) -> DocxValidation {
     check_ct_002_canonical_wml_content_types(&state, &mut findings);
     check_rel_001_rid_references(&state, &mut findings);
     check_rel_004_hdrftr_ref_requires_rid(&state, &mut findings);
+    check_rel_005_hyperlink_relationship_type(&state, &mut findings);
     check_rel_002_id_uniqueness(&state, &mut findings);
     check_rel_003_internal_targets(&state, &mut findings);
     check_story_001_story_relationships(&state, &mut findings);
@@ -267,7 +270,8 @@ fn check_annotations_and_structure(state: &PackageState, findings: &mut Vec<Vali
         check_colfirst_collast_pairing, check_comment_marker_pairing, check_comment_range_count,
         check_custom_xml_range_pairing, check_document_root, check_footnote_endnote_id_range,
         check_no_nested_tracked_changes, check_omath_placement, check_para_id_range,
-        check_perm_id_validity, check_tracked_change_content_model,
+        check_perm_id_validity, check_required_tracked_change_ids,
+        check_tracked_change_content_model,
     };
     use crate::docx_validate_ordering::check_element_ordering;
 
@@ -284,6 +288,7 @@ fn check_annotations_and_structure(state: &PackageState, findings: &mut Vec<Vali
     findings.extend(check_comment_marker_pairing(&story_refs));
     findings.extend(check_custom_xml_range_pairing(&story_refs));
     findings.extend(check_para_id_range(&story_refs));
+    findings.extend(check_required_tracked_change_ids(&story_refs));
     findings.extend(check_tracked_change_content_model(&story_refs));
     findings.extend(check_footnote_endnote_id_range(&story_refs));
     findings.extend(check_no_nested_tracked_changes(&story_refs));
@@ -548,7 +553,7 @@ fn parse_xml(
     }
 }
 
-fn local_element_name(element: &Element) -> &str {
+pub fn local_element_name(element: &Element) -> &str {
     match element.name.rsplit_once(':') {
         Some((_, local)) => local,
         None => &element.name,
@@ -580,7 +585,9 @@ fn parse_relationships(root: &Element) -> Vec<ParsedRelationship> {
         let Some(target) = get_attr(el, "Target") else {
             continue;
         };
-        let rel_type = get_attr(el, "Type").unwrap_or("").to_string();
+        let rel_type =
+            crate::word_xml::canonicalize_relationship_type(get_attr(el, "Type").unwrap_or(""))
+                .into_owned();
         let target_mode = get_attr(el, "TargetMode").map(|s| s.to_string());
         rels.push(ParsedRelationship {
             id: id.to_string(),
@@ -1028,10 +1035,71 @@ pub(crate) fn check_story_hdrftr_ref_rid(
     findings
 }
 
+// =============================================================================
+// I-REL-005: w:hyperlink r:id resolves to a hyperlink relationship
+// =============================================================================
+
+/// A relationship id is only local transport identity; resolving an id is not
+/// enough when it names the wrong semantic resource. `w:hyperlink/@r:id` must
+/// bind to the OPC hyperlink relationship type. Otherwise Word repairs the
+/// document and drops the link even though I-REL-001 sees a present id.
+fn check_rel_005_hyperlink_relationship_type(
+    state: &PackageState,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    for (part_name, root) in &state.story_parts {
+        let rels_path = rels_path_for_part(part_name);
+        let Some(rels) = state.rels_files.get(&rels_path) else {
+            // Missing bindings are already reported by I-REL-001.
+            continue;
+        };
+        collect_hyperlink_relationship_type_findings(part_name, root, rels, findings);
+    }
+}
+
+fn collect_hyperlink_relationship_type_findings(
+    part_name: &str,
+    element: &Element,
+    rels: &[ParsedRelationship],
+    findings: &mut Vec<ValidationFinding>,
+) {
+    if local_element_name(element) == "hyperlink"
+        && let Some(rid) = relationship_id_attr(element)
+        && let Some(binding) = rels.iter().find(|relationship| relationship.id == rid)
+        && binding.rel_type != HYPERLINK_REL_TYPE
+    {
+        findings.push(ValidationFinding {
+            rule_id: "I-REL-005",
+            severity: ValidationSeverity::Error,
+            message: format!(
+                "w:hyperlink relationship reference {rid:?} in {part_name:?} resolves to type {:?}, expected {HYPERLINK_REL_TYPE:?}",
+                binding.rel_type
+            ),
+            location: part_name.to_string(),
+        });
+    }
+    for child in &element.children {
+        if let XMLNode::Element(child) = child {
+            collect_hyperlink_relationship_type_findings(part_name, child, rels, findings);
+        }
+    }
+}
+
+fn relationship_id_attr(element: &Element) -> Option<&str> {
+    element.attributes.iter().find_map(|(name, value)| {
+        let local = name.local_name.as_str();
+        let is_rid = (local == "id"
+            && (name.namespace.as_deref() == Some(REL_ATTR_NS)
+                || name.prefix.as_deref() == Some("r")))
+            || local == "r:id";
+        (is_rid && !value.is_empty()).then_some(value.as_str())
+    })
+}
+
 /// Collect all relationship reference attribute values from an XML element tree.
 ///
 /// Looks for `r:id`, `r:embed`, `r:link` attributes (both prefixed and namespace-qualified).
-fn collect_relationship_references(element: &Element, out: &mut Vec<String>) {
+pub fn collect_relationship_references(element: &Element, out: &mut Vec<String>) {
     for (attr_name, value) in &element.attributes {
         let is_rel_ref = is_relationship_reference_attr(attr_name);
         if is_rel_ref && !value.is_empty() {

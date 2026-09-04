@@ -965,9 +965,9 @@ fn mixed_range_maps_status_by_origin() {
 
 #[test]
 fn anonymous_insertions_stack_rather_than_unpropose() {
-    // D7: author identity is exact byte equality and an anonymous revision
-    // never matches — the engine must never un-propose text it cannot prove
-    // is the editing author's. Deleting text inside an anonymous insertion
+    // D7: reviewer-group membership is exact author-label equality, and a revision
+    // without a label never matches — the engine must never un-propose text it
+    // cannot associate with the editing reviewer group. Deleting text inside an anonymous insertion
     // therefore STACKS (conservative), never silently drops.
     let body = r#"<w:p><w:r><w:t xml:space="preserve">Lead </w:t></w:r><w:ins w:id="1" w:author="" w:date="2026-01-01T00:00:00Z"><w:r><w:t>anon</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> tail.</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");

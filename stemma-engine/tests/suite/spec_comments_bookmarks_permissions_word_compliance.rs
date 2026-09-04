@@ -334,7 +334,8 @@ fn cross_paragraph_comment_range_markers_zero_width() {
 #[test]
 fn lone_comment_range_start_opens_clean() {
     let body = r#"<w:p><w:r><w:t>Before </w:t></w:r><w:commentRangeStart w:id="1"/><w:r><w:t>anchored text</w:t></w:r><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="1"/></w:r></w:p><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
+    let comments = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="Reviewer"><w:p><w:r><w:t>Comment</w:t></w:r></w:p></w:comment></w:comments>"#;
+    let b = make_docx(body, &[("word/comments.xml", comments)]);
     let (ok, detail) = opens_clean(&b);
     assert!(
         ok,
@@ -353,7 +354,8 @@ fn lone_comment_range_start_opens_clean() {
 #[test]
 fn lone_comment_range_end_opens_clean() {
     let body = r#"<w:p><w:r><w:t>anchored text</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="1"/></w:r></w:p><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
+    let comments = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="1" w:author="Reviewer"><w:p><w:r><w:t>Comment</w:t></w:r></w:p></w:comment></w:comments>"#;
+    let b = make_docx(body, &[("word/comments.xml", comments)]);
     let (ok, detail) = opens_clean(&b);
     assert!(
         ok,

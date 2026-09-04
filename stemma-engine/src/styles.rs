@@ -154,7 +154,12 @@ pub struct StyleDefinitions {
     char_styles: HashMap<String, TextMarks>,
     /// Paragraph styles' run properties: style_id → resolved TextMarks.
     para_styles: HashMap<String, TextMarks>,
-    /// Paragraph styles' resolved effective tab stops: style_id → Vec<TabStopDef>.
+    /// Paragraph-style chains whose highest authored Latin `w:rFonts` element
+    /// contains literal ascii/hAnsi values and no Theme selector. Word treats
+    /// that element as replacing a lower docDefaults Theme selector rather
+    /// than attribute-merging the selector back into the style.
+    para_literal_latin_over_doc_default_theme: HashSet<String>,
+    /// Paragraph styles' resolved effective tab stops: style_id → `Vec<TabStopDef>`.
     /// Only non-"clear" stops, sorted ascending by position, de-duped.
     para_tab_stops: HashMap<String, Vec<TabStopDef>>,
     /// Paragraph styles' resolved paragraph properties (alignment, indent, spacing, borders).
@@ -273,7 +278,7 @@ pub(crate) struct RawParagraphProps {
     /// Paragraph borders (whole-object replacement, not per-edge).
     borders: Option<ParagraphBorderProps>,
     /// Numbering properties from w:numPr in the style's pPr (§17.7.4.14).
-    num_props: Option<NumProps>,
+    num_props: Option<DirectNumPr>,
     /// Contextual spacing flag from w:contextualSpacing (§17.3.1.9).
     /// None = not specified (inherit from parent), Some(true/false) = explicit.
     contextual_spacing: Option<bool>,
@@ -450,6 +455,7 @@ impl StyleDefinitions {
         // 3. Resolve basedOn chains and fold in document defaults.
         let mut char_styles = HashMap::new();
         let mut para_styles = HashMap::new();
+        let mut para_literal_latin_over_doc_default_theme = HashSet::new();
         let mut para_tab_stops = HashMap::new();
         let mut para_props = HashMap::new();
         let mut table_styles = HashMap::new();
@@ -501,6 +507,13 @@ impl StyleDefinitions {
                 None => resolve_chain(id, &raw_styles),
             };
             para_styles.insert(id.clone(), resolved);
+            if raw.link.is_none()
+                && doc_defaults.font_family_theme.is_some()
+                && highest_paragraph_style_latin_rfonts(id, &raw_styles)
+                    == Some(LatinRFontsDisposition::Literal)
+            {
+                para_literal_latin_over_doc_default_theme.insert(id.clone());
+            }
 
             let resolved_tabs = resolve_tab_stop_chain(id, &raw_styles);
             if !resolved_tabs.is_empty() {
@@ -563,6 +576,7 @@ impl StyleDefinitions {
             default_char_style_id,
             char_styles,
             para_styles,
+            para_literal_latin_over_doc_default_theme,
             para_tab_stops,
             para_props,
             table_styles,
@@ -920,15 +934,16 @@ impl StyleDefinitions {
         &self,
         style_id: Option<&str>,
         direct: &DirectNumPr,
-    ) -> Option<NumProps> {
+    ) -> DirectNumPr {
         match direct {
-            DirectNumPr::Active(d) => return Some(d.clone()),
-            DirectNumPr::Suppressed => return None,
+            DirectNumPr::Active(_) | DirectNumPr::Suppressed => return direct.clone(),
             DirectNumPr::Absent => {}
         }
         style_id
             .and_then(|id| self.para_props.get(id))
             .and_then(|p| p.num_props.clone())
+            .or_else(|| self.ppr_defaults.num_props.clone())
+            .unwrap_or(DirectNumPr::Absent)
     }
 
     /// Resolve effective contextual spacing for a paragraph (§17.3.1.9).
@@ -1416,9 +1431,69 @@ impl StyleDefinitions {
             preserved: direct.preserved.clone(),
         };
 
+        // ISO 29500-1 §17.3.2.26: `w:rFonts` is one cascade property, even
+        // though its script slots are
+        // represented independently in `TextMarks`. A direct run element that
+        // authors a literal script slot replaces the corresponding inherited
+        // Theme selector; Word does not attribute-merge that lower-level slot
+        // back into the direct element. Keep a Theme selector authored on the
+        // direct element itself: within one `w:rFonts`, Theme attributes still
+        // take precedence over their corresponding literals.
+        let direct_latin_literals_replace_inherited_theme = direct.authored_rfonts.ascii.is_some()
+            && direct.authored_rfonts.h_ansi.is_some()
+            && direct.authored_rfonts.ascii_theme.is_none()
+            && direct.authored_rfonts.h_ansi_theme.is_none();
+        if direct_latin_literals_replace_inherited_theme {
+            result.font_family_theme = None;
+        }
+        let direct_latin_themes_replace_inherited_literals =
+            direct.authored_rfonts.ascii_theme.is_some()
+                && direct.authored_rfonts.h_ansi_theme.is_some();
+        if direct_latin_themes_replace_inherited_literals {
+            result.font_family = None;
+        }
+        if direct.authored_rfonts.east_asia.is_some()
+            && direct.authored_rfonts.east_asia_theme.is_none()
+        {
+            result.font_east_asia_theme = None;
+        }
+        if direct.authored_rfonts.cs.is_some() && direct.authored_rfonts.cs_theme.is_none() {
+            result.font_cs_theme = None;
+        }
+        // `w:color` is likewise one cascade property. A direct literal-only
+        // element replaces a lower style/default Theme selector; Word does
+        // not merge `themeColor` from the inherited element into the direct
+        // `w:color`. A Theme selector authored on the direct element remains
+        // authoritative over its same-element literal fallback.
+        if direct.color.is_some() && direct.color_theme.is_none() {
+            result.color_theme = None;
+        }
+        let direct_authors_latin_rfonts = direct.authored_rfonts.ascii.is_some()
+            || direct.authored_rfonts.h_ansi.is_some()
+            || direct.authored_rfonts.ascii_theme.is_some()
+            || direct.authored_rfonts.h_ansi_theme.is_some();
+        if !direct_authors_latin_rfonts
+            && !char_marks.is_some_and(|marks| {
+                marks.font_family.is_some() || marks.font_family_theme.is_some()
+            })
+            && para_style_id
+                .or(self.default_para_style_id.as_deref())
+                .is_some_and(|style_id| {
+                    self.para_literal_latin_over_doc_default_theme
+                        .contains(style_id)
+                })
+        {
+            // W-STYLE-LITERAL-RFONTS-OVER-DEFAULT-THEME-01: the paragraph
+            // style's literal rFonts element replaces the lower docDefaults
+            // Theme selector for bounded Latin consumers. Linked/character
+            // style cascades are deliberately excluded from this registry.
+            result.font_family_theme = None;
+        }
+
         // Post-processing: resolve theme font references to actual font names.
-        // Per ISO 29500-1 §17.3.2.26, explicit font attributes take precedence
-        // over theme references. Only resolve when the explicit slot is empty.
+        // The element-level cascade rules above first remove a value inherited
+        // from the replaced lower-level rFonts element. Within one rFonts
+        // element the corresponding Theme selector is authoritative.
         if result.font_family.is_none()
             && let Some(ref theme_ref) = result.font_family_theme
         {
@@ -1587,6 +1662,46 @@ fn resolve_option<T: Clone>(
 /// sets.  Properties not explicitly set anywhere in the chain remain
 /// `Inherit` / `None`, so the caller can distinguish "level contributed a
 /// value" from "level inherited from doc defaults".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatinRFontsDisposition {
+    Literal,
+    Theme,
+    LiteralAndTheme,
+}
+
+/// Find the first Latin rFonts element in one same-type paragraph-style chain.
+///
+/// Child styles precede their `basedOn` parents. A literal-only child element
+/// replaces a parent's Theme selector; a Theme-only child replaces a parent's
+/// literal; an element authoring both retains both with Theme precedence.
+fn highest_paragraph_style_latin_rfonts(
+    style_id: &str,
+    raw_styles: &HashMap<String, RawStyle>,
+) -> Option<LatinRFontsDisposition> {
+    let mut current = Some(style_id);
+    let mut visited = HashSet::new();
+    while let Some(id) = current {
+        if !visited.insert(id.to_string()) {
+            return None;
+        }
+        let style = raw_styles.get(id)?;
+        if style.style_type != "paragraph" {
+            return None;
+        }
+        match (
+            style.marks.font_family.is_some(),
+            style.marks.font_family_theme.is_some(),
+        ) {
+            (true, false) => return Some(LatinRFontsDisposition::Literal),
+            (false, true) => return Some(LatinRFontsDisposition::Theme),
+            (true, true) => return Some(LatinRFontsDisposition::LiteralAndTheme),
+            (false, false) => {}
+        }
+        current = style.based_on.as_deref();
+    }
+    None
+}
+
 fn resolve_chain(style_id: &str, raw_styles: &HashMap<String, RawStyle>) -> TextMarks {
     // Walk the basedOn chain collecting layers (child first).
     // Per §17.7.4.3: basedOn must reference a style of the same type.
@@ -2494,17 +2609,21 @@ fn extract_raw_para_props(ppr: &Element) -> RawParagraphProps {
 }
 
 /// Extract numbering properties (numId + ilvl) from a w:pPr/w:numPr element in a style definition.
-fn extract_style_num_props(ppr: &Element) -> Option<NumProps> {
+fn extract_style_num_props(ppr: &Element) -> Option<DirectNumPr> {
     let num_pr = find_w_child(ppr, "numPr")?;
     let num_id_elem = find_w_child(num_pr, "numId")?;
     let num_id: u32 = attr_get(num_id_elem, "w:val")?.parse().ok()?;
+
+    if num_id == 0 {
+        return Some(DirectNumPr::Suppressed);
+    }
 
     let ilvl = find_w_child(num_pr, "ilvl")
         .and_then(|el| attr_get(el, "w:val"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    Some(NumProps { num_id, ilvl })
+    Some(DirectNumPr::Active(NumProps { num_id, ilvl }))
 }
 
 /// Extract paragraph borders from a w:pPr/w:pBdr element in a style definition.
@@ -3234,17 +3353,18 @@ pub struct StyleCollision {
 /// Returns a list of [`StyleCollision`]s for style IDs that:
 /// 1. Appear in both base and target styles.xml
 /// 2. Have different XML definitions (compared by serialized string)
-/// 3. Are actually referenced by the document (present in `referenced_style_ids`)
+/// 3. Are active in either reading: explicitly referenced, declared as a
+///    default style, or inherited through an active style's `w:basedOn` chain
 ///
-/// This is a diagnostic-only function: it detects and reports
-/// collisions but does not remediate them.
+/// Detection does not choose a winner. A package-composition caller must either
+/// provide a native carrier for the differing active definition or refuse the
+/// composition; silently choosing one side makes the other terminal wrong.
 pub fn detect_style_collisions(
     base_styles_xml: &[u8],
     target_styles_xml: &[u8],
     referenced_style_ids: &HashSet<IStr>,
 ) -> Vec<StyleCollision> {
-    if base_styles_xml.is_empty() || target_styles_xml.is_empty() || referenced_style_ids.is_empty()
-    {
+    if base_styles_xml.is_empty() || target_styles_xml.is_empty() {
         return Vec::new();
     }
 
@@ -3261,11 +3381,50 @@ pub fn detect_style_collisions(
     let base_styles = extract_style_elements(&base_root);
     let target_styles = extract_style_elements(&target_root);
 
+    let mut active_style_ids: HashSet<String> = referenced_style_ids
+        .iter()
+        .map(|style_id| style_id.to_string())
+        .collect();
+
+    // A styleless paragraph still consumes the default paragraph style. The
+    // same is true for the default character and table styles on their
+    // corresponding objects, so a differing default definition cannot be
+    // dismissed merely because no explicit pStyle/rStyle/tblStyle names it.
+    for styles in [&base_styles, &target_styles] {
+        for (style_id, style) in styles {
+            if attr_get(style, "w:default")
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+            {
+                active_style_ids.insert(style_id.clone());
+            }
+        }
+    }
+
+    // A referenced/default style observes every definition in its basedOn
+    // closure. Follow both input tables: the parent can itself differ between
+    // the accepted readings even when the child style is byte-identical.
+    let mut pending: Vec<String> = active_style_ids.iter().cloned().collect();
+    while let Some(style_id) = pending.pop() {
+        for styles in [&base_styles, &target_styles] {
+            let Some(style) = styles.get(&style_id) else {
+                continue;
+            };
+            let Some(parent) =
+                find_w_child(style, "basedOn").and_then(|based_on| attr_get(based_on, "w:val"))
+            else {
+                continue;
+            };
+            if active_style_ids.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
+        }
+    }
+
     let mut collisions = Vec::new();
 
     for (style_id, base_el) in &base_styles {
         // Only check styles actually referenced by the document.
-        if !referenced_style_ids.contains(style_id.as_str()) {
+        if !active_style_ids.contains(style_id) {
             continue;
         }
 
@@ -3274,11 +3433,13 @@ pub fn detect_style_collisions(
             None => continue,
         };
 
-        // Compare by serialized XML string. This is a simple byte-level comparison
-        // after re-serialization, which normalizes whitespace within element structure
-        // but preserves attribute order and content.
-        let base_xml = serialize_element(base_el);
-        let target_xml = serialize_element(target_el);
+        // A direct w:rsid child records the editing session that last touched
+        // the style. It does not participate in the style cascade and Word may
+        // rewrite it on save, so it remains source-owned provenance rather
+        // than an active style collision. Every other authored child remains
+        // exact.
+        let base_xml = serialize_active_style(base_el);
+        let target_xml = serialize_active_style(target_el);
 
         if base_xml != target_xml {
             let style_type = attr_get(base_el, "w:type")
@@ -3297,6 +3458,23 @@ pub fn detect_style_collisions(
     // Sort for deterministic output.
     collisions.sort_by(|a, b| a.style_id.cmp(&b.style_id));
     collisions
+}
+
+/// Whether the two style tables author the same document defaults.
+///
+/// `w:docDefaults` is document-global active state. Word has no tracked-change
+/// carrier for switching the styles part between Accept and Reject, so package
+/// composition uses this structural comparison before selecting one physical
+/// styles part. Malformed inputs fail loudly instead of being treated as equal.
+pub fn authored_doc_defaults_equal(
+    base_styles_xml: &[u8],
+    target_styles_xml: &[u8],
+) -> Result<bool, String> {
+    let base_root = crate::word_xml::parse_document_xml(base_styles_xml)
+        .map_err(|error| format!("failed to parse base word/styles.xml: {error:?}"))?;
+    let target_root = crate::word_xml::parse_document_xml(target_styles_xml)
+        .map_err(|error| format!("failed to parse target word/styles.xml: {error:?}"))?;
+    Ok(find_w_child(&base_root, "docDefaults") == find_w_child(&target_root, "docDefaults"))
 }
 
 /// Extract `w:style` elements from a parsed styles.xml root, keyed by `w:styleId`.
@@ -3325,6 +3503,18 @@ fn serialize_element(el: &Element) -> String {
     // and doesn't affect the comparison.
     let _ = el.write(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Serialize the active authored portion of one style definition.
+///
+/// Only the direct style-level `w:rsid` provenance token is excluded. Nested
+/// property state and all other children remain part of the comparison.
+fn serialize_active_style(style: &Element) -> String {
+    let mut active = style.clone();
+    active
+        .children
+        .retain(|child| !matches!(child, XMLNode::Element(element) if is_w_tag(element, "rsid")));
+    serialize_element(&active)
 }
 
 /// Merge two `word/styles.xml` parts, preferring target definitions on
@@ -3362,6 +3552,7 @@ pub fn merge_styles_xml_preferring_target(
         merged_root.children.push(XMLNode::Element(el.clone()));
     }
 
+    crate::word_xml::ensure_all_used_namespaces(&mut merged_root);
     let mut out = Vec::new();
     merged_root.write(&mut out).ok()?;
     Some(out)
@@ -3581,6 +3772,7 @@ fn find_rfonts_family(rpr: &Element) -> Option<(Option<String>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::AuthoredRFonts;
     use std::io::Cursor;
 
     fn make_styles_xml(content: &str) -> Vec<u8> {
@@ -3591,6 +3783,43 @@ mod tests {
             </w:styles>"#,
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn style_num_id_zero_preserves_suppression() {
+        let xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="SuppressedList">
+                <w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>
+            </w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+
+        assert_eq!(
+            defs.resolve_effective_num_props(Some("SuppressedList"), &DirectNumPr::Absent),
+            DirectNumPr::Suppressed
+        );
+    }
+
+    #[test]
+    fn style_suppression_blocks_numbering_from_document_defaults() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:pPrDefault><w:pPr>
+                <w:numPr><w:ilvl w:val="2"/><w:numId w:val="3"/></w:numPr>
+            </w:pPr></w:pPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:styleId="SuppressedList">
+                <w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>
+            </w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+
+        assert_eq!(
+            defs.resolve_effective_num_props(None, &DirectNumPr::Absent),
+            DirectNumPr::Active(NumProps { num_id: 3, ilvl: 2 })
+        );
+        assert_eq!(
+            defs.resolve_effective_num_props(Some("SuppressedList"), &DirectNumPr::Absent),
+            DirectNumPr::Suppressed
+        );
     }
 
     #[test]
@@ -3617,6 +3846,178 @@ mod tests {
             Some("Times New Roman"),
             "and resolve into the effective cs slot (empty-theme fallback)"
         );
+    }
+
+    #[test]
+    fn direct_latin_rfonts_replaces_inherited_doc_default_theme_selector() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let direct = TextMarks {
+            font_family: Some(IStr::from("Courier New")),
+            authored_rfonts: AuthoredRFonts {
+                ascii: Some(IStr::from("Courier New")),
+                h_ansi: Some(IStr::from("Courier New")),
+                ..AuthoredRFonts::default()
+            },
+            ..TextMarks::default()
+        };
+
+        let resolved = defs.resolve(&direct, None, None);
+
+        assert_eq!(resolved.font_family.as_deref(), Some("Courier New"));
+        assert_eq!(resolved.font_family_theme, None);
+    }
+
+    #[test]
+    fn paragraph_style_latin_rfonts_replaces_doc_default_theme_selector() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                <w:rPr><w:rFonts w:ascii="Courier New" w:hAnsi="Courier New"/></w:rPr>
+            </w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+
+        let resolved = defs.resolve(&TextMarks::default(), None, Some("Normal"));
+
+        assert_eq!(resolved.font_family.as_deref(), Some("Courier New"));
+        assert_eq!(resolved.font_family_theme, None);
+    }
+
+    #[test]
+    fn direct_latin_theme_selector_is_retained_when_same_rfonts_authors_it() {
+        let xml = make_styles_xml("");
+        let mut defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        defs.set_theme_fonts(ThemeFonts {
+            minor_latin: Some("Aptos".to_string()),
+            ..ThemeFonts::default()
+        });
+        let direct = TextMarks {
+            font_family: Some(IStr::from("Courier New")),
+            font_family_theme: Some(IStr::from("minorHAnsi")),
+            authored_rfonts: AuthoredRFonts {
+                ascii: Some(IStr::from("Courier New")),
+                h_ansi: Some(IStr::from("Courier New")),
+                ascii_theme: Some(IStr::from("minorHAnsi")),
+                h_ansi_theme: Some(IStr::from("minorHAnsi")),
+                ..AuthoredRFonts::default()
+            },
+            ..TextMarks::default()
+        };
+
+        let resolved = defs.resolve(&direct, None, None);
+
+        assert_eq!(resolved.font_family.as_deref(), Some("Aptos"));
+        assert_eq!(resolved.font_family_theme.as_deref(), Some("minorHAnsi"));
+    }
+
+    #[test]
+    fn direct_latin_theme_rfonts_replaces_inherited_doc_default_literals() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:ascii="Arial" w:hAnsi="Arial"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let mut defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        defs.set_theme_fonts(ThemeFonts {
+            major_latin: Some("Courier New".to_string()),
+            ..ThemeFonts::default()
+        });
+        let direct = TextMarks {
+            font_family_theme: Some(IStr::from("majorHAnsi")),
+            authored_rfonts: AuthoredRFonts {
+                ascii_theme: Some(IStr::from("majorHAnsi")),
+                h_ansi_theme: Some(IStr::from("majorHAnsi")),
+                ..AuthoredRFonts::default()
+            },
+            ..TextMarks::default()
+        };
+
+        let resolved = defs.resolve(&direct, None, None);
+
+        assert_eq!(resolved.font_family.as_deref(), Some("Courier New"));
+        assert_eq!(resolved.font_family_theme.as_deref(), Some("majorHAnsi"));
+    }
+
+    #[test]
+    fn direct_script_rfonts_replace_corresponding_inherited_theme_selectors() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:eastAsiaTheme="majorEastAsia" w:cstheme="majorBidi"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let direct = TextMarks {
+            font_east_asia: Some(IStr::from("MS Gothic")),
+            font_cs: Some(IStr::from("Arial")),
+            authored_rfonts: AuthoredRFonts {
+                east_asia: Some(IStr::from("MS Gothic")),
+                cs: Some(IStr::from("Arial")),
+                ..AuthoredRFonts::default()
+            },
+            ..TextMarks::default()
+        };
+
+        let resolved = defs.resolve(&direct, None, None);
+
+        assert_eq!(resolved.font_east_asia.as_deref(), Some("MS Gothic"));
+        assert_eq!(resolved.font_east_asia_theme, None);
+        assert_eq!(resolved.font_cs.as_deref(), Some("Arial"));
+        assert_eq!(resolved.font_cs_theme, None);
+    }
+
+    #[test]
+    fn direct_literal_color_replaces_inherited_theme_selector() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>
+                <w:color w:val="365F91" w:themeColor="accent1" w:themeShade="BF"/>
+            </w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let direct = TextMarks {
+            color: Some(IStr::from("366091")),
+            ..TextMarks::default()
+        };
+
+        let resolved = defs.resolve(&direct, None, None);
+
+        assert_eq!(resolved.color.as_deref(), Some("366091"));
+        assert_eq!(resolved.color_theme, None);
+    }
+
+    #[test]
+    fn direct_script_theme_selectors_are_retained_when_same_rfonts_authors_them() {
+        let xml = make_styles_xml("");
+        let direct = TextMarks {
+            font_east_asia: Some(IStr::from("MS Gothic")),
+            font_east_asia_theme: Some(IStr::from("majorEastAsia")),
+            font_cs: Some(IStr::from("Arial")),
+            font_cs_theme: Some(IStr::from("majorBidi")),
+            authored_rfonts: AuthoredRFonts {
+                east_asia: Some(IStr::from("MS Gothic")),
+                east_asia_theme: Some(IStr::from("majorEastAsia")),
+                cs: Some(IStr::from("Arial")),
+                cs_theme: Some(IStr::from("majorBidi")),
+                ..AuthoredRFonts::default()
+            },
+            ..TextMarks::default()
+        };
+
+        let resolved = StyleDefinitions::parse(&xml)
+            .expect("parse styles")
+            .resolve(&direct, None, None);
+
+        assert_eq!(
+            resolved.font_east_asia_theme.as_deref(),
+            Some("majorEastAsia")
+        );
+        assert_eq!(resolved.font_cs_theme.as_deref(), Some("majorBidi"));
     }
 
     #[test]
@@ -3653,6 +4054,30 @@ mod tests {
             !normal_xml.contains("w:before=\"240\""),
             "merged styles should not keep the base Normal definition on collision: {normal_xml}"
         );
+    }
+
+    #[test]
+    fn merge_styles_xml_declares_extensions_used_by_base_only_styles() {
+        let base_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                      xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+              <w:style w:type="character" w:styleId="BaseOnly">
+                <w:rPr><w14:ligatures w14:val="standardContextual"/></w:rPr>
+              </w:style>
+            </w:styles>"#;
+        let target_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>"#,
+        );
+
+        let merged = merge_styles_xml_preferring_target(base_xml, &target_xml)
+            .expect("merge styles with extension markup");
+        let merged_text = String::from_utf8(merged.clone()).expect("UTF-8 styles.xml");
+        assert!(merged_text.contains("xmlns:w14="), "{merged_text}");
+        assert!(
+            merged_text.contains("mc:Ignorable=\"w14\""),
+            "{merged_text}"
+        );
+        Element::parse(Cursor::new(merged)).expect("merged styles.xml must be well-formed");
     }
 
     #[test]
@@ -4798,6 +5223,54 @@ mod tests {
     }
 
     #[test]
+    fn collision_detected_for_differing_default_style_without_explicit_reference() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                <w:rPr><w:b/></w:rPr>
+            </w:style>"#,
+        );
+        let target_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                <w:rPr><w:i/></w:rPr>
+            </w:style>"#,
+        );
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &HashSet::new());
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].style_id, "Normal");
+    }
+
+    #[test]
+    fn collision_detected_in_active_based_on_closure() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="Parent"><w:rPr><w:b/></w:rPr></w:style>
+               <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Parent"/></w:style>"#,
+        );
+        let target_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="Parent"><w:rPr><w:i/></w:rPr></w:style>
+               <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Parent"/></w:style>"#,
+        );
+        let referenced: HashSet<IStr> = ["Child"].iter().map(|s| IStr::from(*s)).collect();
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].style_id, "Parent");
+    }
+
+    #[test]
+    fn style_level_rsid_alone_is_not_an_active_collision() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                <w:name w:val="Normal"/><w:rsid w:val="00112233"/>
+            </w:style>"#,
+        );
+        let target_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+                <w:name w:val="Normal"/><w:rsid w:val="AABBCCDD"/>
+            </w:style>"#,
+        );
+        assert!(detect_style_collisions(&base_xml, &target_xml, &HashSet::new()).is_empty());
+    }
+
+    #[test]
     fn collision_empty_when_no_shared_styles() {
         let base_xml = make_styles_xml(
             r#"<w:style w:type="paragraph" w:styleId="StyleA">
@@ -4823,6 +5296,29 @@ mod tests {
         assert!(detect_style_collisions(&[], &[], &referenced).is_empty());
         assert!(detect_style_collisions(b"<w:styles/>", &[], &referenced).is_empty());
         assert!(detect_style_collisions(&[], b"<w:styles/>", &referenced).is_empty());
+    }
+
+    #[test]
+    fn authored_doc_defaults_compare_structurally() {
+        let base = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val="en-AU"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let same = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val="en-AU"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let different = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val="en-US"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+
+        assert!(authored_doc_defaults_equal(&base, &same).unwrap());
+        assert!(!authored_doc_defaults_equal(&base, &different).unwrap());
+    }
+
+    #[test]
+    fn authored_doc_defaults_comparison_fails_loud_on_malformed_xml() {
+        let valid = make_styles_xml("");
+        let error = authored_doc_defaults_equal(b"<w:styles", &valid).unwrap_err();
+        assert!(error.contains("base word/styles.xml"), "{error}");
     }
 
     #[test]

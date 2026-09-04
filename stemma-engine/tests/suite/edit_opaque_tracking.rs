@@ -70,12 +70,10 @@ fn apply_v4(doc: &Document, json: &str) -> Document {
     doc.apply(&txn).expect("apply")
 }
 
-/// DOMAIN RULE: deleting a paragraph that contains a `fldSimple` field must emit
-/// the field as a TRACKED deletion — the field's result runs wrapped in `<w:del>`
-/// (the field element itself stays paragraph-level; per I-TC-001 it cannot be a
-/// child of `<w:del>`). Otherwise Word reads the field as permanent content and
-/// accept-all fails to remove it (a deleted field survives) — the same class of
-/// bug fixed for synthesized hyperlinks.
+/// DOMAIN RULE: deleting a paragraph that contains a qualified `fldSimple`
+/// field must lower the complete field to one balanced complex field inside
+/// `<w:del>`. Leaving a paragraph-level `fldSimple` shell makes the field
+/// permanent, so Accept All cannot remove it.
 #[test]
 fn deleted_paragraph_with_a_field_serializes_the_field_as_tracked() {
     // Two paragraphs; the first carries a fldSimple DATE field. Delete it.
@@ -92,18 +90,23 @@ fn deleted_paragraph_with_a_field_serializes_the_field_as_tracked() {
     let edited = apply_v4(&doc, &json);
 
     let xml = redline_document_xml(&edited);
-    let f_start = xml
-        .find("<w:fldSimple")
-        .expect("redline still emits the deleted field");
-    let f_end = xml[f_start..]
-        .find("</w:fldSimple>")
-        .map(|e| f_start + e)
-        .expect("fldSimple closes");
-    let field_inner = &xml[f_start..f_end];
+    assert!(!xml.contains("<w:fldSimple"), "{xml}");
+    let instruction = xml
+        .find("<w:delInstrText")
+        .expect("deleted field instruction");
+    let field_start = xml[..instruction]
+        .rfind("<w:del ")
+        .expect("whole-field deletion starts before its instruction");
+    let field_end = instruction
+        + xml[instruction..]
+            .find("</w:del>")
+            .expect("whole-field deletion closes")
+        + "</w:del>".len();
+    let field_deletion = &xml[field_start..field_end];
+    assert_eq!(field_deletion.matches("<w:fldChar ").count(), 3, "{xml}");
     assert!(
-        field_inner.contains("<w:del"),
-        "a fldSimple in a Deleted segment must carry an in-field <w:del> envelope \
-         so Word treats the field as a tracked deletion and accept-all removes it; \
-         got:\n{field_inner}"
+        field_deletion.contains("<w:delInstrText")
+            && field_deletion.contains("<w:delText>2026</w:delText>"),
+        "the whole field must use deleted complex-field content: {field_deletion}"
     );
 }

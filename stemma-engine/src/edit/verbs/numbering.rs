@@ -9,7 +9,7 @@
 //! already emits the live `numPr` (serialize.rs "Position 6") and the previous
 //! numbering inside `pPrChange`'s inner `pPr` (including the `numId=0`
 //! explicitly-absent signal), and accept/reject already resolves
-//! `formatting_change` (reject restores `previous_numbering`; accept keeps the
+//! `formatting_change` (reject restores the typed previous numbering; accept keeps the
 //! new numbering and clears the change). It does **not** touch the materializer
 //! (Invariant M) — a numbering change is an in-place pPr delta, not a segment
 //! insert/delete.
@@ -23,7 +23,8 @@
 //! than fabricate these fields (CLAUDE.md "no silent fallbacks"), the verb
 //! requires the caller — which parsed the document and therefore has the
 //! definitions — to supply the already-resolved values for `SetList`/`SetLevel`.
-//! For `Remove`, the new numbering is simply `None`.
+//! `Remove` authors `w:numId=0` suppression. Merely deleting a direct numPr
+//! would allow style- or pStyle-inherited numbering to reappear after save.
 //!
 //! v1 scope (fail loud beyond it):
 //! - top-level paragraphs only (no table-cell numbering);
@@ -36,12 +37,9 @@
 //!   does not convert manual prefixes to structural numbering;
 //! - a structurally-equal no-op request is refused.
 
-use super::super::{EditError, MaterializationMode, NumberingOp};
+use super::super::{EditError, MaterializationMode, NumberingOp, snapshot_paragraph_formatting};
 use super::super::{find_block_index, validate_block_is_editable};
-use crate::domain::{
-    BlockNode, CanonDoc, NodeId, NumberingInfo, ParagraphFormattingChange, ParagraphNode,
-    RevisionInfo,
-};
+use crate::domain::{BlockNode, CanonDoc, NodeId, NumberingInfo, ParagraphNode, RevisionInfo};
 use crate::semantic_hash::check_block_guard;
 
 /// The narrow set of paragraph-numbering operations the verb authors. Mirrors
@@ -245,9 +243,9 @@ fn apply_to_paragraph(
     }
 
     // v1: manual-numbering paragraphs (a stripped literal prefix) are out of
-    // scope — converting a manual prefix to structural numbering interacts with
-    // the previous_numbering_explicitly_absent predicate in ways we do not
-    // author yet. Refuse rather than guess.
+    // scope — converting a manual prefix to structural numbering requires a
+    // proof that the source prefix is materialized as deleted content. This
+    // verb does not author that content weave, so it refuses rather than guess.
     if para.literal_prefix.is_some() {
         return Err(EditError::NumberingManualPrefixUnsupported {
             block_id: block_id.clone(),
@@ -255,7 +253,10 @@ fn apply_to_paragraph(
         });
     }
 
-    // Compute the requested new numbering.
+    // Compute the requested new numbering. Removal is a distinct authored
+    // suppression state, not structural absence: absence may inherit a list
+    // from the paragraph style after serialization.
+    let target_numbering_suppressed = matches!(change, NumberingChange::Remove);
     let new_numbering: Option<NumberingInfo> =
         match change {
             NumberingChange::SetList {
@@ -267,6 +268,7 @@ fn apply_to_paragraph(
             } => Some(NumberingInfo {
                 num_id: *num_id,
                 ilvl: *ilvl,
+                resolution: crate::domain::NumberingResolution::Resolved,
                 synthesized_text: synthesized_text.clone(),
                 is_bullet: *is_bullet,
                 restart_numbering: *restart,
@@ -287,6 +289,7 @@ fn apply_to_paragraph(
                 Some(NumberingInfo {
                     num_id: current.num_id,
                     ilvl: *ilvl,
+                    resolution: crate::domain::NumberingResolution::Resolved,
                     synthesized_text: synthesized_text.clone(),
                     is_bullet: *is_bullet,
                     // Re-leveling does not request a counter restart.
@@ -314,6 +317,7 @@ fn apply_to_paragraph(
                 Some(NumberingInfo {
                     num_id: *num_id,
                     ilvl: current.ilvl,
+                    resolution: crate::domain::NumberingResolution::Resolved,
                     synthesized_text: synthesized_text.clone(),
                     is_bullet: *is_bullet,
                     restart_numbering: current.restart_numbering,
@@ -327,21 +331,12 @@ fn apply_to_paragraph(
     // No-op guard: structural equality (num_id + ilvl) AND identical restart
     // intent means nothing changes. A bare restart of the same list IS a
     // change (it flips restart_numbering), so it is not a no-op.
-    if is_noop(&para.numbering, &new_numbering) {
+    if is_noop(para, &new_numbering, target_numbering_suppressed) {
         return Err(EditError::NoNumberingChangeRequested {
             block_id: block_id.clone(),
             step_index,
         });
     }
-
-    // Snapshot the previous numbering before mutating.
-    let previous_numbering = para.numbering.clone();
-    // Load-bearing reject-view signal: "base had no numbering at all" (no numPr
-    // AND no literal prefix) while numbering is being added. Copies the exact
-    // predicate from the merge producer (tracked_model.rs). literal_prefix is
-    // refused above, so the `!literal_prefix.is_some()` term is always true here.
-    let previous_numbering_explicitly_absent =
-        para.numbering.is_none() && new_numbering.is_some() && para.literal_prefix.is_none();
 
     match mode {
         // Author a tracked change: snapshot the COMPLETE previous paragraph
@@ -350,67 +345,18 @@ fn apply_to_paragraph(
         // constructor mirrors the merge producer (tracked_model.rs) so the
         // inner pPr snapshot is complete and reject restores everything.
         MaterializationMode::TrackedChange => {
-            para.formatting_change = Some(ParagraphFormattingChange {
-                revision_id: revision.revision_id,
-                identity: 0,
-                previous_alignment: para.align.clone(),
-                // Snapshot AUTHORED-direct indent/spacing (the previous DIRECT
-                // pPr), not the resolved effective value — see
-                // snapshot_paragraph_formatting.
-                previous_indentation: para
-                    .has_direct_indent
-                    .then(|| para.authored_indent.clone().or_else(|| para.indent.clone()))
-                    .flatten(),
-                previous_spacing: para
-                    .has_direct_spacing
-                    .then(|| {
-                        para.authored_spacing
-                            .clone()
-                            .or_else(|| para.spacing.clone())
-                    })
-                    .flatten(),
-                previous_numbering,
-                previous_numbering_explicitly_absent,
-                previous_style_id: para.style_id.clone(),
-                previous_keep_next: para.keep_next,
-                previous_keep_lines: para.keep_lines,
-                previous_page_break_before: para.page_break_before,
-                previous_widow_control: para.widow_control,
-                previous_contextual_spacing: para.contextual_spacing,
-                previous_shading: para.shading.clone(),
-                previous_borders: para.borders.clone(),
-                previous_tab_stops: para.tab_stops.clone(),
-                previous_literal_prefix_leading_tab_twips: para.literal_prefix_leading_tab_twips,
-                previous_literal_prefix_trailing_tab_stop_twips: para
-                    .literal_prefix_trailing_tab_stop_twips,
-                previous_paragraph_mark_marks: para.paragraph_mark_marks.clone(),
-                previous_paragraph_mark_style_props: para.paragraph_mark_style_props.clone(),
-                previous_paragraph_mark_rfonts: para.paragraph_mark_rfonts.clone(),
-                previous_paragraph_mark_rpr_off: para.paragraph_mark_rpr_off,
-                previous_text_direction: para.text_direction.clone(),
-                previous_text_alignment: para.text_alignment.clone(),
-                previous_mirror_indents: para.mirror_indents,
-                previous_auto_space_de: para.auto_space_de,
-                previous_auto_space_dn: para.auto_space_dn,
-                previous_bidi: para.bidi,
-                previous_suppress_auto_hyphens: para.suppress_auto_hyphens,
-                previous_snap_to_grid: para.snap_to_grid,
-                previous_overflow_punct: para.overflow_punct,
-                previous_adjust_right_ind: para.adjust_right_ind,
-                previous_word_wrap: para.word_wrap,
-                previous_frame_pr: para.frame_pr.clone(),
-                previous_preserved_ppr: para.preserved_ppr.clone(),
-                author: revision.author.clone().unwrap_or_default(),
-                date: revision.date.clone(),
-            });
+            para.formatting_change = Some(snapshot_paragraph_formatting(para, revision));
             // The verb AUTHORS a direct numPr, so claim provenance: emit the
-            // numbering it just set (or, when clearing, drop the gate too).
+            // numbering it just set. Removal authors an explicit suppression
+            // so inherited numbering cannot reappear on save.
             para.has_direct_numbering = new_numbering.is_some();
+            para.numbering_suppressed = target_numbering_suppressed;
             para.numbering = new_numbering;
         }
         // Direct mutation: set the new numbering, no tracked change.
         MaterializationMode::Direct => {
             para.has_direct_numbering = new_numbering.is_some();
+            para.numbering_suppressed = target_numbering_suppressed;
             para.numbering = new_numbering;
             para.formatting_change = None;
         }
@@ -604,6 +550,7 @@ fn relevel(
     Ok(NumberingInfo {
         num_id: current.num_id,
         ilvl: new_ilvl as u32,
+        resolution: crate::domain::NumberingResolution::Resolved,
         synthesized_text: current.synthesized_text.clone(),
         is_bullet: current.is_bullet,
         // Re-leveling does not request a counter restart.
@@ -630,6 +577,7 @@ fn set_restart(
     Ok(NumberingInfo {
         num_id: current.num_id,
         ilvl: current.ilvl,
+        resolution: crate::domain::NumberingResolution::Resolved,
         synthesized_text: current.synthesized_text.clone(),
         is_bullet: current.is_bullet,
         restart_numbering: restart,
@@ -639,8 +587,18 @@ fn set_restart(
 /// A request is a no-op when the new numbering is structurally equal to the
 /// current one AND carries the same restart intent. Bare-restart of the same
 /// list is therefore NOT a no-op.
-fn is_noop(current: &Option<NumberingInfo>, new: &Option<NumberingInfo>) -> bool {
-    match (current, new) {
+fn is_noop(
+    paragraph: &ParagraphNode,
+    new: &Option<NumberingInfo>,
+    target_suppressed: bool,
+) -> bool {
+    let target_is_direct = new.is_some();
+    if paragraph.has_direct_numbering != target_is_direct
+        || paragraph.numbering_suppressed != target_suppressed
+    {
+        return false;
+    }
+    match (&paragraph.numbering, new) {
         (None, None) => true,
         (Some(c), Some(n)) => c.structurally_eq(n) && c.restart_numbering == n.restart_numbering,
         _ => false,
@@ -656,6 +614,7 @@ mod tests {
         NumberingInfo {
             num_id,
             ilvl,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: "1.".to_string(),
             is_bullet: false,
             restart_numbering: false,
@@ -683,13 +642,13 @@ mod tests {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments: vec![TrackedSegment {
@@ -698,7 +657,7 @@ mod tests {
             }],
             block_text_hash: None,
             numbering,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -776,6 +735,7 @@ mod tests {
     #[test]
     fn structurally_equal_request_is_noop_refused() {
         let mut p = bare_para("p1", Some(ninfo(3, 0)));
+        p.has_direct_numbering = true;
         let err = apply_to_paragraph(
             &mut p,
             &NodeId::new("p1".to_string()),
@@ -792,6 +752,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, EditError::NoNumberingChangeRequested { .. }));
+    }
+
+    #[test]
+    fn structurally_equal_inherited_numbering_can_be_authored_directly() {
+        let mut p = bare_para("p1", Some(ninfo(3, 0)));
+        apply_to_paragraph(
+            &mut p,
+            &NodeId::new("p1".to_string()),
+            &NumberingChange::SetList {
+                num_id: 3,
+                ilvl: 0,
+                restart: false,
+                synthesized_text: "1.".to_string(),
+                is_bullet: false,
+            },
+            &rev(),
+            MaterializationMode::Direct,
+            0,
+        )
+        .expect("authoring a direct numPr changes inherited provenance");
+        assert!(p.has_direct_numbering);
+        assert!(!p.numbering_suppressed);
+    }
+
+    #[test]
+    fn remove_authors_suppression_so_numbering_cannot_reinherit() {
+        let mut p = bare_para("p1", Some(ninfo(3, 0)));
+        apply_to_paragraph(
+            &mut p,
+            &NodeId::new("p1".to_string()),
+            &NumberingChange::Remove,
+            &rev(),
+            MaterializationMode::TrackedChange,
+            0,
+        )
+        .expect("removing inherited numbering must author suppression");
+
+        assert_eq!(p.numbering, None);
+        assert!(!p.has_direct_numbering);
+        assert!(p.numbering_suppressed);
+        let previous = &p
+            .formatting_change
+            .as_ref()
+            .expect("tracked removal carries the previous state")
+            .previous;
+        assert!(matches!(
+            previous.direct.numbering,
+            crate::domain::DirectParagraphNumbering::Absent
+        ));
+        assert_eq!(previous.effective.numbering.as_ref().unwrap().num_id, 3);
     }
 
     #[test]
@@ -882,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn tracked_attach_records_previous_absent_signal() {
+    fn tracked_attach_records_previous_direct_absence() {
         let mut p = bare_para("p1", None);
         apply_to_paragraph(
             &mut p,
@@ -900,9 +910,10 @@ mod tests {
         )
         .expect("attach list");
         let fc = p.formatting_change.as_ref().expect("formatting change set");
-        assert!(fc.previous_numbering.is_none());
-        // Base had neither numPr nor literal prefix → explicitly-absent signal.
-        assert!(fc.previous_numbering_explicitly_absent);
+        assert!(matches!(
+            fc.previous.direct.numbering,
+            crate::domain::DirectParagraphNumbering::Absent
+        ));
         assert_eq!(p.numbering.as_ref().unwrap().num_id, 3);
     }
 
@@ -993,6 +1004,7 @@ mod tests {
     fn continue_on_already_continuing_list_is_noop_refused() {
         // ninfo() has restart_numbering=false already, so Continue is a no-op.
         let mut p = bare_para("p1", Some(ninfo(3, 0)));
+        p.has_direct_numbering = true;
         let err = apply_to_paragraph(
             &mut p,
             &NodeId::new("p1".to_string()),

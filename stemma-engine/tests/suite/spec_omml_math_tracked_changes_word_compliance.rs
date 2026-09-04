@@ -183,14 +183,25 @@ fn math_ctrl_del_roundtrips_verbatim_inside_ctrlpr() {
 }
 
 #[test]
-fn inserted_inline_equation_wrapped_in_w_ins_kept_on_accept_dropped_on_reject() {
-    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:ins w:id="7" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x</m:t></m:r></m:oMath></w:r></w:ins><w:r><w:t xml:space="preserve"> now.</w:t></w:r></w:p><w:sectPr/>"#;
+fn inserted_inline_equation_directly_in_w_ins_is_kept_on_accept_dropped_on_reject() {
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:ins w:id="7" w:author="A" w:date="2006-03-31T12:50:00Z"><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x</m:t></m:r></m:oMath></w:ins><w:r><w:t xml:space="preserve"> now.</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
+    let xml = reserialize(&b);
 
     assert_eq!(
         accept_text(&b).trim(),
         "See \u{FFFC} now.",
         "ECMA-376 §17.13.5.18 — accepting the run-content insertion materializes the inserted inline math (exactly one U+FFFC opaque anchor)."
+    );
+    let inserted = xml.split_once("<w:ins ").expect("serialized insertion").1;
+    let inserted = inserted
+        .split_once("</w:ins>")
+        .expect("closed serialized insertion")
+        .0;
+    assert!(inserted.contains("<m:oMath"));
+    assert!(
+        !inserted.contains("<w:r>"),
+        "m:oMath must be a direct CT_RunTrackChange child, not nested in w:r: {xml}"
     );
     assert_eq!(
         reject_text(&b).trim(),
@@ -199,19 +210,30 @@ fn inserted_inline_equation_wrapped_in_w_ins_kept_on_accept_dropped_on_reject() 
     );
     assert_opens_clean(
         &b,
-        "ECMA-376 §22.1.2.77 / §17.13.5.18 — an oMath inside a w:ins run is valid markup Word opens without repair",
+        "ECMA-376 §22.1.2.77 / §17.13.5.18 — a direct oMath child of w:ins is valid markup Word opens without repair",
     );
 }
 
 #[test]
-fn deleted_inline_equation_wrapped_in_w_del_dropped_on_accept_kept_on_reject() {
-    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:del w:id="8" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x</m:t></m:r></m:oMath></w:r></w:del><w:r><w:t xml:space="preserve"> now.</w:t></w:r></w:p><w:sectPr/>"#;
+fn deleted_inline_equation_directly_in_w_del_is_dropped_on_accept_kept_on_reject() {
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:del w:id="8" w:author="A" w:date="2006-03-31T12:50:00Z"><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x</m:t></m:r></m:oMath></w:del><w:r><w:t xml:space="preserve"> now.</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
+    let xml = reserialize(&b);
 
     assert_eq!(
         accept_text(&b).trim(),
         "See  now.",
         "ECMA-376 §17.13.5.14 — accepting a run-content deletion removes all deleted content, including the entire inline equation; no U+FFFC remains."
+    );
+    let deleted = xml.split_once("<w:del ").expect("serialized deletion").1;
+    let deleted = deleted
+        .split_once("</w:del>")
+        .expect("closed serialized deletion")
+        .0;
+    assert!(deleted.contains("<m:oMath"));
+    assert!(
+        !deleted.contains("<w:r>"),
+        "m:oMath must be a direct CT_RunTrackChange child, not nested in w:r: {xml}"
     );
     assert_eq!(
         reject_text(&b).trim(),
@@ -220,7 +242,7 @@ fn deleted_inline_equation_wrapped_in_w_del_dropped_on_accept_kept_on_reject() {
     );
     assert_opens_clean(
         &b,
-        "ECMA-376 §22.1.2.77 / §17.13.5.14 — an oMath inside a w:del run is valid markup Word opens without repair",
+        "ECMA-376 §22.1.2.77 / §17.13.5.14 — a direct oMath child of w:del is valid markup Word opens without repair",
     );
 }
 

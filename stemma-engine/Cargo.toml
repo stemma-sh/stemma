@@ -1,6 +1,6 @@
 [package]
 name = "stemma"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # Enforceable toolchain floor for the whole workspace. Edition 2024 wants 1.85;
 # deps (zip -> time 0.3.49, and rmcp -> darling 0.23 in stemma-mcp) raise the
@@ -8,17 +8,27 @@ edition = "2024"
 # since 1.91), which is the floor the `--all-targets` gate actually enforces.
 # Kept uniform across crates and pinned by the MSRV job in CI.
 rust-version = "1.91"
-description = "Typed-IR DOCX compiler with tracked-change semantics: DOCX -> CanonDoc -> DOCX, with diff/merge, redline, and a post-serialization OOXML validator."
+description = "Typed-IR DOCX engine with native tracked-change semantics and OOXML validation."
 repository = "https://github.com/stemma-sh/stemma"
-keywords = ["docx", "ooxml", "tracked-changes", "diff", "wordprocessingml"]
+keywords = ["docx", "ooxml", "tracked-changes", "word", "wordprocessingml"]
 categories = ["parser-implementations", "text-processing"]
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 publish = true
 # Keep the published source crate lean and under the crates.io 10 MiB limit:
 # the test corpus, integration tests, examples, and docs are not needed to
-# build the library.
-exclude = ["testdata/**", "tests/**", "docs/**", "examples/**"]
+# build the library. One small DOCX remains because the public API rustdocs
+# compile against it in an extracted source package.
+exclude = [
+    "testdata/**",
+    "!testdata/simple-text/before.docx",
+    "tests/**",
+    "docs/**",
+    "examples/**",
+]
+
+[features]
+default = []
 
 [dependencies]
 base64 = "0.22"
@@ -38,4 +48,5 @@ zip = "0.6.6"
 zstd = "0.13"
 
 [dev-dependencies]
+stemma-diff = { path = "../stemma-diff", features = ["test-support"] }
 zip = "0.6.6"

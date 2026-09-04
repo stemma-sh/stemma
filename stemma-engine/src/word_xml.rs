@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use std::io::Cursor;
@@ -9,6 +10,134 @@ use xmltree::{AttributeName, Element, Namespace, XMLNode};
 
 use crate::xml_attrs::{attr_get, attr_set};
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+const STRICT_RELATIONSHIP_PREFIX: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships/";
+const TRANSITIONAL_RELATIONSHIP_PREFIX: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
+
+fn is_xml_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Return the active character content of one WordprocessingML text leaf.
+///
+/// XML parsers retain the raw character buffer regardless of `xml:space`, but
+/// Word ignores XML boundary whitespace in `w:t`/`w:delText` unless the leaf
+/// explicitly carries `xml:space="preserve"`. Centralizing that projection
+/// keeps import, semantic hashing, and tracked-carrier conversion consistent.
+pub(crate) fn active_word_text(element: &Element) -> String {
+    let text = element
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Text(text) | XMLNode::CData(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if attr_get(element, "xml:space").is_some_and(|space| space == "preserve") {
+        text
+    } else {
+        text.trim_matches(is_xml_whitespace).to_string()
+    }
+}
+
+/// Remove inactive XML boundary whitespace from a WordprocessingML text leaf
+/// without disturbing comments or any other raw child nodes.
+pub fn normalize_word_text_boundary_space(element: &mut Element) {
+    if attr_get(element, "xml:space").is_some_and(|space| space == "preserve") {
+        return;
+    }
+
+    let text_indices = element
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| {
+            matches!(child, XMLNode::Text(_) | XMLNode::CData(_)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let (Some(first), Some(last)) = (text_indices.first().copied(), text_indices.last().copied())
+    else {
+        return;
+    };
+
+    fn text_mut(node: &mut XMLNode) -> &mut String {
+        match node {
+            XMLNode::Text(text) | XMLNode::CData(text) => text,
+            _ => unreachable!("text indices contain only text-like XML nodes"),
+        }
+    }
+
+    let leading = text_mut(&mut element.children[first])
+        .trim_start_matches(is_xml_whitespace)
+        .to_string();
+    *text_mut(&mut element.children[first]) = leading;
+    let trailing = text_mut(&mut element.children[last])
+        .trim_end_matches(is_xml_whitespace)
+        .to_string();
+    *text_mut(&mut element.children[last]) = trailing;
+}
+
+/// Convert the finite set of ISO Strict OOXML namespace names understood by
+/// the engine to their Transitional equivalents at the XML parse boundary.
+///
+/// The canonical in-memory and output model is Transitional. Keeping the
+/// conversion here means every downstream parser sees one namespace vocabulary
+/// and opaque fragments cannot accidentally re-emit a mixture of Strict and
+/// Transitional names.
+pub fn canonicalize_ooxml_namespace(uri: &str) -> Cow<'_, str> {
+    let canonical = match uri {
+        "http://purl.oclc.org/ooxml/wordprocessingml/main" => {
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        }
+        "http://purl.oclc.org/ooxml/officeDocument/relationships" => {
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        }
+        "http://purl.oclc.org/ooxml/officeDocument/math" => {
+            "http://schemas.openxmlformats.org/officeDocument/2006/math"
+        }
+        "http://purl.oclc.org/ooxml/officeDocument/customXml" => {
+            "http://schemas.openxmlformats.org/officeDocument/2006/customXml"
+        }
+        "http://purl.oclc.org/ooxml/officeDocument/docPropsVTypes" => {
+            "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+        }
+        "http://purl.oclc.org/ooxml/officeDocument/extendedProperties" => {
+            "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+        }
+        "http://purl.oclc.org/ooxml/drawingml/main" => {
+            "http://schemas.openxmlformats.org/drawingml/2006/main"
+        }
+        "http://purl.oclc.org/ooxml/drawingml/chart" => {
+            "http://schemas.openxmlformats.org/drawingml/2006/chart"
+        }
+        "http://purl.oclc.org/ooxml/drawingml/diagram" => {
+            "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+        }
+        "http://purl.oclc.org/ooxml/drawingml/picture" => {
+            "http://schemas.openxmlformats.org/drawingml/2006/picture"
+        }
+        "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing" => {
+            "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        }
+        _ => return Cow::Borrowed(uri),
+    };
+    Cow::Borrowed(canonical)
+}
+
+/// Convert an ISO Strict office-document relationship type to the canonical
+/// Transitional vocabulary. Most relationship names retain their suffix; the
+/// Strict `extendedProperties` spelling is the standardized exception.
+pub(crate) fn canonicalize_relationship_type(uri: &str) -> Cow<'_, str> {
+    let Some(suffix) = uri.strip_prefix(STRICT_RELATIONSHIP_PREFIX) else {
+        return Cow::Borrowed(uri);
+    };
+    let suffix = match suffix {
+        "extendedProperties" => "extended-properties",
+        other => other,
+    };
+    Cow::Owned(format!("{TRANSITIONAL_RELATIONSHIP_PREFIX}{suffix}"))
+}
 // Maximum element nesting depth accepted from untrusted XML. This bounds the
 // recursive-descent parsers (and the recursive tree passes that follow) so a
 // crafted deeply-nested fragment cannot overflow the thread stack — a stack
@@ -499,19 +628,27 @@ fn element_from_start(
 
         if key.as_ref() == b"xmlns" {
             // Default namespace declaration.
-            ns_decls.push((String::new(), value));
+            ns_decls.push((
+                String::new(),
+                canonicalize_ooxml_namespace(&value).into_owned(),
+            ));
             continue;
         }
         let (akey_prefix, akey_local) = split_qname(key)?;
         if akey_prefix.as_deref() == Some("xmlns") {
             // `xmlns:foo` -> declares prefix `foo`.
-            ns_decls.push((akey_local, value));
+            ns_decls.push((
+                akey_local,
+                canonicalize_ooxml_namespace(&value).into_owned(),
+            ));
             continue;
         }
 
         // Ordinary attribute. Defer namespace-URI resolution until after we've
         // seen this element's own declarations (an attribute may use a prefix
         // declared on the very same element).
+        let value = canonicalize_ooxml_namespace(&value);
+        let value = canonicalize_relationship_type(&value).into_owned();
         plain_attrs.push((
             AttributeName {
                 local_name: akey_local,
@@ -1290,7 +1427,7 @@ pub fn body_element(root: &Element) -> Result<&Element, WordXmlError> {
 /// to handle legacy raw bytes that may lack declarations. After parsing, the
 /// propagated `namespaces` map is cleared so no redundant declarations are
 /// emitted when the element is later written.
-pub(crate) fn parse_raw_fragment(raw: &[u8]) -> Result<Element, xmltree::ParseError> {
+pub fn parse_raw_fragment(raw: &[u8]) -> Result<Element, xmltree::ParseError> {
     use std::sync::LazyLock;
 
     static NS_WRAPPER_PREFIX: LazyLock<Vec<u8>> = LazyLock::new(|| {
@@ -1376,7 +1513,7 @@ fn strip_ns_decls(element: &mut Element) {
 /// the pair an authoring verb uses to mutate an opaque inline's `raw_xml` in
 /// place (e.g. resize a drawing's `wp:extent`) without disturbing any other
 /// part of the fragment.
-pub(crate) fn serialize_raw_fragment(element: &Element) -> Vec<u8> {
+pub fn serialize_raw_fragment(element: &Element) -> Vec<u8> {
     use xmltree::EmitterConfig;
 
     let bindings = crate::word_ir::collect_prefix_uri_bindings(element);
@@ -1403,7 +1540,8 @@ pub(crate) fn serialize_raw_fragment(element: &Element) -> Vec<u8> {
     buf
 }
 
-pub(crate) fn w_el(local: &str) -> Element {
+#[doc(hidden)]
+pub fn w_el(local: &str) -> Element {
     let mut element = Element::new(local);
     element.prefix = Some("w".to_string());
     element.namespace = Some(WORD_NS.to_string());
@@ -1420,7 +1558,7 @@ pub(crate) fn w_el(local: &str) -> Element {
 ///
 /// Elements with no namespace and no `w:` prefix do NOT match — this prevents
 /// bare, namespace-less elements from being incorrectly treated as Word elements.
-pub(crate) fn is_w_tag(element: &Element, local: &str) -> bool {
+pub fn is_w_tag(element: &Element, local: &str) -> bool {
     if element.name == local {
         if element.prefix.as_deref() == Some("w") {
             return true;
@@ -2158,6 +2296,36 @@ mod tests {
         let body = find_w_child(&root, "body").unwrap();
         assert_eq!(body.namespace.as_deref(), Some(WORD_NS));
         assert!(is_w_tag(body, "body"));
+    }
+
+    #[test]
+    fn quick_builder_canonicalizes_strict_namespace_and_uri_values() {
+        let xml = r#"<w:document xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body><a:graphicData xmlns:a="http://purl.oclc.org/ooxml/drawingml/main" uri="http://purl.oclc.org/ooxml/drawingml/chart"/><Relationship Type="http://purl.oclc.org/ooxml/officeDocument/relationships/image"/></w:body></w:document>"#;
+        let root = parse_document_xml_quick(xml.as_bytes()).unwrap();
+        assert_eq!(root.namespace.as_deref(), Some(WORD_NS));
+        assert_eq!(
+            root.namespaces.as_ref().and_then(|ns| ns.get("w")),
+            Some(WORD_NS)
+        );
+        let body = find_w_child(&root, "body").unwrap();
+        let graphic = body.get_child("graphicData").unwrap();
+        assert_eq!(
+            graphic
+                .attributes
+                .values()
+                .find(|value| value.contains("chart"))
+                .map(String::as_str),
+            Some("http://schemas.openxmlformats.org/drawingml/2006/chart")
+        );
+        let relationship = body.get_child("Relationship").unwrap();
+        assert_eq!(
+            relationship
+                .attributes
+                .values()
+                .find(|value| value.contains("relationships/image"))
+                .map(String::as_str),
+            Some("http://schemas.openxmlformats.org/officeDocument/2006/relationships/image")
+        );
     }
 
     #[test]

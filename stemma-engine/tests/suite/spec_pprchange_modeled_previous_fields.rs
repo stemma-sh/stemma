@@ -3,8 +3,8 @@
 //! `w:pPrChange` (§17.13.5.29) requires the inner w:pPr to be a COMPLETE
 //! snapshot of the previous paragraph properties, and reject must restore the
 //! prior state EXACTLY (`reject_paragraph_formatting`'s reversibility
-//! contract). The domain's `ParagraphFormattingChange` models ~20 previous_*
-//! fields (style, keepNext, borders, shading, tabs, …), but import used to
+//! contract). The domain's `ParagraphFormattingChange` separates the exact
+//! prior direct, effective, and paragraph-mark projections, but import used to
 //! hardcode all of them to "absent" — only jc/ind/spacing/rPr were parsed
 //! from the snapshot. The preserved-remainder bag masked this at the XML
 //! level (raw children round-trip verbatim), but the in-memory model after
@@ -13,8 +13,8 @@
 //! resolution, a later edit to the same property) then saw or produced wrong
 //! state — a later `keep_next` edit would double-write the element.
 //!
-//! This file pins the fix: every inner-pPr child with a previous_* domain
-//! field is parsed into that field (and thus restored as MODEL state on
+//! This file pins the fix: every modeled inner-pPr child is parsed into the
+//! prior direct projection (and thus restored as MODEL state on
 //! reject), and only genuinely unmodeled children (w:suppressLineNumbers,
 //! …) remain in the preserved bag.
 //!
@@ -180,67 +180,87 @@ fn import_models_the_snapshot_fields_instead_of_hardcoding_them_absent() {
         .expect("paragraph carries the imported pPrChange");
 
     assert_eq!(
-        fc.previous_style_id.as_deref(),
+        fc.previous.direct.style_id.as_deref(),
         Some("Quote"),
         "previous pStyle must be modeled"
     );
-    assert_eq!(fc.previous_keep_next, Some(true), "previous keepNext");
     assert_eq!(
-        fc.previous_keep_lines,
+        fc.previous.direct.keep_next,
+        Some(true),
+        "previous keepNext"
+    );
+    assert_eq!(
+        fc.previous.direct.keep_lines,
         Some(false),
         "previous keepLines w:val=0"
     );
-    assert!(fc.previous_page_break_before, "previous pageBreakBefore");
     assert_eq!(
-        fc.previous_widow_control,
+        fc.previous.direct.page_break_before,
+        Some(true),
+        "previous pageBreakBefore"
+    );
+    assert_eq!(
+        fc.previous.direct.widow_control,
         Some(false),
         "previous widowControl w:val=0"
     );
     assert_eq!(
-        fc.previous_contextual_spacing,
+        fc.previous.direct.contextual_spacing,
         Some(true),
         "previous contextualSpacing"
     );
     let shading = fc
-        .previous_shading
+        .previous
+        .direct
+        .shading
         .as_ref()
         .expect("previous shd must be modeled");
     assert_eq!(shading.fill.as_deref(), Some("FFFF00"));
     let borders = fc
-        .previous_borders
+        .previous
+        .direct
+        .borders
         .as_ref()
         .expect("previous pBdr must be modeled");
     assert!(borders.top.is_some(), "previous pBdr top edge");
-    assert_eq!(fc.previous_tab_stops.len(), 1, "previous tabs");
-    assert_eq!(fc.previous_tab_stops[0].position, 720);
+    let previous_tabs = fc
+        .previous
+        .direct
+        .tab_stops
+        .as_ref()
+        .expect("previous tabs container");
+    assert_eq!(previous_tabs.len(), 1, "previous tabs");
+    assert_eq!(previous_tabs[0].position, 720);
     assert_eq!(
-        fc.previous_text_direction,
+        fc.previous.direct.text_direction,
         Some(TextDirection::BtLr),
         "previous textDirection"
     );
     assert_eq!(
-        fc.previous_text_alignment,
+        fc.previous.direct.text_alignment,
         Some(TextAlignment::Center),
         "previous textAlignment"
     );
     assert_eq!(
-        fc.previous_mirror_indents,
+        fc.previous.direct.mirror_indents,
         Some(true),
         "previous mirrorIndents"
     );
-    assert_eq!(fc.previous_bidi, Some(true), "previous bidi");
+    assert_eq!(fc.previous.direct.bidi, Some(true), "previous bidi");
     assert_eq!(
-        fc.previous_auto_space_de,
+        fc.previous.direct.auto_space_de,
         Some(false),
         "previous autoSpaceDE w:val=0"
     );
     assert_eq!(
-        fc.previous_word_wrap,
+        fc.previous.direct.word_wrap,
         Some(false),
         "previous wordWrap w:val=0"
     );
     let frame = fc
-        .previous_frame_pr
+        .previous
+        .direct
+        .frame_pr
         .as_ref()
         .expect("previous framePr must be modeled");
     assert_eq!(frame.width, Some(2000));
@@ -250,7 +270,9 @@ fn import_models_the_snapshot_fields_instead_of_hardcoding_them_absent() {
     // children. A modeled child left in the bag would double-write on
     // serialization (once from the typed field, once verbatim).
     let bag_names: Vec<&str> = fc
-        .previous_preserved_ppr
+        .previous
+        .direct
+        .preserved
         .iter()
         .map(|prop| prop.name.as_str())
         .collect();
@@ -262,13 +284,11 @@ fn import_models_the_snapshot_fields_instead_of_hardcoding_them_absent() {
         !bag_names.contains(&"w:numPr"),
         "modeled w:numPr must not also stay preserved verbatim: {bag_names:?}"
     );
-    let numbering = fc
-        .previous_numbering
-        .as_ref()
-        .expect("valid previous numPr must be modeled");
-    assert_eq!(numbering.num_id, 5);
-    assert_eq!(numbering.ilvl, 0);
-    assert!(!numbering.is_bullet);
+    let DirectParagraphNumbering::Present(numbering) = &fc.previous.direct.numbering else {
+        panic!("valid previous numPr must be modeled as active direct numbering");
+    };
+    assert_eq!(numbering.num_id, Some(5));
+    assert_eq!(numbering.ilvl, Some(0));
     for modeled in [
         "w:pStyle",
         "w:keepNext",

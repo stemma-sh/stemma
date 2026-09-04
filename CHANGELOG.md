@@ -8,6 +8,270 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-03
+
+### Changed
+
+- **Document comparison is now an opinionated downstream crate.**
+  `stemma-diff` owns correspondence, alignment, comparison presentation, and
+  diff-to-carrier orchestration and depends one-way on the Word-compatible
+  `stemma` engine. The engine no longer exposes comparison methods or models
+  and carries no production dependency back to comparison. The product CLI
+  exposes one compare path and no presentation selector, proof-planner budget,
+  package-census command, or research diagnostics feature. The unreleased
+  `stemma::edit_plan` compatibility alias and the old pairwise full-document
+  view were removed; accepted-reading normalization, reusable native carriers,
+  package operations, resolution, serialization, and validation remain
+  engine-owned.
+- **Package serialization now follows one engine-owned reconciliation path.**
+  The unused comparison-era source-preservation mode was removed, along with
+  its conditional story and package handling. Explicit edits and comparison
+  plans now reach the same relationship-closure, story, content-type, and
+  package-validation logic.
+- **Wholly unrelated document bodies no longer acquire Word Compare's
+  first-source/last-target paragraph pivot.** Stemma presents their paragraphs
+  as honest whole insertions and deletions rather than implying presentation-
+  only lineage. Native Word remains authoritative for carrier validity and
+  terminal behavior, not for Stemma's review choreography.
+- **Existing Word author labels now require attribution confirmation, not an
+  impersonation override.** The engine refusal is renamed from
+  `AuthorImpersonation` to `AuthorLabelCollision`, and MCP/HTTP responses name
+  the label, pending-revision count, open-time scope, non-mutation guarantee,
+  and explicit continuation/separation actions. The CLI adds
+  `--allow-existing-author`; successful write receipts record the applied
+  author-label policy, while direct materialization records the policy as not
+  applicable because it creates no Word revisions. Agent guidance no longer
+  tells callers to invent a distinct label; a separate reviewer label must
+  come from the user.
+
+### Migration
+
+- **Rust callers must move document comparison to `stemma-diff`.** Add a
+  dependency on `stemma-diff = "0.6.0"` beside `stemma`, then replace
+  `base.diff(&target)` with `stemma_diff::diff(&base, &target)` and
+  `base.diff_as(&target, author)` with
+  `stemma_diff::diff_as(&base, &target, author)`. The returned value remains a
+  `stemma::api::Document`, so validation, resolution, serialization, and
+  explicit editing continue through the engine API. Comparison-specific read
+  models now come from `stemma_diff`; engine-only callers need no comparison
+  dependency. CLI, HTTP, and MCP callers retain their single `compare`
+  operation and do not select a presentation or proof mode.
+
+### Fixed
+
+- **Import normalization diagnostics remain visible across product
+  boundaries.** Detailed comparison results retain separate base and target
+  diagnostics plus the semantic change count and flattened input revision
+  censuses. CLI receipts, MCP open/compare responses, and HTTP upload/compare
+  responses now disclose those diagnostics instead of letting a target-side
+  normalization disappear into a base-derived redline. MCP `change_count`
+  continues to mean detected semantic changes; the number of emitted Word
+  revision carriers is reported separately as `revision_count`.
+
+- **Word-lenient orphan vertical-merge markers remain readable and lossless.**
+  Word renders a `w:vMerge` continuation with no active restart above it as a
+  standalone cell and preserves the marker on save. Word can also normalize
+  such a cell to a zero-valued `w:gridSpan` sentinel, which it lays out as one
+  column. Stemma now mirrors both import behaviors, while valid continuations
+  remain folded into their restart cell in the visible read projection. The
+  typed authoring API still cannot create orphan or span-mismatched merges.
+- **Dangling package thumbnails now follow Word's safe save normalization.**
+  Raw validation still reports the missing target, while import discloses the
+  repair and serialization removes only the dead package-root thumbnail
+  relationship. Missing actively referenced images, stories, embedded objects,
+  and other semantic targets remain blocking failures rather than silent data
+  loss.
+- **Content-control display text no longer includes XML indentation.** The
+  structured read model now projects only Word's actual `w:t` and `w:delText`
+  carriers, so pretty-print whitespace and CRLF-versus-LF serialization cannot
+  change an SDT's visible text.
+- **Comparison materialization preserves its error boundary.** A missing or
+  unqualified native carrier is reported as `UnsupportedEdit`, while an
+  inferred plan that cannot be applied to its validated source is an internal
+  correctness failure. The compare/engine split no longer collapses both into
+  `ValidationFailed`.
+- **Target-only hyperlinks on an empty replaced final boundary now refuse
+  before output.** A hyperlink envelope has no tracked presence carrier when
+  the source boundary has no content: sharing the required final paragraph lets
+  Word Reject retain an empty `w:hyperlink`, while keeping independent source
+  and target paragraphs makes Word Accept discard the hyperlink. A
+  content-bearing source-final paragraph retains its separately Word-qualified
+  replacement carrier.
+- **Mixed row and merge-topology changes use exact table replacement.** Row
+  insertion/deletion carriers do not preserve previous `gridSpan`, `vMerge`,
+  row-property, or structural cell-shell state. When a surviving row changes
+  one of those properties, Stemma now replaces the exact table region rather
+  than emitting an Accept-correct plan whose Reject reading loses the source
+  merge topology.
+- **Active same-ID numbering conflicts now refuse before output.** Independently
+  authored documents may reuse one package-local `numId` for different list
+  definitions. Stemma no longer treats the source definition's mere presence
+  as closure for the target reference, which could make native Accept retain
+  the source bullet or numbering format. Equivalent definitions with different
+  package IDs or Word-generated `durableId`, `nsid`, `tmpl`, and `tplc`
+  identity tokens remain compatible; genuinely different active definitions
+  require a complete target-side remap or return a typed refusal.
+- **Default and inherited style definitions now participate in collision
+  safety.** A styleless paragraph still consumes the default paragraph style,
+  and an active style consumes its complete `basedOn` chain. Comparison now
+  refuses when either reading would require a different active definition in
+  the one physical styles part. Direct style-level `w:rsid` provenance remains
+  source-owned and does not create a false collision.
+- **Table-cell paragraph replacements retain the cell's required final
+  boundary.** Stemma previously emitted separate deleted and inserted final
+  paragraphs inside a cell; native Word Reject could retain the source
+  paragraph and strand the emptied target paragraph beside it. The carrier now
+  shares only the required boundary while keeping source and target content in
+  distinct deleted and inserted runs.
+- **Comparison refuses simultaneous comment insertion and deletion.** The
+  individually supported comment carriers do not compose atomically in native
+  Word: one terminal can lose the inserted definition while the other retains
+  an emptied replacement anchor. Stemma now fails before materialization until
+  a native replacement carrier is qualified; addition-only and deletion-only
+  comment changes remain supported.
+- **Locked inline content-control deletion now refuses before output.** The
+  qualified deletion carrier remains available for unlocked controls, but
+  native Word can fail to settle the same carrier when `w:lock` protects the
+  control or its content. Stemma now reports that unsupported transition
+  instead of emitting a document whose Accept All operation may not finish.
+- **Comparison no longer double-tracks style-inherited run formatting.** Run
+  differences are now classified from their directly authored `w:rPr` state,
+  not from the fully resolved style cascade. A paragraph style change can
+  therefore own inherited size, strike, language, and other effects without
+  redundant `w:rPrChange` records on unchanged text, while simultaneous direct
+  run edits remain independently tracked with their authored source state and
+  native run-property carrier.
+- **Comparison refuses an unsafe document-final table/paragraph carrier
+  composition.** Completely replacing or deleting the final source table and
+  independently inserting a target-only empty final paragraph can make native
+  Word retain an extra sentinel paragraph; the complete-row replacement arm
+  can also hang Reject All. Stemma refuses that structural composition before
+  materialization. Standalone table changes and partial row changes remain
+  supported.
+- **Complete table-row replacement now refuses when composed with independent
+  story edits.** Each carrier resolves correctly in isolation, but desktop
+  Word can hang on Review UI Reject All when the row replacement and separate
+  paragraph regions coexist. Standalone complete row replacement and partial
+  row changes remain supported.
+- **Table comparison no longer uses text similarity to invent row lineage.**
+  Exact row content or an independently persisted row identity is required for
+  a semantic match. Structurally compatible unrelated rows may share only their
+  physical row, cell, and required paragraph shells while every source payload
+  is deleted and every target payload is inserted. Tables with active opaque
+  content or incompatible shells use exact-region replacement, and a later
+  independent story carrier now refuses because native Word cannot reliably
+  complete Reject All for that ordering.
+- **Comparison refuses oversized paragraph/run property-history plans before
+  materialization.** Native Word Review UI resolution is not reliable for the
+  witnessed 300-carrier story, even though each property carrier is valid in
+  isolation. The opinionated comparer now enforces one fixed internal
+  per-story safety limit and returns an explicit refusal rather than emitting
+  an artifact whose Accept All or Reject All operation may not complete.
+- **Terminal paragraph replacements retain the existing physical document-final
+  boundary.** Native Word can otherwise leave the deleted source tail as an
+  extra empty paragraph after Accept All when the source-final paragraph is
+  deleted and a target-final paragraph is independently inserted. The comparer
+  reuses that one boundary while keeping every target inline inserted and every
+  source inline deleted, so no unrelated text acquires semantic lineage and
+  unrelated complete-body plans are left unchanged.
+- **Final-paragraph deletion now anchors across suffix tables that Accept All
+  removes.** When a deleted source suffix ended with tracked paragraphs and an
+  all-deleted table before the required final paragraph, the final-mark
+  normalizer previously stopped at the table and Word retained an extra empty
+  paragraph. The native carrier now assigns the deleted break to the preceding
+  surviving paragraph and joins across only blocks that the same resolution is
+  proved to remove.
+- **Inserted tables no longer inherit a paragraph-boundary revision from an
+  earlier surviving paragraph.** Paragraph-mark insertion is now limited to
+  all-paragraph suffixes; a table keeps its row-level structural carrier
+  independent even when inserted paragraphs precede it. This avoids a shape
+  that Word opens cleanly but cannot complete Reject All, while preserving the
+  exact accepted and rejected readings.
+- **Strict OOXML is no longer emitted as an invalid partial Transitional
+  conversion.** Untouched Strict packages remain byte-identical through the
+  read/export path. Editing, resolving revisions, or comparing a Strict input
+  now returns an explicit unsupported-edit error until Stemma has a complete
+  lexical as well as namespace conversion; it no longer rewrites namespace
+  URIs while leaving Strict-only measures, percentages, and conditional-style
+  values under Transitional schemas that Word cannot open.
+- **Tracked inline content-control insertion now refuses instead of emitting a
+  false native carrier.** A complete `w:sdt` inside `w:ins` is schema-valid,
+  but desktop Word Reject All can leave the inserted control content and its
+  revision pending. Qualified content-control text edits and the witnessed
+  deletion carrier remain supported; whole inserted or replacement control
+  envelopes fail explicitly until a reversible native carrier is established.
+- **Collapsed text replacements now preserve source formatting on Reject.**
+  When unchanged text inside a replacement also changes formatting, the
+  comparison compiler gives the deleted/source arm its previous run properties
+  and the inserted/target arm its current properties. It no longer copies the
+  target formatting into both arms and asks native Word Reject to restore
+  source text with target styling.
+- **Comparison refuses differing even/odd header selection.** The document-
+  global `w:evenAndOddHeaders` selector has no tracked Accept/Reject carrier;
+  choosing either input's value makes the other terminal activate the wrong
+  header/footer stories. Identical selector state remains supported.
+- **Comparison now refuses a native Word terminal-hang composition.** Move
+  ranges and a separately inserted table remain supported carriers, but they
+  are not composed in the same story: Word can open that combined redline
+  without repair yet fail to complete Reject All. The refusal occurs before
+  materialization and mints no revision state.
+- **Comparison no longer invents note identity from matching prose.** Comments,
+  footnotes, and endnotes with different package-local IDs are explicit
+  deletions and insertions unless identity was independently proved and
+  remapped before diffing. This prevents a similar target comment from losing
+  its definition while its body anchor survives. Dangling comment references
+  are now a blocking validation failure because Word repairs and discards that
+  carrier. Table-cell property revisions also receive distinct revision IDs
+  instead of reusing one ID across multiple cells. When otherwise paired
+  tables differ in outer table, row, or cell-shell state that cell revisions
+  cannot carry, comparison now uses an exact whole-table replacement instead
+  of leaving the source table shell active.
+- **Target hyperlinks nested inside inserted tables now retain their own
+  relationship semantics.** Comparison imports and remaps typed hyperlink
+  relationships even though those nodes do not carry raw XML, so a target
+  hyperlink cannot accidentally bind to an unrelated source relationship that
+  reused the same package-local ID. Validation now rejects any
+  `w:hyperlink/@r:id` bound to a non-hyperlink relationship before Word has to
+  repair and discard it.
+- **Comparison refuses default header/footer binding-topology changes that one
+  native redline cannot switch.** A stable authored binding may still carry
+  tracked story-content edits, but comparison no longer treats a synthesized
+  blank story as an authored relationship: `w:sectPrChange` cannot store a
+  previous header/footer reference, so doing so would leave the target binding
+  active after Reject.
+- **Validation now rejects malformed native revision carriers before they can
+  be reported as Word-safe.** Required non-empty `w:id` attributes are checked
+  on property, section, table-structure, move, insertion, and deletion
+  revisions, and same-type nested move carriers are rejected alongside nested
+  insertions and deletions.
+- **Document audit now identifies header and footer stories by physical part,
+  not only by rendering role.** Multi-section documents may legally contain
+  several distinct `default`, `first`, or `even` stories. Reviewing an
+  unchanged document no longer reports those siblings as direct edits or
+  untouched-state violations, while a role change on one physical part remains
+  visible as a conservative story replacement.
+- **Body section-property revisions now follow Word's relative previous-state
+  semantics.** A tracked `titlePg` transition writes explicit enabled and
+  disabled states on both sides of the unresolved carrier, so native Reject
+  restores the source's first-page header/footer selection. Other body-section
+  transitions and standalone story-binding snapshots now refuse until their
+  absent/default directions have controlled native qualification instead of
+  relying on an incorrect absolute-snapshot projection.
+- **Tracked display-equation insertion now refuses instead of emitting a false
+  native carrier.** Native Word does not reliably reject a directly wrapped
+  `w:ins > m:oMathPara` object. Direct display-equation editing and tracked
+  inline equations remain supported, while comparison refuses side-only block
+  equations before materialization until a qualified tracked carrier exists.
+- **Tracked inline equations now use Word's direct Office Math carrier.**
+  `m:oMath` is written directly inside `w:ins` and `w:del`; the former
+  `w:ins|w:del > w:r > m:oMath` shape opened in Word but lost the equation
+  payload on Reject. The direct carrier preserves both native terminals.
+- **Package reconciliation now fails loudly on unswitchable active style
+  state.** A single `styles.xml` cannot give Accept and Reject different
+  document defaults or different definitions for the same referenced style.
+  Comparison refuses those transitions, and styles-part presence changes,
+  instead of silently choosing one side and emitting a false-success redline.
+
 ## [0.5.2] — 2026-08-13
 
 ### Changed
@@ -408,7 +672,7 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
   dropping them.
 - MCP `check_edit` and `apply_batch(preview=true)` now execute and discard the
   same package-aware, author-protected snapshot apply used by commit. Preview
-  can no longer approve an origin-author impersonation or dangling style that
+  can no longer approve an origin author-label collision or dangling style that
   the persisted path would refuse.
 - MCP `open_docx`, save/compare/audit/review render, and persisted image-backed
   edit responses add artifact identity while retaining their existing response
@@ -491,7 +755,10 @@ applications.
   per-cell data.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/stemma-sh/stemma/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/stemma-sh/stemma/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/stemma-sh/stemma/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/stemma-sh/stemma/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/stemma-sh/stemma/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/stemma-sh/stemma/compare/v0.1.0...v0.2.0

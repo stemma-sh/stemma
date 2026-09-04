@@ -17,7 +17,7 @@ The complete 31-tool surface is in the
 
 | Tool | Purpose |
 |---|---|
-| `open_docx(path, task?, task_id?)` | Open one workspace-confined source. Returns `doc_id`, exact `input_artifact`, and the first compact index page. The first task target may declare a complete multi-file task; later targets name its `task_id`. |
+| `open_docx(path, task?, task_id?)` | Open one workspace-confined source. Returns `doc_id`, exact `input_artifact`, import `diagnostics`, and the first compact index page. The first task target may declare a complete multi-file task; later targets name its `task_id`. |
 | `inspect_docx(doc_id, ...)` | Locate and read bounded document content, revisions, styles, notes, projections, or operation schemas. |
 | `execute_plan(...)` | Preview or apply one transaction, replacement worklist, revision selection, or two-file comparison. |
 | `verify_docx(...)` | Audit an open session or a before/after pair before delivery. |
@@ -216,7 +216,7 @@ Stable artifact failure codes:
 |---|---|
 | Stale guard or expected text | Re-read the block and rebuild the plan. |
 | Match-count mismatch | Narrow or scope the replacement, or correct the expected count. |
-| Existing author collision | Use a distinct author, or continue that author deliberately by passing `allow_existing_author: true` on the mutating call. |
+| Existing author-label collision | If the user intended the existing label, continue that Word reviewer group by passing `allow_existing_author: true`. Otherwise ask the user for a separate label; never invent one to clear the refusal. |
 | Opaque content would be destroyed | Edit around the opaque object or choose a structure-aware operation. |
 | Empty revision selection | Re-read the current revision list and correct the selector. |
 | Existing output | Choose a new output path. |

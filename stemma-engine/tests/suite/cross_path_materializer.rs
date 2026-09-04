@@ -55,6 +55,7 @@
 //! usable set is non-empty.
 
 use std::fs;
+use stemma_diff::test_support::{diff_documents, merge_diff};
 
 use stemma::edit::{
     ContentFragment, EditStep, EditTransaction, MaterializationMode, ParagraphContent,
@@ -63,7 +64,7 @@ use stemma::edit::{
 use stemma::{
     BlockNode, CanonDoc, DocxRuntime, InlineNode, NodeId, OpaqueInlineNode, ParagraphNode,
     RevisionInfo, SimpleRuntime, StyleProps, TextNode, TrackedSegment, TrackingStatus,
-    diff_documents, merge_diff, normal_segment,
+    normal_segment,
 };
 
 // ── shared revision ───────────────────────────────────────────────────────

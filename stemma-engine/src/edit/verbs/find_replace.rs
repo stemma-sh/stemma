@@ -1853,6 +1853,7 @@ mod tests {
                     wrapper_style_props: StyleProps::default(),
                     wrapper_rpr_authored: crate::domain::RunRprAuthored::default(),
                     source_run_attrs: Vec::new(),
+                    formatting_change: None,
                     joins_following_text_run: false,
                 }),
                 text_inline("r1", " end"),

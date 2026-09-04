@@ -25,6 +25,8 @@ use stemma::{
     BlockNode, DocxRuntime, ExportMode, InlineNode, MarkValue, SimpleRuntime, TrackingStatus,
     TransactionMeta,
 };
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use crate::common;
 

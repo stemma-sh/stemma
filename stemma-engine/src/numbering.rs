@@ -30,7 +30,8 @@ pub enum NumberingSource {
 #[derive(Debug)]
 pub enum NumberingError {
     XmlParse(String),
-    MissingAbstractNum { num_id: u32 },
+    MissingNumberingInstance { num_id: u32 },
+    MissingAbstractNum { num_id: u32, abstract_num_id: u32 },
     MissingLevel { abstract_num_id: u32, ilvl: u32 },
 }
 
@@ -38,8 +39,17 @@ impl std::fmt::Display for NumberingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NumberingError::XmlParse(msg) => write!(f, "numbering XML parse error: {msg}"),
-            NumberingError::MissingAbstractNum { num_id } => {
-                write!(f, "numId {num_id} references unknown abstractNumId")
+            NumberingError::MissingNumberingInstance { num_id } => {
+                write!(f, "numId {num_id} has no numbering instance")
+            }
+            NumberingError::MissingAbstractNum {
+                num_id,
+                abstract_num_id,
+            } => {
+                write!(
+                    f,
+                    "numId {num_id} references unknown abstractNumId {abstract_num_id}"
+                )
             }
             NumberingError::MissingLevel {
                 abstract_num_id,
@@ -391,11 +401,21 @@ impl NumberingState {
         let level = definitions.get_level(num_id, ilvl).ok_or_else(|| {
             // Try to give a more specific error
             match definitions.num_instances.get(&num_id) {
+                None => NumberingError::MissingNumberingInstance { num_id },
+                Some(num_instance)
+                    if !definitions
+                        .abstract_nums
+                        .contains_key(&num_instance.abstract_num_id) =>
+                {
+                    NumberingError::MissingAbstractNum {
+                        num_id,
+                        abstract_num_id: num_instance.abstract_num_id,
+                    }
+                }
                 Some(num_instance) => NumberingError::MissingLevel {
                     abstract_num_id: num_instance.abstract_num_id,
                     ilvl,
                 },
-                None => NumberingError::MissingAbstractNum { num_id },
             }
         })?;
 

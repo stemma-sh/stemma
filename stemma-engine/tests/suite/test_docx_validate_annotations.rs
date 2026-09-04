@@ -293,7 +293,7 @@ fn tracked_change_missing_id_fails() {
         </w:document>"#,
     );
     let stories = vec![("word/document.xml".to_string(), &doc)];
-    let findings = check_tracked_change_content_model(&stories);
+    let findings = check_required_tracked_change_ids(&stories);
     let tc002: Vec<_> = findings
         .iter()
         .filter(|f| f.rule_id == "I-TC-002")

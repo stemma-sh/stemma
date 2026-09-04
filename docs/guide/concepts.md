@@ -1,9 +1,11 @@
 # Concepts
 
-Everything stemma does is one pipeline:
+Stemma has one engine pipeline and one downstream comparison path:
 
 ```text
-DOCX bytes -> import -> CanonDoc -> edit / diff -> apply -> serialize -> DOCX bytes
+DOCX bytes -> import -> CanonDoc -> explicit edit -> serialize -> DOCX bytes
+
+accepted base + accepted target -> stemma-diff -> engine operations -> redline
 ```
 
 Four ideas carry the whole system.

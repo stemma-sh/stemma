@@ -1,8 +1,9 @@
 # Fidelity contract
 
-This page explains what stemma guarantees about its output and what it
-deliberately excludes. The short version: **rendering and content are the contract; byte
-identity of the serialized XML is not.**
+This page explains what Stemma guarantees about its output and what it
+deliberately excludes. The short version: **document semantics, rendering, and
+native revision behavior are the contract; byte identity of serialized XML is
+not.**
 
 ## What is guaranteed
 
@@ -18,9 +19,11 @@ identity of the serialized XML is not.**
   `PreservedProp` mechanism); opaque objects (images, equations, fields,
   unknown elements) are carried byte-for-byte. Where a gap in this coverage
   is known, it is inventoried and gated (see below), not ignored.
-- **Fail-loud.** If stemma cannot import a construct faithfully, it refuses
-  with an error instead of guessing. Every output is checked by an OOXML
-  validator before bytes leave the engine.
+- **Fail-loud, with disclosed normalization.** If Stemma cannot import a
+  construct faithfully, it refuses with an error instead of guessing. A
+  narrowly supported deterministic normalization is reported through
+  `Document::diagnostics()`; it never disappears as apparent clean input.
+  Every output is checked by an OOXML validator before bytes leave the engine.
 - **Tracked-change semantics.** Accepting or rejecting stemma-authored
   changes in stemma or in Word restores the document's *content and rendering*
   according to Word's own semantics. This is verified against a
@@ -44,8 +47,8 @@ not an accident:
   the whole file is rewritten. No tool in the ecosystem provides byte
   stability for an edited document.
 - **Every consumer that matters keys on content, not bytes.** Word,
-  Word Compare, and stemma's own projections compare text and effective
-  formatting. The churn is invisible to all of them; the properties that
+  Word and Stemma's own projections consume document meaning rather than raw
+  serialization. The churn is invisible to them; the properties that
   *are* visible are exactly the guaranteed ones above.
 - **Byte preservation would grade the wrong thing.** The user-visible
   fidelity bugs we have found and fixed were all *model expressiveness*
@@ -57,16 +60,31 @@ Practical consequences, stated plainly:
 
 - Checksums, content-addressed stores, and raw-XML diffs (e.g. a
   git-tracked `.docx`) **will** show changes on untouched content after an
-  edit. Use Word Compare or a content-level diff instead.
+  edit. Use a content-level or canonical-model comparison instead.
 - "Reject all changes" restores the document's content and rendering, not
   its original bytes. Keep the original file if you need it, just as you
   would before letting Word save over it.
-- The one byte-stable path: opening and saving **without any edit**
-  round-trips the original package byte-identically.
+- When import reports no normalization, opening and saving **without any
+  edit** round-trips the original package byte-identically. A disclosed import
+  normalization intentionally changes those bytes.
 
 If your workflow contractually requires byte-identical untouched content,
 that requirement is not met today. Tell us about the use case rather than
 discovering the churn in production.
+
+## Import normalization is explicit
+
+Validation applies to exact bytes; parsing establishes editable engine state.
+Those usually coincide, but v0.6 has one deliberately bounded exception:
+Word opens a package whose root thumbnail relationship points to an absent
+thumbnail and removes that dead relationship on save. Stemma can do the same at
+import, records a warning in `Document::diagnostics()`, and emits the repaired
+package. Raw `validate` still reports the original dangling relationship.
+
+This is not a general repair mode. A missing target used by body content,
+headers or footers, drawings, hyperlinks, embedded objects, or another active
+semantic consumer remains a hard error. New tolerances require an explicit
+Word-compatible rule and a public diagnostic; there is no catch-all recovery.
 
 ## The text projection normalizes enumerator separators
 

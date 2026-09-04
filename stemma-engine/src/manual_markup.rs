@@ -102,7 +102,7 @@ pub struct ManualMarkupReport {
 /// entry, scoped to this paragraph's id).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ParagraphMarkupHit {
-    /// Stable IR id of the paragraph (matches FullDocBlock.block_id).
+    /// Stable IR id of the paragraph, suitable for targeting an edit.
     pub paragraph_id: String,
     /// Number of insertion runs in this paragraph.
     pub insertion_count: usize,

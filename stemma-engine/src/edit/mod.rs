@@ -29,10 +29,31 @@ use crate::domain::{
 use crate::numbering::NumberingSource;
 use crate::semantic_hash::check_block_guard;
 use crate::tracked_model::{
-    apply_table_structure_changed, project_block_for_accept_reject,
+    ChangePlanResolver, apply_table_structure_changed, project_block_for_accept_reject,
     project_block_for_text_edit_prep,
 };
 use crate::vocabulary::extract_vocabulary;
+
+struct ExplicitEditPlanResolver;
+
+impl ChangePlanResolver for ExplicitEditPlanResolver {
+    fn paragraph_changes(&self, before: &[InlineNode], after: &[InlineNode]) -> Vec<InlineChange> {
+        crate::local_change::diff_block_content_resolving_opaques(
+            before,
+            after,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    fn nested_table_change(
+        &self,
+        before: &TableNode,
+        after: &TableNode,
+        block_index: usize,
+    ) -> Result<Option<crate::domain::NestedTableDiff>, String> {
+        crate::local_change::diff_nested_tables(before, after, block_index)
+    }
+}
 
 // ─── Core types ──────────────────────────────────────────────────────────────
 
@@ -232,7 +253,7 @@ pub enum EditStep {
     /// Replace a whole table block by id with a fresh target table
     /// expressed in the v4 grammar. The engine builds a target `TableNode`
     /// from the spec, diffs base against target with
-    /// `table_diff::diff_canonical_tables`, then applies the diff via
+    /// `table_edit::diff_canonical_tables`, then applies the diff via
     /// `tracked_model::apply_table_structure_changed` — producing row-level
     /// `w:trPr/w:ins` and `w:trPr/w:del` tracked changes, cell-level
     /// `w:cellIns` / `w:cellDel`, and inline tracked changes inside
@@ -526,7 +547,8 @@ pub enum EditStep {
     ///
     /// Same lift as `SetParagraphFormatting`: the paragraph's `style_id`
     /// already serializes as `w:pStyle` at pPr position 0, the previous style
-    /// is recorded in the existing `ParagraphFormattingChange.previous_style_id`,
+    /// is recorded in the existing
+    /// `ParagraphFormattingChange.previous.direct.style_id`,
     /// and accept/reject already resolves it. A property delta, not a text
     /// edit; it does not go through the segment materializer.
     ///
@@ -1875,17 +1897,11 @@ impl RowFormattingPatch {
 /// only when the caller asked to set it, so unrequested `tblPr` properties — and
 /// every row/cell — are byte-preserved.
 ///
-/// The grammar covers exactly the three `tblPr` properties the accept/reject
-/// projection restores on a `w:tblPrChange` reject (`tracked_model.rs`:
-/// `previous_width` / `previous_borders` / `previous_default_cell_margins`). The
-/// other [`TableFormatting`] fields (style, alignment, indent, layout, cell
-/// spacing, positioning, banding, …) are intentionally NOT in the grammar:
-/// `TableFormattingChange` does not carry them, so reject would not restore them
-/// — authoring them as a tracked change would not round-trip (CLAUDE.md "no
-/// silent fallbacks"). In particular there is **no** table-level shading:
-/// `TableFormatting` has no `shading` field and `tblPr` carries none (cell
-/// shading lives on `w:tcPr` and is authored via `SetCellFormatting`), so a
-/// table-level shading request has nothing to land on and is excluded by design.
+/// This public edit grammar remains deliberately narrow even though the
+/// underlying `TableFormattingChange` now carries a complete previous tblPr
+/// projection. Borders, width, and default cell margins are the currently
+/// exposed authoring intents; adding another intent still requires an explicit
+/// edge type and domain-law tests rather than a generic property bag.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableFormattingPatch {
     /// Table borders (`w:tblBorders`, §17.4.39).
@@ -2794,6 +2810,11 @@ pub enum EditError {
         expected_root: &'static str,
         step_index: usize,
     },
+
+    /// Native Word does not reliably resolve a tracked `m:oMathPara` wrapped
+    /// directly in `w:ins`. Direct block-equation insertion remains supported,
+    /// but tracked insertion refuses until a qualified carrier exists.
+    TrackedBlockEquationUnsupported { step_index: usize },
 
     /// `WrapInContentControl` was given a spec with no distinguishing data (no
     /// tag, no alias, default RichText control). Such a control is
@@ -4133,7 +4154,12 @@ impl std::fmt::Display for EditError {
             } => write!(
                 f,
                 "step {step_index}: equation fragment root is '{actual_root}', \
-                 expected '{expected_root}' for the requested placement"
+                expected '{expected_root}' for the requested placement"
+            ),
+            EditError::TrackedBlockEquationUnsupported { step_index } => write!(
+                f,
+                "step {step_index}: tracked block-equation insertion has no qualified native \
+                 Word carrier; use direct mode or inline math"
             ),
             EditError::EmptyContentControlSpec { step_index } => write!(
                 f,
@@ -4546,7 +4572,7 @@ mod markup;
 pub use markup::{MarkupParseError, parse_paragraph_markup};
 
 // Per-verb authoring logic. See `edit/AGENTS.md`.
-pub(crate) mod verbs;
+pub mod verbs;
 
 // Per-apply transient: OPC parts (media binaries, styles.xml fragments) a verb
 // wants staged into the save path alongside its typed-IR mutation. Derived
@@ -5928,7 +5954,7 @@ struct DiffToken {
 }
 
 /// Diff two text sections by delegating to the shared token-diff pipeline in
-/// `crate::diff`. This runs Patience over `diff::tokenize` and then applies
+/// the local native-change planner. This runs Patience over its tokenizer and then applies
 /// `cleanup_inline_changes_with_config` (adjacent-run merge, zipper-region
 /// collapse, character-level affix factoring), matching the comparison
 /// pipeline so LLM-driven paragraph replaces don't produce per-word zippers
@@ -5979,8 +6005,8 @@ fn diff_text_sections(old_text: &str, new_text: &str) -> Vec<DiffToken> {
     // contract the word tokenizer already enforces. This is the structural
     // invariant Word's reject relies on: unchanged boundary text stays OUTSIDE
     // any tracked envelope.
-    let old_tokens = crate::diff::tokenize(&old_norm);
-    let new_tokens = crate::diff::tokenize(&new_norm);
+    let old_tokens = crate::local_change::tokenize(&old_norm);
+    let new_tokens = crate::local_change::tokenize(&new_norm);
     let max_pre = old_tokens.len().min(new_tokens.len());
     let mut pre_tok = 0usize;
     while pre_tok < max_pre && old_tokens[pre_tok] == new_tokens[pre_tok] {
@@ -6020,7 +6046,7 @@ fn diff_text_sections(old_text: &str, new_text: &str) -> Vec<DiffToken> {
     }
 
     // Word-diff only the genuinely-differing middle.
-    for change in crate::diff::diff_block_content(&old_mid, &new_mid) {
+    for change in crate::local_change::diff_block_content(&old_mid, &new_mid) {
         match change {
             InlineChange::Unchanged { text, .. } => {
                 new_cursor += text.chars().count();
@@ -6182,14 +6208,15 @@ fn apply_opaque_delete(
     match mode {
         MaterializationMode::TrackedChange => match mid_status {
             TrackingStatus::Inserted(ins_rev) => {
-                // Author identity is exact byte equality (an anonymous revision
-                // never matches — never un-propose what you can't prove is yours).
-                let own = matches!(
+                // Reviewer-group membership is exact author-label equality. A
+                // missing label never matches, so its proposal is not collapsed.
+                let same_reviewer_group = matches!(
                     (revision.author.as_deref(), ins_rev.author.as_deref()),
                     (Some(editing), Some(owner)) if editing == owner
                 );
-                if own {
-                    // Deleting one's OWN pending insertion un-proposes it — the
+                if same_reviewer_group {
+                    // Deleting an insertion in the same reviewer group
+                    // un-proposes it — the
                     // drawing never existed in the base, so no tombstone.
                 } else {
                     segments.push(TrackedSegment {
@@ -7339,6 +7366,7 @@ fn apply_formatting_only_replace(
                                 ),
                             };
                         Some(FormattingChange {
+                            carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                             revision_id: rev.revision_id,
                             identity: 0,
                             previous_marks,
@@ -7839,15 +7867,14 @@ fn reconstruct_section_segments(
                         // Inserted segment, or Normal content inside a pending block
                         // insertion) being removed by this edit.
                         Some(ins_rev) => {
-                            // Author identity is exact byte equality; an
-                            // anonymous revision never matches — never
-                            // un-propose what you cannot prove is
-                            // yours.
-                            let own = matches!(
+                            // Reviewer-group membership is exact author-label
+                            // equality. A missing label never matches, so its
+                            // proposal is not collapsed.
+                            let same_reviewer_group = matches!(
                                 (revision.author.as_deref(), ins_rev.author.as_deref()),
                                 (Some(editing), Some(owner)) if editing == owner
                             );
-                            if own {
+                            if same_reviewer_group {
                                 // Removing text from one's OWN pending
                                 // insertion un-proposes it: no tombstone —
                                 // the text never existed in the base
@@ -8338,7 +8365,7 @@ fn next_revision(base: &RevisionInfo, counter: &mut u32) -> RevisionInfo {
 /// too, as the final pass, after field-coalescing and opaque reading-order
 /// normalization, so those passes still see the unmerged segment boundaries
 /// they rely on.
-pub(crate) fn normalize_segments(segments: &mut Vec<TrackedSegment>) {
+pub fn normalize_segments(segments: &mut Vec<TrackedSegment>) {
     // Merge adjacent segments with identical status while retaining every
     // inline boundary in order.
     let mut merged: Vec<TrackedSegment> = Vec::new();
@@ -9168,6 +9195,7 @@ fn resolve_paragraph_spec(
         para.numbering = Some(NumberingInfo {
             num_id: list.num_id,
             ilvl: list.ilvl,
+            resolution: crate::domain::NumberingResolution::Resolved,
             synthesized_text: String::new(),
             is_bullet: sibling.is_bullet,
             restart_numbering: false,
@@ -9493,6 +9521,7 @@ fn resolve_table_spec(
             w_after: None,
             cnf_style: None,
             tbl_pr_ex: None,
+            tbl_pr_ex_change: None,
             cell_spacing: None,
             preserved: Vec::new(),
         });
@@ -10274,71 +10303,181 @@ fn apply_move_block_range(
 /// element must be a COMPLETE snapshot of the previous state, not a
 /// diff — that's the OOXML contract.
 ///
-/// `numbering_explicitly_absent` is true when the paragraph had no
-/// numPr at all before the change (vs. having numbering that was
-/// then swapped for different numbering). The serializer uses this
-/// to emit `numId=0` in the inner pPr so the reject-view numbering
-/// state machine correctly skips the paragraph.
-pub(crate) fn snapshot_paragraph_formatting(
+pub fn snapshot_paragraph_formatting(
     p: &ParagraphNode,
     revision: &RevisionInfo,
 ) -> ParagraphFormattingChange {
-    // §17.13.5.29 + §17.9.18: a paragraph that explicitly SUPPRESSED its
-    // style's numbering carried `numId=0` in its direct pPr, and the previous-
-    // state record must keep saying so — otherwise rejecting this change
-    // "restores" a paragraph with no direct numPr and the style's list
-    // resurrects, swapping the rendered label.
-    let numbering_explicitly_absent =
-        p.numbering_suppressed || (p.numbering.is_none() && p.literal_prefix.is_none());
+    use crate::domain::{
+        DirectParagraphNumPr, DirectParagraphNumbering, DirectParagraphProperties,
+        EffectiveParagraphProperties, ParagraphMarkProperties, PreviousParagraphProperties,
+    };
+
+    // `materialized_numbering` is the same semantic numbering temporarily
+    // hoisted into prefix inlines. It and `numbering` must never both be live.
+    assert!(
+        p.numbering.is_none() || p.materialized_numbering.is_none(),
+        "cannot snapshot paragraph {}: numbering and materialized_numbering are both present",
+        p.id
+    );
+    let effective_numbering = p
+        .numbering
+        .clone()
+        .or_else(|| p.materialized_numbering.clone());
+    assert!(
+        !(p.numbering_suppressed && effective_numbering.is_some()),
+        "cannot snapshot paragraph {}: suppressed and active numbering are mutually exclusive",
+        p.id
+    );
+
+    let assert_direct_payload = |property: &str, direct: bool, has_payload: bool| {
+        assert!(
+            !direct || has_payload,
+            "cannot snapshot paragraph {}: direct {property} has no representable authored value",
+            p.id
+        );
+    };
+    assert_direct_payload("alignment", p.has_direct_align, p.align.is_some());
+    assert_direct_payload("keepNext", p.has_direct_keep_next, p.keep_next.is_some());
+    assert_direct_payload("keepLines", p.has_direct_keep_lines, p.keep_lines.is_some());
+    // pageBreakBefore is already total: its bool carries both authored ON and
+    // authored OFF whenever the separate direct gate is true.
+    assert_direct_payload(
+        "widowControl",
+        p.has_direct_widow_control,
+        p.widow_control.is_some(),
+    );
+    assert_direct_payload(
+        "contextualSpacing",
+        p.has_direct_contextual_spacing,
+        p.contextual_spacing.is_some(),
+    );
+    assert_direct_payload("shading", p.has_direct_shading, p.shading.is_some());
+    assert_direct_payload("borders", p.has_direct_borders, p.borders.is_some());
+
+    // Authored indent/spacing are the only exact direct values. Falling back
+    // to their resolved counterparts would bake inherited formatting into the
+    // previous pPr. The authored payload and direct gate must agree in both
+    // directions; an empty `<w:ind/>`/`<w:spacing/>` is represented by a
+    // present all-None value, not by a missing payload.
+    assert_eq!(
+        p.has_direct_indent,
+        p.authored_indent.is_some(),
+        "cannot snapshot paragraph {}: indentation direct gate and authored payload disagree",
+        p.id
+    );
+    assert_eq!(
+        p.has_direct_spacing,
+        p.authored_spacing.is_some(),
+        "cannot snapshot paragraph {}: spacing direct gate and authored payload disagree",
+        p.id
+    );
+    assert!(
+        !p.numbering_suppressed || !p.has_direct_numbering,
+        "cannot snapshot paragraph {}: active-numbering gate and suppression are mutually exclusive",
+        p.id
+    );
+    assert_direct_payload(
+        "numbering",
+        p.has_direct_numbering,
+        effective_numbering.is_some(),
+    );
+
+    let direct_numbering = if p.numbering_suppressed {
+        DirectParagraphNumbering::Present(DirectParagraphNumPr {
+            num_id: Some(0),
+            ilvl: Some(0),
+            extra_attrs: Vec::new(),
+            preserved: Vec::new(),
+        })
+    } else if p.has_direct_numbering {
+        let numbering = effective_numbering
+            .as_ref()
+            .expect("validated direct numbering payload");
+        DirectParagraphNumbering::Present(DirectParagraphNumPr {
+            num_id: Some(numbering.num_id),
+            ilvl: Some(numbering.ilvl),
+            extra_attrs: Vec::new(),
+            preserved: Vec::new(),
+        })
+    } else {
+        DirectParagraphNumbering::Absent
+    };
+
     ParagraphFormattingChange {
         revision_id: revision.revision_id,
         identity: 0,
-        previous_alignment: p.align.clone(),
-        // The pPrChange inner pPr is the previous DIRECT formatting (§17.13.5.29),
-        // so snapshot the AUTHORED-direct indent/spacing — not the resolved
-        // effective value (which would bake inherited numbering/style into the
-        // "before" state and un-round-trip on reject). Synthesized paragraphs
-        // identify direct authorship with the same emission gates as import.
-        previous_indentation: p
-            .has_direct_indent
-            .then(|| p.authored_indent.clone().or_else(|| p.indent.clone()))
-            .flatten(),
-        previous_spacing: p
-            .has_direct_spacing
-            .then(|| p.authored_spacing.clone().or_else(|| p.spacing.clone()))
-            .flatten(),
-        previous_numbering: p.numbering.clone(),
-        previous_numbering_explicitly_absent: numbering_explicitly_absent,
-        previous_style_id: p.style_id.clone(),
-        previous_keep_next: p.keep_next,
-        previous_keep_lines: p.keep_lines,
-        previous_page_break_before: p.page_break_before,
-        previous_widow_control: p.widow_control,
-        previous_contextual_spacing: p.contextual_spacing,
-        previous_shading: p.shading.clone(),
-        previous_borders: p.borders.clone(),
-        previous_tab_stops: p.tab_stops.clone(),
-        previous_literal_prefix_leading_tab_twips: p.literal_prefix_leading_tab_twips,
-        previous_literal_prefix_trailing_tab_stop_twips: p.literal_prefix_trailing_tab_stop_twips,
-        previous_paragraph_mark_marks: p.paragraph_mark_marks.clone(),
-        previous_paragraph_mark_style_props: p.paragraph_mark_style_props.clone(),
-        previous_paragraph_mark_rfonts: p.paragraph_mark_rfonts.clone(),
-        previous_paragraph_mark_rpr_off: p.paragraph_mark_rpr_off,
-        previous_text_direction: p.text_direction.clone(),
-        previous_text_alignment: p.text_alignment.clone(),
-        previous_mirror_indents: p.mirror_indents,
-        previous_auto_space_de: p.auto_space_de,
-        previous_auto_space_dn: p.auto_space_dn,
-        previous_bidi: p.bidi,
-        previous_suppress_auto_hyphens: p.suppress_auto_hyphens,
-        previous_snap_to_grid: p.snap_to_grid,
-        previous_overflow_punct: p.overflow_punct,
-        previous_adjust_right_ind: p.adjust_right_ind,
-        previous_word_wrap: p.word_wrap,
-        previous_frame_pr: p.frame_pr.clone(),
-        previous_preserved_ppr: p.preserved_ppr.clone(),
+        previous: PreviousParagraphProperties {
+            direct: DirectParagraphProperties {
+                style_id: p.style_id.clone(),
+                alignment: p.has_direct_align.then(|| p.align.clone()).flatten(),
+                indentation: p
+                    .has_direct_indent
+                    .then(|| p.authored_indent.clone())
+                    .flatten(),
+                spacing: p
+                    .has_direct_spacing
+                    .then(|| p.authored_spacing.clone())
+                    .flatten(),
+                numbering: direct_numbering,
+                keep_next: p.has_direct_keep_next.then_some(p.keep_next).flatten(),
+                keep_lines: p.has_direct_keep_lines.then_some(p.keep_lines).flatten(),
+                page_break_before: p
+                    .has_direct_page_break_before
+                    .then_some(p.page_break_before),
+                widow_control: p
+                    .has_direct_widow_control
+                    .then_some(p.widow_control)
+                    .flatten(),
+                contextual_spacing: p
+                    .has_direct_contextual_spacing
+                    .then_some(p.contextual_spacing)
+                    .flatten(),
+                shading: p.has_direct_shading.then(|| p.shading.clone()).flatten(),
+                borders: p.has_direct_borders.then(|| p.borders.clone()).flatten(),
+                tab_stops: (!p.tab_stops.is_empty()).then(|| p.tab_stops.clone()),
+                text_direction: p.text_direction.clone(),
+                text_alignment: p.text_alignment.clone(),
+                mirror_indents: p.mirror_indents,
+                auto_space_de: p.auto_space_de,
+                auto_space_dn: p.auto_space_dn,
+                bidi: p.bidi,
+                suppress_auto_hyphens: p.suppress_auto_hyphens,
+                snap_to_grid: p.snap_to_grid,
+                overflow_punct: p.overflow_punct,
+                adjust_right_ind: p.adjust_right_ind,
+                word_wrap: p.word_wrap,
+                frame_pr: p.frame_pr.clone(),
+                outline_lvl: p.outline_lvl,
+                cnf_style: p.cnf_style.clone(),
+                preserved: p.preserved_ppr.clone(),
+            },
+            effective: EffectiveParagraphProperties {
+                alignment: p.align.clone(),
+                indentation: p.indent.clone(),
+                spacing: p.spacing.clone(),
+                numbering: effective_numbering,
+                keep_next: p.keep_next,
+                keep_lines: p.keep_lines,
+                page_break_before: p.page_break_before,
+                widow_control: p.widow_control,
+                contextual_spacing: p.contextual_spacing,
+                shading: p.shading.clone(),
+                borders: p.borders.clone(),
+                tab_stops_rel: p.effective_tab_stops_rel.clone(),
+                heading_level: p.heading_level.clone(),
+                literal_prefix_leading_tab_twips: p.literal_prefix_leading_tab_twips,
+                literal_prefix_trailing_tab_stop_twips: p.literal_prefix_trailing_tab_stop_twips,
+            },
+            paragraph_mark: ParagraphMarkProperties {
+                marks: p.paragraph_mark_marks.clone(),
+                style_props: p.paragraph_mark_style_props.clone(),
+                rfonts: p.paragraph_mark_rfonts.clone(),
+                rpr_off: p.paragraph_mark_rpr_off,
+            },
+        },
         author: revision.author.clone().unwrap_or_default(),
         date: revision.date.clone(),
+        carrier: crate::domain::ParagraphFormattingChangeCarrier::ParagraphProperties,
     }
 }
 
@@ -10347,18 +10486,35 @@ pub(crate) fn snapshot_paragraph_formatting(
 /// the diff classifier uses (`tracked_model.rs::apply_cell_formatting_change`),
 /// so an authored change is indistinguishable from one Word produced. Called
 /// BEFORE mutating the cell so the snapshot captures the complete prior `tcPr`.
-fn snapshot_cell_formatting(cell: &TableCellNode, revision: &RevisionInfo) -> CellFormattingChange {
+pub fn snapshot_cell_formatting(
+    cell: &TableCellNode,
+    revision: &RevisionInfo,
+) -> CellFormattingChange {
     CellFormattingChange {
         revision_id: revision.revision_id,
         identity: 0,
         previous_width: cell.formatting.width.clone(),
-        previous_borders: cell.formatting.borders.clone(),
-        previous_shading: cell.formatting.shading.clone(),
+        previous_borders: cell
+            .formatting
+            .has_direct_borders
+            .then(|| {
+                cell.formatting
+                    .authored_borders
+                    .clone()
+                    .or_else(|| cell.formatting.borders.clone())
+            })
+            .flatten(),
+        previous_shading: cell
+            .formatting
+            .has_direct_shading
+            .then(|| cell.formatting.shading.clone())
+            .flatten(),
         previous_v_align: cell.formatting.v_align.clone(),
         previous_margins: cell.formatting.margins.clone(),
         previous_no_wrap: cell.formatting.no_wrap,
         previous_text_direction: cell.formatting.text_direction.clone(),
         previous_tc_fit_text: cell.formatting.tc_fit_text,
+        previous_cnf_style: cell.cnf_style.clone(),
         author: revision.author.clone().unwrap_or_default(),
         date: revision.date.clone(),
     }
@@ -10379,24 +10535,24 @@ pub(crate) fn snapshot_row_formatting(
         identity: 0,
         previous_height: row.height,
         previous_height_rule: row.height_rule.clone(),
+        previous_cnf_style: row.cnf_style.clone(),
         author: revision.author.clone().unwrap_or_default(),
         date: revision.date.clone(),
     }
 }
 
-/// Capture a table's CURRENT `tblPr` formatting as the "before" state of a
-/// `w:tblPrChange` (§17.13.5.34). Mirrors the field mapping the tracked-model
-/// classifier and the reject projection use (`tracked_model.rs`: reject restores
-/// `width` / `borders` / `default_cell_margins` from these fields), so a verb-
-/// authored change is byte-identical to one Word produced. Call BEFORE mutating
-/// `table.formatting` so the inner `tblPr` is the complete previous state.
-fn snapshot_table_formatting(table: &TableNode, revision: &RevisionInfo) -> TableFormattingChange {
+/// Capture a table's complete CURRENT `tblPr` projection as the "before" state
+/// of a `w:tblPrChange` (§17.13.5.34). Call before mutating the table so Reject
+/// never has to reconstruct inherited table-style values from the target
+/// environment.
+pub(crate) fn snapshot_table_formatting(
+    table: &TableNode,
+    revision: &RevisionInfo,
+) -> TableFormattingChange {
     TableFormattingChange {
         revision_id: revision.revision_id,
         identity: 0,
-        previous_width: table.formatting.width.clone(),
-        previous_borders: table.formatting.borders.clone(),
-        previous_default_cell_margins: table.formatting.default_cell_margins.clone(),
+        previous: table.formatting.clone(),
         author: revision.author.clone().unwrap_or_default(),
         date: revision.date.clone(),
     }
@@ -12224,8 +12380,8 @@ fn normalize_final_mark(doc: &mut CanonDoc, revision: &RevisionInfo, rev_counter
 
 /// Apply a `ReplaceTable` step.
 ///
-/// Pipeline (mirrors the merge-diff path at `diff.rs::compute_table_diff_result`
-/// + `tracked_model::apply_table_structure_changed`):
+/// Pipeline for compiling two explicit table states through
+/// `tracked_model::apply_table_structure_changed`:
 ///
 /// 1. Locate the target table by id; fail with `BlockNotFound` or
 ///    `NotATable` if the address doesn't resolve to a top-level table block.
@@ -12235,15 +12391,15 @@ fn normalize_final_mark(doc: &mut CanonDoc, revision: &RevisionInfo, rev_counter
 /// 3. Optionally check the caller-supplied `semantic_hash` against the
 ///    base table; mismatch means a stale snapshot — fail loudly.
 /// 4. Resolve the spec into a fresh `TableNode`. Rename the root id to
-///    match the base so the diff aligns on identity.
-/// 5. Run `compute_table_diff_result` to align rows and cells.
-/// 6. Short-circuit (invariant I9): if the diff says nothing changed, do
+///    match the base so the local edit aligns on identity.
+/// 5. Compile the localized row and cell edit plan.
+/// 6. Short-circuit (invariant I9): if the plan says nothing changed, do
 ///    not mutate the block — preserves "edits with no net effect are
 ///    no-ops".
 /// 7. `Direct` mode: replace the table outright with the target. The
 ///    fail-fast checks already guarantee the base table has nothing we'd
 ///    silently lose by overwriting.
-/// 8. `TrackedChange` mode: feed the diff into
+/// 8. `TrackedChange` mode: feed the localized plan into
 ///    `apply_table_structure_changed`, which emits the row/cell-level
 ///    tracked changes (`w:trPr/w:ins`, `w:trPr/w:del`, `w:cellIns`,
 ///    `w:cellDel`, and inline `w:ins`/`w:del` inside modified cells per
@@ -12318,7 +12474,7 @@ fn apply_replace_table(
     }
 
     // Resolve the spec. The freshly-resolved table gets a placeholder id;
-    // we rename it to match the base so diffing aligns on identity.
+    // we rename it to match the base so local edit compilation aligns on identity.
     let mut target_block = resolve_table_spec(doc, replacement, step_index)?;
     let target_table_owned = match &mut target_block {
         BlockNode::Table(t) => {
@@ -12347,16 +12503,16 @@ fn apply_replace_table(
 }
 
 /// Lower a (base, target) table pair into the document at `idx` through the
-/// SAME table-diff machinery `ReplaceTable` uses. This is the shared tail for
-/// every whole-table and granular table op: compute the structural diff, honor
+/// same localized table-edit machinery `ReplaceTable` uses. This is the shared
+/// tail for every whole-table and granular table op: compute the structural edit, honor
 /// the I9 no-op short-circuit, and either overwrite (Direct) or emit row/cell
 /// tracked changes via `apply_table_structure_changed` (TrackedChange). It is
 /// NOT the materializer (Invariant M) — it builds the materializer's input
-/// (`target_table` + the diff) and calls it.
+/// (`target_table` + the localized plan) and calls it.
 ///
 /// `block_id` must equal `base_table.id`, and `doc.blocks[idx].block` must be
 /// the same table (the caller located it). The target must already be a valid
-/// table whose id matches the base (so the diff aligns on identity).
+/// table whose id matches the base (so the edit aligns on identity).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_table_target(
     doc: &mut CanonDoc,
@@ -12370,19 +12526,20 @@ pub(crate) fn lower_table_target(
     context: &'static str,
     step_index: usize,
 ) -> Result<(), EditError> {
-    // Compute the diff. compute_table_diff_result returns an error if
+    // Compile the local edit. `compute_table_diff_result` returns an error if
     // canonicalization fails (e.g., malformed table). The fail-fast checks
     // upstream prevent the known causes of malformedness, so map any
     // remaining failure to UnsupportedParagraphStructure with context.
-    let diff = crate::diff::compute_table_diff_result(base_table, target_table).map_err(|e| {
-        EditError::UnsupportedParagraphStructure {
-            block_id: block_id.clone(),
-            reason: format!("table canonicalization failed: {e}"),
-            step_index,
-        }
-    })?;
+    let diff =
+        crate::local_change::compute_table_diff_result(base_table, target_table).map_err(|e| {
+            EditError::UnsupportedParagraphStructure {
+                block_id: block_id.clone(),
+                reason: format!("table canonicalization failed: {e}"),
+                step_index,
+            }
+        })?;
 
-    // I9 short-circuit: if the diff reports no structural row changes AND
+    // I9 short-circuit: if the edit plan reports no structural row changes AND
     // no modified cells, the op is a no-op. Leave the block untouched.
     if is_table_diff_identity(&diff) {
         return Ok(());
@@ -12392,13 +12549,13 @@ pub(crate) fn lower_table_target(
         // Direct mode: overwrite the base table with the freshly-resolved
         // target. The fail-fast checks guarantee we don't drop anything
         // we'd otherwise preserve. structure_hash gets updated to the
-        // target's so subsequent diffs see the new shape.
+        // target's so subsequent edits see the new shape.
         doc.blocks[idx].block = BlockNode::from(target_table.clone());
         return Ok(());
     }
 
-    // Tracked-change mode: feed the diff to apply_table_structure_changed,
-    // which is the same function the merge-diff path uses. It produces
+    // Tracked-change mode: feed the localized plan to
+    // `apply_table_structure_changed`. It produces
     // a merged TableNode in place with the right row/cell tracking flags.
     apply_table_structure_changed(
         &mut doc.blocks,
@@ -12408,6 +12565,7 @@ pub(crate) fn lower_table_target(
         revision,
         rev_counter,
         context,
+        &ExplicitEditPlanResolver,
     )
     .map_err(|e| EditError::UnsupportedParagraphStructure {
         block_id: block_id.clone(),
@@ -12420,9 +12578,9 @@ pub(crate) fn lower_table_target(
     Ok(())
 }
 
-/// Return true when a table diff has no structural changes (every row is
+/// Return true when a localized table edit has no structural changes (every row is
 /// Matched) and no cell content changes (no Modified or MergeChanged cell
-/// diffs and no nested-table diffs).
+/// edits and no nested-table edits).
 ///
 /// Used as the I9 short-circuit in `apply_replace_table`: a replace that
 /// resolves to the same table must leave the block untouched (no spurious
@@ -12452,8 +12610,8 @@ fn is_table_diff_identity(diff: &crate::domain::TableDiffResult) -> bool {
 ///
 /// What DOES still have to be refused is a base carrying a PRE-EXISTING
 /// unresolved tracked change — a row/cell tracked insert or delete, or a pending `tblPrChange`/
-/// `trPrChange`/`tcPrChange`. The structural diff (`compute_table_diff_result`
-/// → `apply_table_structure_changed`) assumes a clean base; layering a fresh
+/// `tblPrExChange`/`trPrChange`/`tcPrChange`. The localized structural edit
+/// passed to `apply_table_structure_changed` assumes a clean base; layering a fresh
 /// revision over an in-flight one would interleave two change layers ambiguously
 /// (RFC-0003 keeps row-level tracked-change markup out of the edit schema — it
 /// belongs to the revision model). Fail loud and point at the in-flight change
@@ -12489,6 +12647,13 @@ pub(crate) fn validate_table_not_mid_redline(
             return Err(EditError::TableMidRedline {
                 table_id: base.id.clone(),
                 location: format!("row[{row_index}] (trPrChange)"),
+                step_index,
+            });
+        }
+        if row.tbl_pr_ex_change.is_some() {
+            return Err(EditError::TableMidRedline {
+                table_id: base.id.clone(),
+                location: format!("row[{row_index}] (tblPrExChange)"),
                 step_index,
             });
         }
@@ -13557,8 +13722,9 @@ fn rewrite_hyperlink_runs(
 mod tests {
     use super::*;
     use crate::domain::{
-        DocFingerprint, DocMeta, DocPart, FieldData, FieldKind, INTERNAL_IDS_VERSION_V0,
-        OpaqueInlineNode, ProofRef, SCHEMA_VERSION_V0, TextNode, normal_tracked_block,
+        DirectParagraphNumbering, DocFingerprint, DocMeta, DocPart, FieldData, FieldKind,
+        INTERNAL_IDS_VERSION_V0, OpaqueInlineNode, ProofRef, SCHEMA_VERSION_V0, TextNode,
+        normal_tracked_block,
     };
 
     fn meta() -> DocMeta {
@@ -13645,19 +13811,19 @@ mod tests {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments,
             block_text_hash: None,
             numbering: None,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -13745,8 +13911,174 @@ mod tests {
 
         let snapshot = snapshot_paragraph_formatting(&paragraph, &revision());
 
-        assert_eq!(snapshot.previous_indentation, None);
-        assert_eq!(snapshot.previous_spacing, None);
+        assert_eq!(snapshot.previous.direct.indentation, None);
+        assert_eq!(snapshot.previous.direct.spacing, None);
+        assert_eq!(snapshot.previous.effective.indentation, paragraph.indent);
+        assert_eq!(snapshot.previous.effective.spacing, paragraph.spacing);
+    }
+
+    #[test]
+    fn paragraph_format_snapshot_keeps_direct_and_effective_projections_distinct() {
+        let mut paragraph = paragraph_block("p1", normal_segment(vec![text_inline("t1", "x")]));
+        paragraph.align = Some(Alignment::Left);
+        paragraph.has_direct_align = false;
+        // Styleless imported paragraphs resolve the ECMA default while authoring
+        // no widowControl element of their own.
+        paragraph.widow_control = Some(true);
+        paragraph.has_direct_widow_control = false;
+        // Unlike a plain bool snapshot, this must retain authored OFF vs absent.
+        paragraph.page_break_before = false;
+        paragraph.has_direct_page_break_before = true;
+
+        let inherited_numbering = NumberingInfo {
+            num_id: 4,
+            ilvl: 1,
+            resolution: crate::domain::NumberingResolution::Resolved,
+            synthesized_text: "(a)".to_string(),
+            is_bullet: false,
+            restart_numbering: false,
+        };
+        paragraph.numbering = Some(inherited_numbering.clone());
+        paragraph.has_direct_numbering = false;
+        paragraph.numbering_suppressed = false;
+
+        let snapshot = snapshot_paragraph_formatting(&paragraph, &revision());
+        assert_eq!(snapshot.previous.direct.alignment, None);
+        assert_eq!(snapshot.previous.effective.alignment, Some(Alignment::Left));
+        assert_eq!(snapshot.previous.direct.widow_control, None);
+        assert_eq!(snapshot.previous.effective.widow_control, Some(true));
+        assert_eq!(snapshot.previous.direct.page_break_before, Some(false));
+        assert!(!snapshot.previous.effective.page_break_before);
+        assert_eq!(
+            snapshot.previous.direct.numbering,
+            DirectParagraphNumbering::Absent
+        );
+        assert_eq!(
+            snapshot.previous.effective.numbering,
+            Some(inherited_numbering.clone())
+        );
+
+        paragraph.has_direct_numbering = true;
+        let direct = snapshot_paragraph_formatting(&paragraph, &revision());
+        assert_eq!(
+            direct.previous.direct.numbering,
+            DirectParagraphNumbering::active(inherited_numbering.num_id, inherited_numbering.ilvl)
+        );
+
+        paragraph.numbering = None;
+        paragraph.has_direct_numbering = false;
+        paragraph.numbering_suppressed = true;
+        let suppressed = snapshot_paragraph_formatting(&paragraph, &revision());
+        assert_eq!(
+            suppressed.previous.direct.numbering,
+            DirectParagraphNumbering::suppressed()
+        );
+        assert_eq!(suppressed.previous.effective.numbering, None);
+    }
+
+    #[test]
+    fn paragraph_format_reject_restores_effective_values_without_authoring_them() {
+        let mut paragraph = paragraph_block("p1", normal_segment(vec![text_inline("t1", "x")]));
+        paragraph.align = Some(Alignment::Left);
+        paragraph.has_direct_align = false;
+        paragraph.widow_control = Some(true);
+        paragraph.has_direct_widow_control = false;
+        paragraph.page_break_before = false;
+        paragraph.has_direct_page_break_before = true;
+
+        let previous = snapshot_paragraph_formatting(&paragraph, &revision());
+        paragraph.align = Some(Alignment::Right);
+        paragraph.has_direct_align = true;
+        paragraph.widow_control = Some(false);
+        paragraph.has_direct_widow_control = true;
+        paragraph.page_break_before = true;
+        paragraph.has_direct_page_break_before = true;
+        paragraph.formatting_change = Some(previous);
+
+        crate::tracked_model::reject_paragraph_formatting(&mut paragraph);
+
+        assert_eq!(paragraph.align, Some(Alignment::Left));
+        assert!(!paragraph.has_direct_align);
+        assert_eq!(paragraph.widow_control, Some(true));
+        assert!(!paragraph.has_direct_widow_control);
+        assert!(!paragraph.page_break_before);
+        assert!(paragraph.has_direct_page_break_before);
+    }
+
+    #[test]
+    fn paragraph_format_snapshot_refuses_direct_gates_without_payloads() {
+        for property in [
+            "alignment",
+            "indentation",
+            "spacing",
+            "keepNext",
+            "keepLines",
+            "widowControl",
+            "contextualSpacing",
+            "shading",
+            "borders",
+            "numbering",
+        ] {
+            let mut paragraph = paragraph_block("p1", normal_segment(vec![text_inline("t1", "x")]));
+            match property {
+                "alignment" => paragraph.has_direct_align = true,
+                "indentation" => paragraph.has_direct_indent = true,
+                "spacing" => paragraph.has_direct_spacing = true,
+                "keepNext" => paragraph.has_direct_keep_next = true,
+                "keepLines" => paragraph.has_direct_keep_lines = true,
+                "widowControl" => paragraph.has_direct_widow_control = true,
+                "contextualSpacing" => paragraph.has_direct_contextual_spacing = true,
+                "shading" => paragraph.has_direct_shading = true,
+                "borders" => paragraph.has_direct_borders = true,
+                "numbering" => paragraph.has_direct_numbering = true,
+                _ => unreachable!("test enumerates every gated payload"),
+            }
+
+            let result =
+                std::panic::catch_unwind(|| snapshot_paragraph_formatting(&paragraph, &revision()));
+            assert!(
+                result.is_err(),
+                "direct {property} without an authored payload must fail loud"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_format_snapshot_refuses_ungated_authored_composites() {
+        let mut indentation = paragraph_block("p1", normal_segment(vec![text_inline("t1", "x")]));
+        indentation.authored_indent = Some(Indentation {
+            left: None,
+            right: None,
+            effective_first_line_twips: None,
+            start_chars: None,
+            end_chars: None,
+            first_line_chars: None,
+            hanging_chars: None,
+        });
+        assert!(
+            std::panic::catch_unwind(|| {
+                snapshot_paragraph_formatting(&indentation, &revision())
+            })
+            .is_err(),
+            "authored indentation without its direct gate must fail loud"
+        );
+
+        let mut spacing = paragraph_block("p2", normal_segment(vec![text_inline("t2", "x")]));
+        spacing.authored_spacing = Some(ParagraphSpacing {
+            before: None,
+            after: None,
+            before_lines: None,
+            after_lines: None,
+            before_autospacing: None,
+            after_autospacing: None,
+            line: None,
+            line_rule: None,
+        });
+        assert!(
+            std::panic::catch_unwind(|| { snapshot_paragraph_formatting(&spacing, &revision()) })
+                .is_err(),
+            "authored spacing without its direct gate must fail loud"
+        );
     }
 
     fn replace_tx(block_id: &str, expect: &str, new_text: &str) -> EditTransaction {

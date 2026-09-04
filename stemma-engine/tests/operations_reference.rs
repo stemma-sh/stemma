@@ -91,12 +91,12 @@ optimistic concurrency where an op supports it.
 | `summary` | Optional human-readable description. |
 | `materialization_mode` | `tracked_change` (the default) or `direct`. |
 
-`allow_existing_author` is NOT a transaction field: continuing an author who
-already owns revisions in the document is a per-call assertion made on the
-transport (the `allow_existing_author` tool argument over MCP, the
+`allow_existing_author` is NOT a transaction field: continuing a Word reviewer
+group whose label was already present in the document is a per-call assertion
+made on the transport (the `allow_existing_author` tool argument over MCP, the
 `?allow_existing_author=true` query parameter on HTTP `/apply`), never part
 of the durable edit format. See the
-[AuthorImpersonation refusal](mcp-advanced.md#refusal-vocabulary).
+[AuthorLabelCollision refusal](mcp-advanced.md#refusal-vocabulary).
 
 ## Content nodes
 

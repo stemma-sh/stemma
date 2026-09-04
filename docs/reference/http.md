@@ -1,12 +1,12 @@
 # HTTP API reference
 
-`stemma-api` maps the same verbs as the MCP server onto HTTP/JSON. The
-transaction grammar, receipts, and refusal vocabulary are identical to the
-[MCP reference](mcp.md); only the transport differs.
+`stemma-api` maps the same engine transaction grammar and refusal vocabulary
+as the MCP server onto HTTP/JSON. Request and response envelopes are
+transport-specific; see the [MCP reference](mcp.md) for that adapter.
 
 > **Scope.** This is example/demo infrastructure: a single-process, in-memory,
-> single-origin server. It has no auth, no TLS, and no session eviction; it
-> binds loopback only; and documents live only in RAM (keyed by `doc_id`) until
+> single-origin server. It has no auth, no TLS, and no session eviction. It
+> binds to loopback by default; `--host` binds all interfaces. Documents live only in RAM (keyed by `doc_id`) until
 > the process exits. For a hosted runtime or any new consumer, build on the
 > engine itself, not this adapter: see [Embed the engine](embedding.md) for
 > the facade and session runtime, and the
@@ -23,10 +23,11 @@ cargo run -p stemma-api          # then open http://127.0.0.1:3000
 note above); running it means cloning
 [the repository](https://github.com/stemma-sh/stemma) and starting it from the
 source workspace. A `cargo install stemma-cli` install alone cannot reach
-these endpoints: the CLI does not serve the read model. To consume
-[`DocumentView`](read-model.md#the-lean-view) or the
-[full render view](read-model.md#the-full-render-view) from your own code,
-embed the engine ([embedding](embedding.md)).
+these endpoints. The installed CLI's `stemma read` command emits the complete
+lean [`DocumentView`](read-model.md#the-lean-view) plus revision census, but it
+does not expose the [full render view](read-model.md#the-full-render-view). To
+consume that full view from your own code, embed the engine
+([embedding](embedding.md)).
 
 One command starts the API **and** serves the browser review editor that
 runs on it. This Word-style front end uses plain static files and requires no
@@ -40,13 +41,13 @@ client for the endpoints below.
 
 | Method & path | Body | Returns |
 |---|---|---|
-| `POST /api/documents` | raw `.docx` bytes | `{ doc_id, document }` |
-| `POST /api/compare` | `{ base_doc_id, target_doc_id, author? }` | `{ doc_id, document }`, containing a **new** redline document |
-| `GET  /api/documents/{id}` | none | `{ document }` |
-| `POST /api/documents/{id}/apply` | a [v4 transaction](operations.md) (JSON) | `{ document }` after apply |
+| `POST /api/documents` | raw `.docx` bytes | `{ doc_id, document, diagnostics }` |
+| `POST /api/compare` | `{ base_doc_id, target_doc_id, author? }` | `{ doc_id, document, semantic_change_count, revision_count, base_diagnostics, target_diagnostics }`, containing a **new** redline document |
+| `GET  /api/documents/{id}` | none | `{ document, diagnostics }` |
+| `POST /api/documents/{id}/apply` | a [v4 transaction](operations.md) (JSON) | `{ document, diagnostics, author_label_policy }` after apply |
 | `GET  /api/documents/{id}/rich` | none | `{ blocks, section, headers, footers, comments }`, the engine's [full render view](read-model.md#the-full-render-view) serialized whole, with fonts, colors, images, equations, and a per-block guard |
 | `GET  /api/documents/{id}/revisions` | none | `{ revisions }`, containing pending tracked changes |
-| `POST /api/documents/{id}/resolve` | `{ revision_ids, action }` | `{ document }` (accept/reject) |
+| `POST /api/documents/{id}/resolve` | `{ revision_ids, action }` | `{ document, diagnostics }` (accept/reject) |
 | `GET  /api/documents/{id}/export?mode=redline\|accepted\|rejected` | none | `.docx` download |
 | `GET  /api/operations` | none | `{ transaction_envelope, operation_count, operations }`, the engine's v4 operation catalog |
 
@@ -107,19 +108,33 @@ that the rest of the API drives:
 { "base_doc_id": "doc-1", "target_doc_id": "doc-2", "author": "L. Marsh" }
 
 // 200 OK
-{ "doc_id": "doc-3", "document": { "blocks": [ /* the read view */ ] } }
+{
+  "doc_id": "doc-3",
+  "document": { "blocks": [ /* the read view */ ] },
+  "semantic_change_count": 1,
+  "revision_count": 2,
+  "base_diagnostics": [],
+  "target_diagnostics": []
+}
 ```
 
 The returned `doc_id` is a first-class session document: `/revisions`,
 `/resolve`, and `/export` compose with it exactly as with an uploaded file. The
-engine's round-trip contract holds. **Reject-all reconstructs `base`, and
-accept-all reconstructs `target`.** Therefore, `GET /api/documents/doc-3/export?mode=rejected`
-returns the base and `mode=accepted` returns the target.
+engine's accepted-reading round-trip contract holds. Each input is internally
+projected to its accepted reading before discovery, so pre-existing pending
+revisions are consumed rather than stacked into the new comparison.
+Import normalizations are disclosed under the input that required them; they
+never disappear merely because the redline is physically derived from the
+base package.
+**Reject-all reconstructs the accepted `base`, and accept-all reconstructs the
+accepted `target`.** Therefore,
+`GET /api/documents/doc-3/export?mode=rejected` returns the accepted base and
+`mode=accepted` returns the accepted target.
 
 - **Attribution.** The optional `author` field attributes the discovered
-  revisions. Omit it and the redline is anonymous because the Tier-1 `diff`
+  revisions. Omit it and the redline is anonymous because `stemma_diff::diff`
   carries no authoring identity. Include it and every revision is attributed to
-  that name (the Tier-1 `diff_as`), surfacing as each row's `author` under
+  that name (`stemma_diff::diff_as`), surfacing as each row's `author` under
   `/revisions`. A present-but-empty `author` is a client mistake, not a request
   for an anonymous redline: it returns `400` `BadAuthor` (omit the field
   instead). There is no silent fallback to anonymous.
@@ -135,14 +150,15 @@ client-side and pass the resulting `revision_ids` to `POST /resolve`. There is
 no by-author selector on `/resolve` itself. Resolution is by explicit id, and
 `/revisions` already carries the author to filter on.
 
-## Continue an existing author's work
+## Continue an existing Word reviewer group
 
-`/apply` enforces the same author-impersonation guard as every other
-transport: a transaction whose `revision.author` already owns pending
-revisions in the document is refused with `422` `AuthorImpersonation`. Every
-multi-round session hits this on round two. Continuing that author's own work
-is a per-call assertion, made as a query parameter, never a transaction
-field:
+`/apply` enforces the same author-label confirmation guard as every other
+transport: a transaction whose `revision.author` matches a label present when
+the document was opened is refused with `422` `AuthorLabelCollision`. Word
+author values are free-form display labels, not authenticated identities; the
+guard asks whether the new revisions should join the existing Word reviewer
+group. Continuing that group is a per-call assertion, made as a query
+parameter, never a transaction field:
 
 ```jsonc
 // POST /api/documents/doc-1/apply?allow_existing_author=true
@@ -152,13 +168,46 @@ field:
 }
 ```
 
-Without the parameter, use a distinct author per round instead. There is no
-silent continuation.
+The refusal is structured so a caller does not need to parse the message:
 
-Every failure has the shape `{ code, error }` and an HTTP status. The `code` is
-the engine's own refusal name (e.g. `StaleEdit`), so clients can branch on
-it exactly as the [refusal vocabulary](mcp.md#refusal-vocabulary)
-describes. Documents live in an in-memory session keyed by `doc_id`; the
-durable artifacts are the uploaded file and what you export.
+```json
+{
+  "code": "AuthorLabelCollision",
+  "status": "confirmation_required",
+  "author_label": "J. Osei",
+  "existing_revision_count": 12,
+  "existing_scope": "present_when_document_opened",
+  "message": "New revisions with this label will appear in Microsoft Word as part of the same reviewer group.",
+  "error": "author label \"J. Osei\" was already present when this document was opened. ...",
+  "mutation": "none",
+  "actions": [
+    {
+      "action": "continue_existing_label",
+      "allow_existing_author": true,
+      "effect": "New revisions will appear under the existing J. Osei reviewer group."
+    },
+    {
+      "action": "use_separate_label",
+      "effect": "This editing round will appear as a separate reviewer group; the user must supply the label."
+    }
+  ]
+}
+```
+
+Without the parameter, the document is unchanged. If a separate editing round
+is intended, supply a different author label chosen by the user. Never invent a
+label merely to clear the refusal. A label introduced after the document was
+opened can be reused during that same open session without the parameter.
+Successful `/apply` responses record the assertion as `author_label_policy`:
+`continue_existing` when the query parameter was supplied, otherwise
+`require_confirmation_on_collision`. A direct-materialization transaction
+records `not_applicable_direct` because it creates no Word revisions.
+
+Every failure has at least `{ code, error }` and an HTTP status; typed refusals
+add fields such as those above. The `code` is the engine's own refusal name
+(e.g. `StaleEdit`), so clients can branch on it exactly as the
+[refusal vocabulary](mcp.md#refusal-vocabulary) describes. Documents live in
+an in-memory session keyed by `doc_id`; the durable artifacts are the uploaded
+file and what you export.
 
 More detail: [stemma-api/README.md](https://github.com/stemma-sh/stemma/blob/main/stemma-api/README.md).

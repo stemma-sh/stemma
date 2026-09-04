@@ -620,7 +620,7 @@ fn compare_paragraphs(
         segments,
         block_text_hash: _, // computed hash of segment text, derived not authored
         numbering,
-        has_direct_numbering: _, // parse-time provenance flag; numPr emission cross-checked via `numbering`
+        has_direct_numbering,
         numbering_suppressed,
         // Derived cache: the pre-materialization numbering snapshot. Restored
         // into `numbering` during projection, so comparing `numbering` already
@@ -698,7 +698,7 @@ fn compare_paragraphs(
         segments: b_segments,
         block_text_hash: _,
         numbering: b_numbering,
-        has_direct_numbering: _,
+        has_direct_numbering: b_has_direct_numbering,
         numbering_suppressed: b_numbering_suppressed,
         materialized_numbering: _,
         rendered_text: _,
@@ -790,6 +790,12 @@ fn compare_paragraphs(
     compare_val(diffs, &format!("{path}.tab_stops"), tab_stops, b_tab_stops);
     compare_tracked_segments(diffs, &format!("{path}.segments"), segments, b_segments);
     compare_numbering(diffs, &format!("{path}.numbering"), numbering, b_numbering);
+    compare_val(
+        diffs,
+        &format!("{path}.has_direct_numbering"),
+        has_direct_numbering,
+        b_has_direct_numbering,
+    );
     compare_val(
         diffs,
         &format!("{path}.numbering_suppressed"),
@@ -1002,6 +1008,7 @@ fn compare_numbering(
             let NumberingInfo {
                 num_id,
                 ilvl,
+                resolution,
                 // Derived counter value (e.g. "1.", "(a)") synthesized at parse
                 // time from the numbering definitions; it drifts as list items
                 // are added/removed and is not authored fidelity.
@@ -1016,12 +1023,19 @@ fn compare_numbering(
             let NumberingInfo {
                 num_id: b_num_id,
                 ilvl: b_ilvl,
+                resolution: b_resolution,
                 synthesized_text: _,
                 is_bullet: _,
                 restart_numbering: _,
             } = nb;
             compare_val(diffs, &format!("{path}.num_id"), num_id, b_num_id);
             compare_val(diffs, &format!("{path}.ilvl"), ilvl, b_ilvl);
+            compare_val(
+                diffs,
+                &format!("{path}.resolution"),
+                resolution,
+                b_resolution,
+            );
         }
     }
 }
@@ -1036,60 +1050,35 @@ fn compare_opt_formatting_change(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => diff(diffs, path, a.is_some(), b.is_some()),
         (Some(fa), Some(fb)) => {
-            compare_opt(
+            compare_val(
                 diffs,
-                &format!("{path}.previous_alignment"),
-                &fa.previous_alignment,
-                &fb.previous_alignment,
+                &format!("{path}.previous.direct"),
+                &fa.previous.direct,
+                &fb.previous.direct,
             );
-            compare_opt(
+            let mut effective_a = fa.previous.effective.clone();
+            let mut effective_b = fb.previous.effective.clone();
+            let effective_numbering_a = effective_a.numbering.take();
+            let effective_numbering_b = effective_b.numbering.take();
+            compare_val(
                 diffs,
-                &format!("{path}.previous_indentation"),
-                &fa.previous_indentation,
-                &fb.previous_indentation,
-            );
-            compare_opt(
-                diffs,
-                &format!("{path}.previous_spacing"),
-                &fa.previous_spacing,
-                &fb.previous_spacing,
+                &format!("{path}.previous.effective"),
+                &effective_a,
+                &effective_b,
             );
             compare_numbering(
                 diffs,
-                &format!("{path}.previous_numbering"),
-                &fa.previous_numbering,
-                &fb.previous_numbering,
+                &format!("{path}.previous.effective.numbering"),
+                &effective_numbering_a,
+                &effective_numbering_b,
             );
             compare_val(
                 diffs,
-                &format!("{path}.previous_numbering_explicitly_absent"),
-                &fa.previous_numbering_explicitly_absent,
-                &fb.previous_numbering_explicitly_absent,
+                &format!("{path}.previous.paragraph_mark"),
+                &fa.previous.paragraph_mark,
+                &fb.previous.paragraph_mark,
             );
-            compare_val(
-                diffs,
-                &format!("{path}.previous_paragraph_mark_marks"),
-                &fa.previous_paragraph_mark_marks,
-                &fb.previous_paragraph_mark_marks,
-            );
-            compare_val(
-                diffs,
-                &format!("{path}.previous_paragraph_mark_style_props"),
-                &fa.previous_paragraph_mark_style_props,
-                &fb.previous_paragraph_mark_style_props,
-            );
-            compare_val(
-                diffs,
-                &format!("{path}.previous_paragraph_mark_rfonts"),
-                &fa.previous_paragraph_mark_rfonts,
-                &fb.previous_paragraph_mark_rfonts,
-            );
-            compare_val(
-                diffs,
-                &format!("{path}.previous_paragraph_mark_rpr_off"),
-                &fa.previous_paragraph_mark_rpr_off,
-                &fb.previous_paragraph_mark_rpr_off,
-            );
+            compare_val(diffs, &format!("{path}.carrier"), &fa.carrier, &fb.carrier);
             compare_val(diffs, &format!("{path}.author"), &fa.author, &fb.author);
             compare_opt(diffs, &format!("{path}.date"), &fa.date, &fb.date);
         }
@@ -1267,6 +1256,7 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 wrapper_style_props,
                 wrapper_rpr_authored,
                 source_run_attrs,
+                formatting_change,
                 joins_following_text_run,
             } = ha;
             let HardBreakNode {
@@ -1278,6 +1268,7 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 wrapper_style_props: b_wrapper_style_props,
                 wrapper_rpr_authored: b_wrapper_rpr_authored,
                 source_run_attrs: b_source_run_attrs,
+                formatting_change: b_formatting_change,
                 joins_following_text_run: b_joins_following_text_run,
             } = hb;
             compare_val(
@@ -1316,6 +1307,12 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 &format!("{path}.source_run_attrs"),
                 source_run_attrs,
                 b_source_run_attrs,
+            );
+            compare_opt_text_formatting_change(
+                diffs,
+                &format!("{path}.formatting_change"),
+                formatting_change,
+                b_formatting_change,
             );
             compare_val(
                 diffs,
@@ -1590,23 +1587,11 @@ fn compare_opt_table_formatting_change(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => diff(diffs, path, a.is_some(), b.is_some()),
         (Some(fa), Some(fb)) => {
-            compare_opt(
+            compare_val(
                 diffs,
-                &format!("{path}.previous_width"),
-                &fa.previous_width,
-                &fb.previous_width,
-            );
-            compare_opt(
-                diffs,
-                &format!("{path}.previous_borders"),
-                &fa.previous_borders,
-                &fb.previous_borders,
-            );
-            compare_opt(
-                diffs,
-                &format!("{path}.previous_default_cell_margins"),
-                &fa.previous_default_cell_margins,
-                &fb.previous_default_cell_margins,
+                &format!("{path}.previous"),
+                &fa.previous,
+                &fb.previous,
             );
             compare_val(diffs, &format!("{path}.author"), &fa.author, &fb.author);
             compare_opt(diffs, &format!("{path}.date"), &fa.date, &fb.date);
@@ -1645,6 +1630,7 @@ fn compare_table_rows(
             w_after,
             cnf_style,
             tbl_pr_ex,
+            tbl_pr_ex_change,
             cell_spacing,
             preserved,
         } = ra;
@@ -1666,6 +1652,7 @@ fn compare_table_rows(
             w_after: b_w_after,
             cnf_style: b_cnf_style,
             tbl_pr_ex: b_tbl_pr_ex,
+            tbl_pr_ex_change: b_tbl_pr_ex_change,
             cell_spacing: b_cell_spacing,
             preserved: b_preserved,
         } = rb;
@@ -1702,6 +1689,12 @@ fn compare_table_rows(
         compare_opt(diffs, &format!("{p}.w_after"), w_after, b_w_after);
         compare_opt(diffs, &format!("{p}.cnf_style"), cnf_style, b_cnf_style);
         compare_opt(diffs, &format!("{p}.tbl_pr_ex"), tbl_pr_ex, b_tbl_pr_ex);
+        compare_opt(
+            diffs,
+            &format!("{p}.tbl_pr_ex_change"),
+            tbl_pr_ex_change,
+            b_tbl_pr_ex_change,
+        );
         compare_opt(
             diffs,
             &format!("{p}.cell_spacing"),
@@ -2249,6 +2242,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_and_inherited_numbering_are_not_fidelity_equivalent() {
+        let numbering = NumberingInfo {
+            num_id: 7,
+            ilvl: 0,
+            resolution: crate::domain::NumberingResolution::Resolved,
+            synthesized_text: "1.".to_string(),
+            is_bullet: false,
+            restart_numbering: false,
+        };
+        let mut direct = base_paragraph();
+        direct.numbering = Some(numbering.clone());
+        direct.has_direct_numbering = true;
+        let mut inherited = base_paragraph();
+        inherited.numbering = Some(numbering);
+        inherited.has_direct_numbering = false;
+
+        let diffs = compare_canon_docs(&doc_with_paragraph(direct), &doc_with_paragraph(inherited));
+        assert!(
+            diffs
+                .iter()
+                .any(|difference| difference.path.contains("has_direct_numbering")),
+            "direct numPr and inherited numbering serialize differently: {diffs:?}"
+        );
+    }
+
     /// `w:textDirection` (§17.3.1.40) controls glyph flow within the paragraph
     /// (e.g. vertical East-Asian text). Changing it changes how the document
     /// reads, so a roundtrip must preserve it and the comparator must catch a
@@ -2315,19 +2334,9 @@ mod tests {
     fn cnf_style_difference_detected() {
         let mut a = base_paragraph();
         a.cnf_style = Some(CnfStyle {
-            val: Some("100000000000".to_string()),
-            first_row: true,
-            last_row: false,
-            first_column: false,
-            last_column: false,
-            odd_v_band: false,
-            even_v_band: false,
-            odd_h_band: false,
-            even_h_band: false,
-            first_row_first_column: false,
-            first_row_last_column: false,
-            last_row_first_column: false,
-            last_row_last_column: false,
+            val: Some(crate::domain::CnfMask::try_from("100000000000").unwrap()),
+            first_row: Some(true),
+            ..CnfStyle::default()
         });
         let b = base_paragraph();
         let diffs = compare_canon_docs(&doc_with_paragraph(a), &doc_with_paragraph(b));
@@ -2395,6 +2404,7 @@ mod tests {
                 numbering: Some(NumberingInfo {
                     num_id: 1,
                     ilvl: 0,
+                    resolution: crate::domain::NumberingResolution::Resolved,
                     synthesized_text: synth.to_string(),
                     is_bullet: false,
                     restart_numbering: false,

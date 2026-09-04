@@ -11,6 +11,8 @@
 //! 3. Roundtrip: import -> export preserves existing tracked changes.
 
 use std::io::{Cursor, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{
     DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta, redline_extract::extract_redline,

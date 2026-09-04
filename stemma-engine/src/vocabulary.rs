@@ -476,7 +476,7 @@ fn build_paragraph_info(
     let dominant_font_size = normalize_font_size(raw_font_size, default_font_size);
 
     // Numbering.
-    let has_auto_numbering = p.numbering.is_some();
+    let has_auto_numbering = p.has_resolved_numbering();
     let has_literal_prefix = p.literal_prefix.is_some();
     let has_numbering = has_auto_numbering || has_literal_prefix;
 
@@ -551,7 +551,9 @@ fn build_paragraph_info(
 }
 
 fn classify_numbering(p: &ParagraphNode) -> NumberingKind {
-    if let Some(ref num) = p.numbering {
+    if let Some(ref num) = p.numbering
+        && num.is_resolved()
+    {
         return classify_numbering_text(&num.synthesized_text);
     }
     if let Some(ref prefix) = p.literal_prefix {
@@ -568,7 +570,9 @@ fn extract_text_snippet(p: &ParagraphNode) -> String {
     let mut out = String::new();
 
     // Numbering prefix.
-    if let Some(ref num) = p.numbering {
+    if let Some(ref num) = p.numbering
+        && num.is_resolved()
+    {
         out.push_str(&num.synthesized_text);
     }
     if let Some(ref prefix) = p.literal_prefix {

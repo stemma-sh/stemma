@@ -188,6 +188,7 @@ fn formatted_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         w_after: None,
         cnf_style: None,
         tbl_pr_ex: None,
+        tbl_pr_ex_change: None,
         cell_spacing: None,
         preserved: Vec::new(),
     }
@@ -597,6 +598,7 @@ fn structural_op_on_table_with_pending_cell_change_refuses() {
         previous_no_wrap: None,
         previous_text_direction: None,
         previous_tc_fit_text: None,
+        previous_cnf_style: None,
         revision_id: 1,
         identity: 0,
         author: "Prior".to_string(),

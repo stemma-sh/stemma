@@ -41,6 +41,8 @@ fn make_docx(body_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
             Some("application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml")
         } else if part.ends_with("numbering.xml") {
             Some("application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml")
+        } else if part.contains("header") {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml")
         } else {
             None
         }
@@ -385,38 +387,48 @@ fn rprchange_serializes_as_trailing_rpr_child_after_edit_reemit() {
     );
 }
 
-#[ignore = "open question: CONFIRMED GAP — validate() reports opens-clean (ok=true) for a pPrChange missing the required w:id; id-required enforcement is limited to w:del/w:ins (I-TC-002), diverging from ECMA-376 §17.13.5.29 id row"]
 #[test]
 fn pprchange_missing_id_is_nonconformant() {
     // ECMA-376 §17.13.5.29, ISO 29500-1 §17.13.5.29.
     // NEGATIVE post-condition: a pPrChange missing the required w:id should be
-    // reported non-conformant. If this assertion FAILS (opens-clean passes),
-    // that exposes the validator gap (I-TC-002 covers only del/ins) — the gap
-    // we are hunting.
+    // reported non-conformant.
     let body = r#"<w:p><w:pPr><w:jc w:val="center"/><w:pPrChange w:author="John Doe" w:date="2006-01-01T12:00:00Z"><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>Centered</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_not_opens_clean(
         &b,
         "pprchange_missing_id_is_nonconformant — ECMA-376 §17.13.5.29 (id row: 'If this attribute is omitted, then the document is non-conformant'): \
-         a pPrChange missing the required w:id must be reported non-conformant, not opens-clean. opens-clean passing here is the validator gap (I-TC-002 covers only del/ins).",
+         a pPrChange missing the required w:id must be reported non-conformant, not opens-clean.",
     );
 }
 
-#[ignore = "open question: CONFIRMED GAP — validate() reports opens-clean (ok=true) for a sectPrChange missing the required w:id; same root cause as pPrChange (id-required enforcement limited to w:del/w:ins, I-TC-002 does not cover sectPrChange), diverging from ECMA-376 §17.13.5.32 id row"]
 #[test]
 fn sectprchange_missing_id_is_nonconformant() {
     // ECMA-376 §17.13.5.32, ISO 29500-1 §17.13.5.32.
     // NEGATIVE post-condition: a sectPrChange missing required w:id should be
-    // non-conformant. Failure (opens-clean) exposes that I-TC-002 does not cover
-    // sectPrChange.
+    // non-conformant.
     let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:sectPrChange w:author="John Doe" w:date="2006-01-01T12:00:00Z"><w:sectPr/></w:sectPrChange></w:sectPr>"#;
     let b = make_docx(body, &[]);
 
     assert_not_opens_clean(
         &b,
         "sectprchange_missing_id_is_nonconformant — ECMA-376 §17.13.5.32 (id row: 'If this attribute is omitted, then the document is non-conformant'): \
-         a sectPrChange missing the required w:id must be reported non-conformant, not opens-clean. opens-clean passing exposes that I-TC-002 does not cover sectPrChange.",
+         a sectPrChange missing the required w:id must be reported non-conformant, not opens-clean.",
+    );
+}
+
+#[test]
+fn header_property_change_missing_id_is_nonconformant() {
+    let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr/>"#;
+    let header = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p><w:pPr><w:pPrChange w:author="A"><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>Header</w:t></w:r></w:p>
+</w:hdr>"#;
+    let b = make_docx(body, &[("word/header1.xml", header)]);
+
+    assert_not_opens_clean(
+        &b,
+        "I-TC-002 applies to revision carriers in every Word story, including headers",
     );
 }
 

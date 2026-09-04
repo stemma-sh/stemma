@@ -8,6 +8,7 @@ use std::process::{Command, Output, Stdio};
 
 use stemma::api::Document;
 use stemma::audit::{DirectChangeKind, RevisionDisposition};
+use stemma::docx::{DocxArchive, DocxFile};
 use stemma::edit_v4::parse_transaction;
 use stemma::{ExportOptions, StoryScope};
 use stemma_artifacts::{
@@ -23,6 +24,65 @@ fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../stemma-engine/testdata")
         .join(rel)
+}
+
+fn write_with_dangling_package_thumbnail(source: &Path, output: &Path) {
+    let mut archive = DocxArchive::read(&std::fs::read(source).expect("read source fixture"))
+        .expect("read DOCX package");
+    let relationships = String::from_utf8(
+        archive
+            .get("_rels/.rels")
+            .expect("root relationships")
+            .to_vec(),
+    )
+    .expect("test relationships are UTF-8");
+    let dangling = r#"<Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>"#;
+    archive.upsert(
+        "_rels/.rels",
+        relationships
+            .replacen(
+                "</Relationships>",
+                &format!("{dangling}</Relationships>"),
+                1,
+            )
+            .into_bytes(),
+    );
+    std::fs::write(output, archive.write().expect("write normalized fixture"))
+        .expect("write normalized fixture");
+}
+
+fn write_proof_body_docx_paragraphs(path: &Path, paragraphs: &[(&str, &str)]) {
+    let body = paragraphs
+        .iter()
+        .map(|(paragraph_id, text)| {
+            format!(
+                r#"<w:p w14:paraId="{paragraph_id}" w14:textId="{paragraph_id}"><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        })
+        .collect::<String>();
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body>{body}</w:body></w:document>"#
+    );
+    let archive = DocxArchive::from_parts(vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/_rels/document.xml.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: document.into_bytes(),
+        },
+    ]);
+    std::fs::write(path, archive.write().expect("encode minimal proof DOCX"))
+        .expect("write minimal proof DOCX");
 }
 
 /// Run the built binary with `args`, returning the captured output.
@@ -270,6 +330,36 @@ fn dangling_hyperlink_docx() -> Vec<u8> {
 }
 
 #[test]
+fn product_help_exposes_one_opinionated_compare_surface() {
+    let output = run(&["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(stdout.contains("  compare "));
+    for diagnostic in ["proof-compare", "package-plan", "capability-probe"] {
+        assert!(
+            !stdout.contains(diagnostic),
+            "research command {diagnostic} leaked into product help: {stdout}"
+        );
+    }
+
+    let output = run(&["compare", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 compare help");
+    for research_option in [
+        "--comparison-model",
+        "--max-graph-nodes",
+        "--max-block-matrix-cells",
+        "--max-candidate-rechecks",
+        "--ambiguous-correspondence",
+    ] {
+        assert!(
+            !stdout.contains(research_option),
+            "research option {research_option} leaked into product compare: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     let dir = tempfile::tempdir().unwrap();
     let worklist = dir.path().join("worklist.json");
@@ -304,6 +394,7 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
         serde_json::from_slice(&std::fs::read(receipt_for(&out)).unwrap()).unwrap();
     assert_eq!(receipt, durable_receipt);
     assert_eq!(receipt["schema"], "stemma.apply_receipt.v0");
+    assert_eq!(receipt["input_diagnostics"], serde_json::json!([]));
     assert_eq!(receipt["status"], "complete");
     assert_eq!(receipt["input_binding"], "input_verified");
     assert_eq!(receipt["summary"]["total"], 1);
@@ -439,6 +530,50 @@ fn apply_accepts_an_unbound_worklist_and_records_the_actual_input() {
         expected_identity.digest.hex
     );
     assert_eq!(receipt["input"]["bytes"], expected_identity.bytes);
+}
+
+#[test]
+fn apply_discloses_source_import_normalization_in_stderr_and_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.docx");
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("redline.docx");
+    write_with_dangling_package_thumbnail(&fixture("simple-text/before.docx"), &input);
+    std::fs::write(
+        &worklist,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "stemma.worklist.v0",
+            "author": "Reviewer",
+            "changes": [{
+                "id": "change-1",
+                "old": "foo bar",
+                "new": "review-ready language"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "apply should succeed: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rIdThumbnail"));
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        receipt["input_diagnostics"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(
+        receipt["input_diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("rIdThumbnail"))
+    );
 }
 
 #[test]
@@ -1036,18 +1171,19 @@ fn apply_refuses_a_detected_table_cell_match_instead_of_claiming_completion() {
 }
 
 #[test]
-fn apply_refuses_to_impersonate_an_existing_revision_author() {
+fn apply_requires_confirmation_for_an_existing_author_label() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("existing-redline.docx");
     let worklist = dir.path().join("worklist.json");
     let out = dir.path().join("must-not-exist.docx");
+    let confirmed_out = dir.path().join("confirmed-redline.docx");
     write_named_redline(&input, "Prior Counsel", "Counsel's tracked replacement.");
     write_worklist_for(
         &worklist,
         &input,
         "Prior Counsel",
         serde_json::json!([{
-            "id": "impersonating-change",
+            "id": "colliding-author-label",
             "old": "much longer sequence",
             "new": "different sequence",
             "expected_matches": 1
@@ -1066,11 +1202,33 @@ fn apply_refuses_to_impersonate_an_existing_revision_author() {
     assert!(!out.exists());
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["items"][0]["status"], "refused");
+    assert_eq!(receipt["items"][0]["code"], "author_label_collision");
     assert!(
         receipt["items"][0]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("already authors revisions")),
+            .is_some_and(|message| message.contains("same reviewer group")),
         "receipt explains the author collision: {receipt}"
+    );
+
+    let confirmed = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        confirmed_out.to_str().unwrap(),
+        "--allow-existing-author",
+    ]);
+    assert!(
+        confirmed.status.success(),
+        "explicit confirmation continues the reviewer group: {confirmed:?}"
+    );
+    assert!(confirmed_out.exists());
+    let confirmed_receipt: serde_json::Value =
+        serde_json::from_slice(&confirmed.stdout).expect("confirmed apply receipt");
+    assert_eq!(
+        confirmed_receipt["author_label_policy"],
+        "continue_existing"
     );
 }
 
@@ -1191,6 +1349,63 @@ fn compare_produces_a_reviewable_redline() {
     let (accepted, rejected) = readings(&out);
     assert_eq!(rejected, base, "reject-all == base");
     assert_eq!(accepted, target, "accept-all == target");
+}
+
+#[test]
+fn compare_does_not_use_word_complete_document_pivot() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = dir.path().join("before.docx");
+    let after = dir.path().join("after.docx");
+    let out = dir.path().join("redline.docx");
+    write_proof_body_docx_paragraphs(
+        &before,
+        &[
+            ("00000001", "Alpha beta gamma delta epsilon."),
+            ("00000002", "Zeta eta theta iota kappa."),
+            ("00000003", "Lambda mu nu xi omicron."),
+        ],
+    );
+    write_proof_body_docx_paragraphs(
+        &after,
+        &[
+            ("00000004", "Uno dos tres cuatro cinco."),
+            ("00000005", "Seis siete ocho nueve diez."),
+        ],
+    );
+
+    let output = run(&[
+        "compare",
+        before.to_str().unwrap(),
+        after.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "compare failed: {output:?}");
+
+    let package = DocxArchive::read(&std::fs::read(&out).expect("read redline"))
+        .expect("parse redline package");
+    let document = std::str::from_utf8(
+        package
+            .get("word/document.xml")
+            .expect("redline main document"),
+    )
+    .expect("main document is UTF-8");
+    let first_source_paragraph = document
+        .split("</w:p>")
+        .find(|paragraph| paragraph.contains("Alpha beta gamma delta epsilon."))
+        .expect("redline retains the first source paragraph");
+    assert!(
+        first_source_paragraph.contains("Uno dos tres cuatro cinco."),
+        "Stemma should retain target order around the necessary physical boundary"
+    );
+    assert!(
+        !first_source_paragraph.contains("Seis siete ocho nueve diez."),
+        "Stemma must not copy Word Compare's first-source/last-target pivot"
+    );
+
+    let (accepted, rejected) = readings(&out);
+    assert_eq!(rejected, text_of(&before), "Reject reconstructs the source");
+    assert_eq!(accepted, text_of(&after), "Accept reconstructs the target");
 }
 
 #[test]
@@ -1615,12 +1830,12 @@ fn garbage_input_fails_actionably_without_panicking() {
 }
 
 #[test]
-fn blocking_validation_failure_creates_no_output() {
+fn invalid_relationship_graph_creates_no_compare_output() {
     let dir = tempfile::tempdir().unwrap();
     let invalid = dir.path().join("dangling-link.docx");
     let out = dir.path().join("must-not-exist.docx");
     let bytes = dangling_hyperlink_docx();
-    Document::parse(&bytes).expect("fixture imports so compare reaches the output gate");
+    Document::parse(&bytes).expect("fixture imports before package-graph closure");
     assert!(
         !stemma::api::validate(&bytes).ok,
         "fixture must carry a blocking dangling-relationship defect"
@@ -1636,12 +1851,13 @@ fn blocking_validation_failure_creates_no_output() {
     ]);
     assert!(
         !output.status.success(),
-        "the blocking validator must refuse the output"
+        "package-graph closure must refuse the output"
     );
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("I-REL-001") || stderr.contains("ValidationFailed"),
-        "failure identifies the blocking validation gate: {stderr}"
+        stderr.contains("InvalidDocx")
+            && stderr.contains("neither source package supplies that binding"),
+        "failure identifies the unresolved relationship and its provenance: {stderr}"
     );
     assert!(
         !out.exists(),
@@ -1650,14 +1866,14 @@ fn blocking_validation_failure_creates_no_output() {
 }
 
 #[test]
-fn apply_blocking_validation_failure_creates_no_docx() {
+fn invalid_relationship_graph_creates_no_apply_docx() {
     let dir = tempfile::tempdir().unwrap();
     let invalid = dir.path().join("dangling-link.docx");
     let worklist = dir.path().join("worklist.json");
     let out = dir.path().join("must-not-exist.docx");
     let receipt = receipt_for(&out);
     let bytes = dangling_hyperlink_docx();
-    Document::parse(&bytes).expect("fixture imports so apply reaches delivery verification");
+    Document::parse(&bytes).expect("fixture imports before package-graph closure");
     assert!(
         !stemma::api::validate(&bytes).ok,
         "fixture must carry a blocking dangling-relationship defect"
@@ -1685,23 +1901,24 @@ fn apply_blocking_validation_failure_creates_no_docx() {
     ]);
     assert!(
         !output.status.success(),
-        "delivery verification must refuse a blocking validator failure"
+        "package-graph closure must refuse an invalid delivery"
     );
     let result: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout is the refusal receipt");
     assert_eq!(result["status"], "partial");
     assert_eq!(result["deliverable"], false);
-    assert_eq!(result["items"][0]["code"], "validation_failed");
+    assert_eq!(result["items"][0]["code"], "invalid_docx");
     assert!(
         result["items"][0]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("I-REL-001")),
-        "receipt identifies the blocking validation finding: {result}"
+            .is_some_and(|message| message
+                .contains("neither source package supplies that binding")),
+        "receipt identifies the unresolved relationship and its provenance: {result}"
     );
     assert!(!out.exists(), "validation happens before DOCX commit");
     assert!(
         receipt.exists(),
-        "the non-deliverable refusal remains observable in its durable receipt"
+        "the invalid-delivery refusal remains observable in its durable receipt"
     );
 }
 
@@ -2546,6 +2763,14 @@ fn compare_format_json_emits_a_receipt_with_census_and_output_identity() {
     let receipt: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("receipt JSON on stdout");
     assert_eq!(receipt["schema"], "stemma.compare_receipt.v0");
+    assert_eq!(receipt["semantic_change_count"], 1);
+    assert_eq!(receipt["base_diagnostics"], serde_json::json!([]));
+    assert_eq!(receipt["target_diagnostics"], serde_json::json!([]));
+    assert_eq!(
+        receipt["flattened_input_revisions"],
+        serde_json::json!({ "base": [], "target": [] }),
+        "clean inputs disclose an empty flattening census"
+    );
     assert!(
         receipt["author"].is_null(),
         "an anonymous compare records author: null"
@@ -2555,6 +2780,27 @@ fn compare_format_json_emits_a_receipt_with_census_and_output_identity() {
             .as_array()
             .is_some_and(|rows| !rows.is_empty()),
         "the receipt enumerates the discovered revisions"
+    );
+    let receipt_revisions = receipt["revisions"].as_array().unwrap();
+    assert!(
+        receipt_revisions
+            .iter()
+            .all(|row| !row.as_object().unwrap().contains_key("date")),
+        "compare leaves revision dates absent, never blank: {receipt_revisions:?}"
+    );
+
+    // The committed redline carries the same absence after serialize/reopen.
+    // This pins the public extract shape, not only the in-memory receipt.
+    let extracted = run(&["extract", out.to_str().unwrap(), "--format", "json"]);
+    assert!(extracted.status.success(), "{extracted:?}");
+    let extracted: serde_json::Value =
+        serde_json::from_slice(&extracted.stdout).expect("extract JSON on stdout");
+    let extracted_revisions = extracted["revisions"].as_array().unwrap();
+    assert!(
+        extracted_revisions
+            .iter()
+            .all(|row| !row.as_object().unwrap().contains_key("date")),
+        "serialized compare revisions omit date: {extracted_revisions:?}"
     );
 
     // The output identity in the receipt is the committed file's identity.
@@ -2572,6 +2818,114 @@ fn compare_format_json_emits_a_receipt_with_census_and_output_identity() {
     );
     assert_eq!(receipt["output"]["collision_policy"], "create_new");
     assert_eq!(receipt["output"]["disposition"], "created");
+}
+
+#[test]
+fn compare_keeps_import_diagnostics_attributed_in_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let normalized = dir.path().join("normalized.docx");
+    write_with_dangling_package_thumbnail(&fixture("simple-text/after.docx"), &normalized);
+
+    for (label, base, target, diagnostic_side) in [
+        (
+            "target",
+            fixture("simple-text/before.docx"),
+            normalized.clone(),
+            "target_diagnostics",
+        ),
+        (
+            "base",
+            normalized.clone(),
+            fixture("simple-text/before.docx"),
+            "base_diagnostics",
+        ),
+    ] {
+        let out = dir.path().join(format!("{label}-redline.docx"));
+        let output = run(&[
+            "compare",
+            base.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        assert!(
+            output.status.success(),
+            "compare should succeed: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("rIdThumbnail"));
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            receipt[diagnostic_side].as_array().map(Vec::len),
+            Some(1),
+            "diagnostic remains attributed to the normalized {label} input"
+        );
+        let other_side = if diagnostic_side == "base_diagnostics" {
+            "target_diagnostics"
+        } else {
+            "base_diagnostics"
+        };
+        assert_eq!(receipt[other_side], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn compare_discloses_and_consumes_preexisting_input_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base-redline.docx");
+    let target = dir.path().join("accepted-target.docx");
+    let out = dir.path().join("comparison.docx");
+    write_named_redline(&base, "Prior reviewer", "Accepted replacement.");
+    let base_doc = Document::parse(&std::fs::read(&base).unwrap()).unwrap();
+    let target_bytes = base_doc
+        .read_accepted()
+        .unwrap()
+        .serialize(&ExportOptions::default())
+        .unwrap();
+    std::fs::write(&target, target_bytes).unwrap();
+
+    let output = run(&[
+        "compare",
+        base.to_str().unwrap(),
+        target.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("compared accepted readings; flattened"),
+        "the human diagnostic must expose flattening: {output:?}"
+    );
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("receipt JSON on stdout");
+    assert!(
+        receipt["flattened_input_revisions"]["base"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "the receipt must enumerate consumed base revisions: {receipt}"
+    );
+    assert_eq!(
+        receipt["flattened_input_revisions"]["target"],
+        serde_json::json!([])
+    );
+
+    let base_accepted = Document::parse(&std::fs::read(&base).unwrap())
+        .unwrap()
+        .read_accepted()
+        .unwrap()
+        .to_text();
+    let target_accepted = Document::parse(&std::fs::read(&target).unwrap())
+        .unwrap()
+        .read_accepted()
+        .unwrap()
+        .to_text();
+    let (accepted, rejected) = readings(&out);
+    assert_eq!(rejected, base_accepted);
+    assert_eq!(accepted, target_accepted);
 }
 
 #[test]

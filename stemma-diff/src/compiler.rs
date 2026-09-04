@@ -8,6 +8,22 @@ use std::env;
 use sha2::{Digest, Sha256};
 use similar::{Algorithm, ChangeTag, TextDiff};
 
+#[cfg(test)]
+fn merge_diff(
+    base: &stemma::domain::CanonDoc,
+    target: &stemma::domain::CanonDoc,
+    diff: &crate::model::DocumentDiff,
+    revision: &stemma::domain::RevisionInfo,
+) -> Result<crate::materialize::MergeResult, crate::materialize::MergeError> {
+    crate::materialize::materialize_change_plan(
+        base,
+        target,
+        diff,
+        revision,
+        &crate::materialize::ComparisonPlanResolver,
+    )
+}
+
 // =============================================================================
 // Custom tokenizer for word-level diffing
 // =============================================================================
@@ -51,7 +67,13 @@ pub fn tokenize(text: &str) -> Vec<&str> {
         let class = char_class(c);
         chars.next();
 
-        if c == '\u{FFFC}' {
+        if c == '\n' {
+            // A hard break is an independent Word run carrier. Never fuse it
+            // with adjacent whitespace or another break: each carrier may own
+            // distinct current/previous run properties and a distinct w:id.
+            let end = chars.peek().map_or(text.len(), |&(i, _)| i);
+            tokens.push(&text[start..end]);
+        } else if c == '\u{FFFC}' {
             // Tagged opaque placeholders in the resolving-opaques path are
             // `FFFC + 12 hex chars`. Plain placeholders in the regular diff path
             // are just bare `FFFC`. Only consume a trailing tag when there is an
@@ -82,7 +104,7 @@ pub fn tokenize(text: &str) -> Vec<&str> {
         } else {
             // Word and whitespace: consume contiguous run of the same class
             while let Some(&(_, next_c)) = chars.peek() {
-                if char_class(next_c) == class {
+                if next_c != '\n' && char_class(next_c) == class {
                     chars.next();
                 } else {
                     break;
@@ -238,28 +260,143 @@ fn fuse_intraword_apostrophes<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'
 
 use crate::domain::{
     Alignment, BlockNode, BlockType, CanonDoc, CellParagraphChange, ChangeType, CommentPayload,
-    CommentStory, DiffChange, DocumentDiff, EndnoteStory, FooterStory, FootnoteStory,
-    FormattingChange, FullDocBlock, FullDocViewResult, HeaderFooterPayload, HeaderStory,
-    HeadingLevel, IStr, ImageMetadataChange, Indentation, InlineChange, InlineChangeSegmentType,
-    InlineNode, Mark, MarkValue, MoveDirection, NestedTableDiff, NestedTableDiffKind, NodeId,
-    NoteType, OpaqueInlineNode, OpaqueKind, OpaqueSegmentKind, ParagraphBorders, ParagraphNode,
-    ParagraphSpacing, RunRprAuthored, StoryPayload, StructuralChange, StyleProps, TableCellChange,
+    CommentStory, DecorationNode, DecorationType, DiffChange, DocumentDiff, EndnoteStory,
+    FooterStory, FootnoteStory, FormattingChange, FullDocBlock, FullDocViewResult,
+    HeaderFooterPayload, HeaderStory, HeadingLevel, IStr, Indentation, InlineChange,
+    InlineChangeSegmentType, InlineNode, Mark, MarkValue, NestedTableDiff, NestedTableDiffKind,
+    NodeId, NoteType, OpaqueInlineNode, OpaqueKind, OpaqueSegmentKind, ParagraphBorders,
+    ParagraphNode, ParagraphSpacing, RunRprAuthored, StoryPayload, StyleProps, TableCellChange,
     TableCellDiff, TableCellDiffType, TableDiffResult, TableFormatting, TableNode,
     TableRowAlignment, TrackedBlock, TrackingStatus,
 };
-use crate::import::story_blocks_to_segments;
+fn story_blocks_to_segments(blocks: &[TrackedBlock]) -> Vec<InlineChange> {
+    let mut segments = Vec::new();
+    for (index, tracked_block) in blocks.iter().enumerate() {
+        if index > 0 {
+            segments.push(InlineChange::Unchanged {
+                text: "\n".to_string(),
+                marks: Vec::new(),
+                style_props: StyleProps::default(),
+                formatting_change: None,
+            });
+        }
+        let BlockNode::Paragraph(paragraph) = &tracked_block.block else {
+            continue;
+        };
+        for inline in paragraph.all_inlines() {
+            match inline {
+                InlineNode::Text(text) => segments.push(InlineChange::Unchanged {
+                    text: text.text.clone(),
+                    marks: text.marks.clone(),
+                    style_props: text.style_props.clone(),
+                    formatting_change: text.formatting_change.clone(),
+                }),
+                InlineNode::HardBreak(_) => segments.push(InlineChange::Unchanged {
+                    text: "\n".to_string(),
+                    marks: Vec::new(),
+                    style_props: StyleProps::default(),
+                    formatting_change: None,
+                }),
+                InlineNode::OpaqueInline(opaque) => {
+                    let (text, reference_id, field_kind, field_instruction, asset_ref) =
+                        match &opaque.kind {
+                            OpaqueKind::Hyperlink(data) => (
+                                (!data.text.is_empty()).then(|| data.text.clone()),
+                                None,
+                                None,
+                                None,
+                                data.url.clone().or_else(|| {
+                                    data.anchor.as_ref().map(|anchor| format!("#{anchor}"))
+                                }),
+                            ),
+                            OpaqueKind::FootnoteReference(reference)
+                            | OpaqueKind::EndnoteReference(reference)
+                            | OpaqueKind::CommentReference(reference) => {
+                                (None, Some(reference.reference_id.clone()), None, None, None)
+                            }
+                            OpaqueKind::Field(field) => (
+                                field.result_text.clone(),
+                                None,
+                                Some(field.field_kind.clone()),
+                                field
+                                    .semantic
+                                    .as_ref()
+                                    .map(|semantic| semantic.to_instruction_text())
+                                    .or_else(|| field.instruction_text.clone()),
+                                None,
+                            ),
+                            _ => (None, None, None, None, None),
+                        };
+                    segments.push(InlineChange::Opaque {
+                        segment_type: InlineChangeSegmentType::Equal,
+                        kind: opaque_kind_to_segment_kind(&opaque.kind),
+                        opaque_id: opaque.id.0.to_string(),
+                        inline_index: 0,
+                        text,
+                        reference_id,
+                        field_kind,
+                        field_instruction,
+                        asset_ref,
+                        asset_width_emu: None,
+                        asset_height_emu: None,
+                        alt_text: None,
+                        url: opaque_url(&opaque.kind),
+                        content_hash: opaque.content_hash.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    segments
+}
+
+fn story_blocks_to_paragraphs(blocks: &[TrackedBlock]) -> Vec<crate::model::HeaderFooterParagraph> {
+    blocks
+        .iter()
+        .filter_map(|tracked_block| match &tracked_block.block {
+            BlockNode::Paragraph(paragraph) => Some(crate::model::HeaderFooterParagraph {
+                align: paragraph.align.clone(),
+                tab_stops: paragraph.tab_stops.clone(),
+                segments: story_blocks_to_segments(std::slice::from_ref(tracked_block)),
+            }),
+            _ => None,
+        })
+        .collect()
+}
 use crate::table_diff::{
     CellDiffType, RowAlignment, diff_tables, extract_tracked_table_new_text,
     extract_tracked_table_old_text, table_has_tracked_changes,
 };
 
+#[derive(Debug)]
+pub(crate) enum DiffError {
+    Inference(String),
+    Unsupported(String),
+}
+
+impl std::fmt::Display for DiffError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Inference(message) | Self::Unsupported(message)) = self;
+        formatter.write_str(message)
+    }
+}
+
+impl From<String> for DiffError {
+    fn from(message: String) -> Self {
+        Self::Inference(message)
+    }
+}
+
 /// Compare two canonical documents and produce a diff.
-pub fn diff_documents(base: &CanonDoc, target: &CanonDoc) -> Result<DocumentDiff, String> {
+pub fn diff_documents(base: &CanonDoc, target: &CanonDoc) -> Result<DocumentDiff, DiffError> {
     let base_elements = extract_diffable_elements(&base.blocks);
     let target_elements = extract_diffable_elements(&target.blocks);
 
     let alignments = align_elements(&base_elements, &target_elements);
     let mut changes = compute_changes(&alignments, &base_elements, &target_elements)?;
+
+    reconcile_terminal_paragraph_boundary(&mut changes, &base.blocks, &target.blocks)?;
 
     // Detect moves: annotate BlockDeleted/BlockInserted pairs with matching text.
     detect_moves_in_changes(&mut changes);
@@ -280,6 +417,7 @@ pub fn diff_documents(base: &CanonDoc, target: &CanonDoc) -> Result<DocumentDiff
         &base_elements,
         &target_elements,
     ));
+    order_body_insertions_by_target(&mut changes, &target.blocks);
 
     // Diff stories (headers, footers, footnotes, endnotes, comments)
     let (base_header_slots, base_footer_slots) = collect_story_slot_maps(base);
@@ -305,6 +443,166 @@ pub fn diff_documents(base: &CanonDoc, target: &CanonDoc) -> Result<DocumentDiff
         target_fingerprint: target.meta.docx_fingerprint.clone(),
         changes,
     })
+}
+
+/// Keep the existing document-final paragraph boundary when both readings
+/// replace it.
+///
+/// A DOCX body has one required final paragraph mark. When the comparison plan
+/// independently deletes the source-final paragraph and inserts the
+/// target-final paragraph, minting both block carriers forces the final-mark
+/// normalizer to rotate that required mark between them. Native Word can then
+/// retain the emptied source paragraph on Accept even though the in-memory
+/// projection drops it.
+///
+/// Reuse the source-final physical paragraph for the target-final paragraph.
+/// This is boundary lineage only: every source inline remains a deletion and
+/// every target inline remains an insertion, so the rule does not manufacture
+/// content lineage. It is deliberately keyed to the two terminal block
+/// operations, not to a complete-document-replacement presentation.
+fn reconcile_terminal_paragraph_boundary(
+    changes: &mut Vec<DiffChange>,
+    base: &[TrackedBlock],
+    target: &[TrackedBlock],
+) -> Result<(), DiffError> {
+    let Some(base_pivot) = base.last() else {
+        return Ok(());
+    };
+    let Some(target_pivot) = target.last() else {
+        return Ok(());
+    };
+    let (BlockNode::Paragraph(base_paragraph), BlockNode::Paragraph(target_paragraph)) =
+        (&base_pivot.block, &target_pivot.block)
+    else {
+        return Ok(());
+    };
+    let base_inlines = block_inlines(&base_pivot.block);
+    let target_inlines = block_inlines(&target_pivot.block);
+    if target_inlines.is_empty() {
+        return Ok(());
+    }
+
+    let deleted_idx = changes.iter().position(|change| {
+        matches!(
+            change,
+            DiffChange::BlockDeleted {
+                block_id,
+                move_id: None,
+                ..
+            } if block_id == &base_paragraph.id
+        )
+    });
+    let inserted_idx = changes.iter().position(|change| {
+        matches!(
+            change,
+            DiffChange::BlockInserted {
+                block: BlockNode::Paragraph(paragraph),
+                move_id: None,
+                ..
+            } if paragraph.id == target_paragraph.id
+        )
+    });
+    let (Some(deleted_idx), Some(inserted_idx)) = (deleted_idx, inserted_idx) else {
+        return Ok(());
+    };
+
+    let contains_hyperlink = |inlines: &[InlineNode]| {
+        inlines.iter().any(|inline| {
+            matches!(
+                inline,
+                InlineNode::OpaqueInline(opaque)
+                    if matches!(opaque.kind, OpaqueKind::Hyperlink(_))
+            )
+        })
+    };
+    if extract_inline_text(&base_inlines).is_empty()
+        && contains_hyperlink(&target_inlines)
+        && !contains_hyperlink(&base_inlines)
+    {
+        // A target-only hyperlink envelope has no tracked presence carrier at
+        // an otherwise empty required document-final boundary. Reusing that
+        // paragraph lets Word Reject strand an empty `<w:hyperlink>` after
+        // removing its runs; keeping independent paragraphs makes Word Accept
+        // discard the hyperlink with the paragraph-boundary resolution. A
+        // content-bearing source paragraph has a separately witnessed carrier:
+        // its deleted content preserves the physical paragraph through Reject.
+        return Err(DiffError::Unsupported(
+            "a target-only hyperlink in a replaced document-final paragraph has no qualified native Word carrier"
+                .to_string(),
+        ));
+    }
+
+    let mut inline_changes = diff_block_content_with_marks(&[], &target_inlines);
+    inline_changes.extend(diff_block_content_with_marks(&base_inlines, &[]));
+    let pivot = DiffChange::BlockModified {
+        block_id: base_paragraph.id.clone(),
+        old_text: extract_inline_text(&base_inlines),
+        new_text: extract_inline_text(&target_inlines),
+        inline_changes,
+        old_block: base_pivot.block.clone(),
+        new_block: target_pivot.block.clone(),
+        para_split: false,
+    };
+
+    let insertion_idx = deleted_idx.min(inserted_idx);
+    let high = deleted_idx.max(inserted_idx);
+    let low = deleted_idx.min(inserted_idx);
+    changes.remove(high);
+    changes.remove(low);
+
+    changes.insert(insertion_idx, pivot);
+    Ok(())
+}
+
+/// Keep every body insertion in target document order.
+///
+/// Diffable insertions are produced by alignment, while opaque insertions are
+/// discovered in a separate pass. The merge model deliberately uses change
+/// order to order insertions that share the same surviving base anchor. Without
+/// this join step, an opaque target block discovered last moves behind all
+/// ordinary target insertions with that anchor (most visibly during a complete
+/// body replacement).
+fn order_body_insertions_by_target(changes: &mut [DiffChange], target: &[TrackedBlock]) {
+    let target_rank: HashMap<&NodeId, usize> = target
+        .iter()
+        .enumerate()
+        .map(|(index, tracked)| {
+            let id = match &tracked.block {
+                BlockNode::Paragraph(paragraph) => &paragraph.id,
+                BlockNode::Table(table) => &table.id,
+                BlockNode::OpaqueBlock(opaque) => &opaque.id,
+            };
+            (id, index)
+        })
+        .collect();
+    let insertion_slots: Vec<usize> = changes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, change)| {
+            matches!(change, DiffChange::BlockInserted { .. }).then_some(index)
+        })
+        .collect();
+    let mut insertions: Vec<DiffChange> = insertion_slots
+        .iter()
+        .map(|index| changes[*index].clone())
+        .collect();
+    insertions.sort_by_key(|change| {
+        let DiffChange::BlockInserted { block, .. } = change else {
+            unreachable!("insertion list contains only BlockInserted changes")
+        };
+        let id = match block {
+            BlockNode::Paragraph(paragraph) => &paragraph.id,
+            BlockNode::Table(table) => &table.id,
+            BlockNode::OpaqueBlock(opaque) => &opaque.id,
+        };
+        target_rank
+            .get(id)
+            .copied()
+            .expect("body insertion must reference a target block")
+    });
+    for (slot, insertion) in insertion_slots.into_iter().zip(insertions) {
+        changes[slot] = insertion;
+    }
 }
 
 /// Reclassify math-only paragraph replacement pairs from BlockDeleted+BlockInserted
@@ -707,41 +1005,16 @@ struct DiffableBlock {
 /// Returns `true` if any paragraph property (alignment, indent, spacing, numbering,
 /// style, layout flags, etc.) differs. Returns `false` for non-paragraph blocks.
 ///
-/// NOTE: This deliberately duplicates the comparison in `apply_block_modified`
-/// (`tracked_model.rs:834-867`). Per the style guide, duplication is preferred
-/// over premature abstraction across module boundaries. Keep both in sync.
+/// The pPr predicate is shared with materialization so discovery cannot omit a
+/// direct-provenance-only change that the lowerer would otherwise need.
 fn paragraph_properties_differ(base: &BlockNode, target: &BlockNode) -> bool {
     let (base_p, target_p) = match (base, target) {
         (BlockNode::Paragraph(b), BlockNode::Paragraph(t)) => (b, t),
         _ => return false,
     };
 
-    base_p.align != target_p.align
-        || base_p.indent != target_p.indent
-        || base_p.spacing != target_p.spacing
-        || !crate::domain::numbering_structurally_eq(&base_p.numbering, &target_p.numbering)
-        || base_p.style_id != target_p.style_id
-        || base_p.keep_next != target_p.keep_next
-        || base_p.keep_lines != target_p.keep_lines
-        || base_p.page_break_before != target_p.page_break_before
-        || base_p.widow_control != target_p.widow_control
-        || base_p.contextual_spacing != target_p.contextual_spacing
-        || base_p.shading != target_p.shading
-        || base_p.borders != target_p.borders
-        || base_p.tab_stops != target_p.tab_stops
-        || base_p.text_direction != target_p.text_direction
-        || base_p.text_alignment != target_p.text_alignment
-        || base_p.mirror_indents != target_p.mirror_indents
-        || base_p.auto_space_de != target_p.auto_space_de
-        || base_p.auto_space_dn != target_p.auto_space_dn
-        || base_p.bidi != target_p.bidi
-        || base_p.suppress_auto_hyphens != target_p.suppress_auto_hyphens
-        || base_p.snap_to_grid != target_p.snap_to_grid
-        || base_p.overflow_punct != target_p.overflow_punct
-        || base_p.adjust_right_ind != target_p.adjust_right_ind
-        || base_p.word_wrap != target_p.word_wrap
-        || base_p.frame_pr != target_p.frame_pr
-        || base_p.section_properties != target_p.section_properties
+    !crate::domain::paragraph_property_state_eq(base_p, target_p)
+        || !crate::domain::paragraph_mark_property_state_eq(base_p, target_p)
         || base_p.literal_prefix != target_p.literal_prefix
 }
 
@@ -1083,24 +1356,40 @@ fn diff_opaque_blocks(
     base_elements: &[DiffableElement],
     target_elements: &[DiffableElement],
 ) -> Vec<DiffChange> {
-    use std::collections::HashSet;
+    // Merge temporarily prefixes target-scaffold anchors so serialization knows
+    // which package supplied an inserted opaque. That provenance distinction is
+    // not a document-position distinction: after Accept, target_body_index:N is
+    // terminally the same position as the target's body_index:N.
+    fn terminal_anchor(anchor: &str) -> &str {
+        anchor.strip_prefix("target_").unwrap_or(anchor)
+    }
 
-    // Collect opaque_refs from each side
-    let base_opaque_refs: HashSet<&str> = base_blocks
-        .iter()
-        .filter_map(|b| match &b.block {
-            BlockNode::OpaqueBlock(o) => Some(o.opaque_ref.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Opaque identity and body placement form a multiset, not a set: two
+    // byte-identical opaque blocks are two document blocks, and moving one is
+    // a structural change even though its bytes are unchanged. Match one
+    // occurrence from each side and emit changes for surplus occurrences
+    // instead of silently collapsing duplicates.
+    let mut base_opaque_counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for key in base_blocks.iter().filter_map(|b| match &b.block {
+        BlockNode::OpaqueBlock(o) => Some((
+            o.opaque_ref.as_str(),
+            terminal_anchor(o.proof_ref.docx_anchor.as_str()),
+        )),
+        _ => None,
+    }) {
+        *base_opaque_counts.entry(key).or_default() += 1;
+    }
 
-    let target_opaque_refs: HashSet<&str> = target_blocks
-        .iter()
-        .filter_map(|b| match &b.block {
-            BlockNode::OpaqueBlock(o) => Some(o.opaque_ref.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut target_opaque_counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for key in target_blocks.iter().filter_map(|b| match &b.block {
+        BlockNode::OpaqueBlock(o) => Some((
+            o.opaque_ref.as_str(),
+            terminal_anchor(o.proof_ref.docx_anchor.as_str()),
+        )),
+        _ => None,
+    }) {
+        *target_opaque_counts.entry(key).or_default() += 1;
+    }
 
     // Build a mapping from target diffable-element ID to base ID (for after_block_id).
     let mut target_id_to_base_id: std::collections::HashMap<&NodeId, &NodeId> =
@@ -1126,11 +1415,22 @@ fn diff_opaque_blocks(
 
     let mut changes = Vec::new();
 
-    // OpaqueBlocks in base but not in target → BlockDeleted
+    // OpaqueBlocks in base without a corresponding target occurrence →
+    // BlockDeleted.
+    let mut unmatched_target_counts = target_opaque_counts;
     for tracked in base_blocks {
-        if let BlockNode::OpaqueBlock(o) = &tracked.block
-            && !target_opaque_refs.contains(o.opaque_ref.as_str())
-        {
+        let BlockNode::OpaqueBlock(o) = &tracked.block else {
+            continue;
+        };
+        let target_count = unmatched_target_counts
+            .entry((
+                o.opaque_ref.as_str(),
+                terminal_anchor(o.proof_ref.docx_anchor.as_str()),
+            ))
+            .or_default();
+        if *target_count > 0 {
+            *target_count -= 1;
+        } else {
             changes.push(DiffChange::BlockDeleted {
                 block_id: o.id.clone(),
                 old_text: String::new(),
@@ -1140,14 +1440,25 @@ fn diff_opaque_blocks(
         }
     }
 
-    // OpaqueBlocks in target but not in base → BlockInserted
+    // OpaqueBlocks in target without a corresponding base occurrence →
+    // BlockInserted.
     // Find after_block_id by scanning backward through target blocks
     // to find the nearest preceding non-opaque block, then mapping
     // its target ID to its base ID.
+    let mut unmatched_base_counts = base_opaque_counts;
     for (i, tracked) in target_blocks.iter().enumerate() {
-        if let BlockNode::OpaqueBlock(o) = &tracked.block
-            && !base_opaque_refs.contains(o.opaque_ref.as_str())
-        {
+        let BlockNode::OpaqueBlock(o) = &tracked.block else {
+            continue;
+        };
+        let base_count = unmatched_base_counts
+            .entry((
+                o.opaque_ref.as_str(),
+                terminal_anchor(o.proof_ref.docx_anchor.as_str()),
+            ))
+            .or_default();
+        if *base_count > 0 {
+            *base_count -= 1;
+        } else {
             // Find the nearest preceding non-opaque block in the target
             let after_block_id = (0..i).rev().find_map(|j| {
                 let prev_id = match &target_blocks[j].block {
@@ -1161,10 +1472,11 @@ fn diff_opaque_blocks(
                 })
             });
 
-            // The OpaqueBlock's proof_ref references a position in the
-            // target document's XML (e.g. "body_index:5"). Tag it as
-            // target-origin so the serializer knows to skip it (OOXML
-            // doesn't support block-level insertion tracking for SDTs).
+            // The OpaqueBlock's proof_ref references a position in the target
+            // document's XML (e.g. "body_index:5"). Preserve that provenance
+            // explicitly so the serializer reads the target scaffold. Body
+            // SDTs have a tracked inner-content representation; unsupported
+            // target-origin opaque kinds are refused at serialization.
             let mut block = tracked.block.clone();
             if let BlockNode::OpaqueBlock(ref mut opaque) = block
                 && let Some(idx) = opaque.proof_ref.docx_anchor.strip_prefix("body_index:")
@@ -1282,6 +1594,9 @@ pub(crate) fn compute_table_diff_result(
         .map(|a| match a {
             RowAlignment::Matched { old_row, new_row } => {
                 TableRowAlignment::Matched { old_row, new_row }
+            }
+            RowAlignment::Replacement { old_row, new_row } => {
+                TableRowAlignment::Replacement { old_row, new_row }
             }
             RowAlignment::Deleted { old_row } => TableRowAlignment::Deleted { old_row },
             RowAlignment::Inserted { new_row } => TableRowAlignment::Inserted { new_row },
@@ -1788,84 +2103,26 @@ fn extract_drawing_fallback_text(raw_xml: &[u8]) -> Option<String> {
 
 /// Compare drawing metadata between matched base and target inlines.
 /// Returns the list of metadata properties that differ.
-fn compare_drawing_metadata(
-    base_inlines: &[InlineNode],
-    target_inlines: &[InlineNode],
-) -> Vec<ImageMetadataChange> {
-    let base_drawings: Vec<&OpaqueInlineNode> = base_inlines
-        .iter()
-        .filter_map(|i| match i {
-            InlineNode::OpaqueInline(o) if matches!(o.kind, OpaqueKind::Drawing) => {
-                Some(o.as_ref())
-            }
-            _ => None,
-        })
-        .collect();
-    let target_drawings: Vec<&OpaqueInlineNode> = target_inlines
-        .iter()
-        .filter_map(|i| match i {
-            InlineNode::OpaqueInline(o) if matches!(o.kind, OpaqueKind::Drawing) => {
-                Some(o.as_ref())
-            }
-            _ => None,
-        })
-        .collect();
-
-    let mut changes = Vec::new();
-
-    for (base_d, target_d) in base_drawings.iter().zip(target_drawings.iter()) {
-        let base_raw = base_d.raw_xml.as_deref().unwrap_or(&[]);
-        let target_raw = target_d.raw_xml.as_deref().unwrap_or(&[]);
-        let base_meta = parse_drawing_metadata(base_raw);
-        let target_meta = parse_drawing_metadata(target_raw);
-
-        if (base_meta.extent_cx != target_meta.extent_cx
-            || base_meta.extent_cy != target_meta.extent_cy)
-            && !changes.contains(&ImageMetadataChange::Size)
-        {
-            changes.push(ImageMetadataChange::Size);
-        }
-        if base_meta.src_rect != target_meta.src_rect
-            && !changes.contains(&ImageMetadataChange::Cropping)
-        {
-            changes.push(ImageMetadataChange::Cropping);
-        }
-        if base_meta.alt_text != target_meta.alt_text
-            && !changes.contains(&ImageMetadataChange::AltText)
-        {
-            changes.push(ImageMetadataChange::AltText);
-        }
-    }
-
-    changes
-}
-
-/// Placeholder for an opaque inline in diff text.
-///
-/// Returns U+FFFC (barrier character) for all opaque kinds to match the
-/// coordinate space used by `ParagraphView::block_text()` during step application.
-/// This ensures that step ranges computed from diff text are valid when applied
-/// to the actual paragraph.
 fn opaque_placeholder(_opaque: &OpaqueInlineNode) -> String {
     "\u{FFFC}".to_string()
 }
 
 /// Tagged placeholder for opaque inlines in the inline diff path.
-/// Embeds a truncated content hash so the diff algorithm can distinguish
-/// different opaques (e.g., footnote ref 1 vs footnote ref 2).
+/// Embeds a truncated semantic-identity hash so the diff algorithm can
+/// distinguish different opaques (e.g., footnote ref 1 vs footnote ref 2).
 fn opaque_diff_tag(opaque: &OpaqueInlineNode) -> String {
-    let hash_str = match &opaque.content_hash {
-        Some(h) => h[..h.len().min(OPAQUE_HASH_LEN)].to_string(),
-        None => {
-            // Hyperlinks (and any future kinds) without content_hash:
-            // hash the semantic identity of the kind, excluding transport
-            // details like r:id that differ between documents.
-            let identity = opaque_semantic_identity(&opaque.kind);
-            let digest = sha256_hex(identity.as_bytes());
-            digest[..OPAQUE_HASH_LEN].to_string()
-        }
-    };
+    let identity_hash = opaque_identity_hash(opaque);
+    let hash_str = identity_hash[..identity_hash.len().min(OPAQUE_HASH_LEN)].to_string();
     format!("\u{FFFC}{hash_str}")
+}
+
+fn opaque_identity_hash(opaque: &OpaqueInlineNode) -> String {
+    opaque.content_hash.clone().unwrap_or_else(|| {
+        // Hyperlinks (and any future kinds) without content_hash: hash the
+        // semantic identity of the kind, excluding transport details like r:id
+        // that differ between documents.
+        sha256_hex(opaque_semantic_identity(&opaque.kind).as_bytes())
+    })
 }
 
 /// Compute a stable identity string for an opaque kind, excluding fields
@@ -1973,9 +2230,7 @@ fn extract_inline_text_with_opaque_hashes(inlines: &[InlineNode]) -> String {
             InlineNode::HardBreak(_) => out.push('\n'),
             InlineNode::OpaqueInline(o) => {
                 out.push_str(&opaque_placeholder(o));
-                if let Some(hash) = &o.content_hash {
-                    out.push_str(hash);
-                }
+                out.push_str(&opaque_identity_hash(o));
             }
             InlineNode::Decoration(_) => {}
             InlineNode::CommentRangeStart { .. }
@@ -2753,35 +3008,6 @@ fn compute_changes(
                         let para_props_differ =
                             paragraph_properties_differ(&base_block.block, &target_block.block);
 
-                        // When paragraph properties differ (style change tracked via
-                        // pPrChange), run-level mark differences that stem from style
-                        // inheritance are already covered by the paragraph property
-                        // change. Emitting them as rPrChange would double-track the
-                        // change and contaminate the base paragraph's runs with
-                        // target marks (e.g., Mark::Caps inherited from a new style).
-                        // Strip FormattingChange from Unchanged segments and preserve
-                        // base marks so apply_block_modified keeps the original runs.
-                        let inline_changes = if para_props_differ {
-                            inline_changes
-                                .into_iter()
-                                .map(|c| match c {
-                                    InlineChange::Unchanged {
-                                        text,
-                                        formatting_change: Some(fc),
-                                        ..
-                                    } => InlineChange::Unchanged {
-                                        text,
-                                        marks: fc.previous_marks,
-                                        style_props: fc.previous_style_props,
-                                        formatting_change: None,
-                                    },
-                                    other => other,
-                                })
-                                .collect()
-                        } else {
-                            inline_changes
-                        };
-
                         let has_formatting_diff = inline_changes.iter().any(|c| {
                             matches!(
                                 c,
@@ -2825,6 +3051,11 @@ fn compute_changes(
             } => {
                 match (&base[*base_idx], &target[*target_idx]) {
                     (DiffableElement::Block(base_block), DiffableElement::Block(target_block)) => {
+                        let base_inlines = block_inlines(&base_block.block);
+                        let target_inlines = block_inlines(&target_block.block);
+                        let inline_changes =
+                            diff_block_content_with_marks(&base_inlines, &target_inlines);
+
                         // Paragraph-level opaques (m:oMathPara) cannot be tracked
                         // inline — they must be direct children of <w:p>, never
                         // inside <w:del>/<w:ins>. When such a paragraph's content
@@ -2849,11 +3080,7 @@ fn compute_changes(
                                 move_id: None,
                             });
                         } else {
-                            // Block text was modified - use mark-preserving diff
-                            let base_inlines = block_inlines(&base_block.block);
-                            let target_inlines = block_inlines(&target_block.block);
-                            let inline_changes =
-                                diff_block_content_with_marks(&base_inlines, &target_inlines);
+                            // Block text was modified - use mark-preserving diff.
                             changes.push(DiffChange::BlockModified {
                                 block_id: base_block.id.clone(),
                                 old_text: base_block.text.clone(),
@@ -2953,23 +3180,175 @@ fn diff_table_pair(
     let has_row_changes = table_diff.row_alignment.iter().any(|a| {
         matches!(
             a,
-            TableRowAlignment::Inserted { .. } | TableRowAlignment::Deleted { .. }
+            TableRowAlignment::Inserted { .. }
+                | TableRowAlignment::Deleted { .. }
+                | TableRowAlignment::Replacement { .. }
         )
     });
 
     if has_row_changes {
-        Ok(vec![DiffChange::TableStructureChanged {
+        // Row insertion/deletion can coexist with matched rows only while the
+        // surviving row and cell shells are identical. gridSpan/vMerge, row
+        // properties, and SDT/preserved shells have no row-carrier previous
+        // state. Adopting their target values makes Accept look right but makes
+        // Reject permanently lose the source table topology. Escalate the
+        // entire table to the exact-region carrier instead.
+        let row_carrier_is_complete = base.table.formatting == target.table.formatting
+            && table_diff
+                .row_alignment
+                .iter()
+                .all(|alignment| match alignment {
+                    TableRowAlignment::Matched { old_row, new_row } => {
+                        row_shells_match_for_native_carrier(
+                            &base.table.rows[*old_row],
+                            &target.table.rows[*new_row],
+                        )
+                    }
+                    TableRowAlignment::Replacement { old_row, new_row } => {
+                        row_shells_match_for_native_carrier(
+                            &base.table.rows[*old_row],
+                            &target.table.rows[*new_row],
+                        ) && row_content_supports_unrelated_replacement(
+                            &base.table.rows[*old_row],
+                            &target.table.rows[*new_row],
+                        )
+                    }
+                    TableRowAlignment::Inserted { .. } | TableRowAlignment::Deleted { .. } => true,
+                });
+        return Ok(vec![DiffChange::TableStructureChanged {
             table_id: base.id.clone(),
             target_table_id: target.id.clone(),
             old_hash: base.structure_hash.clone(),
             new_hash: target.structure_hash.clone(),
             old_text: extract_table_text(&base.table),
             new_text: extract_table_text(&target.table),
-            table_diff: Some(Box::new(table_diff)),
-        }])
-    } else {
-        diff_matched_tables(base, target)
+            table_diff: row_carrier_is_complete.then(|| Box::new(table_diff)),
+        }]);
     }
+
+    // Per-cell revision carriers switch CellFormatting and inline content; they
+    // do not switch the owning tblPr, row properties, conditional-style flags,
+    // SDT shells, or preserved opaque property children. If any of that shell
+    // state differs, use the already-qualified exact-region replacement rather
+    // than emitting a partial table diff that cannot reach the target reading.
+    if !table_shells_match_for_cell_diff(&base.table, &target.table) {
+        return Ok(vec![DiffChange::TableStructureChanged {
+            table_id: base.id.clone(),
+            target_table_id: target.id.clone(),
+            old_hash: base.structure_hash.clone(),
+            new_hash: target.structure_hash.clone(),
+            old_text: extract_table_text(&base.table),
+            new_text: extract_table_text(&target.table),
+            table_diff: None,
+        }]);
+    }
+
+    diff_matched_tables(base, target)
+}
+
+fn table_shells_match_for_cell_diff(base: &TableNode, target: &TableNode) -> bool {
+    if base.formatting != target.formatting || base.rows.len() != target.rows.len() {
+        return false;
+    }
+
+    base.rows.iter().zip(&target.rows).all(|(base, target)| {
+        base.cells.len() == target.cells.len() && row_shells_match_for_native_carrier(base, target)
+    })
+}
+
+fn row_shells_match_for_native_carrier(
+    base: &crate::domain::TableRowNode,
+    target: &crate::domain::TableRowNode,
+) -> bool {
+    let row_properties_match = base.grid_before == target.grid_before
+        && base.grid_after == target.grid_after
+        && base.is_header == target.is_header
+        && base.height == target.height
+        && base.height_rule == target.height_rule
+        && base.cant_split == target.cant_split
+        && base.jc == target.jc
+        && base.w_before == target.w_before
+        && base.w_after == target.w_after
+        && base.cnf_style == target.cnf_style
+        && base.tbl_pr_ex == target.tbl_pr_ex
+        && base.cell_spacing == target.cell_spacing
+        && base.preserved == target.preserved;
+    row_properties_match
+        && base.cells.iter().zip(&target.cells).all(|(base, target)| {
+            base.grid_span == target.grid_span
+                && base.v_merge == target.v_merge
+                && base.row_sdt_wrapper == target.row_sdt_wrapper
+                && base.content_sdt_wraps == target.content_sdt_wraps
+                && base.cnf_style == target.cnf_style
+                && base.hide_mark == target.hide_mark
+                && base.preserved == target.preserved
+        })
+}
+
+/// The first qualified unrelated-row carrier is intentionally narrow: it
+/// shares only ordinary row/cell/paragraph shells. Opaque block payloads,
+/// nested tables, drawings, fields, comments, and decorations require their
+/// own carrier proof and therefore keep the existing exact-region refusal.
+fn bookmark_element(decoration: &DecorationNode) -> Option<xmltree::Element> {
+    let raw = decoration.raw_xml.as_deref()?;
+    xmltree::Element::parse(raw).ok()
+}
+
+fn paragraph_supports_unrelated_row_replacement(paragraph: &ParagraphNode) -> bool {
+    let go_back_ids: HashSet<String> = paragraph
+        .all_inlines()
+        .filter_map(|inline| {
+            let InlineNode::Decoration(decoration) = inline else {
+                return None;
+            };
+            if decoration.kind != DecorationType::Bookmark {
+                return None;
+            }
+            let element = bookmark_element(decoration)?;
+            (element.name == "bookmarkStart"
+                && element.get_attribute("name").map(String::as_str) == Some("_GoBack"))
+            .then(|| element.get_attribute("id").cloned())
+            .flatten()
+        })
+        .collect();
+
+    paragraph.all_inlines().all(|inline| match inline {
+        InlineNode::Text(_) | InlineNode::HardBreak(_) => true,
+        InlineNode::Decoration(decoration) if decoration.kind == DecorationType::ProofError => true,
+        InlineNode::Decoration(decoration) if decoration.kind == DecorationType::Bookmark => {
+            bookmark_element(decoration).is_some_and(|element| {
+                element
+                    .get_attribute("id")
+                    .is_some_and(|id| go_back_ids.contains(id))
+            })
+        }
+        _ => false,
+    })
+}
+
+fn cell_supports_unrelated_row_replacement(cell: &crate::domain::TableCellNode) -> bool {
+    !cell.blocks.is_empty()
+        && cell.blocks.iter().all(|block| {
+            let BlockNode::Paragraph(paragraph) = block else {
+                return false;
+            };
+            paragraph_supports_unrelated_row_replacement(paragraph)
+        })
+}
+
+fn row_content_supports_unrelated_replacement(
+    base: &crate::domain::TableRowNode,
+    target: &crate::domain::TableRowNode,
+) -> bool {
+    base.cells.len() == target.cells.len()
+        && base
+            .cells
+            .iter()
+            .all(cell_supports_unrelated_row_replacement)
+        && target
+            .cells
+            .iter()
+            .all(cell_supports_unrelated_row_replacement)
 }
 
 /// Diff matched tables with the same structure.
@@ -3085,8 +3464,11 @@ fn diff_matched_tables(
                         let target_text = extract_inline_text(&target_inlines);
 
                         if base_text != target_text {
-                            let inline_changes =
-                                diff_block_content_with_marks(&base_inlines, &target_inlines);
+                            let inline_changes = diff_block_content_resolving_opaques(
+                                &base_inlines,
+                                &target_inlines,
+                                &HashMap::new(),
+                            );
                             paragraph_changes.push(CellParagraphChange {
                                 block_index: block_idx,
                                 inline_changes,
@@ -3194,7 +3576,9 @@ pub fn diff_nested_tables(
     let has_row_changes = table_diff.row_alignment.iter().any(|a| {
         matches!(
             a,
-            TableRowAlignment::Inserted { .. } | TableRowAlignment::Deleted { .. }
+            TableRowAlignment::Inserted { .. }
+                | TableRowAlignment::Deleted { .. }
+                | TableRowAlignment::Replacement { .. }
         )
     });
 
@@ -3244,7 +3628,8 @@ pub fn diff_nested_tables(
 
 /// Diff inline content within a single block using token-level diffing.
 /// This version does not preserve marks (legacy, used for plain text).
-pub fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
+#[cfg(test)]
+fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
     let heuristics = DiffHeuristics::from_env();
     let old_tokens = tokenize(old_text);
     let new_tokens = tokenize(new_text);
@@ -3284,6 +3669,7 @@ pub fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
 struct CharFormatting {
     marks: Vec<Mark>,
     style_props: StyleProps,
+    rpr_authored: RunRprAuthored,
 }
 
 /// Extract text from inlines along with a per-character formatting mapping.
@@ -3304,6 +3690,7 @@ fn extract_text_with_marks(inlines: &[InlineNode]) -> (String, Vec<CharFormattin
                 let fmt = CharFormatting {
                     marks: t.marks.clone(),
                     style_props: t.style_props.clone(),
+                    rpr_authored: t.rpr_authored,
                 };
                 // Add formatting for each character in this text node
                 for _ in node_text.chars() {
@@ -3311,9 +3698,13 @@ fn extract_text_with_marks(inlines: &[InlineNode]) -> (String, Vec<CharFormattin
                 }
                 text.push_str(&node_text);
             }
-            InlineNode::HardBreak(_) => {
+            InlineNode::HardBreak(hard_break) => {
                 text.push('\n');
-                char_fmt.push(CharFormatting::default()); // No formatting for hard break
+                char_fmt.push(CharFormatting {
+                    marks: hard_break.wrapper_marks.clone(),
+                    style_props: hard_break.wrapper_style_props.clone(),
+                    rpr_authored: hard_break.wrapper_rpr_authored,
+                });
             }
             InlineNode::OpaqueInline(o) => {
                 let placeholder = opaque_placeholder(o);
@@ -3362,15 +3753,20 @@ fn extract_text_with_marks_and_opaques<'a>(
                 let fmt = CharFormatting {
                     marks: t.marks.clone(),
                     style_props: t.style_props.clone(),
+                    rpr_authored: t.rpr_authored,
                 };
                 for _ in node_text.chars() {
                     char_fmt.push(fmt.clone());
                 }
                 text.push_str(&node_text);
             }
-            InlineNode::HardBreak(_) => {
+            InlineNode::HardBreak(hard_break) => {
                 text.push('\n');
-                char_fmt.push(CharFormatting::default());
+                char_fmt.push(CharFormatting {
+                    marks: hard_break.wrapper_marks.clone(),
+                    style_props: hard_break.wrapper_style_props.clone(),
+                    rpr_authored: hard_break.wrapper_rpr_authored,
+                });
             }
             InlineNode::OpaqueInline(o) => {
                 opaques.push(OpaqueTracker {
@@ -3440,26 +3836,35 @@ fn detect_formatting_change(
     old_fmt: &CharFormatting,
     new_fmt: &CharFormatting,
 ) -> (Vec<Mark>, StyleProps, Option<FormattingChange>) {
-    let changed = old_fmt.marks != new_fmt.marks || old_fmt.style_props != new_fmt.style_props;
+    // TextNode formatting is RESOLVED through the style cascade. A paragraph
+    // style change can therefore change every run's effective formatting even
+    // though neither run authored a formatting edit. Such a change belongs to
+    // the paragraph/style carrier; synthesizing an rPrChange as well both
+    // invents direct authoring and can make native Word Reject hang.
+    //
+    // Compare the direct run states instead. This still detects a simultaneous
+    // direct run edit because its authored projection (or authored OFF state)
+    // differs independently of the inherited values.
+    let old_direct_marks = old_fmt.rpr_authored.direct_marks(&old_fmt.marks);
+    let new_direct_marks = new_fmt.rpr_authored.direct_marks(&new_fmt.marks);
+    let old_direct_props = old_fmt
+        .rpr_authored
+        .direct_style_props(&old_fmt.style_props);
+    let new_direct_props = new_fmt
+        .rpr_authored
+        .direct_style_props(&new_fmt.style_props);
+    let changed = old_direct_marks != new_direct_marks
+        || old_direct_props != new_direct_props
+        || old_fmt.rpr_authored.formatting_identity() != new_fmt.rpr_authored.formatting_identity();
     if changed {
         (
             new_fmt.marks.clone(),
             new_fmt.style_props.clone(),
             Some(FormattingChange {
+                carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                 previous_marks: old_fmt.marks.clone(),
                 previous_style_props: old_fmt.style_props.clone(),
-                // CharFormatting (this whole character-diff pipeline) never
-                // tracked per-property rPr authoring provenance — it only
-                // ever carried marks/style_props, so there is no "previous"
-                // authored-bitset to recover here. Defaulting to
-                // "nothing authored" is neutral, not a regression: this
-                // path had no such concept before `previous_rpr_authored`
-                // existed either. A reject of a formatting change SYNTHESIZED
-                // by document comparison (as opposed to authored through
-                // SetRunFormatting, which now captures this correctly) may
-                // therefore under-restore authored-vs-inherited state — a
-                // known, pre-existing gap, not something this fix widens.
-                previous_rpr_authored: RunRprAuthored::default(),
+                previous_rpr_authored: old_fmt.rpr_authored,
                 // Placeholder: merge_diff fills from RevisionInfo.
                 revision_id: 0,
                 identity: 0,
@@ -3584,12 +3989,10 @@ fn build_opaque_change(
 
 /// Diff inline content resolving opaque placeholders back to `InlineChange::Opaque`.
 ///
-/// This is the diff function used by `build_full_document_view`. Unlike
-/// `diff_block_content_with_marks_and_notes` (used by `compute_changes`), this
-/// function uses identity-bearing `\u{FFFC}` placeholders so the diff algorithm
-/// can distinguish different opaques, then resolves them back to proper
-/// `InlineChange::Opaque` segments.
-fn diff_block_content_resolving_opaques(
+/// Uses identity-bearing `\u{FFFC}` placeholders so comparison can distinguish
+/// different opaque nodes, then resolves them back to `InlineChange::Opaque`
+/// segments for native materialization.
+pub(crate) fn diff_block_content_resolving_opaques(
     old_inlines: &[InlineNode],
     new_inlines: &[InlineNode],
     note_markers: &HashMap<String, String>,
@@ -3724,12 +4127,15 @@ fn sort_opaque_runs_by_inline_index(mut changes: Vec<InlineChange>) -> Vec<Inlin
                     InlineChange::Opaque {
                         inline_index,
                         segment_type,
+                        kind,
                         ..
                     } => {
-                        let type_order = match segment_type {
-                            InlineChangeSegmentType::Equal => 0,
-                            InlineChangeSegmentType::Delete => 1,
-                            InlineChangeSegmentType::Insert => 2,
+                        let type_order = match (kind, segment_type) {
+                            (_, InlineChangeSegmentType::Equal) => 0,
+                            (OpaqueSegmentKind::Drawing, InlineChangeSegmentType::Insert) => 1,
+                            (OpaqueSegmentKind::Drawing, InlineChangeSegmentType::Delete) => 2,
+                            (_, InlineChangeSegmentType::Delete) => 1,
+                            (_, InlineChangeSegmentType::Insert) => 2,
                         };
                         (*inline_index, type_order)
                     }
@@ -3913,6 +4319,12 @@ fn merge_adjacent_same_type(changes: Vec<InlineChange>) -> Vec<InlineChange> {
 
         let should_merge = if let Some(last) = result.last() {
             !matches!(last, InlineChange::Opaque { .. })
+                // A hard break is a physical run carrier in Word. Keep every
+                // break independent so a formatting transition can receive a
+                // distinct rPrChange identity instead of being merged into a
+                // neighbouring text or break run.
+                && inline_change_text(last) != "\n"
+                && inline_change_text(&change) != "\n"
                 && std::mem::discriminant(last) == std::mem::discriminant(&change)
                 && inline_change_marks(last) == inline_change_marks(&change)
                 && match (last, &change) {
@@ -4007,17 +4419,10 @@ fn find_strong_anchors_with_config(
                     // to appear twice (once deleted, once inserted) instead of once as
                     // Normal — which breaks accept/reject text parity.
                     || inline_change_text(c).contains('\u{FFFC}')))
-                // Equal opaques (unchanged fldSimple, hyperlink, etc.) must never be
-                // collapsed into adjacent del/ins regions — collapse_region destroys
-                // their position information by merging the placeholder text into both
-                // the del and ins sides.
-                || matches!(
-                    c,
-                    InlineChange::Opaque {
-                        segment_type: InlineChangeSegmentType::Equal,
-                        ..
-                    }
-                )
+                // Opaques are structural barriers regardless of change type.
+                // collapse_region converts them to fallback display text, which loses
+                // the identity and position required to merge the actual package node.
+                || matches!(c, InlineChange::Opaque { .. })
             {
                 Some(i)
             } else {
@@ -4466,9 +4871,25 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
                 text,
                 marks,
                 style_props,
-                ..
+                formatting_change,
             } => {
-                push_seg(&mut del_segs, text, marks, style_props);
+                // A collapsed replacement duplicates unchanged text into both
+                // terminal arms. When that text also carries a formatting
+                // revision, the deleted/source arm must use the previous
+                // properties while the inserted/target arm uses the current
+                // properties. Copying the current properties into both arms
+                // makes native Word Reject restore source text with target
+                // formatting.
+                if let Some(change) = formatting_change {
+                    push_seg(
+                        &mut del_segs,
+                        text,
+                        &change.previous_marks,
+                        &change.previous_style_props,
+                    );
+                } else {
+                    push_seg(&mut del_segs, text, marks, style_props);
+                }
                 push_seg(&mut ins_segs, text, marks, style_props);
             }
             InlineChange::Deleted {
@@ -4980,7 +5401,11 @@ fn pair_story_indices_by_hash_and_similarity(
 }
 
 /// Diff footnotes between base and target documents.
-/// Footnotes are matched by content_hash similarity, not by ID (which can change).
+///
+/// A note id is the package-local identity referenced by the main story. Text
+/// similarity is not evidence that two independently addressed notes are the
+/// same note, so only equal ids can form a modified-note relation. Remaining
+/// notes are explicit deletions and insertions.
 /// Separator/continuation notes are excluded from diffing.
 fn diff_footnotes(
     base: &[FootnoteStory],
@@ -5129,10 +5554,10 @@ impl NoteStory for CommentStory {
 
 /// Generic diffing for note-like stories.
 ///
-/// Matching strategy (in order):
-/// 1. Exact content hash matches (unchanged notes)
-/// 2. Exact note ID matches for remaining notes (stable identity)
-/// 3. High-similarity fallback for remaining unmatched notes
+/// Identity is deliberately exact: the story id is the reference key used by
+/// the owning package. Comments that have independently proved cross-package
+/// identity are remapped before this function. A content hash or similarity
+/// score alone must never create semantic lineage between two note stories.
 fn diff_notes_generic<T: NoteStory>(
     base: &[&T],
     target: &[&T],
@@ -5173,61 +5598,6 @@ fn diff_notes_generic<T: NoteStory>(
                     block_changes,
                 ));
             }
-            matched_base[base_idx] = true;
-            matched_target[target_idx] = true;
-        }
-    }
-
-    // Pass 2: exact content-hash matches for remaining (renumbered) notes.
-    for (base_idx, base_note) in base.iter().enumerate() {
-        if matched_base[base_idx] {
-            continue;
-        }
-        let mut matched_idx = None;
-        for (target_idx, target_note) in target.iter().enumerate() {
-            if matched_target[target_idx] {
-                continue;
-            }
-            if base_note.content_hash() == target_note.content_hash() {
-                matched_idx = Some(target_idx);
-                break;
-            }
-        }
-        if let Some(target_idx) = matched_idx {
-            matched_base[base_idx] = true;
-            matched_target[target_idx] = true;
-        }
-    }
-
-    // Pass 3: high-similarity fallback for remaining unmatched notes.
-    for (base_idx, base_note) in base.iter().enumerate() {
-        if matched_base[base_idx] {
-            continue;
-        }
-        let base_text = extract_blocks_text(base_note.blocks());
-        let mut best_match: Option<(usize, f64)> = None;
-
-        for (target_idx, target_note) in target.iter().enumerate() {
-            if matched_target[target_idx] {
-                continue;
-            }
-            let target_text = extract_blocks_text(target_note.blocks());
-            let sim = text_similarity(&base_text, &target_text);
-            if sim > STRONG_MATCH_THRESHOLD && best_match.is_none_or(|(_, best_sim)| sim > best_sim)
-            {
-                best_match = Some((target_idx, sim));
-            }
-        }
-
-        if let Some((target_idx, _)) = best_match {
-            let target_note = target[target_idx];
-            let block_changes = diff_story_blocks(base_note.blocks(), target_note.blocks())?;
-            changes.push(make_modified(
-                base_note.id().to_string(),
-                base_note.content_hash().to_string(),
-                target_note.content_hash().to_string(),
-                block_changes,
-            ));
             matched_base[base_idx] = true;
             matched_target[target_idx] = true;
         }
@@ -5584,10 +5954,6 @@ fn block_metadata(block: &BlockNode) -> (BlockType, Option<u8>, Option<IStr>) {
 ///
 /// Public so the diff response can include content types for downstream consumers
 /// (e.g. atom assignment needs to distinguish empty paragraphs from equation-only ones).
-pub fn content_types_from_block(block: &BlockNode) -> Vec<String> {
-    compute_content_types(&block_inlines(block))
-}
-
 fn compute_content_types(inlines: &[InlineNode]) -> Vec<String> {
     let mut types = Vec::new();
     for inline in inlines {
@@ -5733,284 +6099,6 @@ fn build_note_marker_lookup(doc: &CanonDoc) -> HashMap<String, String> {
         markers.insert(format!("cm:{}", comment.id), comment.id.clone());
     }
     markers
-}
-
-/// Build the full document view — every block in document order with inline diff segments.
-///
-/// For unchanged blocks: all segments are Unchanged (one per formatting run).
-/// For modified blocks: segments come from inline diff.
-/// For inserted blocks: all segments are Inserted.
-/// For deleted blocks: all segments are Deleted.
-/// Compare two documents and produce both a diff (changes) and the full document view
-/// from a single alignment computation. This guarantees that block IDs are consistent
-/// between the two outputs, and avoids duplicate parsing + alignment work.
-pub fn diff_and_full_document(
-    base: &CanonDoc,
-    target: &CanonDoc,
-    base_image_lookup: &HashMap<String, String>,
-    target_image_lookup: &HashMap<String, String>,
-) -> Result<(DocumentDiff, Vec<FullDocBlock>), String> {
-    // The diff half MUST be identical to the canonical `diff_documents` path:
-    // the production redline path (`compare_and_redline` → here → `merge_diff`)
-    // consumes it. Building `changes` separately previously skipped
-    // `reconcile_paragraph_splits`, `reconcile_math_deleted_inserted_replacements`,
-    // and `diff_opaque_blocks` — so paragraph splits, math delete/insert
-    // replacements, and opaque block adds/removes merged wrong (P0 #5). Delegate
-    // to the one implementation instead of maintaining a second copy.
-    let diff = diff_documents(base, target)?;
-
-    // The full-document blocks (for /full_document) are built independently from
-    // the alignment, not from `changes`, so they need their own element/alignment
-    // computation.
-    let base_elements = extract_diffable_elements(&base.blocks);
-    let target_elements = extract_diffable_elements(&target.blocks);
-    let alignments = align_elements(&base_elements, &target_elements);
-    let blocks = build_full_doc_blocks(
-        base,
-        target,
-        &base_elements,
-        &target_elements,
-        &alignments,
-        base_image_lookup,
-        target_image_lookup,
-    )?;
-
-    Ok((diff, blocks))
-}
-
-pub fn build_full_document_view(
-    base: &CanonDoc,
-    target: &CanonDoc,
-    base_image_lookup: &HashMap<String, String>,
-    target_image_lookup: &HashMap<String, String>,
-) -> Result<Vec<FullDocBlock>, String> {
-    let base_elements = extract_diffable_elements(&base.blocks);
-    let target_elements = extract_diffable_elements(&target.blocks);
-    let alignments = align_elements(&base_elements, &target_elements);
-    build_full_doc_blocks(
-        base,
-        target,
-        &base_elements,
-        &target_elements,
-        &alignments,
-        base_image_lookup,
-        target_image_lookup,
-    )
-}
-
-/// Project a single document into the full-document block format.
-///
-/// Unlike `build_full_document_view` (which diffs two documents), this projects
-/// one canonical document directly. Every block is `Unchanged`, every segment is
-/// `equal`, and block IDs are the canonical IDs. This is the editing-ready
-/// projection path for viewing/editing a single document without comparison.
-pub fn project_single_document(
-    doc: &CanonDoc,
-    image_lookup: &HashMap<String, String>,
-) -> Vec<FullDocBlock> {
-    let note_markers = build_note_marker_lookup(doc);
-    let mut blocks = Vec::new();
-
-    for tracked_block in &doc.blocks {
-        match &tracked_block.block {
-            BlockNode::Paragraph(p) => {
-                let (block_type, heading_level, style_id) = block_metadata(&tracked_block.block);
-                let align = block_align(&tracked_block.block);
-                let indent = block_indent(&tracked_block.block);
-                let spacing = block_spacing(&tracked_block.block);
-                let borders = block_borders(&tracked_block.block);
-                let tab_stops = block_tab_stops(&tracked_block.block);
-                let (numbering_text, numbering_ilvl, _, numbering_num_id) =
-                    block_numbering(&tracked_block.block);
-                let inlines = block_inlines(&tracked_block.block);
-                let mut segments = inlines_to_segments(&inlines, "equal", &note_markers);
-                enrich_segments_with_assets(&mut segments, &inlines, image_lookup);
-                let content_types = compute_content_types(&inlines);
-                let equation_xmls = extract_equation_xmls(&inlines);
-                let image_data_uris = extract_image_data_uris(&inlines, image_lookup);
-                blocks.push(FullDocBlock {
-                    block_id: p.id.clone(),
-                    doc1_block_id: None,
-                    doc2_block_id: Some(p.id.clone()),
-                    block_type,
-                    heading_level,
-                    style_id,
-                    change_type: ChangeType::Unchanged,
-                    align,
-                    indent,
-                    spacing,
-                    borders,
-                    tab_stops,
-                    numbering_text,
-                    numbering_ilvl,
-                    numbering_num_id,
-                    segments,
-                    table_diff: None,
-                    content_types,
-                    equation_xmls,
-                    equation_doc1_count: 0,
-                    image_data_uris,
-                    image_doc1_count: 0,
-                    image_metadata_changes: vec![],
-                    move_id: None,
-                    move_direction: None,
-                    structural_change: None,
-                    border_group_id: None,
-                    paragraph_mark_status: None,
-                });
-            }
-            BlockNode::Table(t) => {
-                let text = extract_table_text(t);
-                let segments = vec![InlineChange::Unchanged {
-                    text,
-                    marks: vec![],
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                }];
-                blocks.push(FullDocBlock {
-                    block_id: t.id.clone(),
-                    doc1_block_id: None,
-                    doc2_block_id: Some(t.id.clone()),
-                    block_type: BlockType::Table,
-                    heading_level: None,
-                    style_id: None,
-                    change_type: ChangeType::Unchanged,
-                    align: None,
-                    indent: None,
-                    spacing: None,
-                    borders: None,
-                    tab_stops: vec![],
-                    numbering_text: None,
-                    numbering_ilvl: None,
-                    numbering_num_id: None,
-                    segments,
-                    table_diff: Some(project_self_table_diff(t)),
-                    content_types: vec!["table".to_string()],
-                    equation_xmls: vec![],
-                    equation_doc1_count: 0,
-                    image_data_uris: vec![],
-                    image_doc1_count: 0,
-                    image_metadata_changes: vec![],
-                    move_id: None,
-                    move_direction: None,
-                    structural_change: None,
-                    border_group_id: None,
-                    paragraph_mark_status: None,
-                });
-            }
-            BlockNode::OpaqueBlock(_) => {
-                // Opaque blocks are not projected as visible blocks.
-            }
-        }
-    }
-
-    assign_border_groups(&mut blocks);
-    blocks
-}
-
-/// Resolve the body section's header references (§17.10.2) into projected
-/// payloads, in section-declaration order.
-///
-/// Each `w:headerReference` binds a story by part name (`StoryRef::part_path`)
-/// with a `w:type` (`StoryRef::kind`). We match the ref to the header story it
-/// names and project that story's blocks to inline segments via the SAME path
-/// footnotes/endnotes use — preserving tabs, marks, and fields. A ref whose
-/// part is missing is skipped (the engine carries refs and stories
-/// independently; a dangling ref has no content to show). When the body section
-/// is absent we project nothing: with no section there is no header binding.
-pub(crate) fn project_section_headers(doc: &CanonDoc) -> Vec<HeaderFooterPayload> {
-    let Some(section) = doc.body_section_properties.as_ref() else {
-        return Vec::new();
-    };
-    section
-        .header_refs
-        .iter()
-        .filter_map(|story_ref| {
-            doc.headers
-                .iter()
-                .find(|h| h.part_name == story_ref.part_path)
-                .map(|h| HeaderFooterPayload {
-                    kind: story_ref.kind.to_xml_str().to_string(),
-                    paragraphs: crate::import::story_blocks_to_paragraphs(&h.blocks),
-                })
-        })
-        .collect()
-}
-
-/// Resolve the body section's footer references (§17.10.5) into projected
-/// payloads. Same shape and semantics as [`project_section_headers`].
-pub(crate) fn project_section_footers(doc: &CanonDoc) -> Vec<HeaderFooterPayload> {
-    let Some(section) = doc.body_section_properties.as_ref() else {
-        return Vec::new();
-    };
-    section
-        .footer_refs
-        .iter()
-        .filter_map(|story_ref| {
-            doc.footers
-                .iter()
-                .find(|f| f.part_name == story_ref.part_path)
-                .map(|f| HeaderFooterPayload {
-                    kind: story_ref.kind.to_xml_str().to_string(),
-                    paragraphs: crate::import::story_blocks_to_paragraphs(&f.blocks),
-                })
-        })
-        .collect()
-}
-
-/// Build a single-document `FullDocViewResult` including stories.
-pub fn build_single_document_view(
-    doc: &CanonDoc,
-    image_lookup: &HashMap<String, String>,
-) -> FullDocViewResult {
-    let blocks = project_single_document(doc, image_lookup);
-
-    let footnotes: Vec<StoryPayload> = doc
-        .footnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| StoryPayload {
-            id: n.id.clone(),
-            segments: story_blocks_to_segments(&n.blocks),
-        })
-        .collect();
-
-    let endnotes: Vec<StoryPayload> = doc
-        .endnotes
-        .iter()
-        .filter(|n| n.note_type == NoteType::Normal)
-        .map(|n| StoryPayload {
-            id: n.id.clone(),
-            segments: story_blocks_to_segments(&n.blocks),
-        })
-        .collect();
-
-    let comments: Vec<CommentPayload> = doc
-        .comments
-        .iter()
-        .map(|c| {
-            let (resolved, parent_para_id) =
-                crate::domain::comment_extended_state(c, &doc.comments_extended);
-            CommentPayload {
-                id: c.id.clone(),
-                author: c.author.clone(),
-                date: c.date.clone(),
-                segments: story_blocks_to_segments(&c.blocks),
-                resolved,
-                parent_para_id,
-            }
-        })
-        .collect();
-
-    FullDocViewResult {
-        blocks,
-        footnotes,
-        endnotes,
-        comments,
-        headers: project_section_headers(doc),
-        footers: project_section_footers(doc),
-        body_section_properties: doc.body_section_properties.clone(),
-    }
 }
 
 /// Project a document with pre-existing tracked changes into the full-document
@@ -6298,10 +6386,7 @@ pub fn project_tracked_document(
     blocks
 }
 
-/// Build a tracked-document `FullDocViewResult` including stories.
-///
-/// Parallel to `build_single_document_view` but preserves tracked change status
-/// in inline segments.
+/// Build the comparison-aware tracked-document view, including bound stories.
 pub fn build_tracked_document_view(
     doc: &CanonDoc,
     image_lookup: &HashMap<String, String>,
@@ -6356,620 +6441,46 @@ pub fn build_tracked_document_view(
     }
 }
 
-/// Build a `FullDocBlock` for a deleted paragraph from a `DiffableBlock`.
-/// All segments are marked as deleted. Used by the Deleted alignment arm
-/// and the Modified arm when split heuristics fire.
-fn build_deleted_paragraph_block(
-    b: &DiffableBlock,
-    base_image_lookup: &HashMap<String, String>,
-    note_markers: &HashMap<String, String>,
-) -> FullDocBlock {
-    let (block_type, heading_level, style_id) = block_metadata(&b.block);
-    let align = block_align(&b.block);
-    let indent = block_indent(&b.block);
-    let spacing = block_spacing(&b.block);
-    let borders = block_borders(&b.block);
-    let tab_stops = block_tab_stops(&b.block);
-    let (numbering_text, numbering_ilvl, _, numbering_num_id) = block_numbering(&b.block);
-    let inlines = block_inlines(&b.block);
-    let mut segments = inlines_to_segments(&inlines, "delete", note_markers);
-    enrich_segments_with_assets(&mut segments, &inlines, base_image_lookup);
-    let content_types = compute_content_types(&inlines);
-    let equation_xmls = extract_equation_xmls(&inlines);
-    let equation_doc1_count = equation_xmls.len();
-    let image_data_uris = extract_image_data_uris(&inlines, base_image_lookup);
-    let image_doc1_count = image_data_uris.len();
-    FullDocBlock {
-        block_id: projected_full_doc_block_id(ChangeType::Deleted, Some(&b.id), None),
-        doc1_block_id: Some(b.id.clone()),
-        doc2_block_id: None,
-        block_type,
-        heading_level,
-        style_id,
-        change_type: ChangeType::Deleted,
-        align,
-        indent,
-        spacing,
-        borders,
-        tab_stops,
-        numbering_text,
-        numbering_ilvl,
-        numbering_num_id,
-        segments,
-        table_diff: None,
-        content_types,
-        equation_xmls,
-        equation_doc1_count,
-        image_data_uris,
-        image_doc1_count,
-        image_metadata_changes: vec![],
-        move_id: None,
-        move_direction: None,
-        structural_change: None,
-        border_group_id: None,
-        paragraph_mark_status: None,
-    }
+/// Resolve the body section's header bindings into their projected stories.
+fn project_section_headers(doc: &CanonDoc) -> Vec<HeaderFooterPayload> {
+    let Some(section) = doc.body_section_properties.as_ref() else {
+        return Vec::new();
+    };
+
+    section
+        .header_refs
+        .iter()
+        .filter_map(|story_ref| {
+            doc.headers
+                .iter()
+                .find(|header| header.part_name == story_ref.part_path)
+                .map(|header| HeaderFooterPayload {
+                    kind: story_ref.kind.to_xml_str().to_string(),
+                    paragraphs: story_blocks_to_paragraphs(&header.blocks),
+                })
+        })
+        .collect()
 }
 
-/// Build a `FullDocBlock` for an inserted paragraph from a `DiffableBlock`.
-/// All segments are marked as inserted. Used by the Inserted alignment arm
-/// and the Modified arm when split heuristics fire.
-fn build_inserted_paragraph_block(
-    b: &DiffableBlock,
-    target_image_lookup: &HashMap<String, String>,
-    note_markers: &HashMap<String, String>,
-) -> FullDocBlock {
-    let (block_type, heading_level, style_id) = block_metadata(&b.block);
-    let align = block_align(&b.block);
-    let indent = block_indent(&b.block);
-    let spacing = block_spacing(&b.block);
-    let borders = block_borders(&b.block);
-    let tab_stops = block_tab_stops(&b.block);
-    let (numbering_text, numbering_ilvl, _, numbering_num_id) = block_numbering(&b.block);
-    let inlines = block_inlines(&b.block);
-    let mut segments = inlines_to_segments(&inlines, "insert", note_markers);
-    enrich_segments_with_assets(&mut segments, &inlines, target_image_lookup);
-    let content_types = compute_content_types(&inlines);
-    let equation_xmls = extract_equation_xmls(&inlines);
-    let image_data_uris = extract_image_data_uris(&inlines, target_image_lookup);
-    FullDocBlock {
-        block_id: projected_full_doc_block_id(ChangeType::Inserted, None, Some(&b.id)),
-        doc1_block_id: None,
-        doc2_block_id: Some(b.id.clone()),
-        block_type,
-        heading_level,
-        style_id,
-        change_type: ChangeType::Inserted,
-        align,
-        indent,
-        spacing,
-        borders,
-        tab_stops,
-        numbering_text,
-        numbering_ilvl,
-        numbering_num_id,
-        segments,
-        table_diff: None,
-        content_types,
-        equation_xmls,
-        equation_doc1_count: 0,
-        image_data_uris,
-        image_doc1_count: 0,
-        image_metadata_changes: vec![],
-        move_id: None,
-        move_direction: None,
-        structural_change: None,
-        border_group_id: None,
-        paragraph_mark_status: None,
-    }
-}
+/// Resolve the body section's footer bindings into their projected stories.
+fn project_section_footers(doc: &CanonDoc) -> Vec<HeaderFooterPayload> {
+    let Some(section) = doc.body_section_properties.as_ref() else {
+        return Vec::new();
+    };
 
-fn build_full_doc_blocks(
-    base: &CanonDoc,
-    target: &CanonDoc,
-    base_elements: &[DiffableElement],
-    target_elements: &[DiffableElement],
-    alignments: &[ElementAlignment],
-    base_image_lookup: &HashMap<String, String>,
-    target_image_lookup: &HashMap<String, String>,
-) -> Result<Vec<FullDocBlock>, String> {
-    // Build note marker lookups: merge base + target so both sides can resolve markers.
-    // Target takes precedence — it reflects the current document's ordinals.
-    let mut note_markers = build_note_marker_lookup(base);
-    for (k, v) in build_note_marker_lookup(target) {
-        note_markers.insert(k, v);
-    }
-
-    let mut result = Vec::new();
-
-    for alignment in alignments {
-        match alignment {
-            ElementAlignment::Matched {
-                base_idx,
-                target_idx,
-            } => {
-                let base_elem = &base_elements[*base_idx];
-                let target_elem = &target_elements[*target_idx];
-                match (base_elem, target_elem) {
-                    (DiffableElement::Block(base_b), DiffableElement::Block(target_b)) => {
-                        let (block_type, heading_level, style_id) = block_metadata(&target_b.block);
-                        let align = block_align(&target_b.block);
-                        let indent = block_indent(&target_b.block);
-                        let spacing = block_spacing(&target_b.block);
-                        let borders = block_borders(&target_b.block);
-                        let tab_stops = block_tab_stops(&target_b.block);
-                        let (numbering_text, numbering_ilvl, _, numbering_num_id) =
-                            block_numbering(&target_b.block);
-                        let base_inlines = block_inlines(&base_b.block);
-                        let inlines = block_inlines(&target_b.block);
-                        let mut segments = inlines_to_segments(&inlines, "equal", &note_markers);
-                        enrich_segments_with_assets(&mut segments, &inlines, target_image_lookup);
-                        let content_types = compute_content_types(&inlines);
-                        let equation_xmls = extract_equation_xmls(&inlines);
-                        let image_data_uris =
-                            extract_image_data_uris(&inlines, target_image_lookup);
-                        let image_metadata_changes =
-                            compare_drawing_metadata(&base_inlines, &inlines);
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                ChangeType::Unchanged,
-                                Some(&base_b.id),
-                                Some(&target_b.id),
-                            ),
-                            doc1_block_id: Some(base_b.id.clone()),
-                            doc2_block_id: Some(target_b.id.clone()),
-                            block_type,
-                            heading_level,
-                            style_id,
-                            change_type: ChangeType::Unchanged,
-                            align,
-                            indent,
-                            spacing,
-                            borders,
-                            tab_stops,
-                            numbering_text,
-                            numbering_ilvl,
-                            numbering_num_id,
-                            segments,
-                            table_diff: None,
-                            content_types,
-                            equation_xmls,
-                            equation_doc1_count: 0,
-                            image_data_uris,
-                            image_doc1_count: 0,
-                            image_metadata_changes,
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                    (DiffableElement::Table(base_t), DiffableElement::Table(target_t)) => {
-                        // Compute table_diff first — text_fingerprint alone misses
-                        // cell-level text and formatting differences that
-                        // compute_changes / diff_table_pair would detect. Without
-                        // this, build_full_doc_blocks marks a table Unchanged while
-                        // the merge applies tracked changes, breaking the
-                        // source_change_id invariant.
-                        let table_diff = compute_table_diff_result(&base_t.table, &target_t.table)?;
-                        let has_cell_changes = table_diff
-                            .cell_diffs
-                            .iter()
-                            .any(|cd| !matches!(cd.diff_type, TableCellDiffType::Unchanged))
-                            || table_diff.row_alignment.iter().any(|ra| {
-                                matches!(
-                                    ra,
-                                    TableRowAlignment::Inserted { .. }
-                                        | TableRowAlignment::Deleted { .. }
-                                )
-                            });
-                        let changed = base_t.text_fingerprint != target_t.text_fingerprint
-                            || has_cell_changes;
-                        let (change_type, segments) = if changed {
-                            let segments = vec![
-                                InlineChange::Deleted {
-                                    text: extract_table_text(&base_t.table),
-                                    marks: vec![],
-                                    style_props: StyleProps::default(),
-                                    formatting_change: None,
-                                    rev_id: 0,
-                                },
-                                InlineChange::Inserted {
-                                    text: extract_table_text(&target_t.table),
-                                    marks: vec![],
-                                    style_props: StyleProps::default(),
-                                    formatting_change: None,
-                                    rev_id: 0,
-                                },
-                            ];
-                            (ChangeType::Modified, segments)
-                        } else {
-                            let segments = vec![InlineChange::Unchanged {
-                                text: extract_table_text(&target_t.table),
-                                marks: vec![],
-                                style_props: StyleProps::default(),
-                                formatting_change: None,
-                            }];
-                            (ChangeType::Unchanged, segments)
-                        };
-
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                change_type.clone(),
-                                Some(&base_t.id),
-                                Some(&target_t.id),
-                            ),
-                            doc1_block_id: Some(base_t.id.clone()),
-                            doc2_block_id: Some(target_t.id.clone()),
-                            block_type: BlockType::Table,
-                            heading_level: None,
-                            style_id: None,
-                            change_type,
-                            align: None,
-                            indent: None,
-                            spacing: None,
-                            borders: None,
-                            tab_stops: vec![],
-                            numbering_text: None,
-                            numbering_ilvl: None,
-                            numbering_num_id: None,
-                            segments,
-                            table_diff: Some(table_diff),
-                            content_types: vec!["table".to_string()],
-                            equation_xmls: vec![],
-                            equation_doc1_count: 0,
-                            image_data_uris: vec![],
-                            image_doc1_count: 0,
-                            image_metadata_changes: vec![],
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            ElementAlignment::Modified {
-                base_idx,
-                target_idx,
-            } => {
-                let base_elem = &base_elements[*base_idx];
-                let target_elem = &target_elements[*target_idx];
-                match (base_elem, target_elem) {
-                    (DiffableElement::Block(base_b), DiffableElement::Block(target_b)) => {
-                        // Apply the same split heuristics as compute_changes:
-                        // when blocks are unrelated, wholly opaque, or one side
-                        // is empty, emit separate Deleted + Inserted blocks
-                        // instead of a single Modified block.  This keeps the
-                        // source_change_id scheme consistent with atoms (which
-                        // are extracted from the merged doc where these splits
-                        // have already been applied).
-                        if is_wholly_paragraph_opaque_change(&base_b.block, &target_b.block)
-                            || should_split_empty_paragraph_change(&base_b.block, &target_b.block)
-                            || should_split_unrelated_modification(base_b, target_b)
-                        {
-                            result.push(build_deleted_paragraph_block(
-                                base_b,
-                                base_image_lookup,
-                                &note_markers,
-                            ));
-                            result.push(build_inserted_paragraph_block(
-                                target_b,
-                                target_image_lookup,
-                                &note_markers,
-                            ));
-                            continue;
-                        }
-
-                        let (block_type, heading_level, style_id) = block_metadata(&target_b.block);
-                        let align = block_align(&target_b.block);
-                        let indent = block_indent(&target_b.block);
-                        let spacing = block_spacing(&target_b.block);
-                        let borders = block_borders(&target_b.block);
-                        let tab_stops = block_tab_stops(&target_b.block);
-                        let (numbering_text, numbering_ilvl, _, numbering_num_id) =
-                            block_numbering(&target_b.block);
-                        let base_inlines = block_inlines(&base_b.block);
-                        let target_inlines = block_inlines(&target_b.block);
-                        let segments = diff_block_content_resolving_opaques(
-                            &base_inlines,
-                            &target_inlines,
-                            &note_markers,
-                        );
-                        // If block hashes differ but inline text diff shows everything unchanged,
-                        // opaque content (e.g. images) changed. Show as full replace.
-                        let all_unchanged = segments.iter().all(|s| {
-                            matches!(
-                                s,
-                                InlineChange::Unchanged { .. }
-                                    | InlineChange::Opaque {
-                                        segment_type: InlineChangeSegmentType::Equal,
-                                        ..
-                                    }
-                            )
-                        });
-                        let mut segments = if all_unchanged {
-                            let mut result =
-                                inlines_to_segments(&base_inlines, "delete", &note_markers);
-                            result.extend(inlines_to_segments(
-                                &target_inlines,
-                                "insert",
-                                &note_markers,
-                            ));
-                            result
-                        } else {
-                            segments
-                        };
-                        // Enrich opaque segments from both sides with asset data.
-                        enrich_segments_with_assets(
-                            &mut segments,
-                            &base_inlines,
-                            base_image_lookup,
-                        );
-                        enrich_segments_with_assets(
-                            &mut segments,
-                            &target_inlines,
-                            target_image_lookup,
-                        );
-                        // Include content types from both base and target so the
-                        // frontend knows about equations/images even if only in one side.
-                        let mut content_types = compute_content_types(&base_inlines);
-                        for ct in compute_content_types(&target_inlines) {
-                            if !content_types.contains(&ct) {
-                                content_types.push(ct);
-                            }
-                        }
-                        let mut equation_xmls = extract_equation_xmls(&base_inlines);
-                        let equation_doc1_count = equation_xmls.len();
-                        equation_xmls.extend(extract_equation_xmls(&target_inlines));
-                        let mut image_data_uris =
-                            extract_image_data_uris(&base_inlines, base_image_lookup);
-                        let image_doc1_count = image_data_uris.len();
-                        image_data_uris.extend(extract_image_data_uris(
-                            &target_inlines,
-                            target_image_lookup,
-                        ));
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                ChangeType::Modified,
-                                Some(&base_b.id),
-                                Some(&target_b.id),
-                            ),
-                            doc1_block_id: Some(base_b.id.clone()),
-                            doc2_block_id: Some(target_b.id.clone()),
-                            block_type,
-                            heading_level,
-                            style_id,
-                            change_type: ChangeType::Modified,
-                            align,
-                            indent,
-                            spacing,
-                            borders,
-                            tab_stops,
-                            numbering_text,
-                            numbering_ilvl,
-                            numbering_num_id,
-                            segments,
-                            table_diff: None,
-                            content_types,
-                            equation_xmls,
-                            equation_doc1_count,
-                            image_data_uris,
-                            image_doc1_count,
-                            image_metadata_changes: vec![],
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                    (DiffableElement::Table(base_t), DiffableElement::Table(target_t)) => {
-                        let segments = vec![
-                            InlineChange::Deleted {
-                                text: extract_table_text(&base_t.table),
-                                marks: vec![],
-                                style_props: StyleProps::default(),
-                                formatting_change: None,
-                                rev_id: 0,
-                            },
-                            InlineChange::Inserted {
-                                text: extract_table_text(&target_t.table),
-                                marks: vec![],
-                                style_props: StyleProps::default(),
-                                formatting_change: None,
-                                rev_id: 0,
-                            },
-                        ];
-                        let table_diff = compute_table_diff_result(&base_t.table, &target_t.table)?;
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                ChangeType::Modified,
-                                Some(&base_t.id),
-                                Some(&target_t.id),
-                            ),
-                            doc1_block_id: Some(base_t.id.clone()),
-                            doc2_block_id: Some(target_t.id.clone()),
-                            block_type: BlockType::Table,
-                            heading_level: None,
-                            style_id: None,
-                            change_type: ChangeType::Modified,
-                            align: None,
-                            indent: None,
-                            spacing: None,
-                            borders: None,
-                            tab_stops: vec![],
-                            numbering_text: None,
-                            numbering_ilvl: None,
-                            numbering_num_id: None,
-                            segments,
-                            table_diff: Some(table_diff),
-                            content_types: vec!["table".to_string()],
-                            equation_xmls: vec![],
-                            equation_doc1_count: 0,
-                            image_data_uris: vec![],
-                            image_doc1_count: 0,
-                            image_metadata_changes: vec![],
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            ElementAlignment::Deleted { base_idx } => {
-                let elem = &base_elements[*base_idx];
-                match elem {
-                    DiffableElement::Block(b) => {
-                        result.push(build_deleted_paragraph_block(
-                            b,
-                            base_image_lookup,
-                            &note_markers,
-                        ));
-                    }
-                    DiffableElement::Table(t) => {
-                        let segments = vec![InlineChange::Deleted {
-                            text: extract_table_text(&t.table),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        }];
-                        let table_diff = compute_single_table_diff_result(&t.table, false)?;
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                ChangeType::Deleted,
-                                Some(&t.id),
-                                None,
-                            ),
-                            doc1_block_id: Some(t.id.clone()),
-                            doc2_block_id: None,
-                            block_type: BlockType::Table,
-                            heading_level: None,
-                            style_id: None,
-                            change_type: ChangeType::Deleted,
-                            align: None,
-                            indent: None,
-                            spacing: None,
-                            borders: None,
-                            tab_stops: vec![],
-                            numbering_text: None,
-                            numbering_ilvl: None,
-                            numbering_num_id: None,
-                            segments,
-                            table_diff: Some(table_diff),
-                            content_types: vec!["table".to_string()],
-                            equation_xmls: vec![],
-                            equation_doc1_count: 0,
-                            image_data_uris: vec![],
-                            image_doc1_count: 0,
-                            image_metadata_changes: vec![],
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                }
-            }
-            ElementAlignment::Inserted { target_idx } => {
-                let elem = &target_elements[*target_idx];
-                match elem {
-                    DiffableElement::Block(b) => {
-                        result.push(build_inserted_paragraph_block(
-                            b,
-                            target_image_lookup,
-                            &note_markers,
-                        ));
-                    }
-                    DiffableElement::Table(t) => {
-                        let segments = vec![InlineChange::Inserted {
-                            text: extract_table_text(&t.table),
-                            marks: vec![],
-                            style_props: StyleProps::default(),
-                            formatting_change: None,
-                            rev_id: 0,
-                        }];
-                        let table_diff = compute_single_table_diff_result(&t.table, true)?;
-                        result.push(FullDocBlock {
-                            block_id: projected_full_doc_block_id(
-                                ChangeType::Inserted,
-                                None,
-                                Some(&t.id),
-                            ),
-                            doc1_block_id: None,
-                            doc2_block_id: Some(t.id.clone()),
-                            block_type: BlockType::Table,
-                            heading_level: None,
-                            style_id: None,
-                            change_type: ChangeType::Inserted,
-                            align: None,
-                            indent: None,
-                            spacing: None,
-                            borders: None,
-                            tab_stops: vec![],
-                            numbering_text: None,
-                            numbering_ilvl: None,
-                            numbering_num_id: None,
-                            segments,
-                            table_diff: Some(table_diff),
-                            content_types: vec!["table".to_string()],
-                            equation_xmls: vec![],
-                            equation_doc1_count: 0,
-                            image_data_uris: vec![],
-                            image_doc1_count: 0,
-                            image_metadata_changes: vec![],
-                            move_id: None,
-                            move_direction: None,
-                            structural_change: None,
-                            border_group_id: None,
-                            paragraph_mark_status: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    detect_moves(&mut result);
-    detect_joins_splits(&mut result);
-    assign_border_groups(&mut result);
-
-    Ok(result)
-}
-
-fn projected_full_doc_block_id(
-    change_type: ChangeType,
-    doc1_block_id: Option<&NodeId>,
-    doc2_block_id: Option<&NodeId>,
-) -> NodeId {
-    if let Some(target_id) = doc2_block_id {
-        return target_id.clone();
-    }
-
-    let base_id = doc1_block_id.unwrap_or_else(|| {
-        panic!(
-            "full-document projection is missing canonical block identity for {:?}",
-            change_type
-        )
-    });
-
-    match change_type {
-        ChangeType::Deleted => NodeId::from(format!("deleted:{}", base_id.0)),
-        ChangeType::Unchanged | ChangeType::Modified | ChangeType::Inserted => {
-            panic!(
-                "full-document projection is missing target-side canonical block identity for {:?}",
-                change_type
-            )
-        }
-    }
+    section
+        .footer_refs
+        .iter()
+        .filter_map(|story_ref| {
+            doc.footers
+                .iter()
+                .find(|footer| footer.part_name == story_ref.part_path)
+                .map(|footer| HeaderFooterPayload {
+                    kind: story_ref.kind.to_xml_str().to_string(),
+                    paragraphs: story_blocks_to_paragraphs(&footer.blocks),
+                })
+        })
+        .collect()
 }
 
 /// Post-pass: assign border group IDs and resolve border edges per OOXML §17.3.1.24.
@@ -7045,319 +6556,17 @@ fn assign_border_groups(blocks: &mut [FullDocBlock]) {
     }
 }
 
-/// Post-pass: detect content moves between deleted and inserted blocks.
-///
-/// When a deleted block's normalized text exactly matches an inserted block's
-/// text, they likely represent a move operation. Annotate both blocks with a
-/// shared `move_id` and their respective `move_direction`.
-///
-/// Only matches blocks with substantial text (>= 20 chars after normalization)
-/// to avoid false positives on short/empty paragraphs. Each block participates
-/// in at most one move pair (first match wins).
-fn detect_moves(blocks: &mut [FullDocBlock]) {
-    // Collect indices of deleted and inserted paragraph blocks.
-    let deleted_indices: Vec<usize> = blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.change_type == ChangeType::Deleted && b.block_type != BlockType::Table)
-        .map(|(i, _)| i)
-        .collect();
-    let inserted_indices: Vec<usize> = blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.change_type == ChangeType::Inserted && b.block_type != BlockType::Table)
-        .map(|(i, _)| i)
-        .collect();
-
-    if deleted_indices.is_empty() || inserted_indices.is_empty() {
-        return;
-    }
-
-    // Build normalized text for each candidate.
-    let normalize = |segments: &[InlineChange]| -> String {
-        let mut text = String::new();
-        for seg in segments {
-            match seg {
-                InlineChange::Deleted { text: t, .. }
-                | InlineChange::Inserted { text: t, .. }
-                | InlineChange::Unchanged { text: t, .. } => text.push_str(t),
-                InlineChange::Opaque { .. } => text.push('\u{FFFC}'),
-            }
-        }
-        text.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
-
-    const MIN_MOVE_TEXT_LEN: usize = 20;
-
-    // Build a map from normalized text -> deleted block index.
-    let mut deleted_text_to_idx: HashMap<String, Vec<usize>> = HashMap::new();
-    for &idx in &deleted_indices {
-        let norm = normalize(&blocks[idx].segments);
-        if norm.len() >= MIN_MOVE_TEXT_LEN {
-            deleted_text_to_idx.entry(norm).or_default().push(idx);
-        }
-    }
-
-    let mut move_counter = 0u32;
-    let mut used_deleted: HashSet<usize> = HashSet::new();
-
-    for &ins_idx in &inserted_indices {
-        let norm = normalize(&blocks[ins_idx].segments);
-        if norm.len() < MIN_MOVE_TEXT_LEN {
-            continue;
-        }
-        if let Some(del_indices) = deleted_text_to_idx.get(&norm) {
-            // Find first unused deleted block with matching text.
-            if let Some(&del_idx) = del_indices.iter().find(|i| !used_deleted.contains(i)) {
-                used_deleted.insert(del_idx);
-                let move_id = format!("move_{move_counter}");
-                move_counter += 1;
-
-                blocks[del_idx].move_id = Some(move_id.clone());
-                blocks[del_idx].move_direction = Some(MoveDirection::From);
-                blocks[ins_idx].move_id = Some(move_id);
-                blocks[ins_idx].move_direction = Some(MoveDirection::To);
-            }
-        }
-    }
-
-    // Pass 2: detect consecutive-block group moves.
-    // Short paragraphs (e.g. "Email:", "Name:") individually fall below
-    // MIN_MOVE_TEXT_LEN but when moved as a group their combined text is
-    // long enough.  We find runs of consecutive deleted/inserted indices
-    // (blocks that were not already matched above), concatenate their
-    // normalized text with a paragraph separator, and match groups.
-    detect_consecutive_group_moves(
-        blocks,
-        &deleted_indices,
-        &inserted_indices,
-        &used_deleted,
-        &normalize,
-        &mut move_counter,
-    );
-}
-
-/// Detect moves of consecutive block groups (signature blocks, short line sequences).
-///
-/// Groups runs of consecutive same-type (deleted or inserted) paragraph blocks
-/// whose individual text is too short for single-block matching. Concatenates
-/// their text and matches deleted groups against inserted groups.
-fn detect_consecutive_group_moves(
-    blocks: &mut [FullDocBlock],
-    deleted_indices: &[usize],
-    inserted_indices: &[usize],
-    already_matched: &HashSet<usize>,
-    normalize: &dyn Fn(&[InlineChange]) -> String,
-    move_counter: &mut u32,
-) {
-    const MIN_GROUP_TEXT_LEN: usize = 20;
-    const PARA_SEP: &str = "\n";
-
-    let deleted_runs = find_consecutive_runs(deleted_indices, already_matched);
-    let inserted_runs = find_consecutive_runs(inserted_indices, already_matched);
-
-    if deleted_runs.is_empty() || inserted_runs.is_empty() {
-        return;
-    }
-
-    // Build concatenated normalized text for each deleted run.
-    let del_run_texts: Vec<String> = deleted_runs
-        .iter()
-        .map(|run| {
-            run.iter()
-                .map(|&idx| normalize(&blocks[idx].segments))
-                .collect::<Vec<_>>()
-                .join(PARA_SEP)
-        })
-        .collect();
-
-    let mut used_del_runs: HashSet<usize> = HashSet::new();
-
-    for ins_run in &inserted_runs {
-        let ins_text: String = ins_run
-            .iter()
-            .map(|&idx| normalize(&blocks[idx].segments))
-            .collect::<Vec<_>>()
-            .join(PARA_SEP);
-
-        if ins_text.len() < MIN_GROUP_TEXT_LEN {
-            continue;
-        }
-
-        // Find a matching deleted run.
-        for (del_run_idx, del_text) in del_run_texts.iter().enumerate() {
-            if used_del_runs.contains(&del_run_idx) {
-                continue;
-            }
-            if del_text.len() < MIN_GROUP_TEXT_LEN {
-                continue;
-            }
-            if *del_text != ins_text {
-                continue;
-            }
-            // Matching group found.
-            used_del_runs.insert(del_run_idx);
-            let move_id = format!("move_{}", *move_counter);
-            *move_counter += 1;
-
-            for &idx in &deleted_runs[del_run_idx] {
-                blocks[idx].move_id = Some(move_id.clone());
-                blocks[idx].move_direction = Some(MoveDirection::From);
-            }
-            for &idx in ins_run {
-                blocks[idx].move_id = Some(move_id.clone());
-                blocks[idx].move_direction = Some(MoveDirection::To);
-            }
-            break;
-        }
-    }
-}
-
-/// Extract the text from a block's segments that belongs to a particular side of the diff.
-///
-/// For a modified block, "deleted" text comes from `InlineChange::Deleted` and `Unchanged`,
-/// while "inserted" text comes from `InlineChange::Inserted` and `Unchanged`.
-fn extract_side_text(segments: &[InlineChange], side: &str) -> String {
-    let mut text = String::new();
-    for seg in segments {
-        match seg {
-            InlineChange::Unchanged { text: t, .. } => text.push_str(t),
-            InlineChange::Deleted { text: t, .. } if side == "old" => text.push_str(t),
-            InlineChange::Inserted { text: t, .. } if side == "new" => text.push_str(t),
-            InlineChange::Opaque { .. } => text.push('\u{FFFC}'),
-            _ => {}
-        }
-    }
-    text
-}
-
-/// Normalize text for substring comparison: collapse whitespace, trim.
-fn normalize_for_comparison(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Post-pass: detect paragraph joins and splits between adjacent blocks.
-///
-/// **Join pattern**: A modified block followed by a deleted block, where the
-/// deleted block's text appears at the end of the modified block's new text.
-/// This indicates the deleted paragraph was merged into the modified one.
-///
-/// **Split pattern**: A modified block followed by an inserted block, where the
-/// inserted block's text appears at the end of the modified block's old text
-/// (and is absent from the new text). This indicates the paragraph was split.
-///
-/// Only annotates paragraph blocks (not tables). Requires the candidate text to
-/// be at least 10 characters after normalization to avoid false positives.
-fn detect_joins_splits(blocks: &mut [FullDocBlock]) {
-    if blocks.len() < 2 {
-        return;
-    }
-
-    const MIN_TEXT_LEN: usize = 10;
-
-    // We scan for (modified, deleted) and (modified, inserted) pairs.
-    // Collect annotations first, then apply, to avoid borrow issues.
-    struct Annotation {
-        modified_idx: usize,
-        other_idx: usize,
-        kind: JoinSplitKind,
-    }
-    enum JoinSplitKind {
-        Join,
-        Split,
-    }
-
-    let mut annotations: Vec<Annotation> = Vec::new();
-
-    for i in 0..blocks.len() - 1 {
-        let current = &blocks[i];
-        let next = &blocks[i + 1];
-
-        // Only consider paragraph blocks.
-        if current.block_type == BlockType::Table || next.block_type == BlockType::Table {
-            continue;
-        }
-        // The first block must be modified.
-        if current.change_type != ChangeType::Modified {
-            continue;
-        }
-        // Skip blocks already annotated as moves.
-        if next.move_id.is_some() {
-            continue;
-        }
-
-        if next.change_type == ChangeType::Deleted {
-            // Join candidate: deleted block's text should appear at the end
-            // of the modified block's new text.
-            let deleted_text = extract_side_text(&next.segments, "old");
-            let deleted_norm = normalize_for_comparison(&deleted_text);
-            if deleted_norm.len() < MIN_TEXT_LEN {
-                continue;
-            }
-            let new_text = extract_side_text(&current.segments, "new");
-            let new_norm = normalize_for_comparison(&new_text);
-            if new_norm.ends_with(&deleted_norm) {
-                annotations.push(Annotation {
-                    modified_idx: i,
-                    other_idx: i + 1,
-                    kind: JoinSplitKind::Join,
-                });
-            }
-        } else if next.change_type == ChangeType::Inserted {
-            // Split candidate: inserted block's text should appear at the end
-            // of the modified block's old text, and NOT at the end of the new text.
-            let inserted_text = extract_side_text(&next.segments, "new");
-            let inserted_norm = normalize_for_comparison(&inserted_text);
-            if inserted_norm.len() < MIN_TEXT_LEN {
-                continue;
-            }
-            let old_text = extract_side_text(&current.segments, "old");
-            let old_norm = normalize_for_comparison(&old_text);
-            let new_text = extract_side_text(&current.segments, "new");
-            let new_norm = normalize_for_comparison(&new_text);
-            if old_norm.ends_with(&inserted_norm) && !new_norm.ends_with(&inserted_norm) {
-                annotations.push(Annotation {
-                    modified_idx: i,
-                    other_idx: i + 1,
-                    kind: JoinSplitKind::Split,
-                });
-            }
-        }
-    }
-
-    // Apply annotations.
-    for ann in annotations {
-        let modified_block_id = blocks[ann.modified_idx].block_id.clone();
-        let other_block_id = blocks[ann.other_idx].block_id.clone();
-        match ann.kind {
-            JoinSplitKind::Join => {
-                // The deleted block was joined into the modified block.
-                blocks[ann.other_idx].structural_change = Some(StructuralChange::Join {
-                    into_block_id: modified_block_id,
-                });
-            }
-            JoinSplitKind::Split => {
-                // The inserted block was split from the modified block.
-                blocks[ann.other_idx].structural_change = Some(StructuralChange::Split {
-                    from_block_id: modified_block_id,
-                });
-            }
-        }
-        // Don't annotate the modified block itself — it already shows as "modified"
-        // and the structural_change on the adjacent block points back to it.
-        let _ = other_block_id; // used only for documentation clarity
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{
         CellFormatting, CompatSettings, DocFingerprint, DocMeta, DocPart, FieldData, FieldKind,
-        FootnoteStory, INTERNAL_IDS_VERSION_V0, NoteType, OpaqueBlockNode, OpaqueInlineNode,
-        OpaqueKind, ParagraphNode, ProofRef, SCHEMA_VERSION_V0, StyleProps, TableCellNode,
-        TableNode, TableRowNode, TextNode, VerticalMerge, normal_segment, normal_tracked_block,
+        FootnoteStory, HyperlinkData, INTERNAL_IDS_VERSION_V0, NoteType, OpaqueBlockNode,
+        OpaqueInlineNode, OpaqueKind, ParagraphNode, ProofRef, RevisionInfo, SCHEMA_VERSION_V0,
+        StyleProps, TableCellNode, TableNode, TableRowNode, TextNode, VerticalMerge,
+        normal_segment, normal_tracked_block,
     };
+    use crate::tracked_model::{accept_all, reject_all_with_styles};
 
     fn make_paragraph(id: &str, text: &str) -> BlockNode {
         BlockNode::from(ParagraphNode {
@@ -7378,13 +6587,13 @@ mod tests {
             widow_control: None,
             contextual_spacing: None,
             shading: None,
-            has_direct_keep_next: true,
-            has_direct_keep_lines: true,
-            has_direct_page_break_before: true,
-            has_direct_widow_control: true,
-            has_direct_contextual_spacing: true,
-            has_direct_shading: true,
-            has_direct_borders: true,
+            has_direct_keep_next: false,
+            has_direct_keep_lines: false,
+            has_direct_page_break_before: false,
+            has_direct_widow_control: false,
+            has_direct_contextual_spacing: false,
+            has_direct_shading: false,
+            has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
             segments: normal_segment(vec![InlineNode::from(TextNode {
@@ -7399,7 +6608,7 @@ mod tests {
             })]),
             block_text_hash: Some(sha256_hex(text.as_bytes())),
             numbering: None,
-            has_direct_numbering: true,
+            has_direct_numbering: false,
             numbering_suppressed: false,
             materialized_numbering: None,
             rendered_text: None,
@@ -7481,6 +6690,210 @@ mod tests {
         }
     }
 
+    fn make_body_opaque(id: &str, opaque_ref: &str) -> BlockNode {
+        make_body_opaque_at(id, opaque_ref, "body_index:0")
+    }
+
+    fn make_body_opaque_at(id: &str, opaque_ref: &str, anchor: &str) -> BlockNode {
+        BlockNode::from(OpaqueBlockNode {
+            id: NodeId::from(id.to_string()),
+            kind: OpaqueKind::Sdt,
+            opaque_ref: opaque_ref.to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from(id.to_string()),
+                docx_anchor: anchor.to_string(),
+            },
+            range_marker: None,
+        })
+    }
+
+    #[test]
+    fn diff_body_opaque_change_at_same_position_is_delete_and_insert() {
+        let base = make_doc(
+            "doc",
+            vec![make_body_opaque("base-sdt", "body_item_sha256:base")],
+            "fp1",
+        );
+        let target = make_doc(
+            "doc",
+            vec![make_body_opaque("target-sdt", "body_item_sha256:target")],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockDeleted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockInserted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn diff_body_opaque_identity_is_multiplicity_aware() {
+        let base = make_doc(
+            "doc",
+            vec![
+                make_body_opaque("base-sdt-1", "same-content"),
+                make_body_opaque("base-sdt-2", "same-content"),
+            ],
+            "fp1",
+        );
+        let target = make_doc(
+            "doc",
+            vec![make_body_opaque("target-sdt", "same-content")],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockDeleted { .. }))
+                .count(),
+            1,
+            "one of two identical base occurrences must remain unmatched"
+        );
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockInserted { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn diff_body_opaque_move_is_delete_and_insert() {
+        let base = make_doc(
+            "doc",
+            vec![make_body_opaque_at(
+                "base-sdt",
+                "same-content",
+                "body_index:0",
+            )],
+            "fp1",
+        );
+        let target = make_doc(
+            "doc",
+            vec![make_body_opaque_at(
+                "target-sdt",
+                "same-content",
+                "body_index:1",
+            )],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockDeleted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            diff.changes
+                .iter()
+                .filter(|change| matches!(change, DiffChange::BlockInserted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn diff_body_opaque_target_scaffold_anchor_is_terminally_equivalent() {
+        let accepted = make_doc(
+            "doc",
+            vec![make_body_opaque_at(
+                "accepted-sdt",
+                "same-content",
+                "target_body_index:1",
+            )],
+            "fp1",
+        );
+        let target = make_doc(
+            "doc",
+            vec![make_body_opaque_at(
+                "target-sdt",
+                "same-content",
+                "body_index:1",
+            )],
+            "fp2",
+        );
+
+        let diff = diff_documents(&accepted, &target).expect("diff should succeed");
+        assert!(diff.changes.is_empty());
+    }
+
+    #[test]
+    fn inserted_body_opaque_keeps_target_order_among_unrelated_insertions() {
+        let base = make_doc(
+            "doc",
+            vec![
+                make_paragraph("base-1", "Unrelated source alpha"),
+                make_paragraph("base-2", "Unrelated source omega"),
+            ],
+            "fp1",
+        );
+        let target = make_doc(
+            "doc",
+            vec![
+                make_paragraph("target-1", "Before content control"),
+                make_body_opaque_at("target-sdt", "target-content", "body_index:1"),
+                make_paragraph("target-2", "After content control"),
+            ],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+        let insertion_ids: Vec<&str> = diff
+            .changes
+            .iter()
+            .filter_map(|change| {
+                let DiffChange::BlockInserted { block, .. } = change else {
+                    return None;
+                };
+                Some(match block {
+                    BlockNode::Paragraph(paragraph) => paragraph.id.0.as_ref(),
+                    BlockNode::Table(table) => table.id.0.as_ref(),
+                    BlockNode::OpaqueBlock(opaque) => opaque.id.0.as_ref(),
+                })
+            })
+            .collect();
+        assert_eq!(
+            insertion_ids,
+            ["target-1", "target-sdt"],
+            "separate opaque discovery must preserve its order before later target content"
+        );
+
+        let revision = RevisionInfo {
+            revision_id: 1,
+            identity: 1,
+            author: Some("Reviewer".to_string()),
+            date: Some("2026-08-16T00:00:00Z".to_string()),
+            apply_op_id: None,
+        };
+        let mut accepted = merge_diff(&base, &target, &diff, &revision)
+            .expect("diff should merge")
+            .doc;
+        accept_all(&mut accepted);
+        assert_eq!(accepted.blocks.len(), 3);
+        assert!(matches!(
+            &accepted.blocks[1].block,
+            BlockNode::OpaqueBlock(opaque) if opaque.id.0.as_ref() == "target-sdt"
+        ));
+    }
+
     fn make_footnote(id: &str, block_id: &str, text: &str) -> FootnoteStory {
         let blocks = vec![make_paragraph(block_id, text)];
         let content_hash = sha256_hex(text.as_bytes());
@@ -7489,6 +6902,18 @@ mod tests {
             note_type: NoteType::Normal,
             blocks: blocks.into_iter().map(normal_tracked_block).collect(),
             content_hash,
+        }
+    }
+
+    fn make_comment(id: &str, block_id: &str, text: &str) -> CommentStory {
+        let blocks = vec![make_paragraph(block_id, text)];
+        CommentStory {
+            id: id.to_string(),
+            author: Some("Reviewer".to_string()),
+            date: Some("2026-08-31T00:00:00Z".to_string()),
+            blocks: blocks.into_iter().map(normal_tracked_block).collect(),
+            content_hash: sha256_hex(text.as_bytes()),
+            tracking_status: None,
         }
     }
 
@@ -7541,14 +6966,185 @@ mod tests {
                 }
             ).into_bytes()),
             content_hash: Some(match kind {
-                FieldKind::Begin => "field-begin".to_string(),
-                FieldKind::Separate => "field-separate".to_string(),
-                FieldKind::End => "field-end".to_string(),
+                FieldKind::Begin => "1".repeat(64),
+                FieldKind::Separate => "2".repeat(64),
+                FieldKind::End => "3".repeat(64),
                 FieldKind::Instruction | FieldKind::Simple | FieldKind::Unknown(_) => {
                     unreachable!("not used here")
                 }
             }),
         })
+    }
+
+    fn make_test_opaque(id: &str, kind: OpaqueKind, content_hash: Option<&str>) -> InlineNode {
+        InlineNode::from(OpaqueInlineNode {
+            id: NodeId::from(id.to_string()),
+            kind,
+            opaque_ref: id.to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("p"),
+                docx_anchor: id.to_string(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
+            raw_xml: None,
+            content_hash: content_hash.map(str::to_string),
+        })
+    }
+
+    fn decoration_inline(
+        id: &str,
+        kind: DecorationType,
+        raw_xml: impl Into<Vec<u8>>,
+    ) -> InlineNode {
+        InlineNode::Decoration(Box::new(DecorationNode {
+            id: NodeId::from(id.to_string()),
+            kind,
+            opaque_ref: id.to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("paragraph"),
+                docx_anchor: id.to_string(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
+            raw_xml: Some(raw_xml.into()),
+            origin: None,
+        }))
+    }
+
+    fn paragraph_with_inlines(inlines: Vec<InlineNode>) -> ParagraphNode {
+        let BlockNode::Paragraph(mut paragraph) = make_paragraph("paragraph", "") else {
+            unreachable!("make_paragraph returns a paragraph")
+        };
+        paragraph.segments = normal_segment(inlines);
+        *paragraph
+    }
+
+    #[test]
+    fn unrelated_row_replacement_accepts_paired_go_back_bookmark() {
+        let paragraph = paragraph_with_inlines(vec![
+            decoration_inline(
+                "bookmark-start",
+                DecorationType::Bookmark,
+                br#"<w:bookmarkStart xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7" w:name="_GoBack"/>"#.to_vec(),
+            ),
+            make_text_inline("text", "Replacement", StyleProps::default()),
+            decoration_inline(
+                "bookmark-end",
+                DecorationType::Bookmark,
+                br#"<w:bookmarkEnd xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7"/>"#.to_vec(),
+            ),
+        ]);
+
+        assert!(paragraph_supports_unrelated_row_replacement(&paragraph));
+    }
+
+    #[test]
+    fn unrelated_row_replacement_refuses_authored_bookmark() {
+        let paragraph = paragraph_with_inlines(vec![
+            decoration_inline(
+                "bookmark-start",
+                DecorationType::Bookmark,
+                br#"<w:bookmarkStart xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7" w:name="Section"/>"#.to_vec(),
+            ),
+            make_text_inline("text", "Replacement", StyleProps::default()),
+            decoration_inline(
+                "bookmark-end",
+                DecorationType::Bookmark,
+                br#"<w:bookmarkEnd xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7"/>"#.to_vec(),
+            ),
+        ]);
+
+        assert!(!paragraph_supports_unrelated_row_replacement(&paragraph));
+    }
+
+    #[test]
+    fn unrelated_row_replacement_refuses_orphan_go_back_end() {
+        let paragraph = paragraph_with_inlines(vec![
+            make_text_inline("text", "Replacement", StyleProps::default()),
+            decoration_inline(
+                "bookmark-end",
+                DecorationType::Bookmark,
+                br#"<w:bookmarkEnd xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7"/>"#.to_vec(),
+            ),
+        ]);
+
+        assert!(!paragraph_supports_unrelated_row_replacement(&paragraph));
+    }
+
+    #[test]
+    fn top_level_opaque_replacement_is_terminally_equivalent() {
+        let mut base_block = make_paragraph("p", "");
+        let BlockNode::Paragraph(base_paragraph) = &mut base_block else {
+            unreachable!("make_paragraph returns a paragraph")
+        };
+        base_paragraph.segments = normal_segment(vec![
+            make_text_inline("base-before", "And a ", StyleProps::default()),
+            make_test_opaque(
+                "base-link",
+                OpaqueKind::Hyperlink(HyperlinkData {
+                    url: None,
+                    anchor: Some("bookmark".to_string()),
+                    text: "link".to_string(),
+                    r_id: None,
+                    runs: Vec::new(),
+                    extra_attrs: Vec::new(),
+                }),
+                None,
+            ),
+            make_text_inline("base-after", " to a bookmark", StyleProps::default()),
+        ]);
+
+        let mut target_block = make_paragraph("target-p", "");
+        let BlockNode::Paragraph(target_paragraph) = &mut target_block else {
+            unreachable!("make_paragraph returns a paragraph")
+        };
+        target_paragraph.segments = normal_segment(vec![make_test_opaque(
+            "target-drawing",
+            OpaqueKind::Drawing,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )]);
+
+        let base = make_doc("base", vec![base_block], "base-fingerprint");
+        let target = make_doc("target", vec![target_block], "target-fingerprint");
+        let diff = diff_documents(&base, &target).expect("opaque replacement should diff");
+        let DiffChange::BlockModified { .. } = &diff.changes[0] else {
+            panic!("expected one modified paragraph, got {:#?}", diff.changes)
+        };
+
+        let revision = RevisionInfo {
+            revision_id: 1,
+            identity: 1,
+            author: Some("Reviewer".to_string()),
+            date: Some("2026-08-16T00:00:00Z".to_string()),
+            apply_op_id: None,
+        };
+        let merged = merge_diff(&base, &target, &diff, &revision)
+            .expect("opaque replacement should merge")
+            .doc;
+
+        let mut accepted = merged.clone();
+        accept_all(&mut accepted);
+        let accepted_diff = diff_documents(&accepted, &target).expect("accepted terminal diff");
+        assert!(
+            accepted_diff.changes.is_empty(),
+            "accepting must reproduce the target drawing: {:#?}",
+            accepted_diff.changes
+        );
+
+        let mut rejected = merged;
+        reject_all_with_styles(&mut rejected, None);
+        let rejected_diff = diff_documents(&rejected, &base).expect("rejected terminal diff");
+        assert!(
+            rejected_diff.changes.is_empty(),
+            "rejecting must restore the source hyperlink: {:#?}",
+            rejected_diff.changes
+        );
     }
 
     #[test]
@@ -8568,6 +8164,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diff_comments_never_creates_identity_from_matching_content() {
+        let base = vec![make_comment("5", "base-comment", "Just like that!")];
+        let target = vec![
+            make_comment("6", "target-comment-6", "Just like that!"),
+            make_comment(
+                "72",
+                "target-comment-72",
+                "Just like that, with one clarification!",
+            ),
+        ];
+
+        let changes = diff_comments(&base, &target).expect("comment diff should succeed");
+        let deleted_ids: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| match change {
+                DiffChange::CommentDeleted { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let inserted_ids: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| match change {
+                DiffChange::CommentInserted { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(deleted_ids, ["5"]);
+        assert_eq!(inserted_ids, ["6", "72"]);
+        assert!(
+            changes
+                .iter()
+                .all(|change| !matches!(change, DiffChange::CommentModified { .. })),
+            "different package identities must not become one modified comment: {changes:?}"
+        );
+    }
+
     // =========================================================================
     // DP-based alignment tests
     // =========================================================================
@@ -9443,6 +9077,59 @@ mod tests {
     }
 
     #[test]
+    fn zipper_collapse_keeps_previous_formatting_on_the_source_arm() {
+        let source_props = StyleProps {
+            font_family: Some("Verdana".into()),
+            ..StyleProps::default()
+        };
+        let target_marks = vec![Mark::Bold];
+        let changes = vec![
+            InlineChange::Deleted {
+                text: "old".to_string(),
+                marks: Vec::new(),
+                style_props: source_props.clone(),
+                formatting_change: None,
+                rev_id: 0,
+            },
+            InlineChange::Unchanged {
+                text: " ".to_string(),
+                marks: target_marks.clone(),
+                style_props: StyleProps::default(),
+                formatting_change: Some(FormattingChange {
+                    carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
+                    previous_marks: Vec::new(),
+                    previous_style_props: source_props.clone(),
+                    previous_rpr_authored: RunRprAuthored::default(),
+                    revision_id: 0,
+                    identity: 0,
+                    author: String::new(),
+                    date: None,
+                }),
+            },
+            InlineChange::Inserted {
+                text: "new".to_string(),
+                marks: target_marks.clone(),
+                style_props: StyleProps::default(),
+                formatting_change: None,
+                rev_id: 0,
+            },
+        ];
+
+        let collapsed = collapse_region(&changes);
+
+        assert!(matches!(
+            &collapsed[0],
+            InlineChange::Deleted { text, marks, style_props, .. }
+                if text == "old " && marks.is_empty() && *style_props == source_props
+        ));
+        assert!(matches!(
+            &collapsed[1],
+            InlineChange::Inserted { text, marks, style_props, .. }
+                if text == " new" && *marks == target_marks && *style_props == StyleProps::default()
+        ));
+    }
+
+    #[test]
     fn test_char_level_affix_factoring_known_issue() {
         // Reproduces the known issue: "five (5) years." → "two (2) years."
         // After zipper collapse, factor_common_affixes can't help (one Del, one Ins,
@@ -9944,213 +9631,6 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════
 
     /// Helper to build a minimal FullDocBlock with a given change_type and text segments.
-    fn make_full_doc_block(id: &str, change_type: ChangeType, text: &str) -> FullDocBlock {
-        let segments = vec![match change_type {
-            ChangeType::Deleted => InlineChange::Deleted {
-                text: text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-                rev_id: 0,
-            },
-            ChangeType::Inserted => InlineChange::Inserted {
-                text: text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-                rev_id: 0,
-            },
-            _ => InlineChange::Unchanged {
-                text: text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-            },
-        }];
-        FullDocBlock {
-            block_id: NodeId::from(id.to_string()),
-            doc1_block_id: None,
-            doc2_block_id: None,
-            block_type: BlockType::Paragraph,
-            heading_level: None,
-            style_id: None,
-            change_type,
-            align: None,
-            indent: None,
-            spacing: None,
-            borders: None,
-            tab_stops: vec![],
-            numbering_text: None,
-            numbering_ilvl: None,
-            numbering_num_id: None,
-            segments,
-            table_diff: None,
-            content_types: vec![],
-            equation_xmls: vec![],
-            equation_doc1_count: 0,
-            image_data_uris: vec![],
-            image_doc1_count: 0,
-            image_metadata_changes: vec![],
-            move_id: None,
-            move_direction: None,
-            structural_change: None,
-            border_group_id: None,
-            paragraph_mark_status: None,
-        }
-    }
-
-    #[test]
-    fn test_detect_moves_matching_deleted_and_inserted() {
-        let long_text = "This is a substantial paragraph that was moved from one location to another in the document.";
-
-        let mut blocks = vec![
-            make_full_doc_block("p0", ChangeType::Unchanged, "First paragraph."),
-            make_full_doc_block("p1", ChangeType::Deleted, long_text),
-            make_full_doc_block("p2", ChangeType::Unchanged, "Middle paragraph."),
-            make_full_doc_block("p3", ChangeType::Inserted, long_text),
-        ];
-
-        detect_moves(&mut blocks);
-
-        assert_eq!(
-            blocks[1].move_id.as_deref(),
-            Some("move_0"),
-            "deleted block should have move_id"
-        );
-        assert_eq!(
-            blocks[1].move_direction,
-            Some(MoveDirection::From),
-            "deleted block should be 'from'"
-        );
-        assert_eq!(
-            blocks[3].move_id.as_deref(),
-            Some("move_0"),
-            "inserted block should have same move_id"
-        );
-        assert_eq!(
-            blocks[3].move_direction,
-            Some(MoveDirection::To),
-            "inserted block should be 'to'"
-        );
-
-        // Unchanged blocks should not be affected.
-        assert!(blocks[0].move_id.is_none());
-        assert!(blocks[2].move_id.is_none());
-    }
-
-    #[test]
-    fn test_detect_moves_ignores_short_text() {
-        let mut blocks = vec![
-            make_full_doc_block("p0", ChangeType::Deleted, "Short."),
-            make_full_doc_block("p1", ChangeType::Inserted, "Short."),
-        ];
-
-        detect_moves(&mut blocks);
-
-        // Short text (< 20 chars) should not be detected as moves.
-        assert!(
-            blocks[0].move_id.is_none(),
-            "short text should not be detected as a move"
-        );
-        assert!(
-            blocks[1].move_id.is_none(),
-            "short text should not be detected as a move"
-        );
-    }
-
-    #[test]
-    fn test_detect_moves_no_false_positives_on_unchanged() {
-        let long_text = "This is a long enough paragraph that could theoretically match.";
-        let mut blocks = vec![
-            make_full_doc_block("p0", ChangeType::Unchanged, long_text),
-            make_full_doc_block("p1", ChangeType::Unchanged, long_text),
-        ];
-
-        detect_moves(&mut blocks);
-
-        let moves: Vec<_> = blocks.iter().filter(|b| b.move_id.is_some()).collect();
-        assert!(
-            moves.is_empty(),
-            "unchanged blocks should not be detected as moves"
-        );
-    }
-
-    #[test]
-    fn full_document_projection_reuses_target_ids_and_stable_delete_tombstones() {
-        let base = make_doc(
-            "doc",
-            vec![
-                make_paragraph("base_p1", "Alpha"),
-                make_paragraph("base_p2", "Deleted"),
-                make_paragraph("base_p3", "Gamma"),
-            ],
-            "fp1",
-        );
-        let target = make_doc(
-            "doc",
-            vec![
-                make_paragraph("target_p10", "Alpha"),
-                make_paragraph("target_p30", "Gamma"),
-                make_paragraph("target_p40", "Inserted"),
-            ],
-            "fp2",
-        );
-
-        let blocks = build_full_document_view(&base, &target, &HashMap::new(), &HashMap::new())
-            .expect("full document view should succeed");
-
-        let ids: Vec<_> = blocks
-            .iter()
-            .map(|block| block.block_id.0.as_ref())
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["target_p10", "deleted:base_p2", "target_p30", "target_p40"],
-        );
-        assert_eq!(
-            blocks[0].doc1_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("base_p1"),
-        );
-        assert_eq!(
-            blocks[0].doc2_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("target_p10"),
-        );
-        assert_eq!(blocks[1].change_type, ChangeType::Deleted);
-        assert_eq!(
-            blocks[1].doc1_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("base_p2"),
-        );
-        assert_eq!(blocks[1].doc2_block_id, None);
-        assert_eq!(blocks[3].change_type, ChangeType::Inserted);
-        assert_eq!(blocks[3].doc1_block_id, None);
-        assert_eq!(
-            blocks[3].doc2_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("target_p40"),
-        );
-    }
-
-    #[test]
-    fn full_document_projection_uses_target_id_for_modified_blocks() {
-        let base = make_doc("doc", vec![make_paragraph("base_p1", "Old text")], "fp1");
-        let target = make_doc("doc", vec![make_paragraph("target_p9", "New text")], "fp2");
-
-        let blocks = build_full_document_view(&base, &target, &HashMap::new(), &HashMap::new())
-            .expect("full document view should succeed");
-
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].change_type, ChangeType::Modified);
-        assert_eq!(blocks[0].block_id.0.as_ref(), "target_p9");
-        assert_eq!(
-            blocks[0].doc1_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("base_p1"),
-        );
-        assert_eq!(
-            blocks[0].doc2_block_id.as_ref().map(|id| id.0.as_ref()),
-            Some("target_p9"),
-        );
-    }
-
-    /// Build a minimal single-cell table for identity tests.
     fn make_table(id: &str, cell_text: &str) -> BlockNode {
         let cell_para = match make_paragraph(&format!("{id}_c0_p0"), cell_text) {
             BlockNode::Paragraph(p) => p,
@@ -10189,6 +9669,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -10196,6 +9677,229 @@ mod tests {
             formatting: TableFormatting::default(),
             formatting_change: None,
         })
+    }
+
+    fn set_single_cell_table_inlines(table: &mut BlockNode, inlines: Vec<InlineNode>) {
+        let BlockNode::Table(table) = table else {
+            unreachable!("make_table must return a table")
+        };
+        let BlockNode::Paragraph(paragraph) = &mut table.rows[0].cells[0].blocks[0] else {
+            unreachable!("make_table must put a paragraph in its single cell")
+        };
+        paragraph.segments = normal_segment(inlines);
+    }
+
+    #[test]
+    fn outer_table_property_change_uses_exact_region_replacement() {
+        let base = make_doc("doc", vec![make_table("tbl", "same")], "fp1");
+        let mut target_table = make_table("tbl-target", "same");
+        let BlockNode::Table(target_table_node) = &mut target_table else {
+            unreachable!("make_table must return a table")
+        };
+        target_table_node.formatting.indent = Some(720);
+        let target = make_doc("doc", vec![target_table], "fp2");
+
+        let diff = diff_documents(&base, &target).expect("table diff should succeed");
+        assert!(diff.changes.iter().any(|change| matches!(
+            change,
+            DiffChange::TableStructureChanged {
+                table_diff: None,
+                ..
+            }
+        )));
+        assert!(
+            !diff
+                .changes
+                .iter()
+                .any(|change| matches!(change, DiffChange::TableCellsModified { .. }))
+        );
+    }
+
+    #[test]
+    fn row_property_change_uses_exact_region_replacement() {
+        let base = make_doc("doc", vec![make_table("tbl", "same")], "fp1");
+        let mut target_table = make_table("tbl-target", "same");
+        let BlockNode::Table(target_table_node) = &mut target_table else {
+            unreachable!("make_table must return a table")
+        };
+        target_table_node.rows[0].is_header = true;
+        let target = make_doc("doc", vec![target_table], "fp2");
+
+        let diff = diff_documents(&base, &target).expect("table diff should succeed");
+        assert!(diff.changes.iter().any(|change| matches!(
+            change,
+            DiffChange::TableStructureChanged {
+                table_diff: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn row_insertion_with_changed_survivor_merge_topology_uses_exact_region_replacement() {
+        let mut base_table = make_table("tbl", "same");
+        let BlockNode::Table(base_table_node) = &mut base_table else {
+            unreachable!("make_table must return a table")
+        };
+        base_table_node.rows[0].cells[0].v_merge = VerticalMerge::Restart;
+
+        let mut target_table = make_table("tbl-target", "same");
+        let BlockNode::Table(target_table_node) = &mut target_table else {
+            unreachable!("make_table must return a table")
+        };
+        let BlockNode::Table(mut inserted_table) = make_table("inserted", "new") else {
+            unreachable!("make_table must return a table")
+        };
+        inserted_table.rows[0].id = NodeId::from("inserted-row");
+        target_table_node.rows.push(inserted_table.rows.remove(0));
+
+        let base = make_doc("doc", vec![base_table], "fp1");
+        let target = make_doc("doc", vec![target_table], "fp2");
+        let diff = diff_documents(&base, &target).expect("table diff should succeed");
+
+        assert!(diff.changes.iter().any(|change| matches!(
+            change,
+            DiffChange::TableStructureChanged {
+                table_diff: None,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn table_cell_diff_does_not_align_unrelated_opaque_nodes() {
+        let mut base = make_table("base_table", "");
+        set_single_cell_table_inlines(
+            &mut base,
+            vec![
+                make_text_inline(
+                    "base_prefix",
+                    "The parties agree that this reference remains effective: ",
+                    StyleProps::default(),
+                ),
+                make_field_opaque("begin", FieldKind::Begin),
+                make_field_opaque("separate", FieldKind::Separate),
+                make_text_inline("old_result", "old", StyleProps::default()),
+                make_field_opaque("end", FieldKind::End),
+                make_text_inline(
+                    "base_suffix",
+                    ". All other provisions continue without modification.",
+                    StyleProps::default(),
+                ),
+            ],
+        );
+
+        let mut target = make_table("target_table", "");
+        set_single_cell_table_inlines(
+            &mut target,
+            vec![
+                make_text_inline(
+                    "target_prefix",
+                    "The parties agree that this reference remains effective: ",
+                    StyleProps::default(),
+                ),
+                InlineNode::from(OpaqueInlineNode {
+                    id: NodeId::from("hyperlink"),
+                    kind: OpaqueKind::Hyperlink(HyperlinkData {
+                        url: Some("https://example.test/target".to_string()),
+                        anchor: None,
+                        text: "old".to_string(),
+                        r_id: Some("rId7".to_string()),
+                        runs: Vec::new(),
+                        extra_attrs: Vec::new(),
+                    }),
+                    opaque_ref: "hyperlink".to_string(),
+                    proof_ref: ProofRef {
+                        part: DocPart::DocumentXml,
+                        block_id: NodeId::from("target_table_c0_p0"),
+                        docx_anchor: "hyperlink".to_string(),
+                    },
+                    wrapper_marks: Vec::new(),
+                    wrapper_style_props: StyleProps::default(),
+                    source_run_attrs: Vec::new(),
+                    joins_following_text_run: false,
+                    raw_xml: Some(
+                        br#"<w:hyperlink xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:r><w:t>old</w:t></w:r></w:hyperlink>"#
+                            .to_vec(),
+                    ),
+                    content_hash: None,
+                }),
+                make_text_inline(
+                    "target_suffix",
+                    ". All other provisions continue without modification.",
+                    StyleProps::default(),
+                ),
+            ],
+        );
+
+        let BlockNode::Table(base_table) = base else {
+            unreachable!()
+        };
+        let BlockNode::Table(target_table) = target else {
+            unreachable!()
+        };
+        let changes = diff_matched_tables(
+            &DiffableTable {
+                id: base_table.id.clone(),
+                structure_hash: base_table.structure_hash.clone(),
+                text_fingerprint: extract_table_text(&base_table),
+                table: *base_table,
+            },
+            &DiffableTable {
+                id: target_table.id.clone(),
+                structure_hash: target_table.structure_hash.clone(),
+                text_fingerprint: extract_table_text(&target_table),
+                table: *target_table,
+            },
+        )
+        .expect("matched table diff should succeed");
+
+        let DiffChange::TableCellsModified { cell_changes, .. } = &changes[0] else {
+            panic!("expected a cell-level table diff, got {changes:#?}")
+        };
+        let inline_changes = &cell_changes[0].paragraph_changes[0].inline_changes;
+        let deleted_fields = inline_changes
+            .iter()
+            .filter(|change| {
+                matches!(
+                    change,
+                    InlineChange::Opaque {
+                        segment_type: InlineChangeSegmentType::Delete,
+                        kind: OpaqueSegmentKind::Field,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let inserted_hyperlinks = inline_changes
+            .iter()
+            .filter(|change| {
+                matches!(
+                    change,
+                    InlineChange::Opaque {
+                        segment_type: InlineChangeSegmentType::Insert,
+                        kind: OpaqueSegmentKind::Hyperlink,
+                        ..
+                    }
+                )
+            })
+            .count();
+
+        assert_eq!(
+            deleted_fields, 3,
+            "all old field markers must be deleted; got {inline_changes:#?}"
+        );
+        assert_eq!(
+            inserted_hyperlinks, 1,
+            "the new hyperlink must be inserted; got {inline_changes:#?}"
+        );
+        assert!(inline_changes.iter().all(|change| !matches!(
+            change,
+            InlineChange::Opaque {
+                segment_type: InlineChangeSegmentType::Equal,
+                ..
+            }
+        )));
     }
 
     /// A 1x1 table whose single cell contains `paragraphs.len()` paragraphs.
@@ -10238,6 +9942,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -10294,6 +9999,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -10429,337 +10135,6 @@ mod tests {
     }
 
     #[test]
-    fn full_document_projection_self_comparison_preserves_canonical_ids() {
-        let doc = make_doc(
-            "doc",
-            vec![
-                make_paragraph("para_1", "First paragraph"),
-                make_table("tbl_0", "Cell content"),
-                make_paragraph("para_2", "Last paragraph"),
-            ],
-            "fp1",
-        );
-
-        let blocks = build_full_document_view(&doc, &doc, &HashMap::new(), &HashMap::new())
-            .expect("self-comparison should succeed");
-
-        // Every block should be unchanged with block_id == canonical ID.
-        assert_eq!(blocks.len(), 3);
-        for block in &blocks {
-            assert_eq!(
-                block.change_type,
-                ChangeType::Unchanged,
-                "block {} should be unchanged in self-comparison",
-                block.block_id,
-            );
-            assert_eq!(
-                block.doc1_block_id, block.doc2_block_id,
-                "doc1 and doc2 IDs must match for block {}",
-                block.block_id,
-            );
-            assert_eq!(
-                Some(&block.block_id),
-                block.doc2_block_id.as_ref(),
-                "block_id must equal canonical ID for block {}",
-                block.block_id,
-            );
-        }
-
-        let ids: Vec<_> = blocks.iter().map(|b| b.block_id.0.as_ref()).collect();
-        assert_eq!(ids, vec!["para_1", "tbl_0", "para_2"]);
-    }
-
-    #[test]
-    fn full_document_projection_block_ids_independent_of_analysis() {
-        let base = make_doc(
-            "doc",
-            vec![
-                make_paragraph("base_p1", "Hello world"),
-                make_paragraph("base_p2", "Second"),
-            ],
-            "fp1",
-        );
-        let target = make_doc(
-            "doc",
-            vec![
-                make_paragraph("target_p1", "Hello world changed"),
-                make_paragraph("target_p3", "Inserted"),
-            ],
-            "fp2",
-        );
-
-        // build_full_document_view produces only the document projection (no analysis).
-        let view_blocks =
-            build_full_document_view(&base, &target, &HashMap::new(), &HashMap::new())
-                .expect("full document view should succeed");
-
-        // diff_and_full_document produces both diff changes (analysis input) and the projection.
-        let (_diff, df_blocks) =
-            diff_and_full_document(&base, &target, &HashMap::new(), &HashMap::new())
-                .expect("diff_and_full_document should succeed");
-
-        // Block IDs must be identical regardless of whether analysis was also computed.
-        let view_ids: Vec<_> = view_blocks.iter().map(|b| b.block_id.clone()).collect();
-        let df_ids: Vec<_> = df_blocks.iter().map(|b| b.block_id.clone()).collect();
-        assert_eq!(view_ids, df_ids);
-    }
-
-    #[test]
-    fn single_document_projection_produces_canonical_ids_and_unchanged_blocks() {
-        let doc = make_doc(
-            "doc",
-            vec![
-                make_paragraph("para_1", "First paragraph"),
-                make_table("tbl_0", "Cell content"),
-                make_paragraph("para_2", "Last paragraph"),
-            ],
-            "fp1",
-        );
-
-        let result = build_single_document_view(&doc, &HashMap::new());
-
-        assert_eq!(result.blocks.len(), 3);
-        for block in &result.blocks {
-            assert_eq!(
-                block.change_type,
-                ChangeType::Unchanged,
-                "block {} should be unchanged",
-                block.block_id,
-            );
-            assert!(
-                block.doc1_block_id.is_none(),
-                "single-doc projection should have no doc1 ID for block {}",
-                block.block_id,
-            );
-            assert_eq!(
-                Some(&block.block_id),
-                block.doc2_block_id.as_ref(),
-                "doc2_block_id must equal block_id for block {}",
-                block.block_id,
-            );
-        }
-
-        let ids: Vec<_> = result
-            .blocks
-            .iter()
-            .map(|b| b.block_id.0.as_ref())
-            .collect();
-        assert_eq!(ids, vec!["para_1", "tbl_0", "para_2"]);
-
-        // All segments should be equal.
-        for block in &result.blocks {
-            for seg in &block.segments {
-                match seg {
-                    InlineChange::Unchanged { .. } => {}
-                    InlineChange::Opaque {
-                        segment_type: InlineChangeSegmentType::Equal,
-                        ..
-                    } => {}
-                    other => panic!(
-                        "single-doc projection should have only equal segments, got {:?} in block {}",
-                        other, block.block_id,
-                    ),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn single_document_projection_includes_stories() {
-        let mut doc = make_doc("doc", vec![make_paragraph("para_1", "Body text")], "fp1");
-        doc.footnotes
-            .push(make_footnote("fn1", "fn1_p1", "Footnote text"));
-
-        let result = build_single_document_view(&doc, &HashMap::new());
-
-        assert_eq!(result.blocks.len(), 1);
-        assert_eq!(result.footnotes.len(), 1);
-        assert_eq!(result.footnotes[0].id, "fn1");
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Join/Split detection tests
-    // ══════════════════════════════════════════════════════════════════════
-
-    fn make_modified_block(id: &str, old_text: &str, new_text: &str) -> FullDocBlock {
-        let segments = vec![
-            InlineChange::Deleted {
-                text: old_text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-                rev_id: 0,
-            },
-            InlineChange::Inserted {
-                text: new_text.to_string(),
-                marks: vec![],
-                style_props: StyleProps::default(),
-                formatting_change: None,
-                rev_id: 0,
-            },
-        ];
-        FullDocBlock {
-            block_id: NodeId::from(id.to_string()),
-            doc1_block_id: None,
-            doc2_block_id: None,
-            block_type: BlockType::Paragraph,
-            heading_level: None,
-            style_id: None,
-            change_type: ChangeType::Modified,
-            align: None,
-            indent: None,
-            spacing: None,
-            borders: None,
-            tab_stops: vec![],
-            numbering_text: None,
-            numbering_ilvl: None,
-            numbering_num_id: None,
-            segments,
-            table_diff: None,
-            content_types: vec![],
-            equation_xmls: vec![],
-            equation_doc1_count: 0,
-            image_data_uris: vec![],
-            image_doc1_count: 0,
-            image_metadata_changes: vec![],
-            move_id: None,
-            move_direction: None,
-            structural_change: None,
-            border_group_id: None,
-            paragraph_mark_status: None,
-        }
-    }
-
-    #[test]
-    fn test_detect_join_deleted_after_modified() {
-        let mut blocks = vec![
-            make_modified_block(
-                "target_p9",
-                "First paragraph.",
-                "First paragraph. Second paragraph content.",
-            ),
-            make_full_doc_block(
-                "deleted:base_p2",
-                ChangeType::Deleted,
-                "Second paragraph content.",
-            ),
-        ];
-        detect_joins_splits(&mut blocks);
-        assert_eq!(
-            blocks[1].structural_change,
-            Some(StructuralChange::Join {
-                into_block_id: NodeId::from("target_p9")
-            }),
-        );
-        assert!(blocks[0].structural_change.is_none());
-    }
-
-    #[test]
-    fn test_detect_split_inserted_after_modified() {
-        let mut blocks = vec![
-            make_modified_block(
-                "target_p9",
-                "Full paragraph with extra content.",
-                "Full paragraph.",
-            ),
-            make_full_doc_block("target_p10", ChangeType::Inserted, "with extra content."),
-        ];
-        detect_joins_splits(&mut blocks);
-        assert_eq!(
-            blocks[1].structural_change,
-            Some(StructuralChange::Split {
-                from_block_id: NodeId::from("target_p9")
-            }),
-        );
-        assert!(blocks[0].structural_change.is_none());
-    }
-
-    #[test]
-    fn test_detect_join_ignores_short_text() {
-        let mut blocks = vec![
-            make_modified_block("p0", "Hello.", "Hello. Hi."),
-            make_full_doc_block("p1", ChangeType::Deleted, "Hi."),
-        ];
-        detect_joins_splits(&mut blocks);
-        assert!(blocks[1].structural_change.is_none());
-    }
-
-    #[test]
-    fn test_detect_join_ignores_non_adjacent_patterns() {
-        let mut blocks = vec![
-            make_modified_block(
-                "p0",
-                "First paragraph.",
-                "First paragraph. Appended content here.",
-            ),
-            make_full_doc_block("p1", ChangeType::Unchanged, "Separator paragraph."),
-            make_full_doc_block("p2", ChangeType::Deleted, "Appended content here."),
-        ];
-        detect_joins_splits(&mut blocks);
-        assert!(blocks[2].structural_change.is_none());
-    }
-
-    #[test]
-    fn test_detect_split_not_triggered_when_suffix_in_both() {
-        let mut blocks = vec![
-            make_modified_block(
-                "p0",
-                "Some text with shared suffix.",
-                "Different text with shared suffix.",
-            ),
-            make_full_doc_block("p1", ChangeType::Inserted, "with shared suffix."),
-        ];
-        detect_joins_splits(&mut blocks);
-        assert!(blocks[1].structural_change.is_none());
-    }
-
-    #[test]
-    fn diff_and_full_document_runs_same_reconcile_passes_as_diff_documents() {
-        // P0 #5: the production redline path (compare_and_redline →
-        // diff_and_full_document) must build the SAME changes as the canonical
-        // diff_documents path. It used to re-implement change-building and skip
-        // reconcile_paragraph_splits / reconcile_math_deleted_inserted_replacements
-        // / diff_opaque_blocks, so e.g. a paragraph split was left as an
-        // unreconciled BlockModified + BlockInserted and merged wrong.
-        let base = make_doc(
-            "doc",
-            vec![make_paragraph("p0", "Alpha clause here. Beta clause here.")],
-            "fp1",
-        );
-        let target = make_doc(
-            "doc",
-            vec![
-                make_paragraph("p0", "Alpha clause here."),
-                make_paragraph("p1", "Beta clause here."),
-            ],
-            "fp2",
-        );
-
-        let canonical = diff_documents(&base, &target).expect("diff_documents");
-        let (production, _blocks) =
-            diff_and_full_document(&base, &target, &HashMap::new(), &HashMap::new())
-                .expect("diff_and_full_document");
-
-        // The split must actually be reconciled in the canonical path, otherwise
-        // this test would pass vacuously.
-        assert!(
-            canonical.changes.iter().any(|c| matches!(
-                c,
-                DiffChange::BlockModified {
-                    para_split: true,
-                    ..
-                }
-            )),
-            "precondition: the canonical diff should mark the paragraph split"
-        );
-        assert_eq!(
-            format!("{:?}", production.changes),
-            format!("{:?}", canonical.changes),
-            "production redline path must produce the same reconciled changes as diff_documents"
-        );
-    }
-
-    #[test]
     fn reconcile_paragraph_splits_marks_real_prefix_split_only() {
         let mut changes = vec![
             DiffChange::BlockInserted {
@@ -10861,19 +10236,332 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_join_skips_moved_blocks() {
-        let mut blocks = vec![
-            make_modified_block(
-                "p0",
-                "First paragraph.",
-                "First paragraph. Moved content from elsewhere.",
-            ),
-            make_full_doc_block("p1", ChangeType::Deleted, "Moved content from elsewhere."),
-        ];
-        blocks[1].move_id = Some("move_0".to_string());
-        blocks[1].move_direction = Some(MoveDirection::From);
-        detect_joins_splits(&mut blocks);
-        assert!(blocks[1].structural_change.is_none());
+    fn complete_document_replacement_preserves_unrelated_paragraphs() {
+        let base = make_doc(
+            "base",
+            vec![
+                make_paragraph(
+                    "b0",
+                    "Alpha beta gamma delta epsilon the celestial horizon.",
+                ),
+                make_paragraph("b1", "Zeta eta theta iota kappa luminous orchard."),
+                make_paragraph("b2", "Lambda mu nu xi omicron crystalline harbor."),
+            ],
+            "fp1",
+        );
+        let target = make_doc(
+            "target",
+            vec![
+                make_paragraph("t0", "Uno dos tres cuatro cinco bosque tranquilo."),
+                make_paragraph("t1", "Seis siete ocho nueve diez the camino dorado."),
+            ],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+
+        let insertions = diff
+            .changes
+            .iter()
+            .filter(|change| matches!(change, DiffChange::BlockInserted { .. }))
+            .count();
+        let deletions = diff
+            .changes
+            .iter()
+            .filter(|change| matches!(change, DiffChange::BlockDeleted { .. }))
+            .count();
+        let modifications = diff
+            .changes
+            .iter()
+            .filter(|change| matches!(change, DiffChange::BlockModified { .. }))
+            .count();
+        assert_eq!(insertions, 1, "one target paragraph owns the boundary");
+        assert_eq!(deletions, 2, "one source paragraph owns the boundary");
+        assert_eq!(modifications, 1, "one physical paragraph boundary survives");
+        let boundary_changes = diff.changes.iter().find_map(|change| match change {
+            DiffChange::BlockModified { inline_changes, .. } => Some(inline_changes),
+            _ => None,
+        });
+        assert!(
+            boundary_changes.is_some_and(|changes| {
+                !changes.is_empty()
+                    && changes.iter().all(|change| {
+                        matches!(
+                            change,
+                            InlineChange::Inserted { .. } | InlineChange::Deleted { .. }
+                        )
+                    })
+            }),
+            "the physical boundary must not create shared content lineage"
+        );
+
+        let revision = RevisionInfo {
+            revision_id: 1,
+            author: Some("test".to_string()),
+            date: Some("2026-08-16T00:00:00Z".to_string()),
+            apply_op_id: None,
+            identity: 0,
+        };
+        let merged = merge_diff(&base, &target, &diff, &revision)
+            .expect("complete replacement should merge")
+            .doc;
+        let mut accepted = merged.clone();
+        accept_all(&mut accepted);
+        assert!(
+            diff_documents(&accepted, &target)
+                .expect("accepted fixpoint diff")
+                .changes
+                .is_empty(),
+            "accepting the unrelated replacement must reproduce the target"
+        );
+
+        let mut rejected = merged;
+        reject_all_with_styles(&mut rejected, None);
+        assert!(
+            diff_documents(&rejected, &base)
+                .expect("rejected fixpoint diff")
+                .changes
+                .is_empty(),
+            "rejecting the unrelated replacement must reproduce the source"
+        );
+    }
+
+    #[test]
+    fn terminal_boundary_reuses_empty_source_paragraph_after_a_table() {
+        let base = make_doc(
+            "base",
+            vec![
+                make_paragraph("b0", "Source opening has no target relation."),
+                make_paragraph("b1", "Source tail has no target relation."),
+                make_table_with_cell_paragraphs("table", &["source cell"]),
+                make_paragraph("b2", ""),
+            ],
+            "fp1",
+        );
+        let target = make_doc(
+            "target",
+            vec![
+                make_paragraph("t0", "Target opening is wholly inserted."),
+                make_paragraph("t1", "Target tail is wholly inserted."),
+            ],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+        let boundary = diff.changes.iter().find_map(|change| match change {
+            DiffChange::BlockModified {
+                block_id,
+                new_block,
+                inline_changes,
+                ..
+            } => Some((block_id, new_block, inline_changes)),
+            _ => None,
+        });
+        assert!(
+            boundary.is_some_and(|(block_id, new_block, changes)| {
+                block_id.0.as_ref() == "b2"
+                    && matches!(new_block, BlockNode::Paragraph(p) if p.id.0.as_ref() == "t1")
+                    && changes.iter().all(|change| {
+                        matches!(
+                            change,
+                            InlineChange::Inserted { .. } | InlineChange::Deleted { .. }
+                        )
+                    })
+            }),
+            "the source-final paragraph must carry the physical target boundary"
+        );
+
+        let revision = RevisionInfo {
+            revision_id: 1,
+            author: Some("test".to_string()),
+            date: Some("2026-09-01T00:00:00Z".to_string()),
+            apply_op_id: None,
+            identity: 0,
+        };
+        let merged = merge_diff(&base, &target, &diff, &revision)
+            .expect("complete replacement should merge")
+            .doc;
+        let mut accepted = merged.clone();
+        accept_all(&mut accepted);
+        assert!(
+            diff_documents(&accepted, &target)
+                .expect("accepted fixpoint diff")
+                .changes
+                .is_empty(),
+            "accepting the boundary replacement must reproduce the target"
+        );
+        let mut rejected = merged;
+        reject_all_with_styles(&mut rejected, None);
+        assert!(
+            diff_documents(&rejected, &base)
+                .expect("rejected fixpoint diff")
+                .changes
+                .is_empty(),
+            "rejecting the boundary replacement must reproduce the source"
+        );
+    }
+
+    #[test]
+    fn terminal_boundary_refuses_a_target_only_hyperlink_envelope_on_an_empty_source_boundary() {
+        let base = make_doc(
+            "base",
+            vec![
+                make_paragraph("b0", "Source body."),
+                make_paragraph("b1", ""),
+            ],
+            "fp1",
+        );
+        let mut target_final = make_paragraph("t1", "");
+        let BlockNode::Paragraph(target_paragraph) = &mut target_final else {
+            unreachable!("make_paragraph must return a paragraph")
+        };
+        target_paragraph.segments = normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            id: NodeId::from("target-link"),
+            kind: OpaqueKind::Hyperlink(HyperlinkData {
+                url: None,
+                anchor: Some("bookmark".to_string()),
+                text: "link".to_string(),
+                r_id: None,
+                runs: Vec::new(),
+                extra_attrs: Vec::new(),
+            }),
+            opaque_ref: "target-link".to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("t1"),
+                docx_anchor: "target-link".to_string(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
+            raw_xml: None,
+            content_hash: None,
+        })]);
+        let target = make_doc(
+            "target",
+            vec![make_paragraph("t0", "Target body."), target_final],
+            "fp2",
+        );
+
+        let error = diff_documents(&base, &target)
+            .expect_err("neither final-boundary carrier preserves both native terminals");
+
+        let error = error.to_string();
+        assert!(error.contains("target-only hyperlink"), "{error}");
+        assert!(error.contains("document-final paragraph"), "{error}");
+    }
+
+    #[test]
+    fn terminal_boundary_supports_a_target_only_hyperlink_when_source_content_preserves_it() {
+        let base = make_doc(
+            "base",
+            vec![
+                make_paragraph("b0", "Source body."),
+                make_paragraph("b1", "Source final content."),
+            ],
+            "fp1",
+        );
+        let mut target_final = make_paragraph("t1", "");
+        let BlockNode::Paragraph(target_paragraph) = &mut target_final else {
+            unreachable!("make_paragraph must return a paragraph")
+        };
+        target_paragraph.segments = normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            id: NodeId::from("target-link"),
+            kind: OpaqueKind::Hyperlink(HyperlinkData {
+                url: None,
+                anchor: Some("bookmark".to_string()),
+                text: "link".to_string(),
+                r_id: None,
+                runs: Vec::new(),
+                extra_attrs: Vec::new(),
+            }),
+            opaque_ref: "target-link".to_string(),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from("t1"),
+                docx_anchor: "target-link".to_string(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            source_run_attrs: Vec::new(),
+            joins_following_text_run: false,
+            raw_xml: None,
+            content_hash: None,
+        })]);
+        let target = make_doc(
+            "target",
+            vec![make_paragraph("t0", "Target body."), target_final],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target)
+            .expect("source content provides the witnessed final-boundary carrier");
+        assert!(diff.changes.iter().any(|change| matches!(
+            change,
+            DiffChange::BlockModified { block_id, .. } if block_id.0.as_ref() == "b1"
+        )));
+
+        let revision = RevisionInfo {
+            revision_id: 1,
+            author: Some("test".to_string()),
+            date: Some("2026-09-01T00:00:00Z".to_string()),
+            apply_op_id: None,
+            identity: 0,
+        };
+        let merged = merge_diff(&base, &target, &diff, &revision)
+            .expect("content-bearing final hyperlink replacement should merge")
+            .doc;
+        let mut accepted = merged.clone();
+        accept_all(&mut accepted);
+        assert!(
+            diff_documents(&accepted, &target)
+                .expect("accepted fixpoint diff")
+                .changes
+                .is_empty(),
+            "accepting the boundary replacement must reproduce the target"
+        );
+        let mut rejected = merged;
+        reject_all_with_styles(&mut rejected, None);
+        assert!(
+            diff_documents(&rejected, &base)
+                .expect("rejected fixpoint diff")
+                .changes
+                .is_empty(),
+            "rejecting the boundary replacement must reproduce the source"
+        );
+    }
+
+    #[test]
+    fn terminal_boundary_does_not_reuse_a_nonfinal_paragraph_before_a_table() {
+        let base = make_doc(
+            "base",
+            vec![
+                make_paragraph("b0", "Source opening has no target relation."),
+                make_paragraph("b1", "Source tail has no target relation."),
+                make_table_with_cell_paragraphs("table", &["source cell"]),
+            ],
+            "fp1",
+        );
+        let target = make_doc(
+            "target",
+            vec![make_paragraph("t0", "Target tail is wholly inserted.")],
+            "fp2",
+        );
+
+        let diff = diff_documents(&base, &target).expect("diff should succeed");
+
+        assert!(
+            diff.changes.iter().all(|change| !matches!(
+                change,
+                DiffChange::BlockModified {
+                    block_id,
+                    new_block: BlockNode::Paragraph(paragraph),
+                    ..
+                } if block_id.0.as_ref() == "b1" && paragraph.id.0.as_ref() == "t0"
+            )),
+            "a paragraph before a trailing table is not the document-final boundary"
+        );
     }
 
     /// Tests that equal-length paragraph runs between anchors with zero
@@ -11048,6 +10736,7 @@ mod tests {
     // =========================================================================
 
     fn make_paragraph_with_marks(id: &str, text: &str, marks: Vec<Mark>) -> BlockNode {
+        let rpr_authored = RunRprAuthored::from_effective(&marks, &StyleProps::default());
         BlockNode::from(ParagraphNode {
             id: NodeId::from(id.to_string()),
             style_id: None,
@@ -11081,7 +10770,7 @@ mod tests {
                 text: text.to_string(),
                 marks,
                 style_props: StyleProps::default(),
-                rpr_authored: crate::domain::RunRprAuthored::default(),
+                rpr_authored,
                 source_run_attrs: Vec::new(),
                 formatting_change: None,
             })]),
@@ -11153,7 +10842,10 @@ mod tests {
             text: "Hello World".to_string(),
             marks: vec![Mark::Bold],
             style_props: StyleProps::default(),
-            rpr_authored: crate::domain::RunRprAuthored::default(),
+            rpr_authored: crate::domain::RunRprAuthored {
+                bold: true,
+                ..Default::default()
+            },
             source_run_attrs: Vec::new(),
             formatting_change: None,
         })];
@@ -11341,10 +11033,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modified_paragraph_style_change_does_not_invent_run_formatting_revisions() {
+        // Domain rule: effective run formatting inherited from pStyle belongs
+        // to the paragraph/style transition. A simultaneous text edit must not
+        // cause that inherited delta to be emitted again as w:rPrChange.
+        let mut base_para = make_paragraph_with_marks("p1", "Linked Char old", vec![]);
+        let mut target_para = make_paragraph_with_marks("p1", "Linked Char new", vec![]);
+        if let (BlockNode::Paragraph(base), BlockNode::Paragraph(target)) =
+            (&mut base_para, &mut target_para)
+        {
+            base.style_id = Some("SD_LinkedSizeHeading".into());
+            target.style_id = Some("SD_LinkedStrikeHeading".into());
+
+            let InlineNode::Text(base_text) = &mut base.segments[0].inlines[0] else {
+                panic!("fixture must contain text")
+            };
+            base_text.style_props.font_size = Some(28);
+            base_text.rpr_authored = RunRprAuthored::default();
+
+            let InlineNode::Text(target_text) = &mut target.segments[0].inlines[0] else {
+                panic!("fixture must contain text")
+            };
+            target_text.style_props.strike = MarkValue::On;
+            target_text.rpr_authored = RunRprAuthored::default();
+        }
+
+        let diff = diff_documents(
+            &make_doc("base", vec![base_para], "base-fp"),
+            &make_doc("target", vec![target_para], "target-fp"),
+        )
+        .expect("style plus text change should compile");
+
+        let DiffChange::BlockModified { inline_changes, .. } = &diff.changes[0] else {
+            panic!("expected a modified paragraph")
+        };
+        assert!(inline_changes.iter().all(|change| !matches!(
+            change,
+            InlineChange::Unchanged {
+                formatting_change: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn modified_paragraph_style_change_preserves_independent_direct_run_change() {
+        // A pStyle carrier does not subsume a genuinely authored run edit.
+        // The unchanged anchor text therefore still needs its own rPrChange.
+        let mut base_para = make_paragraph_with_marks("p1", "Anchor old", vec![]);
+        let mut target_para = make_paragraph_with_marks("p1", "Anchor new", vec![]);
+        if let (BlockNode::Paragraph(base), BlockNode::Paragraph(target)) =
+            (&mut base_para, &mut target_para)
+        {
+            base.style_id = Some("SourceStyle".into());
+            target.style_id = Some("TargetStyle".into());
+
+            let InlineNode::Text(target_text) = &mut target.segments[0].inlines[0] else {
+                panic!("fixture must contain text")
+            };
+            target_text.marks.push(Mark::Bold);
+            target_text.rpr_authored.bold = true;
+        }
+
+        let diff = diff_documents(
+            &make_doc("base", vec![base_para], "base-fp"),
+            &make_doc("target", vec![target_para], "target-fp"),
+        )
+        .expect("style, text, and direct run change should compile");
+
+        let DiffChange::BlockModified { inline_changes, .. } = &diff.changes[0] else {
+            panic!("expected a modified paragraph")
+        };
+        assert!(inline_changes.iter().any(|change| matches!(
+            change,
+            InlineChange::Unchanged {
+                formatting_change: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn modified_text_and_direct_run_change_keep_independent_carriers() {
+        let base_para = make_paragraph_with_marks("p1", "Anchor old", vec![]);
+        let mut target_para = make_paragraph_with_marks("p1", "Anchor new", vec![]);
+        let BlockNode::Paragraph(target) = &mut target_para else {
+            panic!("fixture must contain a paragraph")
+        };
+        let InlineNode::Text(target_text) = &mut target.segments[0].inlines[0] else {
+            panic!("fixture must contain text")
+        };
+        target_text.marks.push(Mark::Bold);
+        target_text.rpr_authored.bold = true;
+
+        let diff = diff_documents(
+            &make_doc("base", vec![base_para], "base-fp"),
+            &make_doc("target", vec![target_para], "target-fp"),
+        )
+        .expect("text and direct run change should compile");
+
+        let DiffChange::BlockModified { inline_changes, .. } = &diff.changes[0] else {
+            panic!("expected a modified paragraph")
+        };
+        assert!(
+            inline_changes
+                .iter()
+                .any(|change| matches!(change, InlineChange::Inserted { .. }))
+        );
+        assert!(
+            inline_changes
+                .iter()
+                .any(|change| matches!(change, InlineChange::Deleted { .. }))
+        );
+        assert!(inline_changes.iter().any(|change| matches!(
+            change,
+            InlineChange::Unchanged {
+                formatting_change: Some(_),
+                ..
+            }
+        )));
+    }
+
     fn make_opaque(segment_type: InlineChangeSegmentType, idx: usize) -> InlineChange {
+        make_opaque_of_kind(segment_type, idx, OpaqueSegmentKind::Field)
+    }
+
+    fn make_opaque_of_kind(
+        segment_type: InlineChangeSegmentType,
+        idx: usize,
+        kind: OpaqueSegmentKind,
+    ) -> InlineChange {
         InlineChange::Opaque {
             segment_type,
-            kind: OpaqueSegmentKind::Field,
+            kind,
             opaque_id: format!("op_{idx}"),
             inline_index: idx,
             text: None,
@@ -11398,6 +11220,34 @@ mod tests {
             types,
             vec![&Equal, &Delete, &Insert, &Delete, &Insert, &Equal]
         );
+    }
+
+    #[test]
+    fn sort_opaque_runs_places_drawing_insert_before_delete_at_same_position() {
+        let changes = vec![
+            make_opaque_of_kind(
+                InlineChangeSegmentType::Delete,
+                2,
+                OpaqueSegmentKind::Drawing,
+            ),
+            make_opaque_of_kind(
+                InlineChangeSegmentType::Insert,
+                2,
+                OpaqueSegmentKind::Drawing,
+            ),
+        ];
+
+        let sorted = sort_opaque_runs_by_inline_index(changes);
+        let types: Vec<&InlineChangeSegmentType> = sorted
+            .iter()
+            .map(|change| match change {
+                InlineChange::Opaque { segment_type, .. } => segment_type,
+                _ => unreachable!(),
+            })
+            .collect();
+
+        use InlineChangeSegmentType::*;
+        assert_eq!(types, vec![&Insert, &Delete]);
     }
 
     #[test]

@@ -40,6 +40,7 @@
 * [Agent benchmarks](benchmarks.md)
 * [Benchmark archive](benchmarks-history.md)
 * [Architecture](internals/architecture.md)
+* [Comparison boundary](internals/comparison-boundary.md)
 * [Testing](internals/testing.md)
 * [Design notes](internals/design-notes.md)
 * [Change log](https://github.com/stemma-sh/stemma/blob/main/CHANGELOG.md)

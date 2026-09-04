@@ -22,6 +22,8 @@ use stemma::api::{Document, validate};
 use stemma::domain::RevisionInfo;
 use stemma::edit::{EditStep, EditTransaction, MaterializationMode};
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 // ─── Prelude: minimal-DOCX plumbing ─────────────────────────────────────────
 

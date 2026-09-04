@@ -1,0 +1,10 @@
+[package]
+name = "stemma-doc-tests"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+
+[dependencies]
+stemma = { path = "../stemma-engine" }
+stemma-diff = { path = "../stemma-diff" }

@@ -28,6 +28,8 @@
 //!   (opaque fidelity — the input's own state is not ours to "repair").
 
 use std::io::{Cursor, Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 use zip::ZipArchive;

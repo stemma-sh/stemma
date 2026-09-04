@@ -39,6 +39,7 @@ MCP, the MCP client or its configured model provider may receive selected
 document content through tool calls; consult the client's data policy.
 
 [Documentation](https://stemma.sh/docs) ·
+[LLM documentation](https://stemma.sh/docs/llms.txt) ·
 [CLI reference](https://stemma.sh/docs/reference/cli) ·
 [MCP setup](stemma-mcp/README.md) ·
 [Benchmarks](https://stemma.sh/docs/benchmarks) ·
@@ -97,8 +98,16 @@ Stemma creates `changed.docx` and reports the result:
 wrote redline to changed.docx (<n> tracked revisions); bytes=<n> sha256=<hex> collision_policy=create_new disposition=created
 ```
 
-**Rejecting every change reconstructs `as-sent.docx`. Accepting every change
-reconstructs `as-returned.docx`.**
+**Rejecting every change reconstructs the accepted reading of `as-sent.docx`.
+Accepting every change reconstructs the accepted reading of
+`as-returned.docx`.** Pending revisions in either input are flattened before
+comparison and reported rather than stacked into ambiguous history.
+
+Comparison has one opinionated Stemma presentation. Microsoft Word is the
+authority for whether its native tracked-change carriers open and resolve
+correctly, not a visual template Stemma tries to imitate. If the two readings
+cannot be represented safely by those carriers, Stemma refuses with context
+instead of switching to a weaker comparer.
 
 ### Apply approved changes
 
@@ -191,7 +200,7 @@ Stemma achieved 95% task success versus 82% for raw-XML editing. The
 [full report](https://stemma.sh/docs/benchmarks) documents the version basis,
 methodology, failures, corrections, and reproducibility limits. It is evidence
 about the agent interface, not a claim of independent validation or current
-v0.5 engine correctness.
+v0.6 engine correctness.
 
 ## Current scope
 
@@ -235,8 +244,9 @@ mise install
 just gate
 ```
 
-The workspace contains the Rust engine, CLI, MCP server, shared artifact
-boundary, and a local HTTP/editor demonstration. See the
+The workspace contains the Rust engine, the opinionated `stemma-diff`
+comparison crate, CLI, MCP server, shared artifact boundary, and a local
+HTTP/editor demonstration. See the
 [architecture map](https://stemma.sh/docs/internals/architecture) for the component layout.
 
 Most of the code was written with AI assistance. Human maintainers provide the

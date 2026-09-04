@@ -196,8 +196,8 @@ fn collect_referenced_num_ids(element: &Element, out: &mut Vec<String>) {
 /// Check that every `commentReference` w:id in story parts points to a
 /// `w:comment` defined in `word/comments.xml`.
 ///
-/// A dangling reference means the comment balloon will be lost when Word
-/// opens the file.
+/// A dangling reference makes Word repair the package and discard the broken
+/// comment carrier. This is a blocking package invariant, not an advisory.
 pub(crate) fn check_xref_003_comment_ids(state: &PackageState) -> Vec<ValidationFinding> {
     let mut findings = Vec::new();
 
@@ -230,7 +230,7 @@ pub(crate) fn check_xref_003_comment_ids(state: &PackageState) -> Vec<Validation
         if !defined_comment_ids.contains(id.as_str()) {
             findings.push(ValidationFinding {
                 rule_id: "I-XREF-003",
-                severity: ValidationSeverity::Warning,
+                severity: ValidationSeverity::Error,
                 message: format!(
                     "commentReference w:id='{id}' is referenced but not defined in word/comments.xml"
                 ),
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn xref_003_dangling_comment_reference_produces_warning() {
+    fn xref_003_dangling_comment_reference_produces_error() {
         let state = make_state(&[
             (
                 "word/comments.xml",
@@ -790,7 +790,7 @@ mod tests {
         let findings = check_xref_003_comment_ids(&state);
         assert_eq!(findings.len(), 1, "expected 1 finding, got: {findings:?}");
         assert_eq!(findings[0].rule_id, "I-XREF-003");
-        assert_eq!(findings[0].severity, ValidationSeverity::Warning);
+        assert_eq!(findings[0].severity, ValidationSeverity::Error);
         assert!(findings[0].message.contains("99"));
     }
 
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn xref_003_no_comments_xml_with_refs_produces_warning() {
+    fn xref_003_no_comments_xml_with_refs_produces_error() {
         let state = make_state(&[(
             "word/document.xml",
             r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -905,6 +905,7 @@ mod tests {
             "no comments.xml but ref exists: {findings:?}"
         );
         assert_eq!(findings[0].rule_id, "I-XREF-003");
+        assert_eq!(findings[0].severity, ValidationSeverity::Error);
         assert!(findings[0].message.contains("5"));
     }
 }

@@ -1,6 +1,8 @@
 //! Integration tests for the clone_handle functionality.
 
 use std::fs;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 

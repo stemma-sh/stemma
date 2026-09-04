@@ -7,7 +7,10 @@
 //! content-bearing paragraphs.
 
 use std::fs;
-use stemma::{DiffChange, DocxRuntime, InlineChange, SimpleRuntime};
+use stemma::{DocxRuntime, InlineChange, SimpleRuntime};
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use crate::common;
 

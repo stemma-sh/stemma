@@ -198,7 +198,7 @@ fn an_unchanged_paragraph_mark_snapshot_survives_save_and_reopen() {
             panic!("paragraph");
         };
         let fc = p.formatting_change.as_ref().expect("pPrChange present");
-        fc.previous_paragraph_mark_style_props.clone()
+        fc.previous.paragraph_mark.style_props.clone()
     };
     let authored = snapshot_mark(&edited);
     assert_eq!(

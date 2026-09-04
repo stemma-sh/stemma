@@ -34,12 +34,20 @@ This snippet is compile-checked against the real facade by the engine's
 doctests:
 
 ```rust,no_run
-use stemma::api::Document;
+use stemma::api::{DiagnosticLevel, Document};
 use stemma::edit_v4::parse_transaction;
 
 fn one_edit_cycle(source: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // Bytes in.
     let doc = Document::parse(source)?;
+
+    // Parsing can perform only narrowly defined, deterministic package
+    // normalizations. They are never silent.
+    for diagnostic in doc.diagnostics() {
+        if diagnostic.level == DiagnosticLevel::Warning {
+            eprintln!("DOCX import warning: {}", diagnostic.message);
+        }
+    }
 
     // Read: the lean view carries block ids, text, and each block's `guard`.
     let view = doc.read();
@@ -77,10 +85,56 @@ versions: `cargo run -p stemma --example my_first_edit` and
 One import rule covers the whole facade: **every type a `Document` signature
 names is importable from `stemma::api`**, next to `Document` itself:
 `Resolution`, `ResolveSelectionAction`, `ExportOptions`, `RuntimeError`,
-`RevisionRecord`, and the rest. (Most are also re-exported at the crate
+`Diagnostic`, `DiagnosticLevel`, `RevisionRecord`, and the rest. (Most are also re-exported at the crate
 root; `stemma::ExportOptions` and `stemma::api::ExportOptions` are the same
 type.) Nothing on this page requires knowing which internal module defines
 what.
+
+### Parse diagnostics and byte validation
+
+`Document::parse` establishes editable engine state. It fails on unknown or
+unsafe structures, but it may apply a specifically supported Word-compatible
+normalization at the import edge. Every such normalization is retained on
+`Document::diagnostics()` and carried unchanged through derived edits.
+
+`stemma::api::validate(bytes)` asks a different question: whether those exact
+input bytes satisfy the package and WordprocessingML checks. It does not first
+normalize them. Consequently, malformed raw bytes can fail `validate` while
+`Document::parse` accepts the one known safe case, reports a warning, and later
+serializes normalized bytes. In v0.6 that exception is limited to a dead
+package-root thumbnail relationship whose target is absent, matching Word's
+save behavior. Missing relationships used by document content, stories,
+drawings, or embedded objects remain hard failures.
+
+Treat warnings as provenance, not success noise: surface or log them alongside
+the imported artifact. Re-parsing serialized output starts a new diagnostic
+scope, so a repaired condition no longer appears.
+
+## Comparing two documents
+
+Comparison is deliberately not a `Document` method. Add `stemma-diff` at the
+same minor version when the product needs to infer changes between independently
+authored documents:
+
+```rust,ignore
+let base = stemma::api::Document::parse(&base_bytes)?;
+let target = stemma::api::Document::parse(&target_bytes)?;
+let redline = stemma_diff::diff_as(&base, &target, "Reviewer")?;
+let bytes = redline.serialize(&stemma::ExportOptions::default())?;
+```
+
+There is one comparison contract and one Stemma presentation. Both inputs are
+compared by their accepted readings; a successful result rejects to the
+accepted base and accepts to the accepted target. The returned value is an
+ordinary engine `Document`, so revision enumeration, projection, review, and
+serialization stay on the engine facade. An unrepresentable relationship is a
+typed refusal, never a switch to a fallback comparer.
+
+Product adapters should use `diff_detailed` or `diff_as_detailed`. Their
+`ComparisonResult` keeps the redline together with the semantic change count,
+the pending revision census flattened from each input, and source-labelled
+import diagnostics. The convenience functions above return only the document
+for callers that already surfaced input provenance when parsing.
 
 ## Resolving a redline (Tier 1)
 
@@ -170,7 +224,8 @@ What it actually is:
   state check liveness after a sweep instead of keeping a second clock.
 - **The write entry point for a caller-attributed edit** is
   `apply_edit_authored(handle, &txn, allow_existing_author)`, the same
-  author-collision policy every transport enforces. `review_session(handle)`
+  author-label confirmation policy every transport enforces.
+  `review_session(handle)`
   audits everything the handle changed since open, against the retained
   open-time baseline; `clone_handle` branches a session that shares that
   lineage.

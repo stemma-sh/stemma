@@ -13,6 +13,8 @@
 
 use std::fs;
 use std::io::{Cursor, Read};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 use xmltree::{Element, XMLNode};

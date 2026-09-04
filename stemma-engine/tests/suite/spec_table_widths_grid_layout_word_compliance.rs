@@ -20,6 +20,8 @@
 //! a parse failure on such a form is the divergence we are hunting.
 
 use std::io::{Cursor, Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::ExportOptions;
 use stemma::api::{Document, validate};

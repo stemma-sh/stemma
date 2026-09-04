@@ -16,6 +16,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read as _};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::docx::DocxArchive;
 use stemma::{DocxRuntime, ExportMode, InlineNode, SimpleRuntime, TrackingStatus, TransactionMeta};

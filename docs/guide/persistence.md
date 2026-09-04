@@ -60,9 +60,9 @@ caller's to pin:
   store it inside the transaction like everything else.
 
 One thing is deliberately NOT in the transaction: `allow_existing_author`,
-the per-call assertion that continuing an existing author is intended. It is
-transport policy, enforced at admission. Which leads to the one subtlety of
-replay:
+the per-call assertion that continuing an existing Word reviewer group is
+intended. It is transport policy, enforced at admission. Which leads to the one
+subtlety of replay:
 
 ## Resolutions are part of the log
 

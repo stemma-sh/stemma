@@ -235,10 +235,11 @@ fn collect_normalizable_part_paths(archive: &DocxArchive) -> Result<Vec<String>,
     Ok(paths)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum NoteKind {
     Footnote,
     Endnote,
+    Comment,
 }
 
 impl NoteKind {
@@ -246,13 +247,20 @@ impl NoteKind {
         match self {
             Self::Footnote => FOOTNOTES_REL_TYPE,
             Self::Endnote => ENDNOTES_REL_TYPE,
+            Self::Comment => COMMENTS_REL_TYPE,
         }
     }
 
-    fn reference_tag(self) -> &'static str {
+    fn is_reference_tag(self, local_name: &str) -> bool {
         match self {
-            Self::Footnote => "footnoteReference",
-            Self::Endnote => "endnoteReference",
+            Self::Footnote => local_name == "footnoteReference",
+            Self::Endnote => local_name == "endnoteReference",
+            // A range-only comment is a valid zero-width annotation shape.
+            // Any surviving member of the anchor triple keeps its definition.
+            Self::Comment => matches!(
+                local_name,
+                "commentReference" | "commentRangeStart" | "commentRangeEnd"
+            ),
         }
     }
 
@@ -260,6 +268,7 @@ impl NoteKind {
         match self {
             Self::Footnote => "footnote",
             Self::Endnote => "endnote",
+            Self::Comment => "comment",
         }
     }
 }
@@ -291,7 +300,7 @@ fn collect_note_part_path(
 }
 
 fn collect_note_reference_ids(element: &Element, kind: NoteKind, ids: &mut HashSet<String>) {
-    if local_element_name(element) == kind.reference_tag()
+    if kind.is_reference_tag(local_element_name(element))
         && let Some(id) = get_attr(element, "id")
     {
         ids.insert(id.to_string());
@@ -310,7 +319,8 @@ fn is_reserved_note_definition(element: &Element) -> bool {
     )
 }
 
-/// Reconcile note definitions with the references that survive accept/reject.
+/// Reconcile note/comment definitions with the references that survive
+/// accept/reject.
 ///
 /// A tracked InsertNote wraps the body reference in `w:ins`, while its backing
 /// `w:footnote`/`w:endnote` definition is ordinary story content. Rejecting the
@@ -320,20 +330,28 @@ fn is_reserved_note_definition(element: &Element) -> bool {
 /// resolver disagree with the typed projection and can trigger a Word repair.
 fn prune_unreferenced_note_definitions(
     archive: &mut DocxArchive,
+    original: &DocxArchive,
     story_part_paths: &[String],
 ) -> Result<Vec<String>, NormalizeError> {
     let mut changed_parts = Vec::new();
-    for kind in [NoteKind::Footnote, NoteKind::Endnote] {
+    for kind in [NoteKind::Footnote, NoteKind::Endnote, NoteKind::Comment] {
         let Some(note_part_path) = collect_note_part_path(archive, kind)? else {
             continue;
         };
         let mut referenced_ids = HashSet::new();
+        let mut originally_referenced_ids = HashSet::new();
         for story_path in story_part_paths {
             let Some(bytes) = archive.get(story_path) else {
                 continue;
             };
             let root = parse_xml(bytes)?;
             collect_note_reference_ids(&root, kind, &mut referenced_ids);
+            if kind == NoteKind::Comment
+                && let Some(original_bytes) = original.get(story_path)
+            {
+                let original_root = parse_xml(original_bytes)?;
+                collect_note_reference_ids(&original_root, kind, &mut originally_referenced_ids);
+            }
         }
 
         let Some(note_bytes) = archive.get(&note_part_path) else {
@@ -354,6 +372,7 @@ fn prune_unreferenced_note_definitions(
                 return true;
             };
             referenced_ids.contains(id)
+                || (kind == NoteKind::Comment && !originally_referenced_ids.contains(id))
         });
         if root.children.len() != before {
             archive.upsert(&note_part_path, write_xml(&root)?);
@@ -527,6 +546,7 @@ const PR_CHANGE_TAGS: &[&str] = &[
     "rPrChange",
     "pPrChange",
     "tblPrChange",
+    "tblPrExChange",
     "trPrChange",
     "tcPrChange",
     "sectPrChange",
@@ -600,6 +620,139 @@ fn is_move_range_marker(element: &Element) -> bool {
     ]
     .iter()
     .any(|tag| is_w_tag(element, tag))
+}
+
+fn custom_xml_deletion_range_id<'a>(element: &'a Element, local_name: &str) -> Option<&'a str> {
+    is_w_tag(element, local_name)
+        .then(|| get_attr(element, "id"))
+        .flatten()
+}
+
+/// Whether `children[index..index + 3]` is the bounded inline-SDT deletion
+/// carrier proved by W-SDT-INLINE-DELETE-01:
+///
+/// `customXmlDelRangeStart`, one `w:sdt` whose complete `w:sdtContent` is one
+/// `w:del`, then the matching `customXmlDelRangeEnd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeletedInlineSdtEnvelope {
+    /// Engine-emitted pre-Word-save form: the range encloses the whole SDT.
+    Direct,
+    /// Word-save form: the incoming range ends at the start of sdtContent and
+    /// a new outgoing range begins after the deletion inside sdtContent.
+    WordNormalized,
+}
+
+fn deleted_inline_sdt_envelope_at(
+    children: &[XMLNode],
+    index: usize,
+) -> Option<DeletedInlineSdtEnvelope> {
+    let [
+        XMLNode::Element(start),
+        XMLNode::Element(sdt),
+        XMLNode::Element(end),
+    ] = children.get(index..index.saturating_add(3)).unwrap_or(&[])
+    else {
+        return None;
+    };
+    let start_id = custom_xml_deletion_range_id(start, "customXmlDelRangeStart")?;
+    if !is_w_tag(sdt, "sdt") {
+        return None;
+    }
+    let contents = sdt
+        .children
+        .iter()
+        .filter_map(XMLNode::as_element)
+        .filter(|child| is_w_tag(child, "sdtContent"))
+        .collect::<Vec<_>>();
+    if contents.len() != 1 {
+        return None;
+    }
+    let meaningful = contents[0]
+        .children
+        .iter()
+        .filter(|child| match child {
+            XMLNode::Text(text) | XMLNode::CData(text) => !text.trim().is_empty(),
+            XMLNode::Comment(_) => false,
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    match meaningful.as_slice() {
+        [XMLNode::Element(deletion)]
+            if is_w_tag(deletion, "del")
+                && custom_xml_deletion_range_id(end, "customXmlDelRangeEnd") == Some(start_id) =>
+        {
+            Some(DeletedInlineSdtEnvelope::Direct)
+        }
+        [
+            XMLNode::Element(incoming_end),
+            XMLNode::Element(deletion),
+            XMLNode::Element(outgoing_start),
+        ] if custom_xml_deletion_range_id(incoming_end, "customXmlDelRangeEnd")
+            == Some(start_id)
+            && is_w_tag(deletion, "del")
+            && custom_xml_deletion_range_id(outgoing_start, "customXmlDelRangeStart")
+                .is_some_and(|outgoing_id| {
+                    custom_xml_deletion_range_id(end, "customXmlDelRangeEnd") == Some(outgoing_id)
+                }) =>
+        {
+            Some(DeletedInlineSdtEnvelope::WordNormalized)
+        }
+        _ => None,
+    }
+}
+
+fn strip_word_normalized_sdt_deletion_boundaries(sdt: &mut Element) {
+    let Some(content) = sdt.children.iter_mut().find_map(|child| {
+        child
+            .as_mut_element()
+            .filter(|child| is_w_tag(child, "sdtContent"))
+    }) else {
+        return;
+    };
+    content.children.retain(|child| {
+        !matches!(child, XMLNode::Element(element)
+            if custom_xml_deletion_range_id(element, "customXmlDelRangeEnd").is_some()
+                || custom_xml_deletion_range_id(element, "customXmlDelRangeStart").is_some())
+    });
+}
+
+/// Resolve the structural half of the bounded inline-SDT deletion carrier.
+/// The ordinary revision recursion separately resolves the `w:del` inside
+/// `w:sdtContent` on Reject. On Accept the whole SDT envelope must disappear,
+/// so the carrier is removed atomically before ordinary recursion could leave
+/// an empty active content control behind.
+fn settle_inline_sdt_deletion_envelopes(
+    parent: &mut Element,
+    keep_inserted: bool,
+    stats: &mut NormalizeStats,
+) {
+    let mut index = 0usize;
+    while index + 2 < parent.children.len() {
+        let Some(envelope) = deleted_inline_sdt_envelope_at(&parent.children, index) else {
+            index += 1;
+            continue;
+        };
+        if keep_inserted {
+            let nested = match &parent.children[index + 1] {
+                XMLNode::Element(sdt) => count_nested_revisions(sdt),
+                _ => unreachable!("envelope predicate proved an SDT element"),
+            };
+            parent.children.drain(index..index + 3);
+            stats.opaque_resolved += nested;
+        } else {
+            if envelope == DeletedInlineSdtEnvelope::WordNormalized {
+                let XMLNode::Element(sdt) = &mut parent.children[index + 1] else {
+                    unreachable!("envelope predicate proved an SDT element")
+                };
+                strip_word_normalized_sdt_deletion_boundaries(sdt);
+            }
+            // Remove only the structural range. The SDT shifts into `index`;
+            // ordinary reject recursion then unwraps its deleted content.
+            parent.children.remove(index + 2);
+            parent.children.remove(index);
+            index += 1;
+        }
+    }
 }
 
 /// Check if an element is one we "unwrap" (keep children): w:ins, w:moveTo.
@@ -780,8 +933,8 @@ fn classify_scan_element(
         "moveFrom" => rev_counts.move_from += 1,
         "moveTo" => rev_counts.move_to += 1,
         "delText" => rev_counts.del_text += 1,
-        "rPrChange" | "pPrChange" | "tblPrChange" | "trPrChange" | "tcPrChange"
-        | "sectPrChange" => rev_counts.format_pr_change += 1,
+        "rPrChange" | "pPrChange" | "tblPrChange" | "tblPrExChange" | "trPrChange"
+        | "tcPrChange" | "sectPrChange" => rev_counts.format_pr_change += 1,
         "commentRangeStart" | "commentRangeEnd" | "commentReference" => comment_counts.anchors += 1,
         _ => {}
     }
@@ -1007,7 +1160,7 @@ pub fn normalize_docx(
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
     }
 
-    for part in prune_unreferenced_note_definitions(&mut output, &part_paths)? {
+    for part in prune_unreferenced_note_definitions(&mut output, archive, &part_paths)? {
         if !result.parts_normalized.contains(&part) {
             result.parts_normalized.push(part);
         }
@@ -1061,7 +1214,7 @@ pub fn reject_all_docx(
         result.opaque_nodes_resolved_revisions_count += stats.opaque_resolved;
     }
 
-    for part in prune_unreferenced_note_definitions(&mut output, &part_paths)? {
+    for part in prune_unreferenced_note_definitions(&mut output, archive, &part_paths)? {
         if !result.parts_normalized.contains(&part) {
             result.parts_normalized.push(part);
         }
@@ -1259,10 +1412,13 @@ fn resolve_selected_in(
                 // Recurse through ordinary wrappers (paragraph, hyperlink,
                 // smartTag, …) but never INTO a revision carrier — its interior
                 // is stacked territory.
+                let had_nested_revision = has_nested_content_revision(&el);
                 if !is_content_revision(&el) {
                     resolve_selected_in(&mut el, selected, accept, resolved);
                 }
-                new_children.push(XMLNode::Element(el));
+                if !is_revision_emptied_hyperlink(&el, had_nested_revision) {
+                    new_children.push(XMLNode::Element(el));
+                }
             }
             other => new_children.push(other),
         }
@@ -1279,6 +1435,7 @@ fn resolve_selected_in(
 /// - *PrChange → restore previous properties from the record
 /// - Everything else → recurse
 fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaque: bool) {
+    settle_inline_sdt_deletion_envelopes(parent, false, stats);
     settle_inserted_mark_restored_with_move(parent, stats, inside_opaque);
     // Join paragraphs whose mark insertion this reject un-proposes (must
     // precede the revision pass, which drops the markers).
@@ -1361,6 +1518,7 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
             }
             XMLNode::Element(mut el) => {
                 // Non-revision element: recurse into it
+                let had_nested_revision = has_nested_content_revision(&el);
                 let child_opaque = inside_opaque || is_opaque_container(&el);
                 reject_children(&mut el, stats, child_opaque);
                 // A surviving cell's w:cellDel marker (§17.13.5.1) is resolved
@@ -1378,6 +1536,11 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
                 // zero w:tr children. Remove it rather than producing invalid XML.
                 if is_w_tag(&el, "tbl") && !has_any_row(&el) {
                     // Table is now empty — drop it entirely.
+                } else if is_revision_emptied_hyperlink(&el, had_nested_revision) {
+                    // A paragraph-level hyperlink carries revisions on its inner
+                    // runs. Resolving away every run removes the hyperlink too;
+                    // retaining an empty relationship-bearing shell would invent
+                    // a semantic object absent from this terminal.
                 } else {
                     new_children.push(XMLNode::Element(el));
                 }
@@ -1686,6 +1849,7 @@ const REVISION_BYTE_MARKERS: &[&[u8]] = &[
     b"<w:rPrChange",
     b"<w:pPrChange",
     b"<w:tblPrChange",
+    b"<w:tblPrExChange",
     b"<w:trPrChange",
     b"<w:tcPrChange",
     b"<w:sectPrChange",
@@ -1710,6 +1874,7 @@ pub(crate) const REVISION_ELEMENT_LOCAL_NAMES: &[&str] = &[
     "rPrChange",
     "pPrChange",
     "tblPrChange",
+    "tblPrExChange",
     "trPrChange",
     "tcPrChange",
     "sectPrChange",
@@ -1996,13 +2161,15 @@ fn join_mark_resolved_paragraphs(
             // never drop, an already-empty base paragraph never drops, and
             // the LAST block of a container never drops (a body/cell must
             // still end with a paragraph).
+            let container_may_be_empty = is_w_tag(parent, "sdtContent");
             let drop_empty = match &parent.children[i] {
                 XMLNode::Element(el) => {
                     paragraph_emptied_by_resolution(el, keep_inserted)
-                        && parent.children[(i + 1)..].iter().any(|c| {
-                            matches!(c, XMLNode::Element(el)
-                                if is_w_tag(el, "p") || is_w_tag(el, "tbl"))
-                        })
+                        && (container_may_be_empty
+                            || parent.children[(i + 1)..].iter().any(|c| {
+                                matches!(c, XMLNode::Element(el)
+                                    if is_w_tag(el, "p") || is_w_tag(el, "tbl"))
+                            }))
                 }
                 _ => false,
             };
@@ -2043,6 +2210,7 @@ fn join_mark_resolved_paragraphs(
 }
 
 fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaque: bool) {
+    settle_inline_sdt_deletion_envelopes(parent, true, stats);
     // Join paragraphs whose mark deletion this accept applies (must precede
     // the revision pass, which drops the markers).
     join_mark_resolved_paragraphs(parent, /*keep_inserted=*/ true, stats);
@@ -2130,6 +2298,7 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
             }
             XMLNode::Element(mut el) => {
                 // Non-revision element: recurse into it
+                let had_nested_revision = has_nested_content_revision(&el);
                 let child_opaque = inside_opaque || is_opaque_container(&el);
                 normalize_children(&mut el, stats, child_opaque);
                 // A surviving cell's w:cellIns marker (§17.13.5.2) is resolved
@@ -2147,6 +2316,10 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
                 // zero w:tr children. Remove it rather than producing invalid XML.
                 if is_w_tag(&el, "tbl") && !has_any_row(&el) {
                     // Table is now empty — drop it entirely.
+                } else if is_revision_emptied_hyperlink(&el, had_nested_revision) {
+                    // See the reject path above: inner-run tracking is the legal
+                    // OOXML carrier for a paragraph-level hyperlink insertion or
+                    // deletion, so an emptied wrapper is part of that revision.
                 } else {
                     new_children.push(XMLNode::Element(el));
                 }
@@ -2159,6 +2332,53 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
     }
 
     parent.children = new_children;
+}
+
+fn is_revision_emptied_hyperlink(element: &Element, had_nested_revision: bool) -> bool {
+    had_nested_revision && is_w_tag(element, "hyperlink") && !has_hyperlink_payload(element)
+}
+
+fn has_nested_content_revision(element: &Element) -> bool {
+    element.children.iter().any(|child| {
+        matches!(child, XMLNode::Element(child) if is_content_revision(child)
+            || is_del_text(child)
+            || has_nested_content_revision(child))
+    })
+}
+
+fn has_hyperlink_payload(element: &Element) -> bool {
+    element.children.iter().any(|child| {
+        let XMLNode::Element(child) = child else {
+            return false;
+        };
+        if matches!(child.name.as_str(), "t" | "instrText" | "delText")
+            && child
+                .children
+                .iter()
+                .any(|node| matches!(node, XMLNode::Text(text) if !text.is_empty()))
+        {
+            return true;
+        }
+        if matches!(
+            child.name.as_str(),
+            "tab"
+                | "br"
+                | "cr"
+                | "drawing"
+                | "object"
+                | "pict"
+                | "sym"
+                | "noBreakHyphen"
+                | "softHyphen"
+                | "fldChar"
+                | "footnoteReference"
+                | "endnoteReference"
+                | "commentReference"
+        ) {
+            return true;
+        }
+        has_hyperlink_payload(child)
+    })
 }
 
 /// Current-property children that are NOT part of a `*PrChange`'s
@@ -2544,6 +2764,46 @@ mod tests {
         )
     }
 
+    #[test]
+    fn inline_sdt_deletion_envelope_resolves_both_terminal_structures() {
+        let direct = format!(
+            r#"<w:document xmlns:w="{WORD_NS}"><w:body><w:p><w:r><w:t>LEFT</w:t></w:r><w:customXmlDelRangeStart w:id="7" w:author="Stemma"/><w:sdt><w:sdtPr><w:tag w:val="control"/></w:sdtPr><w:sdtContent><w:del w:id="8" w:author="Stemma"><w:r><w:delText>CONTROL</w:delText></w:r></w:del></w:sdtContent></w:sdt><w:customXmlDelRangeEnd w:id="7"/><w:r><w:t>RIGHT</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        );
+        let word_normalized = format!(
+            r#"<w:document xmlns:w="{WORD_NS}"><w:body><w:p><w:r><w:t>LEFT</w:t></w:r><w:customXmlDelRangeStart w:id="7" w:author="Stemma"/><w:sdt><w:sdtPr><w:tag w:val="control"/></w:sdtPr><w:sdtContent><w:customXmlDelRangeEnd w:id="7"/><w:del w:id="8" w:author="Stemma"><w:r><w:delText>CONTROL</w:delText></w:r></w:del><w:customXmlDelRangeStart w:id="9" w:author="Stemma"/></w:sdtContent></w:sdt><w:customXmlDelRangeEnd w:id="9"/><w:r><w:t>RIGHT</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        );
+
+        for (label, xml) in [("direct", direct), ("Word-normalized", word_normalized)] {
+            let archive = archive_with_document_xml(&xml);
+            let (accepted, accepted_stats) =
+                normalize_docx(&archive).expect("accept inline SDT deletion");
+            let accepted_xml =
+                String::from_utf8(accepted.get("word/document.xml").unwrap().to_vec()).unwrap();
+            assert!(!accepted_xml.contains("<w:sdt"), "{label}: {accepted_xml}");
+            assert!(
+                !accepted_xml.contains("customXmlDelRange"),
+                "{label}: {accepted_xml}"
+            );
+            assert!(!accepted_xml.contains("CONTROL"), "{label}: {accepted_xml}");
+            assert!(accepted_xml.contains("LEFT"));
+            assert!(accepted_xml.contains("RIGHT"));
+            assert!(accepted_stats.opaque_nodes_resolved_revisions_count >= 1);
+
+            let (rejected, rejected_stats) =
+                reject_all_docx(&archive).expect("reject inline SDT deletion");
+            let rejected_xml =
+                String::from_utf8(rejected.get("word/document.xml").unwrap().to_vec()).unwrap();
+            assert!(rejected_xml.contains("<w:sdt"), "{label}: {rejected_xml}");
+            assert!(rejected_xml.contains("<w:t>CONTROL</w:t>"));
+            assert!(
+                !rejected_xml.contains("customXmlDelRange"),
+                "{label}: {rejected_xml}"
+            );
+            assert!(!rejected_xml.contains("<w:del"));
+            assert!(rejected_stats.opaque_nodes_resolved_revisions_count >= 1);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Main-part resolution (OPC §9.3) during normalization
     // -----------------------------------------------------------------------
@@ -2815,6 +3075,42 @@ mod tests {
             std::str::from_utf8(result_archive.get("word/document.xml").unwrap()).unwrap();
         assert!(!result_xml.contains("w:ins"));
         assert!(result_xml.contains("inside sdt"));
+    }
+
+    #[test]
+    fn resolution_may_empty_a_block_content_control() {
+        let deleted = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:sdt><w:sdtContent><w:p>
+      <w:pPr><w:rPr><w:del w:id="1" w:author="A"/></w:rPr></w:pPr>
+      <w:del w:id="2" w:author="A"><w:r><w:delText>gone</w:delText></w:r></w:del>
+    </w:p></w:sdtContent></w:sdt>
+    <w:p><w:r><w:t>survives</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let inserted = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:sdt><w:sdtContent><w:p>
+      <w:pPr><w:rPr><w:ins w:id="1" w:author="A"/></w:rPr></w:pPr>
+      <w:ins w:id="2" w:author="A"><w:r><w:t>gone</w:t></w:r></w:ins>
+    </w:p></w:sdtContent></w:sdt>
+    <w:p><w:r><w:t>survives</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let (accepted, _) = normalize_docx(&archive_with_document_xml(deleted))
+            .expect("accept deleted wrapped paragraph");
+        let (rejected, _) = reject_all_docx(&archive_with_document_xml(inserted))
+            .expect("reject inserted wrapped paragraph");
+        for resolved in [accepted, rejected] {
+            let xml = std::str::from_utf8(resolved.get("word/document.xml").unwrap()).unwrap();
+            assert!(xml.contains("<w:sdtContent"));
+            assert!(!xml.contains("gone"));
+            assert_eq!(xml.matches("<w:p>").count(), 1);
+            assert!(xml.contains("survives"));
+        }
     }
 
     #[test]

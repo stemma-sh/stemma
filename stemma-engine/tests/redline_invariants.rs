@@ -9,14 +9,17 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::BTreeMap, fs};
+use stemma_diff::test_support::{DiffChange, diff_documents, merge_diff};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 mod common;
 
 use rayon::prelude::*;
 use stemma::{
-    BlockNode, CanonDoc, DiffChange, DocxRuntime, ExportMode, InlineChange, InlineNode, Mark,
-    MarkValue, NoteType, RevisionInfo, SimpleRuntime, TrackingStatus, TransactionMeta, accept_all,
-    diff_documents, merge_diff, redline_extract::extract_redline,
+    BlockNode, CanonDoc, DocxRuntime, ExportMode, InlineChange, InlineNode, Mark, MarkValue,
+    NoteType, RevisionInfo, SimpleRuntime, TrackingStatus, TransactionMeta, accept_all,
+    redline_extract::extract_redline,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────

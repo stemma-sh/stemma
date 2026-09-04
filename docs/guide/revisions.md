@@ -32,30 +32,36 @@ All of these are enumerable (`Document::revisions()` in Rust,
 `list_revisions` over MCP, `extract` in the CLI) and resolvable across
 every story, including the body, footnotes, tables, and section properties.
 
-## Authorship
+## Word author labels
 
-Every revision carries an author name, and in a review that name is
-load-bearing: whoever steps through the redline decides what to accept
-partly by *who proposed it*. The dangerous failure is an edit that hides
-inside someone else's authorship. Write under "Opposing Counsel" and your changes
-become indistinguishable from theirs to every reviewer after you.
+Every revision carries a Word author label. It is a free-form display string,
+not an authenticated identity. Microsoft Word groups revisions with the same
+label, so choosing whether to reuse one is still an important attribution
+decision.
 
-Stemma therefore refuses, by default, to author a revision under any name
-that already has revisions in the document (`AuthorImpersonation`). The
-refusal is deliberately blunt: a name is not an authenticated identity, so
-stemma cannot know that you *are* the prior author, even when it is your own
-name from an earlier round. Continuing an existing author's work is
-always an explicit assertion (`allow_existing_author`), never a default an
-agent can drift into.
+Stemma therefore requires confirmation before a write reuses any label that
+was present when the document was opened (`AuthorLabelCollision`). Pass
+`allow_existing_author: true` to continue that existing reviewer group. To
+keep an editing round separate, use a different label only when the user has
+chosen it; an agent must never invent one merely to clear the refusal.
+
+The set checked by this guard is frozen at open time. A label first introduced
+in the current open session can be reused for additional edits in that session
+without the assertion. After saving and reopening, that label is part of the
+new document's open-time set and requires confirmation like every other
+existing label.
+
+Direct materialization creates no Word revisions and emits no author label, so
+the collision policy does not apply to direct edits.
 
 Two edge shapes of authorship are worth stating exactly:
 
-- **A blank author is a real author group.** Word anonymization ("Remove
+- **A blank author label is a real author group.** Word anonymization ("Remove
   personal information") and some third-party tools write `w:author=""`.
   Stemma models that as the empty-string author: it enumerates as
   `author: ""` and is selectable as a group like any other name (the CLI
   selector token is the empty string, `--accept-author ""`).
-- **A missing author is refused.** A tracked change with no `w:author`
+- **A missing author label is refused.** A tracked change with no `w:author`
   attribute at all fails import (`missing required tracked change
   attribute: author`) rather than being silently adopted into some default
   identity, so an enumerated revision always has an author value.

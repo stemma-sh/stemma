@@ -172,10 +172,10 @@ impl PageSetupPatch {
 /// has no authored geometry (observed verbatim in real Word's own
 /// output). Shared with the serializer's empty-snapshot
 /// materialization (`runtime::materialize_empty_sect_pr_snapshot`).
-pub(crate) const WORD_DEFAULT_PAGE_WIDTH: u32 = 12240;
-pub(crate) const WORD_DEFAULT_PAGE_HEIGHT: u32 = 15840;
-pub(crate) const WORD_DEFAULT_MARGIN: i32 = 1440;
-pub(crate) const WORD_DEFAULT_HEADER_FOOTER_DISTANCE: u32 = 720;
+pub const WORD_DEFAULT_PAGE_WIDTH: u32 = 12240;
+pub const WORD_DEFAULT_PAGE_HEIGHT: u32 = 15840;
+pub const WORD_DEFAULT_MARGIN: i32 = 1440;
+pub const WORD_DEFAULT_HEADER_FOOTER_DISTANCE: u32 = 720;
 
 /// Build the raw `w:sectPr` bytes for a previous-state snapshot (the inner
 /// element of `w:sectPrChange`, §17.13.5.32). Reuses the serializer's
@@ -183,10 +183,10 @@ pub(crate) const WORD_DEFAULT_HEADER_FOOTER_DISTANCE: u32 = 720;
 /// previous state matches what import would have parsed — then re-serializes
 /// with the raw-fragment writer the import path's `serialize_element` pairs with.
 ///
-/// The snapshot stays FAITHFUL to the authored previous state — possibly
-/// empty. stemma's own reject restores it verbatim; the Word-interop
-/// materialization for an empty snapshot (Word drops the revision otherwise)
-/// happens at the write edge, in `runtime::materialize_empty_sect_pr_snapshot`.
+/// The snapshot stays faithful to the authored previous state and may be
+/// empty. An empty payload is widened to Word's explicit default geometry by
+/// both serialized materialization and in-memory projection; keeping those two
+/// paths identical is part of the native-carrier law.
 pub(crate) fn previous_sect_pr_raw(prev: &SectionProperties) -> Vec<u8> {
     let el = crate::runtime::section_properties_to_element(prev, None, None, None);
     crate::word_xml::serialize_raw_fragment(&el)

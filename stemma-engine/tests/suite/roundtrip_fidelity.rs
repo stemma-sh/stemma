@@ -54,6 +54,10 @@ const EXPECTED_IMPORT_FAILURES: &[&str] = &[
     // Empty table (zero rows) violates §17.4.37 normative prose (requires non-zero rows).
     // Tested by ec21_empty_table_zero_rows_rejected in spec_edge_tables.rs.
     "testdata/spec-compliance/edge-cases/empty-table-zero-rows/input.docx",
+    // A continuation without a preceding vMerge restart is non-conformant.
+    "testdata/spec-compliance/table-borders-audit/vmerge-continue-no-restart/input.docx",
+    // Row 2 continues a two-column vMerge with a one-column cell.
+    "testdata/spec-compliance/table-content-model/vmerge-grid/input.docx",
 ];
 
 /// Exemption is by fixture identity, not by host path spelling: discovered

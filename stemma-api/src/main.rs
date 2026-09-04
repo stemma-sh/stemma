@@ -16,12 +16,14 @@
 //!   opened documents in an in-memory map keyed by a `doc_id`. Persist the saved
 //!   `.docx` bytes (plus the transactions) if you want durability — the
 //!   in-memory [`Document`] is a hot cache, exactly as the domain model says.
-//! - It is a **new** consumer, so it depends on the stable Tier-1 facade
-//!   ([`stemma::api::Document`]) for every verb, and reaches the unstable engine
-//!   API only at the wire edge to *decode* a transaction
+//! - Engine document verbs use the stable Tier-1 facade
+//!   ([`stemma::api::Document`]) and reach the unstable engine API only at the
+//!   wire edge to *decode* a transaction
 //!   ([`stemma::edit_v4::parse_transaction`], the same path the hosted pipeline
-//!   and `examples/quickstart.rs` use). Parse at the edge; operate on the domain
-//!   type. (`stemma-mcp` reaches deeper only because it predates the facade.)
+//!   and `examples/quickstart.rs` use). Comparison and the full render
+//!   projection come from the downstream `stemma-diff` facade. Parse at the
+//!   edge; operate on typed domain values. (`stemma-mcp` reaches deeper only
+//!   because it predates the facade.)
 //! - It is **fail-loud**: a stale edit, an unknown doc_id, or malformed
 //!   transaction JSON returns a structured error, never a best-effort mutation.
 //!
@@ -29,15 +31,15 @@
 //!
 //! | Method & path | Body | Returns |
 //! |---|---|---|
-//! | `POST /api/documents` | raw `.docx` bytes | `{ doc_id, document }` |
-//! | `POST /api/compare` | `{ base_doc_id, target_doc_id, author? }` | `{ doc_id, document }` — a NEW redline document (reject-all == base, accept-all == target); `author` attributes the revisions, empty = 400 |
-//! | `GET  /api/documents/{id}` | — | `{ document }` (the read view) |
-//! | `POST /api/documents/{id}/apply` | a v4 transaction (JSON) | `{ document }` (re-read after apply) |
-//! | `GET  /api/documents/{id}/rich` | — | `{ blocks }` (the rich, render-faithful projection) |
+//! | `POST /api/documents` | raw `.docx` bytes | `{ doc_id, document, diagnostics }` |
+//! | `POST /api/compare` | `{ base_doc_id, target_doc_id, author? }` | `{ doc_id, document, semantic_change_count, revision_count, base_diagnostics, target_diagnostics }` — a NEW redline document (reject-all == accepted base, accept-all == accepted target); `author` attributes the revisions, empty = 400 |
+//! | `GET  /api/documents/{id}` | — | `{ document, diagnostics }` (the read view) |
+//! | `POST /api/documents/{id}/apply` | a v4 transaction (JSON) | `{ document, diagnostics, author_label_policy }` (re-read after apply) |
+//! | `GET  /api/documents/{id}/rich` | — | `{ blocks, section, headers, footers, comments }` (the rich, render-faithful projection) |
 //! | `GET  /api/documents/{id}/revisions` | — | `{ revisions }` (pending tracked changes) |
-//! | `POST /api/documents/{id}/resolve` | `{ revision_ids, action }` | `{ document }` (accept/reject) |
+//! | `POST /api/documents/{id}/resolve` | `{ revision_ids, action }` | `{ document, diagnostics }` (accept/reject) |
 //! | `GET  /api/documents/{id}/export?mode=redline\|accepted\|rejected` | — | `.docx` bytes |
-//! | `GET  /api/operations` | — | `{ operations }` (the engine's v4 op catalog: fields, cues, canonical shapes) |
+//! | `GET  /api/operations` | — | `{ transaction_envelope, operation_count, operations }` (the engine's v4 op catalog: fields, cues, canonical shapes) |
 //!
 //! Everything else is served as static files from `stemma-examples`, so
 //! `cargo run -p stemma-api` and then opening the printed URL is the whole demo:
@@ -66,15 +68,15 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use stemma::api::{BlockRole, BlockView, Document, DocumentView, SegmentView, TrackStatus};
+use stemma::edit::MaterializationMode;
 use stemma::edit_v4::catalog::operation_catalog;
 use stemma::edit_v4::parse_transaction;
-use stemma::runtime::build_tracked_document_view_from_snapshot;
-use stemma::semantic_hash::block_semantic_hash_for_full_doc_block;
 use stemma::view::{RevisionView, TextMark};
 use stemma::{
     ExportMode, ExportOptions, Resolution, ResolveSelectionAction, ValidatorLevel,
     enumerate_revisions,
 };
+use stemma_diff::block_semantic_hash_for_full_doc_block;
 
 // ─── Session store ────────────────────────────────────────────────────────────
 
@@ -111,6 +113,7 @@ struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -119,7 +122,13 @@ impl ApiError {
             status,
             code: code.into(),
             message: message.into(),
+            details: None,
         }
+    }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     fn not_found(doc_id: &str) -> Self {
@@ -133,11 +142,14 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({ "code": self.code, "error": self.message })),
-        )
-            .into_response()
+        let mut payload = json!({ "code": self.code, "error": self.message });
+        if let Some(Value::Object(details)) = self.details {
+            let object = payload
+                .as_object_mut()
+                .expect("API error payload is constructed as an object");
+            object.extend(details);
+        }
+        (self.status, Json(payload)).into_response()
     }
 }
 
@@ -145,11 +157,42 @@ impl IntoResponse for ApiError {
 /// structured `code`. A precondition failure (stale guard, missing target, …) is
 /// the caller's fault → 422; we keep the engine's code verbatim.
 fn runtime_err(e: stemma::RuntimeError) -> ApiError {
-    ApiError::new(
+    let author_label_collision = e
+        .details
+        .author_label_collision()
+        .map(|details| {
+            json!({
+                "status": "confirmation_required",
+                "author_label": details.author_label,
+                "existing_revision_count": details.existing_revision_count,
+                "existing_scope": "present_when_document_opened",
+                "message": "New revisions with this label will appear in Microsoft Word as part of the same reviewer group.",
+                "mutation": "none",
+                "actions": [
+                    {
+                        "action": "continue_existing_label",
+                        "allow_existing_author": true,
+                        "effect": format!(
+                            "New revisions will appear under the existing {} reviewer group.",
+                            details.author_label
+                        ),
+                    },
+                    {
+                        "action": "use_separate_label",
+                        "effect": "This editing round will appear as a separate reviewer group; the user must supply the label.",
+                    },
+                ],
+            })
+        });
+    let error = ApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
         format!("{:?}", e.code),
         e.message,
-    )
+    );
+    match author_label_collision {
+        Some(details) => error.with_details(details),
+        None => error,
+    }
 }
 
 // ─── DocumentView -> JSON ──────────────────────────────────────────────────────
@@ -265,13 +308,18 @@ async fn upload(State(state): State<AppState>, body: Bytes) -> Result<Json<Value
     })?;
     let view = doc.read();
     let document = document_json(&view);
+    let diagnostics = doc.diagnostics().to_vec();
     let doc_id = state.mint_id();
     state
         .docs
         .lock()
         .expect("docs map poisoned")
         .insert(doc_id.clone(), doc);
-    Ok(Json(json!({ "doc_id": doc_id, "document": document })))
+    Ok(Json(json!({
+        "doc_id": doc_id,
+        "document": document,
+        "diagnostics": diagnostics,
+    })))
 }
 
 /// `GET /api/documents/{id}` — the current read view of an open document.
@@ -283,20 +331,23 @@ async fn read(
     let doc = docs
         .get(&doc_id)
         .ok_or_else(|| ApiError::not_found(&doc_id))?;
-    Ok(Json(json!({ "document": document_json(&doc.read()) })))
+    Ok(Json(json!({
+        "document": document_json(&doc.read()),
+        "diagnostics": doc.diagnostics(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]
 struct ApplyQuery {
-    /// Author-impersonation override, mirroring the MCP transport's
+    /// Existing-author-label confirmation, mirroring the MCP transport's
     /// `allow_existing_author` flag. The transaction JSON *is* the whole
     /// request body (handed verbatim to `parse_transaction`), so this option
     /// rides as a query parameter rather than a body field — the same
-    /// "transaction body + separate transport-level flag" split the MCP
+    /// "transaction body + separate transport-level assertion" split the MCP
     /// tool args use. Default false: authoring under an author that already
-    /// authors a pending revision in the uploaded document's redline is
-    /// refused (`AuthorImpersonation`, mapped to 422 below). Pass `true` to
-    /// deliberately continue that author's own work.
+    /// labels a pending revision in the uploaded document's redline requires
+    /// confirmation (`AuthorLabelCollision`, mapped to 422 below). Pass `true`
+    /// to continue the existing Word reviewer group.
     #[serde(default)]
     allow_existing_author: bool,
 }
@@ -327,16 +378,28 @@ async fn apply(
         .ok_or_else(|| ApiError::not_found(&doc_id))?;
     // `apply_authored` is pure: it returns a NEW document. Replace the stored
     // value only after it succeeds, so a rejected edit leaves the session
-    // untouched. Unlike bare `apply`, this enforces the author-impersonation
+    // untouched. Unlike bare `apply`, this enforces the author-label collision
     // guard (engine-owned policy + data — see `stemma::api::Document::
     // apply_authored`), so an HTTP write is held to the same standard as an
     // MCP one.
     let edited = doc
         .apply_authored(&txn, q.allow_existing_author)
         .map_err(runtime_err)?;
+    let author_label_policy = if txn.materialization_mode == MaterializationMode::Direct {
+        "not_applicable_direct"
+    } else if q.allow_existing_author {
+        "continue_existing"
+    } else {
+        "require_confirmation_on_collision"
+    };
     let document = document_json(&edited.read());
+    let diagnostics = edited.diagnostics().to_vec();
     docs.insert(doc_id, edited);
-    Ok(Json(json!({ "document": document })))
+    Ok(Json(json!({
+        "document": document,
+        "diagnostics": diagnostics,
+        "author_label_policy": author_label_policy,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,7 +576,7 @@ async fn rich_read(
         })
         .collect();
 
-    let view = build_tracked_document_view_from_snapshot(doc.snapshot());
+    let view = stemma_diff::tracked_document_view(doc).map_err(runtime_err)?;
     let blocks: Vec<Value> = view
         .blocks
         .iter()
@@ -549,7 +612,7 @@ async fn rich_read(
     // with faithful formatting (tabs, marks, fields). `inline_index` is stamped
     // for parity with body segments (header/footer text is not addressable for
     // editing, so a stable 0 is fine).
-    let project_band = |p: &stemma::HeaderFooterPayload| -> Value {
+    let project_band = |p: &stemma_diff::HeaderFooterPayload| -> Value {
         // One entry per paragraph, carrying its alignment (w:jc) and tab stops
         // (w:tabs) so the frontend can center/right-align and position tabbed
         // content the way Word does — not flatten it to one left-aligned line.
@@ -697,8 +760,12 @@ async fn resolve(
         .project(Resolution::Selective { ids, action })
         .map_err(runtime_err)?;
     let document = document_json(&resolved.read());
+    let diagnostics = resolved.diagnostics().to_vec();
     docs.insert(doc_id, resolved);
-    Ok(Json(json!({ "document": document })))
+    Ok(Json(json!({
+        "document": document,
+        "diagnostics": diagnostics,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -723,9 +790,9 @@ struct CompareBody {
 ///
 /// The result is a first-class session document: `/revisions`, `/resolve`, and
 /// `/export` compose with the returned `doc_id` exactly as they do with an
-/// uploaded one. The engine's round-trip contract holds on it — reject-all
-/// reconstructs `base`, accept-all reconstructs `target` (see
-/// [`stemma::api::Document::diff`]).
+/// uploaded one. Each input is compared by its accepted reading: reject-all
+/// reconstructs the accepted `base`, and accept-all reconstructs the accepted
+/// `target`.
 ///
 /// Attribution: the optional `author` field attributes the discovered
 /// revisions. Absent, the redline is anonymous (the Tier-1 `diff`, discovery
@@ -767,13 +834,25 @@ async fn compare(
     // `diff`/`diff_as` are pure: they return a NEW document (the redline),
     // touching neither input. Store it under the freshly minted id. `author`
     // present = attributed (`diff_as`); absent = anonymous (`diff`).
-    let redline = match &body.author {
-        Some(author) => base.diff_as(target, author).map_err(runtime_err)?,
-        None => base.diff(target).map_err(runtime_err)?,
+    let comparison = match &body.author {
+        Some(author) => stemma_diff::diff_as_detailed(base, target, author).map_err(runtime_err)?,
+        None => stemma_diff::diff_detailed(base, target).map_err(runtime_err)?,
     };
+    let semantic_change_count = comparison.semantic_change_count;
+    let revision_count = comparison.document.revisions().len();
+    let base_diagnostics = comparison.base_diagnostics;
+    let target_diagnostics = comparison.target_diagnostics;
+    let redline = comparison.document;
     let document = document_json(&redline.read());
     docs.insert(doc_id.clone(), redline);
-    Ok(Json(json!({ "doc_id": doc_id, "document": document })))
+    Ok(Json(json!({
+        "doc_id": doc_id,
+        "document": document,
+        "semantic_change_count": semantic_change_count,
+        "revision_count": revision_count,
+        "base_diagnostics": base_diagnostics,
+        "target_diagnostics": target_diagnostics,
+    })))
 }
 
 // ─── Wiring ─────────────────────────────────────────────────────────────────────
@@ -944,6 +1023,29 @@ mod tests {
             .to_string()
     }
 
+    fn with_dangling_package_thumbnail(bytes: &[u8]) -> Vec<u8> {
+        let mut archive = stemma::docx::DocxArchive::read(bytes).expect("read test package");
+        let relationships = String::from_utf8(
+            archive
+                .get("_rels/.rels")
+                .expect("root relationships")
+                .to_vec(),
+        )
+        .expect("test relationships are UTF-8");
+        let dangling = r#"<Relationship Id="rIdThumbnail" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/>"#;
+        archive.upsert(
+            "_rels/.rels",
+            relationships
+                .replacen(
+                    "</Relationships>",
+                    &format!("{dangling}</Relationships>"),
+                    1,
+                )
+                .into_bytes(),
+        );
+        archive.write().expect("write test package")
+    }
+
     /// The visible text of a stored document, read back out of the session
     /// store (the compare handler returns the lean view, not the text).
     fn stored_text(state: &AppState, doc_id: &str) -> String {
@@ -1040,15 +1142,15 @@ mod tests {
     }
 
     /// THE CONTRACT: `POST /apply` refuses a write whose `revision.author`
-    /// already authors a pending revision in the uploaded document's
-    /// redline — the same author-impersonation guard MCP enforces (see
+    /// already labels a pending revision in the uploaded document's redline —
+    /// the same author-label confirmation guard MCP enforces (see
     /// `stemma::api::Document::apply_authored`), now held at the HTTP edge
     /// too. `allow_existing_author=true` deliberately continues that
-    /// author's own work; a plain 400/404 stays reserved for malformed
+    /// Word reviewer group; a plain 400/404 stays reserved for malformed
     /// input, so the refusal maps to 422 with the engine's code, per this
     /// module's existing `runtime_err` convention.
     #[tokio::test]
-    async fn apply_refuses_to_impersonate_the_uploaded_documents_existing_author() {
+    async fn apply_requires_confirmation_for_an_existing_author_label() {
         let state = AppState::new();
         let docx = docx_with_existing_author("AuthorA");
         let uploaded = upload(State(state.clone()), Bytes::from(docx))
@@ -1071,10 +1173,10 @@ mod tests {
         // target the still-live "Seeded change" rather than the accept-all reading
         // (`block.text`), which also spans the struck original and is not the state
         // being edited.
-        let impersonating = replace_txn_json_expect(
+        let colliding = replace_txn_json_expect(
             &block.id.to_string(),
             "Seeded change",
-            "Attempted impersonation",
+            "Continued review",
             "AuthorA",
         );
 
@@ -1084,32 +1186,45 @@ mod tests {
             Query(ApplyQuery {
                 allow_existing_author: false,
             }),
-            impersonating.clone(),
+            colliding.clone(),
         )
         .await;
-        let err = refused.expect_err("impersonating AuthorA must be refused over HTTP");
+        let err = refused.expect_err("reusing AuthorA must require confirmation over HTTP");
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(err.code, "AuthorImpersonation");
+        assert_eq!(err.code, "AuthorLabelCollision");
         assert!(
             err.message.contains("AuthorA"),
-            "the error names the impersonated author: {}",
+            "the error names the colliding author label: {}",
             err.message
         );
+        let details = err.details.expect("structured collision details");
+        assert_eq!(details["status"], "confirmation_required");
+        assert_eq!(details["author_label"], "AuthorA");
+        assert_eq!(
+            details["message"],
+            "New revisions with this label will appear in Microsoft Word as part of the same reviewer group."
+        );
+        assert!(details["existing_revision_count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(details["existing_scope"], "present_when_document_opened");
+        assert_eq!(details["mutation"], "none");
+        assert_eq!(details["actions"][0]["allow_existing_author"], true);
+        assert!(details["actions"][1].get("author_label").is_none());
 
-        // The override deliberately continues that author's own work.
-        let _ = apply(
+        // The override deliberately continues that Word reviewer group.
+        let confirmed = apply(
             State(state.clone()),
             Path(doc_id),
             Query(ApplyQuery {
                 allow_existing_author: true,
             }),
-            impersonating,
+            colliding,
         )
         .await
         .expect("allow_existing_author=true bypasses the refusal");
+        assert_eq!(confirmed.0["author_label_policy"], "continue_existing");
     }
 
-    /// A distinct author is never impersonation, and the default
+    /// A new author label does not collide, and the default
     /// `allow_existing_author=false` does not block ordinary writes to a
     /// document with no pre-existing redline.
     #[tokio::test]
@@ -1140,7 +1255,7 @@ mod tests {
             txn,
         )
         .await
-        .expect("a distinct author on a clean document is accepted");
+        .expect("a new author label on a clean document is accepted");
     }
 
     /// THE CONTRACT: `POST /api/compare` of two uploaded documents stores a NEW
@@ -1168,6 +1283,10 @@ mod tests {
         .await
         .expect("compare two known documents");
         let redline_id = out.0["doc_id"].as_str().expect("doc_id").to_string();
+        assert_eq!(out.0["semantic_change_count"], 1);
+        assert_eq!(out.0["revision_count"], 2);
+        assert_eq!(out.0["base_diagnostics"], json!([]));
+        assert_eq!(out.0["target_diagnostics"], json!([]));
         assert_ne!(redline_id, base_id, "the redline is a new document");
         assert_ne!(redline_id, target_id, "the redline is a new document");
 
@@ -1181,6 +1300,65 @@ mod tests {
         };
         assert_eq!(accepted, target_text, "accept-all reconstructs the target");
         assert_eq!(rejected, base_text, "reject-all reconstructs the base");
+    }
+
+    #[tokio::test]
+    async fn upload_and_compare_disclose_source_labelled_import_diagnostics() {
+        let state = AppState::new();
+        let base = upload(State(state.clone()), Bytes::from(BEFORE_DOCX.to_vec()))
+            .await
+            .expect("upload clean base");
+        assert_eq!(base.0["diagnostics"], json!([]));
+        let base_id = base.0["doc_id"].as_str().expect("base id").to_string();
+
+        let target_bytes = with_dangling_package_thumbnail(AFTER_DOCX);
+        let target = upload(State(state.clone()), Bytes::from(target_bytes))
+            .await
+            .expect("upload normalized target");
+        assert_eq!(target.0["diagnostics"].as_array().map(Vec::len), Some(1));
+        assert!(
+            target.0["diagnostics"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rIdThumbnail"))
+        );
+        let target_id = target.0["doc_id"].as_str().expect("target id").to_string();
+
+        let out = compare(
+            State(state.clone()),
+            Json(CompareBody {
+                base_doc_id: base_id.clone(),
+                target_doc_id: target_id.clone(),
+                author: None,
+            }),
+        )
+        .await
+        .expect("compare normalized target");
+        assert_eq!(out.0["base_diagnostics"], json!([]));
+        assert_eq!(
+            out.0["target_diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(
+            out.0["target_diagnostics"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rIdThumbnail"))
+        );
+
+        let reverse = compare(
+            State(state),
+            Json(CompareBody {
+                base_doc_id: target_id,
+                target_doc_id: base_id,
+                author: None,
+            }),
+        )
+        .await
+        .expect("compare normalized base");
+        assert_eq!(
+            reverse.0["base_diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(reverse.0["target_diagnostics"], json!([]));
     }
 
     /// An unknown `base_doc_id` (or `target_doc_id`) takes the same 404
@@ -1260,7 +1438,7 @@ mod tests {
 
     /// A present `author` attributes every discovered revision (`diff_as`),
     /// visible on the stored redline's `/revisions` rows, and the round-trip is
-    /// unchanged (reject-all == base, accept-all == target).
+    /// unchanged (reject-all == accepted base, accept-all == accepted target).
     #[tokio::test]
     async fn compare_with_author_attributes_the_revisions() {
         let state = AppState::new();

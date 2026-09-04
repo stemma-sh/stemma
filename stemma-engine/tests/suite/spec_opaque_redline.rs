@@ -9,6 +9,8 @@
 
 use std::fs;
 use std::io::{Cursor, Read};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta};
 use xmltree::{Element, XMLNode};
@@ -234,182 +236,33 @@ fn spec_fldsimple_preserved_in_output() {
 
 // ── opaque-roundtrip sample (real-world fixture) ─────────────────────────
 
-fn roundtrip_before() -> String {
-    std::path::PathBuf::from("testdata")
-        .join("opaque-roundtrip/before.docx")
-        .to_string_lossy()
-        .to_string()
-}
-fn roundtrip_after() -> String {
-    std::path::PathBuf::from("testdata")
-        .join("opaque-roundtrip/after.docx")
-        .to_string_lossy()
-        .to_string()
-}
-
-/// The opaque-roundtrip sample has hyperlinks and fldSimple with text changes
-/// around them. The redline output must not nest them inside del/ins.
+/// The smaller synthesized fixtures above continue to prove legal hyperlink
+/// and field ordering. This broader sample also contains an unrelated table-row
+/// replacement followed by later story changes. Native Word Review Reject All
+/// hangs on that carrier order, so comparison must refuse before producing an
+/// artifact rather than weakening the opaque-ordering guarantees.
 #[test]
-fn spec_opaque_roundtrip_no_illegal_nesting() {
-    let exported = redline_export(&roundtrip_before(), &roundtrip_after());
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
+fn spec_opaque_roundtrip_refuses_the_unqualified_table_carrier_order() {
+    let before_path = std::path::PathBuf::from("testdata").join("opaque-roundtrip/before.docx");
+    let after_path = std::path::PathBuf::from("testdata").join("opaque-roundtrip/after.docx");
+    let before = fs::read(&before_path).expect("read opaque-roundtrip before");
+    let after = fs::read(&after_path).expect("read opaque-roundtrip after");
+    let runtime = SimpleRuntime::new();
+    let ib = runtime.import_docx(&before).expect("import before");
+    let ia = runtime.import_docx(&after).expect("import after");
+    let error = runtime
+        .diff_and_redline(
+            &ib.doc_handle,
+            &ia.doc_handle,
+            TransactionMeta {
+                author: "spec_opaque_redline".to_string(),
+                reason: Some("opaque redline carrier boundary".to_string()),
+                timestamp_utc: Some("2025-01-15T10:30:00Z".to_string()),
+            },
+        )
+        .expect_err("unsafe table carrier order must refuse");
 
-    for (parent, child) in [
-        ("del", "hyperlink"),
-        ("ins", "hyperlink"),
-        ("del", "fldSimple"),
-        ("ins", "fldSimple"),
-    ] {
-        if let Some(path) = find_illegal_nesting(&root, parent, child) {
-            panic!("w:{child} found inside w:{parent} in opaque-roundtrip redline.\nPath: {path}");
-        }
-    }
-}
-
-/// fldSimple must appear between corresponding del/ins pairs, not before all
-/// ins content. When collapse_zipper_regions merges interleaved changes, the
-/// serializer must interleave del+ins at opaque boundaries to preserve reading
-/// order. (RC4 fix)
-#[test]
-fn spec_opaque_roundtrip_fldsimple_ordering() {
-    let exported = redline_export(&roundtrip_before(), &roundtrip_after());
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
-
-    // Find the paragraph containing fldSimple
-    let mut fldsimple_paras = Vec::new();
-    find_paragraphs_containing(&root, "fldSimple", &mut fldsimple_paras);
-    assert_eq!(
-        fldsimple_paras.len(),
-        1,
-        "expected exactly 1 paragraph with fldSimple"
-    );
-
-    let para = fldsimple_paras[0];
-    // Collect the top-level child element tags in order (skipping pPr, bookmarkStart/End)
-    let child_tags: Vec<&str> = para
-        .children
-        .iter()
-        .filter_map(|c| {
-            if let XMLNode::Element(el) = c {
-                let tag = local_name(&el.name);
-                match tag {
-                    "pPr" | "bookmarkStart" | "bookmarkEnd" => None,
-                    _ => Some(tag),
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // The fldSimple must appear after at least one ins element (not only after del).
-    // Correct order: [..., del, ins, fldSimple, del, ins, ...]
-    // Buggy order:   [..., del, fldSimple, del, ins, ins, ...]
-    let fld_pos = child_tags
-        .iter()
-        .position(|&t| t == "fldSimple")
-        .expect("fldSimple must be present in paragraph");
-    let first_ins_pos = child_tags
-        .iter()
-        .position(|&t| t == "ins")
-        .expect("at least one ins must be present");
-    assert!(
-        first_ins_pos < fld_pos,
-        "fldSimple (position {fld_pos}) must appear after the first ins (position {first_ins_pos}) \
-         to preserve reading order. Child tags: {child_tags:?}"
-    );
-}
-
-/// Hyperlink must also appear between corresponding del/ins pairs, not before
-/// all inserted content, to preserve paragraph reading order.
-#[test]
-fn spec_opaque_roundtrip_hyperlink_ordering() {
-    let exported = redline_export(&roundtrip_before(), &roundtrip_after());
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
-
-    let mut hyperlink_paras = Vec::new();
-    find_paragraphs_containing(&root, "hyperlink", &mut hyperlink_paras);
-    assert_eq!(
-        hyperlink_paras.len(),
-        1,
-        "expected exactly 1 paragraph with hyperlink"
-    );
-
-    let para = hyperlink_paras[0];
-    let child_tags: Vec<&str> = para
-        .children
-        .iter()
-        .filter_map(|c| {
-            if let XMLNode::Element(el) = c {
-                let tag = local_name(&el.name);
-                match tag {
-                    "pPr" | "bookmarkStart" | "bookmarkEnd" => None,
-                    _ => Some(tag),
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let hyperlink_pos = child_tags
-        .iter()
-        .position(|&t| t == "hyperlink")
-        .expect("hyperlink must be present in paragraph");
-    let first_ins_pos = child_tags
-        .iter()
-        .position(|&t| t == "ins")
-        .expect("at least one ins must be present");
-    assert!(
-        first_ins_pos < hyperlink_pos,
-        "hyperlink (position {hyperlink_pos}) must appear after the first ins (position {first_ins_pos}) \
-         to preserve reading order. Child tags: {child_tags:?}"
-    );
-}
-
-/// Find paragraphs that contain a descendant with the given tag.
-fn find_paragraphs_containing<'a>(root: &'a Element, tag: &str, out: &mut Vec<&'a Element>) {
-    if local_name(&root.name) == "p" {
-        let mut descendants = Vec::new();
-        find_all_elements(root, tag, &mut descendants);
-        if !descendants.is_empty() {
-            out.push(root);
-        }
-        return;
-    }
-    for child in &root.children {
-        if let XMLNode::Element(el) = child {
-            find_paragraphs_containing(el, tag, out);
-        }
-    }
-}
-
-/// Each opaque element should appear exactly once in the opaque-roundtrip redline,
-/// not duplicated across del/ins segments.
-#[test]
-fn spec_opaque_roundtrip_no_duplicate_opaques() {
-    let exported = redline_export(&roundtrip_before(), &roundtrip_after());
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
-
-    let mut hyperlinks = Vec::new();
-    find_all_elements(&root, "hyperlink", &mut hyperlinks);
-    assert_eq!(
-        hyperlinks.len(),
-        1,
-        "opaque-roundtrip should have exactly 1 hyperlink, found {}",
-        hyperlinks.len()
-    );
-
-    let mut fields = Vec::new();
-    find_all_elements(&root, "fldSimple", &mut fields);
-    assert_eq!(
-        fields.len(),
-        1,
-        "opaque-roundtrip should have exactly 1 fldSimple, found {}",
-        fields.len()
-    );
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(error.message.contains("table-row replacement"));
+    assert!(error.message.contains("followed by another change"));
 }

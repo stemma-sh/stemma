@@ -12,6 +12,7 @@ from urllib.parse import unquote
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 DOCS_SITE = "https://stemma.sh/docs"
+GENERATED_DOCS_SITE_PATHS = {"llms.txt", "llms-full.txt"}
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
@@ -77,6 +78,10 @@ def main() -> int:
             # tree GitBook publishes from docs/).
             if path_text == DOCS_SITE or path_text.startswith(DOCS_SITE + "/"):
                 page = path_text[len(DOCS_SITE) :].strip("/")
+                # GitBook generates these indexes from the checked-in docs tree;
+                # they intentionally have no one-to-one Markdown source page.
+                if page in GENERATED_DOCS_SITE_PATHS:
+                    continue
                 target = DOCS / (f"{page}.md" if page else "README.md")
                 if not target.exists():
                     errors.append(

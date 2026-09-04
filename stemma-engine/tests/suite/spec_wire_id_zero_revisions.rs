@@ -231,3 +231,59 @@ fn mixed_wire_zero_and_real_id_revisions_coexist_uniquely() {
         );
     }
 }
+
+/// The OOXML decimal lexical space is not bounded by the engine's `u32`
+/// annotation slot. A wider value is valid input and enters the same explicit
+/// minting lane as wire zero; both terminal projections must serialize and
+/// reopen without a pending revision.
+#[test]
+fn wide_decimal_revision_id_imports_and_both_projections_reopen() {
+    let body = r#"<w:p><w:ins w:id="42949672960" w:author="Word"><w:r><w:t>inserted</w:t></w:r></w:ins></w:p>"#;
+    let doc = Document::parse(&make_docx(body)).expect("wide decimal id must import");
+    let ids = enumerated_ids(&doc);
+    assert_eq!(ids.len(), 1, "the insertion remains one revision");
+    assert_ne!(ids[0], 0, "the legacy sentinel must be minted away");
+
+    for resolution in [Resolution::AcceptAll, Resolution::RejectAll] {
+        let projected = doc.project(resolution).expect("projection must succeed");
+        let bytes = projected
+            .serialize(&ExportOptions::default())
+            .expect("projection must serialize");
+        let reopened = Document::parse(&bytes).expect("projection must reopen");
+        assert!(
+            enumerated_ids(&reopened).is_empty(),
+            "terminal projection must contain no pending revisions"
+        );
+    }
+}
+
+/// `u32::MAX` is a legal existing wire id. Normalizing a wider sibling must
+/// wrap to a free in-range slot rather than overflowing the allocator.
+#[test]
+fn wide_decimal_revision_id_coexists_with_u32_max() {
+    let body = r#"
+        <w:p><w:ins w:id="4294967295" w:author="A"><w:r><w:t>max</w:t></w:r></w:ins></w:p>
+        <w:p><w:ins w:id="42949672960" w:author="B"><w:r><w:t>wide</w:t></w:r></w:ins></w:p>
+    "#;
+    let doc = Document::parse(&make_docx(body)).expect("max plus wide ids must import");
+    let ids = enumerated_ids(&doc);
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|id| *id != 0));
+    assert_eq!(ids.iter().copied().collect::<HashSet<_>>().len(), 2);
+}
+
+#[test]
+fn non_decimal_revision_id_is_still_refused() {
+    let body =
+        r#"<w:p><w:ins w:id="not-decimal" w:author="Word"><w:r><w:t>bad</w:t></w:r></w:ins></w:p>"#;
+    let error = match Document::parse(&make_docx(body)) {
+        Ok(_) => panic!("non-decimal id must be invalid"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid tracked change attribute id"),
+        "error must identify the malformed edge value: {error}"
+    );
+}

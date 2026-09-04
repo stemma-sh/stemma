@@ -17,6 +17,8 @@
 //! attribute X / nested marker Y" assertions below.
 
 use std::io::{Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::api::Document;
 

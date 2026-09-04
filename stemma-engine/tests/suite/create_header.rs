@@ -4,8 +4,8 @@
 //! These author a NET-NEW, blank header/footer story PLUS a body-section
 //! reference, tracked as a `w:sectPrChange`. The contract under test:
 //!   - accept-all == the doc WITH the new story + section reference (== Direct);
-//!   - reject-all == the original (the new story is pruned, the original sectPr —
-//!     including the importer's synthesized-blank Default reference — restored);
+//!   - reject-all retains the unrevisionable physical story binding, but the
+//!     story is blank and the original synthesized-blank Default slot remains;
 //!   - both projections are validator-clean;
 //!   - the new story serializes as a valid part and survives a reparse;
 //!   - fail-loud refusals: a kind already referenced on the section (incl. the
@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use stemma::api::Document;
-use stemma::domain::{HeaderFooterKind, RevisionInfo};
+use stemma::domain::{BlockNode, HeaderFooterKind, InlineNode, RevisionInfo, TrackedBlock};
 use stemma::edit::{
     EditStep, EditTransaction, MaterializationMode, PageSetupPatch, SectionTarget,
     apply_transaction,
@@ -97,10 +97,34 @@ fn has_header_ref(doc: &Document, kind: &HeaderFooterKind) -> bool {
         .unwrap_or(false)
 }
 
+fn has_footer_ref(doc: &Document, kind: &HeaderFooterKind) -> bool {
+    doc.snapshot()
+        .canonical
+        .body_section_properties
+        .as_ref()
+        .is_some_and(|section| {
+            section
+                .footer_refs
+                .iter()
+                .any(|reference| &reference.kind == kind)
+        })
+}
+
+fn story_blocks_are_blank(blocks: &[TrackedBlock]) -> bool {
+    blocks.iter().all(|block| match &block.block {
+        BlockNode::Paragraph(paragraph) => paragraph.segments.iter().all(|segment| {
+            segment.inlines.iter().all(|inline| match inline {
+                InlineNode::Text(text) => text.text.is_empty(),
+                _ => false,
+            })
+        }),
+        _ => false,
+    })
+}
+
 /// The tracked redline of a `CreateHeader { Even }` validates clean, accept-all
-/// keeps the new Even header story + reference, and reject-all restores the
-/// original (no Even reference, original sectPr) while keeping the synthesized
-/// Default header.
+/// keeps the new Even header story + reference, and reject-all keeps only its
+/// inert physical binding while preserving the synthesized Default header.
 #[test]
 fn create_header_tracked_redline_validates_and_projects() {
     let doc = Document::parse(&make_plain_docx()).expect("parse");
@@ -166,18 +190,28 @@ fn create_header_tracked_redline_validates_and_projects() {
         "accept keeps exactly one net-new header story"
     );
 
-    // reject-all (IR projection): no Even reference, the original section
-    // restored, and the orphan blank Even story pruned (back to the base header
-    // inventory).
+    // Header/footer bindings are physical, not revision-switchable. Reject
+    // retains the blank Even part/reference while clearing the tracked history.
     let rejected = edited.project(Resolution::RejectAll).expect("reject all");
     assert!(
-        !has_header_ref(&rejected, &HeaderFooterKind::Even),
-        "reject drops the Even header reference"
+        has_header_ref(&rejected, &HeaderFooterKind::Even),
+        "reject retains the physical Even header reference"
     );
     assert_eq!(
         rejected.snapshot().canonical.headers.len(),
-        base_header_count,
-        "reject prunes the net-new Even header story"
+        base_header_count + 1,
+        "reject retains exactly one inert physical Even header story"
+    );
+    let retained = rejected
+        .snapshot()
+        .canonical
+        .headers
+        .iter()
+        .find(|story| story.kind == HeaderFooterKind::Even)
+        .expect("retained Even header");
+    assert!(
+        story_blocks_are_blank(&retained.blocks),
+        "the retained Even header has no active content"
     );
     assert!(
         rejected
@@ -359,7 +393,7 @@ fn create_header_refuses_to_stack_sectprchange() {
 }
 
 /// The footer twin: a tracked `CreateFooter { Even }` validates clean and
-/// projects both ways (accept keeps the footer, reject prunes it).
+/// projects both ways (accept keeps the footer, reject leaves it blank).
 #[test]
 fn create_footer_tracked_redline_validates_and_projects() {
     let doc = Document::parse(&make_plain_docx()).expect("parse");
@@ -409,15 +443,32 @@ fn create_footer_tracked_redline_validates_and_projects() {
         .expect("selectively reject footer creation");
     assert_eq!(
         rejected.snapshot().canonical.footers.len(),
-        base_footer_count,
-        "reject prunes the net-new footer story"
+        base_footer_count + 1,
+        "reject retains exactly one inert physical footer story"
+    );
+    assert!(
+        has_footer_ref(&rejected, &HeaderFooterKind::Even),
+        "reject retains the physical Even footer reference"
+    );
+    let retained = rejected
+        .snapshot()
+        .canonical
+        .footers
+        .iter()
+        .find(|story| story.kind == HeaderFooterKind::Even)
+        .expect("retained Even footer");
+    assert!(
+        story_blocks_are_blank(&retained.blocks),
+        "the retained Even footer has no active content"
     );
 }
 
-/// Reject-all at the IR layer (engine accept/reject) reconstructs the base
-/// exactly — including the importer's synthesized Default header/footer.
+/// Header/footer part bindings are not revision-switchable in Word. Reject
+/// therefore retains the newly created physical binding, but its story must be
+/// empty and the original synthesized blank slot and all unrelated section
+/// properties must remain unchanged.
 #[test]
-fn create_header_reject_all_reconstructs_base_ir() {
+fn create_header_reject_all_retains_only_inert_physical_structure() {
     let doc = Document::parse(&make_plain_docx()).expect("parse");
     let base = doc.snapshot().canonical.clone();
 
@@ -437,11 +488,43 @@ fn create_header_reject_all_reconstructs_base_ir() {
 
     reject_all_with_styles(&mut tracked, None);
     assert_eq!(
-        tracked.headers, base.headers,
-        "reject-all reconstructs the original header inventory exactly"
+        tracked
+            .headers
+            .iter()
+            .filter(|story| story.kind == HeaderFooterKind::Default)
+            .collect::<Vec<_>>(),
+        base.headers
+            .iter()
+            .filter(|story| story.kind == HeaderFooterKind::Default)
+            .collect::<Vec<_>>(),
+        "reject preserves the original logical blank slot"
     );
+    let retained = tracked
+        .headers
+        .iter()
+        .filter(|story| story.kind == HeaderFooterKind::Even && !story.synthesized)
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 1, "one physical Even header remains");
+    assert!(
+        retained[0].blocks.is_empty(),
+        "the retained physical header has no active content"
+    );
+
+    let mut actual_section = tracked
+        .body_section_properties
+        .clone()
+        .expect("created header has a final section binding");
+    assert!(actual_section.header_refs.iter().any(|reference| {
+        reference.kind == HeaderFooterKind::Even
+            && reference.part_path == retained[0].part_name
+            && !reference.synthesized
+    }));
+    actual_section
+        .header_refs
+        .retain(|reference| reference.kind != HeaderFooterKind::Even);
     assert_eq!(
-        tracked.body_section_properties, base.body_section_properties,
-        "reject-all reconstructs the original section properties exactly"
+        Some(actual_section),
+        base.body_section_properties,
+        "the inert binding is the only retained section-property delta"
     );
 }

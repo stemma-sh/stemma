@@ -1,7 +1,7 @@
 # Read model reference
 
 <!-- GENERATED FILE. Do not edit by hand: this page is rendered from live
-     engine values by stemma-engine/tests/read_model_reference.rs, and that
+     engine values by stemma-diff/tests/read_model_reference.rs, and that
      test fails the gate when the page drifts (field tables are asserted
      against the engine's own serialization; every example is real engine
      output for a small exemplar document). Regenerate with:
@@ -64,17 +64,19 @@ that renders this page):
 | `serialize(&ExportOptions)` | Validated DOCX bytes back out. |
 | `snapshot()` | The documented Tier 3 escape hatch; the full render view is built from it. |
 
-The write surface (`apply`, `apply_authored`, `diff`, `diff_as`, `project`)
-is documented in the [v4 operation reference](operations.md) and the
-[stability policy](../guide/stability.md#rust-api).
+The engine write surface (`apply`, `apply_authored`, `project`) is documented
+in the [v4 operation reference](operations.md) and the
+[stability policy](../guide/stability.md#rust-api). Document comparison is a
+downstream operation exposed by `stemma-diff`.
 
 ## Where each surface serves the read model
 
 | Surface | Lean view | Full render view |
 |---|---|---|
-| Rust | `Document::read()` | `stemma::runtime::build_tracked_document_view_from_snapshot(doc.snapshot())`, or `SimpleRuntime::single_document_view` / `full_document_view` |
+| Rust | `Document::read()` | `stemma_diff::tracked_document_view(&doc)` |
 | HTTP | `GET /api/documents/{id}` serves a reduced hand-projection of it | `GET /api/documents/{id}/rich` serializes it whole, stamping each block with the lean `guard` and attaching the lean table `cells` and `table` metadata by block id |
 | MCP | `inspect_docx` with `detail:"formatting"` serves a projection of it (block detail plus spans) | not exposed; cell interiors reach MCP through the lean view's `paragraphs`, which reuse the full view's segment shape |
+| CLI | `stemma read` serializes `DocumentView` whole and adds the complete revision census | not exposed; embed the engine or run the source-only HTTP demo |
 
 Three honest caveats a builder should know:
 
@@ -85,13 +87,22 @@ Three honest caveats a builder should know:
 * The full view result also carries `footnotes` and `endnotes` stories, but
   the HTTP `/rich` envelope does not currently include them; over HTTP, note
   TEXT is reachable only by resolving the inline reference anchors.
-* The shipped CLI does not emit either view. `stemma extract --format json`
-  is a flat projection (one `text` string per block, no `segments`), and
-  `stemma inspect --format json` wraps the extended-Markdown projection as a
-  single string with integer counts. Consuming the types on this page means
-  embedding the engine ([embedding](embedding.md)); the HTTP transport that
-  serves them runs from a source checkout only (`cargo run -p stemma-api`,
-  `stemma-api` is not on crates.io).
+* The CLI's `stemma read` emits the complete lean view plus revision census as
+  `stemma.read.v0`. It does not emit the full render view. The `extract` and
+  `inspect` commands remain flatter projections, including in JSON format.
+  For the full view, embed the engine ([embedding](embedding.md)) or run the
+  source-only HTTP demo (`cargo run -p stemma-api`; `stemma-api` is not on
+  crates.io).
+
+## Choosing a surface
+
+| Need | CLI | Embedded engine | HTTP demo |
+|---|---|---|---|
+| Revision census and lean redline rendering | `stemma read` | `Document::read()` plus `Document::revisions()` | `GET /api/documents/{id}` plus `GET /api/documents/{id}/revisions` |
+| Resolve all, by author, by id, or with mixed outcomes | all, author, id, and one-call mixed plan | all and selective resolution; compose mixed outcomes in memory | selective ids; compose author groups client-side |
+| Complete value formatting and assets | not exposed | full render view | `GET /api/documents/{id}/rich` |
+| Headers, footers, comments, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, comments, and page geometry but omits footnote and endnote stories |
+| Stable installed local process boundary | yes | library API, not a process boundary | no; source-only demonstration transport |
 
 ## Units
 
@@ -165,6 +176,7 @@ A lean segment is externally tagged: `{"Text": {...}}` or `{"Opaque": {...}}`.
 | `text` | The run's visible text. |
 | `status` | The span's [track status](#track-status). A run breaks where status or marks change. |
 | `marks` | Meaningful inline marks: "Bold", "Italic", "Underline", "Strike", "Subscript", "Superscript". Value-carrying formatting (fonts, sizes, colors) lives in the full render view, not here. |
+| `format_revision` | Pending run-format revision on this exact span: `revision_id`, `author`, `date`, and `apply_op_id`; omitted when none. `revision_id` joins the revision census. This identifies the change; the previous formatting payload lives only in the full render view. |
 | `handle` | Ephemeral block-local span handle (`s_0`, `s_1`, ...), valid only while the block `guard` is unchanged. |
 
 `Opaque` fields:
@@ -267,6 +279,65 @@ carries a bold mark):
 }
 ```
 
+### A real lean formatting block
+
+The pending run-format change sits on the exact lean text span it changes.
+Its `format_revision.revision_id` is the same identity the revision census and
+selective resolution use; the lean view deliberately omits the previous
+formatting payload.
+
+```json
+{
+  "block_status": "Normal",
+  "cells": [],
+  "guard": "v2:4514b651e91f3c607bf43b6d46dc6ebab7d875b15dc0b0b738cf4ecda41b9d36",
+  "id": "p_4",
+  "list": null,
+  "literal_prefix": null,
+  "opaque_label": null,
+  "paragraph_mark_status": "Normal",
+  "role": "Paragraph",
+  "role_token": "body_text",
+  "segments": [
+    {
+      "Text": {
+        "handle": "s_0",
+        "marks": [],
+        "status": "Normal",
+        "text": "Contact "
+      }
+    },
+    {
+      "Text": {
+        "format_revision": {
+          "apply_op_id": null,
+          "author": "J. Osei",
+          "date": "2026-07-06T10:30:00Z",
+          "revision_id": 2643638233
+        },
+        "handle": "s_1",
+        "marks": [
+          "Italic"
+        ],
+        "status": "Normal",
+        "text": "the Supplier"
+      }
+    },
+    {
+      "Text": {
+        "handle": "s_2",
+        "marks": [],
+        "status": "Normal",
+        "text": " for details."
+      }
+    }
+  ],
+  "style_id": null,
+  "table": null,
+  "text": "Contact the Supplier for details."
+}
+```
+
 ### Tables in the lean view
 
 A table block's `cells` array addresses the grid; each cell's `paragraphs`
@@ -337,7 +408,7 @@ One real cell from the exemplar's table:
               "font_cs_theme": null,
               "font_east_asia": null,
               "font_east_asia_theme": null,
-              "font_family": null,
+              "font_family": "Times New Roman",
               "font_family_theme": null,
               "font_hint": null,
               "font_size": null,
@@ -522,6 +593,7 @@ can show what the formatting was and a reject can restore it:
 
 | Field | Meaning |
 |---|---|
+| `carrier` | The native Word carrier that owns the effective delta: `RunProperties` for an independently selectable `w:rPrChange`, or `ParagraphStyleCascade` when the enclosing paragraph's `w:pPrChange` owns it. The latter is not a second selectable run revision. |
 | `previous_marks` | The boolean marks before the change. |
 | `previous_style_props` | The [style properties](#style-properties) before the change. |
 | `previous_rpr_authored` | Per-slot authored-versus-inherited provenance of the previous state; the serializer consults it on reject so inherited values are not baked into the run. Internal detail for a renderer. |
@@ -709,7 +781,7 @@ linking each tracked span to its revision record:
           "font_cs_theme": null,
           "font_east_asia": null,
           "font_east_asia_theme": null,
-          "font_family": null,
+          "font_family": "Times New Roman",
           "font_family_theme": null,
           "font_hint": null,
           "font_size": null,
@@ -763,7 +835,7 @@ linking each tracked span to its revision record:
           "font_cs_theme": null,
           "font_east_asia": null,
           "font_east_asia_theme": null,
-          "font_family": null,
+          "font_family": "Times New Roman",
           "font_family_theme": null,
           "font_hint": null,
           "font_size": null,
@@ -817,7 +889,7 @@ linking each tracked span to its revision record:
           "font_cs_theme": null,
           "font_east_asia": null,
           "font_east_asia_theme": null,
-          "font_family": null,
+          "font_family": "Times New Roman",
           "font_family_theme": null,
           "font_hint": null,
           "font_size": null,
@@ -873,7 +945,7 @@ linking each tracked span to its revision record:
           "font_cs_theme": null,
           "font_east_asia": null,
           "font_east_asia_theme": null,
-          "font_family": null,
+          "font_family": "Times New Roman",
           "font_family_theme": null,
           "font_hint": null,
           "font_size": null,
@@ -926,7 +998,7 @@ linking each tracked span to its revision record:
           "font_cs_theme": null,
           "font_east_asia": null,
           "font_east_asia_theme": null,
-          "font_family": null,
+          "font_family": "Times New Roman",
           "font_family_theme": null,
           "font_hint": null,
           "font_size": null,

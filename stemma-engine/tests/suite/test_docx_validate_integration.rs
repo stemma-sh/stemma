@@ -1,11 +1,14 @@
-//! Integration test: run the full redline pipeline on all synthesized fixtures
-//! and the opaque-roundtrip sample, then validate the output DOCX bytes.
+//! Integration test: run the full redline pipeline on synthesized fixtures,
+//! validate each emitted DOCX, and prove that an unsafe real-world carrier
+//! composition refuses before serialization.
 //!
 //! Asserts zero validation errors.
 
 use stemma::{
     DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta, docx_validate::validate_docx,
 };
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use crate::common;
 
@@ -57,6 +60,21 @@ fn assert_no_validation_errors(docx_bytes: &[u8], label: &str) {
         errors.len(),
         errors.join("\n")
     );
+}
+
+fn assert_unsafe_table_carrier_order_refuses(before_path: &str, after_path: &str) {
+    let before = std::fs::read(before_path).expect("read refusal fixture before");
+    let after = std::fs::read(after_path).expect("read refusal fixture after");
+    let runtime = SimpleRuntime::new();
+    let ib = runtime.import_docx(&before).expect("import refusal base");
+    let ia = runtime.import_docx(&after).expect("import refusal target");
+    let error = runtime
+        .diff_and_redline(&ib.doc_handle, &ia.doc_handle, redline_meta())
+        .expect_err("unsafe table carrier order must refuse");
+
+    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
+    assert!(error.message.contains("table-row replacement"));
+    assert!(error.message.contains("followed by another change"));
 }
 
 // ── synthesized fixture tests ────────────────────────────────────────────
@@ -163,9 +181,9 @@ fn validate_opaque_redline_field() {
 // ── real sample tests ───────────────────────────────────────────────────
 
 #[test]
-fn validate_opaque_roundtrip_sample() {
+fn opaque_roundtrip_sample_refuses_unsafe_table_carrier_order() {
     let samples = std::path::PathBuf::from("testdata");
-    let bytes = make_redline(
+    assert_unsafe_table_carrier_order_refuses(
         &samples
             .join("opaque-roundtrip/before.docx")
             .to_string_lossy(),
@@ -173,7 +191,6 @@ fn validate_opaque_roundtrip_sample() {
             .join("opaque-roundtrip/after.docx")
             .to_string_lossy(),
     );
-    assert_no_validation_errors(&bytes, "opaque-roundtrip");
 }
 
 #[test]
@@ -307,18 +324,4 @@ fn ordering_opaque_redline_field() {
         &format!("{TESTDATA}/opaque-redline-field/after.docx"),
     );
     assert_no_ordering_warnings(&bytes, "opaque-redline-field");
-}
-
-#[test]
-fn ordering_opaque_roundtrip_sample() {
-    let samples = std::path::PathBuf::from("testdata");
-    let bytes = make_redline(
-        &samples
-            .join("opaque-roundtrip/before.docx")
-            .to_string_lossy(),
-        &samples
-            .join("opaque-roundtrip/after.docx")
-            .to_string_lossy(),
-    );
-    assert_no_ordering_warnings(&bytes, "opaque-roundtrip");
 }

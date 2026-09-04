@@ -191,8 +191,15 @@ catalog entry; you rarely need the whole catalog:
 {"op":"delete","target":"p_7","expect":"<current text>"}
 ```
 
-Every transaction carries `"revision":{"author":"<distinct name>"}`. There is
-no `toc` or `field` op — a table of contents is an `insert` with a
+Every tracked transaction carries
+`"revision":{"author":"<user-chosen label>"}`.
+
+When that label was present when the document was opened, pass
+`allow_existing_author: true` only when the user, approved worklist, or
+declared task explicitly intends to continue that reviewer group. Otherwise
+ask the user for a separate label; never invent one to bypass the refusal.
+
+There is no `toc` or `field` op — a table of contents is an `insert` with a
 `{"type":"toc"}` content block (see below); images use `insert_image`/
 `replace_image`/`set_image_attrs`. Formatting is `set_format` (run marks),
 `set_para_format`, or `apply_style`; tables are `table_op` (see the table
@@ -236,7 +243,7 @@ To get `span` handles (`s_0`, `s_1`, …) and the `guard`, call **`read_block(do
 ```
 
 Do NOT relocate a section by issuing several single-block moves in one transaction, each anchored on the block the PREVIOUS move just relocated (e.g. "move p_22 after p_6", then "move p_23 after p_22") — once moved, that id becomes a `moveFrom` shadow at its OLD position, and anchoring on it is refused (`AmbiguousAnchorAfterMove`; the error names the moved copy's id to anchor on instead, or use a stable neighbor). Chaining several moves onto the SAME fixed, never-moved anchor (all anchored on `p_6`) is fine — they land in issue order. After a move, `apply_edit`'s receipt carries a `moves` entry — `{move_id, pairs: [{source_id, copy_id}], prev, next}` — naming exactly where the run landed, so you can confirm placement without a follow-up read.
-9. **Attribution: set `revision.author` on every transaction** (`"revision":{"author":"YourName"}`); that name is stamped on every `w:ins`/`w:del`. **Never reuse an author already present in the opened redline** — editing under the prior reviewer's identity makes your changes indistinguishable from theirs and defeats layered review. This is *enforced*: an authored write whose author already authors revisions in the document is refused (`AuthorImpersonation`). Pick a name distinct from every author you saw in `list_revisions`. If you genuinely mean to continue an existing author's work, pass `allow_existing_author: true` on that call to opt in deliberately.
+9. **Attribution: set `revision.author` on every transaction** (`"revision":{"author":"YourName"}`); that value is a free-form Word author label, not an authenticated identity, and is stamped on every `w:ins`/`w:del`. Word groups revisions carrying the same label. Reusing a label that was present when the document was opened therefore requires confirmation (`AuthorLabelCollision`). If the user explicitly requested that existing label, or an approved worklist or declared task explicitly supplies it, continue its reviewer group with `allow_existing_author: true`. Otherwise surface the choice and ask the user to supply a separate label. **Never invent a different label merely to clear the collision.** A refused call has not changed the document. Labels first introduced during the current open session can be reused in that session without the assertion.
 
 ## Tracked table row surgery
 

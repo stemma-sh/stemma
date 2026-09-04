@@ -20,7 +20,7 @@
 //!
 //! ## Logical rId convention
 //!
-//! The logical rId MUST start with `"rId"` so [`crate::diff::find_blip_rid`]
+//! The logical rId MUST start with `"rId"` so [`crate::local_change::find_blip_rid`]
 //! (which the save-path rewrite and the inserted-rId collector both use) will
 //! recognize it as a relationship id. We derive it deterministically from the
 //! image's content digest so replaying the same transaction stages the same
@@ -256,7 +256,7 @@ impl ImageSource {
     }
 
     /// Deterministic logical rId for this image, derived from its content digest.
-    /// Starts with `"rId"` so [`crate::diff::find_blip_rid`] recognizes it.
+    /// Starts with `"rId"` so [`crate::local_change::find_blip_rid`] recognizes it.
     fn logical_rid(&self) -> String {
         let digest = sha256_hex(&self.bytes);
         format!("rIdimg{}", &digest[..16])
@@ -676,7 +676,7 @@ mod tests {
         assert!(xml.contains(r#"descr="a &amp; b""#), "{xml}");
         // find_blip_rid must recover the same logical rId the media stages under.
         assert_eq!(
-            crate::diff::find_blip_rid(&xml).as_deref(),
+            crate::local_change::find_blip_rid(&xml).as_deref(),
             Some(rid.as_str())
         );
     }

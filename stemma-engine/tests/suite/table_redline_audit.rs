@@ -13,6 +13,8 @@
 
 use std::fs;
 use std::io::{Cursor, Read};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::{
     DocxRuntime, ExportMode, SimpleRuntime, TransactionMeta, redline_extract::extract_redline,
@@ -169,12 +171,6 @@ impl<'a> RedlineAnalysis<'a> {
         let mut found = Vec::new();
         find_all_w(self.root, "delText", &mut found);
         !found.is_empty()
-    }
-
-    /// Count inline w:ins elements (those NOT inside w:trPr — i.e., wrapping
-    /// runs inside cells or paragraphs).
-    fn inline_ins_count(&self) -> usize {
-        count_inline_tracked_changes(self.root, "ins")
     }
 
     /// Count inline w:del elements (those NOT inside w:trPr).
@@ -499,9 +495,13 @@ fn table_modifications_accept_reject() {
 const TABLE_ROW_DEL_BEFORE: &str = "testdata/table-row-deletion/before.docx";
 const TABLE_ROW_DEL_AFTER: &str = "testdata/table-row-deletion/after.docx";
 
-/// table-row-deletion: 1 row deleted, inline insertion for "Second " text.
+/// These independently authored tables carry no persistent row identities and
+/// contain active opaque inline content. Comparison must not use text
+/// similarity to invent row lineage. The honest native carrier therefore
+/// replaces the complete table region: every source row is deleted and every
+/// target row is inserted.
 #[test]
-fn table_row_deletion_single_table() {
+fn table_row_deletion_uses_exact_region_without_invented_row_lineage() {
     let exported = run_redline_pipeline(TABLE_ROW_DEL_BEFORE, TABLE_ROW_DEL_AFTER);
     let xml = extract_document_xml(&exported);
     let root = parse_xml(&xml);
@@ -509,37 +509,21 @@ fn table_row_deletion_single_table() {
 
     assert_eq!(
         analysis.table_count(),
-        1,
-        "table-row-deletion should produce 1 table, not {}",
+        2,
+        "exact-region table replacement should carry source and target tables, got {}",
         analysis.table_count()
     );
-}
-
-#[test]
-fn table_row_deletion_row_level_tracking() {
-    let exported = run_redline_pipeline(TABLE_ROW_DEL_BEFORE, TABLE_ROW_DEL_AFTER);
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
-    let analysis = RedlineAnalysis::new(&root);
-
     assert_eq!(
         analysis.rows_with_trpr_del(),
-        1,
-        "table-row-deletion: exactly 1 row should have w:del in trPr, got {}",
+        4,
+        "every source row must be deleted when row lineage is unknown, got {}",
         analysis.rows_with_trpr_del()
     );
-}
-
-#[test]
-fn table_row_deletion_inline_insertion() {
-    let exported = run_redline_pipeline(TABLE_ROW_DEL_BEFORE, TABLE_ROW_DEL_AFTER);
-    let xml = extract_document_xml(&exported);
-    let root = parse_xml(&xml);
-    let analysis = RedlineAnalysis::new(&root);
-
-    assert!(
-        analysis.inline_ins_count() > 0,
-        "table-row-deletion: should have at least 1 inline w:ins for 'Second ' text insertion"
+    assert_eq!(
+        analysis.rows_with_trpr_ins(),
+        3,
+        "every target row must be inserted when row lineage is unknown, got {}",
+        analysis.rows_with_trpr_ins()
     );
 }
 

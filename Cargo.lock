@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "stemma"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1399,6 +1399,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
+ "stemma-diff",
  "tracing",
  "unicode-segmentation",
  "xmltree-ns",
@@ -1408,12 +1409,13 @@ dependencies = [
 
 [[package]]
 name = "stemma-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "serde",
  "serde_json",
  "stemma",
+ "stemma-diff",
  "tokio",
  "tower-http",
  "tracing",
@@ -1422,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-artifacts"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "same-file",
  "serde",
@@ -1434,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "serde",
@@ -1442,14 +1444,38 @@ dependencies = [
  "sha2",
  "stemma",
  "stemma-artifacts",
+ "stemma-diff",
  "tempfile",
  "xmltree-ns",
  "zip",
 ]
 
 [[package]]
+name = "stemma-diff"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "stemma",
+ "tracing",
+ "unicode-segmentation",
+ "xmltree-ns",
+ "zip",
+]
+
+[[package]]
+name = "stemma-doc-tests"
+version = "0.0.0"
+dependencies = [
+ "stemma",
+ "stemma-diff",
+]
+
+[[package]]
 name = "stemma-mcp"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1461,6 +1487,7 @@ dependencies = [
  "sha2",
  "stemma",
  "stemma-artifacts",
+ "stemma-diff",
  "tempfile",
  "tokio",
  "tracing",

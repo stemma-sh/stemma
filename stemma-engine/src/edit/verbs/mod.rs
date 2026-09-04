@@ -20,7 +20,7 @@ pub(crate) mod images;
 pub(crate) mod metadata;
 pub(crate) mod numbering;
 pub(crate) mod opaque_text_edit;
-pub(crate) mod page_setup;
+pub mod page_setup;
 pub(crate) mod paragraph_formatting;
 pub(crate) mod row_formatting;
 pub(crate) mod run_formatting;

@@ -270,7 +270,9 @@ fn rejecting_a_ppr_change_by_id_restores_the_previous_state() {
         .formatting_change
         .as_ref()
         .expect("pending pPrChange")
-        .previous_alignment
+        .previous
+        .effective
+        .alignment
         .clone();
     let resolved = doc
         .project(Resolution::Selective {
@@ -379,7 +381,9 @@ fn rejecting_a_ppr_change_by_id_persists_after_save() {
         .formatting_change
         .as_ref()
         .expect("pending pPrChange")
-        .previous_alignment
+        .previous
+        .effective
+        .alignment
         .clone();
     let reparsed = resolve_and_persist(&doc, id, ResolveSelectionAction::Reject);
     let p = first_para(&reparsed);
@@ -804,7 +808,8 @@ fn rejecting_a_table_formatting_change_by_id_persists_after_save() {
         .formatting_change
         .as_ref()
         .expect("pending tblPrChange")
-        .previous_borders
+        .previous
+        .borders
         .clone();
     let reparsed = resolve_and_persist(&doc, id, ResolveSelectionAction::Reject);
     let t = first_table(&reparsed.snapshot().canonical);

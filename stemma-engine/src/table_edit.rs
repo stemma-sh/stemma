@@ -658,7 +658,7 @@ fn diff_cell_nested_tables(
     old_blocks: &[BlockNode],
     new_blocks: &[BlockNode],
 ) -> Vec<NestedTableDiff> {
-    use crate::diff::diff_nested_tables;
+    use crate::local_change::diff_nested_tables;
     old_blocks
         .iter()
         .zip(new_blocks.iter())
@@ -687,7 +687,7 @@ fn find_cell_index(table: &CanonicalTable, cell: &CanonicalCell) -> Option<usize
 
 /// Diff cell text at token level.
 fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
-    use crate::diff::{cleanup_inline_changes, tokenize};
+    use crate::local_change::{cleanup_inline_changes, tokenize};
     use similar::{Algorithm, ChangeTag, TextDiff};
 
     let old_tokens = tokenize(old_text);
@@ -771,7 +771,7 @@ fn tracked_text_from_segments_filtered(
 }
 
 /// Extract "old" text from a table's tracked segments (Normal + Deleted, skip Inserted).
-/// Matches the separator conventions of `diff::extract_table_text`.
+/// Uses the canonical table-text separator conventions.
 pub fn extract_tracked_table_old_text(table: &TableNode) -> String {
     let mut out = String::new();
     for row in &table.rows {
@@ -806,7 +806,7 @@ pub fn extract_tracked_table_old_text(table: &TableNode) -> String {
 }
 
 /// Extract "new" text from a table's tracked segments (Normal + Inserted, skip Deleted).
-/// Matches the separator conventions of `diff::extract_table_text`.
+/// Uses the canonical table-text separator conventions.
 pub fn extract_tracked_table_new_text(table: &TableNode) -> String {
     let mut out = String::new();
     for row in &table.rows {
@@ -1000,6 +1000,7 @@ mod tests {
                     w_after: None,
                     cnf_style: None,
                     tbl_pr_ex: None,
+                    tbl_pr_ex_change: None,
                     cell_spacing: None,
                     preserved: Vec::new(),
                 })
@@ -1493,6 +1494,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -1525,6 +1527,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -1594,6 +1597,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -1626,6 +1630,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],
@@ -1682,6 +1687,7 @@ mod tests {
                 w_after: None,
                 cnf_style: None,
                 tbl_pr_ex: None,
+                tbl_pr_ex_change: None,
                 cell_spacing: None,
                 preserved: Vec::new(),
             }],

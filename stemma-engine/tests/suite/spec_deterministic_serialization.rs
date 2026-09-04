@@ -31,6 +31,8 @@
 //! to a fixed epoch, and asserted directly below.
 
 use std::io::Write as _;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::api::Document;
 use stemma::{DocxRuntime, ExportOptions, SimpleRuntime, TransactionMeta};
@@ -120,7 +122,10 @@ const DIFF_BATTERY: &[(&str, &str)] = &[
         "twenty-paragraphs/after.docx",
     ),
     ("long-table/before.docx", "long-table/after.docx"),
-    ("math-equations/before.docx", "math-equations/after.docx"),
+    (
+        "image-math-wc030/before.docx",
+        "image-math-wc030/after.docx",
+    ),
 ];
 
 #[test]

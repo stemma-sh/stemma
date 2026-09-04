@@ -10,12 +10,12 @@ use std::fs;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use stemma_diff::test_support::{DiffChange, DocumentDiff, diff_documents, merge_diff};
 
 use rayon::prelude::*;
 use stemma::{
-    BlockNode, CanonDoc, DiffChange, DocxRuntime, InlineChange, InlineNode, MarkValue, NodeId,
-    RevisionInfo, SimpleRuntime, TrackedBlock, TrackingStatus, accept_all, diff_documents,
-    merge_diff, reject_all_with_styles,
+    BlockNode, CanonDoc, DocxRuntime, InlineChange, InlineNode, MarkValue, NodeId, RevisionInfo,
+    SimpleRuntime, TrackedBlock, TrackingStatus, accept_all, reject_all_with_styles,
 };
 
 use crate::common;
@@ -277,7 +277,7 @@ fn find_replaceable_text(canon: &CanonDoc) -> Option<(usize, usize, usize)> {
 fn check_diff_reconstruction(
     doc_path: &str,
     edit_kind: &EditKind,
-    diff: &stemma::DocumentDiff,
+    diff: &DocumentDiff,
 ) -> Vec<String> {
     let mut failures = Vec::new();
 
@@ -555,6 +555,15 @@ fn run_self_edit_invariants_on_docs(docs: &[String]) -> (usize, Vec<String>) {
 
             let merged = match merge_diff(canon_a, canon_b, &diff, &revision) {
                 Ok(m) => m.doc,
+                Err(err)
+                    if err.message
+                        == "side-only block equations have no qualified native Word carrier" =>
+                {
+                    eprintln!(
+                        "[{doc_path}] [{edit_kind:?}] expected unsupported block-math refusal"
+                    );
+                    continue;
+                }
                 Err(err) => {
                     failures.push(format!(
                         "[{doc_path}] [{edit_kind:?}] merge_diff failed: {err:?}"

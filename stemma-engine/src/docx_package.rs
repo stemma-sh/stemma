@@ -208,6 +208,27 @@ impl ContentTypes {
             .any(|d| d.extension.eq_ignore_ascii_case(extension))
     }
 
+    /// Resolve the declared content type for a package part. Overrides win;
+    /// otherwise the extension Default applies (OPC §10.1.2). Part-name and
+    /// extension comparisons follow OPC's ASCII case-insensitive rules.
+    pub fn content_type_for_part(&self, part_name: &str) -> Option<&str> {
+        let normalized = part_name.strip_prefix('/').unwrap_or(part_name);
+        if let Some(overridden) = self.overrides.iter().find(|entry| {
+            entry
+                .part_name
+                .strip_prefix('/')
+                .unwrap_or(&entry.part_name)
+                .eq_ignore_ascii_case(normalized)
+        }) {
+            return Some(&overridden.content_type);
+        }
+        let extension = normalized.rsplit_once('.')?.1;
+        self.defaults
+            .iter()
+            .find(|entry| entry.extension.eq_ignore_ascii_case(extension))
+            .map(|entry| entry.content_type.as_str())
+    }
+
     /// For every recognized WordprocessingML part in `part_paths` that has **no**
     /// Override, add its canonical content-type Override (OPC §10.1.2 / ECMA-376
     /// Part 1 §15.2). Never rewrites an existing Override — an explicit author
@@ -239,6 +260,7 @@ impl ContentTypes {
 // =============================================================================
 
 const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const STRICT_OOXML_PREFIX: &[u8] = b"http://purl.oclc.org/ooxml/";
 
 /// A single `<Relationship>` entry from a `.rels` file.
 #[derive(Clone, Debug, PartialEq)]
@@ -247,6 +269,13 @@ pub struct Relationship {
     pub rel_type: String,
     pub target: String,
     pub target_mode: Option<String>,
+}
+
+/// OPC `ST_TargetMode` defaults to `Internal` when omitted. The parser rejects
+/// values outside the closed schema enum, so callers can use this predicate
+/// without guessing from `Option` representation.
+pub fn relationship_target_mode_is_internal(target_mode: Option<&str>) -> bool {
+    matches!(target_mode, None | Some("Internal"))
 }
 
 /// A parsed `.rels` file: a set of `Relationship` entries with auto-ID tracking.
@@ -302,6 +331,7 @@ impl RelationshipSet {
                     message: format!("Relationship {id} missing Type attribute"),
                 })?
                 .to_string();
+            let rel_type = crate::word_xml::canonicalize_relationship_type(&rel_type).into_owned();
 
             let target = attr(el, "Target")
                 .ok_or_else(|| PackageError::MalformedRelationship {
@@ -311,6 +341,15 @@ impl RelationshipSet {
                 .to_string();
 
             let target_mode = attr(el, "TargetMode").map(|s| s.to_string());
+            if !matches!(target_mode.as_deref(), None | Some("Internal" | "External")) {
+                return Err(PackageError::MalformedRelationship {
+                    part: part_name.to_string(),
+                    message: format!(
+                        "Relationship {id} has invalid TargetMode {:?}; expected Internal or External",
+                        target_mode.as_deref().unwrap_or_default()
+                    ),
+                });
+            }
 
             if let Some(n) = id.strip_prefix("rId").and_then(|s| s.parse::<u32>().ok()) {
                 max_id = max_id.max(n);
@@ -415,8 +454,31 @@ impl RelationshipSet {
         target: &str,
         preferred_id: &str,
     ) -> String {
+        self.add_with_preferred_id_and_mode(rel_type, target, preferred_id, None)
+    }
+
+    /// Add a relationship while preserving both a preferred ID and target
+    /// mode. This is the provenance-aware import primitive: an external target
+    /// must remain External, and an ID referenced by imported XML must be kept
+    /// when it is available.
+    pub fn add_with_preferred_id_and_mode(
+        &mut self,
+        rel_type: &str,
+        target: &str,
+        preferred_id: &str,
+        target_mode: Option<&str>,
+    ) -> String {
         // Check if this exact relationship already exists.
-        if let Some(existing) = self.find_by_type_and_target(rel_type, target) {
+        let existing = if target_mode == Some("External") {
+            self.entries.iter().find(|relationship| {
+                relationship.rel_type == rel_type
+                    && relationship.target == target
+                    && relationship.target_mode.as_deref() == Some("External")
+            })
+        } else {
+            self.find_by_type_and_target(rel_type, target)
+        };
+        if let Some(existing) = existing {
             return existing.id.clone();
         }
 
@@ -441,9 +503,39 @@ impl RelationshipSet {
             id: id.clone(),
             rel_type: rel_type.to_string(),
             target: target.to_string(),
-            target_mode: None,
+            target_mode: target_mode.map(str::to_string),
         });
         id
+    }
+
+    /// Insert an exact relationship binding without deduplicating by target.
+    /// XML imported from another package may already reference this precise
+    /// ID even when an equivalent target is registered under a different ID.
+    /// Returns false if the requested ID is already occupied.
+    pub fn insert_exact(
+        &mut self,
+        id: &str,
+        rel_type: &str,
+        target: &str,
+        target_mode: Option<&str>,
+    ) -> bool {
+        if self.find_by_id(id).is_some() {
+            return false;
+        }
+        if let Some(number) = id
+            .strip_prefix("rId")
+            .and_then(|value| value.parse::<u32>().ok())
+            && number >= self.next_id
+        {
+            self.next_id = number.saturating_add(1);
+        }
+        self.entries.push(Relationship {
+            id: id.to_string(),
+            rel_type: rel_type.to_string(),
+            target: target.to_string(),
+            target_mode: target_mode.map(str::to_string),
+        });
+        true
     }
 
     /// Find the first relationship matching a given type. Test-support only.
@@ -457,12 +549,21 @@ impl RelationshipSet {
     /// package-absolute; anything else is relative to the described part's
     /// directory. `.`/`..` segments are collapsed. External (URL) targets are
     /// not part paths and must not be run through this.
-    fn resolve_internal_target(&self, target: &str) -> String {
+    pub fn resolve_internal_target(&self, target: &str) -> String {
         if target.starts_with('/') {
             normalize_package_path(target)
         } else {
             normalize_package_path(&format!("{}{}", self.base_dir, target))
         }
+    }
+
+    /// Clone this set for a different relationships-part path. Imported
+    /// internal targets are normally rewritten package-absolute, but rebasing
+    /// also keeps later additions and target comparisons correct.
+    pub fn rebased(&self, rels_path: &str) -> Self {
+        let mut cloned = self.clone();
+        cloned.base_dir = rels_base_dir(rels_path);
+        cloned
     }
 
     /// Find an internal relationship by type and target part. Targets are
@@ -523,7 +624,15 @@ pub struct DocxPackage {
 }
 
 pub(crate) const CONTENT_TYPES_PATH: &str = "[Content_Types].xml";
-const ROOT_RELS_PATH: &str = "_rels/.rels";
+pub(crate) const ROOT_RELS_PATH: &str = "_rels/.rels";
+
+/// The OPC relationship type for the package preview thumbnail.
+///
+/// Unlike a document image or story relationship, this is package decoration:
+/// when its target is absent there is no reachable content to preserve. Word
+/// removes the dead relationship during an ordinary save.
+pub(crate) const PACKAGE_THUMBNAIL_REL_TYPE: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";
 
 /// The OPC relationship type whose target is the package's main document part
 /// (ECMA-376 Part 2 §9.3 / ISO/IEC 29500-2). The main part name is NOT fixed:
@@ -650,7 +759,9 @@ impl DocxPackage {
             .ok_or_else(|| PackageError::MissingPart(document_rels_path.clone()))?;
         let document_rels = RelationshipSet::parse(doc_rels_bytes, &document_rels_path)?;
 
-        // Parse story rels (word/_rels/header*.xml.rels, footer*.xml.rels, etc.)
+        // Parse every non-root, non-main relationships part. This includes
+        // headers/footers as well as customXml and arbitrary extension parts:
+        // package closure is an OPC graph property, not a story-only property.
         // All name comparisons are ASCII case-insensitive: part-name
         // equivalence is case-insensitive per OPC §6.2, and stored spellings
         // may differ from the canonical ones.
@@ -658,9 +769,9 @@ impl DocxPackage {
         let mut story_rels = HashMap::new();
         for name in archive.list() {
             let lower = name.to_ascii_lowercase();
-            if lower.starts_with("word/_rels/")
-                && lower.ends_with(".rels")
+            if lower.ends_with(".rels")
                 && lower != document_rels_path_lower
+                && lower != ROOT_RELS_PATH
                 && let Some(bytes) = archive.get(name)
             {
                 let rels = RelationshipSet::parse(bytes, name)?;
@@ -684,7 +795,12 @@ impl DocxPackage {
                 continue;
             }
             if let Some(bytes) = archive.get(name) {
-                parts.insert(name.to_string(), bytes.to_vec());
+                let data = if is_xml_part(name) && contains_strict_ooxml_uri(bytes) {
+                    canonicalize_strict_xml_part(bytes, name)?
+                } else {
+                    bytes.to_vec()
+                };
+                parts.insert(name.to_string(), data);
             }
         }
 
@@ -819,9 +935,10 @@ impl DocxPackage {
         self.parts.insert(key, data);
     }
 
-    /// Remove a part. Returns the removed data if the part existed.
-    /// Test-support only.
-    #[cfg(test)]
+    /// Remove a part by its case-insensitive OPC identity. Returns the removed
+    /// bytes when present. Callers use this only on an owned package while
+    /// executing an explicit package projection.
+    #[doc(hidden)]
     pub fn remove_part(&mut self, path: &str) -> Option<Vec<u8>> {
         let key = self.stored_part_key(path)?.to_string();
         self.parts.remove(&key)
@@ -840,13 +957,40 @@ impl DocxPackage {
     /// Get or create the RelationshipSet for a story part's `.rels` file.
     ///
     /// `rels_path` should be the full `.rels` path, e.g. `word/_rels/header1.xml.rels`.
-    /// Test-support only.
-    #[cfg(test)]
+    /// Intended for engine-operation and downstream-compiler tests.
+    #[doc(hidden)]
     pub fn story_rels_mut(&mut self, rels_path: &str) -> &mut RelationshipSet {
         self.story_rels
             .entry(rels_path.to_string())
             .or_insert_with(RelationshipSet::empty)
     }
+}
+
+/// Whether any XML-bearing package part uses the ISO Strict OOXML namespace
+/// vocabulary. Used by the runtime to avoid caching the original Strict bytes
+/// after the package model has canonicalized them to Transitional.
+pub(crate) fn archive_uses_strict_ooxml(archive: &DocxArchive) -> bool {
+    archive
+        .list()
+        .any(|name| is_xml_part(name) && archive.get(name).is_some_and(contains_strict_ooxml_uri))
+}
+
+fn is_xml_part(name: &str) -> bool {
+    name.ends_with(".xml") || name.ends_with(".rels")
+}
+
+fn contains_strict_ooxml_uri(bytes: &[u8]) -> bool {
+    bytes
+        .windows(STRICT_OOXML_PREFIX.len())
+        .any(|window| window == STRICT_OOXML_PREFIX)
+}
+
+/// Reparse a Strict XML part through the canonical namespace boundary. The
+/// parser normalizes both namespace declarations and recognized URI-valued
+/// attributes, including relationship types and DrawingML content URIs.
+fn canonicalize_strict_xml_part(bytes: &[u8], part_name: &str) -> Result<Vec<u8>, PackageError> {
+    let root = parse_xml(bytes, part_name)?;
+    write_xml(&root, part_name)
 }
 
 // =============================================================================
@@ -1260,6 +1404,25 @@ mod tests {
     }
 
     #[test]
+    fn relationship_target_mode_is_a_closed_opc_enum() {
+        let explicit_internal = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="urn:test" Target="item.xml" TargetMode="Internal"/></Relationships>"#;
+        let parsed = RelationshipSet::parse(explicit_internal, "word/_rels/document.xml.rels")
+            .expect("explicit Internal is the schema spelling of the default mode");
+        assert!(relationship_target_mode_is_internal(
+            parsed.entries[0].target_mode.as_deref()
+        ));
+        assert!(relationship_target_mode_is_internal(None));
+        assert!(!relationship_target_mode_is_internal(Some("External")));
+
+        let invalid = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="urn:test" Target="item.xml" TargetMode="internal"/></Relationships>"#;
+        assert!(matches!(
+            RelationshipSet::parse(invalid, "word/_rels/document.xml.rels"),
+            Err(PackageError::MalformedRelationship { message, .. })
+                if message.contains("invalid TargetMode")
+        ));
+    }
+
+    #[test]
     fn relationship_set_roundtrip() {
         let original =
             RelationshipSet::parse(&minimal_document_rels_xml(), "word/_rels/document.xml.rels")
@@ -1490,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn package_story_rels() {
+    fn package_parses_relationship_sets_for_every_part() {
         use crate::docx::DocxFile;
         let header_rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -1515,6 +1678,10 @@ mod tests {
                 data: header_rels.to_vec(),
             },
             DocxFile {
+                name: "customXml/_rels/item1.xml.rels".to_string(),
+                data: br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps" Target="itemProps1.xml"/></Relationships>"#.to_vec(),
+            },
+            DocxFile {
                 name: "word/document.xml".to_string(),
                 data: b"<w:document/>".to_vec(),
             },
@@ -1522,16 +1689,26 @@ mod tests {
                 name: "word/header1.xml".to_string(),
                 data: b"<w:hdr/>".to_vec(),
             },
+            DocxFile {
+                name: "customXml/item1.xml".to_string(),
+                data: b"<item/>".to_vec(),
+            },
         ]);
 
         let pkg = DocxPackage::from_archive(&archive).unwrap();
-        assert_eq!(pkg.story_rels.len(), 1);
+        assert_eq!(pkg.story_rels.len(), 2);
         let header_rels = pkg.story_rels.get("word/_rels/header1.xml.rels").unwrap();
         assert_eq!(header_rels.entries.len(), 1);
         assert_eq!(header_rels.entries[0].target, "media/image1.png");
 
         // header1.xml.rels should NOT be in raw parts.
         assert!(!pkg.has_part("word/_rels/header1.xml.rels"));
+        assert!(
+            pkg.story_rels
+                .contains_key("customXml/_rels/item1.xml.rels"),
+            "OPC relationship graphs are not limited to Word story parts"
+        );
+        assert!(!pkg.has_part("customXml/_rels/item1.xml.rels"));
     }
 
     #[test]

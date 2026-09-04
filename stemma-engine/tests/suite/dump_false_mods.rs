@@ -11,9 +11,12 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::panic;
 use std::path::PathBuf;
+use stemma_diff::test_support::DiffChange;
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use serde::Serialize;
-use stemma::{DiffChange, DocxRuntime, InlineChange, SimpleRuntime};
+use stemma::{DocxRuntime, InlineChange, SimpleRuntime};
 
 /// Word-overlap Jaccard similarity: |intersection| / |union| over whitespace-split words.
 fn word_similarity(a: &str, b: &str) -> f64 {

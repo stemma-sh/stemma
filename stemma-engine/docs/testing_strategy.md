@@ -7,13 +7,16 @@ the transport crates** (stemma-mcp / stemma-api).
 The engine is a pipeline:
 
 ```
-DOCX bytes -> import -> CanonDoc -> edit / diff -> Transaction -> apply -> CanonDoc -> serialize -> DOCX bytes
+DOCX bytes -> import -> CanonDoc -> Transaction -> apply / project -> serialize -> DOCX bytes
 ```
 
 Each stage has invariants. The engine tests prove the ones that depend only on
-stemma symbols (`api`, `domain`, `edit`, `edit_v4`, `view`, `docx`, and the
+engine symbols (`api`, `domain`, `edit`, `edit_v4`, `view`, `docx`, and the
 `runtime` re-exports `accept_all` / `reject_all` / `SimpleRuntime` /
-`DocxRuntime` / `ExportMode` / `ExportOptions` / `Resolution`).
+`DocxRuntime` / `ExportMode` / `ExportOptions` / `Resolution`). Tests that
+exercise inferred two-document comparison use `stemma-diff` as a dev-only
+downstream consumer; that does not create a production dependency from the
+engine back to comparison.
 
 Run suites via `just -f stemma-engine/Justfile <recipe>`.
 
@@ -26,10 +29,11 @@ changes in our redline and gets different text or formatting than intended, we
 have a bug. Word's interpretation of OOXML is the ground truth because that's
 what the lawyer will open.
 
-But Word is **not** authoritative about what the "correct" diff is. Word's
-`CompareDocuments` is just another diff algorithm with its own quirks. A case
-where stemma produces a finer-grained, more readable redline than Word is not a
-bug — it's a feature.
+But Word is **not** authoritative about what the "correct" diff presentation
+is. Its comparison output is useful differential evidence: when another
+producer handles a document Stemma refuses or mishandles, reduce the case and
+learn whether the engine is missing a valid carrier. Stemma does not optimize
+for reproducing Word's revision envelopes or aggregate visual score.
 
 The daily engine gate uses stemma's own `accept_all` / `reject_all`, so it
 cannot catch a bug where stemma's redline markup and stemma's accept/reject are
@@ -61,11 +65,12 @@ becomes Normal, or a dropped bullet marker, is a bug a lawyer would notice.
 Engine mirror: the structural subset of invariant #18, checked in canonical
 space.
 
-### Tier 3: Presentation quality (benchmark, not gated)
+### Tier 3: Stemma presentation quality
 
 How the tracked-change markup *looks* before accept/reject — granularity of
-ins/del spans, formatting-only changes surfaced or suppressed. A difference here
-might mean we're *better*, not wrong. Tracked, not gated.
+ins/del spans, formatting-only changes surfaced or suppressed. Tests encode
+Stemma's chosen review behavior. Other comparison engines are differential
+inputs, not golden presentation output.
 
 ---
 
@@ -124,13 +129,14 @@ serialize via `DocxPackage::ensure_canonical_wml_content_types`).
 ### #10 — Identity [hard gate]
 
 An identity edit emits zero tracked spans (no phantom `w:ins` / `w:del`):
-`edit_identity_replacement_produces_no_tracked_spans`. Mirror of `diff(A, A)`
-being empty.
+`edit_identity_replacement_produces_no_tracked_spans`. The downstream
+comparison suite separately requires `diff(A, A)` to be empty.
 
 ### #20 — Edit engine I1–I9 [hard gate]
 
-The edit engine produces the same `TrackedSegment` model as `merge_diff`. Its
-own invariants (documented in `stemma-engine/docs/` and `edit/AGENTS.md`):
+The edit engine produces the native `TrackedSegment` model consumed by every
+caller, including downstream comparison. Its own invariants (documented in
+`stemma-engine/docs/` and `edit/AGENTS.md`):
 
 - **I1**: every `OpaqueInlineNode` / `HardBreakNode` survives editing exactly.
 - **I2**: `accept_all(edited)` produces the replacement text.
@@ -160,8 +166,9 @@ held-out conformance tier. Every new verb adds a case to both.
 
 ### #20e — Edit engine: table replace [hard gate, daily]
 
-`EditStep::ReplaceTable` (the v4 `replace(table)` op) routed through the same
-diff machinery as `merge_diff`. Engine layers pinned in `stemma-engine/tests/`:
+`EditStep::ReplaceTable` (the v4 `replace(table)` op) uses the engine's local
+before/after compiler for an explicitly selected table. Engine layers pinned
+in `stemma-engine/tests/`:
 
 - Engine apply (canonical): row insert / delete / matched-row cell change
   produce the right `TrackingStatus` markers — `spec_edit_table_tracked_changes.rs`.
@@ -195,8 +202,9 @@ specialization) and the document path (the full diff/redline + production
 paths):
 
 - **#13** — `serialize(parse(A))` opens clean, all fixtures.
-- **#14 / #14b / #15** — redline accept/reject, opens-clean, and
-  Word-comparison over fixture pairs. (Volatile fields — `PAGE`/`DATE`/`TIME`
+- **#14 / #14b** — redline accept/reject and opens-clean over fixture pairs.
+  External comparer outputs may be sampled only to discover missing valid
+  carrier behavior; their presentation is not a score target. (Volatile fields — `PAGE`/`DATE`/`TIME`
   family — are projected as the opaque field barrier `\u{FFFC}` on both sides, since
   Word recomputes them on open and their rendered text is not a stable target.)
 - **#18** — Tier-2 formatting parity after accept.
@@ -250,11 +258,13 @@ engine test home.
 
 ---
 
-## Test import rule
+## Test dependency rule
 
-**`stemma-engine/tests/` may import ONLY stemma symbols.** If a test needs a
-non-stemma symbol, it does **not** belong in the engine test home; lift the
-symbol into stemma first. No shims, no re-export hacks.
+Engine-only tests import only `stemma`. Cross-boundary integration tests may
+import `stemma-diff` through the explicit dev dependency to prove that the
+downstream compiler composes with engine carriers and projections. Production
+engine code must never depend on `stemma-diff`, and comparison-only behavior
+must not be lifted into the engine merely to simplify a test import.
 
 ---
 

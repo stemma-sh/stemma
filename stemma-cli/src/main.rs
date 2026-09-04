@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use stemma::api::{BlockRole, Document, validate};
+use stemma::api::{BlockRole, Diagnostic, DiagnosticLevel, Document, RevisionRecord, validate};
 use stemma::audit::RevisionDisposition;
 use stemma::tracked_model::RevisionKind;
 use stemma::{ExportOptions, Resolution, ResolveSelectionAction};
@@ -70,6 +70,10 @@ enum Command {
         /// Create a non-deliverable partial redline when any item is refused.
         #[arg(long)]
         emit_partial: bool,
+        /// Confirm that the worklist intentionally continues an author label
+        /// already present in the input document's Word reviewer groups.
+        #[arg(long)]
+        allow_existing_author: bool,
     },
 
     /// Inspect a DOCX through the compact, revision-aware agent projection.
@@ -104,8 +108,7 @@ enum Command {
         root: Option<PathBuf>,
     },
 
-    /// Diff two files into a tracked-changes redline (reject-all == base,
-    /// accept-all == target).
+    /// Diff two files' accepted readings into a tracked-changes redline.
     Compare {
         /// The baseline document (the "before").
         base: PathBuf,
@@ -119,11 +122,10 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         author: Option<String>,
         /// Output format: text (human summary on stderr, empty stdout) or json
-        /// (a stemma.compare_receipt.v0 on stdout; the summary stays on stderr).
+        /// (a versioned success record on stdout; the summary stays on stderr).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-
     /// Read a document's body: plain text, or structured JSON with blocks and
     /// pending tracked changes.
     Extract {
@@ -134,9 +136,9 @@ enum Command {
         format: ExtractFormat,
     },
 
-    /// Emit the full structured read model in one call: every block with its
-    /// per-segment tracked status (the redline, machine-readable), plus the
-    /// complete pending-revision census. JSON on stdout; stemma.read.v0.
+    /// Emit the complete structured lean view in one call: every block with
+    /// its per-segment tracked status (the redline, machine-readable), plus
+    /// the complete pending-revision census. JSON on stdout; stemma.read.v0.
     Read {
         /// The document to read.
         file: PathBuf,
@@ -222,6 +224,10 @@ enum OutputFormat {
     Json,
 }
 
+struct CompareOptions {
+    author: Option<String>,
+}
+
 fn main() -> ExitCode {
     // clap handles --help/--version and usage errors itself (exit code 2).
     let cli = Cli::parse();
@@ -244,6 +250,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
             out,
             receipt,
             emit_partial,
+            allow_existing_author,
         } => {
             return apply::apply_worklist(
                 &artifacts,
@@ -251,7 +258,10 @@ fn run(command: Command) -> Result<ExitCode, String> {
                 &worklist,
                 &out,
                 receipt.as_deref(),
-                emit_partial,
+                apply::ApplyOptions {
+                    emit_partial,
+                    allow_existing_author,
+                },
             )
             .map(apply::ApplyStatus::exit_code);
         }
@@ -274,7 +284,14 @@ fn run(command: Command) -> Result<ExitCode, String> {
             out,
             author,
             format,
-        } => compare(&artifacts, &base, &target, &out, author.as_deref(), format),
+        } => compare(
+            &artifacts,
+            &base,
+            &target,
+            &out,
+            CompareOptions { author },
+            format,
+        ),
         Command::Extract { file, format } => extract(&artifacts, &file, format),
         Command::Read { file } => read_cmd(&artifacts, &file),
         Command::Resolve {
@@ -310,15 +327,6 @@ fn run(command: Command) -> Result<ExitCode, String> {
     result.map(|()| ExitCode::SUCCESS)
 }
 
-// ---------------------------------------------------------------------------
-// compact inspect / verify
-// ---------------------------------------------------------------------------
-
-/// The `inspect --format json` envelope. v1 renamed the summary integers from
-/// v0's `blocks`/`pending_revisions` to `*_count`: the read model's `blocks` is
-/// an ARRAY, and reusing that key for a count invited consumers to conflate the
-/// two shapes. The extended-Markdown projection (and its `@stemma inspect.v0`
-/// header line) is unchanged — only this JSON wrapper is versioned here.
 #[derive(Serialize)]
 struct InspectJson {
     schema: &'static str,
@@ -515,8 +523,23 @@ struct CompareReceipt {
     /// The attribution requested via `--author`; `null` for an anonymous
     /// redline (whose revisions then carry the empty author group `""`).
     author: Option<String>,
+    /// Number of semantic differences inferred between the accepted inputs.
+    semantic_change_count: usize,
+    /// Import-time normalizations remain attributed to the input on which
+    /// they occurred.
+    base_diagnostics: Vec<Diagnostic>,
+    target_diagnostics: Vec<Diagnostic>,
+    /// Pending revisions consumed when projecting each input to the accepted
+    /// reading used for comparison. Empty arrays mean the inputs were clean.
+    flattened_input_revisions: FlattenedInputRevisions,
     revisions: Vec<RevisionJson>,
     output: OutputArtifact,
+}
+
+#[derive(Serialize)]
+struct FlattenedInputRevisions {
+    base: Vec<RevisionJson>,
+    target: Vec<RevisionJson>,
 }
 
 fn compare(
@@ -524,25 +547,32 @@ fn compare(
     base: &Path,
     target: &Path,
     out: &Path,
-    author: Option<&str>,
+    options: CompareOptions,
     format: OutputFormat,
 ) -> Result<(), String> {
+    let CompareOptions { author } = options;
+    let author_name = author.as_deref();
     let (base_doc, base_artifact) = parse_doc(artifacts, base, "base_docx")?;
     let (target_doc, target_artifact) = parse_doc(artifacts, target, "target_docx")?;
-
-    // `--author NAME` attributes the discovered revisions (`diff_as`); omitting
-    // it leaves the redline anonymous (`diff`). Same round-trip either way.
-    let redline = match author {
-        Some(name) => base_doc.diff_as(&target_doc, name),
-        None => base_doc.diff(&target_doc),
-    }
-    .map_err(|e| {
+    let comparison = match author_name {
+        Some(name) => stemma_diff::diff_as_detailed(&base_doc, &target_doc, name),
+        None => stemma_diff::diff_detailed(&base_doc, &target_doc),
+    };
+    let comparison = comparison.map_err(|error| {
         format!(
-            "cannot diff {} against {}: {e}",
+            "cannot diff {} against {}: {error}",
             base.display(),
             target.display()
         )
     })?;
+    let flattened_input_revisions = FlattenedInputRevisions {
+        base: revision_jsons(comparison.flattened_input_revisions.base),
+        target: revision_jsons(comparison.flattened_input_revisions.target),
+    };
+    let semantic_change_count = comparison.semantic_change_count;
+    let base_diagnostics = comparison.base_diagnostics;
+    let target_diagnostics = comparison.target_diagnostics;
+    let redline = comparison.document;
 
     let bytes = serialize(&redline, out)?;
     let output = write_output(
@@ -561,12 +591,23 @@ fn compare(
         if count == 1 { "" } else { "s" },
         output_summary(&output),
     );
+    if !flattened_input_revisions.base.is_empty() || !flattened_input_revisions.target.is_empty() {
+        eprintln!(
+            "compared accepted readings; flattened {} base and {} target pending revisions",
+            flattened_input_revisions.base.len(),
+            flattened_input_revisions.target.len()
+        );
+    }
     if format == OutputFormat::Json {
         let receipt = CompareReceipt {
             schema: "stemma.compare_receipt.v0",
             base: base_artifact,
             target: target_artifact,
-            author: author.map(str::to_string),
+            author,
+            semantic_change_count,
+            base_diagnostics,
+            target_diagnostics,
+            flattened_input_revisions,
             revisions: revisions.into_iter().map(RevisionJson::from).collect(),
             output,
         };
@@ -577,8 +618,6 @@ fn compare(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// extract
 // ---------------------------------------------------------------------------
 
 fn extract(artifacts: &PathAuthority, file: &Path, format: ExtractFormat) -> Result<(), String> {
@@ -1330,9 +1369,13 @@ struct PendingRevision {
 /// carriers; we keep the first occurrence's block and excerpt as its
 /// representative, exactly as a reviewer reads it.
 fn pending_revisions(doc: &Document) -> Vec<PendingRevision> {
+    pending_revision_records(doc.revisions())
+}
+
+fn pending_revision_records(records: Vec<RevisionRecord>) -> Vec<PendingRevision> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for r in doc.revisions() {
+    for r in records {
         // Census-only records share id 0; each is its own row, so only real
         // identities deduplicate.
         if r.revision_id != 0 && !seen.insert(r.revision_id) {
@@ -1348,6 +1391,13 @@ fn pending_revisions(doc: &Document) -> Vec<PendingRevision> {
         });
     }
     out
+}
+
+fn revision_jsons(records: Vec<RevisionRecord>) -> Vec<RevisionJson> {
+    pending_revision_records(records)
+        .into_iter()
+        .map(RevisionJson::from)
+        .collect()
 }
 
 /// A short, single-line excerpt: whitespace-collapsed and capped, so a JSON
@@ -1396,7 +1446,27 @@ fn parse_doc(
         .map_err(|e| e.to_string())?;
     let doc = Document::parse(input.bytes())
         .map_err(|e| format!("{}: not a valid DOCX ({e})", path.display()))?;
+    report_import_diagnostics(role, path, doc.diagnostics());
     Ok((doc, input.identity().clone()))
+}
+
+pub(crate) fn report_import_diagnostics(role: &str, path: &Path, diagnostics: &[Diagnostic]) {
+    for diagnostic in diagnostics {
+        let level = match diagnostic.level {
+            DiagnosticLevel::Info => "info",
+            DiagnosticLevel::Warning => "warning",
+        };
+        let context = diagnostic
+            .context
+            .as_deref()
+            .map(|value| format!("; context={value}"))
+            .unwrap_or_default();
+        eprintln!(
+            "{level}: normalized {role} {} during import: {}{context}",
+            path.display(),
+            diagnostic.message
+        );
+    }
 }
 
 fn serialize(doc: &Document, out: &Path) -> Result<Vec<u8>, String> {

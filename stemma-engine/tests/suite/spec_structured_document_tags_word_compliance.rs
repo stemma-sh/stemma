@@ -17,6 +17,8 @@
 //! Annex A ordering) — never "Word ignores value V on layout".
 
 use std::io::{Cursor, Read, Write};
+#[allow(unused_imports)]
+use stemma_diff::test_support::{DocumentComparisonExt as _, RuntimeComparisonExt as _};
 
 use stemma::api::Document;
 use stemma::{DocxRuntime, ExportMode, ExportOptions, SimpleRuntime, TransactionMeta};
@@ -693,6 +695,206 @@ fn body_level_block_sdt_keeps_sibling_label_after_redline() {
     let after = witness_body_doc("Body changed");
     let xml = redline_unrelated_body_edit(&before, &after);
     assert_single_para_sdt_with_sibling_label(&xml);
+}
+
+#[test]
+fn removed_body_level_sdt_tracks_its_inner_content_as_deleted() {
+    let before = make_docx(
+        r#"<w:sdt><w:sdtPr><w:tag w:val="removed"/><w:id w:val="602"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Removed control text</w:t></w:r><w:hyperlink w:anchor="inside"><w:r><w:t> linked text</w:t></w:r></w:hyperlink></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let after = make_docx(
+        r#"<w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+
+    let runtime = SimpleRuntime::new();
+    let before_import = runtime.import_docx(&before).expect("import before");
+    let after_import = runtime.import_docx(&after).expect("import after");
+    runtime
+        .diff_and_redline(
+            &before_import.doc_handle,
+            &after_import.doc_handle,
+            TransactionMeta {
+                author: "Reviewer".to_string(),
+                reason: Some("remove body content control".to_string()),
+                timestamp_utc: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        )
+        .expect("diff and redline");
+    let redline = runtime
+        .export_docx(&before_import.doc_handle, ExportMode::Redline)
+        .expect("export redline");
+    let xml = document_xml_of(&redline);
+    let sdt_content = sdt_content_inners(&xml);
+
+    assert_eq!(
+        sdt_content.len(),
+        1,
+        "pending redline retains one SDT: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:del ")
+            && sdt_content[0].contains("<w:delText>Removed control text</w:delText>"),
+        "a removed block SDT must express its visible content as a deletion: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:pPr><w:rPr><w:del "),
+        "the SDT paragraph mark must be deleted with its runs: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:hyperlink w:anchor=\"inside\"><w:del "),
+        "a hyperlink remains paragraph-level and tracks its runs internally: {xml}"
+    );
+    assert_opens_clean(&redline, "body-SDT deletion redline must be conformant");
+}
+
+#[test]
+fn added_body_level_sdt_tracks_its_inner_content_as_inserted() {
+    let before = make_docx(
+        r#"<w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let after = make_docx(
+        r#"<w:sdt><w:sdtPr><w:tag w:val="added"/><w:id w:val="603"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Added control text</w:t></w:r><w:hyperlink w:anchor="inside"><w:r><w:t> linked text</w:t></w:r></w:hyperlink></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+
+    let base = Document::parse(&before).expect("parse before");
+    let target = Document::parse(&after).expect("parse after");
+    let redline = base
+        .diff_as(&target, "Reviewer")
+        .expect("diff body content-control insertion");
+    let redline_bytes = redline
+        .serialize(&ExportOptions::default())
+        .expect("serialize insertion redline");
+    let xml = document_xml_of(&redline_bytes);
+    let sdt_content = sdt_content_inners(&xml);
+
+    assert_eq!(
+        sdt_content.len(),
+        1,
+        "pending redline retains one inserted SDT: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:ins ")
+            && sdt_content[0].contains("<w:t>Added control text</w:t>"),
+        "an added block SDT must express its visible content as an insertion: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:pPr><w:rPr><w:ins "),
+        "the SDT paragraph mark must be inserted with its runs: {xml}"
+    );
+    assert!(
+        sdt_content[0].contains("<w:hyperlink w:anchor=\"inside\"><w:ins "),
+        "a hyperlink remains paragraph-level and tracks its runs internally: {xml}"
+    );
+    assert_opens_clean(
+        &redline_bytes,
+        "body-SDT insertion redline must be conformant",
+    );
+
+    let accepted = redline.read_accepted().expect("accept insertion");
+    let accepted_bytes = accepted
+        .serialize(&ExportOptions::default())
+        .expect("serialize accepted insertion");
+    let accepted_xml = document_xml_of(&accepted_bytes);
+    assert!(
+        accepted_xml.contains("<w:sdt>") && accepted_xml.contains("Added control text"),
+        "accept-all must retain the target content control: {accepted_xml}"
+    );
+
+    let rejected = redline.read_rejected().expect("reject insertion");
+    let rejected_bytes = rejected
+        .serialize(&ExportOptions::default())
+        .expect("serialize rejected insertion");
+    let rejected_xml = document_xml_of(&rejected_bytes);
+    assert!(
+        !rejected_xml.contains("<w:sdt>") && !rejected_xml.contains("Added control text"),
+        "reject-all must restore the base without the target content control: {rejected_xml}"
+    );
+}
+
+#[test]
+fn removed_body_sdt_tracks_inside_a_nested_inline_sdt_without_wrapping_it() {
+    let before = make_docx(
+        r#"<w:sdt><w:sdtPr><w:tag w:val="outer"/><w:id w:val="604"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Prefix </w:t></w:r><w:sdt><w:sdtPr><w:tag w:val="inner"/><w:id w:val="605"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>nested text</w:t></w:r></w:sdtContent></w:sdt></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let after = make_docx(
+        r#"<w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+
+    let redline = Document::parse(&before)
+        .expect("parse before")
+        .diff_as(&Document::parse(&after).expect("parse after"), "Reviewer")
+        .expect("diff nested content controls")
+        .serialize(&ExportOptions::default())
+        .expect("serialize nested content-control redline");
+    let xml = document_xml_of(&redline);
+    let nested_start = xml
+        .find(r#"<w:sdt><w:sdtPr><w:tag w:val="inner""#)
+        .expect("nested inline SDT remains present");
+    let preceding = &xml[..nested_start];
+    let last_del_start = preceding.rfind("<w:del ");
+    let last_del_end = preceding.rfind("</w:del>");
+    assert!(
+        last_del_start.is_none() || last_del_end > last_del_start,
+        "the inline SDT envelope must not be nested inside w:del: {xml}"
+    );
+    assert!(
+        xml[nested_start..].contains("<w:sdtContent><w:del ")
+            && xml[nested_start..].contains("<w:delText>nested text</w:delText>"),
+        "the inline SDT's runs must be tracked inside its preserved envelope: {xml}"
+    );
+    assert_opens_clean(&redline, "nested SDT deletion redline must be conformant");
+}
+
+#[test]
+fn body_sdt_table_rows_receive_structural_tracking() {
+    let label = make_docx(
+        r#"<w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+    let with_table = make_docx(
+        r#"<w:sdt><w:sdtPr><w:tag w:val="table"/><w:id w:val="606"/></w:sdtPr><w:sdtContent><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="5000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Tracked cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:sdtContent></w:sdt><w:p><w:r><w:t>Surviving label</w:t></w:r></w:p><w:sectPr/>"#,
+        &[],
+    );
+
+    let deletion = Document::parse(&with_table)
+        .expect("parse table before")
+        .diff_as(
+            &Document::parse(&label).expect("parse label target"),
+            "Reviewer",
+        )
+        .expect("diff table SDT deletion")
+        .serialize(&ExportOptions::default())
+        .expect("serialize table SDT deletion");
+    let deletion_xml = document_xml_of(&deletion);
+    assert!(
+        deletion_xml.contains("<w:trPr><w:del ")
+            && deletion_xml.contains("<w:delText>Tracked cell</w:delText>"),
+        "Word deletes both the row structure and its visible content: {deletion_xml}"
+    );
+    assert_opens_clean(&deletion, "table SDT deletion must be conformant");
+
+    let insertion = Document::parse(&label)
+        .expect("parse label before")
+        .diff_as(
+            &Document::parse(&with_table).expect("parse table target"),
+            "Reviewer",
+        )
+        .expect("diff table SDT insertion")
+        .serialize(&ExportOptions::default())
+        .expect("serialize table SDT insertion");
+    let insertion_xml = document_xml_of(&insertion);
+    assert!(
+        insertion_xml.contains("<w:trPr><w:ins ")
+            && insertion_xml.contains("<w:t>Tracked cell</w:t>"),
+        "Word inserts both the row structure and its visible content: {insertion_xml}"
+    );
+    assert_opens_clean(&insertion, "table SDT insertion must be conformant");
 }
 
 /// A cell whose block-level SDT wraps TWO paragraphs from the start, followed

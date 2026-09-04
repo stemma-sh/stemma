@@ -31,10 +31,9 @@
 
 use std::fs;
 use std::path::PathBuf;
+use stemma_diff::test_support::{DiffChange, diff_documents, merge_diff};
 
-use stemma::{
-    DiffChange, DocxRuntime, RevisionInfo, SimpleRuntime, accept_all, diff_documents, merge_diff,
-};
+use stemma::{DocxRuntime, RevisionInfo, SimpleRuntime, accept_all};
 
 /// One representative fixture per tracked-segment shaping category. Each name is
 /// a `testdata/<name>/` directory holding `before.docx` + `after.docx`.
@@ -47,9 +46,8 @@ const CURATED_FIXTURES: &[(&str, &str)] = &[
     ("twenty-paragraphs", "multi-paragraph block structure"),
     ("ordering-mixed-complex", "numbering / block reordering"),
     ("footnotes", "note references (opaque inline)"),
-    ("math-equations", "equations (opaque preservation)"),
+    ("image-math-wc030", "qualified inline equations"),
     ("images", "images (opaque preservation)"),
-    ("image-math-combined", "combined opaque inlines"),
     ("table-modifications", "table row/cell changes"),
 ];
 

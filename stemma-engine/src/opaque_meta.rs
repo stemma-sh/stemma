@@ -452,13 +452,26 @@ pub(crate) fn collect_descendants_by_local<'a>(
     }
 }
 
-/// Concatenate every `XMLNode::Text` descendant of `element`, in document order.
+/// Concatenate textual Word run descendants in document order.
+///
+/// Whitespace between OOXML elements is package formatting, not document text.
+/// Looking at every `XMLNode::Text` made pretty-printed `w:sdtContent` appear to
+/// contain its indentation and made the read model depend on CRLF-vs-LF XML
+/// serialization. `w:t` and `w:delText` are the textual carriers represented
+/// by this compact display summary; non-text controls remain in the opaque
+/// object's exact XML rather than being guessed here.
 fn collect_text_descendants(element: &Element, out: &mut String) {
+    if matches!(element.name.as_str(), "t" | "delText") {
+        for child in &element.children {
+            if let XMLNode::Text(text) = child {
+                out.push_str(text);
+            }
+        }
+        return;
+    }
     for child in &element.children {
-        match child {
-            XMLNode::Text(t) => out.push_str(t),
-            XMLNode::Element(el) => collect_text_descendants(el, out),
-            _ => {}
+        if let XMLNode::Element(el) = child {
+            collect_text_descendants(el, out);
         }
     }
 }
@@ -569,6 +582,19 @@ mod tests {
                 assert_eq!(display_text.as_deref(), Some("Acme Corporation"));
                 assert!(list_items.is_empty());
                 assert_eq!(checked, None);
+            }
+            other => panic!("expected ContentControl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_sdt_display_text_ignores_xml_indentation_and_line_endings() {
+        let raw = b"<w:sdt>\r\n  <w:sdtPr><w:alias w:val=\"Pretty\"/></w:sdtPr>\r\n  <w:sdtContent>\r\n    <w:r><w:t>Basic text</w:t></w:r>\r\n    <w:del><w:r><w:delText> old</w:delText></w:r></w:del>\r\n  </w:sdtContent>\r\n</w:sdt>";
+        let node = node(OpaqueKind::Sdt, Some(raw.to_vec()));
+
+        match project(&node).expect("sdt surfaces metadata") {
+            OpaqueMetadata::ContentControl { display_text, .. } => {
+                assert_eq!(display_text.as_deref(), Some("Basic text old"));
             }
             other => panic!("expected ContentControl, got {other:?}"),
         }
