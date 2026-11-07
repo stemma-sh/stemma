@@ -178,6 +178,7 @@ fn read_block_text_round_trips_as_delete_expect() {
     // Delete the paragraph, pinning it with the VERBATIM read text as `expect`.
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: block_id.clone(),
             to_block_id: block_id,
             rationale: None,

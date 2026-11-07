@@ -11,12 +11,44 @@ use xmltree::{AttributeName, Element, Namespace, XMLNode};
 use crate::xml_attrs::{attr_get, attr_set};
 const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
+/// Physical host-run ownership shared by source-context rebasing and emission.
+/// Run widgets use the importer's single classification, avoiding drift where
+/// a widget imports inside a run but later emits bare at paragraph level.
+pub(crate) fn opaque_raw_element_requires_run_wrapper(element: &Element) -> bool {
+    let name = crate::runtime::local_element_name(element);
+    (name != "oMath" && crate::word_ir::is_run_widget(name))
+        || matches!(name, "t" | "delText" | "br" | "tab" | "AlternateContent")
+}
+
+/// Run-level decorations need a CT_R host; paragraph range markers do not.
+pub(crate) fn decoration_requires_run_wrapper(element: &Element) -> bool {
+    matches!(
+        crate::runtime::local_element_name(element),
+        "footnoteRef"
+            | "endnoteRef"
+            | "separator"
+            | "continuationSeparator"
+            | "annotationRef"
+            | "lastRenderedPageBreak"
+            | "noBreakHyphen"
+            | "softHyphen"
+    )
+}
+
 const STRICT_RELATIONSHIP_PREFIX: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships/";
 const TRANSITIONAL_RELATIONSHIP_PREFIX: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/";
 
 fn is_xml_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Whether a text leaf holding `text` must carry `xml:space="preserve"`: its
+/// boundary whitespace is content only then, and every reader drops it
+/// otherwise ([`active_word_text`]). XML whitespace is space, tab, line feed
+/// and carriage return alike.
+pub(crate) fn needs_space_preserve(text: &str) -> bool {
+    text.starts_with(is_xml_whitespace) || text.ends_with(is_xml_whitespace)
 }
 
 /// Return the active character content of one WordprocessingML text leaf.
@@ -338,7 +370,35 @@ pub enum WordXmlError {
 
 pub fn parse_document_xml(bytes: &[u8]) -> Result<Element, WordXmlError> {
     ensure_xml_depth_within_limit(bytes, MAX_XML_ELEMENT_DEPTH)?;
-    parse_document_xml_quick(bytes)
+    let mut root = parse_document_xml_quick(bytes)?;
+    make_inherited_space_explicit(&mut root, false);
+    Ok(root)
+}
+
+/// `xml:space` applies to an element and everything inside it until a
+/// descendant sets it again (XML 1.0 §2.10), so a part may declare
+/// `xml:space="preserve"` once, on its root. Every reader of a text leaf
+/// looks at the leaf's own attribute ([`active_word_text`]), so write the
+/// inherited value onto each leaf that would otherwise lose it.
+fn make_inherited_space_explicit(element: &mut Element, inherited_preserve: bool) {
+    let preserve = match attr_get(element, "xml:space").map(String::as_str) {
+        Some("preserve") => true,
+        Some(_) => false,
+        None => inherited_preserve,
+    };
+    if preserve
+        && attr_get(element, "xml:space").is_none()
+        && ["t", "delText", "instrText", "delInstrText"]
+            .iter()
+            .any(|local| is_w_tag(element, local))
+    {
+        attr_set(element, "xml:space", "preserve");
+    }
+    for child in &mut element.children {
+        if let XMLNode::Element(child) = child {
+            make_inherited_space_explicit(child, preserve);
+        }
+    }
 }
 
 /// True when `bytes` carry no XML content at all: 0 bytes, a lone UTF-8 BOM, or
@@ -1423,23 +1483,32 @@ pub fn body_element(root: &Element) -> Result<&Element, WordXmlError> {
 ///
 /// The serializer declares all used namespace prefixes on the root element,
 /// so the raw bytes are self-contained. This wrapper adds a synthetic root
-/// that *also* declares every prefix in `KNOWN_OOXML_NAMESPACES` — supplemental,
-/// to handle legacy raw bytes that may lack declarations. After parsing, the
+/// that *also* declares the `KNOWN_OOXML_NAMESPACES` prefixes the bytes
+/// mention — supplemental, to handle legacy raw bytes that may lack
+/// declarations. After parsing, the
 /// propagated `namespaces` map is cleared so no redundant declarations are
 /// emitted when the element is later written.
 pub fn parse_raw_fragment(raw: &[u8]) -> Result<Element, xmltree::ParseError> {
-    use std::sync::LazyLock;
-
-    static NS_WRAPPER_PREFIX: LazyLock<Vec<u8>> = LazyLock::new(|| {
-        let mut s = String::from("<_ns_root");
-        for (prefix, uri) in KNOWN_OOXML_NAMESPACES {
-            s.push_str(&format!(" xmlns:{prefix}=\"{uri}\""));
+    let mut element = parse_raw_fragment_with_namespace_scope(raw)?;
+    let used = crate::word_ir::collect_prefix_uri_bindings(&element);
+    strip_ns_decls(&mut element);
+    if !used.is_empty() {
+        let mut ns = Namespace::empty();
+        for (prefix, uri) in &used {
+            ns.put(prefix.as_str(), uri.as_str());
         }
-        s.push('>');
-        s.into_bytes()
-    });
-    static NS_WRAPPER_SUFFIX: &[u8] = b"</_ns_root>";
+        element.namespaces = Some(ns);
+    }
+    Ok(element)
+}
 
+/// Parse a fragment for semantic inspection, retaining in-scope namespace
+/// bindings needed by QName-valued attributes such as mc:Choice/@Requires.
+/// Mutation callers can use parse_raw_fragment's compact namespace form;
+/// readers must not discard the bindings before interpreting those attributes.
+pub(crate) fn parse_raw_fragment_with_namespace_scope(
+    raw: &[u8],
+) -> Result<Element, xmltree::ParseError> {
     let content = if raw.starts_with(b"<?xml") {
         match raw.iter().position(|&b| b == b'>') {
             Some(pos) => &raw[pos + 1..],
@@ -1449,11 +1518,25 @@ pub fn parse_raw_fragment(raw: &[u8]) -> Result<Element, xmltree::ParseError> {
         raw
     };
 
-    let mut wrapped =
-        Vec::with_capacity(NS_WRAPPER_PREFIX.len() + content.len() + NS_WRAPPER_SUFFIX.len());
-    wrapped.extend_from_slice(&NS_WRAPPER_PREFIX);
+    // Declare only the known prefixes the fragment mentions (see
+    // `prefix_tokens`): a superset of every binding it can use. Declaring
+    // all of them made parsing a 30-byte run property cost twenty times its
+    // own parse, which dominated edits and saves of long documents.
+    let mentioned = prefix_tokens(content);
+    let mut wrapped = Vec::with_capacity(content.len() + 256);
+    wrapped.extend_from_slice(b"<_ns_root");
+    for (prefix, uri) in KNOWN_OOXML_NAMESPACES {
+        if mentioned.contains(prefix.as_bytes()) {
+            wrapped.extend_from_slice(b" xmlns:");
+            wrapped.extend_from_slice(prefix.as_bytes());
+            wrapped.extend_from_slice(b"=\"");
+            wrapped.extend_from_slice(uri.as_bytes());
+            wrapped.push(b'"');
+        }
+    }
+    wrapped.push(b'>');
     wrapped.extend_from_slice(content);
-    wrapped.extend_from_slice(NS_WRAPPER_SUFFIX);
+    wrapped.extend_from_slice(b"</_ns_root>");
 
     // Bound nesting depth before the recursive-descent `Element::parse` (and the
     // recursive `strip_ns_decls` pass below) ever touch these bytes. These are
@@ -1476,23 +1559,40 @@ pub fn parse_raw_fragment(raw: &[u8]) -> Result<Element, xmltree::ParseError> {
         .cdata_to_characters(true);
     let root = Element::parse_with_config(Cursor::new(&wrapped), config)?;
     match root.children.into_iter().find_map(|c| match c {
-        XMLNode::Element(mut el) => {
-            let used = crate::word_ir::collect_prefix_uri_bindings(&el);
-            strip_ns_decls(&mut el);
-            if !used.is_empty() {
-                let mut ns = Namespace::empty();
-                for (prefix, uri) in &used {
-                    ns.put(prefix.as_str(), uri.as_str());
-                }
-                el.namespaces = Some(ns);
-            }
-            Some(el)
-        }
+        XMLNode::Element(el) => Some(el),
         _ => None,
     }) {
         Some(el) => Ok(el),
         None => Err(xmltree::ParseError::CannotParse),
     }
+}
+
+/// The tokens in `xml` that stand where a namespace prefix can be used:
+/// before a `:` in a qualified name (`w:val`, `xsi:type="a:CT_X"`), or as a
+/// whole token in a prefix list (`mc:Choice Requires="wps"`,
+/// `mc:Ignorable="w14 wp14"`). Text that merely contains a prefix's letters (a
+/// namespace URI, a word) yields no token. One pass, so the cost stays linear
+/// in the fragment whatever the number of known prefixes.
+fn prefix_tokens(xml: &[u8]) -> std::collections::HashSet<&[u8]> {
+    let opens = |b: u8| matches!(b, b'<' | b'"' | b'\'' | b'/') || b.is_ascii_whitespace();
+    let closes = |b: u8| matches!(b, b':' | b'"' | b'\'') || b.is_ascii_whitespace();
+    let name_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.');
+    let mut tokens = std::collections::HashSet::new();
+    let mut at = 0;
+    while at < xml.len() {
+        if name_byte(xml[at]) && (at == 0 || opens(xml[at - 1])) {
+            let start = at;
+            while at < xml.len() && name_byte(xml[at]) {
+                at += 1;
+            }
+            if xml.get(at).is_some_and(|&b| closes(b)) {
+                tokens.insert(&xml[start..at]);
+            }
+        } else {
+            at += 1;
+        }
+    }
+    tokens
 }
 
 fn strip_ns_decls(element: &mut Element) {
@@ -1501,6 +1601,65 @@ fn strip_ns_decls(element: &mut Element) {
         if let XMLNode::Element(child_el) = child {
             strip_ns_decls(child_el);
         }
+    }
+}
+
+/// An opaque fragment owns its entire serialized envelope. A compatibility
+/// drawing has exactly one selected active drawing, possibly nested in Choices;
+/// inactive representations are not additional content or revision carriers.
+pub(crate) struct OpaqueFragment {
+    envelope: Element,
+    active_path: Vec<usize>,
+}
+
+impl OpaqueFragment {
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self, String> {
+        let envelope = parse_raw_fragment_with_namespace_scope(raw)
+            .map_err(|error| format!("opaque XML parse failed: {error}"))?;
+        let active_path = if crate::word_ir::is_mc_alternate_content(&envelope) {
+            crate::word_ir::selected_mc_drawing_path(&envelope)
+                .map_err(|error| format!("opaque drawing branch selection failed: {error}"))?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            envelope,
+            active_path,
+        })
+    }
+
+    pub(crate) fn active(&self) -> &Element {
+        let mut element = &self.envelope;
+        for &index in &self.active_path {
+            let XMLNode::Element(child) = &element.children[index] else {
+                unreachable!("validated drawing path points to an element");
+            };
+            element = child;
+        }
+        element
+    }
+
+    pub(crate) fn active_mut(&mut self) -> &mut Element {
+        let mut element = &mut self.envelope;
+        for &index in &self.active_path {
+            let XMLNode::Element(child) = &mut element.children[index] else {
+                unreachable!("validated drawing path points to an element");
+            };
+            element = child;
+        }
+        element
+    }
+
+    /// The whole envelope: for an authoring operation that mirrors an
+    /// addressed text edit into matching compatibility representations, and
+    /// for resolving all revisions. Discovery and selective resolution use
+    /// active()/active_mut().
+    pub(crate) fn envelope_mut(&mut self) -> &mut Element {
+        &mut self.envelope
+    }
+
+    pub(crate) fn serialize(&self) -> Vec<u8> {
+        serialize_raw_fragment(&self.envelope)
     }
 }
 
@@ -1699,7 +1858,7 @@ pub fn w_cell_del(revision_id: u32, author: &str, date: &str) -> Element {
 /// Creates a `<w:delText>` element (used inside deleted runs)
 pub fn w_del_text(text: &str) -> Element {
     let mut del_text = w_el("delText");
-    if text.starts_with(' ') || text.ends_with(' ') {
+    if needs_space_preserve(text) {
         attr_set(&mut del_text, "xml:space", "preserve");
     }
     del_text.children.push(XMLNode::Text(text.to_string()));
@@ -1794,6 +1953,34 @@ pub fn ensure_ppr_rpr_move_from(paragraph: &mut Element, rev_id: u32, author: &s
 mod tests {
     use super::*;
     use xmltree::ParserConfig;
+
+    /// The supplemental declarations still reach a prefix the fragment uses
+    /// without declaring it, in a name and in a QName-valued attribute.
+    #[test]
+    fn raw_fragment_resolves_undeclared_prefixes_it_uses() {
+        let raw = br#"<mc:AlternateContent><mc:Choice Requires="wps"><w:r><w:t>x</w:t></w:r></mc:Choice></mc:AlternateContent>"#;
+        let scoped = parse_raw_fragment_with_namespace_scope(raw).expect("parses");
+        let ns = scoped.namespaces.as_ref().expect("bindings in scope");
+        assert_eq!(
+            ns.get("wps"),
+            Some("http://schemas.microsoft.com/office/word/2010/wordprocessingShape"),
+            "the prefix named only in Requires is bound"
+        );
+        assert!(ns.get("w").is_some() && ns.get("mc").is_some());
+    }
+
+    /// Letters inside a namespace URI or a word are not a use of a prefix.
+    #[test]
+    fn prefix_tokens_are_names_and_list_entries_only() {
+        let raw = br#"<w:lang xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:val="en-US" mc:Ignorable="w14 wp14"/>"#;
+        let tokens = prefix_tokens(raw);
+        for used in ["w", "mc", "w14", "wp14"] {
+            assert!(tokens.contains(used.as_bytes()), "{used} is used");
+        }
+        for unused in ["o", "m", "a", "v"] {
+            assert!(!tokens.contains(unused.as_bytes()), "{unused} is not used");
+        }
+    }
 
     #[test]
     fn revision_helpers_omit_an_absent_date() {

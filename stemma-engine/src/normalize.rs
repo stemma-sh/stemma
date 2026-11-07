@@ -29,12 +29,62 @@ pub enum NormalizeError {
     /// quick-xml builder failure (the Approach-A parser path).
     XmlParseQuick(crate::word_xml::WordXmlError),
     XmlWrite(xmltree::Error),
+    /// An auxiliary grid payload cannot be resolved without losing state.
+    InvalidTableHistory {
+        part: String,
+        reason: String,
+    },
     /// The package's main document part could not be located (OPC §9.3): a
     /// malformed `_rels/.rels`, a missing officeDocument relationship, an
     /// External target, or a dangling target. A real defect — normalizing the
     /// wrong part would silently corrupt output — so it is propagated, never
     /// defaulted away.
     Package(crate::docx_package::PackageError),
+    /// A part carries a pending tracked change the engine does not model, so
+    /// neither Accept All nor Reject All can resolve it; resolving around it
+    /// would return a "resolved" package that still holds the change.
+    UnmodeledRevision {
+        part: String,
+        element: &'static str,
+        reason: &'static str,
+    },
+}
+
+/// Refuse a package any of whose revision-bearing parts carries a tracked
+/// vertical cell merge that changes the merge state (`w:cellMerge` with
+/// `w:vMerge` or `w:vMergeOrig`, §17.13.5.3). The model reports the same
+/// change in its census (`RevisionKind::CellMerge`) and refuses every
+/// projection while it is pending; this is the byte-level twin. A cellMerge
+/// with neither attribute "can be ignored" and passes.
+fn refuse_unmodeled_revisions(archive: &DocxArchive) -> Result<(), NormalizeError> {
+    fn find(element: &Element) -> bool {
+        element.children.iter().any(|child| match child {
+            XMLNode::Element(child) => {
+                (is_w_tag(child, "cellMerge")
+                    && (crate::xml_attrs::attr_get(child, "w:vMerge").is_some()
+                        || crate::xml_attrs::attr_get(child, "w:vMergeOrig").is_some()))
+                    || find(child)
+            }
+            _ => false,
+        })
+    }
+    let mut part_paths = collect_normalizable_part_paths(archive)?;
+    part_paths.extend(collect_glossary_part_paths(archive)?);
+    for part in part_paths {
+        let Some(bytes) = archive.get(&part) else {
+            continue;
+        };
+        // Cheap byte gate first; parse only a part that mentions the element.
+        if memchr_find(bytes, b"cellMerge") && find(&parse_xml(bytes)?) {
+            return Err(NormalizeError::UnmodeledRevision {
+                part,
+                element: "cellMerge",
+                reason: "a tracked vertical cell merge (§17.13.5.3) rewrites the vertical \
+                         merge geometry across rows on Accept/Reject, which is not supported",
+            });
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -313,9 +363,11 @@ fn collect_note_reference_ids(element: &Element, kind: NoteKind, ids: &mut HashS
 }
 
 fn is_reserved_note_definition(element: &Element) -> bool {
+    // These structural definitions need no body reference. In particular a
+    // continuation notice must not be pruned as an orphaned user note.
     matches!(
         get_attr(element, "type"),
-        Some("separator") | Some("continuationSeparator")
+        Some("separator") | Some("continuationSeparator") | Some("continuationNotice")
     )
 }
 
@@ -513,6 +565,272 @@ fn write_xml(element: &Element) -> Result<Vec<u8>, NormalizeError> {
     let mut out = Vec::new();
     element.write(&mut out).map_err(NormalizeError::XmlWrite)?;
     Ok(out)
+}
+
+/// Resolve the auxiliary grid before property owners are removed by the
+/// content walk. Nested tables own their own frames. This deliberately does
+/// not count tblGridChange as an independently selectable revision.
+fn resolve_table_grid_history(
+    root: &mut Element,
+    accept: bool,
+    part: &str,
+) -> Result<u32, NormalizeError> {
+    fn owns_properties(element: &Element) -> bool {
+        element
+            .children
+            .iter()
+            .filter_map(XMLNode::as_element)
+            .any(|child| {
+                if is_w_tag(child, "tbl") || is_w_tag(child, "p") {
+                    return false;
+                }
+                ["tblPrChange", "tblPrExChange", "trPrChange", "tcPrChange"]
+                    .iter()
+                    .any(|tag| is_w_tag(child, tag))
+                    || owns_properties(child)
+            })
+    }
+    let mut resolved = 0;
+    if is_w_tag(root, "tbl") {
+        resolve_simple_column_slots(root, accept, part)?;
+        let restore_previous = !accept && owns_properties(root);
+        for grid in root
+            .children
+            .iter_mut()
+            .filter_map(XMLNode::as_mut_element)
+            .filter(|child| is_w_tag(child, "tblGrid"))
+        {
+            let history = crate::import::parse_grid_history(grid).map_err(|error| {
+                NormalizeError::InvalidTableHistory {
+                    part: part.to_owned(),
+                    reason: error.message,
+                }
+            })?;
+            if history.is_none() {
+                continue;
+            }
+            // The shared parser has proved exactly one record with exactly
+            // one previous tblGrid. Preserve its XML spellings, not a second
+            // reconstruction of the already-validated widths.
+            let index = grid
+                .children
+                .iter()
+                .position(|node| {
+                    node.as_element()
+                        .is_some_and(|el| is_w_tag(el, "tblGridChange"))
+                })
+                .expect("validated auxiliary grid record");
+            let XMLNode::Element(change) = grid.children.remove(index) else {
+                unreachable!("validated auxiliary grid element")
+            };
+            if restore_previous {
+                let previous = change
+                    .children
+                    .into_iter()
+                    .find_map(|node| match node {
+                        XMLNode::Element(el) => Some(el),
+                        _ => None,
+                    })
+                    .expect("validated previous table grid");
+                grid.children = previous.children;
+            }
+            resolved += 1;
+        }
+    }
+    if is_w_tag(root, "tblGridChange") {
+        return Err(NormalizeError::InvalidTableHistory {
+            part: part.to_owned(),
+            reason: "tblGridChange is outside the direct grid of a table".to_owned(),
+        });
+    }
+    for child in root.children.iter_mut().filter_map(XMLNode::as_mut_element) {
+        resolved += resolve_table_grid_history(child, accept, part)?;
+    }
+    Ok(resolved)
+}
+
+/// Reconcile the current simple-grid frame before removing cell carriers or
+/// restoring previous property history. Non-simple grids have row-local span
+/// semantics and do not represent whole-column removal in this coordinate frame.
+fn resolve_simple_column_slots(
+    table: &mut Element,
+    accept: bool,
+    part: &str,
+) -> Result<(), NormalizeError> {
+    fn child<'a>(element: &'a Element, tag: &str) -> Option<&'a Element> {
+        element
+            .children
+            .iter()
+            .filter_map(XMLNode::as_element)
+            .find(|element| is_w_tag(element, tag))
+    }
+    fn value(element: &Element, part: &str) -> Result<u32, NormalizeError> {
+        // ISO 29500-1 §17.4.16 explicitly defines an omitted saved grid width
+        // as zero. Absence is valid; a present malformed value is not. A
+        // present value reads as import reads it.
+        let Some(width) = get_attr(element, "w") else {
+            return Ok(0);
+        };
+        crate::import::parse_twips_measure(width, &element.name).map_err(|error| {
+            NormalizeError::InvalidTableHistory {
+                part: part.to_owned(),
+                reason: error.message,
+            }
+        })
+    }
+    let Some(grid) = child(table, "tblGrid") else {
+        return Ok(());
+    };
+    let widths: Vec<_> = grid
+        .children
+        .iter()
+        .filter_map(XMLNode::as_element)
+        .filter(|element| is_w_tag(element, "gridCol"))
+        .map(|element| value(element, part))
+        .collect::<Result<_, _>>()?;
+    if widths.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<_> = table
+        .children
+        .iter()
+        .filter_map(XMLNode::as_element)
+        .filter(|element| is_w_tag(element, "tr"))
+        .filter(|row| {
+            let properties = child(row, "trPr");
+            let inserted = properties.is_some_and(|properties| child(properties, "ins").is_some());
+            let deleted = properties.is_some_and(|properties| child(properties, "del").is_some());
+            crate::resolution_rules::tracked_class_survives(inserted, deleted, accept)
+        })
+        .collect();
+    let cells: Vec<Vec<_>> = rows
+        .iter()
+        .map(|row| {
+            row.children
+                .iter()
+                .filter_map(XMLNode::as_element)
+                .filter(|element| is_w_tag(element, "tc"))
+                .collect()
+        })
+        .collect();
+    if cells.is_empty()
+        || rows.iter().zip(&cells).any(|(row, cells)| {
+            cells.len() != widths.len()
+                || child(row, "trPr").is_some_and(|properties| {
+                    ["gridBefore", "gridAfter"].iter().any(|tag| {
+                        child(properties, tag)
+                            .is_some_and(|element| get_attr(element, "val") != Some("0"))
+                    })
+                })
+                || cells.iter().any(|cell| {
+                    child(cell, "tcPr").is_some_and(|properties| {
+                        child(properties, "vMerge").is_some()
+                            || child(properties, "gridSpan")
+                                .is_some_and(|element| get_attr(element, "val") != Some("1"))
+                    })
+                })
+        })
+    {
+        return Ok(());
+    }
+    let removed: Vec<_> = (0..widths.len())
+        .map(|index| {
+            cells.iter().all(|row| {
+                !crate::resolution_rules::tracked_class_survives(
+                    has_cell_tracking(row[index], "cellIns"),
+                    has_cell_tracking(row[index], "cellDel"),
+                    accept,
+                )
+            })
+        })
+        .collect();
+    if !removed.iter().any(|removed| *removed) {
+        return Ok(());
+    }
+    let absorb: Vec<_> = (0..widths.len())
+        .map(|index| {
+            accept
+                && cells.iter().all(|row| {
+                    has_cell_tracking(row[index], "cellDel")
+                        && !has_cell_tracking(row[index], "cellIns")
+                })
+        })
+        .collect();
+    let slots = crate::resolution_rules::resolved_column_slots(&widths, &removed, &absorb)
+        .map_err(|reason| NormalizeError::InvalidTableHistory {
+            part: part.to_owned(),
+            reason,
+        })?;
+    for row in table
+        .children
+        .iter_mut()
+        .filter_map(XMLNode::as_mut_element)
+        .filter(|element| is_w_tag(element, "tr"))
+    {
+        for (index, cell) in row
+            .children
+            .iter_mut()
+            .filter_map(XMLNode::as_mut_element)
+            .filter(|element| is_w_tag(element, "tc"))
+            .enumerate()
+        {
+            if !accept {
+                continue;
+            }
+            let Some(&(_, width)) = slots.iter().find(|(slot, _)| *slot == index) else {
+                continue;
+            };
+            if width == widths[index] {
+                continue;
+            }
+            if child(cell, "tcPr").is_none() {
+                cell.children
+                    .insert(0, XMLNode::Element(crate::word_xml::w_el("tcPr")));
+            }
+            let properties = cell
+                .children
+                .iter_mut()
+                .filter_map(XMLNode::as_mut_element)
+                .find(|element| is_w_tag(element, "tcPr"))
+                .expect("cell properties inserted");
+            if child(properties, "tcW").is_none() {
+                properties
+                    .children
+                    .insert(0, XMLNode::Element(crate::word_xml::w_el("tcW")));
+            }
+            let measurement = properties
+                .children
+                .iter_mut()
+                .filter_map(XMLNode::as_mut_element)
+                .find(|element| is_w_tag(element, "tcW"))
+                .expect("cell width inserted");
+            crate::xml_attrs::attr_set(measurement, "w:w", width.to_string());
+            crate::xml_attrs::attr_set(measurement, "w:type", "dxa");
+        }
+    }
+    let grid = table
+        .children
+        .iter_mut()
+        .filter_map(XMLNode::as_mut_element)
+        .find(|element| is_w_tag(element, "tblGrid"))
+        .expect("current grid exists");
+    let mut index = 0;
+    grid.children.retain_mut(|node| {
+        let XMLNode::Element(element) = node else {
+            return true;
+        };
+        if !is_w_tag(element, "gridCol") {
+            return true;
+        }
+        let slot = index;
+        index += 1;
+        let Some(&(_, width)) = slots.iter().find(|(index, _)| *index == slot) else {
+            return false;
+        };
+        crate::xml_attrs::attr_set(element, "w:w", width.to_string());
+        true
+    });
+    Ok(())
 }
 
 fn local_element_name(element: &Element) -> &str {
@@ -1131,6 +1449,17 @@ fn split_name(
 pub fn normalize_docx(
     archive: &DocxArchive,
 ) -> Result<(DocxArchive, NormalizationResult), NormalizeError> {
+    refuse_unmodeled_revisions(archive)?;
+    accept_all_parts(archive)
+}
+
+/// [`normalize_docx`] without the unmodeled-revision refusal. Only the
+/// serializer's accepted BASE image uses it (`normalize_if_needed`): that
+/// image is a template for untouched parts, never handed out as a resolved
+/// document, and an unmodeled change in it rides along verbatim as today.
+fn accept_all_parts(
+    archive: &DocxArchive,
+) -> Result<(DocxArchive, NormalizationResult), NormalizeError> {
     let mut output = archive.clone();
     let mut result = NormalizationResult::default();
 
@@ -1146,6 +1475,7 @@ pub fn normalize_docx(
         let mut stats = NormalizeStats::default();
 
         let range_markers_before = capture_tree_range_markers(&root);
+        let auxiliary_resolved = resolve_table_grid_history(&mut root, true, part_path)?;
         normalize_children(&mut root, &mut stats, false);
         collapse_torn_range_markers_in_tree(&mut root, &range_markers_before);
 
@@ -1153,7 +1483,7 @@ pub fn normalize_docx(
         // Safe to unwrap: we just read this part, so it exists.
         output.upsert(part_path, new_bytes);
 
-        if stats.revisions_resolved > 0 || stats.opaque_resolved > 0 {
+        if stats.revisions_resolved > 0 || stats.opaque_resolved > 0 || auxiliary_resolved > 0 {
             result.parts_normalized.push(part_path.clone());
         }
         result.revisions_resolved += stats.revisions_resolved;
@@ -1186,6 +1516,7 @@ pub fn normalize_docx(
 pub fn reject_all_docx(
     archive: &DocxArchive,
 ) -> Result<(DocxArchive, NormalizationResult), NormalizeError> {
+    refuse_unmodeled_revisions(archive)?;
     let mut output = archive.clone();
     let mut result = NormalizationResult::default();
 
@@ -1201,13 +1532,14 @@ pub fn reject_all_docx(
         let mut stats = NormalizeStats::default();
 
         let range_markers_before = capture_tree_range_markers(&root);
+        let auxiliary_resolved = resolve_table_grid_history(&mut root, false, part_path)?;
         reject_children(&mut root, &mut stats, false);
         collapse_torn_range_markers_in_tree(&mut root, &range_markers_before);
 
         let new_bytes = write_xml(&root)?;
         output.upsert(part_path, new_bytes);
 
-        if stats.revisions_resolved > 0 || stats.opaque_resolved > 0 {
+        if stats.revisions_resolved > 0 || stats.opaque_resolved > 0 || auxiliary_resolved > 0 {
             result.parts_normalized.push(part_path.clone());
         }
         result.revisions_resolved += stats.revisions_resolved;
@@ -1243,6 +1575,7 @@ pub(crate) fn resolve_glossary_docx(
         let mut root = parse_xml(xml_bytes)?;
         let mut stats = NormalizeStats::default();
         let range_markers_before = capture_tree_range_markers(&root);
+        resolve_table_grid_history(&mut root, accept, &part_path)?;
         if accept {
             normalize_children(&mut root, &mut stats, false);
         } else {
@@ -1265,12 +1598,15 @@ pub(crate) enum FragmentResolution {
     /// both a parsed fragment with no revisions AND an unparseable fragment that
     /// contains no revision markers (nothing to resolve either way).
     Clean,
-    /// The fragment failed to reparse BUT its raw bytes contain a revision marker
+    /// The fragment failed XML parsing or active-branch selection, BUT its raw bytes contain a revision marker
     /// (`<w:ins`/`<w:del`/`w:moveFrom`/`w:moveTo`). We cannot resolve revisions
     /// we cannot parse — and silently leaving them is the exact silent-fallback
     /// this descent exists to kill — so the projection must REFUSE rather than
     /// emit a document that still carries pending revisions it claimed to resolve.
     UnparseableWithRevisions,
+    /// The XML parses, but its auxiliary table history cannot be safely
+    /// resolved. Full projection must refuse with this diagnostic.
+    InvalidTableHistory(String),
 }
 
 /// Resolve all tracked changes inside an opaque inline's `raw_xml` fragment,
@@ -1298,34 +1634,52 @@ pub(crate) fn resolve_opaque_fragment_revisions(
     raw: &[u8],
     keep_inserted: bool,
 ) -> FragmentResolution {
-    let mut root = match crate::word_xml::parse_raw_fragment(raw) {
-        Ok(root) => root,
+    let mut fragment = match crate::word_xml::OpaqueFragment::parse(raw) {
+        Ok(fragment) => fragment,
         Err(_) => {
             // Can't parse it. If the raw bytes carry a revision marker, the
             // descent would silently leave a pending revision unresolved —
             // refuse instead (mirrors the quarantine guard's "revisions
             // invisible to this operation" precedent). No markers → nothing to
             // resolve, leave verbatim.
-            if REVISION_BYTE_MARKERS.iter().any(|m| memchr_find(raw, m)) {
+            if REVISION_BYTE_MARKERS.iter().any(|m| memchr_find(raw, m))
+                || memchr_find(raw, b"tblGridChange")
+            {
                 return FragmentResolution::UnparseableWithRevisions;
             }
             return FragmentResolution::Clean;
         }
     };
+    // Every representation of a compatibility drawing shows the same shape, so
+    // resolving everything resolves each of them, as the package resolver does.
+    match resolve_opaque_children(fragment.envelope_mut(), keep_inserted, "opaque fragment") {
+        Ok(false) => FragmentResolution::Clean,
+        Ok(true) => FragmentResolution::Resolved(fragment.serialize()),
+        Err(error) => FragmentResolution::InvalidTableHistory(format!("{error:?}")),
+    }
+}
+
+/// Resolve every tracked change below `container`, an element wrapping
+/// verbatim-preserved content, with the package resolver's own logic. Returns
+/// whether anything was resolved. The container itself is never a revision: it
+/// is the envelope an opaque fragment parses into, or one the caller builds.
+pub(crate) fn resolve_opaque_children(
+    container: &mut Element,
+    keep_inserted: bool,
+    part: &str,
+) -> Result<bool, NormalizeError> {
     let mut stats = NormalizeStats::default();
-    // The root element IS the opaque container, so descend with
+    let auxiliary_resolved = resolve_table_grid_history(container, keep_inserted, part)?;
+    // The container IS the opaque container, so descend with
     // `inside_opaque = true` from the start — its inner revisions count in the
     // opaque bucket, exactly as the whole-document path tallies them when it
     // recurses through `is_opaque_container`.
     if keep_inserted {
-        normalize_children(&mut root, &mut stats, true);
+        normalize_children(container, &mut stats, true);
     } else {
-        reject_children(&mut root, &mut stats, true);
+        reject_children(container, &mut stats, true);
     }
-    if stats.opaque_resolved == 0 && stats.revisions_resolved == 0 {
-        return FragmentResolution::Clean;
-    }
-    FragmentResolution::Resolved(crate::word_xml::serialize_raw_fragment(&root))
+    Ok(stats.opaque_resolved != 0 || stats.revisions_resolved != 0 || auxiliary_resolved != 0)
 }
 
 /// Resolve ONLY the interior revisions whose `w:id` is in `selected`
@@ -1348,8 +1702,8 @@ pub(crate) fn resolve_fragment_selected(
     selected: &std::collections::HashSet<u32>,
     accept: bool,
 ) -> FragmentResolution {
-    let mut root = match crate::word_xml::parse_raw_fragment(raw) {
-        Ok(root) => root,
+    let mut fragment = match crate::word_xml::OpaqueFragment::parse(raw) {
+        Ok(fragment) => fragment,
         Err(_) => {
             if REVISION_BYTE_MARKERS.iter().any(|m| memchr_find(raw, m)) {
                 return FragmentResolution::UnparseableWithRevisions;
@@ -1358,11 +1712,11 @@ pub(crate) fn resolve_fragment_selected(
         }
     };
     let mut resolved = 0usize;
-    resolve_selected_in(&mut root, selected, accept, &mut resolved);
+    resolve_selected_in(fragment.active_mut(), selected, accept, &mut resolved);
     if resolved == 0 {
         FragmentResolution::Clean
     } else {
-        FragmentResolution::Resolved(crate::word_xml::serialize_raw_fragment(&root))
+        FragmentResolution::Resolved(fragment.serialize())
     }
 }
 
@@ -1448,11 +1802,27 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
 
     // Second pass: handle content revisions with inverted logic.
     let mut new_children: Vec<XMLNode> = Vec::with_capacity(parent.children.len());
+    // Where a carrier was dropped or unwrapped: the runs that meet there may
+    // be the pieces of one run an edit split.
+    let mut seams: Vec<usize> = Vec::new();
+
+    // Range markers the dropped carriers hold, kept where they were.
+    let mut removed_stretch: Vec<Element> = Vec::new();
 
     for child in parent.children.drain(..) {
+        match &child {
+            XMLNode::Element(el) if is_w_tag(el, "ins") || is_w_tag(el, "moveTo") => {
+                collect_tree_range_markers(el, &mut removed_stretch);
+            }
+            XMLNode::Element(_) => {
+                keep_removed_stretch_markers(&mut removed_stretch, &mut new_children)
+            }
+            _ => {}
+        }
         match child {
             XMLNode::Element(el) if is_w_tag(&el, "ins") || is_w_tag(&el, "moveTo") => {
                 // w:ins, w:moveTo → drop entirely (reject additions)
+                seams.push(new_children.len());
                 let count = 1 + count_nested_revisions(&el);
                 if inside_opaque {
                     stats.opaque_resolved += count;
@@ -1480,7 +1850,9 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
                 // Recursively reject children before promoting them
                 reject_children(&mut el, stats, inside_opaque);
                 // Promote all children of the revision wrapper
+                seams.push(new_children.len());
                 new_children.extend(el.children);
+                seams.push(new_children.len());
             }
             XMLNode::Element(el) if is_move_range_marker(&el) => {
                 // Move range delimiters go with the move they bracket
@@ -1550,7 +1922,11 @@ fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaq
             }
         }
     }
+    keep_removed_stretch_markers(&mut removed_stretch, &mut new_children);
 
+    if inside_opaque {
+        rejoin_runs_at_seams(&mut new_children, &seams);
+    }
     parent.children = new_children;
 }
 
@@ -1670,14 +2046,16 @@ fn rename_local_preserving_prefix(el: &mut Element, new_local: &str) {
 //
 // The raw-XML twin of `tracked_model::collapse_resolution_torn_range_markers`
 // (see there for the full domain rule). A bookmark / comment range / permission
-// range is a start/end pair joined by a part-local id; a resolution that removes
-// the content holding one half while the other survives tears the pair
-// (schema-invalid, Word repairs on open). Rather than drop the survivor too
-// (deleting base content no revision proposed removing), we re-insert the
-// removed half adjacent to the survivor, collapsing the range to a point — what
-// Word does when a bookmarked range's interior is deleted. Only pairs WHOLE
-// before this resolution are repaired; a half already lone in the input is the
-// document's own state and passes through untouched.
+// range is a start/end pair joined by a part-local id. A dropped revision
+// carrier keeps the range markers it holds at the removal point
+// (`keep_removed_stretch_markers`), so the pair stays whole; a pair wholly
+// inside one removed stretch goes with it. A removal that still tears a pair
+// (a dropped row or cell) would leave it schema-invalid (Word repairs on
+// open), so rather than drop the survivor too (deleting base content no
+// revision proposed removing), we re-insert the removed half adjacent to the
+// survivor, collapsing the range to a point. Only pairs WHOLE before this
+// resolution are repaired; a half already lone in the input is the document's
+// own state and passes through untouched.
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum RangeFamilyTag {
@@ -1758,6 +2136,51 @@ fn survivor_tree_range_markers(
     let mut map = std::collections::HashMap::new();
     walk(root, &mut map);
     map
+}
+
+/// Collect, in document order, the paired range markers inside `el`, a
+/// revision carrier the resolution drops.
+fn collect_tree_range_markers(el: &Element, out: &mut Vec<Element>) {
+    for child in &el.children {
+        if let XMLNode::Element(c) = child {
+            if tree_range_marker_of(c).is_some() {
+                out.push(c.clone());
+            } else {
+                collect_tree_range_markers(c, out);
+            }
+        }
+    }
+}
+
+/// Keep the range markers of a stretch of consecutive dropped carriers at the
+/// removal point, except a pair lying wholly within the stretch, which goes
+/// with it (ECMA-376 §17.13.6; the model twin is
+/// `tracked_model::retain_segments_keeping_range_markers`).
+fn keep_removed_stretch_markers(stretch: &mut Vec<Element>, kept: &mut Vec<XMLNode>) {
+    if stretch.is_empty() {
+        return;
+    }
+    let key_of = |el: &Element| {
+        let (family, id, is_start) =
+            tree_range_marker_of(el).expect("stretch holds only range markers");
+        ((family, id), is_start)
+    };
+    let mut started = std::collections::HashSet::new();
+    let mut whole = std::collections::HashSet::new();
+    for el in stretch.iter() {
+        let (key, is_start) = key_of(el);
+        if is_start {
+            started.insert(key);
+        } else if started.contains(&key) {
+            whole.insert(key);
+        }
+    }
+    kept.extend(
+        stretch
+            .drain(..)
+            .filter(|el| !whole.contains(&key_of(el).0))
+            .map(XMLNode::Element),
+    );
 }
 
 /// Re-pair every range marker the resolution just applied to `root` tore.
@@ -1914,6 +2337,11 @@ pub(crate) fn has_revision_markup_fast(archive: &DocxArchive) -> bool {
         }
 
         if let Some(bytes) = archive.get(entry_name) {
+            // Auxiliary geometry is not a revision identity, but terminal
+            // normalization must still remove it on an otherwise clean file.
+            if memchr_find(bytes, b"tblGridChange") {
+                return true;
+            }
             for marker in REVISION_BYTE_MARKERS {
                 if memchr_find(bytes, marker) {
                     return true;
@@ -1945,7 +2373,7 @@ pub fn normalize_if_needed(archive: &DocxArchive) -> Result<DocxArchive, Normali
             .into_iter()
             .filter_map(|path| archive.get(&path).map(|bytes| (path, bytes.to_vec())))
             .collect();
-        let (mut normalized, _) = normalize_docx(archive)?;
+        let (mut normalized, _) = accept_all_parts(archive)?;
         for (path, bytes) in glossary_parts {
             normalized.upsert(&path, bytes);
         }
@@ -2073,7 +2501,8 @@ fn paragraph_emptied_by_resolution(p: &Element, keep_inserted: bool) -> bool {
             }
             continue;
         }
-        if is_zero_width_body_marker(el) || is_move_range_marker(el) {
+        if is_zero_width_body_marker(el) || is_move_range_marker(el) || is_comment_reference_run(el)
+        {
             continue;
         }
         // Classify this content child and consult the shared survival rule
@@ -2089,6 +2518,74 @@ fn paragraph_emptied_by_resolution(p: &Element, keep_inserted: bool) -> bool {
         had_content = true;
     }
     had_content
+}
+
+/// A run that holds only a comment reference: a zero-width anchor, not content.
+fn is_comment_reference_run(el: &Element) -> bool {
+    is_w_tag(el, "r")
+        && el
+            .children
+            .iter()
+            .any(|c| matches!(c, XMLNode::Element(child) if is_w_tag(child, "commentReference")))
+        && el.children.iter().all(|c| match c {
+            XMLNode::Element(child) => {
+                is_w_tag(child, "rPr") || is_w_tag(child, "commentReference")
+            }
+            _ => true,
+        })
+}
+
+/// The zero-width anchors (range markers, comment-reference runs) that
+/// outlast removing the emptied paragraph `donor`: its own, and the range
+/// markers its dropped carriers hold unless a pair lies wholly within one
+/// removed stretch. The byte twin of `tracked_model::anchors_outlasting_paragraph`.
+fn anchors_outlasting_paragraph(donor: Element, keep_inserted: bool) -> Vec<XMLNode> {
+    let mut anchors = Vec::new();
+    let mut stretch = Vec::new();
+    for child in donor.children {
+        let XMLNode::Element(el) = child else {
+            continue;
+        };
+        let has_ins = is_w_tag(&el, "ins") || is_w_tag(&el, "moveTo");
+        let has_del = is_w_tag(&el, "del") || is_w_tag(&el, "moveFrom");
+        if (has_ins || has_del)
+            && !crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted)
+        {
+            collect_tree_range_markers(&el, &mut stretch);
+        } else if tree_range_marker_of(&el).is_some() || is_comment_reference_run(&el) {
+            keep_removed_stretch_markers(&mut stretch, &mut anchors);
+            anchors.push(XMLNode::Element(el));
+        }
+    }
+    keep_removed_stretch_markers(&mut stretch, &mut anchors);
+    anchors
+}
+
+/// Keep the anchors of an emptied paragraph a blocked join dropped from just
+/// before `parent.children[at]`: at the end of the nearest paragraph before
+/// it, or failing that at the start of the nearest one after. The byte twin of
+/// `tracked_model::hold_anchors_beside_dropped_paragraph`.
+fn hold_anchors_beside_dropped_paragraph(parent: &mut Element, at: usize, anchors: Vec<XMLNode>) {
+    if anchors.is_empty() {
+        return;
+    }
+    let is_paragraph = |c: &XMLNode| matches!(c, XMLNode::Element(el) if is_w_tag(el, "p"));
+    if let Some(before) = parent.children[..at].iter().rposition(is_paragraph) {
+        let XMLNode::Element(holder) = &mut parent.children[before] else {
+            unreachable!("the holder is a paragraph")
+        };
+        holder.children.extend(anchors);
+    } else if let Some(after) = parent.children[at..].iter().position(is_paragraph) {
+        let XMLNode::Element(holder) = &mut parent.children[at + after] else {
+            unreachable!("the holder is a paragraph")
+        };
+        let insert_at = holder
+            .children
+            .iter()
+            .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+            .map_or(0, |index| index + 1);
+        holder.children.splice(insert_at..insert_at, anchors);
+    }
 }
 
 /// Join paragraphs whose mark this resolution removes (ECMA-376 §17.13.5.15 /
@@ -2174,7 +2671,14 @@ fn join_mark_resolved_paragraphs(
                 _ => false,
             };
             if drop_empty {
-                parent.children.remove(i);
+                let XMLNode::Element(donor) = parent.children.remove(i) else {
+                    unreachable!("drop_empty matched an element")
+                };
+                hold_anchors_beside_dropped_paragraph(
+                    parent,
+                    i,
+                    anchors_outlasting_paragraph(donor, keep_inserted),
+                );
                 stats.revisions_resolved += 1;
             } else {
                 i += 1;
@@ -2224,11 +2728,27 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
     // We need to rebuild the children list because unwrapping can expand one
     // child into multiple children.
     let mut new_children: Vec<XMLNode> = Vec::with_capacity(parent.children.len());
+    // Where a carrier was dropped or unwrapped: the runs that meet there may
+    // be the pieces of one run an edit split.
+    let mut seams: Vec<usize> = Vec::new();
+
+    // Range markers the dropped carriers hold, kept where they were.
+    let mut removed_stretch: Vec<Element> = Vec::new();
 
     for child in parent.children.drain(..) {
+        match &child {
+            XMLNode::Element(el) if is_drop_revision(el) => {
+                collect_tree_range_markers(el, &mut removed_stretch);
+            }
+            XMLNode::Element(_) => {
+                keep_removed_stretch_markers(&mut removed_stretch, &mut new_children)
+            }
+            _ => {}
+        }
         match child {
             XMLNode::Element(el) if is_drop_revision(&el) => {
                 // w:del, w:moveFrom → drop entirely
+                seams.push(new_children.len());
                 let count = 1 + count_nested_revisions(&el);
                 if inside_opaque {
                     stats.opaque_resolved += count;
@@ -2254,7 +2774,9 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
                 // Recursively normalize children before promoting them
                 normalize_children(&mut el, stats, inside_opaque);
                 // Promote all children of the revision wrapper
+                seams.push(new_children.len());
                 new_children.extend(el.children);
+                seams.push(new_children.len());
             }
             XMLNode::Element(el) if is_move_range_marker(&el) => {
                 // Move range delimiters go with the move they bracket
@@ -2330,8 +2852,96 @@ fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_o
             }
         }
     }
+    keep_removed_stretch_markers(&mut removed_stretch, &mut new_children);
 
+    if inside_opaque {
+        rejoin_runs_at_seams(&mut new_children, &seams);
+    }
     parent.children = new_children;
+}
+
+/// Rejoin the plain text runs that meet at a resolved carrier's seam. A
+/// tracked edit inside a run splits it around the change; once the change is
+/// resolved the pieces sit side by side with the same properties, and the run
+/// they came from is the one spelling of that text. Only runs meeting at a
+/// seam are joined, so runs the source itself kept apart stay apart. The
+/// joined text is marked `xml:space="preserve"` exactly when it has leading
+/// or trailing XML whitespace, as Word writes it.
+pub(crate) fn rejoin_runs_at_seams(children: &mut Vec<XMLNode>, seams: &[usize]) {
+    let mut seams: Vec<usize> = seams.to_vec();
+    seams.sort_unstable();
+    seams.dedup();
+    for &seam in seams.iter().rev() {
+        if seam == 0 || seam >= children.len() {
+            continue;
+        }
+        let (XMLNode::Element(left), XMLNode::Element(right)) =
+            (&children[seam - 1], &children[seam])
+        else {
+            continue;
+        };
+        let (Some(left_text), Some(right_text)) = (plain_run_text(left), plain_run_text(right))
+        else {
+            continue;
+        };
+        if left.attributes != right.attributes || run_properties(left) != run_properties(right) {
+            continue;
+        }
+        let text = format!("{left_text}{right_text}");
+        children.remove(seam);
+        let XMLNode::Element(left) = &mut children[seam - 1] else {
+            unreachable!("checked above");
+        };
+        let t = left
+            .children
+            .iter_mut()
+            .find_map(|child| match child {
+                XMLNode::Element(el) if is_w_tag(el, "t") => Some(el),
+                _ => None,
+            })
+            .expect("a plain run holds a w:t");
+        t.children = vec![XMLNode::Text(text.clone())];
+        if !crate::word_xml::needs_space_preserve(&text) {
+            t.attributes.retain(|name, _| {
+                !(name.local_name == "space" && name.prefix.as_deref() == Some("xml"))
+            });
+        } else {
+            crate::xml_attrs::attr_set(t, "xml:space", "preserve");
+        }
+    }
+}
+
+/// The text of a `w:r` holding only optional `w:rPr` and one `w:t`.
+fn plain_run_text(run: &Element) -> Option<String> {
+    if !is_w_tag(run, "r") {
+        return None;
+    }
+    let mut text = None;
+    for child in &run.children {
+        match child {
+            XMLNode::Element(el) if is_w_tag(el, "rPr") => {}
+            XMLNode::Element(el) if is_w_tag(el, "t") && text.is_none() => {
+                let mut value = String::new();
+                for node in &el.children {
+                    match node {
+                        XMLNode::Text(t) => value.push_str(t),
+                        _ => return None,
+                    }
+                }
+                text = Some(value);
+            }
+            _ => return None,
+        }
+    }
+    text
+}
+
+/// A run's `w:rPr`, where an empty one is the same as none.
+fn run_properties(run: &Element) -> Option<&Element> {
+    run.children.iter().find_map(|child| match child {
+        XMLNode::Element(el) if is_w_tag(el, "rPr") && !el.children.is_empty() => Some(el),
+        _ => None,
+    })
 }
 
 fn is_revision_emptied_hyperlink(element: &Element, had_nested_revision: bool) -> bool {
@@ -2454,18 +3064,58 @@ fn restore_pr_change_in_place(el: &mut Element, stats: &mut NormalizeStats, insi
     };
 
     let parent_local = local_element_name(el).to_string();
-    let kept: Vec<XMLNode> = el
-        .children
-        .drain(..)
-        .filter(|c| {
-            matches!(c, XMLNode::Element(e) if reject_restore_keeps_current_child(&parent_local, e))
-        })
-        .collect();
+    let (kept, current_properties): (Vec<XMLNode>, Vec<XMLNode>) = el.children.drain(..).partition(|c| {
+        matches!(c, XMLNode::Element(e) if reject_restore_keeps_current_child(&parent_local, e))
+    });
     let restored = previous.children;
     el.children = match parent_local.as_str() {
-        "rPr" | "sectPr" => kept.into_iter().chain(restored).collect(),
+        // Word resolves a rejected section change RELATIVE to the current
+        // section: the previous payload's children replace their current
+        // counterparts and omitted children keep their current values
+        // (observed in Word: rejecting a sectPrChange whose previous sectPr
+        // holds only pgSz keeps the current pgMar, cols and docGrid). The
+        // typed model resolves the same way
+        // (`apply_previous_section_properties_relative`).
+        "sectPr" => kept
+            .into_iter()
+            .chain(overlay_section_properties(current_properties, restored))
+            .collect(),
+        "rPr" => kept.into_iter().chain(restored).collect(),
         _ => restored.into_iter().chain(kept).collect(),
     };
+}
+
+/// Overlay a previous `sectPr` payload onto the current section properties, in
+/// CT_SectPr order. Children of unknown elements stay after the known ones.
+fn overlay_section_properties(current: Vec<XMLNode>, previous: Vec<XMLNode>) -> Vec<XMLNode> {
+    use crate::docx_validate_ordering::SECTPR_PROPERTY_ORDER;
+    let named = |nodes: Vec<XMLNode>| -> Vec<(String, XMLNode)> {
+        nodes
+            .into_iter()
+            .filter_map(|node| match &node {
+                XMLNode::Element(element) => Some((local_element_name(element).to_string(), node)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut current = named(current);
+    let mut previous = named(previous);
+    let take = |list: &mut Vec<(String, XMLNode)>, name: &str| {
+        list.iter()
+            .position(|(child, _)| child == name)
+            .map(|index| list.remove(index).1)
+    };
+    let mut merged = Vec::new();
+    for name in SECTPR_PROPERTY_ORDER {
+        let from_previous = take(&mut previous, name);
+        let from_current = take(&mut current, name);
+        if let Some(node) = from_previous.or(from_current) {
+            merged.push(node);
+        }
+    }
+    merged.extend(current.into_iter().map(|(_, node)| node));
+    merged.extend(previous.into_iter().map(|(_, node)| node));
+    merged
 }
 
 /// Reject *PrChange records in all property elements, recursively: each
@@ -2852,6 +3502,170 @@ mod tests {
         assert_eq!(report.totals.revisions.ins, 1);
         assert_eq!(report.totals.revisions.del, 1);
         assert_eq!(report.totals.revisions.del_text, 1);
+    }
+
+    #[test]
+    fn auxiliary_grid_history_is_cleared_without_inventing_a_revision() {
+        // Native Word discards standalone grid history without reverting the
+        // current grid. ECMA-376 17.13.5.33 carries no author/date: this is
+        // auxiliary table geometry, not an independently selectable change.
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="3000"/><w:tblGridChange w:id="1"><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let archive = archive_with_document_xml(xml);
+        for accept in [true, false] {
+            let FragmentResolution::Resolved(bytes) =
+                resolve_opaque_fragment_revisions(xml.as_bytes(), accept)
+            else {
+                panic!("auxiliary-only opaque fragment must be cleaned");
+            };
+            let terminal = std::str::from_utf8(&bytes).unwrap();
+            assert!(terminal.contains("3000"));
+            assert!(!terminal.contains("4000"));
+            assert!(!terminal.contains("tblGridChange"));
+        }
+        let alternate_prefix = xml.replace("w:", "x:").replace("xmlns:w", "xmlns:x");
+        let alternate = normalize_if_needed(&archive_with_document_xml(&alternate_prefix)).unwrap();
+        assert!(
+            !std::str::from_utf8(alternate.get("word/document.xml").unwrap())
+                .unwrap()
+                .contains("tblGridChange")
+        );
+        assert_eq!(
+            preflight_scan(&archive).unwrap().totals.revisions.total(),
+            0
+        );
+        assert!(
+            has_revision_markup_fast(&archive),
+            "auxiliary history still needs terminal cleanup"
+        );
+        let normalized = normalize_if_needed(&archive).unwrap();
+        assert!(
+            !std::str::from_utf8(normalized.get("word/document.xml").unwrap())
+                .unwrap()
+                .contains("tblGridChange")
+        );
+        let (accepted, accept_stats) = normalize_docx(&archive).unwrap();
+        let (rejected, reject_stats) = reject_all_docx(&archive).unwrap();
+        for (resolved, stats, retained, removed) in [
+            (accepted, accept_stats, "3000", "4000"),
+            (rejected, reject_stats, "3000", "4000"),
+        ] {
+            let xml = std::str::from_utf8(resolved.get("word/document.xml").unwrap()).unwrap();
+            assert!(xml.contains(retained));
+            assert!(!xml.contains(removed));
+            assert!(!xml.contains("tblGridChange"));
+            assert_eq!(stats.revisions_resolved, 0);
+            assert_eq!(stats.parts_normalized, vec!["word/document.xml"]);
+            assert_eq!(
+                preflight_scan(&resolved).unwrap().totals.revisions.total(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_grid_width_is_valid_but_malformed_width_is_not() {
+        // §17.4.16: absence means a zero last-saved width. An unrelated
+        // resolution must preserve that original absence on the wire.
+        let xml = br#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#;
+        for accept in [true, false] {
+            let mut table = parse_xml(xml).unwrap();
+            let original = table.clone();
+            resolve_simple_column_slots(&mut table, accept, "word/document.xml").unwrap();
+            assert_eq!(table, original);
+            let bad = std::str::from_utf8(xml)
+                .unwrap()
+                .replace("<w:gridCol/>", "<w:gridCol w:w=\"invalid\"/>");
+            let mut table = parse_xml(bad.as_bytes()).unwrap();
+            assert!(matches!(
+                resolve_simple_column_slots(&mut table, accept, "word/document.xml"),
+                Err(NormalizeError::InvalidTableHistory { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_grid_width_reads_as_import_reads_it() {
+        // Import reads a decimal or unit-bearing ST_TwipsMeasure; so must the
+        // resolution, which leaves a table without history as it was.
+        for width in ["3908.5", "1in"] {
+            let xml = format!(
+                r#"<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tblGrid><w:gridCol w:w="{width}"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl>"#
+            );
+            for accept in [true, false] {
+                let mut table = parse_xml(xml.as_bytes()).unwrap();
+                let original = table.clone();
+                resolve_simple_column_slots(&mut table, accept, "word/document.xml").unwrap();
+                assert_eq!(table, original, "{width}");
+            }
+        }
+    }
+
+    #[test]
+    fn coupled_grid_history_resolves_with_cell_properties() {
+        // The previous grid and previous cell widths form one coordinate
+        // frame. Reject restores both; Accept keeps both current values.
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="3000"/><w:tblGridChange w:id="1"><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:tcPrChange w:id="2" w:author="Reviewer"><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let archive = archive_with_document_xml(xml);
+        assert_eq!(
+            preflight_scan(&archive).unwrap().totals.revisions.total(),
+            1
+        );
+        for (resolved, stats, retained, removed) in [
+            {
+                let (doc, stats) = normalize_docx(&archive).unwrap();
+                (doc, stats, "3000", "4000")
+            },
+            {
+                let (doc, stats) = reject_all_docx(&archive).unwrap();
+                (doc, stats, "4000", "3000")
+            },
+        ] {
+            let xml = std::str::from_utf8(resolved.get("word/document.xml").unwrap()).unwrap();
+            assert!(xml.contains(retained));
+            assert!(!xml.contains(removed), "mixed coordinate frame: {xml}");
+            assert!(!xml.contains("tblGridChange"));
+            assert!(!xml.contains("tcPrChange"));
+            assert_eq!(stats.revisions_resolved, 1);
+        }
+    }
+
+    #[test]
+    fn nested_table_properties_do_not_own_the_outer_grid_history() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="3000"/><w:tblGridChange w:id="1"><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:tbl><w:tblGrid><w:gridCol w:w="1000"/><w:tblGridChange w:id="2"><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="1000" w:type="dxa"/><w:tcPrChange w:id="3" w:author="Reviewer"><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr><w:p/></w:tc></w:tr></w:tbl><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let (rejected, stats) = reject_all_docx(&archive_with_document_xml(xml)).unwrap();
+        let xml = std::str::from_utf8(rejected.get("word/document.xml").unwrap()).unwrap();
+        assert!(xml.contains("3000"), "outer current grid must remain");
+        assert!(xml.contains("2000"), "inner previous grid must return");
+        assert!(!xml.contains("4000"));
+        assert!(!xml.contains("1000"));
+        assert!(!xml.contains("tblGridChange"));
+        assert_eq!(stats.revisions_resolved, 1);
+    }
+
+    #[test]
+    fn malformed_grid_history_is_not_silently_normalized_away() {
+        for history in [
+            r#"<w:tblGridChange w:id="1"/>"#,
+            r#"<w:tblGridChange><w:tblGrid/></w:tblGridChange>"#,
+            r#"<w:tblGridChange w:id="1"><w:tblGrid><w:gridCol w:w="bad"/></w:tblGrid></w:tblGridChange>"#,
+            r#"<w:tblGridChange w:id="1"><w:tblGrid><w:unknown/></w:tblGrid></w:tblGridChange>"#,
+        ] {
+            let xml = format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="3000"/>{history}</w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#
+            );
+            let archive = archive_with_document_xml(&xml);
+            assert!(matches!(
+                resolve_opaque_fragment_revisions(xml.as_bytes(), true),
+                FragmentResolution::InvalidTableHistory(_)
+            ));
+            for result in [normalize_docx(&archive), reject_all_docx(&archive)] {
+                let Err(NormalizeError::InvalidTableHistory { part, reason }) = result else {
+                    panic!("malformed history must refuse: {history}");
+                };
+                assert_eq!(part, "word/document.xml");
+                assert!(!reason.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -3313,6 +4127,48 @@ mod tests {
     // -----------------------------------------------------------------------
     // Reject all tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn note_resolution_preserves_structural_definitions_in_order() {
+        // Structural notes are not body-referenced user notes. Resolving a
+        // revision must preserve their content and order while still pruning
+        // the user note whose reference disappears.
+        for kind in ["footnote", "endnote"] {
+            for (carrier, accept) in [("ins", false), ("del", true)] {
+                let document = format!(
+                    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:{kind}Reference w:id="8"/></w:r><w:{carrier} w:id="12" w:author="Editor"><w:r><w:{kind}Reference w:id="9"/></w:r></w:{carrier}></w:p></w:body></w:document>"#
+                );
+                let notes = format!(
+                    r#"<w:{kind}s xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:{kind} w:id="-1" w:type="separator"><w:p/></w:{kind}><w:{kind} w:id="0" w:type="continuationSeparator"><w:p/></w:{kind}><w:{kind} w:id="7" w:type="continuationNotice"><w:p><w:r><w:t>Notes continue.</w:t></w:r></w:p></w:{kind}><w:{kind} w:id="8"><w:p><w:r><w:t>Retained.</w:t></w:r></w:p></w:{kind}><w:{kind} w:id="9"><w:p><w:r><w:t>Removed.</w:t></w:r></w:p></w:{kind}></w:{kind}s>"#
+                );
+                let relationships = format!(
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}s" Target="{kind}s.xml"/></Relationships>"#
+                );
+                let path = format!("word/{kind}s.xml");
+                let archive = archive_with_parts(vec![
+                    ("word/document.xml", &document),
+                    (&path, &notes),
+                    ("word/_rels/document.xml.rels", &relationships),
+                ]);
+                let (resolved, _) = if accept {
+                    normalize_docx(&archive).unwrap()
+                } else {
+                    reject_all_docx(&archive).unwrap()
+                };
+                let root = parse_xml(resolved.get(&path).unwrap()).unwrap();
+                let ids: Vec<_> = root
+                    .children
+                    .iter()
+                    .filter_map(|child| child.as_element().and_then(|note| get_attr(note, "id")))
+                    .collect();
+                assert_eq!(ids, ["-1", "0", "7", "8"], "{kind}, accept={accept}");
+                let xml = std::str::from_utf8(resolved.get(&path).unwrap()).unwrap();
+                assert!(xml.contains("Notes continue."));
+                assert!(xml.contains("Retained."));
+                assert!(!xml.contains("Removed."));
+            }
+        }
+    }
 
     #[test]
     fn reject_inserted_footnote_prunes_only_its_orphaned_definition() {
@@ -4055,6 +4911,63 @@ mod tests {
     // ── resolve_opaque_fragment_revisions (M0.1 fragment resolver) ──────────
 
     #[test]
+    fn resolving_all_revisions_resolves_every_drawing_representation() {
+        // A compatibility drawing's representations show one shape. Accepting
+        // or rejecting everything resolves each the same way, so none is left
+        // with pending revisions; the package resolver does the same. A
+        // selection names revisions of the active representation only: an
+        // inactive carrier cannot be matched to its active counterpart.
+        let raw = br#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent><w:p><w:ins w:id="7" w:author="Active"><w:r><w:t>Current</w:t></w:r></w:ins></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice><mc:Fallback><w:pict><w:txbxContent><w:p><w:ins w:id="99" w:author="Legacy"><w:r><w:t>Legacy</w:t></w:r></w:ins></w:p></w:txbxContent></w:pict></mc:Fallback></mc:AlternateContent>"#;
+        let original = crate::word_xml::parse_raw_fragment(raw).unwrap();
+        let fallback =
+            crate::word_xml::serialize_raw_fragment(original.get_child("Fallback").unwrap());
+        assert_eq!(crate::tracked_model::max_interior_id(raw), 7);
+        let fallback_of = |bytes: &[u8]| {
+            let resolved = crate::word_xml::parse_raw_fragment(bytes).unwrap();
+            String::from_utf8(crate::word_xml::serialize_raw_fragment(
+                resolved.get_child("Fallback").unwrap(),
+            ))
+            .unwrap()
+        };
+        let active_of = |bytes: &[u8]| {
+            let fragment = crate::word_xml::OpaqueFragment::parse(bytes).unwrap();
+            String::from_utf8(crate::word_xml::serialize_raw_fragment(fragment.active())).unwrap()
+        };
+        for accept in [false, true] {
+            let FragmentResolution::Resolved(all) = resolve_opaque_fragment_revisions(raw, accept)
+            else {
+                panic!("revisions must resolve");
+            };
+            let resolved_fallback = fallback_of(&all);
+            assert!(!resolved_fallback.contains("w:ins"), "{resolved_fallback}");
+            assert_eq!(resolved_fallback.contains("Legacy"), accept);
+            assert_eq!(active_of(&all).contains("Current"), accept);
+            assert_eq!(
+                resolve_opaque_fragment_revisions(&all, accept),
+                FragmentResolution::Clean
+            );
+
+            let FragmentResolution::Resolved(selected) =
+                resolve_fragment_selected(raw, &std::collections::HashSet::from([7]), accept)
+            else {
+                panic!("the active revision must resolve");
+            };
+            assert_eq!(
+                fallback_of(&selected).as_bytes(),
+                fallback.as_slice(),
+                "a selection leaves the inactive representation as it was"
+            );
+            assert_eq!(active_of(&selected).contains("Current"), accept);
+            assert_eq!(crate::tracked_model::max_interior_id(&selected), 0);
+        }
+        assert_eq!(
+            resolve_fragment_selected(raw, &std::collections::HashSet::from([99]), true),
+            FragmentResolution::Clean,
+            "inactive carrier is not a selectable current revision"
+        );
+    }
+
+    #[test]
     fn fragment_resolver_resolves_revisions() {
         // A parseable sdt fragment with a w:ins → Resolved, with the wrapper
         // unwrapped on accept.
@@ -4067,6 +4980,48 @@ mod tests {
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    fn resolved_text(raw: &[u8], accept: bool) -> String {
+        match resolve_opaque_fragment_revisions(raw, accept) {
+            FragmentResolution::Resolved(bytes) => String::from_utf8(bytes).unwrap(),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// One run split around a tracked replacement is one run again once the
+    /// change is resolved either way: the pieces have the same properties and
+    /// meet where the change was, so the source's spelling is the one spelling.
+    #[test]
+    fn resolving_a_change_inside_a_run_rejoins_the_run() {
+        let split = br#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Keep </w:t></w:r><w:del w:id="1" w:author="a"><w:r><w:rPr><w:b/></w:rPr><w:delText>old</w:delText></w:r></w:del><w:ins w:id="2" w:author="a"><w:r><w:rPr><w:b/></w:rPr><w:t>new</w:t></w:r></w:ins><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> words</w:t></w:r></w:p>"#;
+        let rejected = resolved_text(split, false);
+        assert_eq!(rejected.matches("<w:r>").count(), 1, "{rejected}");
+        assert!(rejected.contains("<w:t>Keep old words</w:t>"), "{rejected}");
+        let accepted = resolved_text(split, true);
+        assert_eq!(accepted.matches("<w:r>").count(), 1, "{accepted}");
+        assert!(accepted.contains("<w:t>Keep new words</w:t>"), "{accepted}");
+    }
+
+    /// Only the runs meeting at the change are joined: runs the source kept
+    /// apart, or that differ in formatting, stay as they are, and joined text
+    /// with edge whitespace keeps `xml:space="preserve"`.
+    #[test]
+    fn resolving_a_change_joins_only_matching_runs_at_the_change() {
+        let raw = br#"<w:p><w:r><w:t>One</w:t></w:r><w:r><w:t xml:space="preserve"> two </w:t></w:r><w:ins w:id="1" w:author="a"><w:r><w:t>three</w:t></w:r></w:ins><w:r><w:rPr><w:i/></w:rPr><w:t>four</w:t></w:r></w:p>"#;
+        let rejected = resolved_text(raw, false);
+        assert!(rejected.contains("<w:t>One</w:t>"), "{rejected}");
+        assert!(
+            rejected.contains(r#"<w:t xml:space="preserve"> two </w:t>"#),
+            "{rejected}"
+        );
+        let accepted = resolved_text(raw, true);
+        assert!(accepted.contains("<w:t>One</w:t>"), "{accepted}");
+        assert!(
+            accepted.contains(r#"<w:t xml:space="preserve"> two three</w:t>"#),
+            "{accepted}"
+        );
+        assert!(accepted.contains("<w:t>four</w:t>"), "{accepted}");
     }
 
     #[test]

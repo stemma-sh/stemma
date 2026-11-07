@@ -59,11 +59,17 @@ pub struct BlockView {
     /// role that `insert` accepts even for a `Normal`-styled doc, where
     /// `style_id` is `null`.
     pub role_token: Option<String>,
-    /// Concatenated visible text: the CURRENT redline reading, with pending
-    /// insertions and not-yet-accepted deletions both present, exactly what
-    /// Word shows with tracked changes displayed. (For the accept-all or
-    /// reject-all reading, project the document first.) This is what a
-    /// plain-paragraph [`crate::edit::EditStep`]'s `expect` matches against.
+    /// The block's text runs concatenated (after the literal-prefix label):
+    /// the CURRENT redline reading, with pending insertions and
+    /// not-yet-accepted deletions both present. (For the accept-all or
+    /// reject-all reading, project the document first.) Inline anchors add no
+    /// characters: a hyperlink's display text and a field's result live in the
+    /// anchor's [`SegmentView::Opaque`] `text`, a content control's value in
+    /// its `metadata`; breaks, comment references and range markers are
+    /// zero-width. This is
+    /// what a plain-paragraph [`crate::edit::EditStep`]'s `expect` matches
+    /// against: any part outside pending deletions, or the whole text, never
+    /// split by an anchor.
     pub text: String,
     /// Block-level tracked status (whole-block insert/delete), from
     /// `TrackedBlock.status`.
@@ -94,13 +100,24 @@ pub struct BlockView {
     /// The typed-in enumeration label (`"1."`, `"(a)"`) this paragraph carries
     /// in [`ParagraphNode::literal_prefix`], when it has one and no structural
     /// auto-numbering supersedes it (see [`literal_prefix_label`]). This is the
-    /// same label already PREPENDED to `text` (as `"{label}\t{body}"`); the
+    /// same label already PREPENDED to `text` (as [`Self::literal_prefix_text`]); the
     /// field is surfaced separately so a detail reader (`read_block`) can tell
     /// that the leading label is a structural enumeration marker, NOT a
     /// `segments` span it can target — body edits address the `segments`, the
     /// label is not span-addressable. `None` for paragraphs without a literal
     /// prefix and for auto-numbered paragraphs (whose marker is in `list`).
     pub literal_prefix: Option<String>,
+    /// The label as written, with the whitespace around it (`"(c) "`,
+    /// `"\t2.\t"`): what `text` starts with, and what Word reads. `Some`
+    /// exactly when [`Self::literal_prefix`] is.
+    #[serde(default)]
+    pub literal_prefix_text: Option<String>,
+    /// The typed label's own run marks (bold, underline, ...). The label is
+    /// not a span, so without this a reader rewriting the paragraph with
+    /// styled content would guess its formatting from the text beside it.
+    /// Empty when there is no label.
+    #[serde(default)]
+    pub literal_prefix_marks: Vec<TextMark>,
     /// Inline structure for fine-grained targeting.
     pub segments: Vec<SegmentView>,
     /// For an `Opaque` block: what KIND of placeholder this is (e.g. `"sdt"`,
@@ -183,7 +200,8 @@ pub struct CellParagraphView {
     /// The paragraph's inline runs, each carrying its visible `text`, `marks`
     /// (bold/italic/…), and `style_props` (font/size/color/highlight/…); opaque
     /// runs (hyperlinks, fields, footnote markers, drawings) arrive as
-    /// `InlineChange::Opaque`. Segments carry per-run tracking status — a tracked
+    /// `InlineChange::Opaque` (a content control's `text` is its current
+    /// value). Segments carry per-run tracking status — a tracked
     /// change inside the cell projects as `Inserted`/`Deleted` (a redline), the
     /// same vocabulary the body uses. Images inside cells surface as `Opaque`
     /// WITHOUT an
@@ -199,6 +217,10 @@ pub struct CellParagraphView {
     /// This cell paragraph's staleness guard (its own semantic hash), pinned by a
     /// `replace` targeting it — the same guard mechanism body paragraphs use.
     pub guard: String,
+    /// A typed label the paragraph starts with (`"b. "`), as written, which the
+    /// segments do not hold (the literal-prefix read rule); None when there is
+    /// none or auto-numbering supplies the label.
+    pub literal_prefix: Option<String>,
 }
 
 /// A table cell's four resolved border edges for the render projection. Each is
@@ -601,9 +623,17 @@ fn opaque_visible_text(node: &OpaqueInlineNode) -> Option<String> {
 /// The meaningful inline marks of a text run, projected for the view. Boolean
 /// marks come from `TextNode.marks`; strike is a tri-state style prop.
 fn text_marks(node: &crate::domain::TextNode) -> Vec<TextMark> {
+    marks_of(&node.marks, &node.style_props)
+}
+
+/// [`text_marks`] for any run's marks and style properties.
+fn marks_of(
+    marks: &[crate::domain::Mark],
+    style_props: &crate::domain::StyleProps,
+) -> Vec<TextMark> {
     use crate::domain::{Mark, MarkValue};
     let mut out = Vec::new();
-    for mark in &node.marks {
+    for mark in marks {
         out.push(match mark {
             Mark::Bold => TextMark::Bold,
             Mark::Italic => TextMark::Italic,
@@ -612,7 +642,7 @@ fn text_marks(node: &crate::domain::TextNode) -> Vec<TextMark> {
             Mark::Superscript => TextMark::Superscript,
         });
     }
-    if node.style_props.strike == MarkValue::On {
+    if style_props.strike == MarkValue::On {
         out.push(TextMark::Strike);
     }
     out
@@ -629,7 +659,8 @@ fn paragraph_role(heading_level: Option<&HeadingLevel>) -> BlockRole {
 }
 
 /// Convert the canonical heading level into the read-model representation.
-fn heading_level_to_u8(level: &HeadingLevel) -> u8 {
+#[doc(hidden)]
+pub fn heading_level_to_u8(level: &HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
         HeadingLevel::H2 => 2,
@@ -839,7 +870,7 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                     out.push(EnumeratedSpan::Opaque {
                         seg_idx,
                         inline_idx,
-                        id: NodeId::from(id.clone()),
+                        id: comment_range_anchor_id(id, CommentRangeSide::Start),
                         kind: OpaqueAnchorKind::CommentRangeStart,
                         status: status.clone(),
                         text: None,
@@ -860,31 +891,8 @@ pub(crate) fn enumerate_text_spans(para: &crate::domain::ParagraphNode) -> Vec<E
                     out.push(EnumeratedSpan::Opaque {
                         seg_idx,
                         inline_idx,
-                        id: NodeId::from(id.clone()),
+                        id: comment_range_anchor_id(id, CommentRangeSide::End),
                         kind: OpaqueAnchorKind::CommentRangeEnd,
-                        status: status.clone(),
-                        text: None,
-                        metadata: Some(OpaqueMetadata::NoteReference {
-                            reference_id: id.clone(),
-                        }),
-                    });
-                }
-                InlineNode::CommentReference { id } => {
-                    flush(
-                        &mut out,
-                        &mut run_start,
-                        &mut run_text,
-                        &mut run_marks,
-                        &mut run_format_revision,
-                        run_last_end,
-                    );
-                    out.push(EnumeratedSpan::Opaque {
-                        seg_idx,
-                        inline_idx,
-                        id: NodeId::from(id.clone()),
-                        // Same kind an IMPORTED commentReference maps to
-                        // (`OpaqueKind::CommentReference` above) — parity.
-                        kind: OpaqueAnchorKind::Comment,
                         status: status.clone(),
                         text: None,
                         metadata: Some(OpaqueMetadata::NoteReference {
@@ -958,15 +966,23 @@ pub(crate) fn literal_prefix_label(p: &crate::domain::ParagraphNode) -> Option<&
         .filter(|label| !label.is_empty())
 }
 
-/// The paragraph's comprehension text: the literal-prefix label (when
-/// [`literal_prefix_label`] yields one) followed by a tab, then the body text.
-/// `"{label}\t{body}"` mirrors the canonical `rendered_text` the import builds
-/// and the run sequence the serializer emits, so a read agrees byte-for-byte
-/// with what Word reads. When there is no label, this is exactly the body text.
+/// The literal-prefix label as written: the label with the whitespace the
+/// import consumed around it (`"(c) "`, `"\t2.\t"`), which the serializer
+/// writes back. `None` exactly when [`literal_prefix_label`] is. A read shows
+/// the separator the document has: a label followed by a space read as followed
+/// by a tab, and an agent copying the read wrote tabs the document never had.
+pub(crate) fn literal_prefix_text(p: &crate::domain::ParagraphNode) -> Option<String> {
+    let label = literal_prefix_label(p)?;
+    Some(crate::tracked_model::materialized_prefix_text(label, p))
+}
+
+/// The paragraph's comprehension text: the literal-prefix label as written
+/// ([`literal_prefix_text`]), then the body text, as Word reads the paragraph.
+/// When there is no label, this is exactly the body text.
 fn paragraph_comprehension_text(p: &crate::domain::ParagraphNode) -> String {
     let body = paragraph_text(&p.segments);
-    match literal_prefix_label(p) {
-        Some(label) => format!("{label}\t{body}"),
+    match literal_prefix_text(p) {
+        Some(prefix) => format!("{prefix}{body}"),
         None => body,
     }
 }
@@ -1011,6 +1027,12 @@ fn block_to_view(tracked: &TrackedBlock, role_ids: &HashMap<NodeId, String>) -> 
                 table: None,
                 text: paragraph_comprehension_text(p),
                 literal_prefix: literal_prefix_label(p).map(str::to_string),
+                literal_prefix_text: literal_prefix_text(p),
+                literal_prefix_marks: if literal_prefix_label(p).is_some() {
+                    marks_of(&p.literal_prefix_marks, &p.literal_prefix_style_props)
+                } else {
+                    Vec::new()
+                },
                 block_status,
                 paragraph_mark_status,
                 guard,
@@ -1029,6 +1051,8 @@ fn block_to_view(tracked: &TrackedBlock, role_ids: &HashMap<NodeId, String>) -> 
             text: crate::local_change::extract_table_text(t),
             // A table is not a paragraph — no literal-prefix enumeration label.
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             block_status,
             paragraph_mark_status: TrackStatus::Normal,
             guard,
@@ -1045,6 +1069,8 @@ fn block_to_view(tracked: &TrackedBlock, role_ids: &HashMap<NodeId, String>) -> 
             table: None,
             text: String::new(),
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             block_status,
             paragraph_mark_status: TrackStatus::Normal,
             guard,
@@ -1191,83 +1217,156 @@ fn table_meta_view(t: &crate::domain::TableNode) -> TableMetaView {
 ///   (Footnotes inside table cells are vanishingly rare; the body path threads
 ///   the doc-level lookup, which is not reachable here without widening the
 ///   block-walk signature.)
+///
+/// A cell's paragraphs include those of tables nested in it (row by row,
+/// cell by cell, in document order): a form often lays its fields out in a
+/// table inside a cell, and each of those paragraphs is an edit target.
 fn cell_paragraph_views(blocks: &[BlockNode]) -> Vec<CellParagraphView> {
+    let mut out = Vec::new();
+    for block in blocks {
+        if let BlockNode::Table(nested) = block {
+            for row in &nested.rows {
+                for cell in &row.cells {
+                    out.extend(cell_paragraph_views(&cell.blocks));
+                }
+            }
+        } else {
+            out.extend(own_cell_paragraph_view(block));
+        }
+    }
+    out
+}
+
+/// The view of one paragraph directly in a cell; None for other blocks.
+fn own_cell_paragraph_view(block: &BlockNode) -> Option<CellParagraphView> {
     let note_markers = HashMap::new();
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            BlockNode::Paragraph(p) => {
-                // Per-segment projection (the same vocabulary the body uses) so a
-                // tracked change INSIDE a cell surfaces as Inserted/Deleted
-                // segments — a redline — not a flat all-Unchanged run.
-                let mut segments = Vec::new();
-                for tracked_seg in &p.segments {
-                    let change_type_str = match &tracked_seg.status {
-                        crate::domain::TrackingStatus::Normal => "equal",
-                        crate::domain::TrackingStatus::Inserted(_) => "insert",
-                        crate::domain::TrackingStatus::Deleted(_)
-                        | crate::domain::TrackingStatus::InsertedThenDeleted(_) => "delete",
-                    };
-                    let mut seg_parts = crate::local_change::inlines_to_segments(
-                        &tracked_seg.inlines,
-                        change_type_str,
-                        &note_markers,
-                    );
-                    let seg_rev = match &tracked_seg.status {
-                        crate::domain::TrackingStatus::Inserted(r)
-                        | crate::domain::TrackingStatus::Deleted(r) => r.identity,
-                        _ => 0,
-                    };
-                    if seg_rev != 0 {
-                        for part in &mut seg_parts {
-                            match part {
-                                crate::domain::InlineChange::Inserted { rev_id, .. }
-                                | crate::domain::InlineChange::Deleted { rev_id, .. } => {
-                                    *rev_id = seg_rev
-                                }
-                                _ => {}
+    match block {
+        BlockNode::Paragraph(p) => {
+            // Per-segment projection (the same vocabulary the body uses) so a
+            // tracked change INSIDE a cell surfaces as Inserted/Deleted
+            // segments — a redline — not a flat all-Unchanged run.
+            let mut segments = Vec::new();
+            for tracked_seg in &p.segments {
+                let change_type_str = match &tracked_seg.status {
+                    crate::domain::TrackingStatus::Normal => "equal",
+                    crate::domain::TrackingStatus::Inserted(_) => "insert",
+                    crate::domain::TrackingStatus::Deleted(_)
+                    | crate::domain::TrackingStatus::InsertedThenDeleted(_) => "delete",
+                };
+                let mut seg_parts = crate::local_change::inlines_to_segments(
+                    &tracked_seg.inlines,
+                    change_type_str,
+                    &note_markers,
+                );
+                let seg_rev = match &tracked_seg.status {
+                    crate::domain::TrackingStatus::Inserted(r)
+                    | crate::domain::TrackingStatus::Deleted(r) => r.identity,
+                    _ => 0,
+                };
+                if seg_rev != 0 {
+                    for part in &mut seg_parts {
+                        match part {
+                            crate::domain::InlineChange::Inserted { rev_id, .. }
+                            | crate::domain::InlineChange::Deleted { rev_id, .. } => {
+                                *rev_id = seg_rev
                             }
+                            _ => {}
                         }
                     }
-                    segments.extend(seg_parts);
                 }
-                Some(CellParagraphView {
-                    segments,
-                    block_id: p.id.to_string(),
-                    guard: crate::semantic_hash::block_semantic_hash_for_paragraph(p),
-                })
+                segments.extend(seg_parts);
             }
-            // Nested tables / opaque blocks inside a cell are not projected as
-            // inline paragraphs here (the render frontend does not recurse into
-            // them yet); their text still contributes to the flat `text`.
-            _ => None,
-        })
-        .collect()
+            // A drawing's size is read from its own XML (no image data is
+            // needed), so a picture in a cell shows it as a body one does.
+            // A content control's current value is read the same way: the
+            // body surfaces it in the control's metadata, and a cell control
+            // is set by the same ops, so the cell segment carries it as its
+            // visible text.
+            let mut drawing_sizes: HashMap<String, (i64, i64)> = HashMap::new();
+            let mut control_values: HashMap<String, String> = HashMap::new();
+            for inline in p.all_inlines() {
+                let InlineNode::OpaqueInline(o) = inline else {
+                    continue;
+                };
+                match crate::opaque_meta::project(o) {
+                    Some(OpaqueMetadata::Drawing {
+                        extent_cx_emu: Some(cx),
+                        extent_cy_emu: Some(cy),
+                        ..
+                    }) => {
+                        drawing_sizes.insert(o.id.to_string(), (cx, cy));
+                    }
+                    Some(OpaqueMetadata::ContentControl {
+                        display_text: Some(value),
+                        ..
+                    }) => {
+                        control_values.insert(o.id.to_string(), value);
+                    }
+                    _ => {}
+                }
+            }
+            for segment in &mut segments {
+                if let crate::domain::InlineChange::Opaque {
+                    opaque_id,
+                    text,
+                    asset_width_emu,
+                    asset_height_emu,
+                    ..
+                } = segment
+                {
+                    if let Some((cx, cy)) = drawing_sizes.get(opaque_id.as_str()) {
+                        asset_width_emu.get_or_insert(*cx);
+                        asset_height_emu.get_or_insert(*cy);
+                    }
+                    if let Some(value) = control_values.get(opaque_id.as_str()) {
+                        text.get_or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            Some(CellParagraphView {
+                segments,
+                block_id: p.id.to_string(),
+                guard: crate::semantic_hash::block_semantic_hash_for_paragraph(p),
+                literal_prefix: literal_prefix_text(p),
+            })
+        }
+        // Opaque blocks inside a cell are not projected as paragraphs.
+        _ => None,
+    }
 }
 
 /// Cell text from already-extracted canonical blocks (mirrors [`cell_text`]).
 fn cell_text_from_blocks(blocks: &[BlockNode]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            BlockNode::Paragraph(p) => Some(paragraph_text(&p.segments)),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut parts = Vec::new();
+    push_cell_texts(blocks, &mut parts);
+    parts.join(" ")
+}
+
+/// The text of each paragraph in `blocks`, descending into nested tables in
+/// document order.
+fn push_cell_texts(blocks: &[BlockNode], parts: &mut Vec<String>) {
+    for block in blocks {
+        match block {
+            // A typed label ("b. ") is text the reader sees (the
+            // literal-prefix read rule), in a cell as in the body.
+            BlockNode::Paragraph(p) => parts.push(paragraph_comprehension_text(p)),
+            BlockNode::Table(nested) => {
+                for row in &nested.rows {
+                    for cell in &row.cells {
+                        push_cell_texts(&cell.blocks, parts);
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
 }
 
 /// Concatenate the visible text of every paragraph in a table cell, blocks
 /// joined by a single space — the current-redline reading used for cell
 /// addressing.
 fn cell_text(cell: &crate::domain::TableCellNode) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for block in &cell.blocks {
-        if let BlockNode::Paragraph(p) = block {
-            parts.push(paragraph_text(&p.segments));
-        }
-    }
-    parts.join(" ")
+    cell_text_from_blocks(&cell.blocks)
 }
 
 /// Project a paragraph's enumerated spans into `SegmentView`s, assigning each its
@@ -1330,15 +1429,22 @@ pub fn build_document_view(snapshot: &EditSnapshot) -> DocumentView {
 /// needs to read it through this clean view — so the canon-level entry point is
 /// public.
 pub fn build_document_view_from_canon(canonical: &CanonDoc) -> DocumentView {
-    // The per-block role token is the SAME role vocabulary the insert op
-    // validates against (`vocabulary::paragraph_role_ids`), built in one walk so
-    // a surfaced token always resolves on write.
+    // Role tokens are the same body vocabulary accepted by insertion.
     let role_ids = crate::vocabulary::paragraph_role_ids(canonical);
     let blocks = canonical
         .blocks
         .iter()
         .map(|b| block_to_view(b, &role_ids))
         .collect();
+    DocumentView { blocks }
+}
+
+/// Project a story's blocks with the same identity, guards, and opaque anchors
+/// as the body read surface. Story-local ids are not keys into the body role
+/// vocabulary: story views expose formatting, but do not advertise body roles.
+pub fn build_story_view(story: &[TrackedBlock]) -> DocumentView {
+    let role_ids = HashMap::new();
+    let blocks = story.iter().map(|b| block_to_view(b, &role_ids)).collect();
     DocumentView { blocks }
 }
 
@@ -1620,11 +1726,10 @@ fn block_plain_text(block: &BlockView) -> String {
     }
     let mut out = String::new();
     // The literal-prefix enumeration label is real text Word reads (see
-    // `literal_prefix_label`); surface it ahead of the body, as `"{label}\t"`,
-    // the same rendering `BlockView::text` carries.
-    if let Some(label) = &block.literal_prefix {
-        out.push_str(label);
-        out.push('\t');
+    // `literal_prefix_label`); surface it ahead of the body as written, the
+    // same rendering `BlockView::text` carries.
+    if let Some(prefix) = &block.literal_prefix_text {
+        out.push_str(prefix);
     }
     for seg in &block.segments {
         match seg {
@@ -1659,6 +1764,23 @@ fn block_plain_text(block: &BlockView) -> String {
 /// This is the consumption surface only; [`to_plain_text`] documents where it
 /// intentionally diverges from the anchor-counting / block-identity surface
 /// ([`crate::import::extract_block_text`] and the story content hash).
+/// Which boundary of a comment's range an anchor is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommentRangeSide {
+    Start,
+    End,
+}
+
+/// The read model's id for a comment range marker: the comment id names the
+/// comment (it is in the anchor's metadata), so each boundary gets its own id
+/// a replacement can name, unique in the document because comment ids are.
+pub(crate) fn comment_range_anchor_id(comment_id: &str, side: CommentRangeSide) -> NodeId {
+    match side {
+        CommentRangeSide::Start => NodeId::from(format!("comment_{comment_id}_start")),
+        CommentRangeSide::End => NodeId::from(format!("comment_{comment_id}_end")),
+    }
+}
+
 fn opaque_read_text(kind: OpaqueAnchorKind, text: &Option<String>) -> String {
     match kind {
         OpaqueAnchorKind::Field => text.clone().unwrap_or_default(),
@@ -1942,7 +2064,7 @@ mod tests {
         // cached result (what Word displays), while a no-text object (here a
         // drawing) reads as one U+FFFC. The field's body run "Section 2" is its
         // cached result and must read as text; the surrounding runs are verbatim.
-        let body = r#"<w:p><w:r><w:t>See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t> and </w:t></w:r><w:r><w:drawing/></w:r><w:r><w:t> now</w:t></w:r></w:p>"#;
+        let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> and </w:t></w:r><w:r><w:drawing/></w:r><w:r><w:t xml:space="preserve"> now</w:t></w:r></w:p>"#;
         let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
         let view = doc.read();
 
@@ -2192,6 +2314,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![SegmentView::Text {
                         text: "Preamble before any heading.".to_string(),
                         status: TrackStatus::Normal,
@@ -2214,6 +2338,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![SegmentView::Text {
                         text: "Article One".to_string(),
                         status: TrackStatus::Normal,
@@ -2236,6 +2362,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![SegmentView::Text {
                         text: "Body under article one.".to_string(),
                         status: TrackStatus::Normal,
@@ -2258,6 +2386,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![SegmentView::Text {
                         text: "Section 1.1".to_string(),
                         status: TrackStatus::Normal,
@@ -2318,6 +2448,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![],
                 opaque_label: None,
             }],
@@ -2361,6 +2493,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![],
                 opaque_label: None,
             }],
@@ -2396,6 +2530,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![],
                 opaque_label: None,
             }],

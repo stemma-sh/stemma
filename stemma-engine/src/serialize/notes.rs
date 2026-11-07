@@ -96,6 +96,7 @@ pub(crate) fn serialize_footnotes_part(
                     "internal error: missing footnote metadata for id {id}"
                 ))
             })?;
+            super::insert_qualified_attributes(note, &story.source_attrs);
             let note_type = match story.note_type {
                 NoteType::Normal => None,
                 NoteType::Separator => Some("separator"),
@@ -195,6 +196,7 @@ pub(crate) fn serialize_endnotes_part(
                     "internal error: missing endnote metadata for id {id}"
                 ))
             })?;
+            super::insert_qualified_attributes(note, &story.source_attrs);
             let note_type = match story.note_type {
                 NoteType::Normal => None,
                 NoteType::Separator => Some("separator"),
@@ -576,17 +578,15 @@ fn xml_attr_escape(value: &str) -> String {
 }
 
 /// Is this note element one of the reserved footnote/endnote notes (§17.11.10)?
-/// The `separator` and `continuationSeparator` notes (conventionally ids `-1`
-/// and `0`) are structural placeholders, not user content: they never enter the
-/// IR's footnote/endnote collection, so `sync_note_like_part` must keep them even
-/// though their id is absent from the authored id set. Comments have no reserved
-/// notes, so a `w:comment` element never matches here.
+/// Separators and continuation notices are structural definitions, not
+/// body-referenced user notes. Keep them even when absent from the authored
+/// id set; classification depends on type, not conventional numeric ids.
 fn is_reserved_note(note: &Element) -> bool {
     matches!(
         crate::xml_attrs::attr_get(note, "w:type")
             .or_else(|| crate::xml_attrs::attr_get(note, "type"))
             .map(String::as_str),
-        Some("separator") | Some("continuationSeparator")
+        Some("separator") | Some("continuationSeparator") | Some("continuationNotice")
     )
 }
 
@@ -660,4 +660,46 @@ pub(crate) fn sync_note_like_part(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_note_sync_preserves_structural_notes_but_removes_user_notes() {
+        for kind in ["footnote", "endnote"] {
+            let xml = format!(
+                r#"<w:{kind}s xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:{kind} w:id="-1" w:type="separator"><w:p/></w:{kind}><w:{kind} w:id="0" w:type="continuationSeparator"><w:p/></w:{kind}><w:{kind} w:id="7" w:type="continuationNotice"><w:p><w:r><w:t>Continued notes.</w:t></w:r></w:p></w:{kind}><w:{kind} w:id="8"><w:p/></w:{kind}></w:{kind}s>"#
+            );
+            let mut root = Element::parse(xml.as_bytes()).unwrap();
+            let structural: Vec<_> = root
+                .children
+                .iter()
+                .filter_map(XMLNode::as_element)
+                .take(3)
+                .cloned()
+                .collect();
+            sync_note_like_part(
+                &mut root,
+                kind,
+                vec![],
+                |_| panic!("no authored notes to serialize"),
+                |_, _| panic!("no authored notes to configure"),
+                &mut 0,
+                &BookmarkIdPolicy::default(),
+            )
+            .unwrap();
+            let remaining: Vec<_> = root
+                .children
+                .iter()
+                .filter_map(XMLNode::as_element)
+                .cloned()
+                .collect();
+            assert_eq!(
+                remaining, structural,
+                "{kind}: retain structural content and order"
+            );
+        }
+    }
 }

@@ -187,6 +187,7 @@ fn direct_delete_block_range_collapses_bookmark_with_half_in_deleted_paragraph()
     let first_para = base.read().blocks[0].id.clone();
     let edited = base
         .apply(&direct_txn(vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: first_para.clone(),
             to_block_id: first_para,
             rationale: None,

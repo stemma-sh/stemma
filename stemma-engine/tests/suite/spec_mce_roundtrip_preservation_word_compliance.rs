@@ -293,7 +293,7 @@ fn mce_choice_no_fallback_understood_requires_selects_choice() {
 #[ignore = "open question: fixture is non-conformant — mc:Ignorable=\"wps wpg\" and Choice Requires=\"wps\" but xmlns:wps / xmlns:wpg are never bound; ISO/IEC 29500-3 §7.2/§7.6 require an in-scope binding for every listed prefix, so stemma correctly rejects it. Fix the fixture (bind xmlns:wps and xmlns:wpg) to exercise the multi-prefix Ignorable roundtrip rule."]
 #[test]
 fn mce_ignorable_multi_prefix_list_survives_roundtrip() {
-    let body = r#"<w:p><w:r><w:t>before </w:t></w:r><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="wps wpg"><mc:Choice Requires="wps"><w:t>choice</w:t></mc:Choice><mc:Fallback><w:t>fallback</w:t></mc:Fallback></mc:AlternateContent></w:r><w:r><w:t> after</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">before </w:t></w:r><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="wps wpg"><mc:Choice Requires="wps"><w:t>choice</w:t></mc:Choice><mc:Fallback><w:t>fallback</w:t></mc:Fallback></mc:AlternateContent></w:r><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let xml = reserialize(&b);
     assert!(
@@ -332,7 +332,7 @@ fn mce_choice_qualified_ignorable_attr_survives_roundtrip() {
 
 #[test]
 fn mce_ac_in_deleted_run_accept_removes_reject_keeps_branch() {
-    let body = r#"<w:p><w:r><w:t>keep </w:t></w:r><w:del w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone</w:delText></w:r></w:del><w:r><w:t> end</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">keep </w:t></w:r><w:del w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone</w:delText></w:r></w:del><w:r><w:t xml:space="preserve"> end</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert_eq!(
         reject_text(&b).trim(),
@@ -353,7 +353,7 @@ fn mce_ac_in_deleted_run_accept_removes_reject_keeps_branch() {
 #[ignore = "open question: likely real stemma gap — paragraph-level nested mc:AlternateContent inside the outer Choice fails parse with \"unknown paragraph-level element: AlternateContent\"; the paragraph-level parser only handles AC at the outer/run level, not recursively (ISO/IEC 29500-3 §9.4 requires recursive Step-3 resolution of the selected branch's children). Bindings are present here so the gap is the nested-AC handling, not an unbound prefix."]
 #[test]
 fn nested_ac_in_selected_choice_resolved_recursively() {
-    let body = r#"<w:p><w:r><w:t>before </w:t></w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><mc:Choice Requires="wps"><mc:AlternateContent><mc:Choice Requires="wps"><w:r><w:t>INNER</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>INNERFB</w:t></w:r></mc:Fallback></mc:AlternateContent></mc:Choice><mc:Fallback><w:r><w:t>OUTERFB</w:t></w:r></mc:Fallback></mc:AlternateContent><w:r><w:t> after</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">before </w:t></w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><mc:Choice Requires="wps"><mc:AlternateContent><mc:Choice Requires="wps"><w:r><w:t>INNER</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>INNERFB</w:t></w:r></mc:Fallback></mc:AlternateContent></mc:Choice><mc:Fallback><w:r><w:t>OUTERFB</w:t></w:r></mc:Fallback></mc:AlternateContent><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert_eq!(
         accept_text(&b).trim(),

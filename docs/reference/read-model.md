@@ -132,7 +132,7 @@ was edited through the same v4 wire path every transport uses.
 | `role` | "Paragraph", {"Heading":{"level":n}}, "Table", or "Opaque". |
 | `style_id` | Paragraph or table style id, when the document carries one; else null. |
 | `role_token` | The role token `insert` accepts to author a NEW paragraph formatted like this block; null for tables and opaque blocks. |
-| `text` | Concatenated visible text: the CURRENT redline reading, pending insertions and not-yet-accepted deletions both present (project the document for the accept-all or reject-all reading). What a plain `expect` matches against. |
+| `text` | The block's text runs concatenated, after its `literal_prefix_text`: the CURRENT redline reading, pending insertions and not-yet-accepted deletions both present (project the document for the accept-all or reject-all reading). Inline anchors add no characters: a hyperlink's display text and a field's result are in that anchor's segment `text` and a content control's value in its `metadata`, and breaks, comment references and range markers are zero-width. What a plain `expect` matches against: any part of `text` outside pending deletions, or the whole of it; no anchor splits a match. |
 | `block_status` | Whole-block tracked status (a block-level insert or delete), a [track status](#track-status). |
 | `paragraph_mark_status` | Tracked status of the trailing paragraph mark, a [track status](#track-status). |
 | `guard` | The staleness guard: the block's semantic hash at read time. A write op carries it back, and a block that changed since the read fails loud with `StaleEdit`. |
@@ -140,6 +140,8 @@ was edited through the same v4 wire path every transport uses.
 | `cells` | Per-cell grid addressing for a table block, row-major (see [tables](#tables-in-the-lean-view)); empty for non-table blocks. |
 | `table` | Table-level metadata: `cols` (grid column widths, twips), `align`, `indent` (twips); null for non-table blocks. |
 | `literal_prefix` | The typed-in enumeration label ("1.", "(a)") already prepended to `text`; surfaced separately because it is a structural marker, not a span an edit can address. |
+| `literal_prefix_text` | That label as written, with the whitespace around it ("(c) " with a space, "1." with a tab): exactly what `text` starts with; null when `literal_prefix` is. |
+| `literal_prefix_marks` | That label's own run marks ("bold", "underline", ...); empty when there is no label. |
 | `segments` | Inline structure for fine-grained targeting; see below. |
 | `opaque_label` | For an opaque block, the honest description of what kind of placeholder it is; null otherwise. |
 
@@ -204,6 +206,8 @@ carries a bold mark):
   "id": "p_2",
   "list": null,
   "literal_prefix": null,
+  "literal_prefix_marks": [],
+  "literal_prefix_text": null,
   "opaque_label": null,
   "paragraph_mark_status": "Normal",
   "role": "Paragraph",
@@ -294,6 +298,8 @@ formatting payload.
   "id": "p_4",
   "list": null,
   "literal_prefix": null,
+  "literal_prefix_marks": [],
+  "literal_prefix_text": null,
   "opaque_label": null,
   "paragraph_mark_status": "Normal",
   "role": "Paragraph",
@@ -365,8 +371,9 @@ Cell paragraph fields:
 | Field | Meaning |
 |---|---|
 | `segments` | The paragraph's runs in the full render view's segment shape (marks, `style_props`, hyperlinks, per-run tracked status). |
-| `block_id` | The cell paragraph's own id; a `replace` or `set_format` can target it in place, like a body paragraph. |
+| `block_id` | The cell paragraph's own id; every op that targets a paragraph (`replace`, `set_format`, `comment_create`, `insert_note`, `apply_style`, ...) can target it in place, like a body paragraph. `move` relocates top-level blocks only and refuses a cell paragraph. |
 | `guard` | The cell paragraph's own staleness guard, same mechanism as body blocks. |
+| `literal_prefix` | A typed label the paragraph starts with (`"b. "`), as written; the segments do not hold it. `null` when there is none or auto-numbering supplies the label. |
 
 Table metadata (`table` on the block): `cols` (Grid column widths in twips, from `w:tblGrid`), `align` (Table alignment ("left", "center", "right"); null means left), `indent` (Table indent from the leading margin, in twips; null when unset)
 
@@ -386,6 +393,7 @@ One real cell from the exemplar's table:
     {
       "block_id": "__edit_table_r0_c0_b0",
       "guard": "dbf49bdbb62cfb7261d8472e6ddc1cf4dc9fa39e180ce48ac0cfa0eba21a3e8e",
+      "literal_prefix": null,
       "segments": [
         {
           "Unchanged": {
@@ -418,6 +426,7 @@ One real cell from the exemplar's table:
               "italic_cs": "Inherit",
               "kern": null,
               "lang": null,
+              "lang_bidi": null,
               "lang_east_asia": null,
               "no_proof": "Inherit",
               "o_math": "Inherit",
@@ -433,6 +442,7 @@ One real cell from the exemplar's table:
               "spec_vanish": "Inherit",
               "strike": "Inherit",
               "text_effect": null,
+              "underline_extra_attrs": [],
               "underline_style": null,
               "vanish": "Inherit",
               "web_hidden": "Inherit"
@@ -513,7 +523,7 @@ The three text variants share these fields:
 | `kind` | What the anchor is: "Drawing", "Omml", "Hyperlink", "Field", "Sdt", "Ruby", "SmartArt", "CommentReference", "FootnoteReference", "EndnoteReference", "SmartTag", "Sym", "Ptab", "CustomXml", or {"Unknown":name}. |
 | `opaque_id` | The anchor's stable id. |
 | `inline_index` | Position of the anchor in the block's inline stream. |
-| `text` | Visible label when known, else null. |
+| `text` | Visible label when known (a link's text, a field's result; in a table cell paragraph, a content control's current value), else null. |
 | `reference_id` | The `w:id` for footnote, endnote, and comment references; else null. |
 | `field_kind` | For fields: "Begin", "Instruction", "Separate", "End", "Simple", or {"Unknown":name}. |
 | `field_instruction` | Field instruction text, for fields. |
@@ -542,12 +552,14 @@ part of the render read.
 | `color_theme` | Theme color reference (themeColor, themeShade, themeTint); when present it wins and `color` is the pre-resolved fallback. |
 | `highlight` | Highlight color (the OOXML highlight vocabulary), or null. |
 | `underline_style` | Underline style from `w:u` ("Single", "Double", "Dotted", ...), or null. |
+| `underline_extra_attrs` | The underline's other `w:u` attributes as [name, value] pairs (`w:color`, `w:themeColor`, `w:themeTint`, `w:themeShade`); empty when it has none. |
 | `font_east_asia` | East Asian font family from `w:rFonts` eastAsia. |
 | `font_east_asia_theme` | Theme font reference for the eastAsia slot. |
 | `font_cs` | Complex script font family from `w:rFonts` cs. |
 | `font_cs_theme` | Theme font reference for the cs slot. |
 | `lang` | Language tag from `w:lang` (e.g. "en-US"). |
 | `lang_east_asia` | East Asian language tag. |
+| `lang_bidi` | Complex-script language tag, independent of the Latin and East Asian slots. |
 | `char_spacing` | Character spacing in twips from `w:spacing`. |
 | `char_style_id` | Character style id from `w:rStyle`. |
 | `run_border` | Run-level border from `w:bdr`, or null. |
@@ -690,6 +702,7 @@ Page geometry for the body section; every dimension is twips.
 
 | Field | Meaning |
 |---|---|
+| `source_section_attrs` | Supplied section editing-session attributes as qualified-name/value pairs (rsidR, rsidRPr, rsidSect, rsidDel); provenance independent of page formatting. |
 | `page_width` | Page width in twips (`w:pgSz`). |
 | `page_height` | Page height in twips. |
 | `orientation` | Page orientation, when authored. |
@@ -712,7 +725,7 @@ Page geometry for the body section; every dimension is twips.
 | `page_number_type` | Page number format and start. |
 | `doc_grid_type` | Document grid type. |
 | `doc_grid_line_pitch` | Document grid line pitch in twips. |
-| `doc_grid_char_space` | Document grid character space in twips. |
+| `doc_grid_char_space` | Document grid character pitch adjustment, in 4096ths of a point; may be negative. |
 | `title_page` | Distinct first-page header and footer flag (`w:titlePg`). |
 | `bidi` | Right-to-left section layout flag. |
 | `form_prot` | Section-level form protection flag. |
@@ -791,6 +804,7 @@ linking each tracked span to its revision record:
           "italic_cs": "Inherit",
           "kern": null,
           "lang": null,
+          "lang_bidi": null,
           "lang_east_asia": null,
           "no_proof": "Inherit",
           "o_math": "Inherit",
@@ -806,6 +820,7 @@ linking each tracked span to its revision record:
           "spec_vanish": "Inherit",
           "strike": "Inherit",
           "text_effect": null,
+          "underline_extra_attrs": [],
           "underline_style": null,
           "vanish": "Inherit",
           "web_hidden": "Inherit"
@@ -845,6 +860,7 @@ linking each tracked span to its revision record:
           "italic_cs": "Inherit",
           "kern": null,
           "lang": null,
+          "lang_bidi": null,
           "lang_east_asia": null,
           "no_proof": "Inherit",
           "o_math": "Inherit",
@@ -860,6 +876,7 @@ linking each tracked span to its revision record:
           "spec_vanish": "Inherit",
           "strike": "Inherit",
           "text_effect": null,
+          "underline_extra_attrs": [],
           "underline_style": null,
           "vanish": "Inherit",
           "web_hidden": "Inherit"
@@ -899,6 +916,7 @@ linking each tracked span to its revision record:
           "italic_cs": "Inherit",
           "kern": null,
           "lang": null,
+          "lang_bidi": null,
           "lang_east_asia": null,
           "no_proof": "Inherit",
           "o_math": "Inherit",
@@ -914,6 +932,7 @@ linking each tracked span to its revision record:
           "spec_vanish": "Inherit",
           "strike": "Inherit",
           "text_effect": null,
+          "underline_extra_attrs": [],
           "underline_style": null,
           "vanish": "Inherit",
           "web_hidden": "Inherit"
@@ -955,6 +974,7 @@ linking each tracked span to its revision record:
           "italic_cs": "Inherit",
           "kern": null,
           "lang": null,
+          "lang_bidi": null,
           "lang_east_asia": null,
           "no_proof": "Inherit",
           "o_math": "Inherit",
@@ -970,6 +990,7 @@ linking each tracked span to its revision record:
           "spec_vanish": "Inherit",
           "strike": "Inherit",
           "text_effect": null,
+          "underline_extra_attrs": [],
           "underline_style": null,
           "vanish": "Inherit",
           "web_hidden": "Inherit"
@@ -1008,6 +1029,7 @@ linking each tracked span to its revision record:
           "italic_cs": "Inherit",
           "kern": null,
           "lang": null,
+          "lang_bidi": null,
           "lang_east_asia": null,
           "no_proof": "Inherit",
           "o_math": "Inherit",
@@ -1023,6 +1045,7 @@ linking each tracked span to its revision record:
           "spec_vanish": "Inherit",
           "strike": "Inherit",
           "text_effect": null,
+          "underline_extra_attrs": [],
           "underline_style": null,
           "vanish": "Inherit",
           "web_hidden": "Inherit"
@@ -1090,6 +1113,7 @@ linking each tracked span to its revision record:
   "printer_settings_rid": null,
   "rtl_gutter": null,
   "section_type": null,
+  "source_section_attrs": [],
   "text_direction": null,
   "title_page": null,
   "v_align": null
@@ -1142,7 +1166,7 @@ selective accept or reject. That loop is the same on every transport
 
 ### Revision kinds
 
-`insert`, `delete`, `format_run`, `format_paragraph`, `format_table`, `format_row`, `format_cell`, `format_section`, `opaque_interior`, `move`
+`insert`, `delete`, `format_run`, `format_paragraph`, `format_table`, `format_row`, `format_cell`, `format_section`, `opaque_interior`, `move`, `cell_merge`
 
 Transports serve projections of these records (HTTP `GET /revisions` rows
 carry `revision_id`, `author`, `kind`, `block_id`, `excerpt`, `date`, and

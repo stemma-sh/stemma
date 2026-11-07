@@ -1,5 +1,6 @@
 //! `SetImageAttributes` — author an in-place attribute edit on an existing
-//! opaque drawing (`w:drawing`): resize it (`wp:extent` @cx/@cy, §20.4.2.7) and
+//! opaque drawing (`w:drawing`, or a legacy VML `w:pict`): resize it
+//! (`wp:extent` @cx/@cy, §20.4.2.7; a VML shape's style width/height) and
 //! /or set its alt text (`wp:docPr` @descr, §20.4.2.5).
 //!
 //! ## Model
@@ -25,7 +26,8 @@
 //! - id resolves to a non-drawing → `NotADrawing`
 //! - drawing has no `raw_xml`     → `DrawingMissingRawXml`
 //! - nothing to edit on the node  → `ImageAttributeTargetAbsent`
-//!   (resize requested but no `wp:extent`; alt-text requested but no `wp:docPr`)
+//!   (resize requested but neither a `wp:extent` nor a sized VML shape;
+//!   alt-text requested but no `wp:docPr`)
 //! - empty request                → `NoImageAttributeRequested`
 //!
 //! ## Out of scope (cross-cutting foundation work, flagged not attempted)
@@ -34,14 +36,15 @@
 //! a relationship; `apply_transaction` operates on the IR alone and has no such
 //! handle. Adding a media part is a packaging change, not a verb.
 
+use super::super::story_addr::{StoryRef, story_blocks_mut};
 use super::super::{
-    EditError, MaterializationMode, apply_opaque_delete, block_at_mut,
-    check_ancestor_table_tracking, find_block_index, find_opaque_flat_index, find_paragraph_path,
+    EditError, MaterializationMode, apply_opaque_delete, block_at_mut, block_at_mut_in,
+    check_ancestor_table_tracking, check_ancestor_table_tracking_in, find_opaque_flat_index,
+    find_paragraph_path, find_paragraph_path_in,
 };
 use crate::domain::{
     BlockNode, CanonDoc, InlineNode, NodeId, OpaqueInlineNode, OpaqueKind, RevisionInfo,
 };
-use crate::import::sha256_hex;
 use crate::word_xml::{parse_raw_fragment, serialize_raw_fragment};
 use xmltree::{Element, XMLNode};
 
@@ -63,6 +66,7 @@ pub struct ImageResize {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     doc: &mut CanonDoc,
+    story: &StoryRef,
     block_id: &NodeId,
     drawing_id: &NodeId,
     semantic_hash: Option<&str>,
@@ -75,12 +79,18 @@ pub(crate) fn apply(
         return Err(EditError::NoImageAttributeRequested { step_index });
     }
 
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-
-    let node = locate_drawing_mut(&mut doc.blocks[idx].block, drawing_id, step_index)?;
+    // The paragraph may sit in a table cell (a letterhead's logo), in the
+    // body or in a header or footer.
+    let blocks = story_blocks_mut(doc, story, step_index)?;
+    let path =
+        find_paragraph_path_in(blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+            block_id: block_id.clone(),
+            step_index,
+        })?;
+    if !path.is_top_level() {
+        check_ancestor_table_tracking_in(blocks, &path, block_id, step_index)?;
+    }
+    let node = locate_drawing_mut(block_at_mut_in(blocks, &path), drawing_id, step_index)?;
 
     if let Some(expected) = semantic_hash {
         let actual = node.content_hash.as_deref().unwrap_or("");
@@ -111,19 +121,30 @@ pub(crate) fn apply(
     // Mutate the requested attributes; fail loud if the requested target node is
     // not present (no silent skip).
     if let Some(r) = resize {
-        let extent = find_descendant_by_local_mut(&mut element, "extent").ok_or_else(|| {
-            EditError::ImageAttributeTargetAbsent {
+        // A DrawingML drawing is sized by wp:extent @cx/@cy (bare attributes
+        // per the DrawingML schema), and the graphic object it frames (a
+        // picture, shape or group) carries its own size in its top-level
+        // `a:xfrm/a:ext`. Word resizes both; a renderer that draws the
+        // picture at its own size shows the old size in the new frame.
+        // A legacy VML shape (`w:pict`, or the fallback of an
+        // AlternateContent) is sized by its CSS-style width/height; every
+        // carrier present is resized so no branch keeps the old size.
+        let mut resized = false;
+        if let Some(extent) = find_descendant_by_local_mut(&mut element, "extent") {
+            let old = (bare_emu(extent, "cx"), bare_emu(extent, "cy"));
+            crate::xml_attrs::attr_set(extent, "cx", r.cx_emu.to_string());
+            crate::xml_attrs::attr_set(extent, "cy", r.cy_emu.to_string());
+            scale_graphic_frame(&mut element, old, r);
+            resized = true;
+        }
+        resized |= resize_vml_shapes(&mut element, r);
+        if !resized {
+            return Err(EditError::ImageAttributeTargetAbsent {
                 drawing_id: drawing_id.clone(),
-                attribute: "wp:extent",
+                attribute: "wp:extent or a VML shape width/height",
                 step_index,
-            }
-        })?;
-        // wp:extent @cx/@cy are bare (un-prefixed) attributes per the DrawingML
-        // schema. We write the inline-display extent specifically — NOT the
-        // inner a:ext on the graphic frame, which is the picture's own size box
-        // and is keyed separately.
-        crate::xml_attrs::attr_set(extent, "cx", r.cx_emu.to_string());
-        crate::xml_attrs::attr_set(extent, "cy", r.cy_emu.to_string());
+            });
+        }
     }
 
     if let Some(descr) = alt_text {
@@ -144,9 +165,77 @@ pub(crate) fn apply(
     }
 
     let new_raw = serialize_raw_fragment(&element);
-    node.content_hash = Some(sha256_hex(&new_raw));
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
     Ok(())
+}
+
+/// A bare EMU attribute of a DrawingML size element, when it is a number.
+pub(super) fn bare_emu(element: &Element, local: &str) -> Option<i64> {
+    crate::xml_attrs::attr_get(element, local).and_then(|value| value.parse().ok())
+}
+
+/// Scale the size of the graphic object a drawing frames — the `a:xfrm/a:ext`
+/// directly under its `pic:spPr`, `wps:spPr` or `wpg:grpSpPr` — by the factors
+/// the frame changed by (`old` → `new`), so a picture that filled its frame
+/// still fills it. A group's children keep their own coordinate space
+/// (`a:chExt`), so only the top level is scaled. With no readable old frame
+/// size the object takes the new frame size.
+pub(super) fn scale_graphic_frame(
+    root: &mut Element,
+    old: (Option<i64>, Option<i64>),
+    new: ImageResize,
+) {
+    let Some(data) = find_descendant_by_local_mut(root, "graphicData") else {
+        return;
+    };
+    for ext in graphic_frame_extents(data) {
+        let cx = scale_frame_dimension(bare_emu(ext, "cx"), old.0, new.cx_emu);
+        let cy = scale_frame_dimension(bare_emu(ext, "cy"), old.1, new.cy_emu);
+        crate::xml_attrs::attr_set(ext, "cx", cx.to_string());
+        crate::xml_attrs::attr_set(ext, "cy", cy.to_string());
+    }
+}
+
+/// One dimension of a framed object's size after its frame went from `old`
+/// to `new`, rounded to the nearest EMU; the new frame size when the object
+/// or the old frame has no readable size.
+pub(crate) fn scale_frame_dimension(inner: Option<i64>, old: Option<i64>, new: i64) -> i64 {
+    match (inner, old) {
+        (Some(inner), Some(old)) if old > 0 => {
+            ((i128::from(inner) * i128::from(new) + i128::from(old) / 2) / i128::from(old)) as i64
+        }
+        _ => new,
+    }
+}
+
+/// The `a:ext` of each top-level graphic object's `a:xfrm` under `graphicData`
+/// (`pic:spPr`, `wps:spPr` or `wpg:grpSpPr`), in document order.
+pub(crate) fn graphic_frame_extents(data: &mut Element) -> Vec<&mut Element> {
+    let mut out = Vec::new();
+    for object in data.children.iter_mut().filter_map(XMLNode::as_mut_element) {
+        for properties in object
+            .children
+            .iter_mut()
+            .filter_map(XMLNode::as_mut_element)
+            .filter(|e| matches!(e.name.as_str(), "spPr" | "grpSpPr"))
+        {
+            for xfrm in properties
+                .children
+                .iter_mut()
+                .filter_map(XMLNode::as_mut_element)
+                .filter(|e| e.name == "xfrm")
+            {
+                out.extend(
+                    xfrm.children
+                        .iter_mut()
+                        .filter_map(XMLNode::as_mut_element)
+                        .filter(|e| e.name == "ext"),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Delete an existing inline Drawing opaque by id. Resolves the host paragraph
@@ -261,6 +350,58 @@ pub(crate) fn locate_drawing_mut<'a>(
             unreachable!("drawing located in the immutable scan above");
         }
     }
+}
+
+const VML_NS: &str = "urn:schemas-microsoft-com:vml";
+
+/// Resize each outermost VML shape under `root` (ISO/IEC 29500-4 §19.1.2.19
+/// `style`: CSS `width`/`height`) to `size`; true when one was resized. A
+/// shape's size is in points here (1 pt = 12,700 EMU). Shapes inside a sized
+/// shape or group are in that container's coordinate space, so the search
+/// stops at the first sized element on each branch.
+fn resize_vml_shapes(root: &mut Element, size: ImageResize) -> bool {
+    if root.namespace.as_deref() == Some(VML_NS)
+        && let Some(style) = crate::xml_attrs::attr_get(root, "style")
+        && let Some(resized) = vml_style_with_size(style, size)
+    {
+        crate::xml_attrs::attr_set(root, "style", resized);
+        return true;
+    }
+    let mut resized = false;
+    for child in &mut root.children {
+        if let XMLNode::Element(child) = child {
+            resized |= resize_vml_shapes(child, size);
+        }
+    }
+    resized
+}
+
+/// `style` with its `width` and `height` set to `size`, or `None` when it does
+/// not declare both (an unsized element is not the shape's size box).
+fn vml_style_with_size(style: &str, size: ImageResize) -> Option<String> {
+    let points = |emu: i64| {
+        let text = format!("{:.2}", emu as f64 / 12_700.0);
+        format!("{}pt", text.trim_end_matches('0').trim_end_matches('.'))
+    };
+    let mut declarations: Vec<String> = style.split(';').map(str::to_string).collect();
+    let mut found = (false, false);
+    for declaration in &mut declarations {
+        let Some((name, _)) = declaration.split_once(':') else {
+            continue;
+        };
+        match name.trim() {
+            "width" => {
+                *declaration = format!("width:{}", points(size.cx_emu));
+                found.0 = true;
+            }
+            "height" => {
+                *declaration = format!("height:{}", points(size.cy_emu));
+                found.1 = true;
+            }
+            _ => {}
+        }
+    }
+    (found == (true, true)).then(|| declarations.join(";"))
 }
 
 /// Depth-first search for the first descendant element (or `root` itself) whose

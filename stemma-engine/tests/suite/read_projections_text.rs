@@ -169,7 +169,7 @@ fn opaque_anchor_survives_accept_all_projection() {
     // before AcceptAll still surfaces its anchor id in the accepted document's
     // markdown, and its cached result still reads as text in `to_text` (the
     // human-readable surface). The fixture's fldSimple result is "Section 2".
-    let body = r#"<w:p><w:r><w:t>See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t> now</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> now</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
 
     // The anchor id as the read view sees it (durable across projection).

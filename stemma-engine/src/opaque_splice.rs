@@ -257,6 +257,9 @@ fn splice_direct_at(
     let mut deleted: Vec<Element> = Vec::new();
     let mut insert_rpr: Option<Element> = None;
     let mut change_emitted = false;
+    // Either side of the change: a direct edit rejoins the runs that meet
+    // there, so it spells its result as accepting the tracked edit does.
+    let mut seams: Vec<usize> = Vec::new();
 
     for child in &region.children {
         match text_run_parts(child) {
@@ -293,6 +296,7 @@ fn splice_direct_at(
                 // The run that contains the END of the span is where the change
                 // block lands — after this run's pre, before its post.
                 if !change_emitted && run_start < end && end <= run_end && end > start {
+                    seams.push(new_children.len());
                     emit_change(
                         &mut new_children,
                         &mut deleted,
@@ -304,6 +308,7 @@ fn splice_direct_at(
                         tracked,
                     );
                     change_emitted = true;
+                    seams.push(new_children.len());
                 }
                 if !post.is_empty() {
                     new_children.push(XMLNode::Element(text_run(rpr, &post)));
@@ -319,19 +324,35 @@ fn splice_direct_at(
         return Err(SpliceError::TextNotFound);
     }
 
+    if !tracked {
+        crate::normalize::rejoin_runs_at_seams(&mut new_children, &seams);
+    }
     region.children = new_children;
     Ok(())
+}
+
+/// The run properties a whole-value SET gives the value.
+#[derive(Clone, Debug)]
+pub(crate) enum ValueRpr {
+    /// Those of the first text run it replaces: the value is an edit of the
+    /// text that was there.
+    OfReplacedText,
+    /// These, or none: the replaced text was a control's placeholder, which
+    /// the value does not inherit (ISO 29500-1 §17.5.2.27).
+    Given(Option<Element>),
 }
 
 /// Whole-value SET: replace ALL of a region's visible text with `value` (the
 /// "set this content control's value" operation). In tracked mode every existing
 /// text run is deleted (`w:del`) and `value` inserted (`w:ins`); in direct mode
-/// the existing runs are dropped and one run carries `value`. Shares the run
-/// builders with [`splice_region_text`]. Refuses a region that already carries
-/// tracked changes; refuses a no-op (no existing text AND empty value).
+/// the existing runs are dropped and one run carries `value`, formatted per
+/// `value_rpr`. Shares the run builders with [`splice_region_text`]. Refuses a
+/// region that already carries tracked changes; refuses a no-op (no existing
+/// text AND empty value).
 pub(crate) fn set_region_text(
     region: &mut Element,
     value: &str,
+    value_rpr: &ValueRpr,
     base: &RevisionInfo,
     rev_counter: &mut u32,
     tracked: bool,
@@ -339,6 +360,7 @@ pub(crate) fn set_region_text(
     set_region_text_inner(
         region,
         value,
+        value_rpr,
         base.author.as_deref().unwrap_or(""),
         base.date.as_deref(),
         &mut counter_mint(rev_counter),
@@ -352,6 +374,7 @@ pub(crate) fn set_region_text(
 pub(crate) fn set_region_text_with_ids(
     region: &mut Element,
     value: &str,
+    value_rpr: &ValueRpr,
     author: &str,
     date: Option<&str>,
     ids: [u32; 2],
@@ -361,6 +384,7 @@ pub(crate) fn set_region_text_with_ids(
     set_region_text_inner(
         region,
         value,
+        value_rpr,
         author,
         date,
         &mut || it.next().expect("at most two ids minted per set"),
@@ -371,6 +395,7 @@ pub(crate) fn set_region_text_with_ids(
 fn set_region_text_inner(
     region: &mut Element,
     value: &str,
+    value_rpr: &ValueRpr,
     author: &str,
     date: Option<&str>,
     mint: &mut dyn FnMut() -> u32,
@@ -424,12 +449,16 @@ fn set_region_text_inner(
         return Err(SpliceError::TextNotFound); // nothing to delete, nothing to add
     }
     let pos = insert_at.unwrap_or(new_children.len());
+    let insert_rpr = match value_rpr {
+        ValueRpr::OfReplacedText => insert_rpr.as_ref(),
+        ValueRpr::Given(rpr) => rpr.as_ref(),
+    };
     let mut block = Vec::new();
     emit_change(
         &mut block,
         &mut deleted,
         value,
-        insert_rpr.as_ref(),
+        insert_rpr,
         author,
         date,
         mint,
@@ -786,7 +815,15 @@ mod tests {
     fn set_region_replaces_whole_value_tracked() {
         let mut p = para(r#"<w:r><w:t>Acme Corp</w:t></w:r>"#);
         let mut counter = 1;
-        set_region_text(&mut p, "Globex Inc", &rev(), &mut counter, true).unwrap();
+        set_region_text(
+            &mut p,
+            "Globex Inc",
+            &ValueRpr::OfReplacedText,
+            &rev(),
+            &mut counter,
+            true,
+        )
+        .unwrap();
         let out = serialized(&p);
         assert!(
             out.contains("delText") && out.contains("Acme Corp"),
@@ -802,7 +839,15 @@ mod tests {
     fn set_region_direct_leaves_only_value() {
         let mut p = para(r#"<w:r><w:t>old</w:t></w:r>"#);
         let mut counter = 1;
-        set_region_text(&mut p, "new", &rev(), &mut counter, false).unwrap();
+        set_region_text(
+            &mut p,
+            "new",
+            &ValueRpr::OfReplacedText,
+            &rev(),
+            &mut counter,
+            false,
+        )
+        .unwrap();
         let out = serialized(&p);
         assert!(!out.contains("<w:ins") && !out.contains("<w:del"), "{out}");
         assert!(out.contains("new") && !out.contains("old"), "{out}");
@@ -812,7 +857,15 @@ mod tests {
     fn set_region_into_empty_inserts_value() {
         let mut p = para("");
         let mut counter = 3;
-        set_region_text(&mut p, "filled", &rev(), &mut counter, true).unwrap();
+        set_region_text(
+            &mut p,
+            "filled",
+            &ValueRpr::OfReplacedText,
+            &rev(),
+            &mut counter,
+            true,
+        )
+        .unwrap();
         let out = serialized(&p);
         assert!(out.contains("<w:ins") && out.contains("filled"), "{out}");
     }

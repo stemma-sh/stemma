@@ -982,12 +982,15 @@ fn plan_flag_execution(
     let selective =
         |accept: HashSet<u32>, reject: HashSet<u32>| Execution::Selective { accept, reject };
     match disposition {
+        // A bulk resolution acts on every pending record, census-only ones
+        // included: "nothing pending" holds only when the census is empty (a
+        // record the engine cannot resolve then refuses loudly instead).
         Disposition::AcceptAll => {
-            require_nonempty(&known, file)?;
+            require_nonempty(pending, file)?;
             Ok(Execution::AcceptAll)
         }
         Disposition::RejectAll => {
-            require_nonempty(&known, file)?;
+            require_nonempty(pending, file)?;
             Ok(Execution::RejectAll)
         }
         Disposition::AcceptAuthor(name) => Ok(selective(
@@ -1159,8 +1162,8 @@ fn execute_resolution(
     }
 }
 
-fn require_nonempty(known: &HashSet<u32>, file: &Path) -> Result<(), String> {
-    if known.is_empty() {
+fn require_nonempty(pending: &[PendingRevision], file: &Path) -> Result<(), String> {
+    if pending.is_empty() {
         return Err(format!(
             "no pending tracked changes to resolve in {}",
             file.display()

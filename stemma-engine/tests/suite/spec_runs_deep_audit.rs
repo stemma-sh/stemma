@@ -267,9 +267,17 @@ fn spec_run_border_preserved() {
         .as_ref()
         .expect("Bordered run should have run_border");
     assert_eq!(border.style, "single", "border style should be 'single'");
-    assert_eq!(border.size, 4, "border size should be 4 eighth-points");
-    assert_eq!(border.space, 1, "border space should be 1 point");
-    assert_eq!(border.color, "FF0000", "border color should be FF0000");
+    assert_eq!(
+        border.size,
+        Some(4),
+        "border size should be 4 eighth-points"
+    );
+    assert_eq!(border.space, Some(1), "border space should be 1 point");
+    assert_eq!(
+        border.color.as_deref(),
+        Some("FF0000"),
+        "border color should be FF0000"
+    );
 }
 
 // ── 4. w:position (vertical displacement) ───────────────────────────────

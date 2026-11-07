@@ -299,10 +299,10 @@ fn spec_single_section_no_header_gets_blank_default() {
 // Bug 4: Continuous section partial margin inheritance (ECMA-376 section 17.6.22)
 // ==========================================================================
 
-/// ECMA-376 section 17.6.22: Continuous section inherits page properties from
-/// the preceding section, but explicit declarations take precedence.
+/// ECMA-376 section 17.6.22: a continuous section keeps the margins it declares
+/// and leaves the rest omitted (Word reads those as its defaults).
 #[test]
-fn spec_continuous_section_partial_margin_inheritance() {
+fn spec_continuous_section_partial_margins_stay_as_authored() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "continuous-section-partial-margins");
 
     let section_props = section_paragraphs(&doc);
@@ -345,21 +345,18 @@ fn spec_continuous_section_partial_margin_inheritance() {
     );
 
     assert_eq!(
-        body_sp.margin_top,
-        Some(1440),
-        "ECMA-376 section 17.6.22: Section 2 should inherit top=1440 from Section 1, got {:?}",
+        body_sp.margin_top, None,
+        "ECMA-376 section 17.6.22: Section 2 is not authored, so it stays omitted (Word reads its own default), got {:?}",
         body_sp.margin_top
     );
     assert_eq!(
-        body_sp.margin_bottom,
-        Some(1440),
-        "ECMA-376 section 17.6.22: Section 2 should inherit bottom=1440 from Section 1, got {:?}",
+        body_sp.margin_bottom, None,
+        "ECMA-376 section 17.6.22: Section 2 is not authored, so it stays omitted (Word reads its own default), got {:?}",
         body_sp.margin_bottom
     );
     assert_eq!(
-        body_sp.margin_right,
-        Some(1440),
-        "ECMA-376 section 17.6.22: Section 2 should inherit right=1440 from Section 1, got {:?}",
+        body_sp.margin_right, None,
+        "ECMA-376 section 17.6.22: Section 2 is not authored, so it stays omitted (Word reads its own default), got {:?}",
         body_sp.margin_right
     );
 }

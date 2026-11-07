@@ -101,7 +101,7 @@ normalization at the import edge. Every such normalization is retained on
 input bytes satisfy the package and WordprocessingML checks. It does not first
 normalize them. Consequently, malformed raw bytes can fail `validate` while
 `Document::parse` accepts the one known safe case, reports a warning, and later
-serializes normalized bytes. In v0.6 that exception is limited to a dead
+serializes normalized bytes. That exception is limited to a dead
 package-root thumbnail relationship whose target is absent, matching Word's
 save behavior. Missing relationships used by document content, stories,
 drawings, or embedded objects remain hard failures.
@@ -231,8 +231,9 @@ What it actually is:
   lineage.
 - **Hot handoff, not storage.** `export_snapshot_blob` /
   `import_snapshot_blob` move a working session between processes running
-  the SAME engine build (schema-version checked, fingerprint checked). They
-  are short-TTL cache entries by contract, never durable storage.
+  the SAME engine release: a blob records the release that wrote it and any
+  other release refuses it. They are short-TTL cache entries by contract,
+  never durable storage.
 
 Signatures, exact semantics, and the rest of the method set: rustdoc on
 `stemma::runtime::SimpleRuntime`.

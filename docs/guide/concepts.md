@@ -81,8 +81,10 @@ This structural validation pass checks the emitted package, and it guards
 **every** exit: `Document::serialize` runs it by default
 (`ExportOptions::default()` gates at the blocking level; opting out is the
 explicit, engine-internal `ExportOptions::unchecked`), and
-`save_docx` refuses to persist a structurally corrupt file. Transport output
-commits are create-new: inputs and every existing destination are refused.
+`save_docx` refuses to persist a structurally corrupt file. CLI and MCP output
+commits are create-new: inputs and every existing destination are refused (the
+Python binding's `save(path, overwrite=True)` is the one opt-in replacement,
+written atomically).
 Bytes are staged beside the destination, committed without clobbering, and
 verified by length and SHA-256 before success. This is collision-safe
 visibility, not a power-loss durability claim.

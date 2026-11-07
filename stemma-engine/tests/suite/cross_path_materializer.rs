@@ -181,8 +181,7 @@ fn inline_kind(inline: &InlineNode) -> InlineKind {
         InlineNode::HardBreak(_) => InlineKind::HardBreak,
         InlineNode::Decoration(_)
         | InlineNode::CommentRangeStart { .. }
-        | InlineNode::CommentRangeEnd { .. }
-        | InlineNode::CommentReference { .. } => InlineKind::Other,
+        | InlineNode::CommentRangeEnd { .. } => InlineKind::Other,
     }
 }
 

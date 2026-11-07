@@ -1,10 +1,11 @@
 //! Spec-compliance tests for the sections / page-setup + headers/footers verbs.
 //!
 //! These encode behavioral constraints from ECMA-376 / ISO 29500:
-//! - §17.6.22 ST_SectionMark: a `Continuous` section inherits page properties
-//!   from the PRECEDING section (a known drafting-error workaround the importer
-//!   implements; this test guards against a regression to following-section
-//!   inheritance);
+//! - §17.6.22 / §17.6.11: a `Continuous` section that omits page properties is
+//!   stored and written as authored. Real Word reads the omitted values as its
+//!   defaults (letter portrait, 1440 margins, 720 header and footer), not as the
+//!   preceding section's, so copying a neighbour's values in would change the
+//!   layout on save;
 //! - the page-setup grammar refuses an empty patch (no silent no-op);
 //! - the v4 wire edge rejects an unknown `section_type` / `orientation` token —
 //!   NEVER mapping it to a default;
@@ -12,7 +13,7 @@
 //! - §17.15.1.35 `w:evenAndOddHeaders` round-trips present / absent honestly.
 
 use stemma::api::Document;
-use stemma::domain::{PageOrientation, RevisionInfo, SectionType};
+use stemma::domain::{RevisionInfo, SectionType};
 use stemma::edit::{
     EditStep, EditTransaction, MaterializationMode, PageSetupPatch, SectionTarget,
     apply_transaction,
@@ -42,10 +43,21 @@ const RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 const DOC_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
 
+/// `word/document.xml` of a serialized package.
+fn document_xml(docx: &[u8]) -> String {
+    let archive = stemma::docx::DocxArchive::read(docx).expect("read archive");
+    String::from_utf8(
+        archive
+            .get("word/document.xml")
+            .expect("document.xml")
+            .to_vec(),
+    )
+    .expect("utf-8")
+}
+
 /// A two-section doc: the first paragraph carries a NextPage section break with
 /// an explicit landscape `pgSz`; the body section is `Continuous` and OMITS
-/// `pgSz`. Per §17.6.22 the continuous body section must inherit the preceding
-/// section's page size.
+/// `pgSz`.
 fn make_two_section_docx() -> Vec<u8> {
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
@@ -76,10 +88,13 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
     }
 }
 
-/// §17.6.22: a Continuous section inherits page properties from the PRECEDING
-/// section, not the following one.
+/// A continuous section that omits its page size keeps it omitted. Real Word
+/// opens this shape and saves the continuous section as letter portrait
+/// (12240 x 15840), its default, not the preceding landscape page, so the
+/// stored model must not take the neighbour's values and a save must not write
+/// them.
 #[test]
-fn continuous_section_inherits_from_preceding() {
+fn continuous_section_keeps_its_omitted_page_size() {
     let doc = Document::parse(&make_two_section_docx()).expect("parse");
     let canon = doc.snapshot().canonical.clone();
 
@@ -88,22 +103,62 @@ fn continuous_section_inherits_from_preceding() {
         .as_ref()
         .expect("body sectPr present");
     assert_eq!(body_sp.section_type, Some(SectionType::Continuous));
-    // The continuous body section omits pgSz; it must have inherited the
-    // PRECEDING (first paragraph's) landscape 16838x11906 page size.
-    assert_eq!(
-        body_sp.page_width,
-        Some(16838),
-        "continuous section inherits preceding page width (§17.6.22)"
+    assert_eq!(body_sp.page_width, None, "no page width was authored");
+    assert_eq!(body_sp.page_height, None, "no page height was authored");
+    assert_eq!(body_sp.orientation, None, "no orientation was authored");
+
+    let xml = document_xml(&doc.serialize(&ExportOptions::default()).expect("serialize"));
+    let body_sect = &xml[xml.rfind("<w:sectPr").expect("body sectPr")..];
+    assert!(
+        !body_sect.contains("pgSz"),
+        "the continuous section is written without a page size: {body_sect}"
     );
+}
+
+/// The same for margins: a continuous section whose `w:pgMar` names only `top`
+/// keeps only `top`. Word reads the missing header and footer distances as 720
+/// and the missing margins as 1440, not the preceding section's 0 and 766.
+#[test]
+fn continuous_section_keeps_its_omitted_margins() {
+    let authored = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="2880" w:right="2880" w:bottom="2880" w:left="2880" w:header="0" w:footer="766" w:gutter="0"/></w:sectPr></w:pPr><w:r><w:t>First section.</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second section.</w:t></w:r></w:p>
+<w:sectPr><w:type w:val="continuous"/><w:pgMar w:top="500"/></w:sectPr>
+</w:body></w:document>"#;
+    let doc = Document::parse(&zip_docx(&[
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("_rels/.rels", RELS),
+        ("word/_rels/document.xml.rels", DOC_RELS),
+        ("word/document.xml", authored),
+    ]))
+    .expect("parse");
+    let canon = doc.snapshot().canonical.clone();
+    let body_sp = canon
+        .body_section_properties
+        .as_ref()
+        .expect("body sectPr present");
+    assert_eq!(body_sp.margin_top, Some(500));
     assert_eq!(
-        body_sp.page_height,
-        Some(11906),
-        "continuous section inherits preceding page height"
+        (
+            body_sp.margin_left,
+            body_sp.margin_right,
+            body_sp.margin_bottom,
+            body_sp.header_distance,
+            body_sp.footer_distance,
+        ),
+        (None, None, None, None, None),
+        "only the authored top margin is stored"
     );
+
+    let xml = document_xml(&doc.serialize(&ExportOptions::default()).expect("serialize"));
+    let body_sect = &xml[xml.rfind("<w:sectPr").expect("body sectPr")..];
+    let pg_mar = &body_sect[body_sect.find("<w:pgMar").expect("pgMar")..];
+    let pg_mar = &pg_mar[..pg_mar.find("/>").expect("pgMar end")];
     assert_eq!(
-        body_sp.orientation,
-        Some(PageOrientation::Landscape),
-        "continuous section inherits preceding orientation"
+        pg_mar.trim_end(),
+        r#"<w:pgMar w:top="500""#,
+        "only top is written: {pg_mar}"
     );
 }
 

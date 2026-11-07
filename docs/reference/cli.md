@@ -236,8 +236,9 @@ Empty `new` text is a tracked deletion.
 spaces and straight/curly quote classes only for matching; the replacement is
 written verbatim and the receipt names every normalization class actually used.
 
-`scope` is optional and defaults to all top-level body paragraphs. It may be a
-single block:
+`scope` is optional and defaults to every body paragraph, including the
+paragraphs in table cells (nested tables too). It may be a single block, a body
+paragraph or a paragraph in a cell:
 
 ```json
 { "block_id": "p_41" }
@@ -249,15 +250,29 @@ or an inclusive body-block range:
 { "from_block_id": "p_35", "to_block_id": "p_48" }
 ```
 
-Use `stemma extract <input> --format json` to inspect current block IDs. A
+Use `stemma read <input>` to inspect current block IDs, including the
+`block_id` of each table cell's paragraphs (`stemma extract --format json`
+lists top-level blocks only). A
 match-count mismatch refuses that item and returns actual matches with excerpts
 instead of guessing. A match crossing an opaque anchor or existing tracked
-segment also refuses the item. Default-scope matches detected in table cells
-are reported as `unreachable_match` and not partially applied.
+segment also refuses the item. An occurrence inside a hyperlink's display text
+or an inline content control's value refuses the item with code
+`matches_inside_inline_objects`: the worklist does not edit inside those
+objects, so the refusal names each one, its paragraph, and the op that edits
+it (`replace` on the hyperlink, `set_content_control_value` or
+`opaque_text_edit` on the control) rather than replacing the rest. A match inside another author's pending
+insertion is applied as a tracked change stacked on that insertion: the
+insertion stays the other author's, edited inside, and is never accepted or
+rejected.
 
 Items are deliberately independent and sequential for complete outcome
 reporting. A refused item leaves the in-memory document unchanged and does not
-block later evaluation; a later item sees every earlier successful edit. If any
+block later evaluation; a later item sees every earlier successful edit. A
+later item may revise or undo an earlier item's pending change (amend "Buyer"
+to "Purchaser" after replacing "Customer" with "Buyer"): editing your own
+pending insertion changes the proposal itself, so no revision is stacked on
+it, and the item's receipt counts the earlier revisions it replaced or removed
+as `withdrawn_revisions`. If any
 item refuses, the receipt status is `partial`, `deliverable` is false, the
 process exits `3`, and no DOCX is created by default. `--emit-partial` persists
 the successful edits only for explicit diagnosis/review; it never changes the
@@ -277,11 +292,20 @@ status, deliverability, or exit code.
   verification profile, `complete` or `partial` status, deliverability, and
   applied/refused counts;
 - every item ID, status, expected/actual match count, match excerpts, changed
-  block IDs, actual scope, match mode, new revision count, or explicit stable
-  refusal code and diagnosis;
-- declared supported, conditionally detected, and unsearched regions;
-- validator result, direct-change count, untouched-scope violations,
-  pre-existing revision preservation, and the audited new revision count;
+  block IDs, actual scope, match mode, new revision count, the count of
+  earlier items' revisions it revised or withdrew (`withdrawn_revisions`), or
+  explicit stable refusal code and diagnosis; the items' created less
+  withdrawn revisions equal the audited new revision count;
+- `coverage`: the `supported` regions (`body_paragraphs`,
+  `table_cell_paragraphs`), the `default_scope`
+  (`all_body_and_table_paragraphs`), the regions searched but not edited
+  (`searched_not_edited`: `hyperlink_text`, `content_control_values`), and
+  the `unsearched` stories;
+- under `verification`: the validator result (`validator_ok`), the
+  direct-change count (`direct_changes`), untouched-scope violations
+  (`untouched_violations`), pre-existing revisions preserved and edited inside
+  (`preexisting_revisions_preserved`, `preexisting_revisions_edited_inside`),
+  and the audited new revision count (`new_revisions`);
 - `verification.artifact_stage`, which is `serialized_output` for a complete
   delivery, and `verification.output_sha256`, which must equal the output
   artifact digest;
@@ -295,17 +319,18 @@ artifact identities would be misleading.
 
 Before output, Stemma serializes the candidate and audits those exact bytes.
 It blocks any untracked direct change, unexplained untouched-scope violation,
-changed/resolved pre-existing revision, invalid package, disagreement between
+resolved pre-existing revision, pre-existing revision changed outside the
+blocks the worklist edited, invalid package, disagreement between
 the execution-time item revision census and the serialized package audit
 census, or disagreement between the verification output hash and candidate
 bytes.
 
-Current coverage is intentionally narrow: top-level body paragraphs. Headers,
-footers, footnotes, endnotes, comments, textboxes, and nested table cells are
-named as unsearched. For default-scope items, occurrences in top-level table
-cells are conditionally detected and refused; this is not a recursive table
-search. A `complete` receipt means complete under this declared v0 coverage, not
-universal DOCX coverage.
+Current coverage is body paragraphs and the paragraphs in table cells, nested
+tables included. Headers, footers, footnotes, endnotes, comments, and textboxes
+are named as unsearched. Within covered paragraphs, hyperlink display text and
+inline content-control values are searched but never edited; an occurrence
+there refuses its item. A `complete` receipt means complete under this declared
+v0 coverage, not universal DOCX coverage.
 
 The durable receipt is committed before the DOCX. Its `deliverable` field is a
 policy result for the exact candidate bytes, not proof of the subsequent
@@ -420,11 +445,19 @@ $ stemma extract redline.docx --format json
 [read model reference](read-model.md) documents), not just insert/delete:
 `insert`, `delete`, `move` (a source/destination pair enumerates as ONE
 atomic record), `format_run`, `format_paragraph`, `format_table`,
-`format_row`, `format_cell`, `format_section`, and `opaque_interior` (a
+`format_row`, `format_cell`, `format_section`, `opaque_interior` (a
 change inside opaque content such as a textbox; individually resolvable only
 when it carries a nonzero `revision_id`; a census-only interior reports
-`revision_id: 0` and is never selectable). A consumer switching on `kind`
-must handle, or explicitly refuse, all ten: a real multi-party redline
+`revision_id: 0` and is never selectable), and `cell_merge` (a tracked
+vertical cell merge, `w:cellMerge` with `w:vMerge` or `w:vMergeOrig`; it
+reports `revision_id: 0`, and every resolution, `--accept-all` and
+`--reject-all` included, refuses while one is pending, because resolving it
+is not supported). Unlike every other kind, an `opaque_interior` id is the
+change's own `w:id` inside the textbox, so it is selectable only when no
+other revision in the document carries the same `w:id`; two textboxes sharing
+one both report `0` and are resolved only by accepting or rejecting
+everything. A consumer switching on `kind`
+must handle, or explicitly refuse, all eleven: a real multi-party redline
 routinely carries moves and formatting changes alongside inserts and
 deletes.
 
@@ -462,8 +495,9 @@ omit `date`.
 > alters a *surviving* revision's content (or removes an identical-signature
 > duplicate ahead of it), that survivor is re-keyed; a mixed `resolve --plan`
 > detects this at its internal phase boundary and refuses rather than
-> resolving the wrong revision. Ids never come from raw XML; always read
-> them from `extract`, `read`, or a receipt.
+> resolving the wrong revision. Apart from `opaque_interior` changes (see
+> `kind` above), ids never come from raw XML; always read them from
+> `extract`, `read`, or a receipt.
 
 ## read
 
@@ -563,7 +597,9 @@ output, one receipt:
 - Plans address the selectable census (`revision_id != 0`). Census-only
   records (id `0`, e.g. some opaque-interior changes) are outside plan scope
   and stay pending; only the total `--accept-all`/`--reject-all` resolve
-  those.
+  those. The exception is a pending `cell_merge` record: it is resolved by
+  nothing, and while one is pending every resolution, the total ones
+  included, refuses.
 - A mixed plan executes accepts before rejects internally. Revision ids are
   content-derived and survive the internal phase (see **Id durability**
   above); in the rare case an accepted change re-keys a survivor selected

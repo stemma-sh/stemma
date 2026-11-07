@@ -59,7 +59,7 @@ fn block_identity_surface_renders_field_as_object_replacement_character() {
     // hash input) a field is a no-text object: its stream position is exactly one
     // OBJECT REPLACEMENT CHARACTER, never its cached result, so block identity is
     // stable against a volatile field result.
-    let body = r#"<w:p><w:r><w:t>See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t> now</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> now</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
     let snapshot = doc.snapshot();
 
@@ -78,7 +78,7 @@ fn block_identity_surface_renders_field_as_object_replacement_character() {
 fn human_readable_surface_renders_field_as_its_cached_result() {
     // On the HUMAN-READABLE surface (`to_plain_text`) the same field reads as its
     // cached result "Section 2" — the displayed result Word shows — NOT a U+FFFC.
-    let body = r#"<w:p><w:r><w:t>See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t> now</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> now</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
     let text = to_plain_text(&doc.read());
 
@@ -97,7 +97,7 @@ fn human_readable_and_identity_surfaces_diverge_only_on_fields() {
     // The two surfaces agree on text runs and on no-text objects (a drawing reads
     // as one U+FFFC on both), and diverge ONLY where a field carries a cached
     // result: identity surface = U+FFFC, human-readable surface = the result.
-    let body = r#"<w:p><w:r><w:t>Alpha </w:t></w:r><w:fldSimple w:instr=" REF X \h "><w:r><w:t>X</w:t></w:r></w:fldSimple><w:r><w:t> mid </w:t></w:r><w:r><w:drawing/></w:r><w:r><w:t> omega</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">Alpha </w:t></w:r><w:fldSimple w:instr=" REF X \h "><w:r><w:t>X</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> mid </w:t></w:r><w:r><w:drawing/></w:r><w:r><w:t xml:space="preserve"> omega</w:t></w:r></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
     let snapshot = doc.snapshot();
     let view = doc.read();

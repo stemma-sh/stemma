@@ -108,12 +108,11 @@ fn write_block(out: &mut String, block: &BlockView) {
         BlockRole::Paragraph | BlockRole::Heading { .. } => {
             // The typed-in enumeration label (`"1."`, `"(a)"`) is real text Word
             // reads but lives outside `segments` (in `literal_prefix`); emit it
-            // ahead of the body as plain `"{label}\t"` so the redline/markdown
-            // read shows what Word shows. It is untracked structural text — no
+            // ahead of the body as written, so the redline/markdown read shows
+            // what Word shows. It is untracked structural text — no
             // <ins>/<del> wrapper, and not a span the model can target.
-            if let Some(label) = &block.literal_prefix {
-                out.push_str(label);
-                out.push('\t');
+            if let Some(prefix) = &block.literal_prefix_text {
+                out.push_str(prefix);
             }
             for seg in &block.segments {
                 write_segment(out, seg);
@@ -253,13 +252,30 @@ fn opaque_tag(
             }
         }
         OpaqueAnchorKind::Equation => format!("<eq id={id}/>"),
-        // The reference marker (also what an imported `commentReference`
-        // projects to) and the range boundaries share the id space but are
-        // distinct tags, so a reader can tell "here's the comment" from
-        // "here's where the commented range starts/ends".
-        OpaqueAnchorKind::Comment => format!("<comment id={id}/>"),
-        OpaqueAnchorKind::CommentRangeStart => format!("<comment_start id={id}/>"),
-        OpaqueAnchorKind::CommentRangeEnd => format!("<comment_end id={id}/>"),
+        // The reference marker and the range boundaries carry the same
+        // comment id (the id comment operations take) but are distinct tags,
+        // so a reader can tell "here's the comment" from "here's where the
+        // commented range starts/ends". Every comment reference projects
+        // its comment id as `NoteReference` metadata.
+        OpaqueAnchorKind::Comment => match metadata {
+            Some(OpaqueMetadata::NoteReference { reference_id }) => {
+                format!("<comment id={reference_id}/>")
+            }
+            _ => format!("<comment id={id}/>"),
+        },
+        OpaqueAnchorKind::CommentRangeStart | OpaqueAnchorKind::CommentRangeEnd => {
+            let tag = if kind == OpaqueAnchorKind::CommentRangeStart {
+                "comment_start"
+            } else {
+                "comment_end"
+            };
+            match metadata {
+                Some(OpaqueMetadata::NoteReference { reference_id }) => {
+                    format!("<{tag} id={reference_id}/>")
+                }
+                _ => format!("<{tag} id={id}/>"),
+            }
+        }
         OpaqueAnchorKind::HardBreak => format!("<br id={id}/>"),
         OpaqueAnchorKind::Other => format!("<obj id={id}/>"),
     }
@@ -322,6 +338,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![SegmentView::Text {
                         text: "Confidentiality".to_string(),
                         status: TrackStatus::Normal,
@@ -345,6 +363,8 @@ mod tests {
                     paragraph_mark_status: TrackStatus::Normal,
                     guard: String::new(),
                     literal_prefix: None,
+                    literal_prefix_text: None,
+                    literal_prefix_marks: Vec::new(),
                     segments: vec![
                         SegmentView::Text {
                             text: "The term ".to_string(),
@@ -440,6 +460,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![seg],
                 opaque_label: None,
             }],
@@ -507,6 +529,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: Some("1.".to_string()),
+                literal_prefix_text: Some("1.\t".to_string()),
+                literal_prefix_marks: Vec::new(),
                 segments: vec![SegmentView::Text {
                     text: "Events".to_string(),
                     status: TrackStatus::Normal,
@@ -663,6 +687,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![],
                 opaque_label: Some("quarantined_nested_tracked_changes".to_string()),
             }],

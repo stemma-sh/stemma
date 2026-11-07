@@ -580,7 +580,13 @@ fn set_value_on_non_sdt_opaque_fails_not_a_content_control() {
 /// A DOCX whose paragraph hosts an INLINE plain-text content control that is in
 /// the placeholder state (`<w:showingPlcHdr/>` in sdtPr, placeholder run text).
 fn make_docx_with_placeholder_sdt() -> Vec<u8> {
-    let sdt = r#"<w:sdt><w:sdtPr><w:rPr/><w:alias w:val="Tenant"/><w:tag w:val="Tenant"/><w:id w:val="123"/><w:showingPlcHdr/><w:text/></w:sdtPr><w:sdtContent><w:r><w:rPr><w:rStyle w:val="PlaceholderText"/></w:rPr><w:t>Click here to enter text.</w:t></w:r></w:sdtContent></w:sdt>"#;
+    make_docx_with_sdt(
+        r#"<w:sdt><w:sdtPr><w:rPr/><w:alias w:val="Tenant"/><w:tag w:val="Tenant"/><w:id w:val="123"/><w:showingPlcHdr/><w:text/></w:sdtPr><w:sdtContent><w:r><w:rPr><w:rStyle w:val="PlaceholderText"/></w:rPr><w:t>Click here to enter text.</w:t></w:r></w:sdtContent></w:sdt>"#,
+    )
+}
+
+/// A paragraph "Name: " followed by the inline control `sdt`.
+fn make_docx_with_sdt(sdt: &str) -> Vec<u8> {
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w:body><w:p><w:r><w:t xml:space="preserve">Name: </w:t></w:r>{sdt}</w:p><w:sectPr/></w:body></w:document>"#
@@ -675,4 +681,54 @@ fn tracked_set_is_refused_until_b1() {
         EditError::TrackedContentControlSetUnsupported { sdt_id: s, .. } => assert_eq!(s, sdt_id),
         other => panic!("expected TrackedContentControlSetUnsupported, got {other:?}"),
     }
+}
+
+/// DOMAIN RULE (§17.5.2.27): a value set in place of placeholder text takes
+/// the run properties the control keeps for entered text, never the
+/// placeholder's formatting.
+#[test]
+fn set_value_on_a_placeholder_takes_the_controls_entered_text_formatting() {
+    let base = Document::parse(&make_docx_with_sdt(
+        r#"<w:sdt><w:sdtPr><w:rPr><w:b/></w:rPr><w:alias w:val="Tenant"/><w:showingPlcHdr/><w:text/></w:sdtPr><w:sdtContent><w:r><w:rPr><w:rStyle w:val="PlaceholderText"/></w:rPr><w:t>Click here to enter text.</w:t></w:r></w:sdtContent></w:sdt>"#,
+    ))
+    .expect("parse");
+    let (block_id, sdt_id, _) = first_sdt(&base.snapshot().canonical).expect("sdt imported");
+    let edited = base
+        .apply(&txn(vec![EditStep::SetContentControlValue {
+            block_id,
+            sdt_id,
+            value: SdtValue::Text("Acme Ltd".to_string()),
+            tracked: false,
+            rationale: None,
+        }]))
+        .expect("set value");
+    let (_, _, raw) = first_sdt(&edited.snapshot().canonical).expect("sdt present");
+    let content = &raw[raw.find("<w:sdtContent").expect("content")..];
+    assert!(!content.contains("PlaceholderText"), "{raw}");
+    assert!(content.contains("<w:b"), "{raw}");
+    assert!(!raw.contains("showingPlcHdr"), "{raw}");
+}
+
+/// A control showing its value keeps that value's formatting when the value
+/// changes: a checkbox's glyph stays in its symbol font.
+#[test]
+fn set_value_keeps_the_formatting_of_the_value_it_replaces() {
+    let base = Document::parse(&make_docx_with_sdt(
+        r#"<w:sdt><w:sdtPr><w14:checkbox><w14:checked w14:val="0"/><w14:checkedState w14:val="2612" w14:font="MS Gothic"/><w14:uncheckedState w14:val="2610" w14:font="MS Gothic"/></w14:checkbox></w:sdtPr><w:sdtContent><w:r><w:rPr><w:rFonts w:ascii="MS Gothic" w:eastAsia="MS Gothic" w:hAnsi="MS Gothic"/></w:rPr><w:t>☐</w:t></w:r></w:sdtContent></w:sdt>"#,
+    ))
+    .expect("parse");
+    let (block_id, sdt_id, _) = first_sdt(&base.snapshot().canonical).expect("sdt imported");
+    let edited = base
+        .apply(&txn(vec![EditStep::SetContentControlValue {
+            block_id,
+            sdt_id,
+            value: SdtValue::Checked(true),
+            tracked: false,
+            rationale: None,
+        }]))
+        .expect("set checked");
+    let (_, _, raw) = first_sdt(&edited.snapshot().canonical).expect("sdt present");
+    let content = &raw[raw.find("<w:sdtContent").expect("content")..];
+    assert!(content.contains("☒"), "{raw}");
+    assert!(content.contains("MS Gothic"), "{raw}");
 }

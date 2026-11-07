@@ -30,10 +30,10 @@
 //!   (do NOT silently flatten existing redlines — the agent's path is
 //!   "resolve first (M0 accept/reject), then set")
 
+use super::super::story_addr::{StoryRef, find_block_index_in_story, story_blocks_mut};
 use super::super::{EditError, find_block_index};
 use super::images::locate_drawing_mut;
 use crate::domain::{CanonDoc, NodeId};
-use crate::import::sha256_hex;
 use crate::word_xml::{parse_raw_fragment, serialize_raw_fragment, w_el};
 use xmltree::{Element, XMLNode};
 
@@ -41,17 +41,24 @@ use xmltree::{Element, XMLNode};
 /// children with one `w:p` per entry in `paragraphs`.
 pub(crate) fn apply_set_text(
     doc: &mut CanonDoc,
+    story: &StoryRef,
     block_id: &NodeId,
     drawing_id: &NodeId,
     paragraphs: &[String],
     semantic_hash: Option<&str>,
     step_index: usize,
 ) -> Result<(), EditError> {
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-    let node = locate_drawing_mut(&mut doc.blocks[idx].block, drawing_id, step_index)?;
+    let idx = match story {
+        StoryRef::Body => {
+            find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+                block_id: block_id.clone(),
+                step_index,
+            })?
+        }
+        _ => find_block_index_in_story(doc, story, block_id, step_index)?,
+    };
+    let blocks = story_blocks_mut(doc, story, step_index)?;
+    let node = locate_drawing_mut(&mut blocks[idx].block, drawing_id, step_index)?;
 
     if let Some(expected) = semantic_hash {
         let actual = node.content_hash.as_deref().unwrap_or("");
@@ -143,7 +150,7 @@ pub(crate) fn apply_set_text(
     replace_all_txbxcontent(&mut element, &new_children);
 
     let new_raw = serialize_raw_fragment(&element);
-    node.content_hash = Some(sha256_hex(&new_raw));
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
     Ok(())
 }

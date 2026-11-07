@@ -24,9 +24,14 @@ use zip::write::FileOptions;
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
 fn docx_from_body(body: &str) -> Vec<u8> {
+    docx_from_root_and_body("", body)
+}
+
+/// A package whose `w:document` element also carries `root_attrs`.
+fn docx_from_root_and_body(root_attrs: &str, body: &str) -> Vec<u8> {
     let doc = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="{W_NS}"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+<w:document xmlns:w="{W_NS}"{root_attrs}><w:body>{body}<w:sectPr/></w:body></w:document>"#
     );
     let ct = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -459,4 +464,148 @@ fn spec_pprchange_previous_state_preserves_numbering_suppression() {
         in_memory,
         "and the spelling survives save/reopen"
     );
+}
+
+/// Whitespace at the edge of a `w:t` is content only under
+/// `xml:space="preserve"`, and XML whitespace is space, tab, line feed and
+/// carriage return alike. Preserved boundary whitespace of every kind must
+/// therefore survive save and reopen, in a plain run and a hyperlink run, also
+/// when an edit inside the paragraph makes the engine write it from the model.
+/// (A text ending in a preserved line feed lost it: the writer only marked text
+/// that began or ended with a space.)
+#[test]
+fn spec_preserved_boundary_whitespace_survives_save() {
+    for edge in ["\n", "\r", " \n", "\n "] {
+        let body = format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Lead-word{edge}</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">{edge}Trail-word</w:t></w:r></w:p><w:p><w:hyperlink w:anchor="Target"><w:r><w:t xml:space="preserve">Link-word{edge}</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="1" w:name="Target"/><w:r><w:t>Target</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#
+        );
+        let doc = Document::parse(&docx_from_body(&body)).expect("parse fixture");
+        let ids: Vec<String> = doc
+            .snapshot()
+            .canonical
+            .blocks
+            .iter()
+            .take(2)
+            .map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => paragraph.id.to_string(),
+                _ => panic!("the fixture's first blocks are paragraphs"),
+            })
+            .collect();
+        // Bold the word away from the edge: the run splits, so the paragraph is
+        // written from the model, and the untouched piece keeps the edge.
+        let ops: Vec<String> = [(&ids[0], "Lead"), (&ids[1], "word")]
+            .iter()
+            .map(|(id, word)| {
+                format!(r#"{{"op":"set_format","target":"{id}","expect":"{word}","marks":[{{"type":"bold"}}]}}"#)
+            })
+            .collect();
+        let edit = format!(
+            r#"{{"ops":[{}],"revision":{{"author":"Reviewer"}}}}"#,
+            ops.join(",")
+        );
+        let edited = doc
+            .apply(
+                &stemma::edit_v4::parse_transaction(&edit)
+                    .expect("parse edit")
+                    .into_edit_transaction()
+                    .expect("adapt edit"),
+            )
+            .expect("edit");
+        for (label, document) in [("parsed", &doc), ("edited", &edited)] {
+            let differences = stemma::roundtrip_compare::compare_canon_docs(
+                &document.snapshot().canonical,
+                &reopened(document).snapshot().canonical,
+            );
+            assert!(
+                differences.is_empty(),
+                "{label}, edge {edge:?}: {:?}",
+                differences
+                    .iter()
+                    .take(3)
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// The reading side of the same rule: without `xml:space="preserve"`, edge
+/// whitespace in a `w:t` is not content, so Word shows `<w:t> Lead\n</w:t>` as
+/// "Lead". With it, every character is content.
+#[test]
+fn spec_unpreserved_boundary_whitespace_is_not_content() {
+    let body = "<w:p><w:r><w:t> Lead\n</w:t></w:r></w:p><w:p><w:r><w:t xml:space=\"preserve\"> Kept\n</w:t></w:r></w:p>";
+    let doc = Document::parse(&docx_from_body(body)).expect("parse fixture");
+    let texts: Vec<String> = doc
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .map(|tracked| match &tracked.block {
+            BlockNode::Paragraph(paragraph) => paragraph
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.inlines)
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("the fixture holds paragraphs"),
+        })
+        .collect();
+    assert_eq!(texts, ["Lead", " Kept\n"]);
+}
+
+/// `xml:space` is inherited (XML 1.0 §2.10): a part that declares
+/// `xml:space="preserve"` on its root preserves the whitespace of every text
+/// run inside it, so a run holding only a space is content, as Word shows it.
+/// A descendant that sets `xml:space="default"` turns it off again below it.
+/// The reading holds across save and reopen.
+#[test]
+fn spec_inherited_preserve_makes_edge_whitespace_content() {
+    let body = r#"<w:p><w:r><w:t>A</w:t></w:r><w:r><w:t> </w:t></w:r><w:r><w:t>B</w:t></w:r></w:p><w:p xml:space="default"><w:r><w:t>C</w:t></w:r><w:r><w:t> </w:t></w:r><w:r><w:t>D</w:t></w:r></w:p>"#;
+    let doc = Document::parse(&docx_from_root_and_body(r#" xml:space="preserve""#, body))
+        .expect("parse fixture");
+    let texts = |document: &Document| -> Vec<String> {
+        document
+            .snapshot()
+            .canonical
+            .blocks
+            .iter()
+            .map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(paragraph) => paragraph
+                    .segments
+                    .iter()
+                    .flat_map(|segment| &segment.inlines)
+                    .filter_map(|inline| match inline {
+                        InlineNode::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => panic!("the fixture holds paragraphs"),
+            })
+            .collect()
+    };
+    assert_eq!(texts(&doc), ["A B", "CD"]);
+    assert_eq!(texts(&reopened(&doc)), ["A B", "CD"]);
+}
+
+/// Word opens a paragraph whose `w:ind/@w:firstLine` is negative and reads it
+/// as a hanging indent of that size: it saves `firstLine="-360"` as
+/// `hanging="360"` (Word-verified). The engine reads it the same way and
+/// reopens its own save to the same indent.
+#[test]
+fn spec_negative_first_line_reads_as_hanging() {
+    let body = r#"<w:p><w:pPr><w:ind w:left="720" w:firstLine="-360"/></w:pPr><w:r><w:t>Negative first line.</w:t></w:r></w:p>"#;
+    let doc = Document::parse(&docx_from_body(body)).expect("Word opens it, so must the engine");
+    let first_line = |document: &Document| match &document.snapshot().canonical.blocks[0].block {
+        BlockNode::Paragraph(paragraph) => paragraph
+            .authored_indent
+            .as_ref()
+            .and_then(|indent| indent.effective_first_line_twips),
+        _ => panic!("the fixture holds a paragraph"),
+    };
+    assert_eq!(first_line(&doc), Some(-360));
+    assert_eq!(first_line(&reopened(&doc)), Some(-360));
 }

@@ -22,8 +22,9 @@
 //!
 //! v1 scope (fail loud beyond it, per CLAUDE.md "start narrow"):
 //! - top-level paragraphs only;
-//! - the `expect` span must lie within a single contiguous run of text (it may
-//!   not cross an opaque inline or hard break);
+//! - the `expect` span must lie within one segment's text runs; it may cross
+//!   zero-width markers (bookmark, comment-range, permission and proofing
+//!   boundaries), not an inline object or hard break;
 //! - the covered runs must not already carry a tracked formatting change;
 //! - color is a literal 6-hex RGB or `"auto"` (no theme color refs);
 //! - font_family sets only the ascii/hAnsi slot (no east-asia / cs / theme);
@@ -96,10 +97,21 @@ pub(crate) fn apply(
         block_id: block_id.clone(),
         step_index,
     })?;
-    if path.is_top_level() {
-        validate_top_level_block_status(&doc.blocks[path.top_block], step_index)?;
+    // Content the author is still proposing (their own pending insertion) is
+    // formatted directly: the format is part of the proposal.
+    let own_insertion = mode == MaterializationMode::TrackedChange
+        && super::super::inside_own_pending_insertion(doc, &path, revision.author.as_deref());
+    let mode = if own_insertion {
+        MaterializationMode::Direct
     } else {
-        check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
+        mode
+    };
+    if !own_insertion {
+        if path.is_top_level() {
+            validate_top_level_block_status(&doc.blocks[path.top_block], step_index)?;
+        } else {
+            check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
+        }
     }
 
     // Block kind + staleness guard (immutable borrow, released before the apply).
@@ -258,25 +270,14 @@ fn apply_to_paragraph(
         );
     }
 
-    let visible: String = para
-        .segments
-        .iter()
-        .flat_map(|s| s.inlines.iter())
-        .filter_map(|i| match i {
-            InlineNode::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    Err(EditError::ExpectMismatch {
-        block_id: block_id.clone(),
-        expected: expect.to_string(),
-        actual_text: visible,
-        step_index,
-    })
+    Err(super::super::unlocatable_expect(
+        para, block_id, expect, false, step_index,
+    ))
 }
 
-/// Find `expect` within a single contiguous run of TextNodes. Returns the
-/// inline-index range and the char offsets of the match inside that run.
+/// Find `expect` within a contiguous run of TextNodes, which zero-width markers
+/// do not break. Returns the inline-index range and the char offsets of the
+/// match over that run's text.
 fn find_spans(inlines: &[InlineNode], expect: &str) -> Vec<SpanPlan> {
     if expect.is_empty() {
         return Vec::new();
@@ -288,7 +289,7 @@ fn find_spans(inlines: &[InlineNode], expect: &str) -> Vec<SpanPlan> {
             i += 1;
             continue;
         }
-        // Contiguous TextNode run [i, j).
+        // Contiguous TextNode run [i, j), markers included.
         let mut j = i;
         let mut concat = String::new();
         while j < inlines.len() {
@@ -297,6 +298,7 @@ fn find_spans(inlines: &[InlineNode], expect: &str) -> Vec<SpanPlan> {
                     concat.push_str(&t.text);
                     j += 1;
                 }
+                marker if super::super::is_zero_width_marker(marker) => j += 1,
                 _ => break,
             }
         }
@@ -321,7 +323,7 @@ fn formatting_changes_in_span<'a>(
     let mut offset = 0usize;
     for inline in &inlines[plan.first..=plan.last] {
         let InlineNode::Text(node) = inline else {
-            unreachable!("span contains text nodes only");
+            continue; // a zero-width marker inside the span
         };
         let end = offset + node.text.chars().count();
         let intersects = plan.start < end && plan.end > offset;
@@ -387,7 +389,9 @@ fn apply_span(
     let mut offset = 0usize;
     for inline in inlines.drain(plan.first..=plan.last) {
         let InlineNode::Text(node) = inline else {
-            unreachable!("run is all TextNodes");
+            // A zero-width marker inside the span stays where it is.
+            rebuilt.push(inline);
+            continue;
         };
         let node_len = node.text.chars().count();
         let node_start = offset;

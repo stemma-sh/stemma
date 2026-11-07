@@ -21,8 +21,7 @@
 //!
 //! v1 scope (fail loud beyond it, per CLAUDE.md "start narrow", "no silent
 //! fallbacks"):
-//! - top-level paragraphs only (a nested table-cell paragraph surfaces as
-//!   `BlockNotFound`);
+//! - `InsertBookmark` targets body paragraphs, top-level or in a table cell;
 //! - `InsertBookmark`: the `expect` span must lie within a single contiguous
 //!   `Normal` run of text (mirrors `fields_crossrefs::find_anchor`); the start
 //!   and end land in the same paragraph (a multi-paragraph bookmark is out of
@@ -40,7 +39,7 @@
 //! Failure modes are explicit `EditError` variants carrying the bookmark name
 //! and `step_index` — never a best-effort default.
 
-use super::super::{EditError, find_block_index, validate_block_is_editable};
+use super::super::{EditError, block_at, block_at_mut, find_editable_block_path};
 use crate::domain::{
     BlockNode, CanonDoc, DecorationNode, DecorationType, DocPart, InlineNode, NodeId,
     ParagraphNode, ProofRef, TrackedSegment, TrackingStatus,
@@ -52,7 +51,8 @@ use crate::semantic_hash::check_block_guard;
 /// and keeps them disjoint from base ("base") / target ("target") bookmark ids.
 const AUTHORED_ORIGIN: &str = "authored";
 
-/// Resolve the target paragraph (top-level, editable, hash-checked) and run `f`.
+/// Resolve the target paragraph (top-level or in a table cell, editable,
+/// hash-checked) and run `f`.
 fn with_target_paragraph<R>(
     doc: &mut CanonDoc,
     block_id: &NodeId,
@@ -60,14 +60,9 @@ fn with_target_paragraph<R>(
     step_index: usize,
     f: impl FnOnce(&mut ParagraphNode) -> Result<R, EditError>,
 ) -> Result<R, EditError> {
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
-
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -86,7 +81,7 @@ fn with_target_paragraph<R>(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -96,7 +91,7 @@ fn with_target_paragraph<R>(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
     f(para)
@@ -243,6 +238,7 @@ fn xml_escape_attr(s: &str) -> String {
 fn make_bookmark_decoration(para_id: &NodeId, suffix: &str, raw_xml: Vec<u8>) -> InlineNode {
     let id = NodeId::from(format!("{}_{suffix}", para_id.0));
     InlineNode::from(DecorationNode {
+        source_run_attrs: Vec::new(),
         id: id.clone(),
         kind: DecorationType::Bookmark,
         opaque_ref: format!("bookmarkref_{}", id.0),
@@ -318,13 +314,7 @@ fn insert_in_paragraph(
     }
 
     let plan = find_span(&para.segments, expect).ok_or_else(|| {
-        let visible = paragraph_visible_text(para);
-        EditError::ExpectMismatch {
-            block_id: block_id.clone(),
-            expected: expect.to_string(),
-            actual_text: visible,
-            step_index,
-        }
+        super::super::unlocatable_expect(para, block_id, expect, false, step_index)
     })?;
 
     let placeholder = next_authored_placeholder_id(para);
@@ -346,20 +336,9 @@ fn insert_in_paragraph(
     Ok(())
 }
 
-/// Concatenated visible text of a paragraph (for `ExpectMismatch` context).
-fn paragraph_visible_text(para: &ParagraphNode) -> String {
-    para.segments
-        .iter()
-        .flat_map(|s| s.inlines.iter())
-        .filter_map(|i| match i {
-            InlineNode::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Locate `expect` inside a single contiguous run of `Text` nodes within one
-/// Normal segment. Returns the start/end inline+char boundaries of the match.
+/// Locate `expect` inside a contiguous run of `Text` nodes (zero-width markers
+/// do not break it) within one Normal segment. Returns the start/end
+/// inline+char boundaries of the match.
 fn find_span(segments: &[TrackedSegment], expect: &str) -> Option<SpanPlan> {
     if expect.is_empty() {
         return None;
@@ -384,6 +363,7 @@ fn find_span(segments: &[TrackedSegment], expect: &str) -> Option<SpanPlan> {
                         concat.push_str(&t.text);
                         j += 1;
                     }
+                    marker if super::super::is_zero_width_marker(marker) => j += 1,
                     _ => break,
                 }
             }
@@ -415,7 +395,7 @@ fn map_run_offset(
     let mut consumed = 0usize;
     for (k, inline) in inlines.iter().enumerate().take(j).skip(i) {
         let InlineNode::Text(t) = inline else {
-            unreachable!("run is all TextNodes");
+            continue; // a zero-width marker inside the run
         };
         let len = t.text.chars().count();
         if target_chars <= consumed + len {
@@ -647,6 +627,11 @@ fn remove_in_paragraph(
 
     // Drop both the named start and the bookmarkEnd sharing its id. All other
     // inlines (including unrelated decorations) are left byte-identical.
+    let removed: Vec<_> = para.segments.iter().flat_map(|segment| &segment.inlines)
+        .filter(|inline| matches!(inline, InlineNode::Decoration(deco)
+            if bookmark_start_name(deco).as_deref() == Some(name) || is_bookmark_end_with_id(deco, &w_id)))
+        .filter_map(crate::domain::LiteralPrefixMarker::from_inline).collect();
+    crate::literal_prefix::remove_marker_references(para, &removed);
     for seg in &mut para.segments {
         seg.inlines.retain(|inline| {
             let InlineNode::Decoration(deco) = inline else {
@@ -757,6 +742,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }
@@ -773,7 +759,7 @@ mod tests {
     }
 
     fn visible(para: &ParagraphNode) -> String {
-        paragraph_visible_text(para)
+        crate::edit::paragraph_visible_text(para)
     }
 
     /// Splice a fresh authored bookmark named `name` around `expect` in `para`,

@@ -151,8 +151,7 @@ fn extract_paragraph_text(p: &stemma::ParagraphNode) -> String {
             InlineNode::OpaqueInline(_) => out.push('\u{FFFC}'),
             InlineNode::Decoration(_)
             | InlineNode::CommentRangeStart { .. }
-            | InlineNode::CommentRangeEnd { .. }
-            | InlineNode::CommentReference { .. } => {}
+            | InlineNode::CommentRangeEnd { .. } => {}
         }
     }
     out

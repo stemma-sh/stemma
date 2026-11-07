@@ -92,6 +92,7 @@ fn inner_region(xml: &str, open: &str, close: &str) -> String {
 fn set_text_txn(block_id: NodeId, drawing_id: NodeId, paragraphs: Vec<String>) -> EditTransaction {
     EditTransaction {
         steps: vec![EditStep::SetTextboxText {
+            story: stemma::edit::StoryRef::Body,
             block_id,
             drawing_id,
             paragraphs,

@@ -92,7 +92,7 @@ fn docx_with_spacing_ppr_change() -> Vec<u8> {
     make_docx(body, &[("word/styles.xml", styles)])
 }
 
-fn body_spacing(doc: &Document) -> (Option<u32>, Option<u32>) {
+fn body_spacing(doc: &Document) -> (Option<u32>, Option<i32>) {
     let canon = doc.snapshot().canonical.clone();
     let stemma::BlockNode::Paragraph(p) = &canon.blocks[0].block else {
         panic!("first block is a paragraph");
@@ -174,6 +174,9 @@ fn an_unchanged_paragraph_mark_snapshot_survives_save_and_reopen() {
                     spacing: None,
                     borders: None,
                     shading: None,
+                    keep_next: None,
+                    keep_lines: None,
+                    page_break_before: None,
                 },
                 rationale: None,
             }],
@@ -262,6 +265,8 @@ fn an_inserted_paragraphs_id_is_unique_against_cell_paragraphs() {
                 rationale: None,
                 blocks: vec![stemma::edit::BlockSpec::Paragraph(
                     stemma::edit::ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some("default".to_string()),
                         content: stemma::edit::ParagraphContent {
                             fragments: vec![stemma::edit::ContentFragment::Text(
@@ -353,6 +358,8 @@ fn a_role_less_insert_inherits_the_following_paragraphs_formatting() {
         rationale: None,
         blocks: vec![stemma::edit::BlockSpec::Paragraph(
             stemma::edit::ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: None,
                 content: stemma::edit::ParagraphContent {
                     fragments: vec![stemma::edit::ContentFragment::Text(
@@ -468,6 +475,8 @@ fn a_role_less_insert_before_inherits_the_literal_prefix_runs_formatting() {
         rationale: None,
         blocks: vec![stemma::edit::BlockSpec::Paragraph(
             stemma::edit::ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: None,
                 content: stemma::edit::ParagraphContent {
                     fragments: vec![stemma::edit::ContentFragment::Text(
@@ -522,6 +531,93 @@ fn a_role_less_insert_before_inherits_the_literal_prefix_runs_formatting() {
     }
 }
 
+/// The text label a role-less insert does not take includes the spaces before
+/// it: a paragraph " 2.\tBody" keeps its label and those spaces, and the
+/// paragraph inserted before it has neither, in memory as after a reopen.
+#[test]
+fn a_role_less_insert_before_a_spaced_label_takes_none_of_the_label() {
+    let body = concat!(
+        r#"<w:p><w:r><w:t xml:space="preserve"> 2.</w:t></w:r><w:r><w:tab/><w:t>Second aim.</w:t></w:r></w:p>"#,
+        r#"<w:sectPr/>"#,
+    );
+    let doc = Document::parse(&make_docx(body, &[])).expect("parse");
+    let anchor_id = {
+        let canon = doc.snapshot().canonical.clone();
+        let stemma::BlockNode::Paragraph(paragraph) = &canon.blocks[0].block else {
+            panic!("anchor");
+        };
+        assert_eq!(paragraph.literal_prefix.as_deref(), Some("2."));
+        assert_eq!(paragraph.literal_prefix_leading_ws, " ");
+        paragraph.id.clone()
+    };
+    let step = stemma::edit::EditStep::InsertParagraphs {
+        anchor_block_id: anchor_id,
+        position: stemma::edit::InsertPosition::Before,
+        rationale: None,
+        blocks: vec![stemma::edit::BlockSpec::Paragraph(
+            stemma::edit::ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
+                role: None,
+                content: stemma::edit::ParagraphContent {
+                    fragments: vec![stemma::edit::ContentFragment::Text(
+                        "Inserted aim.".to_string(),
+                    )],
+                },
+                restart_numbering: false,
+                list: None,
+            },
+        )],
+    };
+    for mode in [
+        stemma::edit::MaterializationMode::TrackedChange,
+        stemma::edit::MaterializationMode::Direct,
+    ] {
+        let edited = doc
+            .apply(&stemma::edit::EditTransaction {
+                steps: vec![step.clone()],
+                summary: None,
+                materialization_mode: mode,
+                revision: stemma::domain::RevisionInfo {
+                    revision_id: 10,
+                    identity: 0,
+                    author: Some("Reviewer".into()),
+                    date: Some("2026-08-03T00:00:00Z".into()),
+                    apply_op_id: None,
+                },
+            })
+            .expect("role-less insert applies");
+        let canonical = &edited.snapshot().canonical;
+        let stemma::BlockNode::Paragraph(inserted) = &canonical.blocks[0].block else {
+            panic!("{mode:?}: inserted paragraph");
+        };
+        assert_eq!(
+            (
+                inserted.literal_prefix.as_deref(),
+                inserted.literal_prefix_leading_ws.as_str(),
+                inserted.literal_prefix_trailing_ws.as_str(),
+            ),
+            (None, "", ""),
+            "{mode:?}"
+        );
+        let reopened = Document::parse(
+            &edited
+                .serialize(&ExportOptions::default())
+                .expect("serialize"),
+        )
+        .expect("reopen");
+        let differences = stemma::roundtrip_compare::compare_canon_docs(
+            canonical,
+            &reopened.snapshot().canonical,
+        );
+        assert!(
+            differences.is_empty(),
+            "{mode:?}: {:?}",
+            &differences[..differences.len().min(3)]
+        );
+    }
+}
+
 /// A leading break is a real physical run with its own typing format. Word's
 /// insertion point precedes that run; skipping to the following text can pick
 /// a different format (plain break followed by bold text in this witness).
@@ -548,6 +644,8 @@ fn a_role_less_insert_inherits_a_leading_hard_breaks_run_formatting() {
         rationale: None,
         blocks: vec![stemma::edit::BlockSpec::Paragraph(
             stemma::edit::ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: None,
                 content: stemma::edit::ParagraphContent {
                     fragments: vec![stemma::edit::ContentFragment::Text(
@@ -762,7 +860,7 @@ fn a_pagination_cache_marker_does_not_make_documents_differ() {
         r#"</w:styles>"#,
     );
     let with_marker = concat!(
-        r#"<w:p><w:r><w:t>Page top </w:t><w:lastRenderedPageBreak/><w:t>text.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Page top </w:t><w:lastRenderedPageBreak/><w:t>text.</w:t></w:r></w:p>"#,
         r#"<w:sectPr/>"#,
     );
     let without_marker = concat!(

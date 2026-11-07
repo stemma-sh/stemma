@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 pub use crate::audit::AuditReport;
-use crate::audit::audit_documents;
 use crate::domain::CanonDoc;
 pub use crate::domain::{DocProtectEdit, DocumentProtection};
 pub use crate::edit::EditTransaction;
@@ -96,6 +95,10 @@ pub struct Document {
     /// every verb carries it forward unchanged (re-parsing is the only
     /// baseline reset).
     baseline: Arc<CanonDoc>,
+    /// The revisions inside the baseline's sealed body blocks, whose bytes
+    /// live in the scaffold this struct does not retain; the review census
+    /// needs them on its `before` side.
+    baseline_sealed_revisions: Arc<Vec<RevisionRecord>>,
 }
 
 /// The render format for a windowed read ([`Document::window`]). A closed set
@@ -125,10 +128,12 @@ impl Document {
     pub fn parse(bytes: &[u8]) -> Result<Document, RuntimeError> {
         let (snapshot, diagnostics) = snapshot_and_diagnostics_from_docx_bytes(bytes)?;
         let baseline = Arc::clone(&snapshot.canonical);
+        let baseline_sealed_revisions = Arc::new(snapshot.sealed_revisions());
         Ok(Document {
             snapshot,
             diagnostics: Arc::new(diagnostics),
             baseline,
+            baseline_sealed_revisions,
         })
     }
 
@@ -139,6 +144,7 @@ impl Document {
             snapshot,
             diagnostics: Arc::clone(&self.diagnostics),
             baseline: Arc::clone(&self.baseline),
+            baseline_sealed_revisions: Arc::clone(&self.baseline_sealed_revisions),
         }
     }
 
@@ -323,16 +329,24 @@ impl Document {
     /// Discover editable text INSIDE opaque regions (RFC-0002): textbox
     /// paragraphs and inline content-control text regions, addressable by
     /// `opaque_text_edit`/`sdt_text_fill`. Body-level (block) content controls
-    /// keep their bytes in the scaffold, not the IR — discover those with
-    /// [`Document::block_content_control_targets`].
+    /// are discovered with [`Document::block_content_control_targets`].
     pub fn opaque_text_targets(&self) -> Vec<crate::opaque_targets::OpaqueTextTarget> {
         crate::opaque_targets::opaque_text_targets(&self.snapshot.canonical)
     }
 
     /// Discover fillable body-level (block) content controls, each with the
-    /// `body_index` that `sdt_text_fill` addresses (RFC-0002 §Phase-2).
+    /// address `sdt_text_fill` takes: an open control's first block id, or a
+    /// sealed control's body index (RFC-0002 §Phase-2).
     pub fn block_content_control_targets(&self) -> Vec<crate::opaque_targets::BlockSdtTextTarget> {
         self.snapshot.block_content_control_targets()
+    }
+
+    /// Inspect legacy fields inside opaque body controls without mistaking the
+    /// enclosing control's first paragraph for the requested field value.
+    pub fn block_form_field_targets(
+        &self,
+    ) -> Result<Vec<crate::opaque_targets::BlockFormFieldTarget>, RuntimeError> {
+        self.snapshot.block_form_field_targets()
     }
 
     /// The extended-markdown comprehension projection: honest, id-bearing
@@ -430,7 +444,7 @@ impl Document {
     /// revision-free, and author-scoped resolution misses that author's
     /// formatting changes).
     pub fn revisions(&self) -> Vec<RevisionRecord> {
-        crate::tracked_model::enumerate_revisions(&self.snapshot.canonical)
+        self.snapshot.revisions()
     }
 
     /// Escape hatch: borrow the internal [`EditSnapshot`].
@@ -486,12 +500,17 @@ impl Document {
         // re-resolves style-inherited run marks (see `audit_documents`).
         let before_styles = self.snapshot.scaffold_style_table()?;
         let after_styles = style_table_from_docx(&bytes)?;
-        audit_documents(
+        crate::audit::audit_documents_with_identity(
             &self.baseline,
             &self.snapshot.canonical,
             before_styles.as_ref(),
             after_styles.as_ref(),
             validate(&bytes),
+            crate::audit_delta::BlockIdentity::SharedSession,
+            crate::audit::SealedRevisions {
+                before: self.baseline_sealed_revisions.as_ref().clone(),
+                after: self.snapshot.sealed_revisions(),
+            },
         )
     }
 }
@@ -509,12 +528,17 @@ pub fn audit(before_bytes: &[u8], after_bytes: &[u8]) -> Result<AuditReport, Run
     // change (see `audit_documents`).
     let before_styles = style_table_from_docx(before_bytes)?;
     let after_styles = style_table_from_docx(after_bytes)?;
-    audit_documents(
+    crate::audit::audit_documents_with_identity(
         &before.canonical,
         &after.canonical,
         before_styles.as_ref(),
         after_styles.as_ref(),
         validate(after_bytes),
+        crate::audit_delta::BlockIdentity::IndependentParses,
+        crate::audit::SealedRevisions {
+            before: before.sealed_revisions(),
+            after: after.sealed_revisions(),
+        },
     )
 }
 
@@ -676,6 +700,59 @@ mod tests {
         assert!(validate(&bytes).ok, "serialized output must be valid DOCX");
         // And re-parseable into a Document.
         Document::parse(&bytes).expect("re-parse serialized output");
+    }
+
+    #[test]
+    fn whole_paragraph_move_keeps_revision_carrier_walk_on_reopen() {
+        // Persistence contract: saving our own tracked move must not invent
+        // additional revision carriers and invalidate its identity hint.
+        let doc = Document::parse(&make_test_docx(&["Alpha", "Beta", "Gamma"]))
+            .expect("parse synthetic document");
+        let view = doc.read();
+        let transaction = serde_json::json!({
+            "ops": [{
+                "op": "move",
+                "target": {"from": view.blocks[0].id, "to": view.blocks[0].id},
+                "destination": {"anchor": view.blocks[2].id, "position": "after"}
+            }],
+            "revision": {"author": "Move reviewer"}
+        });
+        let transaction = crate::edit_v4::parse_transaction(&transaction.to_string())
+            .expect("parse move")
+            .into_edit_transaction()
+            .expect("translate move");
+        let edited = doc.apply(&transaction).expect("apply move");
+        let expected_walk =
+            crate::import::revision_walk_digest(&mut (*edited.snapshot.canonical).clone());
+        let bytes = edited
+            .serialize(&ExportOptions::default())
+            .expect("save move");
+        let reopened = Document::parse(&bytes).expect("reopen move");
+        let actual_walk =
+            crate::import::revision_walk_digest(&mut (*reopened.snapshot.canonical).clone());
+        assert_eq!(
+            actual_walk, expected_walk,
+            "own save must preserve revision-carrier walk"
+        );
+        let identities = |document: &Document| {
+            let mut canonical = (*document.snapshot.canonical).clone();
+            let mut identities = Vec::new();
+            crate::import::for_each_rev_carrier_mut(&mut canonical, &mut |carrier| {
+                identities.push(*carrier.identity);
+            });
+            identities
+        };
+        assert_eq!(identities(&reopened), identities(&edited));
+        for candidate in [&edited, &reopened] {
+            assert_eq!(
+                all_text(&candidate.project(Resolution::AcceptAll).unwrap()),
+                "BetaGammaAlpha"
+            );
+            assert_eq!(
+                all_text(&candidate.project(Resolution::RejectAll).unwrap()),
+                "AlphaBetaGamma"
+            );
+        }
     }
 
     #[test]

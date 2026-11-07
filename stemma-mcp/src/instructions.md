@@ -10,6 +10,10 @@ hatches over the same kernels.
 1. **`open_docx(path)`** returns `doc_id`, exact input identity, and the first 16
    rows of a paged compact block index. Prefer find over walking every page.
    Paths stay under the configured workspace root.
+   For ordinary single-document editing, omit `task` and `task_id`; they are
+   optional bounded multi-document delivery contracts, not required setup.
+   Give the new output path to `save_docx`, not `open_docx`. Never bypass an
+   existing task binding or broaden its declared effects.
 2. **`inspect_docx(doc_id, ...)`** returns the first compact index page by default.
    Prefer `query:"find"` plus `pattern`, then inspect one exact block. When
    several known phrases must be located, pass `patterns:[...]` once (maximum
@@ -50,19 +54,25 @@ hatches over the same kernels.
    occurrence. `match_mode` is exactly `exact` or
    `normalize_ws`. Omitted scope includes top-level and table-cell paragraphs;
    pass a matching cell paragraph `block_id` as `scope:{block_id}` only when
-   disambiguation is needed. Do not flatten the cell.
+   disambiguation is needed. Do not flatten the cell. An item whose `old` also
+   stands in a hyperlink's display text or a content control's value refuses
+   (`ReplaceTextInsideInlineObjects`), its `unreached_matches` naming each
+   object and the op that edits it; edit those first, then re-run the item.
 
 When replacing a paragraph that contains an opaque span, preserve that anchor
 inside `content.content` as
 `{"type":"opaque_ref","attrs":{"id":"<opaque id from block segments>"}}`.
 Do not flatten, omit, or invent the anchor.
-4. **`save_docx(doc_id, path)`** runs a fresh session audit and refuses a
-   non-deliverable result before creating the output path. A passing result is
-   serialized, checked by the blocking package gate, and committed to a NEW
-   unused path. Successful typed accept/reject calls are retained as session
-   evidence: their selected prior revisions and exact committed effects are
-   expected, while any changed prior revision or direct effect outside that
-   evidence still blocks. Existing destinations and input aliases are refused.
+4. **`save_docx(doc_id, path)`** runs a fresh session audit, serializes, checks
+   the bytes with the blocking package gate, and commits to a NEW unused path.
+   Only a package-gate error refuses the save. The audit is reported in the
+   receipt: `verdict.status` is `pass`, or `needs_review` when the audit found
+   a direct change or a changed prior revision it cannot explain. On
+   `needs_review` the file exists; call `verify_docx` and fix or report what
+   it found before delivering. Successful typed accept/reject calls are
+   retained as session evidence, so their effects are expected. In a declared
+   task a non-deliverable audit still refuses before path creation. Existing
+   destinations and input aliases are refused.
 
 Use **`verify_docx({doc_id})`** when you need to inspect the session audit
 without saving. It reports unexpected direct changes, untouched-scope
@@ -70,7 +80,7 @@ violations, pre-existing-revision dispositions, and validator findings. It also
 accepts a producer-neutral before/after path pair. Audit lists return 16 rows by
 default with totals and continuation metadata; retrieve remaining rows with
 `detail`, `offset`, and `limit` (maximum 64). A separate call is not required
-before `save_docx`, because save runs a fresh delivery gate itself. Session
+before `save_docx`, because save reruns the audit and reports it. Session
 reports partition raw `changed_prior_revisions` into
 `expected_changed_prior_revisions` and
 `unexpected_changed_prior_revisions`; producer-neutral audits have no command
@@ -137,7 +147,9 @@ For "accept/reject <author>'s changes" tasks, especially on long documents:
    context; reserve explicit ids for cherry-picks the axes cannot express.
    For a section named in the instruction: `query:"find"` the heading, take
    the section's block range via `query:"section"` on the heading id, and
-   pass those endpoints as `by_block_range`.
+   pass those endpoints as `by_block_range`. A range covers the tables inside
+   it, cells included, and any `block_id` an inventory row shows is a valid
+   endpoint.
 3. **Trust bounded receipts.** Bulk writes and resolutions return exact counts
    beside capped evidence lists carrying `omitted` and `set_sha256` commitments
    to the complete set. Submitted worklist items and transaction operations are
@@ -145,8 +157,7 @@ For "accept/reject <author>'s changes" tasks, especially on long documents:
    re-reading the inventory; use `verify_docx` only when detailed audit evidence
    needs inspection before delivery.
 4. **Persist before polishing.** Once the requested changes are complete, call
-   `save_docx` IMMEDIATELY. It runs the fresh verification gate and refuses
-   before path creation if the session is not deliverable. Completed-but-unsaved
+   `save_docx` IMMEDIATELY, then read its `verdict`. Completed-but-unsaved
    work is worthless if the session ends. Extra spot-checks and summary
    material come after the artifact exists, never before.
 
@@ -187,17 +198,20 @@ catalog entry; you rarely need the whole catalog:
 
 ```json
 {"op":"replace","target":"p_7","expect":"<current text>","content":{"type":"paragraph","content":[{"type":"text","text":"new text"}]}}
-{"op":"insert","target":{"anchor":"p_7","position":"after"},"content":[{"type":"paragraph","content":[{"type":"text","text":"new paragraph"}]}]}
+{"op":"insert","target":{"anchor":"p_7","position":"after"},"content":[{"type":"paragraph","attrs":{"format_from":"p_7"},"content":[{"type":"text","text":"new paragraph"}]}]}
 {"op":"delete","target":"p_7","expect":"<current text>"}
 ```
 
-Every tracked transaction carries
-`"revision":{"author":"<user-chosen label>"}`.
+For aligned text after a shorter inserted label, set paragraph
+`attrs.tab_stops`, for example `[{"position":1440,"alignment":"left"}]`.
+Positions are signed twips from the page text edge, within -31680..31680,
+and must be unique. This replaces direct tab stops only: omit it to inherit
+the template, use `[]` to remove direct stops, or an explicit `clear` entry
+at a position to suppress a style-inherited stop. This attribute is insert-only.
 
-When that label was present when the document was opened, pass
-`allow_existing_author: true` only when the user, approved worklist, or
-declared task explicitly intends to continue that reviewer group. Otherwise
-ask the user for a separate label; never invent one to bypass the refusal.
+Every tracked transaction carries
+`"revision":{"author":"<user-chosen label>"}` (see sharp edge 9 for a label
+that was already present when the document was opened).
 
 There is no `toc` or `field` op — a table of contents is an `insert` with a
 `{"type":"toc"}` content block (see below); images use `insert_image`/
@@ -227,14 +241,14 @@ To get `span` handles (`s_0`, `s_1`, …) and the `guard`, call **`read_block(do
 
 ## Sharp edges (each one cost a cold agent an error)
 
-1. **Marks are objects, not strings.** Bold+italic is `"marks":[{"type":"bold"},{"type":"italic"}]`, never `["bold","italic"]`. The string form fails with an opaque untagged-enum schema error.
+1. **Two shapes of `marks`.** On a text node it is an array: bold+italic is `"marks":[{"type":"bold"},{"type":"italic"}]` (the bare names `["bold","italic"]` also work; an unknown name is refused with the valid ones). On `set_format` it is a patch object: `"marks":{"bold":true,"italic":false}`, where an omitted mark is unchanged.
 2. **Span replaces take PLAIN TEXT only.** A span replace with styled `marks` is refused (`UnsupportedEdit`). For a mark/formatting change, do a **whole-paragraph replace** (omit `span`, or `span:"whole"`) — that path accepts marks.
 3. **A write invalidates handles and guards for that paragraph.** `read_block` handles are ordinal and the `guard` is a content hash; any edit to the same paragraph makes both stale. Re-read the block before the next edit to it. A stale guard fails loudly (`StaleEdit`/`AnchorNotFound`) — re-read and retry, never guess.
 4. **Whitespace and quotes: the exactness burden is on `content`, not `expect`.** Non-breaking spaces (U+00A0) read as plain spaces but are not, and curly quotes/apostrophes are not the straight ASCII ones — so copy them verbatim into your `content`, or you produce a change that only swaps a character class. `expect` is more forgiving: the engine punctuation-normalizes it (curly/straight, dash and ellipsis glyphs), so an ASCII `expect` still matches a curly-quoted paragraph. A no-effect edit no longer passes silently — it fails loudly (`NoOpEdit`), and a stale `expect` fails `StaleEdit`; if you see those, re-read the block and fix the text. For `replace_text`, `match_mode:"normalize_ws"` folds these classes (NBSP/typographic spaces, curly/straight quotes) for matching and reports what folded in `normalization_applied`.
 5. **`span` endpoints `before`/`after`/`between` address OPAQUE ANCHORS** (fields, images, bookmarks), not text runs. To target text, use a `s_n` handle. There is no substring fallback.
 6. **`replace_all` refuses paragraphs that already carry tracked changes** (it would fold unrelated history); its refusal message points you to **`replace_text`**, which splices a tracked change through them. So for tracked-paragraph find/replace, use `replace_text` — not a span replace. (`replace_text` matches body text only; it cannot target a structural numbering label, so put your `old` needle in the body text after the label — see edge 8.)
 7. **Tabs are literal `\t` in the text** (list markers like `\t(b)\t` are real characters in the run, not layout) — include them in `expect`/`content`.
-8. **A typed-in enumeration label is in `text` but is NOT editable text.** When a paragraph carries a hand-typed label (`"1.\t"`, `"(a)\t"`), `read_block` shows it at the FRONT of `text` and again in a separate `literal_prefix` field, but the label is structural: it is not one of the `spans`. When you target this paragraph, work with the BODY text (the part after the label): use it for `expect`, and write your replacement `content` as the new body. Do NOT re-type the leading `literal_prefix` into your `content` — the label stays attached on its own, so re-typing it is at best redundant and may be rejected. (This is also why a label you reject can correctly reappear in `text`: it is restored as structural text, not a tracked change.)
+8. **A typed-in enumeration label is in `text` but is NOT editable text.** When a paragraph carries a hand-typed label (`"1.\t"`, `"(a)\t"`), `read_block` shows it at the FRONT of `text` and again in a separate `literal_prefix` field, but the label is structural: it is not one of the `spans`. When you target this paragraph, work with the BODY text (the part after the label): use it for `expect`, and write your replacement `content` as the new body. Do NOT re-type the leading `literal_prefix` into your `content` — the label stays attached on its own, and re-typing the same label is refused (`PrefixDuplicatesLabel`, which names the content to send). To CHANGE a typed label (`"(b)"` → `"(c)"`, `"X."` → `"XI."`), do a whole-paragraph `replace` whose content starts with the new label and the separator you want (`"(c)\tThe Supplier…"`): the label is rewritten like any other text. A label produced by automatic list numbering is changed with `set_numbering`, not by typing one. (This is also why a label you reject can correctly reappear in `text`: it is restored as structural text, not a tracked change.)
 8b. **Moving a heading that a cross-reference (REF field / bookmark) points at:** a tracked MOVE, once accepted in Word, drops the bookmark and orphans the REF ("Error! Reference source not found") — this is Word's own behavior for moves, not something the engine can prevent. If the moved range is a REF target, re-anchor it after the move with `insert_bookmark` at the destination, or tell the user the cross-reference will need re-pointing. Don't claim the references are preserved when they will break on accept.
 8c. **Moving a whole section: use `move`'s RANGE form, in ONE op — never chain single-block moves.** `target` takes either one block id or a contiguous `{"from","to"}` range (either doc order):
 
@@ -255,10 +269,11 @@ To insert or delete a whole table row as a tracked change, use `table_op` (`appl
 {"op":"table_op","target":"tbl_1","table_op":{"kind":"insert_row","ref_row":2,"position":"after","cells":["Widget","4","$12.00"]}}
 ```
 
-  Fewer entries than the table has columns leaves the rest empty; omit `cells` entirely for an all-blank row. MORE entries than columns is refused (naming the actual column count) rather than silently clamped. This is ONE tracked row insertion (`w:trPr/w:ins` + `w:cellIns` per cell) — do not insert a blank row and then call `set_cell_text` per cell to fill it; give the content up front.
+  Fewer entries than the table has columns leaves the rest empty; omit `cells` entirely for an all-blank row. MORE entries than columns is refused (naming the actual column count) rather than silently clamped. New cell text inherits the corresponding reference cell's first paragraph and leading text formatting (including font and size), not its text or revision history. This is ONE tracked row insertion (`w:trPr/w:ins` + `w:cellIns` per cell) — do not insert a blank row and then call `set_cell_text` per cell to fill it; give the content up front.
 - **`delete_row`** marks the whole row (and its cells) as a tracked deletion: `{"kind":"delete_row","row_index":2}`. Deleting the table's last remaining row is refused — delete the whole table block instead.
 - **Formatting is preserved.** `insert_row` / `delete_row` / `merge_cells` (and a whole-table `replace`) work on a fully-formatted table — borders, shading, cell widths, row heights, table style all round-trip; untouched cells are byte-identical. The one refusal is a table that already carries an UNRESOLVED tracked change (accept/reject it first). To *change* a cell's or table's formatting as a tracked change, use `set_cell_format` / `set_row_format` / `set_table_format`.
-- **Building/inserting a formatted table.** When you `insert` (or `replace` with `mode:"direct"`) a table, you can set its look inline via `attrs`: the table object takes `attrs:{style,borders,width,cell_margins}`, each row `attrs:{header,height,height_rule}`, and each cell `attrs:{grid_span,v_merge,borders,shading,width,v_align,margins}` (same shapes as the `set_*_format` ops). On a `replace`, any formatting you set wins and everything you omit is inherited from the base table. Caller-set table/row/cell formatting on a *tracked* `replace` is refused (it can't be a reversible tracked change) — use `mode:"direct"`, or the `set_*_format` verbs to author it tracked.
+- **Merged cells.** A table read gives a merged cell its `row_span` / `col_span`; the rows a vertical merge covers list no cell of their own in that column. A new row does not join a merged group (`insert_row` does not extend a merge, nor does Word's Insert Row at the group's end): in the same transaction, `merge_cells` down that column from the group's top row through the new row (`{"kind":"merge_cells","start_row":10,"start_col":0,"end_row":13,"end_col":0}`, once per merged column). Merging moves the absorbed cells' text into the top cell and is not a tracked change, as in Word with Track Changes on.
+- **Building/inserting a formatted table.** When you `insert` (or `replace` with `mode:"direct"`) a table, you can set its look inline via `attrs`: the table object takes `attrs:{style,borders,width,cell_margins}`, each row `attrs:{header,height,height_rule,cant_split}`, and each cell `attrs:{grid_span,v_merge,borders,shading,width,v_align,margins}` (same shapes as the `set_*_format` ops). `cant_split:true` keeps the row together when it fits on one page; `false` explicitly permits splitting. Omission inherits the table style on insertion. On a `replace`, any formatting you set wins and everything you omit is inherited from the base table. Caller-set table/row/cell formatting on a *tracked* `replace` is refused (it can't be a reversible tracked change) — use `mode:"direct"`, or the `set_*_format` verbs for the properties they support to author them tracked.
 - **If you DO need to fill a row inserted earlier IN THE SAME `apply_edit` call** (e.g. you inserted it blank, or a prior step already committed you to two ops), `set_cell_text` on that row's own cells is allowed — the text becomes part of the same pending insertion, not a second tracked layer. But `set_cell_text` on a cell carrying a PRE-EXISTING tracked change (from an earlier `apply_edit` call, or imported from Word) is still refused: accept/reject that revision first, or address the cell's own paragraph `block_id` (from `read_block`'s `cells` — each entry now carries `{row, col, text, block_id}`) with a tracked `replace` instead of the grid address.
 - After a row insert/delete, `apply_edit`'s receipt carries a `table_receipts` entry — `{table_id, rows: [{row_index, status, cell_texts, prev_row_texts, next_row_texts}]}` — naming exactly which row(s) were freshly marked and their neighbors, so you confirm placement without a follow-up read (the same idiom `moves` uses for block moves).
 
@@ -293,7 +308,7 @@ Batch these style edits into ONE `apply_edit` transaction — each `apply_edit` 
 Three ops, all via `apply_edit`, all default to tracked (`w:ins`/`w:del`):
 
 - **`insert_note`** — splice a reference run after `expect` in `target`, plus a new story: `{"op":"insert_note","target":"<block_id>","expect":"<substring in the block>","note_kind":"footnote","body":"<note text>"}`. Tracked: BOTH the reference run and the whole story body show as inserted; reject-all removes the note entirely, accept-all keeps it.
-- **`edit_note`** — replace an existing note's body by its `note_id` (from `read_index`'s `notes` or from `list_revisions`): `{"op":"edit_note","note_id":"<note_id>","note_kind":"footnote","body":"<new body text>"}`. Tracked mode is a SURGICAL word-diff (like a whole-paragraph `replace`) — only the changed words become `w:ins`/`w:del`, not the whole body. Refused (`NoteBodyMultiParagraph`) if the note's body is more than one paragraph — v1 scope is single-paragraph note bodies.
+- **`edit_note`** — replace an existing note's body by its `note_id` (from `read_index`'s `notes` or from `list_revisions`): `{"op":"edit_note","note_id":"<note_id>","note_kind":"footnote","body":"<new body text>"}`. Tracked mode is a SURGICAL word-diff (like a whole-paragraph `replace`) — only the changed words become `w:ins`/`w:del`, not the whole body. For a note of several paragraphs, give one line per paragraph, separated by `\n`, in order (repeat a line unchanged to keep it): each paragraph is edited in place and keeps its formatting and list numbering. A line count other than the note's paragraph count is refused (`NoteBodyLineCountMismatch`).
 - **`delete_note`** — remove a note and its reference run by `note_id`: `{"op":"delete_note","note_id":"<note_id>","note_kind":"footnote"}`. Tracked mode marks both the reference and the story `Deleted` (not physically removed) — accept-all removes the note, reject-all restores it fully.
 
 **No stacking.** `edit_note`/`delete_note` in tracked mode refuse (`BlockHasTrackedStatus`) if the target note's story already carries a pending tracked change (e.g. you just `insert_note`d it and haven't accepted/rejected yet, or a prior `delete_note` on it is still pending) — resolve the existing change first, same rule as editing an already-tracked body paragraph. This is why a note you just inserted in the SAME session can't be `edit_note`d again until it's committed (`accept_changes`/`reject_changes`) or the document is reopened with it already resolved.

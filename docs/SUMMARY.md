@@ -26,6 +26,7 @@
 * [CLI](reference/cli.md)
 * [MCP core](reference/mcp.md)
 * [MCP advanced](reference/mcp-advanced.md)
+* [Python](reference/python.md)
 * [v4 operations](reference/operations.md)
 * [Read model](reference/read-model.md)
 * [Embed the engine](reference/embedding.md)
@@ -37,7 +38,7 @@
 
 ## Evidence and internals
 
-* [Agent benchmarks](benchmarks.md)
+* [Benchmark history](benchmarks.md)
 * [Benchmark archive](benchmarks-history.md)
 * [Architecture](internals/architecture.md)
 * [Comparison boundary](internals/comparison-boundary.md)

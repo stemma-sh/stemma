@@ -256,7 +256,7 @@ fn spec_comment_range_has_matching_reference() {
         .any(|i| matches!(i, InlineNode::CommentRangeEnd { id } if id == "1"));
     let has_reference = all_inlines
         .iter()
-        .any(|i| matches!(i, InlineNode::CommentReference { id } if id == "1"));
+        .any(|i| matches!(i, InlineNode::OpaqueInline(o) if matches!(&o.kind, OpaqueKind::CommentReference(r) if r.reference_id == "1")));
 
     // CommentReference may also be stored as an OpaqueInline with
     // OpaqueKind::CommentReference — check that form too.

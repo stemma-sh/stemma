@@ -11,10 +11,9 @@
 //! **barrier anchors** — opaque inlines (images, fields, hyperlinks, footnote
 //! refs, …) and hard breaks. This is exactly what `extract_text_sections`
 //! returns: for `N` anchors there are `N + 1` sections. `ReplaceParagraphText`
-//! matches its `expect` *section-locally* (the substring must lie inside one
-//! section, not span an anchor), and it rewrites the whole paragraph by
-//! interleaving new text with a `PreservedInlineRef` for every anchor in
-//! original order.
+//! rewrites the whole paragraph by interleaving new text with a
+//! `PreservedInlineRef` for every anchor in original order (its `expect` is
+//! matched against the paragraph's read text, which anchors do not split).
 //!
 //! So the planner's job per paragraph is:
 //!   1. Flatten the paragraph into `[Section(text), Anchor(id), Section(text), …]`
@@ -25,8 +24,7 @@
 //!      rewritten section text (as `Text` fragments) with a `PreservedInlineRef`
 //!      for each anchor, in order.
 //!   4. Derive `expect` from the FIRST section that actually changed — the whole
-//!      original section text — so the precondition is guaranteed section-local
-//!      and present (the same notion of "section" `ReplaceParagraphText` uses).
+//!      original section text — so the precondition is guaranteed present.
 //!
 //! # Barriers (no silent fallback)
 //!
@@ -140,6 +138,33 @@ pub fn plan_find_replace_all(
     // Identity / empty needle => no-op. We refuse to author zero-content edits.
     if opts.needle.is_empty() || opts.needle == opts.replacement {
         return Ok(Vec::new());
+    }
+
+    // An occurrence inside a link or content control is beyond the
+    // paragraph rewrite; replacing the rest would leave it standing.
+    let mut searched: Vec<&[TrackedBlock]> = vec![&doc.blocks];
+    if opts.scope == FindReplaceScope::BodyAndStories {
+        searched.extend(doc.footnotes.iter().map(|story| story.blocks.as_slice()));
+        searched.extend(doc.endnotes.iter().map(|story| story.blocks.as_slice()));
+        searched.extend(doc.comments.iter().map(|story| story.blocks.as_slice()));
+    }
+    let inside_objects: Vec<InlineObjectMatch> = searched
+        .into_iter()
+        .flatten()
+        .filter_map(|tracked| match &tracked.block {
+            BlockNode::Paragraph(para) => Some(para.as_ref()),
+            _ => None,
+        })
+        .flat_map(inline_object_texts)
+        .filter(|(_, text)| find_match(text, opts).is_some())
+        .map(|(occurrence, _)| occurrence)
+        .collect();
+    if !inside_objects.is_empty() {
+        return Err(EditError::ReplaceTextInsideInlineObjects {
+            needle: opts.needle.clone(),
+            occurrences: inside_objects,
+            step_index: 0,
+        });
     }
 
     let mut steps = Vec::new();
@@ -274,7 +299,7 @@ fn plan_paragraph(
     }
 
     // Build the rewritten content and capture the first changed section's
-    // ORIGINAL text as the `expect` precondition (guaranteed section-local).
+    // ORIGINAL text as the `expect` precondition (guaranteed present).
     let mut fragments: Vec<ContentFragment> = Vec::new();
     let mut expect: Option<String> = None;
     for element in &elements {
@@ -609,6 +634,103 @@ pub fn unreached_cell_matches(
     out
 }
 
+/// Inline objects holding text that a replace-text splice does not reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineObjectText {
+    /// A hyperlink's display text (`w:hyperlink` runs).
+    HyperlinkText,
+    /// An inline content control's current value (`w:sdtContent`).
+    ContentControlValue,
+}
+
+/// One inline object in a searched paragraph whose text holds the needle.
+#[derive(Clone, Debug)]
+pub struct InlineObjectMatch {
+    /// The paragraph holding the object.
+    pub block_id: NodeId,
+    /// The object's id, the handle the op that edits it targets.
+    pub object_id: NodeId,
+    pub object: InlineObjectText,
+}
+
+impl InlineObjectMatch {
+    /// Where the occurrence is, and the op that edits it.
+    pub fn describe(&self) -> String {
+        match self.object {
+            InlineObjectText::HyperlinkText => format!(
+                "the text of hyperlink '{}' in paragraph '{}' (replace targeting the hyperlink \
+                 id with content.type=hyperlink)",
+                self.object_id, self.block_id
+            ),
+            InlineObjectText::ContentControlValue => format!(
+                "the value of content control '{}' in paragraph '{}' \
+                 (set_content_control_value, or opaque_text_edit on the control)",
+                self.object_id, self.block_id
+            ),
+        }
+    }
+}
+
+/// The live inline objects of `para` that hold text of their own, with that
+/// text. Text replacement edits a paragraph's own runs; a hyperlink's display
+/// text and a content control's value are edited through their objects.
+fn inline_object_texts(para: &ParagraphNode) -> Vec<(InlineObjectMatch, String)> {
+    let mut out = Vec::new();
+    for segment in &para.segments {
+        // Deleted text is not live content; there is nothing to replace there.
+        if !matches!(
+            segment.status,
+            TrackingStatus::Normal | TrackingStatus::Inserted(_)
+        ) {
+            continue;
+        }
+        for inline in &segment.inlines {
+            let InlineNode::OpaqueInline(opaque) = inline else {
+                continue;
+            };
+            let (text, object) = match &opaque.kind {
+                crate::domain::OpaqueKind::Hyperlink(link) => {
+                    (link.text.clone(), InlineObjectText::HyperlinkText)
+                }
+                crate::domain::OpaqueKind::Sdt => match crate::opaque_meta::project(opaque) {
+                    Some(crate::view::OpaqueMetadata::ContentControl {
+                        display_text: Some(value),
+                        ..
+                    }) => (value, InlineObjectText::ContentControlValue),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            out.push((
+                InlineObjectMatch {
+                    block_id: para.id.clone(),
+                    object_id: opaque.id.clone(),
+                    object,
+                },
+                text,
+            ));
+        }
+    }
+    out
+}
+
+/// The inline objects of `para` whose text holds `opts.old` under its match
+/// mode.
+fn inline_object_matches(
+    para: &ParagraphNode,
+    opts: &ReplaceTextOptions,
+) -> Vec<InlineObjectMatch> {
+    inline_object_texts(para)
+        .into_iter()
+        .filter(|(_, text)| {
+            !region_matches(text, &opts.old, opts.match_mode)
+                .0
+                .is_empty()
+        })
+        .map(|(occurrence, _)| occurrence)
+        .collect()
+}
+
 /// A match that could not be replaced because it crossed a wall, surfaced under
 /// `BarrierPolicy::Skip` so a partial outcome is never silent.
 #[derive(Clone, Debug)]
@@ -638,8 +760,10 @@ pub enum ReplaceTextError {
         expected: ExpectedMatches,
         actual: usize,
         sites: Vec<MatchSite>,
-        /// Teaching diagnostics, populated ONLY on a ZERO-match mismatch (when
-        /// `actual > 0` the per-site `sites` excerpts already serve). Each entry
+        /// Teaching diagnostics, populated on a ZERO-match mismatch (when
+        /// `actual > 0` the per-site `sites` excerpts already serve; an
+        /// occurrence inside a link or content control refuses before the
+        /// count gate, `EditError::ReplaceTextInsideInlineObjects`). Each entry
         /// explains WHY the literal needle matched nothing and what to change — so
         /// the agent fixes the call in one follow-up instead of falling back to
         /// read_block/apply_edit ceremony (the benchmark's measured residual).
@@ -686,7 +810,7 @@ const EXCERPT_RADIUS: usize = 32;
 /// whole inline. Because `partition_regions` derives them from
 /// `flat_inlines_with_status` (the same flattening, paired with segment status),
 /// a region's `[flat_start, flat_end)` selects EXACTLY the inlines whose text it
-/// holds — true by construction, not by two iterations that happen to agree
+/// holds, plus any proofing marks between them — true by construction, not by two iterations that happen to agree
 /// (`region_flat_range_indexes_the_same_inlines_it_collected` pins this).
 struct Region {
     text: String,
@@ -698,7 +822,8 @@ struct Region {
 /// Coalesce the paragraph's flat inlines into maximal runs of text with the
 /// same editable status ("regions"), separated by walls. Normal and Inserted
 /// segments are editable; Deleted and InsertedThenDeleted remain walls. Opaque
-/// anchors, hard breaks, and zero-width decorations are walls too. A region
+/// anchors, hard breaks, and zero-width decorations other than proofing marks
+/// ([`is_proofing_mark`]) are walls too. A region
 /// never spans a status boundary, keeping attribution explicit.
 ///
 /// The flat index space is the SHARED `flat_inlines_with_status(para)`, which is
@@ -723,20 +848,25 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
             let flat_start = i;
             let region_status = flat[i].1;
             let mut text = String::new();
+            // One past the last text inline taken: a region ends on text, so
+            // proofing marks after its last text stay outside it.
+            let mut flat_end = i;
             while i < flat.len() {
-                if let InlineNode::Text(t) = flat[i].0
-                    && flat[i].1 == region_status
-                {
-                    text.push_str(&t.text);
-                    i += 1;
-                } else {
-                    break;
+                match flat[i].0 {
+                    InlineNode::Text(t) if flat[i].1 == region_status => {
+                        text.push_str(&t.text);
+                        i += 1;
+                        flat_end = i;
+                    }
+                    inline if is_proofing_mark(inline) => i += 1,
+                    _ => break,
                 }
             }
+            i = flat_end;
             regions.push(Region {
                 text,
                 flat_start,
-                flat_end: i,
+                flat_end,
             });
         } else {
             // Wall (anchor, hard break, deletion/stacked text, or zero-width inline) —
@@ -745,6 +875,14 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
         }
     }
     regions
+}
+
+/// Word's spelling/grammar marks (`w:proofErr`) bracket a word Word's
+/// proofing flagged and are recomputed on open. They are not content, so a
+/// search region runs through them (Word's own Find does); the splice carries
+/// them with the surrounding text. Every other non-text inline stays a wall.
+fn is_proofing_mark(inline: &InlineNode) -> bool {
+    matches!(inline, InlineNode::Decoration(d) if d.kind == crate::domain::DecorationType::ProofError)
 }
 
 /// Fold one char to its normalization-class representative, returning the class
@@ -988,8 +1126,11 @@ pub fn plan_replace_text(
     let mut sites: Vec<MatchSite> = Vec::new();
     let mut skipped: Vec<SkippedStraddle> = Vec::new();
     let mut classes: Vec<NormalizationClass> = Vec::new();
+    let mut inside_objects: Vec<InlineObjectMatch> = Vec::new();
 
     for para in &paras {
+        inside_objects.extend(inline_object_matches(para, opts));
+
         // A tracked BLOCK status can't be carried by a splice — refuse up front.
         let top_level_status =
             find_paragraph_path(doc, &para.id).map(|path| &doc.blocks[path.top_block].status);
@@ -1051,6 +1192,19 @@ pub fn plan_replace_text(
         }
     }
 
+    // ── Occurrences the splice cannot reach ────────────────────────────────
+    // Replacing the reachable occurrences while one sits in a link or a
+    // content control would report success with the text still there.
+    if !inside_objects.is_empty() {
+        return Err(ReplaceTextError::Engine(
+            EditError::ReplaceTextInsideInlineObjects {
+                needle: opts.old.clone(),
+                occurrences: inside_objects,
+                step_index: 0,
+            },
+        ));
+    }
+
     // ── Gate on expected_matches ───────────────────────────────────────────
     let actual = sites.len();
     match opts.expected {
@@ -1060,6 +1214,7 @@ pub fn plan_replace_text(
             // On a ZERO-match mismatch, diagnose WHY (the benchmark's measured
             // residual: bare zero-match errors forced fallback ceremony). The
             // probes fire only when they'd change the outcome; empty otherwise.
+            // (Occurrences inside links and content controls refused above.)
             let diagnosis = if actual == 0 {
                 zero_match_diagnosis(doc, &paras, opts)
             } else {
@@ -1098,15 +1253,88 @@ fn plan_paragraph_splice(
     para: &ParagraphNode,
     opts: &ReplaceTextOptions,
 ) -> Result<Option<EditStep>, EditError> {
+    let Some((cover_start, cover_end, content)) = plan_paragraph_splice_range(para, opts)? else {
+        return Ok(None);
+    };
+    let expect = flat_range_visible_text(para, cover_start, cover_end);
+    let guard = block_semantic_hash_for_block(&BlockNode::from(para.clone()));
+    let span = flat_range_to_selector(para, cover_start, cover_end);
+    Ok(Some(EditStep::ReplaceSpanText {
+        block_id: para.id.clone(),
+        guard,
+        expect: Some(expect),
+        span,
+        content,
+        rationale: None,
+    }))
+}
+
+/// The flat-inline range covering every match of `opts.old` in `para` and its
+/// rewritten content; None without a match. A header or footer edit applies
+/// it to its story paragraph directly.
+pub(crate) fn plan_paragraph_splice_range(
+    para: &ParagraphNode,
+    opts: &ReplaceTextOptions,
+) -> Result<Option<(usize, usize, ParagraphContent)>, EditError> {
+    plan_splice_range(para, opts, &opts.new, (0, 0))
+}
+
+/// [`plan_paragraph_splice_range`] for an edit to part of a paragraph (a
+/// header or footer part edit): the text `old` and `new` share at their start
+/// and end stays in place, so only what differs is spliced and the unchanged
+/// characters keep their runs, as an edit of the whole paragraph diffs them.
+/// At least one character of `old` stays in the splice, so a pure insertion
+/// lands inside the run it continues.
+pub(crate) fn plan_paragraph_part_splice_range(
+    para: &ParagraphNode,
+    opts: &ReplaceTextOptions,
+) -> Result<Option<(usize, usize, ParagraphContent)>, EditError> {
+    assert_eq!(
+        opts.match_mode,
+        MatchMode::Exact,
+        "a part splice trims an exact match"
+    );
+    let old: Vec<char> = opts.old.chars().collect();
+    let new: Vec<char> = opts.new.chars().collect();
+    let mut prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    prefix = prefix.min(old.len().saturating_sub(1));
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix.min(new.len())..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(old.len() - prefix - 1);
+    let middle: String = new[prefix..new.len() - suffix].iter().collect();
+    plan_splice_range(para, opts, &middle, (prefix, suffix))
+}
+
+/// The covering range of every match of `opts.old`, each match narrowed by
+/// `trim` (characters left in place at its start and end) and rewritten to
+/// `new`.
+fn plan_splice_range(
+    para: &ParagraphNode,
+    opts: &ReplaceTextOptions,
+    new: &str,
+    trim: (usize, usize),
+) -> Result<Option<(usize, usize, ParagraphContent)>, EditError> {
     let regions = partition_regions(para);
     // Find regions that actually change.
-    let mut matched: Vec<(&Region, Vec<(usize, usize)>)> = Vec::new();
+    let mut bounded = Vec::new();
     for region in &regions {
         let (spans, _) = region_matches(&region.text, &opts.old, opts.match_mode);
+        let spans: Vec<(usize, usize)> = spans
+            .into_iter()
+            .map(|(start, end)| (start + trim.0, end - trim.1))
+            .collect();
         if !spans.is_empty() {
-            matched.push((region, spans));
+            bounded.push(bound_matched_region(para, region, spans));
         }
     }
+    let matched: Vec<(&Region, Vec<(usize, usize)>)> = bounded
+        .iter()
+        .map(|(region, spans)| (region, spans.clone()))
+        .collect();
     if matched.is_empty() {
         return Ok(None);
     }
@@ -1134,20 +1362,76 @@ fn plan_paragraph_splice(
     // [cover_start, cover_end), emitting rewritten editable Text and a
     // PreservedInlineRef for each anchor (so opaques survive). A region's matches
     // are applied; non-matched editable text is copied verbatim.
-    let content = build_covering_content(para, &matched, cover_start, cover_end, &opts.new);
-    let expect = flat_range_visible_text(para, cover_start, cover_end);
-    let guard = block_semantic_hash_for_block(&BlockNode::from(para.clone()));
+    let content = build_covering_content(para, &matched, cover_start, cover_end, new);
+    Ok(Some((cover_start, cover_end, content)))
+}
 
-    let span = flat_range_to_selector(para, cover_start, cover_end);
+/// How many times `needle` occurs in `para`'s searchable text (proofing marks
+/// included, other walls not crossed).
+pub(crate) fn paragraph_match_count(para: &ParagraphNode, needle: &str) -> usize {
+    partition_regions(para)
+        .iter()
+        .map(|region| {
+            region_matches(&region.text, needle, MatchMode::Exact)
+                .0
+                .len()
+        })
+        .sum()
+}
 
-    Ok(Some(EditStep::ReplaceSpanText {
-        block_id: para.id.clone(),
-        guard,
-        expect: Some(expect),
-        span,
-        content,
-        rationale: None,
-    }))
+/// Search regions are maximal, but the local compiler must receive only the
+/// inline envelope touched by matches. Offsets are Unicode character offsets,
+/// exactly as returned by `region_matches`, not UTF-8 byte positions.
+fn bound_matched_region(
+    para: &ParagraphNode,
+    region: &Region,
+    spans: Vec<(usize, usize)>,
+) -> (Region, Vec<(usize, usize)>) {
+    let first = spans.first().expect("matched region has a match").0;
+    let last = spans.last().expect("matched region has a match").1;
+    let flat = crate::edit::flat_inlines(para);
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = None;
+    let mut prefix = 0;
+    for (index, inline) in flat
+        .iter()
+        .enumerate()
+        .take(region.flat_end)
+        .skip(region.flat_start)
+    {
+        if is_proofing_mark(inline) {
+            continue;
+        }
+        let InlineNode::Text(text) = inline else {
+            panic!("search region contains non-text inline at {index}");
+        };
+        let next = offset + text.text.chars().count();
+        if next > first && offset < last {
+            if start.is_none() {
+                start = Some(index);
+                prefix = offset;
+            }
+            end = Some(index + 1);
+        }
+        offset = next;
+    }
+    let start = start.expect("match starts inside its search region");
+    let end = end.expect("match ends inside its search region");
+    assert!(last <= offset, "match extends past its search region");
+    let text = flat_range_visible_text(para, start, end);
+    let spans = spans
+        .into_iter()
+        .map(|(a, b)| (a - prefix, b - prefix))
+        .collect();
+    (
+        Region {
+            text,
+            flat_start: start,
+            flat_end: end,
+        },
+        spans,
+    )
 }
 
 /// Does `[start, end)` contain text from a segment the tracked splice cannot
@@ -1246,7 +1530,11 @@ fn build_covering_content(
 /// Pick the splice selector for the flat range `[start, end)`: `Whole` when the
 /// range is the entire paragraph, else `Between` with `FlatIndex` (or `Start`/
 /// `End`) endpoints.
-fn flat_range_to_selector(para: &ParagraphNode, start: usize, end: usize) -> ResolvedSpanSelector {
+pub(crate) fn flat_range_to_selector(
+    para: &ParagraphNode,
+    start: usize,
+    end: usize,
+) -> ResolvedSpanSelector {
     let total = flat_inline_count(para);
     if start == 0 && end == total {
         return ResolvedSpanSelector::Whole;
@@ -1376,13 +1664,33 @@ fn classify_normalize_ws(paras: &[&ParagraphNode], opts: &ReplaceTextOptions) ->
     ))
 }
 
-/// Classification 2: the needle begins with a structural numbering label
-/// (`match_prefix_pattern` — the recognizer import uses to hoist labels). The
-/// label lives in `literal_prefix`, never in matchable body text. Fires ONLY when
-/// the label-stripped needle WOULD match in scope. Intent-preserving per the
-/// prefix-duplication contract: tell the agent to drop the label from the needle.
+/// Classification 2: the needle begins with a numbering label. A typed label
+/// (`literal_prefix`) of a paragraph in scope is named with the op that rewrites
+/// it (whole-paragraph `replace`), even when the needle is only the label.
+/// Otherwise, a recognizer-shaped label (`match_prefix_pattern`) fires ONLY when
+/// the label-stripped needle WOULD match in scope: tell the agent to drop it.
 fn classify_label_strip(paras: &[&ParagraphNode], opts: &ReplaceTextOptions) -> Option<String> {
     let trimmed = opts.old.trim_start_matches([' ', '\t']);
+    // A typed label ("X.", "(c)") is the paragraph's own text, but not text a
+    // find-replace reaches: name the op that rewrites it.
+    let typed = paras.iter().find_map(|p| {
+        let label = p.literal_prefix.as_deref()?.trim();
+        (!label.is_empty() && trimmed.starts_with(label)).then_some((p.id.clone(), label))
+    });
+    if let Some((block_id, label)) = typed {
+        let rest = trimmed[label.len()..].trim_start_matches([' ', '\t']);
+        let text_route = if rest.is_empty() {
+            String::new()
+        } else {
+            format!("; to change only the text after it, retry with '{rest}'")
+        };
+        return Some(format!(
+            "'{label}' is the typed label of paragraph '{}', which find-replace does not \
+             change — to change the label, replace that paragraph (op replace) with \
+             content starting with the new label{text_route}",
+            block_id.0
+        ));
+    }
     let (label, consumed) = crate::import::match_prefix_pattern(trimmed)?;
     let stripped = trimmed[consumed..].to_string();
     if stripped.is_empty() {
@@ -1798,6 +2106,66 @@ mod tests {
                 region.flat_end
             ));
         }
+    }
+
+    #[test]
+    fn paragraph_splice_excludes_unmatched_neighboring_runs() {
+        // A search region is not an edit region: unrelated runs must remain
+        // outside the local compiler's input, preserving their direct styling.
+        let para = para_with_segments(
+            "p_field",
+            vec![(
+                TrackingStatus::Normal,
+                vec![
+                    ("label", "Patient: "),
+                    ("value", "Émile"),
+                    ("padding", "\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}"),
+                    ("next", "\u{a0}Species: cat"),
+                ],
+            )],
+        );
+        let options = ReplaceTextOptions {
+            old: "Émile\u{a0}\u{a0}\u{a0}".to_string(),
+            new: "Émile\u{a0}II".to_string(),
+            author: "Reviewer".to_string(),
+            scope: ReplaceTextScope::SingleBlock(para.id.clone()),
+            expected: ExpectedMatches::Count(1),
+            match_mode: MatchMode::Exact,
+            on_barrier_match: BarrierPolicy::Fail,
+        };
+        let step = plan_paragraph_splice(&para, &options).unwrap().unwrap();
+        let EditStep::ReplaceSpanText { span, expect, .. } = step else {
+            panic!("expected a local text splice");
+        };
+        assert_eq!(span, flat_range_to_selector(&para, 1, 3));
+        assert_eq!(
+            expect.as_deref(),
+            Some("Émile\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}")
+        );
+    }
+
+    #[test]
+    fn bounded_match_region_preserves_unicode_offsets_and_all_matches() {
+        let para = para_with_segments(
+            "p_unicode",
+            vec![(
+                TrackingStatus::Normal,
+                vec![
+                    ("before", "préfixe "),
+                    ("first", "a\u{a0}b"),
+                    ("gap", " / "),
+                    ("second", "a b"),
+                    ("after", " suffix"),
+                ],
+            )],
+        );
+        let regions = partition_regions(&para);
+        let (spans, _) = region_matches(&regions[0].text, "a b", MatchMode::NormalizeWs);
+        assert_eq!(spans.len(), 2);
+        let (bounded, adjusted) = bound_matched_region(&para, &regions[0], spans);
+        assert_eq!((bounded.flat_start, bounded.flat_end), (1, 4));
+        assert_eq!(bounded.text, "a\u{a0}b / a b");
+        assert_eq!(rewrite_region(&bounded.text, &adjusted, "X"), "X / X");
     }
 
     #[test]

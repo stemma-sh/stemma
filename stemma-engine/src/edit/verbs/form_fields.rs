@@ -47,7 +47,6 @@ use crate::domain::{
     BlockNode, CanonDoc, FieldKind, InlineNode, NodeId, OpaqueKind, RunRprAuthored, TextNode,
     TrackingStatus,
 };
-use crate::import::sha256_hex;
 use crate::word_xml::{parse_raw_fragment, serialize_raw_fragment};
 use xmltree::{Element, XMLNode};
 
@@ -63,6 +62,26 @@ pub enum FormFieldValue {
     Checked(bool),
     /// FORMDROPDOWN: select an entry by its `listEntry` value string.
     Selected(String),
+}
+
+/// A legacy form field's DEFAULT (§17.16.13 `textInput/default`, §17.16.6
+/// `checkBox/default`): what the field shows when reset, distinct from its
+/// current value. A dropdown has none (its default is its first entry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormFieldDefault {
+    /// FORMTEXT default text.
+    Text(String),
+    /// FORMCHECKBOX default state.
+    Checked(bool),
+}
+
+impl FormFieldDefault {
+    fn kind_label(&self) -> &'static str {
+        match self {
+            FormFieldDefault::Text(_) => "text default",
+            FormFieldDefault::Checked(_) => "checked default",
+        }
+    }
 }
 
 impl FormFieldValue {
@@ -342,6 +361,25 @@ enum InsertAt {
     Back,
 }
 
+/// Set (or insert) the `w:val`-keyed child `local` of `parent`; a new one goes
+/// right after the last child named in `after` (or first), which keeps the
+/// sequence of `CT_FFTextInput` (`type?, default?, …`) and `CT_FFCheckBox`
+/// (`(size|sizeAuto), default?, checked?`).
+fn set_val_child_after(parent: &mut Element, local: &str, val: &str, after: &[&str]) {
+    if let Some(existing) = child_by_local_mut(parent, local) {
+        crate::xml_attrs::attr_set(existing, "w:val", val);
+        return;
+    }
+    let mut el = crate::word_xml::w_el(local);
+    crate::xml_attrs::attr_set(&mut el, "w:val", val);
+    let position = parent
+        .children
+        .iter()
+        .rposition(|child| matches!(child, XMLNode::Element(e) if after.contains(&e.name.as_str())))
+        .map_or(0, |index| index + 1);
+    parent.children.insert(position, XMLNode::Element(el));
+}
+
 /// Set (or insert) a single `w:val`-keyed child element of `parent`, e.g.
 /// `<w:checked w:val="true"/>` or `<w:result w:val="2"/>`. Updates the element
 /// in place when present; otherwise creates it and inserts it at `at` so the
@@ -375,7 +413,8 @@ pub(crate) fn apply_set_value(
     doc: &mut CanonDoc,
     block_id: &NodeId,
     field_id: &NodeId,
-    value: &FormFieldValue,
+    value: Option<&FormFieldValue>,
+    default: Option<&FormFieldDefault>,
     semantic_hash: Option<&str>,
     step_index: usize,
 ) -> Result<(), EditError> {
@@ -425,7 +464,7 @@ pub(crate) fn apply_set_value(
             step_index,
         });
     };
-    let resolved = mutate_ffdata(opaque, value, field_id, step_index)?;
+    let resolved = mutate_ffdata(opaque, value, default, field_id, step_index)?;
 
     // 4. Splice the result run (FORMTEXT / FORMDROPDOWN). FORMCHECKBOX has no
     //    result run (`display` is None) and no separate, so nothing to splice.
@@ -454,7 +493,8 @@ pub(crate) fn apply_set_value(
 /// `content_hash`. Returns the resolved display text for the result run.
 fn mutate_ffdata(
     opaque: &mut crate::domain::OpaqueInlineNode,
-    value: &FormFieldValue,
+    value: Option<&FormFieldValue>,
+    default: Option<&FormFieldDefault>,
     field_id: &NodeId,
     step_index: usize,
 ) -> Result<ResolvedSet, EditError> {
@@ -477,6 +517,39 @@ fn mutate_ffdata(
     })?;
     let kind = classify_ffdata(ffdata, field_id, step_index)?;
 
+    if let Some(default) = default {
+        let (container, after): (&str, &[&str]) = match (default, kind) {
+            (FormFieldDefault::Text(_), FfKind::Text) => ("textInput", &["type"]),
+            (FormFieldDefault::Checked(_), FfKind::Checkbox) => ("checkBox", &["size", "sizeAuto"]),
+            (default, kind) => {
+                return Err(EditError::FormFieldTypeMismatch {
+                    field_id: field_id.clone(),
+                    requested: default.kind_label(),
+                    actual: kind.label(),
+                    step_index,
+                });
+            }
+        };
+        let parent =
+            child_by_local_mut(ffdata, container).ok_or_else(|| EditError::MalformedFfData {
+                field_id: field_id.clone(),
+                reason: "the field's input element vanished",
+                step_index,
+            })?;
+        let val = match default {
+            FormFieldDefault::Text(text) => text.as_str(),
+            FormFieldDefault::Checked(true) => "true",
+            FormFieldDefault::Checked(false) => "false",
+        };
+        set_val_child_after(parent, "default", val, after);
+    }
+
+    let Some(value) = value else {
+        let new_raw = serialize_raw_fragment(&fld_char);
+        opaque.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
+        opaque.raw_xml = Some(new_raw);
+        return Ok(ResolvedSet { display: None });
+    };
     let display = match (value, kind) {
         (FormFieldValue::Text(text), FfKind::Text) => {
             // FORMTEXT: the live value is the result run; the textInput/default
@@ -537,7 +610,7 @@ fn mutate_ffdata(
     };
 
     let new_raw = serialize_raw_fragment(&fld_char);
-    opaque.content_hash = Some(sha256_hex(&new_raw));
+    opaque.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     opaque.raw_xml = Some(new_raw);
 
     Ok(ResolvedSet { display })
@@ -548,6 +621,11 @@ fn mutate_ffdata(
 /// strictly between `separate` and `end`; we drop them and insert the new run
 /// at the separate-anchor's segment, right after the separate.
 fn replace_result_run(para: &mut crate::domain::ParagraphNode, span: &FieldSpan, display: &str) {
+    // The value keeps the look of the result it replaces: the formatting of the
+    // result's first text run, or, for an empty result, of the field's own
+    // `separate` run (where Word puts text typed into the empty field).
+    let formatting = result_formatting(para, span);
+
     // Remove the existing result inlines. Delete from the highest (segment,
     // inline) first so earlier positions stay valid.
     let mut to_remove = span.result.clone();
@@ -561,13 +639,14 @@ fn replace_result_run(para: &mut crate::domain::ParagraphNode, span: &FieldSpan,
     // removing the result inlines after it did not shift the separate's own
     // index. When there is no separate (checkbox), `display` is None and this
     // function is not called, so `separate` is always Some here.
+    let (marks, style_props, rpr_authored) = formatting;
     let new_run = InlineNode::from(TextNode {
         id: NodeId::from(format!("{}_result", para.id.0)),
         text_role: None,
         text: display.to_string(),
-        marks: Vec::new(),
-        style_props: crate::domain::StyleProps::default(),
-        rpr_authored: RunRprAuthored::default(),
+        marks,
+        style_props,
+        rpr_authored,
         source_run_attrs: Vec::new(),
         formatting_change: None,
     });
@@ -575,5 +654,42 @@ fn replace_result_run(para: &mut crate::domain::ParagraphNode, span: &FieldSpan,
         let seg = &mut para.segments[sep.segment];
         let insert_at = (sep.inline + 1).min(seg.inlines.len());
         seg.inlines.insert(insert_at, new_run);
+    }
+}
+
+/// The run formatting a new field value takes: that of the result's first text
+/// run, or of the `separate` anchor's run when the result holds no text.
+fn result_formatting(
+    para: &crate::domain::ParagraphNode,
+    span: &FieldSpan,
+) -> (
+    Vec<crate::domain::Mark>,
+    crate::domain::StyleProps,
+    RunRprAuthored,
+) {
+    let at = |pos: &InlinePos| &para.segments[pos.segment].inlines[pos.inline];
+    if let Some(InlineNode::Text(text)) = span
+        .result
+        .iter()
+        .map(at)
+        .find(|inline| matches!(inline, InlineNode::Text(_)))
+    {
+        return (
+            text.marks.clone(),
+            text.style_props.clone(),
+            text.rpr_authored,
+        );
+    }
+    let separate = span
+        .separate
+        .as_ref()
+        .expect("a text value is only written to a field with a separate");
+    match at(separate) {
+        InlineNode::OpaqueInline(anchor) => (
+            anchor.wrapper_marks.clone(),
+            anchor.wrapper_style_props.clone(),
+            anchor.wrapper_rpr_authored,
+        ),
+        other => unreachable!("a field's separate is an opaque anchor, got {other:?}"),
     }
 }

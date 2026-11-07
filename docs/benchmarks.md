@@ -1,10 +1,11 @@
-# Agent benchmarks: stemma-mcp vs. the stock DOCX skill
+# Benchmark history (v0.1 to v0.5): stemma-mcp vs. the stock DOCX skill
 
-> **Provenance and version basis.** This is a maintainer-run benchmark, not an
-> independent evaluation. The 95% headline comes from pinned pre-release
-> builds of the line released as v0.1.0; the compact-contract re-run is reported
-> separately against the v0.2.0 release-qualification build. No v0.5 agent
-> benchmark has been run or is implied. The report publishes the losses,
+> **Historical.** These results measure earlier Stemma releases, not the
+> current one. The 95% headline comes from pinned pre-release builds of the
+> line released as v0.1.0; the compact-contract re-run is reported separately
+> against the v0.2.0 release-qualification build. No agent benchmark of v0.5
+> or later is published here, and none is implied. This is a maintainer-run
+> benchmark, not an independent evaluation; the report keeps the losses,
 > corrections, and reproducibility limits alongside the results.
 
 **TL;DR.** Claude's stock DOCX skill is better than its reputation: on

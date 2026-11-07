@@ -158,6 +158,7 @@ fn hyperlink_href_change_roundtrips_through_serializer() {
 
     let txn = EditTransaction {
         steps: vec![EditStep::SetHyperlinkAttr {
+            story: stemma::edit::StoryRef::Body,
             hyperlink_id: hyperlink_id.clone(),
             new_href: Some("https://example.com/new-target".to_string()),
             new_anchor: None,
@@ -226,6 +227,7 @@ fn hyperlink_rid_remains_consistent_after_mutation() {
 
     let txn = EditTransaction {
         steps: vec![EditStep::SetHyperlinkAttr {
+            story: stemma::edit::StoryRef::Body,
             hyperlink_id,
             new_href: Some("https://example.com/new-target".to_string()),
             new_anchor: None,
@@ -306,6 +308,7 @@ fn hyperlink_set_attr_produces_no_tracked_changes() {
 
     let txn = EditTransaction {
         steps: vec![EditStep::SetHyperlinkAttr {
+            story: stemma::edit::StoryRef::Body,
             hyperlink_id,
             new_href: Some("https://example.com/new-target".to_string()),
             new_anchor: None,

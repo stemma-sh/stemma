@@ -24,7 +24,7 @@
 //! accept keeps the inserted `fldSimple`; reject drops it.
 //!
 //! v1 scope (fail loud beyond it, per CLAUDE.md "start narrow"):
-//! - top-level paragraphs only;
+//! - body paragraphs, top-level or in a table cell;
 //! - authors only the self-contained `w:fldSimple` REF/PAGEREF/NOREF — the
 //!   four-piece `fldChar` begin/instr/separate/end complex field is out of
 //!   scope (roundtrip-only via `raw_xml`) and is never produced here;
@@ -37,7 +37,7 @@
 //!   `None`.
 
 use super::super::{EditError, MaterializationMode};
-use super::super::{find_block_index, validate_block_is_editable};
+use super::super::{block_at, block_at_mut, find_editable_block_path};
 use crate::domain::{
     BlockNode, CanonDoc, DocPart, FieldData, FieldKind, FieldSemantic, InlineNode, NodeId,
     OpaqueInlineNode, OpaqueKind, ParagraphNode, ProofRef, RefFieldSpec, RevisionInfo, StyleProps,
@@ -73,18 +73,10 @@ pub(crate) fn apply(
         return Err(EditError::CrossRefEmptyBookmark { step_index });
     }
 
-    // v1: top-level paragraphs only. A nested (table-cell) paragraph is not
-    // found here and surfaces as BlockNotFound — extend when authoring demand
-    // for in-cell cross-references appears.
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
+    // The paragraph may be top-level or in a table cell.
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    // Block status + segment-Normal preconditions (same gate as a text replace).
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
-
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -103,7 +95,7 @@ pub(crate) fn apply(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -113,7 +105,7 @@ pub(crate) fn apply(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
     apply_to_paragraph(para, block_id, expect, spec, revision, mode, step_index)
@@ -129,26 +121,11 @@ fn apply_to_paragraph(
     step_index: usize,
 ) -> Result<(), EditError> {
     let plan = find_anchor(&para.segments, expect).ok_or_else(|| {
-        let visible: String = para
-            .segments
-            .iter()
-            .flat_map(|s| s.inlines.iter())
-            .filter_map(|i| match i {
-                InlineNode::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        EditError::ExpectMismatch {
-            block_id: block_id.clone(),
-            expected: expect.to_string(),
-            actual_text: visible,
-            step_index,
-        }
+        super::super::unlocatable_expect(para, block_id, expect, false, step_index)
     })?;
 
-    // Synthesize the new field opaque. Its id is derived from the paragraph id
-    // so it is stable and unique within the block.
-    let field_id = NodeId::from(format!("{}_xref0", para.id.0));
+    // Synthesize the new field opaque, its id minted unique within the block.
+    let field_id = super::super::InlineIdMint::for_paragraph(para).mint("xref");
     let field = synthesize_new_field_inline(&field_id, spec);
 
     splice_field(&mut para.segments, plan, field, revision, mode);
@@ -159,10 +136,10 @@ fn apply_to_paragraph(
     Ok(())
 }
 
-/// Locate `expect` inside a single contiguous run of `Text` nodes within one
-/// Normal segment. Returns the segment, the inline index of the text node whose
-/// tail contains the end of the match, and the char offset where the match ends
-/// inside that node. The cross-reference is inserted at that boundary.
+/// Locate `expect` inside a contiguous run of `Text` nodes (zero-width markers
+/// do not break it) within one Normal segment. Returns the segment, the inline
+/// index of the text node whose tail contains the end of the match, and the
+/// char offset where the match ends inside that node. The cross-reference is inserted at that boundary.
 fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> {
     if expect.is_empty() {
         return None;
@@ -189,6 +166,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                         concat.push_str(&t.text);
                         j += 1;
                     }
+                    marker if super::super::is_zero_width_marker(marker) => j += 1,
                     _ => break,
                 }
             }
@@ -198,7 +176,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                 let mut consumed = 0usize;
                 for (k, inline) in inlines.iter().enumerate().take(j).skip(i) {
                     let InlineNode::Text(t) = inline else {
-                        unreachable!("run is all TextNodes");
+                        continue; // a zero-width marker inside the run
                     };
                     let len = t.text.chars().count();
                     if match_end_chars <= consumed + len {
@@ -314,6 +292,8 @@ fn synthesize_new_field_inline(id: &NodeId, spec: &RefFieldSpec) -> InlineNode {
         result_text: None,
         semantic: Some(FieldSemantic::Ref(spec.clone())),
     };
+    let content_hash =
+        crate::serialize::authored_simple_field_hash(&data, &[], &StyleProps::default());
     InlineNode::from(OpaqueInlineNode {
         id: id.clone(),
         kind: OpaqueKind::Field(data),
@@ -325,10 +305,11 @@ fn synthesize_new_field_inline(id: &NodeId, spec: &RefFieldSpec) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: None,
-        content_hash: None,
+        content_hash,
     })
 }
 

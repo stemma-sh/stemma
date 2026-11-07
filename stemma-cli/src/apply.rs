@@ -8,11 +8,9 @@ use sha2::{Digest as _, Sha256};
 use stemma::api::{Diagnostic, Document};
 use stemma::audit::RevisionDisposition;
 use stemma::edit::{
-    BarrierPolicy, EditTransaction, ExpectedMatches, MatchMode, MaterializationMode,
+    BarrierPolicy, EditError, EditTransaction, ExpectedMatches, MatchMode, MaterializationMode,
     ReplaceTextError, ReplaceTextOptions, ReplaceTextScope, plan_replace_text,
-    unreached_cell_matches,
 };
-use stemma::tracked_model::enumerate_revisions;
 use stemma::{ErrorCode, ExportOptions, RevisionInfo};
 use stemma_artifacts::{ArtifactIdentity, CollisionPolicy, OutputArtifact, PathAuthority};
 
@@ -119,7 +117,7 @@ struct PreparedChange {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ScopeReceipt {
-    AllTopLevelBodyParagraphs,
+    AllBodyAndTableParagraphs,
     Block {
         block_id: String,
     },
@@ -226,20 +224,21 @@ struct SummaryReceipt {
 
 #[derive(Serialize)]
 struct CoverageReceipt {
-    supported: [&'static str; 1],
+    supported: [&'static str; 2],
     default_scope: &'static str,
-    conditional_detection: [&'static str; 1],
-    unsearched: [&'static str; 7],
+    /// Text in covered paragraphs that is matched but not edited: an
+    /// occurrence there refuses its item.
+    searched_not_edited: [&'static str; 2],
+    unsearched: [&'static str; 6],
 }
 
 impl Default for CoverageReceipt {
     fn default() -> Self {
         Self {
-            supported: ["top_level_body_paragraphs"],
-            default_scope: "all_top_level_body_paragraphs",
-            conditional_detection: ["top_level_table_cells_for_default_scope"],
+            supported: ["body_paragraphs", "table_cell_paragraphs"],
+            default_scope: "all_body_and_table_paragraphs",
+            searched_not_edited: ["hyperlink_text", "content_control_values"],
             unsearched: [
-                "nested_table_cells",
                 "headers",
                 "footers",
                 "footnotes",
@@ -265,10 +264,11 @@ struct ItemReceipt {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     changed_block_ids: Vec<String>,
     created_revisions: usize,
+    /// Revisions created by earlier items of this worklist that this item
+    /// revised (replaced by one it created) or withdrew.
+    withdrawn_revisions: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     normalization_applied: Vec<&'static str>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    unreachable_matches: Vec<UnreachableMatchReceipt>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     diagnosis: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,15 +309,6 @@ struct MatchReceipt {
 }
 
 #[derive(Serialize)]
-struct UnreachableMatchReceipt {
-    region: &'static str,
-    block_id: String,
-    row: usize,
-    col: usize,
-    excerpt: String,
-}
-
-#[derive(Serialize)]
 struct VerificationReceipt {
     profile: &'static str,
     artifact_stage: &'static str,
@@ -330,6 +321,8 @@ struct VerificationReceipt {
     untouched_verified_blocks: usize,
     untouched_parts: Vec<&'static str>,
     preexisting_revisions_preserved: usize,
+    /// Pre-existing revisions the worklist edited inside (in blocks it edited).
+    preexisting_revisions_edited_inside: usize,
     new_revisions: usize,
 }
 
@@ -417,47 +410,6 @@ where
     let mut outcomes = Vec::with_capacity(submitted);
     let mut attributed_revision_ids = BTreeSet::new();
     for change in worklist.changes {
-        let unreachable = if matches!(change.scope, ReplaceTextScope::WholeDoc) {
-            unreached_cell_matches(
-                document.snapshot().canonical.as_ref(),
-                &change.old,
-                change.engine_match_mode,
-            )
-        } else {
-            Vec::new()
-        };
-        if !unreachable.is_empty() {
-            outcomes.push(ItemReceipt {
-                id: change.id,
-                status: ItemStatus::Refused,
-                expected_matches: change.expected_matches,
-                scope: change.receipt_scope,
-                match_mode: change.match_mode,
-                actual_matches: None,
-                matches: Vec::new(),
-                changed_block_ids: Vec::new(),
-                created_revisions: 0,
-                normalization_applied: Vec::new(),
-                unreachable_matches: unreachable
-                    .into_iter()
-                    .map(|site| UnreachableMatchReceipt {
-                        region: "table_cell",
-                        block_id: site.table_id.to_string(),
-                        row: site.row,
-                        col: site.col,
-                        excerpt: site.excerpt,
-                    })
-                    .collect(),
-                diagnosis: Vec::new(),
-                code: Some("unreachable_match".to_string()),
-                message: Some(
-                    "the requested text also occurs in a table cell outside worklist.v0 coverage"
-                        .to_string(),
-                ),
-            });
-            continue;
-        }
-
         let options = ReplaceTextOptions {
             old: change.old,
             new: change.new,
@@ -491,8 +443,8 @@ where
                         .collect(),
                     changed_block_ids: Vec::new(),
                     created_revisions: 0,
+                    withdrawn_revisions: 0,
                     normalization_applied: Vec::new(),
-                    unreachable_matches: Vec::new(),
                     diagnosis,
                     code: Some("match_count_mismatch".to_string()),
                     message: Some(format!(
@@ -503,6 +455,28 @@ where
                         change.expected_matches
                     )),
                 });
+                continue;
+            }
+            Err(ReplaceTextError::Engine(
+                ref error @ EditError::ReplaceTextInsideInlineObjects {
+                    ref occurrences, ..
+                },
+            )) => {
+                // Text the item asked to replace stands where the worklist
+                // does not reach: refuse, and name each place and its route.
+                let mut item = refused_engine_item(
+                    change.id,
+                    change.expected_matches,
+                    change.receipt_scope,
+                    change.match_mode,
+                    "matches_inside_inline_objects",
+                    error.to_string(),
+                );
+                item.diagnosis = occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.describe())
+                    .collect();
+                outcomes.push(item);
                 continue;
             }
             Err(ReplaceTextError::Engine(error)) => {
@@ -581,11 +555,24 @@ where
             .difference(&before_revision_ids)
             .copied()
             .collect();
-        if created_revision_ids.is_empty() {
+        // A later item may revise or undo an earlier item's pending change:
+        // editing your own pending insertion changes the proposal itself, so
+        // that revision is replaced (its content-derived id changes) or
+        // removed. The worklist's own revisions are the net set.
+        let withdrawn_revision_ids: Vec<u32> = attributed_revision_ids
+            .iter()
+            .filter(|id| !after_revision_ids.contains(id))
+            .copied()
+            .collect();
+        if created_revision_ids.is_empty() && withdrawn_revision_ids.is_empty() {
             return Err(format!(
-                "worklist item {:?} changed the document without creating a tracked revision",
+                "worklist item {:?} changed the document without creating, revising or \
+                 withdrawing a tracked revision",
                 change.id
             ));
+        }
+        for id in &withdrawn_revision_ids {
+            attributed_revision_ids.remove(id);
         }
         attributed_revision_ids.extend(created_revision_ids.iter().copied());
         document = edited;
@@ -599,8 +586,8 @@ where
             matches,
             changed_block_ids,
             created_revisions: created_revision_ids.len(),
+            withdrawn_revisions: withdrawn_revision_ids.len(),
             normalization_applied,
-            unreachable_matches: Vec::new(),
             diagnosis: Vec::new(),
             code: None,
             message: None,
@@ -619,6 +606,11 @@ where
     };
     let deliverable = refused == 0;
     let should_emit_output = applied > 0 && (deliverable || emit_partial);
+    let edited_blocks: BTreeSet<String> = outcomes
+        .iter()
+        .filter(|item| matches!(item.status, ItemStatus::Applied))
+        .flat_map(|item| item.changed_block_ids.iter().cloned())
+        .collect();
 
     let in_memory_report = if applied == 0 {
         None
@@ -626,7 +618,7 @@ where
         let report = document
             .review()
             .map_err(|e| format!("cannot verify worklist result: {e}"))?;
-        verify_report(&report)?;
+        verify_report(&report, &edited_blocks)?;
         let audited_revision_ids: BTreeSet<u32> = report
             .new_revisions
             .iter()
@@ -658,7 +650,7 @@ where
             None,
         )),
         (Some(_), Some(bytes)) => {
-            let report = verify_serialized_delivery(input.bytes(), bytes)?;
+            let report = verify_serialized_delivery(input.bytes(), bytes, &edited_blocks)?;
             let audited_revision_ids: BTreeSet<u32> = report
                 .new_revisions
                 .iter()
@@ -966,8 +958,8 @@ fn parse_scope(
 ) -> Result<(ReplaceTextScope, ScopeReceipt), String> {
     let Some(scope) = scope else {
         return Ok((
-            ReplaceTextScope::WholeDoc,
-            ScopeReceipt::AllTopLevelBodyParagraphs,
+            ReplaceTextScope::BodyAndTables,
+            ScopeReceipt::AllBodyAndTableParagraphs,
         ));
     };
     match (scope.block_id, scope.from_block_id, scope.to_block_id) {
@@ -993,7 +985,8 @@ fn parse_scope(
 }
 
 fn revision_ids(document: &Document) -> BTreeSet<u32> {
-    enumerate_revisions(document.snapshot().canonical.as_ref())
+    document
+        .revisions()
         .into_iter()
         .map(|revision| revision.revision_id)
         .collect()
@@ -1017,8 +1010,8 @@ fn refused_engine_item(
         matches: Vec::new(),
         changed_block_ids: Vec::new(),
         created_revisions: 0,
+        withdrawn_revisions: 0,
         normalization_applied: Vec::new(),
-        unreachable_matches: Vec::new(),
         diagnosis: Vec::new(),
         code: Some(code.to_string()),
         message: Some(message),
@@ -1045,7 +1038,15 @@ fn runtime_error_code(code: ErrorCode) -> &'static str {
     }
 }
 
-fn verify_report(report: &stemma::audit::AuditReport) -> Result<(), String> {
+/// The delivery policy over the exact candidate: valid, every change tracked,
+/// untouched content unchanged, and no pre-existing revision resolved. A
+/// pre-existing revision may be edited inside only where the worklist edited
+/// (`edited_blocks`): a change inside another author's pending insertion
+/// narrows that insertion, which is the edit asked for.
+fn verify_report(
+    report: &stemma::audit::AuditReport,
+    edited_blocks: &BTreeSet<String>,
+) -> Result<(), String> {
     if !report.validator.ok {
         return Err("worklist result failed structural validation".to_string());
     }
@@ -1064,11 +1065,18 @@ fn verify_report(report: &stemma::audit::AuditReport) -> Result<(), String> {
     let changed_preexisting = report
         .preexisting_revisions
         .iter()
-        .filter(|revision| !matches!(revision.disposition, RevisionDisposition::Untouched))
+        .filter(|revision| match &revision.disposition {
+            RevisionDisposition::Untouched => false,
+            RevisionDisposition::Modified { .. } => {
+                !edited_blocks.contains(&revision.record.block_id.to_string())
+            }
+            RevisionDisposition::Resolved => true,
+        })
         .count();
     if changed_preexisting != 0 {
         return Err(format!(
-            "worklist result changed or resolved {changed_preexisting} pre-existing revision(s)"
+            "worklist result changed or resolved {changed_preexisting} pre-existing revision(s) \
+             outside the blocks it edited"
         ));
     }
     Ok(())
@@ -1077,10 +1085,11 @@ fn verify_report(report: &stemma::audit::AuditReport) -> Result<(), String> {
 fn verify_serialized_delivery(
     input_bytes: &[u8],
     output_bytes: &[u8],
+    edited_blocks: &BTreeSet<String>,
 ) -> Result<stemma::audit::AuditReport, String> {
     let report = stemma::api::audit(input_bytes, output_bytes)
         .map_err(|error| format!("cannot audit serialized worklist result: {error}"))?;
-    verify_report(&report)?;
+    verify_report(&report, edited_blocks)?;
     Ok(report)
 }
 
@@ -1099,7 +1108,16 @@ fn verification_receipt(
         untouched_violations: report.untouched.violations.len(),
         untouched_verified_blocks: report.untouched.verified_blocks,
         untouched_parts: report.untouched.parts.clone(),
-        preexisting_revisions_preserved: report.preexisting_revisions.len(),
+        preexisting_revisions_preserved: report
+            .preexisting_revisions
+            .iter()
+            .filter(|revision| matches!(revision.disposition, RevisionDisposition::Untouched))
+            .count(),
+        preexisting_revisions_edited_inside: report
+            .preexisting_revisions
+            .iter()
+            .filter(|revision| matches!(revision.disposition, RevisionDisposition::Modified { .. }))
+            .count(),
         new_revisions: report.new_revisions.len(),
     }
 }
@@ -1210,7 +1228,7 @@ mod tests {
             .serialize(&ExportOptions::default())
             .expect("serialize direct edit");
 
-        let error = verify_serialized_delivery(&before, &after)
+        let error = verify_serialized_delivery(&before, &after, &BTreeSet::new())
             .expect_err("untracked direct output is not deliverable");
         assert!(
             error.contains("untracked direct change"),

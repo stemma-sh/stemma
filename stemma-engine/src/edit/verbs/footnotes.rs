@@ -49,16 +49,18 @@
 //! no renumber pass — do not add one.**
 //!
 //! v1 scope (fail loud beyond it, per CLAUDE.md "start narrow"):
-//! - `InsertNote` targets top-level body paragraphs only; the `expect` anchor
-//!   must lie within a single contiguous run of `Text` nodes in one Normal
-//!   segment;
+//! - `InsertNote` targets a body paragraph, top-level or in a table cell; the
+//!   `expect` anchor must lie within a contiguous run of `Text` nodes in one
+//!   Normal segment (zero-width markers do not break it);
 //! - `body` must be non-empty (an empty note is refused, not defaulted);
-//! - `EditNote` replaces the note story's body from the provided text (v1:
-//!   single-paragraph body only — `NoteBodyMultiParagraph` beyond that),
-//!   preserving the leading `footnoteRef`/`endnoteRef` decoration and any
-//!   pre-existing opaque inlines in the note story (else `OpaqueDestroyed`);
-//!   `Direct` mode wholesale-rebuilds the paragraph, `TrackedChange` mode
-//!   surgically word-diffs it;
+//! - `EditNote` edits the note story's body from the provided text, one line
+//!   per note paragraph: each paragraph is word-diffed in place (tracked) or
+//!   rewritten in place (direct), keeping its properties and the leading
+//!   `footnoteRef`/`endnoteRef` decoration; a note carrying opaque inlines or
+//!   line breaks is refused (`OpaqueDestroyed`). A line count other than the
+//!   paragraph count is refused (`NoteBodyLineCountMismatch`); a one-line body
+//!   for a note of several paragraphs rebuilds it as one paragraph in `Direct`
+//!   mode and is refused in `TrackedChange` mode (`NoteBodyMultiParagraph`);
 //! - `DeleteNote` removes (`Direct`) or tracked-deletes (`TrackedChange`) the
 //!   story AND every matching reference run; a story with no body reference
 //!   (or a reference with no story) is a hard error (`NoteReferenceMissing`),
@@ -69,7 +71,7 @@ use super::super::{
     find_opaque_flat_index, next_revision,
 };
 use super::super::{EditError, MaterializationMode};
-use super::super::{find_block_index, validate_block_is_editable};
+use super::super::{block_at, block_at_mut, find_editable_block_path, validate_block_is_editable};
 use crate::domain::{
     BlockNode, CanonDoc, DecorationNode, DecorationType, DocPart, EndnoteStory, FootnoteStory,
     InlineNode, NodeId, NoteReferenceData, NoteType, OpaqueInlineNode, OpaqueKind, ParagraphNode,
@@ -153,15 +155,10 @@ pub(crate) fn apply_insert(
         return Err(EditError::NoteEmptyBody { step_index });
     }
 
-    // v1: top-level body paragraphs only. A nested paragraph surfaces as
-    // BlockNotFound here, matching the other anchor-splice verbs.
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
+    // The paragraph may be top-level or in a table cell.
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NoteAnchorNotAParagraph {
@@ -180,7 +177,7 @@ pub(crate) fn apply_insert(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -193,26 +190,12 @@ pub(crate) fn apply_insert(
     // Allocate the link id before borrowing the paragraph mutably.
     let note_id = allocate_note_id(doc, step_index)?;
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
     let plan = find_anchor(&para.segments, expect).ok_or_else(|| {
-        let visible: String = para
-            .segments
-            .iter()
-            .flat_map(|s| s.inlines.iter())
-            .filter_map(|i| match i {
-                InlineNode::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        EditError::ExpectMismatch {
-            block_id: block_id.clone(),
-            expected: expect.to_string(),
-            actual_text: visible,
-            step_index,
-        }
+        super::super::unlocatable_expect(para, block_id, expect, false, step_index)
     })?;
 
     let reference = synthesize_reference_inline(&para.id, &note_id, note_kind);
@@ -254,14 +237,48 @@ pub(crate) fn apply_insert(
     let content_hash =
         crate::import::compute_story_content_hash(std::slice::from_ref(&blocks[0].block));
 
+    // A document's first note of a kind creates its part, which opens with the
+    // reserved separator notes Word requires (§17.11.10). They are part of the
+    // document from here on, as they are when a document with notes is read.
+    let first_of_kind = match note_kind {
+        NoteKind::Footnote => doc.footnotes.is_empty(),
+        NoteKind::Endnote => doc.endnotes.is_empty(),
+    };
+    if first_of_kind {
+        for (id, note_type) in [
+            ("-1", NoteType::Separator),
+            ("0", NoteType::ContinuationSeparator),
+        ] {
+            let (source_attrs, blocks, content_hash) = reserved_note(note_kind, id, &note_type);
+            match note_kind {
+                NoteKind::Footnote => doc.footnotes.push(FootnoteStory {
+                    source_attrs,
+                    id: id.to_string(),
+                    note_type,
+                    blocks,
+                    content_hash,
+                }),
+                NoteKind::Endnote => doc.endnotes.push(EndnoteStory {
+                    source_attrs,
+                    id: id.to_string(),
+                    note_type,
+                    blocks,
+                    content_hash,
+                }),
+            }
+        }
+    }
+
     match note_kind {
         NoteKind::Footnote => doc.footnotes.push(FootnoteStory {
+            source_attrs: Vec::new(),
             id: note_id,
             note_type: NoteType::Normal,
             blocks,
             content_hash,
         }),
         NoteKind::Endnote => doc.endnotes.push(EndnoteStory {
+            source_attrs: Vec::new(),
             id: note_id,
             note_type: NoteType::Normal,
             blocks,
@@ -327,160 +344,181 @@ pub(crate) fn apply_edit(
     // v1 authors plain text, so any opaque present means a richer note we
     // cannot faithfully rebuild/diff from a flat string — fail loud rather
     // than silently destroy it.
-    let opaque_ids = story_opaque_ids(existing_blocks);
-    if !opaque_ids.is_empty() {
+    let preserved = story_preserved_inlines(existing_blocks);
+    if !preserved.is_empty() {
         let preview = story_text_preview(existing_blocks);
-        let missing_inline_kinds = vec!["opaque"; opaque_ids.len()];
+        let (missing_opaque_ids, missing_inline_kinds) = preserved.into_iter().unzip();
         return Err(EditError::OpaqueDestroyed {
             step_index,
             target_block_id: NodeId::from(format!("{}_{note_id}", note_kind.label())),
-            missing_opaque_ids: opaque_ids,
+            missing_opaque_ids,
             missing_inline_kinds,
             original_text_preview: preview,
         });
     }
 
-    match mode {
-        MaterializationMode::Direct => {
-            // Unchanged pre-existing contract: rebuild the single-paragraph
-            // body (footnoteRef/endnoteRef + new text).
-            let story_para = build_note_body_paragraph(note_id, note_kind, body);
-            let blocks = vec![TrackedBlock {
-                status: TrackingStatus::Normal,
-                block: BlockNode::from(story_para),
-                move_id: None,
-                block_sdt_wrap: None,
-            }];
-            let content_hash =
-                crate::import::compute_story_content_hash(std::slice::from_ref(&blocks[0].block));
-            match note_kind {
-                NoteKind::Footnote => {
-                    let story = doc
-                        .footnotes
-                        .iter_mut()
-                        .find(|f| f.id == note_id)
-                        .expect("located above");
-                    story.blocks = blocks;
-                    story.content_hash = content_hash;
-                }
-                NoteKind::Endnote => {
-                    let story = doc
-                        .endnotes
-                        .iter_mut()
-                        .find(|e| e.id == note_id)
-                        .expect("located above");
-                    story.blocks = blocks;
-                    story.content_hash = content_hash;
-                }
-            }
+    // A body with line breaks gives one line per note paragraph, in order:
+    // each paragraph is edited in place, like a body paragraph, so its style,
+    // numbering and markers survive. A one-line body edits a one-paragraph
+    // note in place, or (direct) rebuilds a longer note as one paragraph.
+    let lines: Vec<&str> = body
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let paragraph_count = existing_blocks.len();
+    if lines.len() > 1 && lines.len() != paragraph_count {
+        return Err(EditError::NoteBodyLineCountMismatch {
+            note_id: note_id.to_string(),
+            note_kind: note_kind.label(),
+            paragraph_count,
+            line_count: lines.len(),
+            step_index,
+        });
+    }
+    if lines.len() == 1 && paragraph_count != 1 {
+        if mode == MaterializationMode::TrackedChange {
+            return Err(EditError::NoteBodyMultiParagraph {
+                note_id: note_id.to_string(),
+                note_kind: note_kind.label(),
+                paragraph_count,
+                step_index,
+            });
         }
-        MaterializationMode::TrackedChange => {
-            // v1 scope: a single-paragraph body only (module doc). A richer
-            // shape would silently lose every paragraph past the first if we
-            // diffed only `blocks[0]` — refuse instead of guessing.
-            if existing_blocks.len() != 1 {
-                return Err(EditError::NoteBodyMultiParagraph {
-                    note_id: note_id.to_string(),
-                    note_kind: note_kind.label(),
-                    paragraph_count: existing_blocks.len(),
-                    step_index,
-                });
-            }
+        let story_para = build_note_body_paragraph(note_id, note_kind, body);
+        let blocks = vec![TrackedBlock {
+            status: TrackingStatus::Normal,
+            block: BlockNode::from(story_para),
+            move_id: None,
+            block_sdt_wrap: None,
+        }];
+        let content_hash =
+            crate::import::compute_story_content_hash(std::slice::from_ref(&blocks[0].block));
+        let (story_blocks, story_hash) = note_story_mut(doc, note_id, note_kind);
+        *story_blocks = blocks;
+        *story_hash = content_hash;
+        return Ok(());
+    }
 
-            let tracked_block = match note_kind {
-                NoteKind::Footnote => doc
-                    .footnotes
-                    .iter_mut()
-                    .find(|f| f.id == note_id)
-                    .map(|f| &mut f.blocks[0]),
-                NoteKind::Endnote => doc
-                    .endnotes
-                    .iter_mut()
-                    .find(|e| e.id == note_id)
-                    .map(|e| &mut e.blocks[0]),
-            }
-            .expect("located above");
+    let direct = mode == MaterializationMode::Direct;
+    let (blocks, content_hash) = note_story_mut(doc, note_id, note_kind);
+    for (tracked_block, line) in blocks.iter_mut().zip(&lines) {
+        edit_note_paragraph_in_place(
+            tracked_block,
+            line,
+            direct,
+            revision,
+            rev_counter,
+            step_index,
+        )?;
+    }
+    *content_hash = crate::import::compute_story_content_hash(
+        &blocks.iter().map(|b| b.block.clone()).collect::<Vec<_>>(),
+    );
+    Ok(())
+}
 
-            // No stacking: a story block that already carries a pending
-            // tracked status (e.g. a not-yet-resolved tracked InsertNote, or a
-            // pending DeleteNote) is refused rather than layering a second
-            // change onto it — the SAME convention `validate_block_is_editable`
-            // enforces for ordinary body-paragraph edits.
-            validate_block_is_editable(tracked_block, step_index)?;
-
-            let BlockNode::Paragraph(para) = &mut tracked_block.block else {
-                unreachable!(
-                    "story_opaque_ids treats Table/OpaqueBlock as opaque and refuses above"
-                );
-            };
-
-            // Isolate the leading footnoteRef/endnoteRef decoration from the
-            // word-diff entirely, rather than leaning on the body's generic
-            // structural-marker offset repositioning
-            // (`inject_structural_markers_at_offsets`). That machinery
-            // re-inserts a marker INTO whichever segment the diff produces at
-            // its offset — correct for a comment range (its fate legitimately
-            // follows the text it brackets), but wrong here: offset 0 can land
-            // inside a freshly `Deleted` segment (the first word changed), and
-            // accepting that deletion would delete the decoration WITH it —
-            // permanently destroying the note's auto-number marker. The
-            // decoration has no such text relationship; it must survive
-            // untouched no matter what the diff does to the words after it.
-            // So: pop it off before diffing, run the surgical diff on the
-            // remaining content, then prepend it back as its own leading
-            // `Normal` segment.
-            let leading_decoration = match para.segments.first_mut() {
-                Some(seg) if matches!(seg.inlines.first(), Some(InlineNode::Decoration(_))) => {
-                    let deco = seg.inlines.remove(0);
-                    if seg.inlines.is_empty() {
-                        para.segments.remove(0);
-                    }
-                    Some(deco)
-                }
-                _ => None,
-            };
-
-            let content = ParagraphContent {
-                fragments: vec![ContentFragment::Text(body.to_string())],
-            };
-            // No enclosing block insertion: a note paragraph has no top-level
-            // block-insertion axis (the pending-block-insertion case), and the note-block guard
-            // upstream refuses a tracked-inserted note block.
-            apply_replace_paragraph_text(para, &content, revision, None, rev_counter);
-
-            if let Some(deco) = leading_decoration {
-                para.segments.insert(
-                    0,
-                    TrackedSegment {
-                        status: TrackingStatus::Normal,
-                        inlines: vec![deco],
-                    },
-                );
-            }
-
-            let content_hash = crate::import::compute_story_content_hash(std::slice::from_ref(
-                &tracked_block.block,
-            ));
-            match note_kind {
-                NoteKind::Footnote => {
-                    let story = doc
-                        .footnotes
-                        .iter_mut()
-                        .find(|f| f.id == note_id)
-                        .expect("located above");
-                    story.content_hash = content_hash;
-                }
-                NoteKind::Endnote => {
-                    let story = doc
-                        .endnotes
-                        .iter_mut()
-                        .find(|e| e.id == note_id)
-                        .expect("located above");
-                    story.content_hash = content_hash;
-                }
-            }
+/// The note story's blocks and content hash, by id.
+fn note_story_mut<'a>(
+    doc: &'a mut CanonDoc,
+    note_id: &str,
+    note_kind: NoteKind,
+) -> (&'a mut Vec<TrackedBlock>, &'a mut String) {
+    match note_kind {
+        NoteKind::Footnote => {
+            let story = doc
+                .footnotes
+                .iter_mut()
+                .find(|f| f.id == note_id)
+                .expect("located by the caller");
+            (&mut story.blocks, &mut story.content_hash)
+        }
+        NoteKind::Endnote => {
+            let story = doc
+                .endnotes
+                .iter_mut()
+                .find(|e| e.id == note_id)
+                .expect("located by the caller");
+            (&mut story.blocks, &mut story.content_hash)
         }
     }
+}
+
+/// Edit one note paragraph in place to `line`: a surgical word-diff, as a
+/// body paragraph's `replace` is, keeping its properties and leading marker.
+fn edit_note_paragraph_in_place(
+    tracked_block: &mut TrackedBlock,
+    line: &str,
+    direct: bool,
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+    step_index: usize,
+) -> Result<(), EditError> {
+    // No stacking: a story block that already carries a pending
+    // tracked status (e.g. a not-yet-resolved tracked InsertNote, or a
+    // pending DeleteNote) is refused rather than layering a second
+    // change onto it — the SAME convention `validate_block_is_editable`
+    // enforces for ordinary body-paragraph edits.
+    if direct {
+        // A direct edit works on the note's accepted content, as a
+        // direct body-paragraph edit does.
+        super::super::project_block_for_accept_reject(&mut tracked_block.block, true);
+    }
+    validate_block_is_editable(tracked_block, step_index)?;
+
+    let BlockNode::Paragraph(para) = &mut tracked_block.block else {
+        unreachable!(
+            "story_preserved_inlines treats Table/OpaqueBlock as opaque and refuses above"
+        );
+    };
+
+    // Isolate the leading footnoteRef/endnoteRef decoration from the
+    // word-diff entirely, rather than leaning on the body's generic
+    // structural-marker offset repositioning
+    // (`inject_structural_markers_at_offsets`). That machinery
+    // re-inserts a marker INTO whichever segment the diff produces at
+    // its offset — correct for a comment range (its fate legitimately
+    // follows the text it brackets), but wrong here: offset 0 can land
+    // inside a freshly `Deleted` segment (the first word changed), and
+    // accepting that deletion would delete the decoration WITH it —
+    // permanently destroying the note's auto-number marker. The
+    // decoration has no such text relationship; it must survive
+    // untouched no matter what the diff does to the words after it.
+    // So: pop it off before diffing, run the surgical diff on the
+    // remaining content, then prepend it back as its own leading
+    // `Normal` segment.
+    let leading_decoration = match para.segments.first_mut() {
+        Some(seg) if matches!(seg.inlines.first(), Some(InlineNode::Decoration(_))) => {
+            let deco = seg.inlines.remove(0);
+            if seg.inlines.is_empty() {
+                para.segments.remove(0);
+            }
+            Some(deco)
+        }
+        _ => None,
+    };
+
+    let content = ParagraphContent {
+        fragments: vec![ContentFragment::Text(line.to_string())],
+    };
+    // No enclosing block insertion: a note paragraph has no top-level
+    // block-insertion axis (the pending-block-insertion case), and the note-block guard
+    // upstream refuses a tracked-inserted note block.
+    apply_replace_paragraph_text(para, &content, revision, None, rev_counter);
+
+    if let Some(deco) = leading_decoration {
+        para.segments.insert(
+            0,
+            TrackedSegment {
+                status: TrackingStatus::Normal,
+                inlines: vec![deco],
+            },
+        );
+    }
+    if direct {
+        // Resolve the edit's own changes at once, leaving no revision.
+        super::super::project_block_for_accept_reject(&mut tracked_block.block, true);
+    }
+
     Ok(())
 }
 
@@ -637,6 +675,7 @@ fn synthesize_reference_inline(para_id: &NodeId, note_id: &str, kind: NoteKind) 
         // carry it in the typed model too so a live snapshot and its reopened
         // form expose the same effective wrapper formatting.
         wrapper_style_props,
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: None,
@@ -644,8 +683,9 @@ fn synthesize_reference_inline(para_id: &NodeId, note_id: &str, kind: NoteKind) 
     })
 }
 
-/// Locate `expect` inside a single contiguous run of `Text` nodes within one
-/// Normal segment. Identical strategy to `fields_crossrefs::find_anchor`.
+/// Locate `expect` inside a contiguous run of `Text` nodes (zero-width markers
+/// do not break it) within one Normal segment. Identical strategy to
+/// `fields_crossrefs::find_anchor`.
 fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> {
     if expect.is_empty() {
         return None;
@@ -669,6 +709,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                         concat.push_str(&t.text);
                         j += 1;
                     }
+                    marker if super::super::is_zero_width_marker(marker) => j += 1,
                     _ => break,
                 }
             }
@@ -676,7 +717,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                 let mut consumed = 0usize;
                 for (k, inline) in inlines.iter().enumerate().take(j).skip(i) {
                     let InlineNode::Text(t) = inline else {
-                        unreachable!("run is all TextNodes");
+                        continue; // a zero-width marker inside the run
                     };
                     let len = t.text.chars().count();
                     if match_end_chars <= consumed + len {
@@ -794,6 +835,7 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
         ..crate::domain::StyleProps::default()
     };
     let deco = InlineNode::from(DecorationNode {
+        source_run_attrs: Vec::new(),
         id: NodeId::from(format!("{para_id}_ref")),
         // Footnote/endnote auto-number markers are not in DecorationType; they
         // round-trip purely through raw_xml. The importer classifies them
@@ -821,6 +863,61 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
     para.block_text_hash = None;
     para.rendered_text = None;
     para
+}
+
+/// The root attributes, blocks and content hash of a reserved separator note:
+/// one paragraph holding the `w:separator` or `w:continuationSeparator` mark.
+fn reserved_note(
+    kind: NoteKind,
+    id: &str,
+    note_type: &NoteType,
+) -> (
+    Vec<crate::domain::QualifiedAttribute>,
+    Vec<TrackedBlock>,
+    String,
+) {
+    let tag = match note_type {
+        NoteType::Separator => "separator",
+        NoteType::ContinuationSeparator => "continuationSeparator",
+        other => unreachable!("{other:?} is not a separator note"),
+    };
+    let para_id = format!("{}_{id}_p1", kind.label());
+    let mut para = ParagraphNode::new_story_body(&para_id, "", None);
+    para.segments = vec![TrackedSegment {
+        status: TrackingStatus::Normal,
+        inlines: vec![InlineNode::from(DecorationNode {
+            source_run_attrs: Vec::new(),
+            id: NodeId::from(format!("{para_id}_mark")),
+            // The importer reads both marks as foreign elements.
+            kind: DecorationType::ForeignElement,
+            opaque_ref: format!("{para_id}_mark"),
+            proof_ref: ProofRef {
+                part: DocPart::DocumentXml,
+                block_id: NodeId::from(format!("{para_id}_mark")),
+                docx_anchor: String::new(),
+            },
+            wrapper_marks: Vec::new(),
+            wrapper_style_props: StyleProps::default(),
+            joins_following_text_run: false,
+            raw_xml: Some(format!("<w:{tag}/>").into_bytes()),
+            origin: None,
+        })],
+    }];
+    let block = BlockNode::from(para);
+    let content_hash = crate::import::compute_story_content_hash(std::slice::from_ref(&block));
+    let source_attrs = vec![crate::domain::QualifiedAttribute {
+        local_name: "type".to_string(),
+        prefix: Some("w".to_string()),
+        namespace: Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main".to_string()),
+        value: tag.to_string(),
+    }];
+    let blocks = vec![TrackedBlock {
+        status: TrackingStatus::Normal,
+        block,
+        move_id: None,
+        block_sdt_wrap: None,
+    }];
+    (source_attrs, blocks, content_hash)
 }
 
 // ─── reference scanning / removal helpers ─────────────────────────────────────
@@ -918,26 +1015,34 @@ fn mark_references_deleted_in_block(
     }
 }
 
-/// Collect the ids of every inline opaque (image, field, reference, etc.) in
-/// the story. Used by `EditNote` to refuse a wholesale text replace that would
-/// silently destroy such content. A table / opaque block in a note story is
-/// itself non-flat-text content, surfaced under its block id.
-fn story_opaque_ids(blocks: &[TrackedBlock]) -> Vec<String> {
-    let mut ids = Vec::new();
+/// The id and kind label of every preserved inline in the story — each inline
+/// opaque (image, field, reference, etc.) and each line break, the same set a
+/// body paragraph's `replace` must carry (`collect_anchor_inventory`). Used by
+/// `EditNote` to refuse a wholesale text replace that would silently destroy
+/// such content: its plain-text body has no way to carry one. A table / opaque
+/// block in a note story is itself non-flat-text content, surfaced under its
+/// block id.
+fn story_preserved_inlines(blocks: &[TrackedBlock]) -> Vec<(String, &'static str)> {
+    let mut preserved = Vec::new();
     for tb in blocks {
         match &tb.block {
             BlockNode::Paragraph(p) => {
                 for inline in p.segments.iter().flat_map(|s| s.inlines.iter()) {
-                    if let InlineNode::OpaqueInline(o) = inline {
-                        ids.push(o.id.0.to_string());
+                    match inline {
+                        InlineNode::OpaqueInline(o) => preserved
+                            .push((o.id.0.to_string(), super::super::opaque_kind_label(&o.kind))),
+                        InlineNode::HardBreak(b) => {
+                            preserved.push((b.id.0.to_string(), "hard_break"))
+                        }
+                        _ => {}
                     }
                 }
             }
-            BlockNode::Table(t) => ids.push(t.id.0.to_string()),
-            BlockNode::OpaqueBlock(o) => ids.push(o.id.0.to_string()),
+            BlockNode::Table(t) => preserved.push((t.id.0.to_string(), "opaque")),
+            BlockNode::OpaqueBlock(o) => preserved.push((o.id.0.to_string(), "opaque")),
         }
     }
-    ids
+    preserved
 }
 
 /// Short visible-text preview of a note story (first paragraph's text), for the
@@ -993,6 +1098,7 @@ mod tests {
 
     fn footnote(id: &str, note_type: NoteType) -> FootnoteStory {
         FootnoteStory {
+            source_attrs: Vec::new(),
             id: id.to_string(),
             note_type,
             blocks: vec![],
@@ -1016,6 +1122,7 @@ mod tests {
         let mut doc = empty_doc();
         doc.footnotes = vec![footnote("1", NoteType::Normal)];
         doc.endnotes = vec![EndnoteStory {
+            source_attrs: Vec::new(),
             id: "5".to_string(),
             note_type: NoteType::Normal,
             blocks: vec![],

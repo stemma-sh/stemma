@@ -75,6 +75,8 @@ fn insert_after(anchor: &NodeId, texts: &[&str]) -> EditTransaction {
                 .iter()
                 .map(|t| {
                     BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some("body".to_string()),
                         content: parse_paragraph_markup(t).unwrap(),
                         restart_numbering: false,
@@ -168,6 +170,270 @@ fn paragraph_mark_has(el: &Element, marker: &str) -> bool {
     el.get_child("pPr")
         .and_then(|ppr| ppr.get_child("rPr"))
         .is_some_and(|rpr| rpr.get_child(marker).is_some())
+}
+
+/// A surviving cell owns its final paragraph mark. Appending text introduces
+/// the preceding break, not a rejectable mark beyond the cell boundary.
+#[test]
+fn cell_tail_append_preserves_the_original_final_mark() {
+    let runtime = SimpleRuntime::new();
+    let imported = runtime.import_docx(&make_docx_with_body(&format!(
+        "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2400\"/></w:tblGrid><w:tr><w:tc><w:tcPr/>{}</w:tc></w:tr></w:tbl>{}",
+        para("Original cell."), para("Body tail.")
+    ))).unwrap();
+    let BlockNode::Table(table) = &imported.canonical.blocks[0].block else {
+        panic!("table")
+    };
+    let BlockNode::Paragraph(anchor) = &table.rows[0].cells[0].blocks[0] else {
+        panic!("cell paragraph")
+    };
+    let cell_fixture = Fixture {
+        runtime,
+        handle: imported.doc_handle,
+        para_ids: vec![],
+    };
+    let (canonical, root) = apply_and_export(
+        &cell_fixture,
+        &insert_after(&anchor.id, &["Appended cell."]),
+    );
+    let cell = body_element(&root)
+        .get_child("tbl")
+        .unwrap()
+        .get_child("tr")
+        .unwrap()
+        .get_child("tc")
+        .unwrap();
+    let paragraphs: Vec<_> = cell
+        .children
+        .iter()
+        .filter_map(|node| match node {
+            xmltree::XMLNode::Element(element) if element.name == "p" => Some(element),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paragraphs.len(), 2);
+    assert!(
+        !paragraph_mark_has(paragraphs[1], "ins"),
+        "the cell-final mark belongs to the original reading"
+    );
+    assert!(
+        paragraph_mark_has(paragraphs[0], "ins"),
+        "the appended paragraph introduces the preceding break"
+    );
+    let texts = |doc: &CanonDoc| {
+        let BlockNode::Table(table) = &doc.blocks[0].block else {
+            panic!("table")
+        };
+        table.rows[0].cells[0]
+            .blocks
+            .iter()
+            .map(|block| {
+                let BlockNode::Paragraph(p) = block else {
+                    panic!("paragraph")
+                };
+                p.all_inlines()
+                    .filter_map(|inline| match inline {
+                        InlineNode::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut accepted = canonical.clone();
+    accept_all(&mut accepted);
+    assert_eq!(texts(&accepted), ["Original cell.", "Appended cell."]);
+    let mut rejected = canonical;
+    reject_all_with_styles(&mut rejected, None);
+    assert_eq!(texts(&rejected), ["Original cell."]);
+}
+
+#[test]
+fn cell_tail_append_then_delete_keeps_both_readings() {
+    let runtime = SimpleRuntime::new();
+    let imported = runtime.import_docx(&make_docx_with_body(&format!(
+        "<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w=\"2400\"/></w:tblGrid><w:tr><w:tc><w:tcPr/>{}</w:tc></w:tr></w:tbl>{}",
+        para("Original cell."), para("Body tail.")
+    ))).unwrap();
+    let BlockNode::Table(table) = &imported.canonical.blocks[0].block else {
+        panic!("table")
+    };
+    let BlockNode::Paragraph(anchor) = &table.rows[0].cells[0].blocks[0] else {
+        panic!("paragraph")
+    };
+    let anchor_id = anchor.id.clone();
+    let mut transaction = insert_after(&anchor_id, &["Replacement cell."]);
+    transaction.steps.push(EditStep::DeleteBlockRange {
+        story: stemma::edit::StoryRef::Body,
+        from_block_id: anchor_id.clone(),
+        to_block_id: anchor_id,
+        rationale: None,
+        expect: "Original cell.".into(),
+        semantic_hash: None,
+    });
+    let fixture = Fixture {
+        runtime,
+        handle: imported.doc_handle,
+        para_ids: vec![],
+    };
+    let (pending, root) = apply_and_export(&fixture, &transaction);
+    let cell = body_element(&root)
+        .get_child("tbl")
+        .unwrap()
+        .get_child("tr")
+        .unwrap()
+        .get_child("tc")
+        .unwrap();
+    let paragraphs: Vec<_> = cell
+        .children
+        .iter()
+        .filter_map(|node| match node {
+            xmltree::XMLNode::Element(e) if e.name == "p" => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paragraphs.len(), 2);
+    assert!(paragraph_mark_has(paragraphs[0], "ins"));
+    assert!(paragraph_mark_has(paragraphs[0], "del"));
+    assert!(!paragraph_mark_has(paragraphs[1], "ins"));
+    assert!(!paragraph_mark_has(paragraphs[1], "del"));
+    for (accept, expected) in [(true, "Replacement cell."), (false, "Original cell.")] {
+        let mut projected = pending.clone();
+        if accept {
+            accept_all(&mut projected);
+        } else {
+            reject_all_with_styles(&mut projected, None);
+        }
+        let BlockNode::Table(table) = &projected.blocks[0].block else {
+            panic!("table")
+        };
+        let [BlockNode::Paragraph(paragraph)] = table.rows[0].cells[0].blocks.as_slice() else {
+            panic!("one cell paragraph required")
+        };
+        let text = paragraph
+            .all_inlines()
+            .filter_map(|inline| match inline {
+                InlineNode::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, expected);
+    }
+    let bytes = fixture
+        .runtime
+        .export_docx(&fixture.handle, ExportMode::Redline)
+        .unwrap();
+    let document = stemma::api::Document::parse(&bytes).unwrap();
+    for resolution in [stemma::Resolution::AcceptAll, stemma::Resolution::RejectAll] {
+        let projected = document.project(resolution).unwrap();
+        let persisted = projected
+            .serialize(&stemma::ExportOptions::default())
+            .unwrap();
+        assert!(stemma::api::validate(&persisted).ok);
+        assert!(
+            stemma::api::Document::parse(&persisted)
+                .unwrap()
+                .revisions()
+                .is_empty()
+        );
+    }
+    let ids: BTreeSet<_> = document
+        .revisions()
+        .iter()
+        .map(|record| record.revision_id)
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "append and deletion are two independently selectable intentions: {:?}",
+        document.revisions()
+    );
+    assert_eq!(
+        revision_groups(&pending),
+        revision_groups(&document.snapshot().canonical),
+        "persistence must not split or regroup intentions"
+    );
+    // Every proposal must be independently resolvable without leaving an
+    // untracked empty cell paragraph or losing an unrelated pending proposal.
+    for id in ids {
+        let kind = document
+            .revisions()
+            .into_iter()
+            .find(|record| record.revision_id == id)
+            .unwrap()
+            .kind;
+        for action in [
+            ResolveSelectionAction::Accept,
+            ResolveSelectionAction::Reject,
+        ] {
+            let projected = document
+                .project(stemma::Resolution::Selective {
+                    ids: [id].into_iter().collect(),
+                    action,
+                })
+                .unwrap();
+            let persisted = projected
+                .serialize(&stemma::ExportOptions::default())
+                .unwrap();
+            assert!(stemma::api::validate(&persisted).ok);
+            let reopened = stemma::api::Document::parse(&persisted).unwrap();
+            for resolution in [stemma::Resolution::AcceptAll, stemma::Resolution::RejectAll] {
+                let final_accept = matches!(resolution, stemma::Resolution::AcceptAll);
+                let terminal = reopened.project(resolution).unwrap();
+                assert!(terminal.revisions().is_empty());
+                let BlockNode::Table(table) = &terminal.snapshot().canonical.blocks[0].block else {
+                    panic!("table")
+                };
+                assert!(!table.rows[0].cells[0].blocks.is_empty());
+                let actual: Vec<_> = table.rows[0].cells[0]
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        let BlockNode::Paragraph(p) = block else {
+                            panic!("cell paragraph")
+                        };
+                        p.all_inlines()
+                            .filter_map(|inline| match inline {
+                                InlineNode::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>()
+                    })
+                    .collect();
+                let expected: Vec<&str> = match (kind, action, final_accept) {
+                    (stemma::RevisionKind::Insert, ResolveSelectionAction::Accept, true) => {
+                        vec!["Replacement cell."]
+                    }
+                    (stemma::RevisionKind::Insert, ResolveSelectionAction::Accept, false) => {
+                        vec!["Original cell.", "Replacement cell."]
+                    }
+                    (stemma::RevisionKind::Insert, ResolveSelectionAction::Reject, true) => {
+                        vec![""]
+                    }
+                    (stemma::RevisionKind::Insert, ResolveSelectionAction::Reject, false) => {
+                        vec!["Original cell."]
+                    }
+                    (stemma::RevisionKind::Delete, ResolveSelectionAction::Accept, true) => {
+                        vec!["Replacement cell."]
+                    }
+                    (stemma::RevisionKind::Delete, ResolveSelectionAction::Accept, false) => {
+                        vec![""]
+                    }
+                    (stemma::RevisionKind::Delete, ResolveSelectionAction::Reject, true) => {
+                        vec!["Original cell.", "Replacement cell."]
+                    }
+                    (stemma::RevisionKind::Delete, ResolveSelectionAction::Reject, false) => {
+                        vec!["Original cell."]
+                    }
+                    _ => panic!("unexpected intention {kind:?}"),
+                };
+                assert_eq!(
+                    actual, expected,
+                    "selected {kind:?} {action:?}, terminal accept={final_accept}"
+                );
+            }
+        }
+    }
 }
 
 /// Visible text of every body paragraph, joined by `\n` (the engine's own
@@ -295,6 +561,38 @@ fn tail_append_is_one_identity_across_save_and_reopen() {
     );
 }
 
+/// A tail append has one spelling. The engine models an inserted paragraph
+/// as a block-level insertion, and at the end of a story the inserted pilcrow
+/// is displaced onto the anchor (the story's final mark cannot carry it). The
+/// saved form must reopen as that same model, for one appended paragraph and
+/// for several.
+#[test]
+fn tail_append_reopens_as_the_model_that_saved_it() {
+    for appended in [&["Appended."][..], &["Appended A.", "Appended B."][..]] {
+        let fixture = import_body(&format!("{}{}", para("First."), para("Second.")));
+        let anchor = fixture.para_ids.last().unwrap().clone();
+        let result = fixture
+            .runtime
+            .apply_edit(&fixture.handle, &insert_after(&anchor, appended))
+            .expect("apply_edit");
+        let bytes = fixture
+            .runtime
+            .export_docx(&fixture.handle, ExportMode::Redline)
+            .expect("export_docx");
+        let reopened = SimpleRuntime::new()
+            .import_docx(&bytes)
+            .expect("reopen the exported redline")
+            .canonical;
+        let differences =
+            stemma::roundtrip_compare::compare_canon_docs(&result.canonical, &reopened);
+        assert!(
+            differences.is_empty(),
+            "{} appended paragraph(s): {differences:#?}",
+            appended.len()
+        );
+    }
+}
+
 // ── (i) tracked InsertParagraphs after the LAST body paragraph ──────────────
 
 #[test]
@@ -344,13 +642,27 @@ fn body_range_marker_after_last_paragraph_does_not_hide_the_final_mark() {
     // A body-level bookmark end is zero-width. It may legally follow the last
     // paragraph, but that paragraph's pilcrow is still the document-final mark.
     // The canonical model preserves the marker as an opaque block, so the
-    // normalizer must look through it without moving or consuming it.
+    // normalizer must look through it without moving or consuming it. (An
+    // insert after the last paragraph lands after such a marker, outside the
+    // range it closes; a tracked delete of the last paragraph keeps it last.)
     let fixture = import_body(&format!(
         "{}<w:p><w:bookmarkStart w:id=\"7\" w:name=\"tail\"/><w:r><w:t>Second.</w:t></w:r></w:p><w:bookmarkEnd w:id=\"7\"/>",
         para("First.")
     ));
-    let anchor = fixture.para_ids.last().unwrap().clone();
-    let tx = insert_after(&anchor, &["Inserted A.", "Inserted B."]);
+    let victim = fixture.para_ids.last().unwrap().clone();
+    let tx = EditTransaction {
+        steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
+            from_block_id: victim.clone(),
+            to_block_id: victim,
+            rationale: None,
+            expect: "Second.".to_string(),
+            semantic_hash: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::TrackedChange,
+        revision: test_revision(),
+    };
     let (canonical, root) = apply_and_export(&fixture, &tx);
 
     assert!(
@@ -378,7 +690,7 @@ fn body_range_marker_after_last_paragraph_does_not_hide_the_final_mark() {
         "the zero-width trailing marker must not leave the final pilcrow tracked"
     );
     assert!(
-        !paragraph_mark_has(last_paragraph(&root), "ins"),
+        !paragraph_mark_has(last_paragraph(&root), "del"),
         "serialized final pilcrow must remain untracked"
     );
 
@@ -391,7 +703,7 @@ fn body_range_marker_after_last_paragraph_does_not_hide_the_final_mark() {
     );
     let (accept, reject) = accept_reject_text(&canonical);
     assert_eq!(reject, "First.\nSecond.");
-    assert_eq!(accept, "First.\nSecond.\nInserted A.\nInserted B.");
+    assert_eq!(accept, "First.");
 }
 
 // ── (ii) tracked DeleteBlockRange of the LAST paragraph ─────────────────────
@@ -403,6 +715,7 @@ fn delete_last_body_paragraph_leaves_final_mark_untracked() {
     let preceding = fixture.para_ids[fixture.para_ids.len() - 2].clone();
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: victim.clone(),
             to_block_id: victim.clone(),
             rationale: None,
@@ -713,20 +1026,37 @@ fn insert_tail_case() -> InsertTailCase {
             .canonical,
     );
 
-    // The anchor (a surviving, block-Normal paragraph) carries the shifted
-    // mark-insertion; the two appended paragraphs are block-level insertions.
+    // Each appended paragraph is one proposal: its content plus the break
+    // before it. The anchor's (shifted) mark is the first one's break, so it
+    // shares that proposal's identity. H7: address revisions by the
+    // engine-minted identity, not wire id.
     let mut anchor_mark_id = None;
     let mut block_insert_ids = Vec::new();
     for tb in &edited.blocks {
-        if let TrackingStatus::Inserted(r) = &tb.status {
-            // H7: address revisions by the engine-minted identity, not wire id.
-            block_insert_ids.push(r.identity);
-        } else if let BlockNode::Paragraph(p) = &tb.block
-            && let Some(TrackingStatus::Inserted(r)) = &p.para_mark_status
-        {
-            anchor_mark_id = Some(r.identity);
+        let BlockNode::Paragraph(p) = &tb.block else {
+            continue;
+        };
+        let content = match &tb.status {
+            TrackingStatus::Inserted(r) => Some(r.identity),
+            _ => p.segments.iter().find_map(|segment| match &segment.status {
+                TrackingStatus::Inserted(r) => Some(r.identity),
+                _ => None,
+            }),
+        };
+        match content {
+            Some(identity) => block_insert_ids.push(identity),
+            None => {
+                if let Some(TrackingStatus::Inserted(r)) = &p.para_mark_status {
+                    anchor_mark_id = Some(r.identity);
+                }
+            }
         }
     }
+    assert_eq!(
+        Some(block_insert_ids[0]),
+        anchor_mark_id,
+        "the anchor's shifted mark is the first appended paragraph's break"
+    );
     let doc = stemma::api::Document::parse(&make_docx_with_body(&body))
         .unwrap()
         .apply(&tx)
@@ -758,10 +1088,11 @@ fn selective_final_mark_facts(
     (tracked, accept, reject)
 }
 
-/// Accepting ONLY the shifted tail mark (leaving both block insertions tracked)
-/// must not strand the block insertion on the document-final pilcrow.
+/// Accepting ONLY the first appended paragraph (its content and the shifted
+/// break before it) keeps it and leaves the second pending, without stranding
+/// an insertion on the document-final pilcrow.
 #[test]
-fn selective_accept_of_only_the_tail_mark_leaves_final_mark_untracked() {
+fn selective_accept_of_only_the_first_append_leaves_final_mark_untracked() {
     let case = insert_tail_case();
     let (tracked, accept, reject) = selective_final_mark_facts(
         &case.doc,
@@ -770,11 +1101,11 @@ fn selective_accept_of_only_the_tail_mark_leaves_final_mark_untracked() {
     );
     assert!(
         !tracked,
-        "document-final pilcrow must carry no w:ins/w:del after accepting the tail mark"
+        "document-final pilcrow must carry no w:ins/w:del after accepting the first append"
     );
-    // The two block insertions remain: accept keeps them, reject restores base.
+    // The second append remains: accept keeps it, reject drops only it.
     assert_eq!(accept, "Alpha.\nBeta.\nGamma.\nInserted A.\nInserted B.");
-    assert_eq!(reject, "Alpha.\nBeta.\nGamma.");
+    assert_eq!(reject, "Alpha.\nBeta.\nGamma.\nInserted A.");
 }
 
 /// Rejecting the LAST block insertion (leaving the tail mark and the first
@@ -799,13 +1130,11 @@ fn selective_reject_of_last_block_insert_leaves_final_mark_untracked() {
     assert_eq!(reject, "Alpha.\nBeta.\nGamma.");
 }
 
-/// Rejecting BOTH block insertions strands the anchor (which still carries the
-/// pending mark-insertion) as the final paragraph. The pass materializes the
-/// empty inserted trailing paragraph that pending break introduces, so the
-/// final pilcrow is untracked and the surviving revision stays resolvable:
-/// rejecting it restores the original, accepting it keeps the empty tail.
+/// Rejecting BOTH appended paragraphs restores the original exactly. The
+/// anchor's shifted mark belongs to the first append, so no pending break is
+/// left behind to strand on the final paragraph.
 #[test]
-fn selective_reject_stranding_the_anchor_materializes_empty_tail() {
+fn selective_reject_of_both_appends_restores_the_original() {
     let case = insert_tail_case();
     let (tracked, accept, reject) = selective_final_mark_facts(
         &case.doc,
@@ -814,12 +1143,10 @@ fn selective_reject_stranding_the_anchor_materializes_empty_tail() {
     );
     assert!(
         !tracked,
-        "document-final pilcrow must carry no w:ins/w:del after stranding the anchor"
+        "document-final pilcrow must carry no w:ins/w:del after rejecting both appends"
     );
-    // The tail mark alone remains. Rejecting it merges the empty tail back onto
-    // the original final paragraph; accepting it keeps the empty trailing para.
     assert_eq!(reject, "Alpha.\nBeta.\nGamma.");
-    assert_eq!(accept, "Alpha.\nBeta.\nGamma.\n");
+    assert_eq!(accept, "Alpha.\nBeta.\nGamma.");
 }
 
 /// Comprehensive invariant: for the three tail-shaped edits (insert, delete,
@@ -839,6 +1166,7 @@ fn selective_resolution_never_strands_a_tracked_final_mark() {
     let v2 = del_fixture.para_ids[del_fixture.para_ids.len() - 2].clone();
     let del_tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: v2.clone(),
             to_block_id: v.clone(),
             rationale: None,
@@ -1339,9 +1667,11 @@ fn moved_paragraph_pilcrow_move_marker_round_trips() {
         .unwrap()
         .apply(&move_after(&orig[1], &orig[1], &orig[3]))
         .unwrap();
-    // Re-import the serialized wire: pilcrow moveTo/moveFrom must be read back as
-    // a tracked mark that coalesces into the move (block move_id set, mark
-    // tracked) — not dropped to an untracked pilcrow.
+    // Re-import the serialized wire without duplicating the move's carriers.
+    // The destination block's insertion owns its pilcrow; the source keeps
+    // an explicit deleted mark. Both represent tracked marks on the wire,
+    // but requiring an extra destination IR carrier would invalidate the
+    // identity walk written from the authoring model.
     let bytes = doc.serialize(&stemma::ExportOptions::default()).unwrap();
     let reimported = stemma::api::Document::parse(&bytes).unwrap();
     let mut move_dest_marked = false;
@@ -1354,8 +1684,8 @@ fn moved_paragraph_pilcrow_move_marker_round_trips() {
             match tb.status {
                 TrackingStatus::Inserted(_) => {
                     assert!(
-                        matches!(p.para_mark_status, Some(TrackingStatus::Inserted(_))),
-                        "moveTo destination pilcrow must round-trip as an Inserted mark"
+                        p.para_mark_status.is_none(),
+                        "whole-block moveTo owns its mark without a redundant carrier"
                     );
                     move_dest_marked = true;
                 }
@@ -1374,6 +1704,37 @@ fn moved_paragraph_pilcrow_move_marker_round_trips() {
         move_dest_marked && move_src_marked,
         "both move halves round-tripped"
     );
+    // Force a new emission from the reopened model, rather than returning
+    // the original package bytes. Outer ownership must still emit BOTH
+    // native moved paragraph marks.
+    let rewritten = reimported
+        .apply(&EditTransaction {
+            steps: vec![EditStep::SetDocDefaults {
+                font_family: Some("Calibri".into()),
+                font_size_half_points: None,
+                rationale: None,
+            }],
+            materialization_mode: MaterializationMode::Direct,
+            revision: test_revision(),
+            summary: None,
+        })
+        .unwrap();
+    let mut marks = Vec::new();
+    for paragraph in body_paragraphs(&rewritten) {
+        let (pilcrow, to, from) = paragraph_move_shape(&paragraph);
+        if to || from {
+            assert_eq!(
+                pilcrow,
+                if to {
+                    vec!["moveTo".to_string()]
+                } else {
+                    vec!["moveFrom".to_string()]
+                }
+            );
+            marks.push((to, from));
+        }
+    }
+    assert_eq!(marks.len(), 2);
     // Reject on the re-imported doc still restores the original order.
     let (_, reject) = accept_reject_text(&reimported.snapshot().canonical);
     assert_eq!(reject, "Para1.\nPara2.\nPara3.\nPara4.\nPara5.");
@@ -1929,6 +2290,9 @@ fn tracked_run_formatting_remembers_previous_marks_across_save_and_reopen() {
                 spacing: None,
                 borders: None,
                 shading: None,
+                keep_next: None,
+                keep_lines: None,
+                page_break_before: None,
             },
             rationale: None,
         }],
@@ -2026,6 +2390,9 @@ fn session_split_keeps_a_pre_existing_run_change_intact() {
             spacing: None,
             borders: None,
             shading: None,
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         },
         rationale: None,
     };
@@ -2034,6 +2401,8 @@ fn session_split_keeps_a_pre_existing_run_change_intact() {
         position: InsertPosition::After,
         rationale: None,
         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some("body".to_string()),
             content: parse_paragraph_markup("Wave 8 modeled insertion.").unwrap(),
             restart_numbering: false,
@@ -2158,6 +2527,8 @@ fn a_partial_resolution_leaves_a_surviving_run_change_intact() {
                         position: InsertPosition::After,
                         rationale: None,
                         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                            tab_stops: None,
+                            format_from: None,
                             role: Some("body".to_string()),
                             content: parse_paragraph_markup("Wave 8 modeled insertion.").unwrap(),
                             restart_numbering: false,
@@ -2463,6 +2834,8 @@ fn an_inserted_empty_paragraph_emits_one_tracked_envelope() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body".to_string()),
                 content: parse_paragraph_markup("").unwrap(),
                 restart_numbering: false,

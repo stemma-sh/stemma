@@ -7,8 +7,9 @@ a durable receipt. Exact input binding is optional in the general worklist
 contract, but recommended here because approval and execution are separate
 steps.
 
-The focused worklist currently targets top-level body paragraphs. Unsupported,
-missing, or ambiguous changes are refused instead of guessed.
+The focused worklist currently targets body paragraphs and the paragraphs in
+table cells. Unsupported, missing, or ambiguous changes are refused instead of
+guessed.
 
 ## 1. Identify the exact input
 

@@ -212,7 +212,7 @@ fn del_wraps_delinstrtext_run(xml: &str) -> bool {
 
 #[test]
 fn ins_encapsulates_multiple_runs_accept_keeps_all_reject_drops_all() {
-    let body = r#"<w:p><w:r><w:t>pre </w:t></w:r><w:ins w:id="8" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><w:t>foo</w:t></w:r><w:r><w:t>bar</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> post</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">pre </w:t></w:r><w:ins w:id="8" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><w:t>foo</w:t></w:r><w:r><w:t>bar</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> post</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_eq!(
@@ -419,7 +419,7 @@ fn deleted_field_code_uses_delinstrtext_not_instrtext() {
 
 #[test]
 fn t_inside_del_treated_as_deleted_consumption() {
-    let body = r#"<w:p><w:r><w:t>keep </w:t></w:r><w:del w:id="1" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><w:t>gone</w:t></w:r></w:del><w:r><w:t xml:space="preserve"> tail</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">keep </w:t></w:r><w:del w:id="1" w:author="A" w:date="2006-03-31T12:50:00Z"><w:r><w:t>gone</w:t></w:r></w:del><w:r><w:t xml:space="preserve"> tail</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_eq!(
@@ -460,4 +460,32 @@ fn ins_without_author_still_resolves_accept_reject() {
         ok,
         "ECMA-376 §17.13.5.18 — omitted author is handled by prose ('no author shall be associated'), so a w:ins without author is consumed, not rejected as broken. issues: {detail}"
     );
+}
+
+/// Without `xml:space="preserve"` the edge whitespace of a `w:delText` is not
+/// content (ISO 29500-1 §17.3.3.31, as Word reads it), so a deletion whose
+/// only text is such whitespace deletes nothing. The document still parses,
+/// saves as a valid package, and resolves either way to the surrounding text.
+#[test]
+fn deletion_of_unpreserved_whitespace_only_deletes_nothing() {
+    let bytes = make_docx(
+        r#"<w:p><w:r><w:t>Kept</w:t></w:r><w:del w:id="1" w:author="A"><w:r><w:delText> </w:delText></w:r></w:del><w:r><w:t>text</w:t></w:r></w:p><w:p><w:ins w:id="2" w:author="B"><w:r><w:t>Other</w:t></w:r></w:ins></w:p>"#,
+        &[],
+    );
+    let doc = Document::parse(&bytes).expect("parse");
+    let saved = doc
+        .serialize(&ExportOptions::default())
+        .expect("saves as a valid package");
+    let (ok, detail) = opens_clean(&saved);
+    assert!(ok, "{detail}");
+    assert_eq!(accept_text(&bytes), "Kepttext\n\nOther");
+    // Only the second paragraph's run is inserted, not its mark, so rejecting
+    // leaves that paragraph empty.
+    assert_eq!(reject_text(&bytes), "Kepttext\n\n");
+    for resolution in [stemma::Resolution::AcceptAll, stemma::Resolution::RejectAll] {
+        doc.project(resolution)
+            .expect("project")
+            .serialize(&ExportOptions::default())
+            .expect("the projection saves as a valid package");
+    }
 }

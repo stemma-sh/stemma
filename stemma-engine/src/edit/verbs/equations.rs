@@ -33,12 +33,11 @@
 //! the existing serializer path gives it a tracked container.
 
 use super::super::{EditError, MaterializationMode};
-use super::super::{find_block_index, validate_block_is_editable};
+use super::super::{block_at, block_at_mut, find_editable_block_path};
 use crate::domain::{
     BlockNode, CanonDoc, DocPart, InlineNode, NodeId, OpaqueInlineNode, OpaqueKind, ProofRef,
     RevisionInfo, StyleProps, TrackedSegment, TrackingStatus,
 };
-use crate::import::sha256_hex;
 use crate::semantic_hash::check_block_guard;
 use crate::word_xml::parse_raw_fragment;
 
@@ -100,13 +99,9 @@ pub(crate) fn apply(
         return Err(EditError::TrackedBlockEquationUnsupported { step_index });
     }
 
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -125,7 +120,7 @@ pub(crate) fn apply(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -135,7 +130,7 @@ pub(crate) fn apply(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
@@ -143,25 +138,11 @@ pub(crate) fn apply(
         EquationPlacement::Inline => OpaqueKind::OmmlInline,
         EquationPlacement::Block => OpaqueKind::OmmlBlock,
     };
-    let eq_id = NodeId::from(format!("{}_eq0", para.id.0));
+    let eq_id = super::super::InlineIdMint::for_paragraph(para).mint("eq");
     let equation = synthesize_equation_inline(&eq_id, kind, omml);
 
     let plan = find_anchor(&para.segments, expect).ok_or_else(|| {
-        let visible: String = para
-            .segments
-            .iter()
-            .flat_map(|s| s.inlines.iter())
-            .filter_map(|i| match i {
-                InlineNode::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        EditError::ExpectMismatch {
-            block_id: block_id.clone(),
-            expected: expect.to_string(),
-            actual_text: visible,
-            step_index,
-        }
+        super::super::unlocatable_expect(para, block_id, expect, false, step_index)
     })?;
 
     splice_equation(&mut para.segments, plan, equation, revision, mode);
@@ -185,17 +166,19 @@ fn synthesize_equation_inline(id: &NodeId, kind: OpaqueKind, omml: &[u8]) -> Inl
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(omml.to_vec()),
-        content_hash: Some(sha256_hex(omml)),
+        content_hash: Some(crate::import::canonical_raw_hash(omml)),
     })
 }
 
-/// Locate `expect` inside a single contiguous run of `Text` nodes within one
-/// Normal segment — identical anchoring to the cross-reference verb. Returns the
-/// segment, the inline index of the text node whose tail contains the match end,
-/// and the char offset of the match end inside that node.
+/// Locate `expect` inside a contiguous run of `Text` nodes (zero-width markers
+/// do not break it) within one Normal segment — identical anchoring to the
+/// cross-reference verb. Returns the segment, the inline index of the text node
+/// whose tail contains the match end, and the char offset of the match end
+/// inside that node.
 fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> {
     if expect.is_empty() {
         return None;
@@ -219,6 +202,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                         concat.push_str(&t.text);
                         j += 1;
                     }
+                    marker if super::super::is_zero_width_marker(marker) => j += 1,
                     _ => break,
                 }
             }
@@ -226,7 +210,7 @@ fn find_anchor(segments: &[TrackedSegment], expect: &str) -> Option<InsertPlan> 
                 let mut consumed = 0usize;
                 for (k, inline) in inlines.iter().enumerate().take(j).skip(i) {
                     let InlineNode::Text(t) = inline else {
-                        unreachable!("run is all TextNodes");
+                        continue; // a zero-width marker inside the run
                     };
                     let len = t.text.chars().count();
                     if match_end_chars <= consumed + len {
@@ -342,7 +326,10 @@ mod tests {
         assert!(matches!(o.kind, OpaqueKind::OmmlInline));
         // The fragment IS the source of truth — raw_xml is retained.
         assert_eq!(o.raw_xml.as_deref(), Some(raw.as_slice()));
-        assert_eq!(o.content_hash, Some(sha256_hex(&raw)));
+        assert_eq!(
+            o.content_hash,
+            Some(crate::import::canonical_raw_hash(&raw))
+        );
     }
 
     #[test]

@@ -48,8 +48,7 @@ fn extract_inline_text(inlines: &[InlineNode]) -> String {
             InlineNode::OpaqueInline(_) => out.push('\u{FFFC}'),
             InlineNode::Decoration(_)
             | InlineNode::CommentRangeStart { .. }
-            | InlineNode::CommentRangeEnd { .. }
-            | InlineNode::CommentReference { .. } => {}
+            | InlineNode::CommentRangeEnd { .. } => {}
         }
     }
     out

@@ -640,7 +640,8 @@ fn diff_row_cells(
 }
 
 /// Extract text only from paragraph blocks (not nested tables).
-fn extract_paragraph_text(blocks: &[BlockNode]) -> String {
+#[doc(hidden)]
+pub fn extract_paragraph_text(blocks: &[BlockNode]) -> String {
     use crate::table::extract_cell_text;
     let para_blocks: Vec<_> = blocks
         .iter()
@@ -681,12 +682,14 @@ fn diff_cell_nested_tables(
 }
 
 /// Find the index of a cell in the table's cells vector.
-fn find_cell_index(table: &CanonicalTable, cell: &CanonicalCell) -> Option<usize> {
+#[doc(hidden)]
+pub fn find_cell_index(table: &CanonicalTable, cell: &CanonicalCell) -> Option<usize> {
     table.cells.iter().position(|c| c.id == cell.id)
 }
 
 /// Diff cell text at token level.
-fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
     use crate::local_change::{cleanup_inline_changes, tokenize};
     use similar::{Algorithm, ChangeTag, TextDiff};
 
@@ -709,6 +712,7 @@ fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
                     text,
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
+                    rpr_authored: crate::domain::RunRprAuthored::default(),
                     formatting_change: None,
                 });
             }
@@ -717,6 +721,7 @@ fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
                     text,
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
+                    rpr_authored: crate::domain::RunRprAuthored::default(),
                     formatting_change: None,
                     rev_id: 0,
                 });
@@ -726,6 +731,7 @@ fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
                     text,
                     marks: Vec::new(),
                     style_props: StyleProps::default(),
+                    rpr_authored: crate::domain::RunRprAuthored::default(),
                     formatting_change: None,
                     rev_id: 0,
                 });
@@ -745,7 +751,8 @@ fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
 // its tracked content with adjacent atoms.
 // ---------------------------------------------------------------------------
 
-fn tracked_text_from_inlines(inlines: &[InlineNode]) -> String {
+#[doc(hidden)]
+pub fn tracked_text_from_inlines(inlines: &[InlineNode]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
@@ -757,7 +764,8 @@ fn tracked_text_from_inlines(inlines: &[InlineNode]) -> String {
     out
 }
 
-fn tracked_text_from_segments_filtered(
+#[doc(hidden)]
+pub fn tracked_text_from_segments_filtered(
     segments: &[TrackedSegment],
     filter: impl Fn(&TrackingStatus) -> bool,
 ) -> String {
@@ -957,6 +965,7 @@ mod tests {
                 text_id: None,
                 text_direction: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             })],
             grid_span: 1,
@@ -974,11 +983,13 @@ mod tests {
 
     fn make_table(rows: Vec<Vec<&str>>) -> TableNode {
         TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: rows
                 .into_iter()
                 .enumerate()
                 .map(|(r, cells)| TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from(format!("tbl_0_r{}", r)),
                     cells: cells
                         .into_iter()
@@ -994,7 +1005,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -1363,6 +1374,7 @@ mod tests {
         let inner_table = make_table(inner_rows);
         // Adjust inner table ID to be unique based on cell
         let inner_table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from(format!("{}_inner_tbl", id)),
             ..inner_table
         };
@@ -1447,6 +1459,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         });
 
@@ -1471,8 +1484,10 @@ mod tests {
         // Outer table has one row with one cell containing a nested table.
         // The nested table's inner cell text changes.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1488,7 +1503,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1504,8 +1519,10 @@ mod tests {
         };
 
         let new = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1521,7 +1538,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1574,8 +1591,10 @@ mod tests {
     fn test_nested_table_both_para_and_table_change() {
         // Both the paragraph text and nested table content change.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1591,7 +1610,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1607,8 +1626,10 @@ mod tests {
         };
 
         let new = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1624,7 +1645,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1664,8 +1685,10 @@ mod tests {
     fn test_nested_table_unchanged() {
         // Nested table content is the same — no diffs should be generated.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1681,7 +1704,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,

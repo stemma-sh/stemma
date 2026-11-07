@@ -24,14 +24,17 @@ profile.
 | `read_markdown` / `read_text` / `read_html` | Read whole-document projections. |
 | `read_block(block_id)` | Read one block's text spans, handles, guards, marks, and opaque anchors. |
 | `read_redline` / `read_accepted` / `read_rejected` | Read current, accept-all, or reject-all projections without mutation. |
-| `find(pattern)` | Locate matching visible text and return bounded excerpts plus block ids. |
+| `find(pattern)` | Locate matching text and return bounded excerpts plus block ids; matches in links, textboxes, controls, and headers and footers are included, with the same fields as `inspect_docx` [`find`](mcp.md#inspecting-a-document). |
 | `get_section(heading_id)` | Read one heading subtree. |
 | `read_styles` | Read authored document defaults and styles. |
-| `list_revisions` | List current revisions and their session-derived ids. |
+| `list_revisions` | List current revisions and their content-derived ids. |
 
 Re-read a block after editing it. Span handles and guards become stale after a
-write to the same block. Revision ids must come from the current session, never
-from raw XML or an earlier open.
+write to the same block. Revision ids are content-derived: a revision whose own
+content is untouched keeps its id across save, reopen, and the resolution of
+other revisions (see [id durability](cli.md#extract)). Read them from
+`list_revisions` or a receipt, never from raw XML; the one exception is a
+change inside a textbox, whose id is its own `w:id`.
 
 ## Edit
 
@@ -141,9 +144,17 @@ input. Only the host operator should raise process-wide limits.
 | `AmbiguousAnchorAfterMove` | The plan anchors on a block moved earlier in the transaction. | Use the moved id named by the error or a stable neighbor. |
 | `OpaqueDestroyed` | The operation would silently drop an opaque object. | Edit around it or use a structure-aware operation. |
 | `AuthorLabelCollision` | The Word author label was already present when the document was opened. | If the user intended the existing reviewer group, pass the explicit override. Otherwise ask the user to choose a separate label. |
-| `CommentAnchorOverlapsDeleted` | A comment anchor falls on deleted text. | Anchor on retained text or resolve the deletion first. |
-| `ParagraphContainsTrackedSegments` | The requested span operation lacks a safe coordinate space. | Resolve the paragraph or use `replace_text`. |
-| `StyleNotFound` | A requested style does not exist. | Read current styles or create the style in the same transaction. |
+| `CommentAnchorOverlapsDeleted` | A comment anchor falls on deleted text (wire code `AnchorNotFound`). | Anchor on retained text or resolve the deletion first. |
+| `ParagraphContainsTrackedSegments` | The requested span operation lacks a safe coordinate space (wire code `UnsupportedEdit`). | Resolve the paragraph or use `replace_text`. |
+| `StyleNotFound` | A requested style does not exist (wire code `AnchorNotFound`). | Read current styles or create the style in the same transaction. |
+| `PrefixDuplicatesLabel` | The content starts with the paragraph's own label, which would print twice, or with a different label on automatic list numbering. | Send the body only; the message names the content to send. Change list numbering with `set_numbering`. |
+| `ReplaceTextInsideInlineObjects` | The phrase also stands in a hyperlink's display text or a content control's value, which text replacement does not edit; `unreached_matches` names each object and the op that edits it (wire code `UnsupportedEdit` on `replace_text`). | Edit those with the named op first, or narrow the scope, then replace the rest. |
+| `ExpectCrossesInlineObject` | `expect` runs across a field, image, break, or other inline object the operation cannot span (wire code `UnsupportedEdit`). | Give text on one side of the named object. |
+| `TableColumnHeaderMismatch` | A column op's `expect_header` is not the text of that column's top cell (wire code `UnsupportedEdit`). | Take the index from the refusal, which lists every column with its header. |
+| `NoteBodyLineCountMismatch` | An `edit_note` body has a different number of lines than the note has paragraphs (wire code `UnsupportedEdit`). | Give one line per paragraph, in order, repeating a line to keep it. |
+| `BlockedJoin` | A selective resolution would join paragraphs across blocks that another pending revision removes (wire code `UnsupportedEdit`; `context` lists `required_revision_ids`). | Resolve the listed revisions together. |
+| pending `cell_merge` | A table has a pending tracked cell merge, so every resolution refuses, accept-all and reject-all included (wire code `UnsupportedEdit`; `context` starts `revision_kind=cell_merge`). | Resolve the merge in Word, then resolve the rest. |
+| `doc_id_required` | The call omitted `doc_id` while no document or several documents are open; `open_doc_ids` lists them. | Pass the `doc_id` that `open_docx` returned. |
 | `InvalidRange` | A revision selector matched nothing. | Re-read revisions and correct the selector. |
 | `FormatRevisionConflict` | The target already carries a pending formatting revision from another proposal. | Resolve that revision, leave it pending, or comment; the refusal names which. |
 | `AmbiguousFormatTarget` | `expect` matched more than one eligible span in the block. | Lengthen `expect` until it matches one span. |
@@ -222,8 +233,9 @@ label was not explicit in the user's instruction or another approved source,
 surface the choice between continuing that group and supplying a separate,
 user-chosen label.
 
-On text nodes, `marks` takes an array of tagged objects such as
-`[{"type":"bold"}]`, never bare strings; the grammar is specified under
+On text nodes, `marks` takes an array of marks such as `[{"type":"bold"}]`; a
+plain mark may also be its bare name (`["bold"]`), and an unknown name is
+refused with the valid ones. The grammar is specified under
 [content nodes](operations.md#content-nodes). On `set_format`, `marks` is a
 tri-state patch object. An omitted property is left unchanged, `true` turns it
 on, and `false` turns it off, so `{"bold": false}` is how formatting is removed:

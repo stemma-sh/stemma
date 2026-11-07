@@ -103,6 +103,20 @@ demo-check:
     cargo build -p stemma-cli
     python3 scripts/check-demo.py
 
+# Not part of `gate`: it downloads maturin and pytest from PyPI, and the gate
+# must run without network. The release workflow's wheel jobs pin the same
+# maturin version.
+[doc("Build the stemma-py wheel and run its Python tests in a fresh venv (needs uv + network)")]
+py-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    uvx --from maturin==1.15.0 maturin build --manifest-path stemma-py/Cargo.toml --out "$work/wheels"
+    uv venv --quiet "$work/venv"
+    VIRTUAL_ENV="$work/venv" uv pip install --quiet "$work"/wheels/*.whl pytest
+    "$work/venv/bin/python" -m pytest -p no:cacheprovider stemma-py/tests
+
 _build-mcp:
     cargo build -p stemma-mcp
 

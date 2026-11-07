@@ -229,6 +229,7 @@ fn delete_block_range_with_tracked_endpoint_fails_block_has_tracked_status() {
     let to = block_id_at(&canon, 1);
 
     let step = EditStep::DeleteBlockRange {
+        story: stemma::edit::StoryRef::Body,
         from_block_id: from,
         to_block_id: to,
         rationale: None,
@@ -264,6 +265,7 @@ fn replace_hyperlink_inside_inserted_paragraph_fails_block_has_tracked_status() 
     let hyperlink_id = first_hyperlink_id(&canon);
 
     let step = EditStep::ReplaceHyperlinkText {
+        story: stemma::edit::StoryRef::Body,
         hyperlink_id,
         rationale: None,
         expect: "here".to_string(),
@@ -300,6 +302,7 @@ fn set_hyperlink_attr_inside_deleted_paragraph_fails_block_has_tracked_status() 
     let hyperlink_id = first_hyperlink_id(&canon);
 
     let step = EditStep::SetHyperlinkAttr {
+        story: stemma::edit::StoryRef::Body,
         hyperlink_id,
         new_href: Some("https://new.example.com/".to_string()),
         new_anchor: None,

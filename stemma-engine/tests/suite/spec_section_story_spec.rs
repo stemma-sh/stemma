@@ -156,7 +156,7 @@ fn spec_titlepg_true_no_first_header_synthesizes_blank() {
 }
 
 // ==========================================================================
-// Test 2: Continuous section without pgSz inherits page dimensions
+// Test 2: Continuous section without pgSz keeps it omitted
 // ==========================================================================
 
 /// ISO 29500-1 §17.6.22: Continuous section breaks "might not specify certain
@@ -165,10 +165,10 @@ fn spec_titlepg_true_no_first_header_synthesizes_blank() {
 /// Fixture: Section 1 has pgSz w=12240 h=15840. Section 2 is continuous
 /// with NO pgSz element (but explicit pgMar).
 ///
-/// Expected: Section 2 inherits page_width=12240 and page_height=15840
-/// from Section 1 via `propagate_continuous_section_properties()`.
+/// Expected: Section 2 keeps no page size (Word reads a missing pgSz as letter
+/// portrait, its default, not as Section 1's).
 #[test]
-fn spec_continuous_section_inherits_page_size() {
+fn spec_continuous_section_keeps_its_omitted_page_size() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "continuous-no-page-size");
 
     let section_props = section_paragraphs(&doc);
@@ -205,19 +205,14 @@ fn spec_continuous_section_inherits_page_size() {
         body_sp.section_type
     );
 
-    // Section 2 should inherit page dimensions from Section 1
     assert_eq!(
-        body_sp.page_width,
-        Some(12240),
-        "ISO 29500-1 §17.6.22: continuous section without pgSz should inherit \
-         page_width=12240 from Section 1, got {:?}",
+        body_sp.page_width, None,
+        "ISO 29500-1 §17.6.22: continuous section without pgSz is not authored, so it stays omitted (Word reads its own default), got {:?}",
         body_sp.page_width
     );
     assert_eq!(
-        body_sp.page_height,
-        Some(15840),
-        "ISO 29500-1 §17.6.22: continuous section without pgSz should inherit \
-         page_height=15840 from Section 1, got {:?}",
+        body_sp.page_height, None,
+        "ISO 29500-1 §17.6.22: continuous section without pgSz is not authored, so it stays omitted (Word reads its own default), got {:?}",
         body_sp.page_height
     );
 

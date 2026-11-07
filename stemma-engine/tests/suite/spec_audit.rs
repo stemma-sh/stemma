@@ -100,6 +100,232 @@ fn make_multisection_docx_with_repeated_story_kinds() -> Vec<u8> {
 
 const THREE_PARAS: &str = r#"<w:p><w:r><w:t>Service levels apply.</w:t></w:r></w:p><w:p><w:r><w:t>Credits are the sole remedy.</w:t></w:r></w:p><w:p><w:r><w:t>Left alone.</w:t></w:r></w:p>"#;
 
+#[test]
+fn paragraph_insertion_audits_actual_untouched_neighbors() {
+    use stemma::edit::{BlockSpec, InsertPosition, ParagraphBlockSpec};
+    // Equal text, different formatting makes positional mispairing visible:
+    // preserving both neighbors must not compare one against the other.
+    let original = make_docx_with_body(concat!(
+        "<w:p><w:bookmarkStart w:id=\"10\" w:name=\"section\"/><w:r><w:t>Anchor.</w:t></w:r><w:bookmarkEnd w:id=\"10\"/></w:p>",
+        "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Repeated.</w:t></w:r></w:p>",
+        "<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Repeated.</w:t></w:r></w:p>",
+        "<w:p><w:hyperlink w:anchor=\"section\"><w:r><w:t>Tail.</w:t></w:r></w:hyperlink></w:p>",
+    ));
+    let doc = Document::parse(&original).unwrap();
+    let edited = apply(
+        &doc,
+        EditStep::InsertParagraphs {
+            anchor_block_id: doc.read().blocks[0].id.clone(),
+            position: InsertPosition::After,
+            rationale: None,
+            blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
+                role: None,
+                restart_numbering: false,
+                list: None,
+                content: ParagraphContent {
+                    fragments: vec![ContentFragment::Text("New paragraph.".into())],
+                },
+            })],
+        },
+        MaterializationMode::TrackedChange,
+        revision(95, "Editor"),
+    );
+    for report in [
+        edited.review().unwrap(),
+        stemma::audit(
+            &original,
+            &edited.serialize(&stemma::ExportOptions::default()).unwrap(),
+        )
+        .unwrap(),
+    ] {
+        assert!(report.direct_changes.is_empty(), "{report:?}");
+        assert!(report.untouched.violations.is_empty(), "{report:?}");
+        assert_eq!(
+            report.untouched.verified_blocks, 4,
+            "all original blocks remain unchanged: {report:?}"
+        );
+    }
+    // A nearby legitimate insertion must not exempt an unrelated same-text
+    // formatting mutation. It is neither a tracked edit nor a text delta.
+    let changed = apply(
+        &edited,
+        EditStep::SetParagraphFormatting {
+            block_id: doc.read().blocks[3].id.clone(),
+            semantic_hash: None,
+            patch: ParagraphFormattingPatch {
+                align: Some(Alignment::Center),
+                indent: None,
+                spacing: None,
+                borders: None,
+                shading: None,
+                keep_next: None,
+                keep_lines: None,
+                page_break_before: None,
+            },
+            rationale: None,
+        },
+        MaterializationMode::Direct,
+        revision(96, "Editor"),
+    );
+    for report in [
+        changed.review().unwrap(),
+        stemma::audit(
+            &original,
+            &changed
+                .serialize(&stemma::ExportOptions::default())
+                .unwrap(),
+        )
+        .unwrap(),
+    ] {
+        assert!(
+            !report.untouched.violations.is_empty(),
+            "off-target formatting must fail the untouched proof: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn audit_alignment_does_not_hide_untracked_reordering() {
+    let bold = "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Repeated.</w:t></w:r></w:p>";
+    let italic = "<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Repeated.</w:t></w:r></w:p>";
+    let before = make_docx_with_body(&format!("{bold}{italic}"));
+    let after = make_docx_with_body(&format!("{italic}{bold}"));
+    let report = stemma::audit(&before, &after).unwrap();
+    assert!(
+        !report.direct_changes.is_empty() || !report.untouched.violations.is_empty(),
+        "reordering same-text, differently formatted paragraphs is observable: {report:?}"
+    );
+}
+
+fn audit_table_docx(cell_content: &str) -> Vec<u8> {
+    make_docx_with_body(&format!(
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>{cell_content}</w:tc></w:tr></w:tbl>"#
+    ))
+}
+
+#[test]
+fn audit_table_equivalent_run_partition_is_not_a_change() {
+    // Run boundaries carry no meaning when text, formatting, attributes and
+    // revision status are identical. This also holds inside table cells.
+    let before = audit_table_docx(
+        r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Review complete.</w:t></w:r></w:p>"#,
+    );
+    let after = audit_table_docx(
+        r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Review </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>complete.</w:t></w:r></w:p>"#,
+    );
+    let report = stemma::audit(&before, &after).unwrap();
+    assert!(report.direct_changes.is_empty(), "{report:?}");
+    assert!(report.untouched.violations.is_empty(), "{report:?}");
+    assert_eq!(report.untouched.verified_blocks, 1, "{report:?}");
+}
+
+#[test]
+fn audit_table_cached_hash_and_paragraph_identity_are_not_content() {
+    let doc = Document::parse(&audit_table_docx(
+        r#"<w:p><w:r><w:t>Stable content.</w:t></w:r></w:p>"#,
+    ))
+    .unwrap();
+    let before = doc.snapshot().canonical.as_ref().clone();
+    let mut after = before.clone();
+    let stemma::BlockNode::Table(table) = &mut after.blocks[0].block else {
+        panic!("table")
+    };
+    table.structure_hash = "recomputed structure digest".into();
+    let stemma::BlockNode::Paragraph(paragraph) = &mut table.rows[0].cells[0].blocks[0] else {
+        panic!("paragraph")
+    };
+    paragraph.block_text_hash = Some("recomputed text digest".into());
+    paragraph.para_id = Some("12ABCDEF".into());
+    let report = stemma::audit::audit_documents(
+        &before,
+        &after,
+        None,
+        None,
+        stemma::ValidationReport {
+            ok: true,
+            issues: vec![],
+        },
+    )
+    .unwrap();
+    assert!(report.direct_changes.is_empty(), "{report:?}");
+    assert!(report.untouched.violations.is_empty(), "{report:?}");
+    assert_eq!(report.untouched.verified_blocks, 1);
+}
+
+#[test]
+fn audit_table_real_content_format_and_structure_changes_remain_visible() {
+    let before = audit_table_docx(r#"<w:p><w:r><w:t>Review complete.</w:t></w:r></w:p>"#);
+    for changed in [
+        r#"<w:p><w:r><w:t>Review cancelled.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Review complete.</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Review complete.</w:t></w:r></w:p><w:p/>"#,
+        r#"<w:p><w:r><w:t xml:space="preserve">Review </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>complete.</w:t></w:r></w:p>"#,
+    ] {
+        let report = stemma::audit(&before, &audit_table_docx(changed)).unwrap();
+        assert!(
+            !report.direct_changes.is_empty() || !report.untouched.violations.is_empty(),
+            "real table difference must be reported: {changed}: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn audit_table_tracked_cell_edit_has_no_untracked_table_delta() {
+    let original = audit_table_docx(r#"<w:p><w:r><w:t>Review complete.</w:t></w:r></w:p>"#);
+    let doc = Document::parse(&original).unwrap();
+    let stemma::BlockNode::Table(table) = &doc.snapshot().canonical.blocks[0].block else {
+        panic!("table")
+    };
+    let stemma::BlockNode::Paragraph(paragraph) = &table.rows[0].cells[0].blocks[0] else {
+        panic!("paragraph")
+    };
+    let edited = apply(
+        &doc,
+        EditStep::ReplaceParagraphText {
+            block_id: paragraph.id.clone(),
+            rationale: None,
+            replacement_role: None,
+            expect: "Review complete.".into(),
+            semantic_hash: None,
+            content: ParagraphContent {
+                fragments: vec![ContentFragment::Text("Review pending.".into())],
+            },
+        },
+        MaterializationMode::TrackedChange,
+        revision(91, "Editor"),
+    );
+    let report = edited.review().unwrap();
+    assert!(!report.new_revisions.is_empty(), "{report:?}");
+    assert!(report.direct_changes.is_empty(), "{report:?}");
+    assert!(report.untouched.violations.is_empty(), "{report:?}");
+    let options = stemma::ExportOptions::default();
+    let output = edited.serialize(&options).unwrap();
+    let report = stemma::audit(&original, &output).unwrap();
+    assert!(
+        report.direct_changes.is_empty(),
+        "serialized audit: {report:?}"
+    );
+    assert!(
+        report.untouched.violations.is_empty(),
+        "serialized audit: {report:?}"
+    );
+    for (projection, expected) in [
+        (edited.read_rejected().unwrap(), "Review complete."),
+        (edited.read_accepted().unwrap(), "Review pending."),
+    ] {
+        let bytes = projection.serialize(&options).unwrap();
+        let reference = audit_table_docx(&format!("<w:p><w:r><w:t>{expected}</w:t></w:r></w:p>"));
+        let report = stemma::audit(&reference, &bytes).unwrap();
+        assert!(report.direct_changes.is_empty(), "projection: {report:?}");
+        assert!(
+            report.untouched.violations.is_empty(),
+            "projection: {report:?}"
+        );
+    }
+}
+
 /// A body whose second paragraph carries TWO pending revisions by two
 /// authors: del #41 ("sole ") by Alice, ins #42 ("exclusive ") by Bob.
 const PARAS_WITH_PENDING: &str = r#"<w:p><w:r><w:t>Service levels apply.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Credits are the </w:t></w:r><w:del w:id="41" w:author="Alice" w:date="2026-07-01T00:00:00Z"><w:r><w:delText xml:space="preserve">sole </w:delText></w:r></w:del><w:ins w:id="42" w:author="Bob" w:date="2026-07-01T00:00:00Z"><w:r><w:t xml:space="preserve">exclusive </w:t></w:r></w:ins><w:r><w:t>remedy.</w:t></w:r></w:p><w:p><w:r><w:t>Left alone.</w:t></w:r></w:p>"#;
@@ -548,6 +774,9 @@ fn identical_format_proposals_authored_before_an_existing_one_get_distinct_stabl
                 spacing: None,
                 borders: None,
                 shading: None,
+                keep_next: None,
+                keep_lines: None,
+                page_break_before: None,
             },
             rationale: None,
         }],
@@ -886,6 +1115,38 @@ fn silent_bookmark_rename_is_an_untouched_violation() {
     assert!(
         !report.untouched.violations.is_empty(),
         "a renamed bookmark is a content change the proof must surface: {report:?}"
+    );
+}
+
+/// A table endpoint and an inline endpoint can bracket different Word ranges
+/// despite identical visible text and pairing IDs. The baseline must retain
+/// that distinction so import loss cannot make both sides appear equal.
+#[test]
+fn silent_table_bookmark_endpoint_relocation_is_reported() {
+    let prefix = concat!(
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid><w:tr><w:tc><w:p>"#,
+        r#"<w:r><w:t>Value</w:t></w:r><w:bookmarkStart w:id="17" w:name="Region"/>"#,
+    );
+    let before = make_docx_with_body(&format!(
+        "{prefix}</w:p></w:tc></w:tr><w:bookmarkEnd w:id=\"17\"/></w:tbl><w:p/>"
+    ));
+    let after = make_docx_with_body(&format!(
+        "{prefix}<w:bookmarkEnd w:id=\"17\"/></w:p></w:tc></w:tr></w:tbl><w:p/>"
+    ));
+    let report = stemma::audit(&before, &after).expect("audit runs");
+    // Table changes are classified direct deltas, not unexplained untouched
+    // violations. The changed table must be reported and excluded from the
+    // untouched certificate; only the following paragraph is unchanged.
+    assert!(
+        report
+            .direct_changes
+            .iter()
+            .any(|change| change.kind == DirectChangeKind::TableChanged),
+        "structural endpoint relocation must be reported: {report:?}"
+    );
+    assert_eq!(
+        report.untouched.verified_blocks, 1,
+        "the changed table cannot be certified untouched: {report:?}"
     );
 }
 
@@ -1243,5 +1504,65 @@ fn a_changed_walk_declines_adoption_rather_than_trusting_a_stale_record() {
         derived, survivors,
         "with the record declined, derivation renumbers the lookalike \
          survivors — the gate actually gates"
+    );
+}
+
+/// An edit inside another author's pending insertion splits it ("45 days" →
+/// Bob deletes "45" inside it, Alice's " days" stays hers): the insertion is
+/// one pre-existing revision, edited inside, and the only new revisions are
+/// Bob's. A piece of a pre-existing revision is never a new revision.
+#[test]
+fn an_edit_inside_a_pending_insertion_is_not_a_new_revision_of_its_author() {
+    let before = make_docx_with_body(
+        r#"<w:p><w:r><w:t xml:space="preserve">Payment is due within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">45 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of invoice.</w:t></w:r></w:p>"#,
+    );
+    let doc = Document::parse(&before).unwrap();
+    let options = stemma::edit::ReplaceTextOptions {
+        old: "45 days".to_string(),
+        new: "60 days".to_string(),
+        author: "Bob".to_string(),
+        scope: stemma::edit::ReplaceTextScope::BodyAndTables,
+        expected: stemma::edit::ExpectedMatches::Count(1),
+        match_mode: stemma::edit::MatchMode::Exact,
+        on_barrier_match: stemma::edit::BarrierPolicy::Fail,
+    };
+    let plan =
+        stemma::edit::plan_replace_text(doc.snapshot().canonical.as_ref(), &options).expect("plan");
+    let edited = doc
+        .apply(&EditTransaction {
+            steps: plan.steps,
+            summary: None,
+            materialization_mode: MaterializationMode::TrackedChange,
+            revision: RevisionInfo {
+                revision_id: 1,
+                identity: 0,
+                author: Some("Bob".to_string()),
+                date: None,
+                apply_op_id: None,
+            },
+        })
+        .expect("apply");
+    let after = edited.serialize(&stemma::ExportOptions::default()).unwrap();
+    let report = stemma::audit(&before, &after).unwrap();
+
+    let new_authors: Vec<Option<String>> = report
+        .new_revisions
+        .iter()
+        .map(|r| r.author.clone())
+        .collect();
+    assert_eq!(
+        new_authors,
+        vec![Some("Bob".to_string()), Some("Bob".to_string())],
+        "only Bob's deletion and insertion are new: {:?}",
+        report.new_revisions
+    );
+    assert_eq!(report.preexisting_revisions.len(), 1);
+    assert!(
+        matches!(
+            &report.preexisting_revisions[0].disposition,
+            RevisionDisposition::Modified { after_excerpt } if after_excerpt.contains("45") && after_excerpt.contains("days")
+        ),
+        "Alice's insertion is edited inside, all of it still hers: {:?}",
+        report.preexisting_revisions[0].disposition
     );
 }

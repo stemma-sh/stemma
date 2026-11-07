@@ -498,6 +498,9 @@ fn set_paragraph_formatting_is_faithful() {
             }),
             borders: None,
             shading: None,
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         },
         rationale: None,
     }];
@@ -616,6 +619,9 @@ fn set_paragraph_formatting_borders_and_shading_is_faithful() {
             spacing: None,
             borders: Some(borders.clone()),
             shading: Some(shading.clone()),
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         },
         rationale: None,
     }];
@@ -784,6 +790,8 @@ fn insert_paragraph_is_faithful() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: text_content("Inserted middle paragraph"),
                 restart_numbering: false,
@@ -800,6 +808,7 @@ fn delete_block_range_is_faithful() {
         "delete",
         &base,
         vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from(ids[1].as_str()),
             to_block_id: NodeId::from(ids[1].as_str()),
             rationale: None,
@@ -1293,6 +1302,8 @@ fn replace_table_merged_cells_is_faithful() {
     fn cell(text: &str, merge_h: Option<u32>, merge_v: Option<VerticalMergeSpec>) -> TableCellSpec {
         TableCellSpec {
             content: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: text_content(text),
                 restart_numbering: false,
@@ -1309,6 +1320,7 @@ fn replace_table_merged_cells_is_faithful() {
         rows: vec![
             // Header row, one cell spanning both columns.
             TableRowSpec {
+                cant_split: None,
                 cells: vec![cell("Header", Some(2), None)],
                 is_header: true,
                 height: None,
@@ -1316,6 +1328,7 @@ fn replace_table_merged_cells_is_faithful() {
             },
             // Body row: left cell starts a vertical merge.
             TableRowSpec {
+                cant_split: None,
                 cells: vec![
                     cell("Left", None, Some(VerticalMergeSpec::Restart)),
                     cell("B2", None, None),
@@ -1326,6 +1339,7 @@ fn replace_table_merged_cells_is_faithful() {
             },
             // Body row: left cell continues the vertical merge.
             TableRowSpec {
+                cant_split: None,
                 cells: vec![
                     cell("Left", None, Some(VerticalMergeSpec::Continue)),
                     cell("D2", None, None),
@@ -1819,6 +1833,7 @@ fn set_image_attributes_is_faithful() {
     assert!(base_raw_str.contains(r#"cx="999""#));
 
     let steps = vec![EditStep::SetImageAttributes {
+        story: stemma::edit::StoryRef::Body,
         block_id,
         drawing_id: drawing_id.clone(),
         semantic_hash: None,
@@ -1917,6 +1932,7 @@ fn set_image_attributes_clears_alt_text() {
     let (block_id, drawing_id, _) = first_drawing(&base);
 
     let steps = vec![EditStep::SetImageAttributes {
+        story: stemma::edit::StoryRef::Body,
         block_id,
         drawing_id,
         semantic_hash: None,
@@ -2474,7 +2490,7 @@ fn insert_image_is_faithful() {
 /// two text runs, so the plain-text projection's one-U+FFFC-per-opaque invariant
 /// has an anchor to count. `make_test_docx` has no opaque inlines.
 fn make_field_docx() -> Vec<u8> {
-    let body = r#"<w:p><w:r><w:t>See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t> for details</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:fldSimple w:instr=" REF Defs \h "><w:r><w:t>Section 2</w:t></w:r></w:fldSimple><w:r><w:t xml:space="preserve"> for details</w:t></w:r></w:p>"#;
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>"#
@@ -2810,7 +2826,6 @@ fn comment_marker_counts(doc: &CanonDoc, id: &str) -> (usize, usize, usize) {
                     match inline {
                         InlineNode::CommentRangeStart { id: i } if i == id => s += 1,
                         InlineNode::CommentRangeEnd { id: i } if i == id => e += 1,
-                        InlineNode::CommentReference { id: i } if i == id => r += 1,
                         InlineNode::OpaqueInline(o) => {
                             if let OpaqueKind::CommentReference(rd) = &o.kind
                                 && rd.reference_id == id
@@ -3375,6 +3390,7 @@ fn table_fidelity_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -3401,6 +3417,7 @@ fn table_fidelity_cell(id: &str, text: &str) -> TableCellNode {
 
 fn table_fidelity_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -3412,7 +3429,7 @@ fn table_fidelity_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -3426,6 +3443,7 @@ fn table_fidelity_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 
 fn table_fidelity_doc() -> CanonDoc {
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("tf_t"),
         rows: vec![
             table_fidelity_row(
@@ -3471,6 +3489,7 @@ fn table_op_insert_row_is_faithful() {
             ref_row: 1,
             position: TableInsertPosition::After,
             cells: None,
+            format_from_row: None,
         })],
     );
 }
@@ -3501,7 +3520,10 @@ fn table_op_delete_column_is_faithful() {
     assert_fidelity(
         "table_op_delete_column",
         &table_fidelity_doc(),
-        vec![table_step(TableOp::DeleteColumn { col_index: 0 })],
+        vec![table_step(TableOp::DeleteColumn {
+            col_index: 0,
+            expect_header: None,
+        })],
     );
 }
 
@@ -3550,6 +3572,7 @@ fn formatted_table_fidelity_doc() -> CanonDoc {
         tr2bl: None,
     };
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("tf_t"),
         rows: vec![
             table_fidelity_row(

@@ -18,6 +18,30 @@ use stemma::edit::{EditTransaction, apply_transaction};
 use stemma::edit_v4::parse_transaction;
 use stemma::reject_all_with_styles;
 
+#[test]
+fn move_row_wire_requires_explicit_source_reference_and_position() {
+    let request = table_op_json(
+        "t1",
+        r#"{"kind":"move_row","row_index":2,"ref_row":0,"position":"before"}"#,
+    );
+    assert!(
+        try_translate(&request).is_ok(),
+        "complete row relocation is an explicit edit"
+    );
+    for body in [
+        r#"{"kind":"move_row","ref_row":0,"position":"before"}"#,
+        r#"{"kind":"move_row","row_index":2,"position":"before"}"#,
+        r#"{"kind":"move_row","row_index":2,"ref_row":0}"#,
+        r#"{"kind":"move_row","row_index":2,"ref_row":0,"position":"around"}"#,
+        r#"{"kind":"move_row","row_index":2,"ref_row":0,"position":"before","cells":["replacement"]}"#,
+    ] {
+        assert!(
+            try_translate(&table_op_json("t1", body)).is_err(),
+            "malformed move accepted: {body}"
+        );
+    }
+}
+
 // ─── Doc-construction helpers (mirrors redline_table_replace.rs) ──────────────
 
 fn make_para(id: &str, text: &str) -> ParagraphNode {
@@ -102,6 +126,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -125,6 +150,7 @@ fn make_cell(id: &str, text: &str) -> TableCellNode {
 
 fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -136,7 +162,7 @@ fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -150,6 +176,7 @@ fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 
 fn make_table(id: &str, rows: Vec<TableRowNode>) -> TableNode {
     TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from(id),
         rows,
         structure_hash: String::new(),
@@ -283,6 +310,135 @@ fn find_table<'a>(doc: &'a CanonDoc, id: &str) -> &'a TableNode {
 // ─── InsertTableRow ──────────────────────────────────────────────────────────
 
 #[test]
+fn move_row_does_not_relocate_an_earlier_pending_change_in_the_same_batch() {
+    let doc = grid_2x2();
+    let transaction = translate(
+        r#"{"ops":[
+        {"op":"table_op","target":"t1","table_op":{"kind":"insert_row","ref_row":0,"position":"after","cells":["new",""]}},
+        {"op":"table_op","target":"t1","table_op":{"kind":"move_row","row_index":1,"ref_row":0,"position":"before"}}
+    ],"revision":{"author":"Reviewer"}}"#,
+    );
+    assert!(matches!(
+        apply_transaction(&doc, &transaction),
+        Err(stemma::edit::EditError::TableMidRedline { .. })
+    ));
+}
+
+#[test]
+fn move_row_preserves_full_rows_with_distinct_or_identical_text() {
+    for identical_text in [false, true] {
+        let rows = (0..3)
+            .map(|index| {
+                let label = if identical_text {
+                    "same".to_string()
+                } else {
+                    format!("row {index}")
+                };
+                let mut row = make_row(
+                    &format!("row{index}"),
+                    vec![make_cell(&format!("cell{index}"), &label)],
+                );
+                row.height = Some(400 + index * 37);
+                row.height_rule = Some(HeightRule::AtLeast);
+                row.cant_split = (index == 2).then_some(true);
+                row.cells[0].formatting.no_wrap = Some(index == 1);
+                // Persisted source identities let us distinguish untouched rows
+                // from the fresh physical copy required for a tracked move.
+                row.para_id = Some(format!("000000{:02X}", index + 16));
+                let BlockNode::Paragraph(paragraph) = &mut row.cells[0].blocks[0] else {
+                    unreachable!()
+                };
+                paragraph.para_id = Some(format!("000000{:02X}", index + 1));
+                paragraph.text_id = Some("00000100".to_string());
+                row
+            })
+            .collect();
+        let base = make_table("t1", rows);
+        for (source, reference, position, order) in [
+            (2, 0, "before", [2, 0, 1]),
+            (0, 2, "after", [1, 2, 0]),
+            (2, 0, "after", [0, 2, 1]),
+            (0, 2, "before", [1, 0, 2]),
+        ] {
+            let doc = doc_with_table(base.clone());
+            let body = format!(
+                r#"{{"kind":"move_row","row_index":{source},"ref_row":{reference},"position":"{position}"}}"#
+            );
+            let edited = apply_transaction(&doc, &translate(&table_op_json("t1", &body)))
+                .expect("row relocation")
+                .0;
+            let mut accepted = edited.clone();
+            accept_all(&mut accepted);
+            // MS-DOCX 2.6.2.3 requires distinct physical paragraph identities.
+            // A tracked relocation retains the source as a deleted row, so its
+            // inserted copy cannot reuse the source row or paragraph identity.
+            let physical_ids: Vec<_> = find_table(&edited, "t1")
+                .rows
+                .iter()
+                .flat_map(|row| {
+                    let BlockNode::Paragraph(paragraph) = &row.cells[0].blocks[0] else {
+                        unreachable!()
+                    };
+                    [
+                        row.para_id.as_ref().unwrap(),
+                        paragraph.para_id.as_ref().unwrap(),
+                    ]
+                })
+                .map(|id| u32::from_str_radix(id, 16).unwrap())
+                .collect();
+            assert_eq!(physical_ids.len(), 8);
+            assert!(physical_ids.iter().all(|id| (1..0x80000000).contains(id)));
+            assert_eq!(
+                physical_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                physical_ids.len()
+            );
+            let mut expected: Vec<_> = order
+                .iter()
+                .map(|index| base.rows[*index].clone())
+                .collect();
+            // The alignment may express an adjacent swap by relocating either
+            // neighbor. Only rows physically emitted as insertions need new IDs;
+            // the requested final order and every other property remain exact.
+            for expected_row in &mut expected {
+                let inserted = find_table(&edited, "t1").rows.iter().find(|row| {
+                    row.id == expected_row.id
+                        && matches!(row.tracking_status, Some(TrackingStatus::Inserted(_)))
+                });
+                if let Some(inserted) = inserted {
+                    assert_ne!(inserted.para_id, expected_row.para_id);
+                    expected_row.para_id.clone_from(&inserted.para_id);
+                    let BlockNode::Paragraph(inserted_paragraph) = &inserted.cells[0].blocks[0]
+                    else {
+                        unreachable!()
+                    };
+                    let BlockNode::Paragraph(expected_paragraph) =
+                        &mut expected_row.cells[0].blocks[0]
+                    else {
+                        unreachable!()
+                    };
+                    assert_ne!(inserted_paragraph.para_id, expected_paragraph.para_id);
+                    expected_paragraph
+                        .para_id
+                        .clone_from(&inserted_paragraph.para_id);
+                }
+            }
+            assert_eq!(
+                find_table(&accepted, "t1").rows,
+                expected,
+                "explicit row identity, not text similarity, determines relocation (identical={identical_text})"
+            );
+            let mut rejected = edited;
+            reject_all_with_styles(&mut rejected, None);
+            let actual_rows = &find_table(&rejected, "t1").rows;
+            assert_eq!(actual_rows, &base.rows);
+        }
+    }
+}
+
+#[test]
 fn insert_row_accept_is_target_reject_is_base() {
     let doc = grid_2x2();
     let txn = translate(&table_op_json(
@@ -312,6 +468,153 @@ fn insert_row_accept_is_target_reject_is_base() {
         vec![vec!["r0c0", "r0c1"], vec!["r1c0", "r1c1"]],
         "reject_all on insert_row restores the base"
     );
+}
+
+#[test]
+fn reorder_rows_is_one_complete_permutation_with_exact_terminal_laws() {
+    let rows = (0..4)
+        .map(|index| {
+            let mut row = make_row(
+                &format!("source{index}"),
+                vec![make_cell(&format!("cell{index}"), "identical label")],
+            );
+            row.height = Some(300 + index * 29);
+            row.height_rule = Some(HeightRule::AtLeast);
+            row.cant_split = Some(index % 2 == 0);
+            row.cells[0].formatting.no_wrap = Some(index == 1);
+            row.para_id = Some(format!("001000{index:02X}"));
+            let BlockNode::Paragraph(paragraph) = &mut row.cells[0].blocks[0] else {
+                unreachable!()
+            };
+            paragraph.para_id = Some(format!("002000{index:02X}"));
+            paragraph.text_id = Some("00300000".into());
+            row
+        })
+        .collect();
+    let base = make_table("t1", rows);
+    let doc = doc_with_table(base.clone());
+    let request = table_op_json("t1", r#"{"kind":"reorder_rows","row_order":[3,1,0,2]}"#);
+    let edited = apply_transaction(&doc, &translate(&request))
+        .expect("one permutation")
+        .0;
+    let proposals = stemma::tracked_model::enumerate_revisions(&edited);
+    assert_eq!(
+        proposals
+            .iter()
+            .map(|record| record.revision_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "One requested complete permutation must be one selectable intention, not independently resolvable row fragments"
+    );
+    let mut accepted = edited.clone();
+    accept_all(&mut accepted);
+    assert_eq!(
+        find_table(&accepted, "t1")
+            .rows
+            .iter()
+            .map(|r| (r.id.clone(), r.height, r.cant_split))
+            .collect::<Vec<_>>(),
+        [3, 1, 0, 2]
+            .into_iter()
+            .map(|i| (
+                base.rows[i].id.clone(),
+                base.rows[i].height,
+                base.rows[i].cant_split
+            ))
+            .collect::<Vec<_>>(),
+        "Complete source-row associations must move together"
+    );
+    let mut expected = [3, 1, 0, 2]
+        .into_iter()
+        .map(|i| base.rows[i].clone())
+        .collect::<Vec<_>>();
+    for row in &mut expected {
+        if let Some(inserted) = find_table(&edited, "t1").rows.iter().find(|candidate| {
+            candidate.id == row.id
+                && matches!(candidate.tracking_status, Some(TrackingStatus::Inserted(_)))
+        }) {
+            // Native moved copies cannot reuse IDs belonging to the physical
+            // deleted source. Only these typed transport identities may differ.
+            assert_ne!(row.para_id, inserted.para_id);
+            row.para_id.clone_from(&inserted.para_id);
+            let BlockNode::Paragraph(expected_paragraph) = &mut row.cells[0].blocks[0] else {
+                unreachable!()
+            };
+            let BlockNode::Paragraph(inserted_paragraph) = &inserted.cells[0].blocks[0] else {
+                unreachable!()
+            };
+            assert_ne!(expected_paragraph.para_id, inserted_paragraph.para_id);
+            expected_paragraph
+                .para_id
+                .clone_from(&inserted_paragraph.para_id);
+        }
+    }
+    assert_eq!(
+        find_table(&accepted, "t1").rows,
+        expected,
+        "Row identity determines the complete content/property association, even with identical text"
+    );
+    for (action, expected_rows) in [
+        (
+            stemma::tracked_model::ResolveSelectionAction::Accept,
+            find_table(&accepted, "t1").rows.clone(),
+        ),
+        (
+            stemma::tracked_model::ResolveSelectionAction::Reject,
+            base.rows.clone(),
+        ),
+    ] {
+        let mut selected = edited.clone();
+        stemma::tracked_model::resolve_selected_revisions_with_styles(
+            &mut selected,
+            &std::collections::HashSet::from([proposals[0].revision_id]),
+            action,
+            None,
+        )
+        .expect("whole permutation is selectively resolvable");
+        assert_eq!(find_table(&selected, "t1").rows, expected_rows);
+        assert!(stemma::tracked_model::enumerate_revisions(&selected).is_empty());
+        assert_eq!(selected.blocks[0], doc.blocks[0]);
+    }
+    let mut rejected = edited;
+    reject_all_with_styles(&mut rejected, None);
+    assert_eq!(find_table(&rejected, "t1").rows, base.rows);
+    assert_eq!(
+        accepted.blocks[0], doc.blocks[0],
+        "Untouched body stays exact"
+    );
+}
+
+#[test]
+fn reorder_rows_refuses_loss_duplication_and_out_of_range_indices() {
+    let doc = grid_2x2();
+    for order in ["[]", "[0]", "[0,0]", "[0,2]", "[0,1,2]"] {
+        let request = table_op_json(
+            "t1",
+            &format!(r#"{{"kind":"reorder_rows","row_order":{order}}}"#),
+        );
+        assert!(
+            matches!(
+                apply_transaction(&doc, &translate(&request)),
+                Err(stemma::edit::EditError::UnsupportedTableRowMove { .. })
+            ),
+            "Invalid permutation must refuse without mutation: {order}"
+        );
+    }
+}
+
+#[test]
+fn reorder_rows_does_not_layer_over_a_pending_move_in_the_same_batch() {
+    let doc = grid_2x2();
+    let request = r#"{"revision":{"author":"Editor"},"ops":[
+        {"op":"table_op","target":"t1","table_op":{"kind":"move_row","row_index":1,"ref_row":0,"position":"before"}},
+        {"op":"table_op","target":"t1","table_op":{"kind":"reorder_rows","row_order":[1,0]}}
+    ]}"#;
+    assert!(matches!(
+        apply_transaction(&doc, &translate(request)),
+        Err(stemma::edit::EditError::TableMidRedline { .. })
+    ));
 }
 
 #[test]
@@ -436,9 +739,81 @@ fn delete_column_accept_is_target_reject_is_base() {
     );
 }
 
+/// A column op that names the header it means is refused when that column is
+/// headed otherwise (the caller counted wrong, e.g. forgot a label column),
+/// and the refusal lists every column's index and header so the caller can
+/// pick the right one. Nothing is changed.
 #[test]
-fn column_op_on_merged_grid_refused() {
-    // Build a table whose first row has a span-2 cell -> merged grid.
+fn a_column_op_naming_another_columns_header_is_refused_with_the_columns() {
+    let doc = grid_2x2();
+    for body in [
+        r#"{ "kind": "delete_column", "col_index": 0, "expect_header": "r0c1" }"#,
+        r#"{ "kind": "move_column", "col_index": 0, "ref_col": 1, "position": "after", "expect_header": "r0c1" }"#,
+    ] {
+        let err = apply_transaction(&doc, &translate(&table_op_json("t1", body)))
+            .expect_err("a header mismatch is refused");
+        assert!(
+            matches!(
+                &err,
+                stemma::edit::EditError::TableColumnHeaderMismatch { col_index: 0, expected, headers, .. }
+                    if expected == "r0c1" && headers == &["r0c0", "r0c1"]
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("column 0 of table 't1' is headed 'r0c0', not 'r0c1'")
+                && message.contains("0: 'r0c0', 1: 'r0c1'"),
+            "{message}"
+        );
+    }
+}
+
+/// The header that matches lets the op through; whitespace runs compare as
+/// one space, as an agent copies a header from a read.
+#[test]
+fn a_column_op_naming_its_own_header_applies() {
+    let doc = grid_2x2();
+    let txn = translate(&table_op_json(
+        "t1",
+        r#"{ "kind": "delete_column", "col_index": 1, "expect_header": "  r0c1 " }"#,
+    ));
+    let mut accepted = apply_transaction(&doc, &txn).expect("apply").0;
+    accept_all(&mut accepted);
+    assert_eq!(
+        cell_texts(&accepted, "t1"),
+        vec![vec!["r0c0"], vec!["r1c0"]]
+    );
+}
+
+/// A top cell spanning several columns heads each of them.
+#[test]
+fn a_spanning_top_cell_heads_every_column_it_covers() {
+    let mut merged = make_cell("t1_r0c0", "wide");
+    merged.grid_span = 2;
+    let table = make_table(
+        "t1",
+        vec![
+            make_row("t1_r0", vec![merged]),
+            make_row(
+                "t1_r1",
+                vec![make_cell("t1_r1c0", "a"), make_cell("t1_r1c1", "b")],
+            ),
+        ],
+    );
+    let doc = doc_with_table(table);
+    let txn = translate(&table_op_json(
+        "t1",
+        r#"{ "kind": "delete_column", "col_index": 1, "expect_header": "wide" }"#,
+    ));
+    apply_transaction(&doc, &txn).expect("column 1 is headed by the spanning cell");
+}
+
+/// Deleting a column under a cell that spans it, tracked: accepting gives the
+/// table with the span shrunk and the column's own cells gone; rejecting gives
+/// back the original table.
+#[test]
+fn delete_column_under_a_spanning_cell_accepts_and_rejects() {
     let mut merged = make_cell("t1_r0c0", "wide");
     merged.grid_span = 2;
     let table = make_table(
@@ -456,10 +831,15 @@ fn column_op_on_merged_grid_refused() {
         "t1",
         r#"{ "kind": "delete_column", "col_index": 0 }"#,
     ));
-    let err = apply_transaction(&doc, &txn).unwrap_err();
-    assert!(
-        format!("{err:?}").contains("TableColumnOpOnMergedGrid"),
-        "expected TableColumnOpOnMergedGrid, got {err:?}"
+    let edited = apply_transaction(&doc, &txn).expect("apply").0;
+    let mut accepted = edited.clone();
+    accept_all(&mut accepted);
+    assert_eq!(cell_texts(&accepted, "t1"), vec![vec!["wide"], vec!["b"]]);
+    let mut rejected = edited.clone();
+    reject_all_with_styles(&mut rejected, None);
+    assert_eq!(
+        cell_texts(&rejected, "t1"),
+        vec![vec!["wide"], vec!["a", "b"]]
     );
 }
 
@@ -792,4 +1172,77 @@ fn table_op_on_non_table_refused() {
         format!("{err:?}").contains("NotATable"),
         "expected NotATable, got {err:?}"
     );
+}
+
+// ─── Row order in a table with vertical merges ───────────────────────────────
+//
+// Domain rule: a vertical merge group is a restart cell and the continue cells
+// directly below it in its grid column. A row move or permutation keeps the
+// table's meaning exactly when every continuing row still sits directly below
+// the row it continued; rows outside a group move freely.
+
+/// Rows 1 and 2 form a merge group in the first column; rows 0 and 3 are plain.
+fn grid_with_merge_group() -> CanonDoc {
+    let mut rows = Vec::new();
+    for r in 0..4 {
+        let mut first = make_cell(&format!("m_r{r}c0"), &format!("r{r}c0"));
+        first.v_merge = match r {
+            1 => VerticalMerge::Restart,
+            2 => VerticalMerge::Continue,
+            _ => VerticalMerge::None,
+        };
+        rows.push(make_row(
+            &format!("m_r{r}"),
+            vec![first, make_cell(&format!("m_r{r}c1"), &format!("r{r}c1"))],
+        ));
+    }
+    doc_with_table(make_table("m", rows))
+}
+
+fn row_ids_after_accept(doc: &CanonDoc, request: &str) -> Vec<String> {
+    let (mut edited, _) = apply_transaction(doc, &translate(request)).expect("allowed");
+    accept_all(&mut edited);
+    find_table(&edited, "m")
+        .rows
+        .iter()
+        .map(|row| row.id.to_string())
+        .collect()
+}
+
+#[test]
+fn rows_outside_a_merge_group_move_freely() {
+    let doc = grid_with_merge_group();
+    let moved = table_op_json(
+        "m",
+        r#"{"kind":"move_row","row_index":3,"ref_row":0,"position":"before"}"#,
+    );
+    assert_eq!(
+        row_ids_after_accept(&doc, &moved),
+        ["m_r3", "m_r0", "m_r1", "m_r2"]
+    );
+    let reordered = table_op_json("m", r#"{"kind":"reorder_rows","row_order":[1,2,0,3]}"#);
+    assert_eq!(
+        row_ids_after_accept(&doc, &reordered),
+        ["m_r1", "m_r2", "m_r0", "m_r3"]
+    );
+}
+
+#[test]
+fn a_move_that_separates_a_merge_group_is_refused() {
+    let doc = grid_with_merge_group();
+    for op in [
+        // The continuing row away from its restart.
+        r#"{"kind":"move_row","row_index":2,"ref_row":0,"position":"before"}"#,
+        // A row between the restart and its continuation.
+        r#"{"kind":"move_row","row_index":0,"ref_row":1,"position":"after"}"#,
+        r#"{"kind":"reorder_rows","row_order":[2,1,0,3]}"#,
+    ] {
+        assert!(
+            matches!(
+                apply_transaction(&doc, &translate(&table_op_json("m", op))),
+                Err(stemma::edit::EditError::UnsupportedTableRowMove { .. })
+            ),
+            "{op}"
+        );
+    }
 }

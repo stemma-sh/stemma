@@ -4,8 +4,10 @@
 //! WHAT changed (tracked and untracked), what happened to the changes that
 //! were already pending, and is everything else provably untouched? The
 //! session form (`Document::review` — baseline captured at parse) and the
-//! stateless form (`crate::api::audit` — any two byte packages) are the same
-//! computation; the session handle merely supplies the baseline.
+//! stateless form (`crate::api::audit` — any two byte packages) share the
+//! same checks. Session snapshots additionally supply a shared block-ID
+//! namespace; independently parsed packages use explicit insertion carriers
+//! and conservative baseline positions, never content-based lineage.
 //!
 //! THE CONTRACT (the reason this module exists): "declared success without
 //! read-back" is the universal agent failure mode. The audit is the
@@ -55,14 +57,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::audit_delta::{AuditDelta, audit_changes};
+use crate::audit_delta::{AuditDelta, BlockIdentity, audit_changes};
 use crate::domain::{
     BlockNode, CanonDoc, HeaderFooterKind, InlineNode, NodeId, OpaqueKind, StoryScope,
     TrackedBlock, TrackingStatus,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, RuntimeError, ValidationReport, first_quarantined_block,
-    first_unparseable_opaque_with_revisions,
+    first_unresolvable_opaque_with_revisions,
 };
 use crate::styles::StyleTable;
 use crate::tracked_model::{
@@ -219,6 +221,8 @@ pub enum UntouchedViolationKind {
 /// Audit `after` against `before`, both as canonical documents. The
 /// `validator` verdict for `after`'s BYTES is computed at the byte edge and
 /// passed in (see `crate::api::audit` / `Document::review`).
+/// Block IDs are treated as independent import-local addresses. Session
+/// callers use [`audit_session_documents`] with explicit shared-ID provenance.
 ///
 /// Refuses (mutating nothing) when either document carries revisions the
 /// census cannot see — a quarantined block or an unparseable opaque with
@@ -232,6 +236,11 @@ pub enum UntouchedViolationKind {
 /// paragraph-style change is rejected — without them, a document carrying such
 /// a change would produce a spurious committed-delta row. Pass `None` for a
 /// document with no style table.
+///
+/// A `CanonDoc` does not hold the bytes of a body block the model cannot
+/// represent (a sealed content control), so revisions inside one are not in
+/// this census; a change to such a block fails the untouched proof instead.
+/// [`crate::api::audit`] and `Document::review` see them.
 pub fn audit_documents(
     before: &CanonDoc,
     after: &CanonDoc,
@@ -239,12 +248,68 @@ pub fn audit_documents(
     after_styles: Option<&StyleTable>,
     validator: ValidationReport,
 ) -> Result<AuditReport, RuntimeError> {
+    audit_documents_with_identity(
+        before,
+        after,
+        before_styles,
+        after_styles,
+        validator,
+        BlockIdentity::IndependentParses,
+        SealedRevisions::default(),
+    )
+}
+
+/// Session snapshots retain the baseline's block identity namespace. Only
+/// callers holding that provenance may use identity-based correspondence.
+/// Both documents must descend from the same imported snapshot without
+/// serialization/re-import between them. For independently parsed documents,
+/// use [`audit_documents`] instead: parser-assigned IDs are not shared identity.
+pub fn audit_session_documents(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    before_styles: Option<&StyleTable>,
+    after_styles: Option<&StyleTable>,
+    validator: ValidationReport,
+) -> Result<AuditReport, RuntimeError> {
+    audit_documents_with_identity(
+        before,
+        after,
+        before_styles,
+        after_styles,
+        validator,
+        BlockIdentity::SharedSession,
+        SealedRevisions::default(),
+    )
+}
+
+/// The revisions inside each side's sealed body blocks (see
+/// [`crate::tracked_model::enumerate_body_opaque_block_revisions`]). Their
+/// bytes live in a snapshot's scaffold, not the `CanonDoc`, so only a caller
+/// holding snapshots can supply them; the `CanonDoc`-only entry points pass
+/// none, and a changed sealed block then fails the untouched proof instead.
+#[derive(Default)]
+pub(crate) struct SealedRevisions {
+    pub(crate) before: Vec<RevisionRecord>,
+    pub(crate) after: Vec<RevisionRecord>,
+}
+
+pub(crate) fn audit_documents_with_identity(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    before_styles: Option<&StyleTable>,
+    after_styles: Option<&StyleTable>,
+    validator: ValidationReport,
+    identity: BlockIdentity,
+    sealed: SealedRevisions,
+) -> Result<AuditReport, RuntimeError> {
     refuse_unauditable(before, "before")?;
     refuse_unauditable(after, "after")?;
 
     // Section 1: the census delta.
-    let before_records = enumerate_revisions(before);
-    let after_records = enumerate_revisions(after);
+    let mut before_records = enumerate_revisions(before);
+    before_records.extend(sealed.before);
+    let mut after_records = enumerate_revisions(after);
+    after_records.extend(sealed.after);
     let (new_revisions, preexisting_revisions) = match_census(before_records, after_records);
 
     // Section 2: the committed (untracked) delta. Reject with each document's
@@ -255,9 +320,20 @@ pub fn audit_documents(
     reject_all_with_styles(&mut before_committed, before_styles);
     let mut after_committed = after.clone();
     reject_all_with_styles(&mut after_committed, after_styles);
-    let committed_changes = audit_changes(&before_committed, &after_committed);
+    let committed_changes = audit_changes(&before_committed, &after_committed, identity);
     let mut direct_changes = direct_rows(&committed_changes);
-    append_hyperlink_metadata_rows(&before_committed, &after_committed, &mut direct_changes);
+    append_hyperlink_metadata_rows(
+        &before_committed,
+        &after_committed,
+        &mut direct_changes,
+        identity,
+    );
+    append_image_attribute_rows(
+        &before_committed,
+        &after_committed,
+        &mut direct_changes,
+        identity,
+    )?;
     if before_committed.body_section_properties != after_committed.body_section_properties {
         direct_changes.push(DirectChange {
             story: StoryScope::Body,
@@ -274,7 +350,7 @@ pub fn audit_documents(
     // revisions and all): the raw diff explains every sequence difference;
     // whatever it leaves unmentioned must pair 1:1 and be structurally
     // identical, except pairs a census row already accounts for.
-    let raw_changes = audit_changes(before, after);
+    let raw_changes = audit_changes(before, after, identity);
     let untouched = untouched_proof(
         before,
         after,
@@ -307,13 +383,11 @@ fn refuse_unauditable(doc: &CanonDoc, side: &str) -> Result<(), RuntimeError> {
             details: ErrorDetails::default(),
         });
     }
-    if let Some(opaque_id) = first_unparseable_opaque_with_revisions(doc) {
+    if let Some((opaque_id, reason)) = first_unresolvable_opaque_with_revisions(doc) {
         return Err(RuntimeError {
             code: ErrorCode::UnsupportedEdit,
             message: format!(
-                "audit refused: {side} document's opaque '{opaque_id}' carries tracked changes \
-                 inside raw_xml that could not be parsed; they are invisible to the census, so \
-                 the audit would silently under-report"
+                "audit refused: {side} document's opaque '{opaque_id}' cannot resolve its tracked state: {reason}"
             ),
             details: ErrorDetails::default(),
         });
@@ -390,6 +464,32 @@ fn match_census(
             record,
             disposition: RevisionDisposition::Resolved,
         });
+    }
+
+    // An edit inside a pre-existing revision can split it into more rows than
+    // it had (Bob deleting a word inside Alice's insertion leaves her text on
+    // both sides of his change). A leftover row under a pre-existing identity
+    // is a piece of that revision, never a new one: fold it into the
+    // revision, which was edited inside.
+    for (i, record) in after.iter().enumerate() {
+        if consumed[i] {
+            continue;
+        }
+        let key = census_key(record);
+        let Some(prior) = preexisting.iter_mut().rev().find(|prior| {
+            census_key(&prior.record) == key
+                && !matches!(prior.disposition, RevisionDisposition::Resolved)
+        }) else {
+            continue;
+        };
+        consumed[i] = true;
+        let pieces = match &prior.disposition {
+            RevisionDisposition::Modified { after_excerpt } => after_excerpt.clone(),
+            _ => prior.record.excerpt.clone(),
+        };
+        prior.disposition = RevisionDisposition::Modified {
+            after_excerpt: format!("{pieces}{}", record.excerpt),
+        };
     }
 
     let new_revisions = after
@@ -642,6 +742,41 @@ fn push_direct_rows(rows: &mut Vec<DirectChange>, change: &AuditDelta, story: &S
     }
 }
 
+/// Account for direct image attributes only after proving that every other
+/// field of the paragraph remains unchanged. A failed proof leaves the
+/// paragraph to the untouched checker; it does not grant a partial exemption.
+fn append_image_attribute_rows(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    rows: &mut Vec<DirectChange>,
+    identity: BlockIdentity,
+) -> Result<(), RuntimeError> {
+    for (old_index, new_index) in
+        crate::audit_delta::paired_block_indices(&before.blocks, &after.blocks, identity)
+    {
+        let old = &before.blocks[old_index];
+        let new = &after.blocks[new_index];
+        let block_id = block_node_id(&old.block);
+        if rows
+            .iter()
+            .any(|row| row.story == StoryScope::Body && row.block_id.as_ref() == Some(&block_id))
+        {
+            continue;
+        }
+        if crate::audit_image::only_image_attributes_changed(old, new)? {
+            rows.push(DirectChange {
+                story: StoryScope::Body,
+                kind: DirectChangeKind::BlockModified,
+                block_id: Some(block_id),
+                old_excerpt: Some(extract_block_text_for_hash(&old.block)),
+                new_excerpt: Some(extract_block_text_for_hash(&new.block)),
+                coincides_with_resolution: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Hyperlink relationship retargeting changes committed metadata while leaving
 /// display text unchanged. The semantic text diff deliberately treats that
 /// paragraph as matched, so add the missing audit row explicitly from the typed
@@ -650,17 +785,14 @@ fn append_hyperlink_metadata_rows(
     before: &CanonDoc,
     after: &CanonDoc,
     rows: &mut Vec<DirectChange>,
+    identity: BlockIdentity,
 ) {
-    let after_by_id: HashMap<NodeId, &TrackedBlock> = after
-        .blocks
-        .iter()
-        .map(|block| (block_node_id(&block.block), block))
-        .collect();
-    for before_block in &before.blocks {
+    for (old_index, new_index) in
+        crate::audit_delta::paired_block_indices(&before.blocks, &after.blocks, identity)
+    {
+        let before_block = &before.blocks[old_index];
+        let after_block = &after.blocks[new_index];
         let block_id = block_node_id(&before_block.block);
-        let Some(after_block) = after_by_id.get(&block_id) else {
-            continue;
-        };
         if hyperlink_targets(&before_block.block) == hyperlink_targets(&after_block.block) {
             continue;
         }
@@ -1123,7 +1255,6 @@ fn block_contains_comment_anchor(block: &BlockNode, comment_id: &str) -> bool {
                     inline,
                     InlineNode::CommentRangeStart { id }
                         | InlineNode::CommentRangeEnd { id }
-                        | InlineNode::CommentReference { id }
                         if id == comment_id
                 )
             })
@@ -1359,11 +1490,18 @@ fn verify_block_sequences(
         // parses of identical content, and compares everything that IS
         // document content — the same classification the roundtrip suite
         // enforces exhaustively per field.
-        let differences = crate::roundtrip_compare::compare_tracked_block_pair(b, a);
+        let mut differences: Vec<String> =
+            crate::roundtrip_compare::compare_tracked_block_pair(b, a)
+                .iter()
+                .map(|d| d.to_string())
+                .collect();
+        if let Some(difference) = sealed_bytes_difference(&b.block, &a.block) {
+            differences.push(difference);
+        }
         if differences.is_empty() {
             *verified += 1;
         } else {
-            let named: Vec<String> = differences.iter().take(3).map(|d| d.to_string()).collect();
+            let named: Vec<String> = differences.iter().take(3).cloned().collect();
             violations.push(UntouchedViolation {
                 story: story.clone(),
                 kind: UntouchedViolationKind::BlockDiffers {
@@ -1379,6 +1517,23 @@ fn verify_block_sequences(
             });
         }
     }
+}
+
+/// A body block the model cannot hold is recorded only as the hash of its
+/// bytes (`body_item_sha256:…`), which the fidelity comparator skips. Equal
+/// hashes prove the block untouched; different ones mean its content may
+/// have changed, which the proof must not certify away. (Equivalent content
+/// can hash differently, e.g. after a tracked edit inside it is rejected;
+/// reporting that is the safe direction.)
+fn sealed_bytes_difference(before: &BlockNode, after: &BlockNode) -> Option<String> {
+    const PREFIX: &str = "body_item_sha256:";
+    let (BlockNode::OpaqueBlock(b), BlockNode::OpaqueBlock(a)) = (before, after) else {
+        return None;
+    };
+    (b.opaque_ref.starts_with(PREFIX)
+        && a.opaque_ref.starts_with(PREFIX)
+        && b.opaque_ref != a.opaque_ref)
+        .then(|| "the preserved block's bytes changed".to_string())
 }
 
 /// Verify one story family (headers, footers, footnotes, endnotes,

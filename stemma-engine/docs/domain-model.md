@@ -193,6 +193,17 @@ confused with the supported `Document` facade.
   refuses with context.
 - **Directness preservation.** Authored direct properties remain distinct from
   inherited effective properties.
+- **Paragraph identity versus version.** `w14:paraId` identifies a paragraph;
+  persisted owners are unique within a part, except mutually exclusive
+  `AlternateContent` branches (MS-DOCX §2.6.2.3). A tracked move's destination
+  copy needs fresh persisted owners as well as fresh runtime addresses; source
+  owners stay intact for Reject. Untouched opaque payloads still reserve their
+  identities. Cloning opaque identities requires explicit remapping or refusal.
+  The optional `w14:textId` identifies a content version (MS-DOCX §2.6.2.4).
+  Removing the optional version is valid when an edit or resolution changes
+  its content. Reusing it must not claim that different text is the same
+  version. Formatting-only and untouched text retain their existing versions;
+  this advisory consistency rule is not a new import blocker.
 - **Tri-state properties.** Absent, enabled, and explicitly disabled are distinct
   where Word distinguishes them.
 - **Native Word semantics.** In-memory projection is not evidence when native
@@ -212,3 +223,8 @@ reviewable, and the resulting document still satisfies the engine postconditions
 
 A benchmark score can reveal a candidate mechanism. It cannot redefine any of
 the invariants above.
+
+Unresolved table, row and cell property revisions retain their explicit UTC
+date independently of their legacy revision date (MS-DOCX §2.12.2.1). Import
+and export preserve the optional UTC value exactly; an absent value remains
+absent. Resolving a property revision removes its metadata with that revision.

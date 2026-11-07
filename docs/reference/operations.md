@@ -53,25 +53,26 @@ of the durable edit format. See the
 The `content` field of `replace`, `insert`, `edit_header`, and `edit_footer`
 takes the nodes below, each shown here inside a complete op.
 
-One `marks` vocabulary is used everywhere: an ARRAY of tagged objects
-(`[{"type":"bold"}]`), never bare strings. A text node's `marks` authors
-inline content; `set_format`'s `marks` replaces a span's mark set, with the
-value-carrying formatting (color, font, size) in sibling fields.
+A text node's `marks` is an ARRAY of marks (`[{"type":"bold"}]`; a plain
+mark may also be written as its bare name, `["bold"]`). `set_format`'s `marks`
+is a different shape: a tri-state patch (`{"bold":true,"italic":false}`)
+where an omitted property is unchanged, with the value-carrying formatting
+(color, font, size) in sibling fields.
 
 ### `paragraph` node
 
 A body paragraph: `content` is an ordered inline list; `role` is optional.
 
 ```json
-{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text>"}]}}
+{"op":"replace","target":"<block_id>","expect":"<text currently in the block>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text>"}]}}
 ```
 
 ### `text` node
 
-An inline text run. `marks` is an ARRAY of tagged objects; mark types are bold, italic, underline, strike, subscript, superscript, and inline_role (which carries an `id`). Mixing marked and unmarked runs is how a phrase inside a paragraph gets formatting.
+An inline text run. `marks` is an ARRAY of marks: bold, italic, underline, strike, subscript, superscript (each as `{"type":"bold"}` or the bare name `"bold"`), and inline_role (`{"type":"inline_role","id":"<role>"}`). Mixing marked and unmarked runs is how a phrase inside a paragraph gets formatting.
 
 ```json
-{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"The Supplier shall "},{"type":"text","text":"indemnify","marks":[{"type":"bold"}]},{"type":"text","text":" the Customer."}]}}
+{"op":"replace","target":"<block_id>","expect":"<text currently in the block>","content":{"type":"paragraph","content":[{"type":"text","text":"The Supplier shall "},{"type":"text","text":"indemnify","marks":[{"type":"bold"}]},{"type":"text","text":" the Customer."}]}}
 ```
 
 ### `hyperlink` node
@@ -79,15 +80,15 @@ An inline text run. `marks` is an ARRAY of tagged objects; mark types are bold, 
 An inline hyperlink wrapping its own inline list. `attrs` takes `href` (external URL) and/or `anchor` (internal bookmark), plus optional `title`.
 
 ```json
-{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"See "},{"type":"hyperlink","attrs":{"href":"https://example.com/terms"},"content":[{"type":"text","text":"the standard terms"}]}]}}
+{"op":"replace","target":"<block_id>","expect":"<text currently in the block>","content":{"type":"paragraph","content":[{"type":"text","text":"See "},{"type":"hyperlink","attrs":{"href":"https://example.com/terms"},"content":[{"type":"text","text":"the standard terms"}]}]}}
 ```
 
 ### `opaque_ref` node
 
-A pointer to an EXISTING opaque inline node (image, field, footnote reference) by its stable id. Opaque content is never authored inline; a replace payload must carry the same opaque id set as the target block.
+A pointer to an EXISTING opaque inline node (image, field, footnote reference) by its stable id. Opaque content is never authored inline; a replace payload must reference every opaque node of the target block, in order. Comment references and comment range markers (`comment_<id>_start`, `comment_<id>_end`) may be left out: they are put back at their text position.
 
 ```json
-{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text before the image> "},{"type":"opaque_ref","attrs":{"id":"<opaque_id>"}}]}}
+{"op":"replace","target":"<block_id>","expect":"<text currently in the block>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text before the image> "},{"type":"opaque_ref","attrs":{"id":"<opaque_id>"}}]}}
 ```
 
 ### `table` node
@@ -108,12 +109,12 @@ A native table-of-contents field. Insert-only; `levels` defaults to headings 1 t
 
 ## Catalog
 
-49 operations in 14 groups:
+52 operations in 14 groups:
 
-* [Content](#content): `replace`, `insert`, `delete`, `move`, `blocks_to_table`
+* [Content](#content): `replace`, `insert`, `delete`, `join_paragraphs`, `move`, `blocks_to_table`
 * [Formatting and styles](#formatting-and-styles): `set_attr`, `set_format`, `set_para_format`, `apply_style`, `create_style`, `modify_style`, `set_doc_defaults`
 * [Tables](#tables): `set_cell_format`, `set_row_format`, `table_op`, `set_table_format`
-* [References](#references): `insert_cross_ref`, `insert_bookmark`, `rename_bookmark`, `remove_bookmark`
+* [References](#references): `insert_cross_ref`, `insert_bookmark`, `rename_bookmark`, `remove_bookmark`, `unlink_hyperlink`
 * [Numbering](#numbering): `set_numbering`
 * [Images](#images): `set_image_attrs`, `delete_image`, `insert_image`, `replace_image`, `set_image_layout`
 * [Comments](#comments): `comment_create`, `comment_reply`, `comment_resolve`, `comment_delete`
@@ -122,48 +123,70 @@ A native table-of-contents field. Insert-only; `levels` defaults to headings 1 t
 * [Headers and footers](#headers-and-footers): `edit_header`, `edit_footer`, `create_header`, `create_footer`, `set_header_footer_mode`
 * [Equations](#equations): `insert_equation`
 * [Content controls](#content-controls): `wrap_content_control`, `set_content_control_value`, `sdt_text_fill`, `wrap_blocks_content_control`
-* [Form fields](#form-fields): `set_form_field_value`
+* [Form fields](#form-fields): `set_form_field_value`, `set_block_form_text`
 * [Textboxes and opaque content](#textboxes-and-opaque-content): `set_textbox_text`, `opaque_text_edit`
 
 ## Content
 
 ### `replace`
 
-Tracked whole-paragraph or guarded span replacement.
+Tracked whole-paragraph, guarded span, or hyperlink display-text replacement. For a hyperlink, target its opaque id and use content.type=hyperlink; attrs.href/anchor assert the current destination, not a new one. Change the destination separately with set_attr. A link in a header or footer adds header_part or footer_part (the part find names under story_matches). A typed label ("1." written as text, not list numbering) is rewritten by a whole-paragraph replace whose content starts with the new label; an automatic list label changes with set_numbering.
 
-Fields: `target`, `content`, `span`, `expect`, `guard`, `semantic_hash`, `rationale`.
+Fields: `target`, `content`, `span`, `expect`, `guard`, `semantic_hash`, `header_part`, `footer_part`, `rationale`.
 
 ```json
-{"op":"replace","target":"<block_id>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text>"}]}}
+{"op":"replace","target":"<block_id>","expect":"<text currently in the block>","content":{"type":"paragraph","content":[{"type":"text","text":"<new text>"}]}}
+```
+
+```json
+{"op":"replace","target":"<hyperlink_id>","expect":"<current display text>","content":{"type":"hyperlink","attrs":{"href":"https://example.com/current"},"content":[{"type":"text","text":"<new display text>"}]}}
 ```
 
 ### `insert`
 
-Insert paragraphs, tables, or a native table of contents at an anchor.
+Insert paragraphs, tables, or a native table of contents. Paragraph attrs.format_from selects a template paragraph (its text supplies the formatting; anchors, fields and links in it are not copied): local text replacement inherits its mixed character formatting and paragraph/list properties. attrs.tab_stops overrides direct stops with [{position: signed twips, alignment: left|right|center|decimal|bar|start|end|num|clear, leader?: dot|heavy|hyphen|middleDot|none|underscore}]; positions must be unique and within -31680..31680. Omit to inherit the template; [] removes direct stops, while clear entries suppress inherited positions. Explicit marks add to inherited formatting; content that marks any of its text keeps the template's formatting on unchanged words, and its new text is the template's body text plus the marks given. Source objects, identity, and revision history are not copied. Role selects a representative, not an exact neighbor.
 
 Fields: `target`, `content`, `rationale`.
 
 ```json
-{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"paragraph","role":"body_text","content":[{"type":"text","text":"<new text>"}]}]}
+{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"paragraph","attrs":{"format_from":"<paragraph_id>"},"content":[{"type":"text","text":"<new text>"}]}]}
+```
+
+```json
+{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"paragraph","attrs":{"format_from":"<paragraph_id>"},"content":[{"type":"text","text":"<new text>"},{"type":"hyperlink","attrs":{"href":"<new_url>"},"content":[{"type":"text","text":"<new display text>"}]}]}]}
 ```
 
 ```json
 {"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"toc"}]}
 ```
 
+```json
+{"op":"insert","target":{"anchor":"<block_id>","position":"after"},"content":[{"type":"table","attrs":{"width":{"w":5000,"width_type":"pct"},"borders":{"top":{"style":"single","size":4,"color":"000000"},"bottom":{"style":"single","size":4,"color":"000000"},"left":{"style":"single","size":4,"color":"000000"},"right":{"style":"single","size":4,"color":"000000"},"inside_h":{"style":"single","size":4,"color":"000000"},"inside_v":{"style":"single","size":4,"color":"000000"}}},"content":[{"attrs":{"cant_split":true},"content":[{"content":[{"type":"paragraph","content":[{"type":"text","text":"Item","marks":[{"type":"bold"}]}]}]},{"content":[{"type":"paragraph","content":[{"type":"text","text":"Amount","marks":[{"type":"bold"}]}]}]}]},{"attrs":{"cant_split":true},"content":[{"content":[{"type":"paragraph","content":[{"type":"text","text":"Total"}]}]},{"content":[{"type":"paragraph","content":[{"type":"text","text":"100"}]}]}]}]}]}
+```
+
 ### `delete`
 
-Track deletion of one block.
+Track deletion of one block. For a paragraph in a header or footer, add header_part or footer_part; the story keeps its last paragraph.
 
-Fields: `target`, `expect`, `guard`, `semantic_hash`, `rationale`.
+Fields: `target`, `expect`, `guard`, `semantic_hash`, `header_part`, `footer_part`, `rationale`.
 
 ```json
-{"op":"delete","target":"<block_id>"}
+{"op":"delete","target":"<block_id>","expect":"<text currently in the block>"}
+```
+
+### `join_paragraphs`
+
+Join a paragraph with the paragraph right after it (with: that paragraph's id), as Delete at the end of the first does in Word: tracks the deletion of the paragraph mark between them. The joined paragraph takes the first paragraph's paragraph formatting (the tracked change records the second's, so Reject restores both) and each part keeps its own character formatting; mind the space at the seam (the first text's end is kept as it is).
+
+Fields: `target`, `with`, `expect`, `guard`, `semantic_hash`, `rationale`.
+
+```json
+{"op":"join_paragraphs","target":"<block_id>","with":"<block_id>","expect":"<text currently in the block>"}
 ```
 
 ### `move`
 
-Track relocation of one block or one contiguous range in a single op.
+Track relocation of one top-level block or one contiguous range of them in a single op; a paragraph in a table cell is refused (move its row with move_row).
 
 Fields: `target`, `destination`, `expect`, `guard`, `semantic_hash`, `rationale`.
 
@@ -177,7 +200,7 @@ Fields: `target`, `destination`, `expect`, `guard`, `semantic_hash`, `rationale`
 
 ### `blocks_to_table`
 
-Convert a contiguous paragraph range into a tracked table.
+Convert a contiguous paragraph range into a tracked table. Each cell keeps its source text, run formatting, line breaks and footnote/endnote references.
 
 Fields: `from`, `to`, `delimiter`, `header`, `rationale`.
 
@@ -189,9 +212,9 @@ Fields: `from`, `to`, `delimiter`, `header`, `rationale`.
 
 ### `set_attr`
 
-Change a hyperlink's target or other kind-specific attributes; expect_href guards an href retarget.
+Change a hyperlink's target or other kind-specific attributes; expect_href guards an href retarget. A link's visible text is changed with replace on the hyperlink id (content.type=hyperlink). A link in a header or footer adds header_part or footer_part.
 
-Fields: `target`, `attrs`, `expect_href`, `expect_anchor`, `rationale`.
+Fields: `target`, `attrs`, `expect_href`, `expect_anchor`, `header_part`, `footer_part`, `rationale`.
 
 ```json
 {"op":"set_attr","target":"<hyperlink_id>","attrs":{"href":"<new_url>"},"expect_href":"<current_url>"}
@@ -199,7 +222,7 @@ Fields: `target`, `attrs`, `expect_href`, `expect_anchor`, `rationale`.
 
 ### `set_format`
 
-Tracked character formatting on a guarded text span; marks is a tri-state object where an omitted property is unchanged, true turns it on and false turns it off, and the value-carrying fields (color, font, size) ride alongside it.
+Tracked character formatting on a guarded text span; marks is a tri-state object where an omitted property is unchanged, true turns it on and false turns it off, and the value-carrying fields (color, font, size) ride alongside it. The expect text may run across bookmark, comment-range and proofing marks, not across a link, field or other inline object (the refusal names it).
 
 Fields: `target`, `expect`, `semantic_hash`, `marks`, `color`, `highlight`, `font_family`, `font_size_half_points`, `caps`, `small_caps`, `char_spacing`, `rationale`.
 
@@ -209,12 +232,16 @@ Fields: `target`, `expect`, `semantic_hash`, `marks`, `color`, `highlight`, `fon
 
 ### `set_para_format`
 
-Tracked paragraph formatting: alignment, indentation, spacing, borders, shading.
+Tracked paragraph formatting: alignment, indentation, spacing, borders, shading, and pagination (keep_with_next, keep_lines_together, page_break_before).
 
-Fields: `target`, `semantic_hash`, `align`, `indent`, `spacing`, `borders`, `shading`, `rationale`.
+Fields: `target`, `semantic_hash`, `align`, `indent`, `spacing`, `borders`, `shading`, `keep_with_next`, `keep_lines_together`, `page_break_before`, `rationale`.
 
 ```json
 {"op":"set_para_format","target":"<block_id>","align":"center","spacing":{"after":120}}
+```
+
+```json
+{"op":"set_para_format","target":"<block_id>","keep_with_next":true}
 ```
 
 ### `apply_style`
@@ -281,7 +308,7 @@ Fields: `target`, `semantic_hash`, `row_index`, `height`, `height_rule`, `ration
 
 ### `table_op`
 
-Structural table edits; insert_row carries cell text in the same op.
+Structural table edits. Row and column indices are 0-based, as in a table read's cells (the first column is 0, including a label column). Read the table before a column op and give expect_header, the text of the column's top cell: a column op whose header does not match is refused with every column's index and header. move_row relocates an existing complete row using pre-operation row_index/ref_row and explicit before/after position. reorder_rows expresses a complete target-order permutation of source row indices in one operation; each source row must occur exactly once. move_column relocates one column (grid index col_index, before/after ref_col) with each cell's content, formatting and width, in direct mode; on a merged grid every cell must lie in the moving column, in the columns it crosses, outside both, or span both. swap_cells exchanges the contents of two cells (row/col as in cells), each keeping its cell formatting, in direct mode: use it to swap entries in some rows only. Both preserve complete content/formatting associations and require a clean source table. A vertically merged group moves only as a whole (a continuing row must stay directly below the row it continues); tables with table-level range boundaries are refused. insert_row carries cell text in the same op and inherits the reference row's height and header-row flag, and the reference cells' cell, paragraph, and leading text formatting; format_from_row names another row to copy instead (the new row is still placed by ref_row and position), e.g. a last row formatted like an earlier one. New rows do not inherit source editing-session IDs or tracked formatting history. Tracked delete_column on an explicit simple grid preserves surviving grid widths using fixed layout and reversible table/grid/cell geometry as one intention; Reject restores source layout and preferred widths. Row offsets, mismatched physical grids, and adjacent survivors narrower than 720 twips are refused (two pending slots require Word's 360-twip minimum). No whole-table replacement is substituted. merge_cells merges a rectangle as Word's Merge Cells does: the absorbed cells' text moves into the top-left cell, and the merge is not a tracked change (Word records none with Track Changes on). Down one column it works on a table with merged cells and extends or joins existing vertical merges; it never cuts one. insert_row does not join the new row to a merged group (neither does Word's Insert Row at the group's end): merge_cells down each merged column from the group's top row through the new row. Table reads give a merged cell its row_span / col_span.
 
 Fields: `target`, `semantic_hash`, `table_op`, `rationale`.
 
@@ -295,6 +322,26 @@ Fields: `target`, `semantic_hash`, `table_op`, `rationale`.
 
 ```json
 {"op":"table_op","target":"<table_id>","table_op":{"kind":"delete_row","row_index":0}}
+```
+
+```json
+{"op":"table_op","target":"<table_id>","table_op":{"kind":"move_row","row_index":2,"ref_row":0,"position":"before"}}
+```
+
+```json
+{"op":"table_op","target":"<table_id>","table_op":{"kind":"reorder_rows","row_order":[2,0,1]}}
+```
+
+```json
+{"op":"table_op","target":"<table_id>","table_op":{"kind":"move_column","col_index":1,"expect_header":"<text of the column's top cell>","ref_col":0,"position":"before"}}
+```
+
+```json
+{"op":"table_op","target":"<table_id>","table_op":{"kind":"swap_cells","row":0,"col":0,"with_row":0,"with_col":1}}
+```
+
+```json
+{"op":"table_op","target":"<table_id>","table_op":{"kind":"merge_cells","start_row":2,"start_col":0,"end_row":4,"end_col":0}}
 ```
 
 ### `set_table_format`
@@ -349,13 +396,27 @@ Fields: `target`, `name`, `semantic_hash`, `rationale`.
 {"op":"remove_bookmark","target":"<block_id>","name":"bookmark_name"}
 ```
 
+### `unlink_hyperlink`
+
+Remove a hyperlink, retaining its plain-text runs and formatting. Target the hyperlink opaque ID and supply its exact display text as expect. Tracks complete link deletion plus ordinary-text insertion. Pending target revisions and complex run payload refuse; unrelated revisions remain untouched.
+
+Fields: `target`, `expect`.
+
+```json
+{"op":"unlink_hyperlink","target":"<hyperlink_id>","expect":"<exact display text>"}
+```
+
 ## Numbering
 
 ### `set_numbering`
 
-Change a paragraph's auto-numbering membership (remove, split, join).
+Change a paragraph's auto-numbering: its level (indent / outdent: one level deeper or shallower in the same list, the label re-derived), its membership (remove from the list; split the list here; set_list puts it in a list by num_id and level), or, with kind format, the label format of this item and the following items of its list.
 
 Fields: `target`, `change`, `semantic_hash`, `rationale`.
+
+```json
+{"op":"set_numbering","target":"<block_id>","change":{"kind":"indent"}}
+```
 
 ```json
 {"op":"set_numbering","target":"<block_id>","change":{"kind":"remove"}}
@@ -365,13 +426,17 @@ Fields: `target`, `change`, `semantic_hash`, `rationale`.
 {"op":"set_numbering","target":"<block_id>","change":{"kind":"split"}}
 ```
 
+```json
+{"op":"set_numbering","target":"<block_id>","change":{"kind":"format","num_fmt":"lowerLetter","lvl_text":"(%1)"}}
+```
+
 ## Images
 
 ### `set_image_attrs`
 
-Resize an existing drawing or change alt text; this is a direct property edit.
+Resize an existing drawing (DrawingML extent or a legacy VML shape's width/height) or change alt text; this is a direct property edit. For a drawing in a header or footer, add header_part or footer_part.
 
-Fields: `target`, `drawing_id`, `semantic_hash`, `resize`, `alt_text`, `rationale`.
+Fields: `target`, `drawing_id`, `semantic_hash`, `resize`, `alt_text`, `header_part`, `footer_part`, `rationale`.
 
 ```json
 {"op":"set_image_attrs","target":"<block_id>","drawing_id":"<drawing_id>","resize":{"cx":4320000,"cy":2880000}}
@@ -394,7 +459,7 @@ Insert image bytes/path at a paragraph; dimensions may use intrinsic size.
 Fields: `target`, `bytes_base64`, `format`, `cx`, `cy`, `alt_text`, `expect`, `semantic_hash`, `rationale`.
 
 ```json
-{"op":"insert_image","target":"<block_id>","bytes_base64":"AAAA","format":"png","alt_text":"<description>"}
+{"op":"insert_image","target":"<block_id>","bytes_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","format":"png","alt_text":"<description>"}
 ```
 
 ### `replace_image`
@@ -404,7 +469,7 @@ Replace an existing drawing's media by drawing_id.
 Fields: `target`, `drawing_id`, `bytes_base64`, `format`, `cx`, `cy`, `alt_text`, `allow_stretch`, `semantic_hash`, `rationale`.
 
 ```json
-{"op":"replace_image","target":"<block_id>","drawing_id":"<drawing_id>","bytes_base64":"AAAA","format":"png"}
+{"op":"replace_image","target":"<block_id>","drawing_id":"<drawing_id>","bytes_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","format":"png"}
 ```
 
 ### `set_image_layout`
@@ -477,7 +542,8 @@ Fields: `target`, `expect`, `note_kind`, `body`, `semantic_hash`, `rationale`.
 
 ### `edit_note`
 
-Edit one note body by its note_id from the current notes index.
+Edit one note body by its note_id from the current notes index; for a note of several paragraphs give one line per paragraph, separated by 
+, and each paragraph is edited in place.
 
 Fields: `note_id`, `note_kind`, `body`, `rationale`.
 
@@ -531,7 +597,7 @@ Fields: `anchor`, `section_type`, `page_size`, `orientation`, `margins`, `column
 
 ### `edit_header`
 
-Tracked text edit of one header story paragraph, addressed by part name and story-local id.
+Tracked text edit of one header story paragraph, addressed by part name and story-local id. expect names text in it and content what replaces it: plain replacement text for a part (a date beside page-number fields) changes just that part; content repeating the paragraph's other text, or keeping its objects as opaque_ref, rebuilds the whole paragraph. It reaches a paragraph inside a table in the header (a letterhead cell). find reports header matches under story_matches. A link in the header: replace or set_attr with header_part.
 
 Fields: `header_part`, `target`, `expect`, `content`, `semantic_hash`, `rationale`.
 
@@ -541,7 +607,7 @@ Fields: `header_part`, `target`, `expect`, `content`, `semantic_hash`, `rational
 
 ### `edit_footer`
 
-Tracked text edit of one footer story paragraph, addressed by part name and story-local id.
+Tracked text edit of one footer story paragraph, addressed by part name and story-local id. expect names text in it and content what replaces it: plain replacement text for a part (a date beside page-number fields) changes just that part; content repeating the paragraph's other text, or keeping its objects as opaque_ref, rebuilds the whole paragraph. It reaches a paragraph inside a table in the footer. A link in the footer: replace or set_attr with footer_part.
 
 Fields: `footer_part`, `target`, `expect`, `content`, `semantic_hash`, `rationale`.
 
@@ -623,12 +689,16 @@ Fields: `target`, `sdt_id`, `text`, `checked`, `selected`, `tracked`, `rationale
 
 ### `sdt_text_fill`
 
-Tracked whole-value fill of a content control, inline (block_id + sdt_id) or block-level (body_index).
+Tracked whole-value fill of a content control: inline (block_id + sdt_id), open block-level (its first block_id), or sealed block-level (body_index).
 
 Fields: `block_id`, `sdt_id`, `body_index`, `value`, `semantic_hash`, `rationale`.
 
 ```json
 {"op":"sdt_text_fill","block_id":"<block_id>","sdt_id":"<sdt_id>","value":"<new value>"}
+```
+
+```json
+{"op":"sdt_text_fill","block_id":"<block_id>","value":"<new value>"}
 ```
 
 ```json
@@ -649,21 +719,35 @@ Fields: `start_block`, `end_block`, `tag`, `alias`, `control`, `rationale`.
 
 ### `set_form_field_value`
 
-Fill a legacy form field (FORMTEXT, FORMCHECKBOX, FORMDROPDOWN): exactly one of text, checked, selected.
+Fill a legacy form field (FORMTEXT, FORMCHECKBOX, FORMDROPDOWN): at most one of text, checked, selected; default sets what the field shows when reset (a string for a text field, a boolean for a checkbox), with or without a value.
 
-Fields: `target`, `field_id`, `text`, `checked`, `selected`, `semantic_hash`, `rationale`.
+Fields: `target`, `field_id`, `text`, `checked`, `selected`, `default`, `semantic_hash`, `rationale`.
 
 ```json
 {"op":"set_form_field_value","target":"<block_id>","field_id":"<field_id>","text":"<new value>"}
+```
+
+```json
+{"op":"set_form_field_value","target":"<block_id>","field_id":"<field_id>","text":"<new value>","default":"<new value>"}
+```
+
+### `set_block_form_text`
+
+Update a FORMTEXT cached result inside an opaque body block using its hash-bound field address. Direct field-value update; preserves the stored default and other fields.
+
+Fields: `body_index`, `paragraph_index`, `field_index`, `semantic_hash`, `text`.
+
+```json
+{"op":"set_block_form_text","body_index":0,"paragraph_index":1,"field_index":0,"semantic_hash":"<containing-block hash>","text":"<new value>"}
 ```
 
 ## Textboxes and opaque content
 
 ### `set_textbox_text`
 
-Replace a textbox's interior paragraphs wholesale; direct edit, refuses an interior that already carries tracked changes.
+Replace a textbox's interior paragraphs wholesale as plain paragraphs (its run formatting is not kept); direct edit, refuses an interior that already carries tracked changes. To change words in place, tracked and keeping their formatting, use opaque_text_edit. For a textbox in a header or footer, add header_part or footer_part.
 
-Fields: `target`, `drawing_id`, `paragraphs`, `semantic_hash`, `rationale`.
+Fields: `target`, `drawing_id`, `paragraphs`, `semantic_hash`, `header_part`, `footer_part`, `rationale`.
 
 ```json
 {"op":"set_textbox_text","target":"<block_id>","drawing_id":"<drawing_id>","paragraphs":["<paragraph text, one entry per paragraph>"]}
@@ -671,12 +755,16 @@ Fields: `target`, `drawing_id`, `paragraphs`, `semantic_hash`, `rationale`.
 
 ### `opaque_text_edit`
 
-Tracked find/replace inside a textbox or inline content control.
+Tracked find/replace inside a textbox or inline content control. For one in a header or footer, add header_part or footer_part (its part name).
 
-Fields: `target`, `opaque_id`, `find`, `replacement`, `container_index`, `paragraph_index`, `semantic_hash`, `rationale`.
+Fields: `target`, `opaque_id`, `find`, `replacement`, `container_index`, `paragraph_index`, `semantic_hash`, `header_part`, `footer_part`, `rationale`.
 
 ```json
 {"op":"opaque_text_edit","target":"<block_id>","opaque_id":"<opaque_id>","find":"<text currently inside>","replacement":"<new text>"}
+```
+
+```json
+{"op":"opaque_text_edit","header_part":"header2.xml","target":"<block_id>","opaque_id":"<opaque_id>","find":"<text currently inside>","replacement":"<new text>"}
 ```
 
 ## Related

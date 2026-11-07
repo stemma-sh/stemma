@@ -109,7 +109,8 @@ fn set_value_txn(block_id: NodeId, field_id: NodeId, value: FormFieldValue) -> E
         steps: vec![EditStep::SetFormFieldValue {
             block_id,
             field_id,
-            value,
+            value: Some(value),
+            default: None,
             semantic_hash: None,
             rationale: None,
         }],
@@ -150,6 +151,72 @@ fn set_formtext_replaces_result_run() {
     assert!(
         xml.contains("<w:textInput") && xml.contains(r#"w:val="FirstName""#),
         "ffData preserved: {xml}"
+    );
+}
+
+/// The run properties of the run holding `text` in `xml`, as a spelling-free
+/// comparison key (namespace redeclarations and whitespace before `/>` dropped).
+fn rpr_of_run_with(xml: &str, text: &str) -> String {
+    let at = xml
+        .find(&format!(">{text}</w:t>"))
+        .expect("the text is written");
+    let run = &xml[xml[..at].rfind("<w:r>").expect("its run")..at];
+    run.find("<w:rPr>")
+        .map(|start| run[start..run.find("</w:rPr>").expect("closed") + 8].to_string())
+        .unwrap_or_default()
+        .replace(
+            r#" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#,
+            "",
+        )
+        .replace(" />", "/>")
+}
+
+/// Domain rule: a form field's value is shown in the field's result run, and
+/// filling the field changes the value, not its look (Word keeps the result
+/// run's formatting when a user types into the field). Every run of this field
+/// is Arial 10pt with proofing off, as a form template typically has it.
+#[test]
+fn set_formtext_keeps_the_result_formatting() {
+    let rpr = r#"<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:noProof/><w:sz w:val="20"/></w:rPr>"#;
+    let body = format!(
+        r#"<w:p><w:r>{rpr}<w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Term"/><w:enabled/><w:textInput/></w:ffData></w:fldChar></w:r><w:r>{rpr}<w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r><w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r><w:r>{rpr}<w:t>three</w:t></w:r><w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+    );
+    let base = Document::parse(&make_docx(&body)).expect("parse");
+    let before = rpr_of_run_with(&document_xml(&base), "three");
+    assert!(before.contains("Arial"), "fixture: {before}");
+    let (block_id, field_id) = first_form_field(&base.snapshot().canonical);
+    let edited = base
+        .apply(&set_value_txn(
+            block_id,
+            field_id,
+            FormFieldValue::Text("five".to_string()),
+        ))
+        .expect("set value");
+    assert_eq!(rpr_of_run_with(&document_xml(&edited), "five"), before);
+}
+
+/// A field whose result is empty has no result run to keep: the value takes
+/// the formatting of the field's own runs (its `separate` run), where Word
+/// puts text typed into the empty field.
+#[test]
+fn set_formtext_on_an_empty_result_takes_the_field_formatting() {
+    let rpr = r#"<w:rPr><w:b/><w:sz w:val="28"/></w:rPr>"#;
+    let body = format!(
+        r#"<w:p><w:r>{rpr}<w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Term"/><w:enabled/><w:textInput/></w:ffData></w:fldChar></w:r><w:r>{rpr}<w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r><w:r>{rpr}<w:fldChar w:fldCharType="separate"/></w:r><w:r>{rpr}<w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+    );
+    let base = Document::parse(&make_docx(&body)).expect("parse");
+    let (block_id, field_id) = first_form_field(&base.snapshot().canonical);
+    let edited = base
+        .apply(&set_value_txn(
+            block_id,
+            field_id,
+            FormFieldValue::Text("five".to_string()),
+        ))
+        .expect("set value");
+    let written = rpr_of_run_with(&document_xml(&edited), "five");
+    assert!(
+        written.contains("<w:b/>") && written.contains(r#"w:val="28""#),
+        "the value has the field's formatting: {written}"
     );
 }
 
@@ -428,4 +495,84 @@ fn set_formtext_in_table_cell() {
         .expect("set value in a table cell");
     let xml = document_xml(&edited);
     assert!(xml.contains("InCell"), "value set in-cell: {xml}");
+}
+
+// ─── Defaults ─────────────────────────────────────────────────────────────────
+
+/// Apply one wire `set_form_field_value` with `fields` (value and/or default).
+fn set_wire(base: &Document, fields: serde_json::Value) -> Result<Document, stemma::RuntimeError> {
+    let (block_id, field_id) = first_form_field(&base.snapshot().canonical);
+    let mut op = serde_json::json!({"op":"set_form_field_value","target":block_id.to_string(),"field_id":field_id.to_string()});
+    for (key, value) in fields.as_object().expect("fields") {
+        op[key] = value.clone();
+    }
+    let json =
+        serde_json::json!({"ops":[op],"materialization_mode":"direct","revision":{"author":"FF"}})
+            .to_string();
+    base.apply(
+        &stemma::edit_v4::parse_transaction(&json)
+            .expect("parse")
+            .into_edit_transaction()
+            .expect("adapt"),
+    )
+}
+
+/// The ffData of the first field, as written.
+fn ffdata(doc: &Document) -> String {
+    let xml = document_xml(doc);
+    let start = xml.find("<w:ffData").expect("ffData");
+    xml[start..xml[start..].find("</w:ffData>").expect("closed") + start].replace(" />", "/>")
+}
+
+/// Domain rule: a text form field has a current value (its result) and a
+/// default (§17.16.13 `w:textInput/w:default`, what it shows when reset). A
+/// request to make a field read "five" and default to "five" sets both; the
+/// field's other settings stay in place.
+#[test]
+fn set_formtext_value_and_default() {
+    let body = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Term"/><w:enabled/><w:textInput><w:default w:val="three"/><w:maxLength w:val="10"/></w:textInput></w:ffData></w:fldChar></w:r><w:r><w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>three</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    let base = Document::parse(&make_docx(body)).expect("parse");
+    let edited = set_wire(&base, serde_json::json!({"text":"five","default":"five"})).expect("set");
+    let data = ffdata(&edited);
+    assert!(
+        data.contains(r#"<w:default w:val="five"/><w:maxLength w:val="10"/>"#),
+        "default set in place, maxLength kept: {data}"
+    );
+    assert!(
+        document_xml(&edited).contains(">five</w:t>"),
+        "the value too"
+    );
+}
+
+/// A default alone is a complete request; a new `w:default` goes after
+/// `w:type`, as `CT_FFTextInput` orders them.
+#[test]
+fn set_formtext_default_alone_in_schema_order() {
+    let body = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Term"/><w:enabled/><w:textInput><w:type w:val="regular"/><w:maxLength w:val="10"/></w:textInput></w:ffData></w:fldChar></w:r><w:r><w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>three</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    let base = Document::parse(&make_docx(body)).expect("parse");
+    let edited = set_wire(&base, serde_json::json!({"default":"five"})).expect("set");
+    let data = ffdata(&edited);
+    assert!(
+        data.contains(r#"<w:type w:val="regular"/><w:default w:val="five"/><w:maxLength"#),
+        "{data}"
+    );
+    assert!(
+        document_xml(&edited).contains(">three</w:t>"),
+        "the value is untouched"
+    );
+}
+
+/// A checkbox default goes after its size and before `w:checked`
+/// (`CT_FFCheckBox`); a text default on a checkbox is refused.
+#[test]
+fn set_formcheckbox_default_and_mismatch() {
+    let body = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Agree"/><w:enabled/><w:checkBox><w:sizeAuto/><w:checked w:val="false"/></w:checkBox></w:ffData></w:fldChar></w:r><w:r><w:instrText xml:space="preserve"> FORMCHECKBOX </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#;
+    let base = Document::parse(&make_docx(body)).expect("parse");
+    let edited = set_wire(&base, serde_json::json!({"default":true})).expect("set");
+    let data = ffdata(&edited);
+    assert!(
+        data.contains(r#"<w:sizeAuto/><w:default w:val="true"/><w:checked w:val="false"/>"#),
+        "{data}"
+    );
+    assert!(set_wire(&base, serde_json::json!({"default":"yes"})).is_err());
 }

@@ -220,8 +220,9 @@ fn edit_header_preserves_page_field_or_fails_loud() {
         })
         .expect("header has a PAGE field opaque");
 
-    // (a) An edit that does NOT reference the opaque drops it → OpaqueDestroyed.
-    let drop_err = apply_transaction(
+    // (a) Plain text for the part `expect` names replaces just that part: the
+    // PAGE field beside it is kept, not destroyed.
+    let replaced = apply_transaction(
         &base,
         &txn(
             vec![EditStep::EditHeader {
@@ -230,6 +231,39 @@ fn edit_header_preserves_page_field_or_fails_loud() {
                 expect: "Page ".to_string(),
                 semantic_hash: None,
                 content: text_content("No field here"),
+                rationale: None,
+            }],
+            MaterializationMode::TrackedChange,
+        ),
+    )
+    .expect("the part is replaced")
+    .0;
+    let kept = replaced.headers[0].blocks.iter().any(|b| match &b.block {
+        BlockNode::Paragraph(p) => p
+            .segments
+            .iter()
+            .flat_map(|s| &s.inlines)
+            .any(|i| matches!(i, InlineNode::OpaqueInline(o) if o.id == opaque_id)),
+        _ => false,
+    });
+    assert!(kept, "the PAGE field stays");
+
+    // (a') Content that rebuilds the paragraph without its field still fails
+    // loud: the whole text named, the field left out.
+    let drop_err = apply_transaction(
+        &base,
+        &txn(
+            vec![EditStep::EditHeader {
+                story: StoryRef::Header(part.clone()),
+                block_id: block_id.clone(),
+                expect: "Page ".to_string(),
+                semantic_hash: None,
+                content: ParagraphContent {
+                    fragments: vec![ContentFragment::StyledText {
+                        text: "No field here".to_string(),
+                        marks: Default::default(),
+                    }],
+                },
                 rationale: None,
             }],
             MaterializationMode::TrackedChange,

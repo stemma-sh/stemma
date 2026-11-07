@@ -232,7 +232,7 @@ fn compare_opt_section_properties(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => diff(diffs, path, a.is_some(), b.is_some()),
         (Some(a), Some(b)) => {
-            // SectionProperties already has a custom PartialEq that ignores `raw`
+            // Compare the complete modeled properties, including source provenance.
             if a != b {
                 diff(diffs, path, a, b);
             }
@@ -250,37 +250,23 @@ fn compare_opt_section_property_change(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => diff(diffs, path, a.is_some(), b.is_some()),
         (Some(a_val), Some(b_val)) => {
-            compare_revision_info(
+            compare_tracking_revision_info(
                 diffs,
                 &format!("{path}.revision"),
                 &a_val.revision,
                 &b_val.revision,
             );
-            // previous_properties_raw is raw XML — compare as bytes
+            // The previous properties are raw XML: compare their canonical
+            // spelling, so a namespace redeclaration is not a difference but
+            // any changed property is.
             compare_val(
                 diffs,
-                &format!("{path}.previous_properties_raw.len"),
-                &a_val.previous_properties_raw.len(),
-                &b_val.previous_properties_raw.len(),
+                &format!("{path}.previous_properties_raw"),
+                &crate::import::canonical_raw_hash(&a_val.previous_properties_raw),
+                &crate::import::canonical_raw_hash(&b_val.previous_properties_raw),
             );
         }
     }
-}
-
-fn compare_revision_info(
-    diffs: &mut Vec<Difference>,
-    path: &str,
-    a: &RevisionInfo,
-    b: &RevisionInfo,
-) {
-    compare_val(
-        diffs,
-        &format!("{path}.revision_id"),
-        &a.revision_id,
-        &b.revision_id,
-    );
-    compare_opt(diffs, &format!("{path}.author"), &a.author, &b.author);
-    compare_opt(diffs, &format!("{path}.date"), &a.date, &b.date);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,18 +344,26 @@ fn compare_footnotes(
         // Exhaustive destructure of FootnoteStory.
         let FootnoteStory {
             id,
+            source_attrs,
             note_type,
             blocks,
             content_hash: _, // computed digest for cross-document alignment
         } = na;
         let FootnoteStory {
             id: b_id,
+            source_attrs: b_source_attrs,
             note_type: b_note_type,
             blocks: b_blocks,
             content_hash: _,
         } = nb;
         compare_val(diffs, &format!("{p}.id"), id, b_id);
         compare_val(diffs, &format!("{p}.note_type"), note_type, b_note_type);
+        compare_val(
+            diffs,
+            &format!("{p}.source_attrs"),
+            source_attrs,
+            b_source_attrs,
+        );
         compare_tracked_blocks(diffs, &format!("{p}.blocks"), blocks, b_blocks);
     }
 }
@@ -389,16 +383,24 @@ fn compare_endnotes(
         // Exhaustive destructure of EndnoteStory.
         let EndnoteStory {
             id,
+            source_attrs,
             note_type,
             blocks,
             content_hash: _, // computed digest for cross-document alignment
         } = na;
         let EndnoteStory {
             id: b_id,
+            source_attrs: b_source_attrs,
             note_type: b_note_type,
             blocks: b_blocks,
             content_hash: _,
         } = nb;
+        compare_val(
+            diffs,
+            &format!("{p}.source_attrs"),
+            source_attrs,
+            b_source_attrs,
+        );
         compare_val(diffs, &format!("{p}.id"), id, b_id);
         compare_val(diffs, &format!("{p}.note_type"), note_type, b_note_type);
         compare_tracked_blocks(diffs, &format!("{p}.blocks"), blocks, b_blocks);
@@ -438,7 +440,7 @@ fn compare_comments(
         compare_opt(diffs, &format!("{p}.author"), author, b_author);
         compare_opt(diffs, &format!("{p}.date"), date, b_date);
         compare_tracked_blocks(diffs, &format!("{p}.blocks"), blocks, b_blocks);
-        compare_opt(
+        compare_opt_tracking_status(
             diffs,
             &format!("{p}.tracking_status"),
             tracking_status,
@@ -486,6 +488,21 @@ fn compare_tracked_blocks(
             b_block_sdt_wrap,
         );
         compare_block_nodes(diffs, &p, block, b_block);
+    }
+}
+
+/// An optional tracking status, compared like any other carrier: by engine
+/// identity, never by the wire id serialization renumbers.
+fn compare_opt_tracking_status(
+    diffs: &mut Vec<Difference>,
+    path: &str,
+    a: &Option<TrackingStatus>,
+    b: &Option<TrackingStatus>,
+) {
+    match (a, b) {
+        (None, None) => {}
+        (Some(a), Some(b)) => compare_tracking_status(diffs, path, a, b),
+        _ => diff(diffs, path, a, b),
     }
 }
 
@@ -665,6 +682,7 @@ fn compare_paragraphs(
         frame_pr,
         para_id: _, // optional w14:paraId identity hex; renumbered on serialize
         text_id: _, // optional w14:textId identity hex; renumbered on serialize
+        source_paragraph_attrs,
         cnf_style,
         preserved_ppr,
     } = a;
@@ -741,9 +759,16 @@ fn compare_paragraphs(
         para_id: _,
         text_id: _,
         cnf_style: b_cnf_style,
+        source_paragraph_attrs: b_source_paragraph_attrs,
         preserved_ppr: b_preserved_ppr,
     } = b;
 
+    compare_val(
+        diffs,
+        &format!("{path}.source_paragraph_attrs"),
+        source_paragraph_attrs,
+        b_source_paragraph_attrs,
+    );
     compare_opt(diffs, &format!("{path}.style_id"), style_id, b_style_id);
     compare_opt(diffs, &format!("{path}.align"), align, b_align);
     compare_opt(diffs, &format!("{path}.indent"), indent, b_indent);
@@ -1127,12 +1152,10 @@ fn compare_tracked_segments(
         }
 
         let mut out: Vec<(&TrackingStatus, Vec<InlineNode>)> = Vec::new();
-        let mut cache_since_content = false;
         for seg in segs {
             // Exhaustive destructure: a new TrackedSegment field must be handled.
             let TrackedSegment { status, inlines } = seg;
             if inlines.is_empty() {
-                cache_since_content = false;
                 if out
                     .last()
                     .is_none_or(|(last_status, _)| *last_status != status)
@@ -1143,7 +1166,6 @@ fn compare_tracked_segments(
             }
             for inline in inlines {
                 if is_pagination_cache(inline) {
-                    cache_since_content = true;
                     continue;
                 }
                 if out
@@ -1151,20 +1173,19 @@ fn compare_tracked_segments(
                     .is_none_or(|(last_status, _)| *last_status != status)
                 {
                     out.push((status, Vec::new()));
-                    cache_since_content = false;
                 }
                 let output_inlines = &mut out.last_mut().expect("group was created").1;
-                if cache_since_content
-                    && let (Some(InlineNode::Text(left)), InlineNode::Text(right)) =
-                        (output_inlines.last_mut(), inline)
+                // Adjacent equally styled text in the SAME revision status
+                // has the same meaning regardless of run partition. Never
+                // merge across a decoration, formatting or status boundary.
+                if let (Some(InlineNode::Text(left)), InlineNode::Text(right)) =
+                    (output_inlines.last_mut(), inline)
                     && text_can_join(left, right)
                 {
                     left.text.push_str(&right.text);
-                    cache_since_content = false;
                     continue;
                 }
                 output_inlines.push(inline.clone());
-                cache_since_content = false;
             }
         }
         out
@@ -1336,9 +1357,6 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
         (InlineNode::CommentRangeEnd { id: a_id }, InlineNode::CommentRangeEnd { id: b_id }) => {
             compare_val(diffs, &format!("{path}.comment_range_end.id"), a_id, b_id);
         }
-        (InlineNode::CommentReference { id: a_id }, InlineNode::CommentReference { id: b_id }) => {
-            compare_val(diffs, &format!("{path}.comment_reference.id"), a_id, b_id);
-        }
         _ => {
             diff(
                 diffs,
@@ -1358,7 +1376,6 @@ fn inline_variant_name(n: &InlineNode) -> &'static str {
         InlineNode::Decoration(_) => "Decoration",
         InlineNode::CommentRangeStart { .. } => "CommentRangeStart",
         InlineNode::CommentRangeEnd { .. } => "CommentRangeEnd",
-        InlineNode::CommentReference { .. } => "CommentReference",
     }
 }
 
@@ -1404,6 +1421,7 @@ fn compare_opaque_inlines(
         proof_ref: _,  // ephemeral proof bookkeeping
         wrapper_marks,
         wrapper_style_props,
+        wrapper_rpr_authored,
         source_run_attrs,
         joins_following_text_run,
         // raw_xml carries the verbatim bytes; its identity is summarized by
@@ -1419,12 +1437,34 @@ fn compare_opaque_inlines(
         proof_ref: _,
         wrapper_marks: b_wrapper_marks,
         wrapper_style_props: b_wrapper_style_props,
+        wrapper_rpr_authored: b_wrapper_rpr_authored,
         source_run_attrs: b_source_run_attrs,
         joins_following_text_run: b_joins_following_text_run,
         raw_xml: _,
         content_hash: b_content_hash,
     } = b;
-    compare_val(diffs, &format!("{path}.kind"), kind, b_kind);
+    match (kind, b_kind) {
+        (OpaqueKind::Hyperlink(a), OpaqueKind::Hyperlink(b)) => {
+            compare_hyperlink(diffs, &format!("{path}.hyperlink"), a, b)
+        }
+        _ => compare_val(diffs, &format!("{path}.kind"), kind, b_kind),
+    }
+    // Compare the direct properties, not the provenance bitset: synthesized
+    // wrappers use ALL, while reopening records the individual authored slots.
+    compare_val(
+        diffs,
+        &format!("{path}.wrapper_direct_rpr"),
+        &crate::serialize::build_run_direct_rpr(
+            wrapper_marks,
+            wrapper_style_props,
+            *wrapper_rpr_authored,
+        ),
+        &crate::serialize::build_run_direct_rpr(
+            b_wrapper_marks,
+            b_wrapper_style_props,
+            *b_wrapper_rpr_authored,
+        ),
+    );
     compare_val(
         diffs,
         &format!("{path}.wrapper_marks"),
@@ -1477,6 +1517,7 @@ fn compare_decorations(
 ) {
     // Exhaustive destructure of DecorationNode.
     let DecorationNode {
+        source_run_attrs,
         id: _, // ephemeral NodeId
         kind,
         // opaque_ref is an internal store reference minted from the global
@@ -1505,6 +1546,7 @@ fn compare_decorations(
         origin: _,
     } = a;
     let DecorationNode {
+        source_run_attrs: b_source_run_attrs,
         id: _,
         kind: b_kind,
         opaque_ref: _,
@@ -1516,6 +1558,12 @@ fn compare_decorations(
         origin: _,
     } = b;
     compare_val(diffs, &format!("{path}.decoration.kind"), kind, b_kind);
+    compare_val(
+        diffs,
+        &format!("{path}.decoration.source_run_attrs"),
+        source_run_attrs,
+        b_source_run_attrs,
+    );
     compare_opt(
         diffs,
         &format!("{path}.decoration.name"),
@@ -1550,6 +1598,7 @@ fn compare_tables(diffs: &mut Vec<Difference>, path: &str, a: &TableNode, b: &Ta
     // Exhaustive destructure of TableNode.
     let TableNode {
         id: _, // ephemeral NodeId
+        range_markers,
         rows,
         structure_hash: _, // computed digest of row/column/merge layout
         formatting,
@@ -1557,6 +1606,7 @@ fn compare_tables(diffs: &mut Vec<Difference>, path: &str, a: &TableNode, b: &Ta
     } = a;
     let TableNode {
         id: _,
+        range_markers: b_range_markers,
         rows: b_rows,
         structure_hash: _,
         formatting: b_formatting,
@@ -1573,6 +1623,12 @@ fn compare_tables(diffs: &mut Vec<Difference>, path: &str, a: &TableNode, b: &Ta
         &format!("{path}.formatting_change"),
         formatting_change,
         b_formatting_change,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.range_markers"),
+        range_markers,
+        b_range_markers,
     );
     compare_table_rows(diffs, &format!("{path}.rows"), rows, b_rows);
 }
@@ -1614,6 +1670,7 @@ fn compare_table_rows(
         // Exhaustive destructure of TableRowNode.
         let TableRowNode {
             id: _, // ephemeral NodeId
+            source_row_attrs,
             cells,
             grid_before,
             grid_after,
@@ -1636,6 +1693,7 @@ fn compare_table_rows(
         } = ra;
         let TableRowNode {
             id: _,
+            source_row_attrs: b_source_row_attrs,
             cells: b_cells,
             grid_before: b_grid_before,
             grid_after: b_grid_after,
@@ -1658,12 +1716,18 @@ fn compare_table_rows(
         } = rb;
         compare_val(
             diffs,
+            &format!("{p}.source_row_attrs"),
+            source_row_attrs,
+            b_source_row_attrs,
+        );
+        compare_val(
+            diffs,
             &format!("{p}.grid_before"),
             grid_before,
             b_grid_before,
         );
         compare_val(diffs, &format!("{p}.grid_after"), grid_after, b_grid_after);
-        compare_opt(
+        compare_opt_tracking_status(
             diffs,
             &format!("{p}.tracking_status"),
             tracking_status,
@@ -1728,6 +1792,66 @@ fn compare_opt_row_formatting_change(
                 &fa.previous_height_rule,
                 &fb.previous_height_rule,
             );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_grid_before"),
+                &fa.previous_grid_before,
+                &fb.previous_grid_before,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_grid_after"),
+                &fa.previous_grid_after,
+                &fb.previous_grid_after,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_cant_split"),
+                &fa.previous_cant_split,
+                &fb.previous_cant_split,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_is_header"),
+                &fa.previous_is_header,
+                &fb.previous_is_header,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_jc"),
+                &fa.previous_jc,
+                &fb.previous_jc,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_w_before"),
+                &fa.previous_w_before,
+                &fb.previous_w_before,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_w_after"),
+                &fa.previous_w_after,
+                &fb.previous_w_after,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_cell_spacing"),
+                &fa.previous_cell_spacing,
+                &fb.previous_cell_spacing,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_cnf_style"),
+                &fa.previous_cnf_style,
+                &fb.previous_cnf_style,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_preserved"),
+                &fa.previous_preserved,
+                &fb.previous_preserved,
+            );
             compare_val(diffs, &format!("{path}.author"), &fa.author, &fb.author);
             compare_opt(diffs, &format!("{path}.date"), &fa.date, &fb.date);
         }
@@ -1784,7 +1908,7 @@ fn compare_table_cells(
             formatting_change,
             b_formatting_change,
         );
-        compare_opt(
+        compare_opt_tracking_status(
             diffs,
             &format!("{p}.tracking_status"),
             tracking_status,
@@ -1844,6 +1968,36 @@ fn compare_opt_cell_formatting_change(
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => diff(diffs, path, a.is_some(), b.is_some()),
         (Some(fa), Some(fb)) => {
+            compare_val(
+                diffs,
+                &format!("{path}.previous_grid_span"),
+                &fa.previous_grid_span,
+                &fb.previous_grid_span,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_v_merge"),
+                &fa.previous_v_merge,
+                &fb.previous_v_merge,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_hide_mark"),
+                &fa.previous_hide_mark,
+                &fb.previous_hide_mark,
+            );
+            compare_val(
+                diffs,
+                &format!("{path}.previous_preserved"),
+                &fa.previous_preserved,
+                &fb.previous_preserved,
+            );
+            compare_opt(
+                diffs,
+                &format!("{path}.previous_cnf_style"),
+                &fa.previous_cnf_style,
+                &fb.previous_cnf_style,
+            );
             compare_opt(
                 diffs,
                 &format!("{path}.previous_width"),
@@ -1943,6 +2097,8 @@ fn compare_opaque_blocks(
         opaque_ref: _,   // internal store reference, reassigned on parse
         proof_ref: _,    // ephemeral proof bookkeeping
         range_marker: _, // derived from the same bytes; not an independent axis
+        note_references,
+        source_paragraph_ids,
     } = a;
     let OpaqueBlockNode {
         id: _,
@@ -1950,8 +2106,22 @@ fn compare_opaque_blocks(
         opaque_ref: _,
         proof_ref: _,
         range_marker: _,
+        note_references: b_note_references,
+        source_paragraph_ids: b_source_paragraph_ids,
     } = b;
     compare_val(diffs, &format!("{path}.kind"), kind, b_kind);
+    compare_val(
+        diffs,
+        &format!("{path}.note_references"),
+        note_references,
+        b_note_references,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.source_paragraph_ids"),
+        source_paragraph_ids,
+        b_source_paragraph_ids,
+    );
 }
 
 #[cfg(test)]
@@ -2129,6 +2299,7 @@ mod tests {
                 text_id: None,
                 text_direction: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             })));
         let diffs = compare_canon_docs(&a, &b);
@@ -2215,6 +2386,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }
@@ -2367,6 +2539,21 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_session_attribute_loss_is_not_equivalent() {
+        let mut source = base_paragraph();
+        source.source_paragraph_attrs = vec![("w:rsidRDefault".into(), "00112233".into())];
+        let source = doc_with_paragraph(source);
+        assert!(compare_canon_docs(&source, &source).is_empty());
+        let stripped = doc_with_paragraph(base_paragraph());
+        let differences = compare_canon_docs(&source, &stripped);
+        assert!(
+            differences
+                .iter()
+                .any(|d| d.path.contains("source_paragraph_attrs"))
+        );
+    }
+
+    #[test]
     fn synthesized_text_ignored_in_numbering() {
         let mut a = empty_canon_doc();
         let mut b = empty_canon_doc();
@@ -2451,6 +2638,7 @@ mod tests {
                 text_id: None,
                 text_direction: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             }))
         };
@@ -2489,6 +2677,7 @@ mod segment_coalescing_tests {
 
     fn bookmark_end() -> InlineNode {
         InlineNode::from(DecorationNode {
+            source_run_attrs: Vec::new(),
             id: NodeId::from("d"),
             kind: DecorationType::Bookmark,
             opaque_ref: "p:deco:1".to_string(),
@@ -2513,6 +2702,43 @@ mod segment_coalescing_tests {
 
     fn seg(status: TrackingStatus, inlines: Vec<InlineNode>) -> TrackedSegment {
         TrackedSegment { status, inlines }
+    }
+
+    /// Equivalent text partition does not change paragraph fidelity.
+    #[test]
+    fn equivalent_adjacent_text_runs_compare_equal() {
+        let split = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("Review "), text("complete.")],
+        )]);
+        let merged = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("Review complete.")],
+        )]);
+        let mut diffs = Vec::new();
+        compare_paragraphs(&mut diffs, "paragraph", &split, &merged);
+        assert!(diffs.is_empty(), "same text and formatting: {diffs:?}");
+    }
+
+    #[test]
+    fn adjacent_text_run_source_attributes_are_not_erased_by_coalescing() {
+        let mut second = text("complete.");
+        let InlineNode::Text(node) = &mut second else {
+            panic!("text")
+        };
+        node.source_run_attrs
+            .push(("w:rsidR".into(), "00ABCDEF".into()));
+        let split = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("Review "), second],
+        )]);
+        let merged = para(vec![seg(
+            TrackingStatus::Normal,
+            vec![text("Review complete.")],
+        )]);
+        let mut diffs = Vec::new();
+        compare_paragraphs(&mut diffs, "paragraph", &split, &merged);
+        assert!(!diffs.is_empty(), "source attributes are fidelity-bearing");
     }
 
     /// Segment boundaries between EQUAL-status neighbors are parse
@@ -2560,5 +2786,82 @@ mod segment_coalescing_tests {
         let mut diffs = Vec::new();
         compare_paragraphs(&mut diffs, "block[0].paragraph", &split, &merged);
         assert!(!diffs.is_empty(), "a status change is real content");
+    }
+}
+
+/// Field by field, with run property bytes shown as text, so a difference
+/// names the field that differs instead of dumping two byte arrays.
+fn compare_hyperlink(
+    diffs: &mut Vec<Difference>,
+    path: &str,
+    a: &crate::domain::HyperlinkData,
+    b: &crate::domain::HyperlinkData,
+) {
+    let crate::domain::HyperlinkData {
+        url,
+        anchor,
+        text,
+        r_id,
+        runs,
+        extra_attrs,
+    } = a;
+    compare_val(diffs, &format!("{path}.url"), url, &b.url);
+    compare_val(diffs, &format!("{path}.anchor"), anchor, &b.anchor);
+    compare_val(diffs, &format!("{path}.text"), text, &b.text);
+    // `r_id` is package-local addressing: the serializer resolves the
+    // relationship from `url` when it writes, so two equal links can carry
+    // different ids (like node ids, which are not compared either).
+    let _ = r_id;
+    compare_val(
+        diffs,
+        &format!("{path}.extra_attrs"),
+        extra_attrs,
+        &b.extra_attrs,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.runs.len"),
+        &runs.len(),
+        &b.runs.len(),
+    );
+    fn bytes(value: &Option<Vec<u8>>) -> Option<std::borrow::Cow<'_, str>> {
+        value.as_deref().map(String::from_utf8_lossy)
+    }
+    for (index, (run, b_run)) in runs.iter().zip(&b.runs).enumerate() {
+        let crate::domain::HyperlinkRun {
+            text,
+            rpr_xml,
+            additional_rpr_xml,
+            source_xml,
+            source_run_attrs,
+            status,
+        } = run;
+        let p = format!("{path}.runs[{index}]");
+        compare_val(diffs, &format!("{p}.text"), text, &b_run.text);
+        compare_val(
+            diffs,
+            &format!("{p}.rpr_xml"),
+            &bytes(rpr_xml),
+            &bytes(&b_run.rpr_xml),
+        );
+        compare_val(
+            diffs,
+            &format!("{p}.additional_rpr_xml"),
+            additional_rpr_xml,
+            &b_run.additional_rpr_xml,
+        );
+        compare_val(
+            diffs,
+            &format!("{p}.source_xml"),
+            &bytes(source_xml),
+            &bytes(&b_run.source_xml),
+        );
+        compare_val(
+            diffs,
+            &format!("{p}.source_run_attrs"),
+            source_run_attrs,
+            &b_run.source_run_attrs,
+        );
+        compare_val(diffs, &format!("{p}.status"), status, &b_run.status);
     }
 }

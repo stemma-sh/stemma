@@ -5,8 +5,9 @@ are intended to identify the failed invariant and the next safe action.
 
 ## The output path already exists
 
-Stemma outputs are create-new. It will not overwrite an existing file or write
-through an alias of an input.
+CLI and MCP outputs are create-new. They will not overwrite an existing file or
+write through an alias of an input. In Python, `save(path)` follows the same
+rule unless you pass `overwrite=True`, which replaces the file atomically.
 
 Choose a new output path, or deliberately remove or rename the old output
 before retrying.
@@ -43,13 +44,19 @@ receipt is partial and not deliverable. By default no DOCX is created.
 Read `items` in the receipt, correct each refused instruction, and run again
 with a fresh output path.
 
-## A match is reported as unreachable
+## A match is inside a link or content control
 
-The text was detected outside the focused CLI worklist's supported top-level
-body-paragraph scope, commonly in a table cell or another document story.
+A text replacement searches body and table-cell paragraphs, but it does not
+edit a hyperlink's display text or a content control's value. When the text
+also occurs there, the item refuses rather than replacing only the occurrences
+it can reach: the CLI receipt reports `matches_inside_inline_objects`, and MCP
+`replace_text` reports `ReplaceTextInsideInlineObjects` with `unreached_matches`
+naming each object and the operation that edits it.
 
-Use the MCP or Rust engine surface that supports the relevant structure. Do not
-assume the CLI searched or edited that region.
+Edit those occurrences with the named operation first, or narrow the scope to
+exclude them, then run the replacement again. Headers, footers, notes and
+comments are not searched at all; the CLI receipt lists them under
+`coverage.unsearched`.
 
 ## `stemma compare` refuses a document pair
 
@@ -93,11 +100,70 @@ Move the artifact under the configured root or restart the server with
 `--workspace-root /path/to/documents`. No tool argument can widen the boundary
 at runtime.
 
+## An MCP tool asks for a `doc_id`
+
+While exactly one document is open, tools may omit `doc_id`. With none or
+several open, the call refuses with `doc_id_required` and lists
+`open_doc_ids`; an id that names no open document refuses with
+`unknown_doc_id` and the same list. Use the `doc_id` that `open_docx`
+returned. A document idle past the server's timeout is closed
+(`doc_evicted`); open it again.
+
+## MCP `save_docx` reports `needs_review`
+
+The file was written. The session audit found a change it cannot explain: a
+direct (untracked) change, or a pre-existing revision that changed. Inspect
+the output with `verify_docx` and fix or disclose each finding before
+delivering it. A declared task refuses such a save instead and creates no
+output.
+
 ## An MCP edit is stale
 
 Another edit changed the addressed block after it was inspected. Re-read the
 block, rebuild the operation from the current guard or expected text, preview
 again, and then apply.
+
+## An edit's `expect` runs across an inline object
+
+`expect` is refused (`ExpectCrossesInlineObject`, wire code
+`UnsupportedEdit`) when the text it names runs across an object the operation
+cannot span: a field, an image, a line break, or for some operations a
+bookmark or comment-range marker. The message names the object. Give text on
+one side of it.
+
+## A column operation names the wrong column
+
+A column operation's `expect_header` must equal the text of the column's top
+cell. On a mismatch the refusal lists every column with its 0-based index and
+header; pick the index from that list.
+
+## `edit_note` refuses the body's line count
+
+A note of several paragraphs takes one line per paragraph, separated by `\n`
+and in order (`NoteBodyLineCountMismatch`). Repeat a paragraph's current text
+to keep it.
+
+## Every accept or reject refuses: a tracked cell merge is pending
+
+A table with a pending tracked vertical cell merge (`w:cellMerge`) blocks
+every resolution of that document, Accept All and Reject All included,
+because resolving merge changes is not supported. The revision census lists
+it with kind `cell_merge` and id `0`, and the refusal names the table. Resolve
+that merge in Word, then resolve the rest with Stemma.
+
+## A saved snapshot blob is refused
+
+Snapshot blobs are a same-version cache: a blob written by another engine
+release is refused on load. Re-import the source DOCX. See
+[persistence](../guide/persistence.md).
+
+## A document that opened before is refused
+
+Some documents an earlier release opened are now refused at import, with the
+element and attribute named: an on/off or numeric property no schema form
+admits (which used to be dropped silently), or a tracked change whose previous
+numbering names a list but no level. Stemma refuses rather than lose that
+property. Report the case with the error message if Word opens the file.
 
 ## A document fails validation
 
@@ -108,8 +174,8 @@ problem. Do not convert a validation failure into apparent success.
 Raw validation describes the exact bytes supplied. The Rust engine's
 `Document::parse` can accept a narrowly supported Word-compatible import
 normalization, but it reports that action through `Document::diagnostics()`;
-it does not turn the original bytes into a validation pass. In v0.6 the only
-such package normalization is removal of a dead package-root thumbnail
+it does not turn the original bytes into a validation pass. The only such
+package normalization is removal of a dead package-root thumbnail
 relationship whose target is absent. A missing relationship used by document
 content is still a hard failure.
 

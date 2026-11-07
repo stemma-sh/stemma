@@ -1,8 +1,8 @@
 # 60-second approved-worklist demo
 
 This synthetic walkthrough uses a prebuilt `stemma` executable, `jq`, and the
-repository fixtures. It demonstrates only the experimental top-level
-body-paragraph workflow.
+repository fixtures. It demonstrates the experimental approved-worklist
+workflow on body paragraphs.
 
 | Time | Show | Narration |
 |---:|---|---|
@@ -10,7 +10,7 @@ body-paragraph workflow.
 | 10-25s | Run `stemma apply`; show exit `0`, `stemma validate`, and the minimized receipt summary. | Complete means every item applied, the output is deliverable, and the persisted size/hash tuple agrees. |
 | 25-38s | Show the redline's native revision inventory. | The output is a new DOCX with a tracked delete and insert by the declared reviewer; the original stays unchanged. |
 | 38-55s | Run the missing-text worklist; show exit `3`, its partial receipt, and absence of `refused.docx`. | Ambiguity or mismatch is refused rather than guessed. A safe refusal is not a completed redline. |
-| 55-60s | Point to the CLI contract. | Tables and non-body stories are outside this experimental v0 boundary. |
+| 55-60s | Point to the CLI contract. | The worklist reaches body and table-cell paragraphs; headers, footers, notes, comments and textboxes are outside this experimental v0 boundary. |
 
 Run the exact sequence:
 

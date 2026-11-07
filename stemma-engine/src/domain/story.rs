@@ -78,6 +78,8 @@ pub struct FootnoteStory {
     pub id: String,
     /// Type of footnote (normal vs separator/continuation).
     pub note_type: NoteType,
+    /// Complete authored root attributes except the transport `w:id`.
+    pub source_attrs: Vec<super::QualifiedAttribute>,
     /// Block content of the footnote.
     pub blocks: Vec<TrackedBlock>,
     /// Content hash for cross-document alignment.
@@ -91,6 +93,8 @@ pub struct EndnoteStory {
     pub id: String,
     /// Type of endnote (normal vs separator/continuation).
     pub note_type: NoteType,
+    /// Complete authored root attributes except the transport `w:id`.
+    pub source_attrs: Vec<super::QualifiedAttribute>,
     /// Block content of the endnote.
     pub blocks: Vec<TrackedBlock>,
     /// Content hash for cross-document alignment.

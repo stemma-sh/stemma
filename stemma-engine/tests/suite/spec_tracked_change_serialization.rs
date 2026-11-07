@@ -369,23 +369,45 @@ fn spec_serialized_no_nested_ins_del() {
 // MS-OI29500 §2.1.313
 // =========================================================================
 
-/// Changing text on both sides of an anchored comment currently duplicates the
-/// anchor when the paragraph is represented as an exact replacement. Word
-/// repairs that package. Until comparison owns a native anchor-relocation
-/// carrier, checked materialization must refuse rather than emit a false
-/// success. This supersedes the old characterization test, which inspected
-/// only `comments.xml` and missed the malformed duplicate anchors in the main
-/// story.
+/// Changing text on both sides of an anchored comment is a change to the
+/// paragraph, not to the comment: the comment story carries no revision
+/// (MS-OI29500 §2.1.313), and the main story keeps exactly one range start,
+/// range end and reference for it (ISO 29500-1 §17.13.4: one comment id
+/// delimits one range).
 #[test]
-fn comparison_refuses_duplicate_comment_anchor_identity() {
+fn comparison_keeps_one_comment_anchor_when_text_around_it_changes() {
     let before_path = format!("{FIXTURES}/no-revisions-in-comments/before.docx");
     let after_path = format!("{FIXTURES}/no-revisions-in-comments/after.docx");
-    let error = redline_export_result(&before_path, &after_path)
-        .expect_err("duplicate comment-anchor identities must be refused");
+    let exported = redline_export(&before_path, &after_path);
 
-    assert_eq!(error.code, stemma::ErrorCode::ValidationFailed);
-    assert!(error.message.contains("I-ANN-010"), "{error}");
-    assert!(error.message.contains("multiple ranges"), "{error}");
+    let document = extract_document_xml(&exported);
+    for marker in ["commentRangeStart", "commentRangeEnd", "commentReference"] {
+        assert_eq!(
+            document.matches(&format!("<w:{marker} ")).count(),
+            1,
+            "{marker} must appear once:\n{document}"
+        );
+    }
+    let root = parse_xml(&document);
+    let mut ins_elements = Vec::new();
+    find_all_w_elements(&root, "ins", &mut ins_elements);
+    assert!(
+        !ins_elements.is_empty(),
+        "the surrounding text changes are tracked"
+    );
+
+    let mut zip = ZipArchive::new(Cursor::new(&exported[..])).expect("open DOCX zip");
+    let mut comments = String::new();
+    zip.by_name("word/comments.xml")
+        .expect("DOCX keeps its comments part")
+        .read_to_string(&mut comments)
+        .expect("read word/comments.xml");
+    for revision in ["<w:ins ", "<w:del "] {
+        assert!(
+            !comments.contains(revision),
+            "comments must not contain revisions:\n{comments}"
+        );
+    }
 }
 
 // =========================================================================

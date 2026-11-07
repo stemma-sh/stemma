@@ -212,10 +212,21 @@ fn project_drawing(node: &OpaqueInlineNode) -> OpaqueMetadata {
         Ok(el) => el,
         Err(reason) => return OpaqueMetadata::Unparsed { reason },
     };
+    let element = match crate::word_ir::active_drawing_representation(&element) {
+        Ok(element) => element,
+        Err(error) => {
+            return OpaqueMetadata::Unparsed {
+                reason: format!("drawing compatibility selection failed: {error}"),
+            };
+        }
+    };
 
-    let extent = descendant_by_local(&element, "extent");
-    let extent_cx_emu = extent.and_then(|e| attr_i64(e, "cx"));
-    let extent_cy_emu = extent.and_then(|e| attr_i64(e, "cy"));
+    // A DrawingML drawing's size is its wp:extent; a legacy VML shape's is the
+    // width/height of its style (what `set_image_attrs` resizes).
+    let (extent_cx_emu, extent_cy_emu) = match descendant_by_local(&element, "extent") {
+        Some(extent) => (attr_i64(extent, "cx"), attr_i64(extent, "cy")),
+        None => vml_shape_size_emu(&element).map_or((None, None), |(cx, cy)| (Some(cx), Some(cy))),
+    };
     // wp:docPr @descr is the accessibility alt text (§20.4.2.5).
     let alt_text = descendant_by_local(&element, "docPr")
         .and_then(|d| crate::xml_attrs::attr_get(d, "descr").cloned())
@@ -234,21 +245,56 @@ fn project_drawing(node: &OpaqueInlineNode) -> OpaqueMetadata {
     }
 }
 
+/// The size in EMU of the outermost VML shape under `root` whose style
+/// declares a width and height (ISO/IEC 29500-4 style; CSS absolute units).
+/// `None` when there is none, or its size uses a unit with no fixed length
+/// (`%`, `em`, a bare number).
+fn vml_shape_size_emu(root: &Element) -> Option<(i64, i64)> {
+    if root.namespace.as_deref() == Some("urn:schemas-microsoft-com:vml")
+        && let Some(style) = crate::xml_attrs::attr_get(root, "style")
+    {
+        let length = |name: &str| {
+            style.split(';').find_map(|declaration| {
+                let (key, value) = declaration.split_once(':')?;
+                (key.trim() == name).then(|| css_length_emu(value.trim()))?
+            })
+        };
+        if let (Some(width), Some(height)) = (length("width"), length("height")) {
+            return Some((width, height));
+        }
+    }
+    root.children.iter().find_map(|child| match child {
+        XMLNode::Element(child) => vml_shape_size_emu(child),
+        _ => None,
+    })
+}
+
+/// An absolute CSS length in EMU (914,400 per inch).
+fn css_length_emu(value: &str) -> Option<i64> {
+    let (number, per_unit) = [
+        ("pt", 12_700.0),
+        ("in", 914_400.0),
+        ("cm", 360_000.0),
+        ("mm", 36_000.0),
+        ("pc", 152_400.0),
+        ("px", 9_525.0),
+    ]
+    .iter()
+    .find_map(|(unit, emu)| value.strip_suffix(unit).map(|n| (n, *emu)))?;
+    let number: f64 = number.trim().parse().ok()?;
+    Some((number * per_unit).round() as i64)
+}
+
 /// Concatenate the interior text of the textbox(es) carried by a drawing. Each
 /// `w:txbxContent` (the common story element of BOTH a DrawingML `wps:txbx` and
 /// a VML `v:textbox`) is reduced to its child `w:p` text joined by `\n`; the
 /// per-textbox interiors are then joined by `\n`. `None` when the drawing
 /// carries no textbox.
 ///
-/// **Multiple/duplicate textboxes** (a DECISION, per review): Word's standard
-/// textbox emission wraps the shape in `mc:AlternateContent` with a DrawingML
-/// `Choice` AND a VML `Fallback`, each carrying a DUPLICATE `w:txbxContent` —
-/// and a group shape can carry several DISTINCT textboxes. So we collect ALL
-/// `txbxContent` descendants, DEDUPE byte-identical interiors (the
-/// Choice/Fallback duplicate projects ONCE, not doubled), and `\n`-join the
-/// remaining DISTINCT interiors in document order (reading every distinct
-/// textbox is the honest projection — this is a read, not a mutation, so there
-/// is no refusal).
+/// This receives the selected compatibility reading, not the stored envelope.
+/// Every active textbox is retained in order, including separate textboxes with
+/// identical text. Inactive fallback text has already been excluded by branch
+/// selection; textual deduplication would erase real repeated content.
 ///
 /// **Visibility** (v1 read semantics, a DECISION not an accident): we surface
 /// the **markup-resolved-as-shown** reading — the text a reviewer sees in Word's
@@ -277,11 +323,7 @@ fn textbox_interior_text(drawing: &Element) -> Option<String> {
             }
         }
         let interior = paragraphs.join("\n");
-        // Dedupe identical copies (AlternateContent Choice/Fallback duplicate).
-        // Order-preserving: keep the first occurrence, drop later identicals.
-        if !interiors.contains(&interior) {
-            interiors.push(interior);
-        }
+        interiors.push(interior);
     }
     // A textbox with paragraphs but no text yields an empty-string interior,
     // which is still "the textbox exists and is empty" — distinct from no
@@ -388,7 +430,8 @@ fn parse_required_raw(node: &OpaqueInlineNode, what: &str) -> Result<Element, St
         .raw_xml
         .as_deref()
         .ok_or_else(|| format!("{what} has no raw_xml"))?;
-    parse_raw_fragment(raw).map_err(|e| format!("{what} raw_xml parse failed: {e}"))
+    crate::word_xml::parse_raw_fragment_with_namespace_scope(raw)
+        .map_err(|e| format!("{what} raw_xml parse failed: {e}"))
 }
 
 /// First direct child element with the given local name (xmltree-ns: `name` is
@@ -540,6 +583,7 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
             source_run_attrs: Vec::new(),
             joins_following_text_run: false,
             raw_xml,
@@ -717,6 +761,37 @@ mod tests {
         assert_eq!(drawing_textbox_text(&n).as_deref(), Some("VML text here"));
     }
 
+    /// A legacy VML shape has no wp:extent; its size is the width/height of
+    /// its style (1 pt = 12,700 EMU, 1 in = 914,400 EMU), so a caller can read
+    /// the size it is about to change.
+    #[test]
+    fn project_drawing_reads_a_vml_shape_size_from_its_style() {
+        let shape = |style: &str| {
+            format!(
+                r#"<w:pict xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml"><v:shape style="{style}"><v:textbox><w:txbxContent><w:p><w:r><w:t>TAB 2</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>"#
+            )
+            .into_bytes()
+        };
+        let size = |style: &str| match project(&node(OpaqueKind::Drawing, Some(shape(style)))) {
+            Some(OpaqueMetadata::Drawing {
+                extent_cx_emu,
+                extent_cy_emu,
+                ..
+            }) => (extent_cx_emu, extent_cy_emu),
+            other => panic!("expected drawing metadata, got {other:?}"),
+        };
+        assert_eq!(
+            size("position:absolute;margin-left:89pt;width:35.12pt;height:14pt"),
+            (Some(446_024), Some(177_800))
+        );
+        assert_eq!(
+            size("width:1in;height:0.5in"),
+            (Some(914_400), Some(457_200))
+        );
+        // A relative size has no fixed length: unknown, not guessed.
+        assert_eq!(size("width:50%;height:14pt"), (None, None));
+    }
+
     #[test]
     fn project_drawing_no_textbox_is_none() {
         // A plain picture drawing (no txbxContent) → textbox_text None.
@@ -759,10 +834,27 @@ mod tests {
     fn project_drawing_alternatecontent_duplicate_textbox_appears_once() {
         // Word's standard textbox: mc:AlternateContent with a DrawingML Choice
         // AND a VML Fallback, each carrying an IDENTICAL w:txbxContent. The
-        // duplicate must project ONCE (deduped), not doubled.
+        // only the selected Choice projects, not its duplicate Fallback.
         let raw = br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"><mc:AlternateContent><mc:Choice Requires="wps"><wps:txbx><w:txbxContent><w:p><w:r><w:t>Shared label</w:t></w:r></w:p></w:txbxContent></wps:txbx></mc:Choice><mc:Fallback><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Shared label</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></mc:Fallback></mc:AlternateContent></w:drawing>"#.to_vec();
         let n = node(OpaqueKind::Drawing, Some(raw));
         assert_eq!(drawing_textbox_text(&n).as_deref(), Some("Shared label"));
+    }
+
+    #[test]
+    fn project_drawing_ignores_distinct_fallback_text() {
+        let raw = br#"<mc:AlternateContent xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>Visible</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice><mc:Fallback><w:pict><w:txbxContent><w:p><w:r><w:t>Inactive legacy text</w:t></w:r></w:p></w:txbxContent></w:pict></mc:Fallback></mc:AlternateContent>"#.to_vec();
+        let n = node(OpaqueKind::Drawing, Some(raw));
+        assert_eq!(drawing_textbox_text(&n).as_deref(), Some("Visible"));
+    }
+
+    #[test]
+    fn project_drawing_keeps_identical_independent_textboxes() {
+        let raw = br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:txbx><w:txbxContent><w:p><w:r><w:t>Repeated</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:txbx><w:txbxContent><w:p><w:r><w:t>Repeated</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing>"#.to_vec();
+        let n = node(OpaqueKind::Drawing, Some(raw));
+        assert_eq!(
+            drawing_textbox_text(&n).as_deref(),
+            Some("Repeated\nRepeated")
+        );
     }
 
     #[test]

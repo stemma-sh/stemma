@@ -103,6 +103,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -132,6 +133,7 @@ fn make_opaque(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(b"<w:drawing/>".to_vec()),
@@ -400,8 +402,10 @@ fn invariant_4_two_level_diff_keeps_opaque_anchor_intact() {
 
 fn make_simple_table(id: &str, cell_text: &str) -> BlockNode {
     BlockNode::from(TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from(id),
         rows: vec![TableRowNode {
+            source_row_attrs: Vec::new(),
             id: NodeId::from(format!("{id}_r0")),
             cells: vec![TableCellNode {
                 id: NodeId::from(format!("{id}_c0")),
@@ -429,7 +433,7 @@ fn make_simple_table(id: &str, cell_text: &str) -> BlockNode {
             formatting_change: None,
             para_id: None,
             text_id: None,
-            cant_split: false,
+            cant_split: None,
             jc: None,
             w_before: None,
             w_after: None,
@@ -662,6 +666,7 @@ fn doc_with_hyperlink(para_id: &str, hyperlink_id: &str, url: &str, text: &str) 
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: None,
@@ -946,6 +951,7 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: None,
@@ -1001,6 +1007,7 @@ fn set_attr_hyperlink_target_not_a_hyperlink() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(b"<w:footnoteReference w:id=\"7\"/>".to_vec()),
@@ -1118,6 +1125,7 @@ fn set_attr_hyperlink_no_op_when_neither_field_set_after_adapter() {
     let doc = doc_with_hyperlink("p1", "h1", "https://example.com", "click");
     let txn = EditTransaction {
         steps: vec![EditStep::SetHyperlinkAttr {
+            story: stemma::edit::StoryRef::Body,
             hyperlink_id: NodeId::from("h1"),
             new_href: None,
             new_anchor: None,

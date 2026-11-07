@@ -406,7 +406,7 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     assert_eq!(receipt["items"][0]["created_revisions"], 2);
     assert_eq!(
         receipt["items"][0]["scope"]["kind"],
-        "all_top_level_body_paragraphs"
+        "all_body_and_table_paragraphs"
     );
     assert_eq!(receipt["items"][0]["match_mode"], "exact");
     assert_eq!(receipt["verification"]["validator_ok"], true);
@@ -422,15 +422,11 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     );
     assert_eq!(
         receipt["coverage"]["supported"],
-        serde_json::json!(["top_level_body_paragraphs"])
-    );
-    assert_eq!(
-        receipt["coverage"]["conditional_detection"],
-        serde_json::json!(["top_level_table_cells_for_default_scope"])
+        serde_json::json!(["body_paragraphs", "table_cell_paragraphs"])
     );
     assert_eq!(
         receipt["coverage"]["unsearched"].as_array().unwrap().len(),
-        7
+        6
     );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("revision_id"),
@@ -1135,10 +1131,12 @@ fn apply_refuses_to_write_the_redline_over_its_docx_input() {
 }
 
 #[test]
-fn apply_refuses_a_detected_table_cell_match_instead_of_claiming_completion() {
+fn apply_changes_text_in_a_table_cell() {
+    // Table cells are in worklist.v0 coverage: an approved change to text in
+    // a cell is applied as a tracked change, like one in a body paragraph.
     let dir = tempfile::tempdir().unwrap();
     let worklist = dir.path().join("worklist.json");
-    let out = dir.path().join("must-not-exist.docx");
+    let out = dir.path().join("table-redline.docx");
     write_worklist_for(
         &worklist,
         &fixture("table-changes/before.docx"),
@@ -1159,14 +1157,249 @@ fn apply_refuses_a_detected_table_cell_match_instead_of_claiming_completion() {
         "-o",
         out.to_str().unwrap(),
     ]);
-    assert_eq!(output.status.code(), Some(3));
-    assert!(!out.exists());
+    assert!(output.status.success(), "apply should succeed: {output:?}");
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["items"][0]["status"], "refused");
-    assert_eq!(receipt["items"][0]["code"], "unreachable_match");
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["items"][0]["status"], "applied");
+    assert_eq!(receipt["items"][0]["actual_matches"], 1);
+    assert_eq!(receipt["verification"]["direct_changes"], 0);
+    let (accepted, rejected) = readings(&out);
+    assert!(accepted.contains("Revised table language."), "{accepted}");
+    assert!(rejected.contains("In the second row."), "{rejected}");
+}
+
+#[test]
+fn apply_edits_inside_another_authors_pending_insertion() {
+    // Alice's pending insertion "45 days"; Bob's approved change to "60 days"
+    // is tracked as his deletion of "45" inside her insertion and his
+    // insertion of "60". Her revision is edited inside, never resolved, and
+    // the receipt says so.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("nested.docx");
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Notice must be given within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">45 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of delivery.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let archive = DocxArchive::from_parts(vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: document.as_bytes().to_vec(),
+        },
+    ]);
+    std::fs::write(&input, archive.write().unwrap()).unwrap();
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("nested-redline.docx");
+    write_worklist_for(
+        &worklist,
+        &input,
+        "Bob",
+        serde_json::json!([{"id": "c0", "old": "45 days", "new": "60 days"}]),
+    );
+
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "apply should succeed: {output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "complete");
+    assert_eq!(receipt["verification"]["new_revisions"], 2);
     assert_eq!(
-        receipt["items"][0]["unreachable_matches"][0]["region"],
-        "table_cell"
+        receipt["verification"]["preexisting_revisions_edited_inside"],
+        1
+    );
+    assert_eq!(
+        receipt["verification"]["preexisting_revisions_preserved"],
+        0
+    );
+    let (accepted, rejected) = readings(&out);
+    assert!(
+        accepted.contains("within 60 days of delivery."),
+        "{accepted}"
+    );
+    assert!(
+        rejected.contains("within  of delivery."),
+        "rejecting everything also rejects Alice's insertion: {rejected}"
+    );
+}
+
+/// Run a worklist over "The Customer shall pay the Price." / "The Supplier
+/// shall deliver the Goods." and return the receipt and the output path.
+fn apply_sequence(
+    dir: &Path,
+    name: &str,
+    changes: serde_json::Value,
+) -> (serde_json::Value, PathBuf) {
+    let input = dir.join(format!("{name}-input.docx"));
+    write_proof_body_docx_paragraphs(
+        &input,
+        &[
+            ("00000001", "The Customer shall pay the Price."),
+            ("00000002", "The Supplier shall deliver the Goods."),
+        ],
+    );
+    let worklist = dir.join(format!("{name}-worklist.json"));
+    let out = dir.join(format!("{name}-redline.docx"));
+    write_worklist_for(&worklist, &input, "Bob", changes);
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{name}: apply should succeed: {output:?}"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "complete", "{name}: {receipt}");
+    assert_eq!(receipt["summary"]["applied"], 2, "{name}: {receipt}");
+    // The items' revision bookkeeping nets out to the audited redline: every
+    // revision an item created, less the earlier items' revisions it revised
+    // or withdrew.
+    let items = receipt["items"].as_array().unwrap();
+    let net: i64 = items
+        .iter()
+        .map(|item| {
+            item["created_revisions"].as_i64().unwrap()
+                - item["withdrawn_revisions"].as_i64().unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(
+        Some(net),
+        receipt["verification"]["new_revisions"].as_i64(),
+        "{name}: {receipt}"
+    );
+    (receipt, out)
+}
+
+#[test]
+fn apply_lets_a_later_item_revise_or_undo_an_earlier_items_change() {
+    // Items apply in order against live state, so a later item may revise an
+    // earlier item's pending change (ordinary review: the author amends their
+    // own proposal) or undo it. Changing your own pending insertion changes
+    // the proposal itself: no revision is stacked on it.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Amend: Customer -> Buyer, then Buyer -> Purchaser. The redline proposes
+    // replacing "Customer" with "Purchaser"; "Buyer" was never in the document.
+    let (receipt, out) = apply_sequence(
+        dir.path(),
+        "amend",
+        serde_json::json!([
+            {"id": "a", "old": "Customer", "new": "Buyer"},
+            {"id": "b", "old": "Buyer", "new": "Purchaser"},
+        ]),
+    );
+    assert_eq!(receipt["items"][1]["withdrawn_revisions"], 1, "{receipt}");
+    let (accepted, rejected) = readings(&out);
+    assert!(accepted.contains("The Purchaser shall pay"), "{accepted}");
+    assert!(!accepted.contains("Buyer"), "{accepted}");
+    assert!(rejected.contains("The Customer shall pay"), "{rejected}");
+
+    // Undo: "the Goods" -> "the new Goods", then "new " -> "". Bob's
+    // proposal is withdrawn; both readings are the original text.
+    let (receipt, out) = apply_sequence(
+        dir.path(),
+        "undo",
+        serde_json::json!([
+            {"id": "a", "old": "the Goods", "new": "the new Goods"},
+            {"id": "b", "old": "new ", "new": ""},
+        ]),
+    );
+    assert_eq!(receipt["items"][1]["created_revisions"], 0, "{receipt}");
+    assert_eq!(receipt["verification"]["new_revisions"], 0, "{receipt}");
+    let (accepted, rejected) = readings(&out);
+    assert!(accepted.contains("deliver the Goods."), "{accepted}");
+    assert_eq!(accepted, rejected);
+
+    // Rename: Customer -> Supplier, then both Suppliers -> Vendor (one is
+    // a's pending insertion, one the original text).
+    let (_, out) = apply_sequence(
+        dir.path(),
+        "rename",
+        serde_json::json!([
+            {"id": "a", "old": "Customer", "new": "Supplier"},
+            {"id": "b", "old": "Supplier", "new": "Vendor", "expected_matches": 2},
+        ]),
+    );
+    let (accepted, rejected) = readings(&out);
+    assert!(
+        accepted.contains("The Vendor shall pay") && accepted.contains("The Vendor shall deliver"),
+        "{accepted}"
+    );
+    assert!(
+        rejected.contains("The Customer shall pay")
+            && rejected.contains("The Supplier shall deliver"),
+        "{rejected}"
+    );
+}
+
+#[test]
+fn apply_refuses_an_item_whose_text_also_stands_in_a_link_or_control() {
+    // A worklist edits a paragraph's own runs; a hyperlink's display text and
+    // a content control's value are edited through their objects. Replacing
+    // the other occurrence and calling the item complete would leave text the
+    // item asked to replace, so it refuses and names each object.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("objects.docx");
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Acme Corp signs; see </w:t></w:r><w:hyperlink w:anchor="terms"><w:r><w:t>the Acme Corp terms</w:t></w:r></w:hyperlink><w:r><w:t>.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Party: </w:t></w:r><w:sdt><w:sdtPr><w:id w:val="7"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p><w:sectPr/></w:body></w:document>"#;
+    let archive = DocxArchive::from_parts(vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: document.as_bytes().to_vec(),
+        },
+    ]);
+    std::fs::write(&input, archive.write().unwrap()).unwrap();
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("objects-redline.docx");
+    write_worklist_for(
+        &worklist,
+        &input,
+        "Bob",
+        serde_json::json!([{"id": "rename", "old": "Acme Corp", "new": "Acme Inc"}]),
+    );
+
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(!out.exists(), "a refused worklist creates no redline");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["status"], "partial", "{receipt}");
+    let item = &receipt["items"][0];
+    assert_eq!(item["status"], "refused", "{receipt}");
+    assert_eq!(item["code"], "matches_inside_inline_objects", "{receipt}");
+    let diagnosis = item["diagnosis"].as_array().expect("diagnosis");
+    assert_eq!(diagnosis.len(), 2, "the link and the control: {receipt}");
+    assert!(
+        diagnosis[0].as_str().unwrap().contains("hyperlink")
+            && diagnosis[1].as_str().unwrap().contains("content control"),
+        "{receipt}"
     );
 }
 
@@ -1659,6 +1892,65 @@ fn resolve_accept_author_empty_string_errors_when_no_anonymous_changes() {
     assert!(
         stderr.contains("no pending tracked changes by author"),
         "the refusal names the failed selection: {stderr}"
+    );
+}
+
+/// A tracked vertical cell merge (`w:cellMerge` with `w:vMerge`, §17.13.5.3)
+/// is a pending change the engine cannot resolve yet: Accept All must refuse
+/// and name it, never report "no pending tracked changes" or write a file.
+#[test]
+fn resolve_accept_all_refuses_a_pending_tracked_cell_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("cell-merge.docx");
+    let resolved = dir.path().join("resolved.docx");
+    let cell = |text: &str, tc_pr: &str| {
+        format!(
+            r#"<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/>{tc_pr}</w:tcPr><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"#
+        )
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr>{}</w:tr><w:tr>{}</w:tr></w:tbl><w:p/><w:sectPr/>"#,
+        cell("Above", ""),
+        cell(
+            "Below",
+            r#"<w:cellMerge w:id="3" w:author="Alice" w:date="2026-01-01T00:00:00Z" w:vMerge="cont"/>"#
+        )
+    );
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    let archive = DocxArchive::from_parts(vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: document.into_bytes(),
+        },
+    ]);
+    std::fs::write(&input, archive.write().unwrap()).unwrap();
+
+    let output = run(&[
+        "resolve",
+        input.to_str().unwrap(),
+        "-o",
+        resolved.to_str().unwrap(),
+        "--accept-all",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "accept-all must refuse: {stderr}");
+    assert!(
+        !resolved.exists(),
+        "a refused resolution writes no output file"
+    );
+    assert!(
+        stderr.contains("cellMerge") && !stderr.contains("no pending tracked changes"),
+        "the refusal names the pending cell merge: {stderr}"
     );
 }
 

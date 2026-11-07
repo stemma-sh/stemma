@@ -167,8 +167,7 @@ fn render_paragraph(p: &ParagraphNode, label: &str) -> String {
                 }
                 InlineNode::Decoration(_)
                 | InlineNode::CommentRangeStart { .. }
-                | InlineNode::CommentRangeEnd { .. }
-                | InlineNode::CommentReference { .. } => {}
+                | InlineNode::CommentRangeEnd { .. } => {}
             }
         }
     }

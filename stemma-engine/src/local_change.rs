@@ -5,10 +5,10 @@
 //! infer document-level correspondence; those responsibilities belong to the
 //! downstream comparison crate.
 
+use crate::import::sha256_hex;
 use std::collections::HashMap;
 use std::env;
 
-use sha2::{Digest, Sha256};
 use similar::{Algorithm, ChangeTag, TextDiff};
 
 // =============================================================================
@@ -18,13 +18,15 @@ use similar::{Algorithm, ChangeTag, TextDiff};
 /// Character class for tokenization.
 /// Each contiguous run of the same class becomes one token.
 #[derive(PartialEq)]
-enum CharClass {
+#[doc(hidden)]
+pub enum CharClass {
     Word,
     Whitespace,
     Punctuation,
 }
 
-fn char_class(c: char) -> CharClass {
+#[doc(hidden)]
+pub fn char_class(c: char) -> CharClass {
     if c.is_alphanumeric() || c == '_' {
         CharClass::Word
     } else if c.is_whitespace() {
@@ -36,12 +38,15 @@ fn char_class(c: char) -> CharClass {
 
 /// Length of the truncated hash appended to opaque `\u{FFFC}` tags.
 /// Must match the truncation length in `opaque_diff_tag()`.
-const OPAQUE_HASH_LEN: usize = 12;
+#[doc(hidden)]
+pub const OPAQUE_HASH_LEN: usize = 12;
 
 /// Tokenize text into slices, splitting on word/whitespace/punctuation boundaries.
 ///
 /// - Word characters (alphanumeric + underscore) are grouped into contiguous runs.
-/// - Whitespace characters are grouped into contiguous runs.
+/// - Each whitespace character is its own token: a run of spaces is that many
+///   spaces, so a change in its length keeps the spaces it shares (and their
+///   runs' formatting) instead of rewriting the whole run.
 /// - Each punctuation/symbol character is its own token (they are semantically independent).
 ///
 /// Example: `"Stock);"` → `["Stock", ")", ";"]`
@@ -82,12 +87,12 @@ pub fn tokenize(text: &str) -> Vec<&str> {
             }
             let end = chars.peek().map_or(text.len(), |&(i, _)| i);
             tokens.push(&text[start..end]);
-        } else if class == CharClass::Punctuation {
-            // Each punctuation char is its own token
+        } else if class == CharClass::Punctuation || class == CharClass::Whitespace {
+            // Each punctuation or whitespace char is its own token
             let end = chars.peek().map_or(text.len(), |&(i, _)| i);
             tokens.push(&text[start..end]);
         } else {
-            // Word and whitespace: consume contiguous run of the same class
+            // Word: consume a contiguous run of word characters
             while let Some(&(_, next_c)) = chars.peek() {
                 if next_c != '\n' && char_class(next_c) == class {
                     chars.next();
@@ -106,7 +111,8 @@ pub fn tokenize(text: &str) -> Vec<&str> {
 
 /// Check if a string is a legal enumerator content (inside parentheses).
 /// Matches: single letters a-z/A-Z, roman numerals i-xiv, double letters aa-zz.
-fn is_enumerator_content(s: &str) -> bool {
+#[doc(hidden)]
+pub fn is_enumerator_content(s: &str) -> bool {
     // Single letter
     if s.len() == 1 {
         let c = s.as_bytes()[0];
@@ -143,7 +149,8 @@ fn is_enumerator_content(s: &str) -> bool {
 /// Boundary guards prevent false fusing:
 /// - Left: token before `(` must NOT end with an alphanumeric char (prevents `13(d)`)
 /// - Right: token after `)` must NOT start with an alphanumeric char
-fn fuse_legal_enumerators<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'a str> {
+#[doc(hidden)]
+pub fn fuse_legal_enumerators<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'a str> {
     if tokens.len() < 3 {
         return tokens;
     }
@@ -196,12 +203,14 @@ fn fuse_legal_enumerators<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'a st
 }
 
 /// Check if a character is an apostrophe (ASCII or Unicode smart quote).
-fn is_apostrophe(c: char) -> bool {
+#[doc(hidden)]
+pub fn is_apostrophe(c: char) -> bool {
     c == '\'' || c == '\u{2019}' // ASCII apostrophe or right single quotation mark
 }
 
 /// Check if a token consists entirely of word characters (alphanumeric or underscore).
-fn is_word_token(token: &str) -> bool {
+#[doc(hidden)]
+pub fn is_word_token(token: &str) -> bool {
     !token.is_empty() && token.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
@@ -209,7 +218,8 @@ fn is_word_token(token: &str) -> bool {
 ///
 /// Contractions and possessives like `don't`, `it's`, `refer's` should be
 /// atomic tokens so the diff treats them as single units.
-fn fuse_intraword_apostrophes<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'a str> {
+#[doc(hidden)]
+pub fn fuse_intraword_apostrophes<'a>(tokens: Vec<&'a str>, text: &'a str) -> Vec<&'a str> {
     if tokens.len() < 3 {
         return tokens;
     }
@@ -257,9 +267,10 @@ struct DiffableTable {
     table: TableNode,
 }
 
-struct OpaqueTracker<'a> {
-    inline_index: usize,
-    node: &'a OpaqueInlineNode,
+#[doc(hidden)]
+pub struct OpaqueTracker<'a> {
+    pub inline_index: usize,
+    pub node: &'a OpaqueInlineNode,
 }
 pub fn extract_table_text(table: &TableNode) -> String {
     let mut out = String::new();
@@ -350,7 +361,8 @@ pub(crate) fn compute_table_diff_result(
         cell_diffs,
     })
 }
-pub(crate) fn find_blip_rid(xml: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn find_blip_rid(xml: &str) -> Option<String> {
     // Try DrawingML r:embed first (a:blip r:embed="rIdN")
     if let Some(rid) = find_rid_by_patterns(
         xml,
@@ -370,7 +382,8 @@ pub(crate) fn find_blip_rid(xml: &str) -> Option<String> {
 }
 
 /// Search for a relationship ID matching any of the given attribute patterns.
-fn find_rid_by_patterns(xml: &str, patterns: &[&str]) -> Option<String> {
+#[doc(hidden)]
+pub fn find_rid_by_patterns(xml: &str, patterns: &[&str]) -> Option<String> {
     for pattern in patterns {
         let mut search_start = 0;
         while let Some(pos) = xml[search_start..].find(pattern) {
@@ -392,7 +405,8 @@ fn find_rid_by_patterns(xml: &str, patterns: &[&str]) -> Option<String> {
 ///
 /// VML shapes use `r:id` on `v:imagedata` elements instead of the DrawingML
 /// `r:embed` on `a:blip`. Both reference the same image relationships.
-fn find_vml_imagedata_rid(xml: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn find_vml_imagedata_rid(xml: &str) -> Option<String> {
     // Find <v:imagedata or <imagedata elements, then extract r:id
     let imagedata_markers = ["<v:imagedata", "<imagedata"];
     for marker in &imagedata_markers {
@@ -417,17 +431,19 @@ fn find_vml_imagedata_rid(xml: &str) -> Option<String> {
 }
 /// Metadata extracted from a Drawing XML fragment for comparison.
 #[derive(Debug, PartialEq, Eq)]
-struct DrawingMetadata {
-    extent_cx: Option<String>,
-    extent_cy: Option<String>,
-    src_rect: Option<String>,
-    alt_text: Option<String>,
-    drawing_type: DrawingType,
+#[doc(hidden)]
+pub struct DrawingMetadata {
+    pub extent_cx: Option<String>,
+    pub extent_cy: Option<String>,
+    pub src_rect: Option<String>,
+    pub alt_text: Option<String>,
+    pub drawing_type: DrawingType,
 }
 
 /// Classification of drawing types for generating fallback labels.
 #[derive(Debug, PartialEq, Eq)]
-enum DrawingType {
+#[doc(hidden)]
+pub enum DrawingType {
     RasterImage,      // Has r:embed (DrawingML) or v:imagedata r:id (VML)
     VmlShape(String), // VML shape without raster backing (rect, oval, etc.)
     WpShape(String),  // wps:wsp with preset geometry name
@@ -436,7 +452,8 @@ enum DrawingType {
 }
 
 /// Parse drawing metadata from raw XML bytes using simple string search.
-fn parse_drawing_metadata(raw_xml: &[u8]) -> DrawingMetadata {
+#[doc(hidden)]
+pub fn parse_drawing_metadata(raw_xml: &[u8]) -> DrawingMetadata {
     let xml = match std::str::from_utf8(raw_xml) {
         Ok(s) => s,
         Err(e) => {
@@ -489,7 +506,8 @@ fn parse_drawing_metadata(raw_xml: &[u8]) -> DrawingMetadata {
 
 /// Find a specific attribute value on an element by local name.
 /// Handles namespace-prefixed tags (e.g. `wp:extent` matches `extent`).
-fn find_xml_attr(xml: &str, element_local_name: &str, attr_name: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn find_xml_attr(xml: &str, element_local_name: &str, attr_name: &str) -> Option<String> {
     // Look for the element — may be prefixed (e.g. wp:extent, a:srcRect)
     // Search for `:element_local_name ` or `<element_local_name `
     let patterns = [
@@ -517,7 +535,8 @@ fn find_xml_attr(xml: &str, element_local_name: &str, attr_name: &str) -> Option
 
 /// Extract all attributes of an element as a sorted string for comparison.
 /// Returns None if the element is not found.
-fn find_element_attrs(xml: &str, element_local_name: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn find_element_attrs(xml: &str, element_local_name: &str) -> Option<String> {
     let patterns = [
         format!(":{element_local_name}"),
         format!("<{element_local_name}"),
@@ -559,7 +578,8 @@ fn find_element_attrs(xml: &str, element_local_name: &str) -> Option<String> {
 
 /// Extract VML shape type from pict elements.
 /// Examples: <v:rect>, <v:oval>, <v:roundrect>
-fn extract_vml_shape_type(xml: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn extract_vml_shape_type(xml: &str) -> Option<String> {
     let vml_shapes = [
         "<v:rect",
         "<v:oval",
@@ -581,13 +601,15 @@ fn extract_vml_shape_type(xml: &str) -> Option<String> {
 
 /// Extract WordprocessingML shape preset from wps:wsp elements.
 /// Example: <a:prstGeom prst="rect">
-fn extract_wp_shape_preset(xml: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn extract_wp_shape_preset(xml: &str) -> Option<String> {
     find_xml_attr(xml, "prstGeom", "prst")
 }
 
 /// Generate descriptive fallback text for drawings without asset_ref.
 /// Priority: alt text > shape type > generic label
-fn extract_drawing_fallback_text(raw_xml: &[u8]) -> Option<String> {
+#[doc(hidden)]
+pub fn extract_drawing_fallback_text(raw_xml: &[u8]) -> Option<String> {
     let meta = parse_drawing_metadata(raw_xml);
 
     // Priority 1: Use author-provided alt text
@@ -607,20 +629,23 @@ fn extract_drawing_fallback_text(raw_xml: &[u8]) -> Option<String> {
         DrawingType::Unknown => Some("[drawing]".to_string()),
     }
 }
-fn opaque_placeholder(_opaque: &OpaqueInlineNode) -> String {
+#[doc(hidden)]
+pub fn opaque_placeholder(_opaque: &OpaqueInlineNode) -> String {
     "\u{FFFC}".to_string()
 }
 
 /// Tagged placeholder for opaque inlines in the inline diff path.
 /// Embeds a truncated semantic-identity hash so the diff algorithm can
 /// distinguish different opaques (e.g., footnote ref 1 vs footnote ref 2).
-fn opaque_diff_tag(opaque: &OpaqueInlineNode) -> String {
+#[doc(hidden)]
+pub fn opaque_diff_tag(opaque: &OpaqueInlineNode) -> String {
     let identity_hash = opaque_identity_hash(opaque);
     let hash_str = identity_hash[..identity_hash.len().min(OPAQUE_HASH_LEN)].to_string();
     format!("\u{FFFC}{hash_str}")
 }
 
-fn opaque_identity_hash(opaque: &OpaqueInlineNode) -> String {
+#[doc(hidden)]
+pub fn opaque_identity_hash(opaque: &OpaqueInlineNode) -> String {
     opaque.content_hash.clone().unwrap_or_else(|| {
         // Hyperlinks (and any future kinds) without content_hash: hash the
         // semantic identity of the kind, excluding transport details like r:id
@@ -632,7 +657,8 @@ fn opaque_identity_hash(opaque: &OpaqueInlineNode) -> String {
 /// Compute a stable identity string for an opaque kind, excluding fields
 /// that are transport/serialization details (like r:id) rather than semantic
 /// identity.
-fn opaque_semantic_identity(kind: &OpaqueKind) -> String {
+#[doc(hidden)]
+pub fn opaque_semantic_identity(kind: &OpaqueKind) -> String {
     match kind {
         OpaqueKind::Hyperlink(data) => {
             format!(
@@ -645,7 +671,8 @@ fn opaque_semantic_identity(kind: &OpaqueKind) -> String {
     }
 }
 
-fn change_type_to_segment_type(change_type: &str) -> InlineChangeSegmentType {
+#[doc(hidden)]
+pub fn change_type_to_segment_type(change_type: &str) -> InlineChangeSegmentType {
     match change_type {
         "insert" => InlineChangeSegmentType::Insert,
         "delete" => InlineChangeSegmentType::Delete,
@@ -655,7 +682,8 @@ fn change_type_to_segment_type(change_type: &str) -> InlineChangeSegmentType {
 
 /// The hyperlink target for the render projection: the external URL, or
 /// `#anchor` for an internal bookmark link. None for non-hyperlink opaques.
-pub(crate) fn opaque_url(kind: &OpaqueKind) -> Option<String> {
+#[doc(hidden)]
+pub fn opaque_url(kind: &OpaqueKind) -> Option<String> {
     match kind {
         OpaqueKind::Hyperlink(data) => data
             .url
@@ -665,7 +693,8 @@ pub(crate) fn opaque_url(kind: &OpaqueKind) -> Option<String> {
     }
 }
 
-pub(crate) fn opaque_kind_to_segment_kind(kind: &OpaqueKind) -> OpaqueSegmentKind {
+#[doc(hidden)]
+pub fn opaque_kind_to_segment_kind(kind: &OpaqueKind) -> OpaqueSegmentKind {
     match kind {
         OpaqueKind::Drawing => OpaqueSegmentKind::Drawing,
         // Defensive label only: compare/diff refuses quarantined inputs at
@@ -691,7 +720,8 @@ pub(crate) fn opaque_kind_to_segment_kind(kind: &OpaqueKind) -> OpaqueSegmentKin
     }
 }
 
-fn extract_inline_text(inlines: &[InlineNode]) -> String {
+#[doc(hidden)]
+pub fn extract_inline_text(inlines: &[InlineNode]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
@@ -709,9 +739,7 @@ fn extract_inline_text(inlines: &[InlineNode]) -> String {
             InlineNode::HardBreak(_) => out.push('\n'),
             InlineNode::OpaqueInline(o) => out.push_str(&opaque_placeholder(o)),
             InlineNode::Decoration(_) => {} // Zero-width, no contribution
-            InlineNode::CommentRangeStart { .. }
-            | InlineNode::CommentRangeEnd { .. }
-            | InlineNode::CommentReference { .. } => {} // Zero-width, no contribution
+            InlineNode::CommentRangeStart { .. } | InlineNode::CommentRangeEnd { .. } => {} // Zero-width, no contribution
         }
     }
     out
@@ -733,31 +761,38 @@ fn extract_inline_text(inlines: &[InlineNode]) -> String {
 /// paragraph provides enough bonus to pull the DP through an expensive gap path,
 /// rather than letting the DP take a cheaper path that deletes+reinserts it.
 /// Minimum non-whitespace characters for an Unchanged span to be a "strong anchor".
-const ANCHOR_MIN_CHARS: usize = 8;
+#[doc(hidden)]
+pub const ANCHOR_MIN_CHARS: usize = 8;
 
 /// Minimum alternating del/ins run count to trigger zipper collapse.
-const ZIPPER_MIN_CHANGE_RUNS: usize = 4;
+#[doc(hidden)]
+pub const ZIPPER_MIN_CHANGE_RUNS: usize = 4;
 
 /// Regions with similarity below this are force-collapsed even without high alternation.
-const LOW_SIMILARITY_THRESHOLD: f64 = 0.15;
+#[doc(hidden)]
+pub const LOW_SIMILARITY_THRESHOLD: f64 = 0.15;
 
 /// If overall text similarity is below this, bail out of token-level diff entirely.
-const BAIL_OUT_SIMILARITY_THRESHOLD: f64 = 0.30;
+#[doc(hidden)]
+pub const BAIL_OUT_SIMILARITY_THRESHOLD: f64 = 0.30;
 
 /// Minimum text length (in chars) to consider bail-out.
-const BAIL_OUT_MIN_CHARS: usize = 50;
+#[doc(hidden)]
+pub const BAIL_OUT_MIN_CHARS: usize = 50;
 
 #[derive(Clone, Copy, Debug)]
-struct DiffHeuristics {
-    anchor_min_chars: usize,
-    zipper_min_change_runs: usize,
-    low_similarity_threshold: f64,
-    bail_out_similarity_threshold: f64,
-    bail_out_min_chars: usize,
+#[doc(hidden)]
+pub struct DiffHeuristics {
+    pub anchor_min_chars: usize,
+    pub zipper_min_change_runs: usize,
+    pub low_similarity_threshold: f64,
+    pub bail_out_similarity_threshold: f64,
+    pub bail_out_min_chars: usize,
 }
 
 impl DiffHeuristics {
-    fn from_env() -> Self {
+    #[doc(hidden)]
+    pub fn from_env() -> Self {
         Self {
             anchor_min_chars: parse_env_usize("DIFF_ANCHOR_MIN_CHARS").unwrap_or(ANCHOR_MIN_CHARS),
             zipper_min_change_runs: parse_env_usize("DIFF_ZIPPER_MIN_CHANGE_RUNS")
@@ -772,7 +807,8 @@ impl DiffHeuristics {
     }
 }
 
-fn parse_env_usize(key: &str) -> Option<usize> {
+#[doc(hidden)]
+pub fn parse_env_usize(key: &str) -> Option<usize> {
     let value = env::var(key).ok()?;
     match value.parse::<usize>() {
         Ok(parsed) => Some(parsed),
@@ -783,7 +819,8 @@ fn parse_env_usize(key: &str) -> Option<usize> {
     }
 }
 
-fn parse_env_f64(key: &str) -> Option<f64> {
+#[doc(hidden)]
+pub fn parse_env_f64(key: &str) -> Option<f64> {
     let value = env::var(key).ok()?;
     match value.parse::<f64>() {
         Ok(parsed) => Some(parsed),
@@ -793,7 +830,8 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         }
     }
 }
-fn normalize_for_similarity(text: &str) -> String {
+#[doc(hidden)]
+pub fn normalize_for_similarity(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -802,7 +840,8 @@ fn normalize_for_similarity(text: &str) -> String {
 
 /// Compute similarity between two text strings (0.0 to 1.0).
 /// Uses word-level LCS ratio on normalized text.
-fn text_similarity(text1: &str, text2: &str) -> f64 {
+#[doc(hidden)]
+pub fn text_similarity(text1: &str, text2: &str) -> f64 {
     let norm1 = normalize_for_similarity(text1);
     let norm2 = normalize_for_similarity(text2);
     let old_tokens = tokenize(&norm1);
@@ -1062,12 +1101,14 @@ pub fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
                 text: change.to_string_lossy().into_owned(),
                 marks: Vec::new(),
                 style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
                 formatting_change: None,
             },
             ChangeTag::Insert => InlineChange::Inserted {
                 text: change.to_string_lossy().into_owned(),
                 marks: Vec::new(),
                 style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
                 formatting_change: None,
                 rev_id: 0,
             },
@@ -1075,6 +1116,7 @@ pub fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
                 text: change.to_string_lossy().into_owned(),
                 marks: Vec::new(),
                 style_props: StyleProps::default(),
+                rpr_authored: RunRprAuthored::default(),
                 formatting_change: None,
                 rev_id: 0,
             },
@@ -1085,14 +1127,17 @@ pub fn diff_block_content(old_text: &str, new_text: &str) -> Vec<InlineChange> {
 
 /// Per-character formatting info: boolean marks + value-carrying style props.
 #[derive(Clone, Default)]
-struct CharFormatting {
-    marks: Vec<Mark>,
-    style_props: StyleProps,
+#[doc(hidden)]
+pub struct CharFormatting {
+    pub marks: Vec<Mark>,
+    pub style_props: StyleProps,
+    pub rpr_authored: RunRprAuthored,
 }
 
 /// Extract text from inlines along with a per-character formatting mapping.
 /// Returns (text, char_fmt) where char_fmt[i] contains the formatting for character i.
-fn extract_text_with_marks_and_opaques<'a>(
+#[doc(hidden)]
+pub fn extract_text_with_marks_and_opaques<'a>(
     inlines: &'a [InlineNode],
 ) -> (String, Vec<CharFormatting>, Vec<OpaqueTracker<'a>>) {
     let mut text = String::new();
@@ -1110,6 +1155,7 @@ fn extract_text_with_marks_and_opaques<'a>(
                 let fmt = CharFormatting {
                     marks: t.marks.clone(),
                     style_props: t.style_props.clone(),
+                    rpr_authored: t.rpr_authored,
                 };
                 for _ in node_text.chars() {
                     char_fmt.push(fmt.clone());
@@ -1121,6 +1167,7 @@ fn extract_text_with_marks_and_opaques<'a>(
                 char_fmt.push(CharFormatting {
                     marks: hard_break.wrapper_marks.clone(),
                     style_props: hard_break.wrapper_style_props.clone(),
+                    rpr_authored: hard_break.wrapper_rpr_authored,
                 });
             }
             InlineNode::OpaqueInline(o) => {
@@ -1136,8 +1183,7 @@ fn extract_text_with_marks_and_opaques<'a>(
             }
             InlineNode::Decoration(_)
             | InlineNode::CommentRangeStart { .. }
-            | InlineNode::CommentRangeEnd { .. }
-            | InlineNode::CommentReference { .. } => {}
+            | InlineNode::CommentRangeEnd { .. } => {}
         }
     }
 
@@ -1145,7 +1191,8 @@ fn extract_text_with_marks_and_opaques<'a>(
 }
 
 /// Get formatting at a specific character offset, or default if out of bounds.
-fn formatting_at_offset(char_fmt: &[CharFormatting], offset: usize) -> CharFormatting {
+#[doc(hidden)]
+pub fn formatting_at_offset(char_fmt: &[CharFormatting], offset: usize) -> CharFormatting {
     char_fmt.get(offset).cloned().unwrap_or_default()
 }
 
@@ -1155,7 +1202,8 @@ fn formatting_at_offset(char_fmt: &[CharFormatting], offset: usize) -> CharForma
 /// unless **every** character in the range carries it. Caps is the only mark
 /// with a rendering side-effect (uppercase transform), so applying it to a
 /// whole token based on a single character produces incorrect text.
-fn formatting_for_token_range(
+#[doc(hidden)]
+pub fn formatting_for_token_range(
     char_fmt: &[CharFormatting],
     offset: usize,
     len: usize,
@@ -1181,37 +1229,118 @@ fn formatting_for_token_range(
     fmt
 }
 
+/// The formatting runs of a token spanning `offset..offset+len`: consecutive
+/// `(char count, formatting)` pieces, split where the marks, style properties
+/// or authored rPr slots change. Each piece's formatting follows
+/// [`formatting_for_token_range`] over that piece. A deleted token is recorded
+/// run by run so rejecting the deletion restores each run as it was.
+#[doc(hidden)]
+pub fn formatting_runs_for_token_range(
+    char_fmt: &[CharFormatting],
+    offset: usize,
+    len: usize,
+) -> Vec<(usize, CharFormatting)> {
+    let same = |a: usize, b: usize| match (char_fmt.get(a), char_fmt.get(b)) {
+        (Some(x), Some(y)) => {
+            x.marks == y.marks && x.style_props == y.style_props && x.rpr_authored == y.rpr_authored
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let mut runs = Vec::new();
+    let mut run_start = offset;
+    for i in offset + 1..offset + len {
+        if !same(i - 1, i) {
+            runs.push((
+                i - run_start,
+                formatting_for_token_range(char_fmt, run_start, i - run_start),
+            ));
+            run_start = i;
+        }
+    }
+    let end = offset + len;
+    if end > run_start {
+        runs.push((
+            end - run_start,
+            formatting_for_token_range(char_fmt, run_start, end - run_start),
+        ));
+    }
+    runs
+}
+
+/// The `Deleted` changes for a token removed from the old text: one per
+/// formatting run (see [`formatting_runs_for_token_range`]).
+#[doc(hidden)]
+pub fn deleted_token_changes(
+    text: &str,
+    char_fmt: &[CharFormatting],
+    offset: usize,
+) -> Vec<InlineChange> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = 0usize;
+    formatting_runs_for_token_range(char_fmt, offset, chars.len())
+        .into_iter()
+        .map(|(len, fmt)| {
+            let piece: String = chars[at..at + len].iter().collect();
+            at += len;
+            InlineChange::Deleted {
+                text: piece,
+                marks: fmt.marks,
+                style_props: fmt.style_props,
+                rpr_authored: fmt.rpr_authored,
+                formatting_change: None,
+                rev_id: 0,
+            }
+        })
+        .collect()
+}
+
 /// Detect formatting-only changes between old and new character positions.
 ///
 /// When text is unchanged (ChangeTag::Equal) but marks or style_props differ,
 /// returns the current (new) formatting and a FormattingChange capturing the
 /// previous (old) formatting. Author/date are left empty; the merge step fills
 /// them from RevisionInfo.
-fn detect_formatting_change(
+#[doc(hidden)]
+pub fn detect_formatting_change(
     old_fmt: &CharFormatting,
     new_fmt: &CharFormatting,
-) -> (Vec<Mark>, StyleProps, Option<FormattingChange>) {
-    let changed = old_fmt.marks != new_fmt.marks || old_fmt.style_props != new_fmt.style_props;
+) -> (
+    Vec<Mark>,
+    StyleProps,
+    RunRprAuthored,
+    Option<FormattingChange>,
+) {
+    // TextNode formatting is RESOLVED through the style cascade. A paragraph
+    // style change can therefore change every run's effective formatting even
+    // though neither run authored a formatting edit. Such a change belongs to
+    // the paragraph/style carrier; synthesizing an rPrChange as well both
+    // invents direct authoring and can make native Word Reject hang.
+    //
+    // Compare the direct run states instead. This still detects a simultaneous
+    // direct run edit because its authored projection (or authored OFF state)
+    // differs independently of the inherited values.
+    let old_direct_marks = old_fmt.rpr_authored.direct_marks(&old_fmt.marks);
+    let new_direct_marks = new_fmt.rpr_authored.direct_marks(&new_fmt.marks);
+    let old_direct_props = old_fmt
+        .rpr_authored
+        .direct_style_props(&old_fmt.style_props);
+    let new_direct_props = new_fmt
+        .rpr_authored
+        .direct_style_props(&new_fmt.style_props);
+    let changed = old_direct_marks != new_direct_marks
+        || old_direct_props != new_direct_props
+        || old_fmt.rpr_authored.formatting_identity() != new_fmt.rpr_authored.formatting_identity();
     if changed {
         (
             new_fmt.marks.clone(),
             new_fmt.style_props.clone(),
+            new_fmt.rpr_authored,
             Some(FormattingChange {
                 carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
                 previous_marks: old_fmt.marks.clone(),
                 previous_style_props: old_fmt.style_props.clone(),
-                // CharFormatting (this whole character-diff pipeline) never
-                // tracked per-property rPr authoring provenance — it only
-                // ever carried marks/style_props, so there is no "previous"
-                // authored-bitset to recover here. Defaulting to
-                // "nothing authored" is neutral, not a regression: this
-                // path had no such concept before `previous_rpr_authored`
-                // existed either. A reject of a formatting change SYNTHESIZED
-                // by document comparison (as opposed to authored through
-                // SetRunFormatting, which now captures this correctly) may
-                // therefore under-restore authored-vs-inherited state — a
-                // known, pre-existing gap, not something this fix widens.
-                previous_rpr_authored: RunRprAuthored::default(),
+                previous_rpr_authored: old_fmt.rpr_authored,
                 // Placeholder: merge_diff fills from RevisionInfo.
                 revision_id: 0,
                 identity: 0,
@@ -1220,13 +1349,19 @@ fn detect_formatting_change(
             }),
         )
     } else {
-        (old_fmt.marks.clone(), old_fmt.style_props.clone(), None)
+        (
+            old_fmt.marks.clone(),
+            old_fmt.style_props.clone(),
+            old_fmt.rpr_authored,
+            None,
+        )
     }
 }
 
 /// Diff inline content with marks preservation.
 /// Uses token-level diffing but maps character positions back to source marks.
-fn build_opaque_change(
+#[doc(hidden)]
+pub fn build_opaque_change(
     tracker: &OpaqueTracker,
     segment_type: InlineChangeSegmentType,
     note_markers: &HashMap<String, String>,
@@ -1257,7 +1392,8 @@ fn build_opaque_change(
 /// distinguish different opaque objects inside a region the caller has already
 /// selected, then resolves them back to `InlineChange::Opaque` segments. It
 /// does not infer correspondence between documents.
-pub(crate) fn diff_block_content_resolving_opaques(
+#[doc(hidden)]
+pub fn diff_block_content_resolving_opaques(
     old_inlines: &[InlineNode],
     new_inlines: &[InlineNode],
     note_markers: &HashMap<String, String>,
@@ -1332,26 +1468,20 @@ pub(crate) fn diff_block_content_resolving_opaques(
                 ChangeTag::Equal => {
                     let old_fmt = formatting_for_token_range(&old_char_fmt, old_offset, len);
                     let new_fmt = formatting_for_token_range(&new_char_fmt, new_offset, len);
-                    let (marks, style_props, formatting_change) =
+                    let (marks, style_props, rpr_authored, formatting_change) =
                         detect_formatting_change(&old_fmt, &new_fmt);
                     result.push(InlineChange::Unchanged {
                         text,
                         marks,
                         style_props,
+                        rpr_authored,
                         formatting_change,
                     });
                     old_offset += len;
                     new_offset += len;
                 }
                 ChangeTag::Delete => {
-                    let fmt = formatting_for_token_range(&old_char_fmt, old_offset, len);
-                    result.push(InlineChange::Deleted {
-                        text,
-                        marks: fmt.marks,
-                        style_props: fmt.style_props,
-                        formatting_change: None,
-                        rev_id: 0,
-                    });
+                    result.extend(deleted_token_changes(&text, &old_char_fmt, old_offset));
                     old_offset += len;
                 }
                 ChangeTag::Insert => {
@@ -1360,6 +1490,7 @@ pub(crate) fn diff_block_content_resolving_opaques(
                         text,
                         marks: fmt.marks,
                         style_props: fmt.style_props,
+                        rpr_authored: fmt.rpr_authored,
                         formatting_change: None,
                         rev_id: 0,
                     });
@@ -1378,7 +1509,8 @@ pub(crate) fn diff_block_content_resolving_opaques(
 /// inserts within a hunk, which can produce out-of-order inline indices when
 /// opaques at multiple positions are replaced (e.g. indices 2,3,2,3 instead
 /// of 2,2,3,3).
-fn sort_opaque_runs_by_inline_index(mut changes: Vec<InlineChange>) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn sort_opaque_runs_by_inline_index(mut changes: Vec<InlineChange>) -> Vec<InlineChange> {
     let len = changes.len();
     let mut i = 0;
     while i < len {
@@ -1419,7 +1551,8 @@ fn sort_opaque_runs_by_inline_index(mut changes: Vec<InlineChange>) -> Vec<Inlin
 // =============================================================================
 
 /// Check if a token looks like a high-value numeric/financial token.
-fn is_high_value_token(s: &str) -> bool {
+#[doc(hidden)]
+pub fn is_high_value_token(s: &str) -> bool {
     // Numbers, percentages, currency, section references
     s.chars().any(|c| c.is_ascii_digit())
         || s == "%"
@@ -1432,7 +1565,8 @@ fn is_high_value_token(s: &str) -> bool {
 /// Compute content-only similarity (ignoring whitespace tokens).
 /// Whitespace tokens inflate standard text_similarity, making bail-out
 /// hard to trigger for truly different texts.
-fn content_similarity(old_text: &str, new_text: &str) -> f64 {
+#[doc(hidden)]
+pub fn content_similarity(old_text: &str, new_text: &str) -> f64 {
     let norm1 = normalize_for_similarity(old_text);
     let norm2 = normalize_for_similarity(new_text);
     let old_tokens: Vec<&str> = tokenize(&norm1)
@@ -1458,7 +1592,8 @@ fn content_similarity(old_text: &str, new_text: &str) -> f64 {
 /// Check if we should bail out of token-level diffing.
 /// Returns true if texts are so dissimilar that a clean delete-all/insert-all is better.
 /// Safety: never bails out if high-value tokens (numbers, currency, percentages) differ.
-fn should_bail_out_with_config(
+#[doc(hidden)]
+pub fn should_bail_out_with_config(
     old_text: &str,
     new_text: &str,
     heuristics: &DiffHeuristics,
@@ -1500,7 +1635,8 @@ fn should_bail_out_with_config(
 
 /// Build a clean delete-all + insert-all replacement from inlines, preserving marks.
 /// Common leading/trailing segments are factored out as Unchanged.
-fn build_full_replace(
+#[doc(hidden)]
+pub fn build_full_replace(
     old_inlines: &[InlineNode],
     new_inlines: &[InlineNode],
     note_markers: &HashMap<String, String>,
@@ -1515,12 +1651,14 @@ fn build_full_replace(
 // =============================================================================
 
 /// Count non-whitespace characters in a string.
-fn non_ws_chars(s: &str) -> usize {
+#[doc(hidden)]
+pub fn non_ws_chars(s: &str) -> usize {
     s.chars().filter(|c| !c.is_whitespace()).count()
 }
 
 /// Get the text content of an InlineChange.
-fn inline_change_text(change: &InlineChange) -> &str {
+#[doc(hidden)]
+pub fn inline_change_text(change: &InlineChange) -> &str {
     match change {
         InlineChange::Unchanged { text, .. } => text,
         InlineChange::Deleted { text, .. } => text,
@@ -1530,7 +1668,8 @@ fn inline_change_text(change: &InlineChange) -> &str {
 }
 
 /// Get the marks of an InlineChange.
-fn inline_change_marks(change: &InlineChange) -> &[Mark] {
+#[doc(hidden)]
+pub fn inline_change_marks(change: &InlineChange) -> &[Mark] {
     match change {
         InlineChange::Unchanged { marks, .. } => marks,
         InlineChange::Deleted { marks, .. } => marks,
@@ -1541,7 +1680,8 @@ fn inline_change_marks(change: &InlineChange) -> &[Mark] {
 
 /// Get the style_props of an InlineChange.
 /// Panics on Opaque (which has no style_props); callers must filter those out.
-fn inline_change_style_props(change: &InlineChange) -> &StyleProps {
+#[doc(hidden)]
+pub fn inline_change_style_props(change: &InlineChange) -> &StyleProps {
     match change {
         InlineChange::Unchanged { style_props, .. }
         | InlineChange::Deleted { style_props, .. }
@@ -1552,8 +1692,21 @@ fn inline_change_style_props(change: &InlineChange) -> &StyleProps {
     }
 }
 
+#[doc(hidden)]
+pub fn inline_change_rpr_authored(change: &InlineChange) -> RunRprAuthored {
+    match change {
+        InlineChange::Unchanged { rpr_authored, .. }
+        | InlineChange::Deleted { rpr_authored, .. }
+        | InlineChange::Inserted { rpr_authored, .. } => *rpr_authored,
+        InlineChange::Opaque { .. } => {
+            panic!("inline_change_rpr_authored called on Opaque segment")
+        }
+    }
+}
+
 /// Check if an InlineChange is an enumerator token like (i), (ii), (a) etc.
-fn is_enumerator_anchor(change: &InlineChange) -> bool {
+#[doc(hidden)]
+pub fn is_enumerator_anchor(change: &InlineChange) -> bool {
     let text = inline_change_text(change);
     if !text.starts_with('(') || !text.ends_with(')') || text.len() < 3 {
         return false;
@@ -1563,7 +1716,8 @@ fn is_enumerator_anchor(change: &InlineChange) -> bool {
 }
 
 /// Merge adjacent same-type segments only when their formatting payload matches.
-fn merge_adjacent_same_type(changes: Vec<InlineChange>) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn merge_adjacent_same_type(changes: Vec<InlineChange>) -> Vec<InlineChange> {
     if changes.is_empty() {
         return changes;
     }
@@ -1648,7 +1802,8 @@ fn merge_adjacent_same_type(changes: Vec<InlineChange>) -> Vec<InlineChange> {
 
 /// Identify indices of "strong anchors" — Unchanged spans with >= ANCHOR_MIN_CHARS
 /// non-whitespace characters, OR enumerator tokens like (i), (ii).
-fn find_strong_anchors_with_config(
+#[doc(hidden)]
+pub fn find_strong_anchors_with_config(
     changes: &[InlineChange],
     heuristics: &DiffHeuristics,
 ) -> Vec<usize> {
@@ -1685,7 +1840,8 @@ fn find_strong_anchors_with_config(
 /// Each contiguous block of Deleted tokens is one group; each contiguous block
 /// of Inserted tokens is one group. Tiny unchanged spans (< 3 non-ws chars)
 /// are ignored (treated as transparent). This counts the number of such groups.
-fn count_change_runs(region: &[InlineChange]) -> usize {
+#[doc(hidden)]
+pub fn count_change_runs(region: &[InlineChange]) -> usize {
     let mut runs = 0;
     // Track whether last significant segment was Del, Ins, or Equal
     // 0 = none, 1 = deleted, 2 = inserted
@@ -1736,7 +1892,8 @@ fn count_change_runs(region: &[InlineChange]) -> usize {
 }
 
 /// Count how many tokens in a region are changed (Deleted or Inserted).
-fn count_changed_tokens(region: &[InlineChange]) -> usize {
+#[doc(hidden)]
+pub fn count_changed_tokens(region: &[InlineChange]) -> usize {
     region
         .iter()
         .filter(|c| {
@@ -1755,7 +1912,8 @@ fn count_changed_tokens(region: &[InlineChange]) -> usize {
 }
 
 /// Compute the text similarity of just the old-side and new-side of a region.
-fn region_similarity(region: &[InlineChange]) -> f64 {
+#[doc(hidden)]
+pub fn region_similarity(region: &[InlineChange]) -> f64 {
     let old_text: String = region
         .iter()
         .filter_map(|c| match c {
@@ -1778,7 +1936,8 @@ fn region_similarity(region: &[InlineChange]) -> f64 {
 }
 
 /// Decide whether a region between strong anchors should be collapsed.
-fn should_collapse_region_with_config(
+#[doc(hidden)]
+pub fn should_collapse_region_with_config(
     region: &[InlineChange],
     heuristics: &DiffHeuristics,
 ) -> bool {
@@ -1814,7 +1973,8 @@ fn should_collapse_region_with_config(
 /// segment lists. Leading segments that match (same text and marks) become Unchanged
 /// (prefix), trailing matching segments become Unchanged (suffix), and the differing
 /// middle remains Deleted/Inserted.
-fn factor_common_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn factor_common_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
     // Split into del and ins segments.
     let mut del: Vec<&InlineChange> = Vec::new();
     let mut ins: Vec<&InlineChange> = Vec::new();
@@ -1865,6 +2025,7 @@ fn factor_common_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
             text: inline_change_text(d).to_string(),
             marks: inline_change_marks(d).to_vec(),
             style_props: inline_change_style_props(d).clone(),
+            rpr_authored: inline_change_rpr_authored(d),
             formatting_change: None,
         });
     }
@@ -1885,6 +2046,7 @@ fn factor_common_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
             text: inline_change_text(d).to_string(),
             marks: inline_change_marks(d).to_vec(),
             style_props: inline_change_style_props(d).clone(),
+            rpr_authored: inline_change_rpr_authored(d),
             formatting_change: None,
         });
     }
@@ -1894,7 +2056,8 @@ fn factor_common_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
 
 /// True if byte position `pos` in `text` falls on a token boundary
 /// (the tokenizer would start a new token here).
-fn is_token_boundary(text: &str, pos: usize) -> bool {
+#[doc(hidden)]
+pub fn is_token_boundary(text: &str, pos: usize) -> bool {
     if pos == 0 || pos >= text.len() {
         return true;
     }
@@ -1907,7 +2070,8 @@ fn is_token_boundary(text: &str, pos: usize) -> bool {
 }
 
 /// Snap a byte-level common prefix length down to a token boundary in both texts.
-fn snap_prefix_to_token_boundary(old_text: &str, new_text: &str, raw: usize) -> usize {
+#[doc(hidden)]
+pub fn snap_prefix_to_token_boundary(old_text: &str, new_text: &str, raw: usize) -> usize {
     if raw == 0 {
         return 0;
     }
@@ -1933,7 +2097,8 @@ fn snap_prefix_to_token_boundary(old_text: &str, new_text: &str, raw: usize) -> 
 }
 
 /// Snap a byte-level common suffix length down to a token boundary in both texts.
-fn snap_suffix_to_token_boundary(old_text: &str, new_text: &str, raw_suffix: usize) -> usize {
+#[doc(hidden)]
+pub fn snap_suffix_to_token_boundary(old_text: &str, new_text: &str, raw_suffix: usize) -> usize {
     if raw_suffix == 0 {
         return 0;
     }
@@ -1975,7 +2140,8 @@ fn snap_suffix_to_token_boundary(old_text: &str, new_text: &str, raw_suffix: usi
 /// help because the entire text differs as a segment. This function recovers the shared
 /// text at character level, snapped to token boundaries, producing finer-grained output:
 /// `Unchanged(") years.") + Del("five (5") + Ins("two (2") + Unchanged(") years.")`.
-fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -1987,19 +2153,25 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
                     text: del_text,
                     marks: del_marks,
                     style_props: del_sp,
+                    rpr_authored: del_rpr,
                     ..
                 },
                 InlineChange::Inserted {
                     text: ins_text,
                     marks: ins_marks,
                     style_props: ins_sp,
+                    rpr_authored: ins_rpr,
                     ..
                 },
             ) = (&changes[i], &changes[i + 1])
         {
             // Only factor when marks and style_props match (content substitution,
             // not a formatting change).
-            if del_marks == ins_marks && del_sp == ins_sp && del_text != ins_text {
+            if del_marks == ins_marks
+                && del_sp == ins_sp
+                && del_rpr == ins_rpr
+                && del_text != ins_text
+            {
                 let raw_prefix = del_text
                     .bytes()
                     .zip(ins_text.bytes())
@@ -2032,6 +2204,7 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
                             text: del_text[..prefix].to_string(),
                             marks: del_marks.clone(),
                             style_props: del_sp.clone(),
+                            rpr_authored: *del_rpr,
                             formatting_change: None,
                         });
                     }
@@ -2039,6 +2212,7 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
                         text: del_mid.to_string(),
                         marks: del_marks.clone(),
                         style_props: del_sp.clone(),
+                        rpr_authored: *del_rpr,
                         formatting_change: None,
                         rev_id: 0,
                     });
@@ -2046,6 +2220,7 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
                         text: ins_mid.to_string(),
                         marks: ins_marks.clone(),
                         style_props: ins_sp.clone(),
+                        rpr_authored: *ins_rpr,
                         formatting_change: None,
                         rev_id: 0,
                     });
@@ -2054,6 +2229,7 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
                             text: del_text[del_text.len() - suffix..].to_string(),
                             marks: del_marks.clone(),
                             style_props: del_sp.clone(),
+                            rpr_authored: *del_rpr,
                             formatting_change: None,
                         });
                     }
@@ -2075,12 +2251,14 @@ fn factor_char_level_affixes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
 /// Unchanged text within the region is duplicated to both sides.
 /// Preserves mark boundaries: emits one segment per contiguous run of same marks,
 /// so per-word formatting (e.g. bold defined terms) is not lost.
-fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
+#[doc(hidden)]
+pub fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
     // Intermediate segment: text + marks + style_props for one contiguous run.
     struct Seg {
         text: String,
         marks: Vec<Mark>,
         style_props: StyleProps,
+        rpr_authored: RunRprAuthored,
     }
 
     let mut del_segs: Vec<Seg> = Vec::new();
@@ -2090,13 +2268,20 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
     // both toggle marks and value-carrying style props match. Otherwise we can
     // smear formatting across adjacent text/opaque boundaries (e.g. field
     // result text next to a field structural placeholder).
-    fn push_seg(segs: &mut Vec<Seg>, text: &str, marks: &[Mark], style_props: &StyleProps) {
+    fn push_seg(
+        segs: &mut Vec<Seg>,
+        text: &str,
+        marks: &[Mark],
+        style_props: &StyleProps,
+        rpr_authored: RunRprAuthored,
+    ) {
         if text.is_empty() {
             return;
         }
         if let Some(last) = segs.last_mut()
             && last.marks == marks
             && last.style_props == *style_props
+            && last.rpr_authored == rpr_authored
         {
             last.text.push_str(text);
             return;
@@ -2105,6 +2290,7 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
             text: text.to_string(),
             marks: marks.to_vec(),
             style_props: style_props.clone(),
+            rpr_authored,
         });
     }
 
@@ -2114,26 +2300,46 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
                 text,
                 marks,
                 style_props,
-                ..
+                rpr_authored,
+                formatting_change,
             } => {
-                push_seg(&mut del_segs, text, marks, style_props);
-                push_seg(&mut ins_segs, text, marks, style_props);
+                // A collapsed replacement duplicates unchanged text into both
+                // terminal arms. When that text also carries a formatting
+                // revision, the deleted/source arm must use the previous
+                // properties while the inserted/target arm uses the current
+                // properties. Copying the current properties into both arms
+                // makes native Word Reject restore source text with target
+                // formatting.
+                if let Some(change) = formatting_change {
+                    push_seg(
+                        &mut del_segs,
+                        text,
+                        &change.previous_marks,
+                        &change.previous_style_props,
+                        change.previous_rpr_authored,
+                    );
+                } else {
+                    push_seg(&mut del_segs, text, marks, style_props, *rpr_authored);
+                }
+                push_seg(&mut ins_segs, text, marks, style_props, *rpr_authored);
             }
             InlineChange::Deleted {
                 text,
                 marks,
                 style_props,
+                rpr_authored,
                 ..
             } => {
-                push_seg(&mut del_segs, text, marks, style_props);
+                push_seg(&mut del_segs, text, marks, style_props, *rpr_authored);
             }
             InlineChange::Inserted {
                 text,
                 marks,
                 style_props,
+                rpr_authored,
                 ..
             } => {
-                push_seg(&mut ins_segs, text, marks, style_props);
+                push_seg(&mut ins_segs, text, marks, style_props, *rpr_authored);
             }
             InlineChange::Opaque {
                 segment_type, text, ..
@@ -2144,18 +2350,42 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
                 match segment_type {
                     InlineChangeSegmentType::Equal => {
                         if let Some(t) = text {
-                            push_seg(&mut del_segs, t, empty_marks, &default_sp);
-                            push_seg(&mut ins_segs, t, empty_marks, &default_sp);
+                            push_seg(
+                                &mut del_segs,
+                                t,
+                                empty_marks,
+                                &default_sp,
+                                RunRprAuthored::default(),
+                            );
+                            push_seg(
+                                &mut ins_segs,
+                                t,
+                                empty_marks,
+                                &default_sp,
+                                RunRprAuthored::default(),
+                            );
                         }
                     }
                     InlineChangeSegmentType::Delete => {
                         if let Some(t) = text {
-                            push_seg(&mut del_segs, t, empty_marks, &default_sp);
+                            push_seg(
+                                &mut del_segs,
+                                t,
+                                empty_marks,
+                                &default_sp,
+                                RunRprAuthored::default(),
+                            );
                         }
                     }
                     InlineChangeSegmentType::Insert => {
                         if let Some(t) = text {
-                            push_seg(&mut ins_segs, t, empty_marks, &default_sp);
+                            push_seg(
+                                &mut ins_segs,
+                                t,
+                                empty_marks,
+                                &default_sp,
+                                RunRprAuthored::default(),
+                            );
                         }
                     }
                 }
@@ -2169,6 +2399,7 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
             text: seg.text,
             marks: seg.marks,
             style_props: seg.style_props,
+            rpr_authored: seg.rpr_authored,
             formatting_change: None,
             rev_id: 0,
         });
@@ -2178,6 +2409,7 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
             text: seg.text,
             marks: seg.marks,
             style_props: seg.style_props,
+            rpr_authored: seg.rpr_authored,
             formatting_change: None,
             rev_id: 0,
         });
@@ -2185,15 +2417,8 @@ fn collapse_region(region: &[InlineChange]) -> Vec<InlineChange> {
     factor_common_affixes(result)
 }
 
-/// Split changes by strong anchors, collapse qualifying regions.
-#[cfg(test)]
-#[allow(dead_code)]
-fn collapse_zipper_regions(changes: Vec<InlineChange>) -> Vec<InlineChange> {
-    let heuristics = DiffHeuristics::from_env();
-    collapse_zipper_regions_with_config(changes, &heuristics)
-}
-
-fn collapse_zipper_regions_with_config(
+#[doc(hidden)]
+pub fn collapse_zipper_regions_with_config(
     changes: Vec<InlineChange>,
     heuristics: &DiffHeuristics,
 ) -> Vec<InlineChange> {
@@ -2247,7 +2472,8 @@ pub fn cleanup_inline_changes(changes: Vec<InlineChange>) -> Vec<InlineChange> {
     cleanup_inline_changes_with_config(changes, &heuristics)
 }
 
-fn cleanup_inline_changes_with_config(
+#[doc(hidden)]
+pub fn cleanup_inline_changes_with_config(
     changes: Vec<InlineChange>,
     heuristics: &DiffHeuristics,
 ) -> Vec<InlineChange> {
@@ -2260,16 +2486,6 @@ fn cleanup_inline_changes_with_config(
 // =============================================================================
 // Story diffing functions
 // =============================================================================
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
 /// Convert a block's inline nodes to InlineChange segments of a given type.
 ///
 /// Walks InlineNode list, extracting TextNode.text + TextNode.marks,
@@ -2291,6 +2507,7 @@ pub fn inlines_to_segments(
                         text: t.text.clone(),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
+                        rpr_authored: t.rpr_authored,
                         formatting_change: t.formatting_change.clone(),
                         rev_id: 0,
                     },
@@ -2298,6 +2515,7 @@ pub fn inlines_to_segments(
                         text: t.text.clone(),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
+                        rpr_authored: t.rpr_authored,
                         formatting_change: t.formatting_change.clone(),
                         rev_id: 0,
                     },
@@ -2305,6 +2523,7 @@ pub fn inlines_to_segments(
                         text: t.text.clone(),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
+                        rpr_authored: t.rpr_authored,
                         formatting_change: t.formatting_change.clone(),
                     },
                 };
@@ -2316,6 +2535,7 @@ pub fn inlines_to_segments(
                         text: "\n".to_string(),
                         marks: vec![],
                         style_props: StyleProps::default(),
+                        rpr_authored: RunRprAuthored::default(),
                         formatting_change: None,
                         rev_id: 0,
                     },
@@ -2323,6 +2543,7 @@ pub fn inlines_to_segments(
                         text: "\n".to_string(),
                         marks: vec![],
                         style_props: StyleProps::default(),
+                        rpr_authored: RunRprAuthored::default(),
                         formatting_change: None,
                         rev_id: 0,
                     },
@@ -2330,6 +2551,7 @@ pub fn inlines_to_segments(
                         text: "\n".to_string(),
                         marks: vec![],
                         style_props: StyleProps::default(),
+                        rpr_authored: RunRprAuthored::default(),
                         formatting_change: None,
                     },
                 };
@@ -2367,11 +2589,22 @@ pub fn inlines_to_segments(
             // by the engine) marks the close. `CommentRangeEnd` is the redundant
             // structural twin of `CommentReference` and is dropped to avoid a
             // double close marker.
-            InlineNode::CommentRangeStart { id } | InlineNode::CommentReference { id } => {
+            //
+            // The start marker's `opaque_id` is the id every read gives it
+            // (`comment_<id>_start`, `view::comment_range_anchor_id`), never the
+            // comment id, which names the comment and is also its reference's:
+            // a replace naming the marker by what a cell paragraph's segments
+            // show must find it.
+            InlineNode::CommentRangeStart { id } => {
                 segments.push(InlineChange::Opaque {
                     segment_type: change_type_to_segment_type(change_type),
                     kind: OpaqueSegmentKind::CommentReference,
-                    opaque_id: id.clone(),
+                    opaque_id: crate::view::comment_range_anchor_id(
+                        id,
+                        crate::view::CommentRangeSide::Start,
+                    )
+                    .0
+                    .to_string(),
                     inline_index,
                     text: None,
                     reference_id: Some(id.clone()),
@@ -2396,7 +2629,8 @@ pub fn inlines_to_segments(
     merge_adjacent_same_type(segments)
 }
 
-fn extract_opaque_metadata(
+#[doc(hidden)]
+pub fn extract_opaque_metadata(
     kind: &OpaqueKind,
     note_markers: &HashMap<String, String>,
     opaque_node: Option<&OpaqueInlineNode>,

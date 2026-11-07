@@ -258,7 +258,7 @@ pub struct ConditionalCellProps {
 /// Fields are individually optional: None means "inherit from parent".
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawParagraphProps {
-    alignment: Option<String>,
+    alignment: Option<Alignment>,
     indent_left: Option<i32>,
     indent_right: Option<i32>,
     indent_first_line: Option<i32>,
@@ -273,7 +273,7 @@ pub(crate) struct RawParagraphProps {
     spacing_after_lines: Option<u32>,
     spacing_before_autospacing: Option<bool>,
     spacing_after_autospacing: Option<bool>,
-    spacing_line: Option<u32>,
+    spacing_line: Option<i32>,
     spacing_line_rule: Option<String>,
     /// Paragraph borders (whole-object replacement, not per-edge).
     borders: Option<ParagraphBorderProps>,
@@ -354,7 +354,7 @@ impl StyleDefinitions {
 
         // 1. Parse document defaults
         let doc_defaults = parse_doc_defaults(&root);
-        let ppr_defaults = parse_ppr_defaults(&root);
+        let ppr_defaults = parse_ppr_defaults(&root)?;
 
         // 2. Parse all raw style entries
         let mut raw_styles: HashMap<String, RawStyle> = HashMap::new();
@@ -425,7 +425,11 @@ impl StyleDefinitions {
             } else {
                 let ppr = find_w_child(el, "pPr");
                 let tabs = ppr.and_then(parse_ppr_tab_stops);
-                let props = ppr.map(extract_raw_para_props).unwrap_or_default();
+                let props = ppr
+                    .map(extract_raw_para_props)
+                    .transpose()
+                    .map_err(|err| format!("word/styles.xml style {style_id:?}: {err}"))?
+                    .unwrap_or_default();
                 (tabs, props)
             };
 
@@ -914,10 +918,10 @@ impl StyleDefinitions {
     pub fn resolve_effective_alignment(
         &self,
         style_id: Option<&str>,
-        direct: Option<&str>,
-    ) -> Option<String> {
+        direct: Option<&Alignment>,
+    ) -> Option<Alignment> {
         if let Some(a) = direct {
-            return Some(a.to_string());
+            return Some(a.clone());
         }
         style_id
             .and_then(|id| self.para_props.get(id))
@@ -1235,6 +1239,14 @@ impl StyleDefinitions {
                 para_marks.and_then(|m| m.underline_style.as_ref()),
                 self.doc_defaults.underline_style.as_ref(),
             ),
+            // `Some` exactly where `underline_style` is, so this resolves from
+            // the same level as the style it belongs to.
+            underline_extra_attrs: resolve_option(
+                &direct.underline_extra_attrs,
+                char_marks.and_then(|m| m.underline_extra_attrs.as_ref()),
+                para_marks.and_then(|m| m.underline_extra_attrs.as_ref()),
+                self.doc_defaults.underline_extra_attrs.as_ref(),
+            ),
             font_east_asia: resolve_option(
                 &direct.font_east_asia,
                 char_marks.and_then(|m| m.font_east_asia.as_ref()),
@@ -1276,6 +1288,12 @@ impl StyleDefinitions {
                 char_marks.and_then(|m| m.lang_east_asia.as_ref()),
                 para_marks.and_then(|m| m.lang_east_asia.as_ref()),
                 self.doc_defaults.lang_east_asia.as_ref(),
+            ),
+            lang_bidi: resolve_option(
+                &direct.lang_bidi,
+                char_marks.and_then(|m| m.lang_bidi.as_ref()),
+                para_marks.and_then(|m| m.lang_bidi.as_ref()),
+                self.doc_defaults.lang_bidi.as_ref(),
             ),
             char_spacing: resolve_option(
                 &direct.char_spacing,
@@ -1346,6 +1364,12 @@ impl StyleDefinitions {
                 char_marks.and_then(|m| m.run_border_color.as_ref()),
                 para_marks.and_then(|m| m.run_border_color.as_ref()),
                 self.doc_defaults.run_border_color.as_ref(),
+            ),
+            run_border_extra_attrs: resolve_option(
+                &direct.run_border_extra_attrs,
+                char_marks.and_then(|m| m.run_border_extra_attrs.as_ref()),
+                para_marks.and_then(|m| m.run_border_extra_attrs.as_ref()),
+                self.doc_defaults.run_border_extra_attrs.as_ref(),
             ),
             // Vertical position, kerning, char width scaling — cascade.
             position: resolve_option(
@@ -1839,6 +1863,7 @@ fn overlay_marks(base: &mut TextMarks, top: &TextMarks) {
     }
     if top.underline_style.is_some() {
         base.underline_style = top.underline_style.clone();
+        base.underline_extra_attrs = top.underline_extra_attrs.clone();
     }
     if top.font_east_asia.is_some() {
         base.font_east_asia = top.font_east_asia.clone();
@@ -1857,6 +1882,9 @@ fn overlay_marks(base: &mut TextMarks, top: &TextMarks) {
     }
     if top.lang_east_asia.is_some() {
         base.lang_east_asia = top.lang_east_asia.clone();
+    }
+    if top.lang_bidi.is_some() {
+        base.lang_bidi = top.lang_bidi.clone();
     }
     if top.char_spacing.is_some() {
         base.char_spacing = top.char_spacing;
@@ -1890,6 +1918,9 @@ fn overlay_marks(base: &mut TextMarks, top: &TextMarks) {
     }
     if top.run_border_color.is_some() {
         base.run_border_color = top.run_border_color.clone();
+    }
+    if top.run_border_extra_attrs.is_some() {
+        base.run_border_extra_attrs = top.run_border_extra_attrs.clone();
     }
     if top.position.is_some() {
         base.position = top.position;
@@ -2075,6 +2106,7 @@ fn overlay_linked_char(
         && (char_raw.underline_style.is_some() || para_raw.underline_style.is_none())
     {
         base.underline_style = char_resolved.underline_style.clone();
+        base.underline_extra_attrs = char_resolved.underline_extra_attrs.clone();
     }
     if char_resolved.font_east_asia.is_some()
         && (char_raw.font_east_asia.is_some() || para_raw.font_east_asia.is_none())
@@ -2102,6 +2134,11 @@ fn overlay_linked_char(
         && (char_raw.lang_east_asia.is_some() || para_raw.lang_east_asia.is_none())
     {
         base.lang_east_asia = char_resolved.lang_east_asia.clone();
+    }
+    if char_resolved.lang_bidi.is_some()
+        && (char_raw.lang_bidi.is_some() || para_raw.lang_bidi.is_none())
+    {
+        base.lang_bidi = char_resolved.lang_bidi.clone();
     }
     if char_resolved.char_spacing.is_some()
         && (char_raw.char_spacing.is_some() || para_raw.char_spacing.is_none())
@@ -2137,6 +2174,11 @@ fn overlay_linked_char(
         && (char_raw.run_border_color.is_some() || para_raw.run_border_color.is_none())
     {
         base.run_border_color = char_resolved.run_border_color.clone();
+    }
+    if char_resolved.run_border_extra_attrs.is_some()
+        && (char_raw.run_border_extra_attrs.is_some() || para_raw.run_border_extra_attrs.is_none())
+    {
+        base.run_border_extra_attrs = char_resolved.run_border_extra_attrs.clone();
     }
     if char_resolved.position.is_some()
         && (char_raw.position.is_some() || para_raw.position.is_none())
@@ -2218,20 +2260,20 @@ fn parse_doc_defaults(root: &Element) -> TextMarks {
 }
 
 /// Parse document paragraph defaults: w:docDefaults/w:pPrDefault/w:pPr.
-fn parse_ppr_defaults(root: &Element) -> RawParagraphProps {
+fn parse_ppr_defaults(root: &Element) -> Result<RawParagraphProps, String> {
     let doc_defaults = match find_w_child(root, "docDefaults") {
         Some(el) => el,
-        None => return RawParagraphProps::default(),
+        None => return Ok(RawParagraphProps::default()),
     };
     let ppr_default = match find_w_child(doc_defaults, "pPrDefault") {
         Some(el) => el,
-        None => return RawParagraphProps::default(),
+        None => return Ok(RawParagraphProps::default()),
     };
     let ppr = match find_w_child(ppr_default, "pPr") {
         Some(el) => el,
-        None => return RawParagraphProps::default(),
+        None => return Ok(RawParagraphProps::default()),
     };
-    extract_raw_para_props(ppr)
+    extract_raw_para_props(ppr).map_err(|err| format!("word/styles.xml docDefaults: {err}"))
 }
 
 /// Parse formatting marks from a w:rPr element.
@@ -2245,14 +2287,24 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
             _ => continue,
         };
 
+        // An extension element is never a modeled style property, even when it
+        // shares a core local name (`w14:shadow` is not `w:shadow`).
+        if !crate::word_ir::is_word_core_element(el) {
+            continue;
+        }
         let local_name = local_element_name(el);
 
         match local_name.as_str() {
+            "shd" => marks.run_shading = Some(crate::word_ir::parse_run_shading(el)),
             "b" => marks.bold = parse_toggle_value(el),
             "i" => marks.italic = parse_toggle_value(el),
             "u" => {
                 marks.underline = parse_underline_value(el);
                 marks.underline_style = attr_get(el, "w:val").cloned();
+                marks.underline_extra_attrs = marks
+                    .underline_style
+                    .is_some()
+                    .then(|| crate::xml_attrs::capture_extra_attrs(el, &["val"]));
             }
             "strike" => marks.strike = parse_toggle_value(el),
             "dstrike" => marks.double_strike = parse_toggle_value(el),
@@ -2326,6 +2378,7 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
             "lang" => {
                 marks.lang = attr_get(el, "w:val").map(|s| IStr::from(s.as_str()));
                 marks.lang_east_asia = attr_get(el, "w:eastAsia").map(|s| IStr::from(s.as_str()));
+                marks.lang_bidi = attr_get(el, "w:bidi").map(|s| IStr::from(s.as_str()));
             }
             "spacing" => {
                 marks.char_spacing = attr_get(el, "w:val").and_then(|v| v.parse::<i32>().ok());
@@ -2439,8 +2492,11 @@ fn local_element_name(element: &Element) -> String {
 // =============================================================================
 
 /// Extract raw paragraph properties (alignment, indent, spacing, borders) from a w:pPr element.
-fn extract_raw_para_props(ppr: &Element) -> RawParagraphProps {
-    let alignment = find_w_child(ppr, "jc").and_then(|jc| attr_get(jc, "w:val").cloned());
+fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
+    let alignment = find_w_child(ppr, "jc")
+        .and_then(|jc| attr_get(jc, "w:val"))
+        .map(|value| Alignment::from_xml_str(value).map_err(|err| format!("pPr/jc: {err}")))
+        .transpose()?;
 
     let (
         indent_left,
@@ -2579,7 +2635,7 @@ fn extract_raw_para_props(ppr: &Element) -> RawParagraphProps {
 
     let shading = extract_shading(ppr);
 
-    RawParagraphProps {
+    Ok(RawParagraphProps {
         alignment,
         indent_left,
         indent_right,
@@ -2605,7 +2661,7 @@ fn extract_raw_para_props(ppr: &Element) -> RawParagraphProps {
         page_break_before,
         outline_lvl,
         shading,
-    }
+    })
 }
 
 /// Extract numbering properties (numId + ilvl) from a w:pPr/w:numPr element in a style definition.
@@ -2673,6 +2729,7 @@ fn extract_style_border_edge(container: &Element, edge_name: &str) -> Option<Bor
         color,
         size,
         space,
+        extra_attrs: crate::xml_attrs::capture_extra_attrs(edge, &["val", "color", "sz", "space"]),
     })
 }
 
@@ -3786,6 +3843,64 @@ mod tests {
     }
 
     #[test]
+    fn complex_script_language_cascades_independently_and_retains_directness() {
+        let xml = make_styles_xml(
+            r#"
+            <w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val="en-GB" w:eastAsia="ja-JP" w:bidi="ar-SA"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:styleId="P"><w:rPr><w:lang w:bidi="ar-EG"/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Base"><w:rPr><w:lang w:bidi="fa-IR"/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="C"><w:basedOn w:val="Base"/><w:rPr><w:lang w:val="de-DE"/></w:rPr></w:style>
+        "#,
+        );
+        let defs = StyleDefinitions::parse(&xml).unwrap();
+        let direct = TextMarks {
+            lang: Some(IStr::from("fr-FR")),
+            ..TextMarks::default()
+        };
+        assert_eq!(
+            defs.resolve(&direct, None, None).lang_bidi.as_deref(),
+            Some("ar-SA")
+        );
+        assert_eq!(
+            defs.resolve(&direct, None, Some("P")).lang_bidi.as_deref(),
+            Some("ar-EG")
+        );
+        let inherited = defs.resolve(&direct, Some("C"), Some("P"));
+        assert_eq!(inherited.lang_bidi.as_deref(), Some("fa-IR"));
+        assert_eq!(inherited.lang.as_deref(), Some("fr-FR"));
+        assert_eq!(inherited.lang_east_asia.as_deref(), Some("ja-JP"));
+        let direct = TextMarks {
+            lang_bidi: Some(IStr::from("ur-PK")),
+            ..direct
+        };
+        assert_eq!(
+            defs.resolve(&direct, Some("C"), Some("P"))
+                .lang_bidi
+                .as_deref(),
+            Some("ur-PK")
+        );
+        let props = crate::domain::StyleProps {
+            lang_bidi: Some(IStr::from("ur-PK")),
+            ..Default::default()
+        };
+        assert!(
+            !props.is_empty(),
+            "complex-script language is a real formatting property"
+        );
+        let inherited = crate::domain::RunRprAuthored::default().direct_style_props(&props);
+        assert!(
+            inherited.lang_bidi.is_none(),
+            "inherited language must not become a direct run override"
+        );
+        let authored = crate::domain::RunRprAuthored {
+            lang_bidi: true,
+            ..Default::default()
+        }
+        .direct_style_props(&props);
+        assert_eq!(authored.lang_bidi.as_deref(), Some("ur-PK"));
+    }
+
+    #[test]
     fn style_num_id_zero_preserves_suppression() {
         let xml = make_styles_xml(
             r#"<w:style w:type="paragraph" w:styleId="SuppressedList">
@@ -4552,9 +4667,8 @@ mod tests {
         );
         let defs = StyleDefinitions::parse(&xml).unwrap();
         assert_eq!(
-            defs.resolve_effective_alignment(Some("Normal"), None)
-                .as_deref(),
-            Some("center")
+            defs.resolve_effective_alignment(Some("Normal"), None),
+            Some(Alignment::Center)
         );
     }
 
@@ -4569,9 +4683,8 @@ mod tests {
         );
         let defs = StyleDefinitions::parse(&xml).unwrap();
         assert_eq!(
-            defs.resolve_effective_alignment(Some("Normal"), Some("right"))
-                .as_deref(),
-            Some("right")
+            defs.resolve_effective_alignment(Some("Normal"), Some(&Alignment::Right)),
+            Some(Alignment::Right)
         );
     }
 
@@ -4589,10 +4702,25 @@ mod tests {
         );
         let defs = StyleDefinitions::parse(&xml).unwrap();
         assert_eq!(
-            defs.resolve_effective_alignment(Some("Child"), None)
-                .as_deref(),
-            Some("both")
+            defs.resolve_effective_alignment(Some("Child"), None),
+            Some(Alignment::Justify)
         );
+    }
+
+    /// ST_Jc (§17.18.44) is a closed set: a style whose `w:jc` holds anything
+    /// else has no alignment a reader can honour, so the table refuses to load
+    /// and names the style, as import refuses such a paragraph.
+    #[test]
+    fn para_props_unrecognized_alignment_is_refused() {
+        let xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="Odd">
+                <w:pPr>
+                    <w:jc w:val="sideways"/>
+                </w:pPr>
+            </w:style>"#,
+        );
+        let err = StyleDefinitions::parse(&xml).expect_err("unknown jc must refuse");
+        assert!(err.contains("\"Odd\"") && err.contains("sideways"), "{err}");
     }
 
     #[test]
@@ -4974,6 +5102,7 @@ mod tests {
                 color: Some("0000FF".into()),
                 size: Some(8),
                 space: None,
+                extra_attrs: Vec::new(),
             }),
             bottom: None,
             left: None,

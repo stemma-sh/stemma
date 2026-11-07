@@ -83,6 +83,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -128,6 +129,7 @@ fn make_opaque(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(b"<w:drawing/>".to_vec()),
@@ -178,6 +180,7 @@ fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(
@@ -205,6 +208,7 @@ fn make_field(id: &str, kind: FieldKind) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(b"<w:fldChar w:fldCharType=\"begin\"/>".to_vec()),
@@ -225,6 +229,7 @@ fn make_sdt(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(
@@ -238,6 +243,7 @@ fn make_sdt(id: &str) -> InlineNode {
 #[allow(dead_code)]
 fn make_decoration(id: &str) -> InlineNode {
     InlineNode::from(DecorationNode {
+        source_run_attrs: Vec::new(),
         id: NodeId::from(id),
         kind: DecorationType::Bookmark,
         opaque_ref: format!("bm_{id}"),
@@ -751,6 +757,7 @@ fn replace_block_not_found() {
 #[test]
 fn replace_not_a_paragraph() {
     let table = BlockNode::from(TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("tbl1"),
         rows: vec![],
         structure_hash: String::new(),
@@ -939,8 +946,10 @@ fn replace_paragraph_with_existing_tracked_segments_in_direct_mode_projects_work
 }
 
 #[test]
-fn expect_spanning_anchor_boundary_fails() {
-    // "before after" spans across the opaque — should fail
+fn expect_spanning_an_anchor_matches_the_read_text() {
+    // The read `text` of "before" <opaque> "after" is "beforeafter": an anchor
+    // adds no characters and does not split it (docs/reference/read-model.md),
+    // so an `expect` copied from `text` matches across the anchor.
     let para = make_para(
         "p1",
         normal_segment(vec![
@@ -955,14 +964,27 @@ fn expect_spanning_anchor_boundary_fails() {
         fragments: vec![
             ContentFragment::Text("before".to_string()),
             ContentFragment::PreservedInlineRef(NodeId::from("op1")),
-            ContentFragment::Text("after".to_string()),
+            ContentFragment::Text("afterwards".to_string()),
         ],
     };
     let tx = replace_transaction("p1", "beforeafter", content);
-    let err = apply_transaction(&doc, &tx).unwrap_err();
+    apply_transaction(&doc, &tx).expect("an expect copied from the read text matches");
+
+    let stale = replace_transaction(
+        "p1",
+        "before after",
+        ParagraphContent {
+            fragments: vec![
+                ContentFragment::Text("before".to_string()),
+                ContentFragment::PreservedInlineRef(NodeId::from("op1")),
+                ContentFragment::Text("afterwards".to_string()),
+            ],
+        },
+    );
+    let err = apply_transaction(&doc, &stale).unwrap_err();
     assert!(
         matches!(err, EditError::ExpectMismatch { .. }),
-        "expected ExpectMismatch for cross-anchor expect, got: {err}"
+        "text the paragraph does not read is still refused, got: {err}"
     );
 }
 
@@ -1330,6 +1352,8 @@ fn insert_after_adds_inserted_paragraph_in_order() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("inserted para").unwrap(),
                 restart_numbering: false,
@@ -1447,6 +1471,8 @@ fn insert_with_bold_mark_produces_styled_text_node() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("<bold>LOUD</bold> soft").unwrap(),
                 restart_numbering: false,
@@ -1514,6 +1540,8 @@ fn insert_with_strike_applies_style_props() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("<strike>gone</strike>").unwrap(),
                 restart_numbering: false,
@@ -1562,6 +1590,8 @@ fn insert_rejects_preserved_inline_ref() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup(r#"hello <opaque id="op1"/> world"#).unwrap(),
                 restart_numbering: false,
@@ -1593,6 +1623,7 @@ fn delete_range_marks_blocks_deleted() {
 
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from("p1"),
             to_block_id: NodeId::from("p2"),
             rationale: None,
@@ -1648,6 +1679,8 @@ fn replace_block_range_with_marks_falls_back_to_structural() {
             expect: "hello".to_string(),
             semantic_hash: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("<bold>important</bold> notice").unwrap(),
                 restart_numbering: false,
@@ -1715,12 +1748,16 @@ fn replace_block_range_structurally_deletes_old_and_inserts_new_blocks() {
             semantic_hash: None,
             blocks: vec![
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some("body_text".to_string()),
                     content: parse_paragraph_markup("merged para one").unwrap(),
                     restart_numbering: false,
                     list: None,
                 }),
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some("body_text".to_string()),
                     content: parse_paragraph_markup("merged para two").unwrap(),
                     restart_numbering: false,
@@ -1784,6 +1821,8 @@ fn insert_paragraph_at_position() {
             position: InsertPosition::Before,
             rationale: Some("Bridge clause".to_string()),
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("middle").unwrap(),
                 restart_numbering: false,
@@ -1843,6 +1882,7 @@ fn delete_paragraph() {
 
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from("p2"),
             to_block_id: NodeId::from("p2"),
             rationale: Some("Removed by user request".to_string()),
@@ -1914,6 +1954,7 @@ fn delete_paragraph_with_opaque_content_preserved() {
 
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from("p1"),
             to_block_id: NodeId::from("p1"),
             rationale: None,
@@ -1983,6 +2024,8 @@ fn insert_with_stale_anchor_fails() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("orphan").unwrap(),
                 restart_numbering: false,
@@ -2028,6 +2071,7 @@ fn delete_with_expect_mismatch_fails() {
 
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from("p1"),
             to_block_id: NodeId::from("p1"),
             rationale: None,
@@ -2785,7 +2829,7 @@ fn apply_op_id_is_stamped_on_every_tracked_segment_the_apply_produces() {
         revision: RevisionInfo {
             revision_id: 0,
             identity: 0,
-            author: Some("Andreas".to_string()),
+            author: Some("Jordan".to_string()),
             date: Some("2026-04-13T00:00:00Z".to_string()),
             apply_op_id: Some("op_test_xyz".to_string()),
         },
@@ -3483,6 +3527,8 @@ fn insert_literal_prefix_gets_anchor_plus_one_arabic() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("numbered_item".to_string()),
                 content: parse_paragraph_markup("gamma").unwrap(),
                 restart_numbering: false,
@@ -3530,6 +3576,8 @@ fn insert_literal_prefix_in_middle_does_not_renumber_downstream() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("numbered_item".to_string()),
                 content: parse_paragraph_markup("bridge").unwrap(),
                 restart_numbering: false,
@@ -3578,6 +3626,8 @@ fn insert_literal_prefix_letter_sequence() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("numbered_item".to_string()),
                 content: parse_paragraph_markup("middle").unwrap(),
                 restart_numbering: false,
@@ -3608,6 +3658,8 @@ fn insert_literal_prefix_unsupported_format_errors() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("numbered_item".to_string()),
                 content: parse_paragraph_markup("next").unwrap(),
                 restart_numbering: false,
@@ -3639,8 +3691,8 @@ fn insert_literal_prefix_unsupported_format_errors() {
         Err(err) => {
             let msg = err.to_string();
             assert!(
-                msg.contains("supported formats") || msg.contains("Arabic"),
-                "error must name the supported formats: {msg}"
+                msg.contains("numbers '1.'") && msg.contains("its own label"),
+                "error names the numbered formats and how to supply the label: {msg}"
             );
         }
         Ok(_) => panic!("hierarchical '1.1' must not be silently accepted"),
@@ -3664,6 +3716,8 @@ fn insert_literal_prefix_reject_all_restores_original() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("numbered_item".to_string()),
                 content: parse_paragraph_markup("middle").unwrap(),
                 restart_numbering: false,
@@ -3831,6 +3885,7 @@ fn delete_accepts_ascii_apostrophe_against_curly_quote_in_doc() {
 
     let tx = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: NodeId::from("p1"),
             to_block_id: NodeId::from("p1"),
             rationale: None,
@@ -3972,6 +4027,7 @@ fn make_table_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
 
 fn make_table_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -3983,7 +4039,7 @@ fn make_table_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -3997,6 +4053,7 @@ fn make_table_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 
 fn make_table(id: &str, rows: Vec<TableRowNode>) -> BlockNode {
     BlockNode::from(TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from(id),
         rows,
         structure_hash: String::new(),
@@ -4223,6 +4280,7 @@ fn replace_hyperlink_transaction(
 ) -> EditTransaction {
     EditTransaction {
         steps: vec![EditStep::ReplaceHyperlinkText {
+            story: stemma::edit::StoryRef::Body,
             hyperlink_id: NodeId::from(hyperlink_id),
             rationale: None,
             expect: expect.to_string(),
@@ -4281,9 +4339,16 @@ fn replace_hyperlink_text_accept_yields_new_text() {
     let data = get_hyperlink(&result, "h1");
     assert_eq!(data.text, "new link");
     assert_eq!(data.url.as_deref(), Some("https://example.com"));
-    // Runs collapse to a single Normal run with the new text.
-    assert_eq!(data.runs.len(), 1);
-    assert_eq!(data.runs[0].text, "new link");
+    // Only the changed word was tracked ("old" -> "new"); " link" was kept.
+    // After Accept every run is Normal and the runs read the new text.
+    assert_eq!(
+        data.runs
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<String>(),
+        "new link"
+    );
+    assert!(data.runs.iter().all(|r| r.status == TrackingStatus::Normal));
 }
 
 #[test]
@@ -4334,9 +4399,14 @@ fn resolve_selected_revisions_accepts_hyperlink_edit_by_id() {
 
     let data = get_hyperlink(&result, "h1");
     assert_eq!(data.text, "new link");
-    assert_eq!(data.runs.len(), 1);
-    assert_eq!(data.runs[0].text, "new link");
-    assert_eq!(data.runs[0].status, TrackingStatus::Normal);
+    assert_eq!(
+        data.runs
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<String>(),
+        "new link"
+    );
+    assert!(data.runs.iter().all(|r| r.status == TrackingStatus::Normal));
 }
 
 /// Selective-resolution counterpart to `replace_hyperlink_text_reject_yields_old_text`.
@@ -4368,9 +4438,14 @@ fn resolve_selected_revisions_rejects_hyperlink_edit_by_id() {
 
     let data = get_hyperlink(&result, "h1");
     assert_eq!(data.text, "old link");
-    assert_eq!(data.runs.len(), 1);
-    assert_eq!(data.runs[0].text, "old link");
-    assert_eq!(data.runs[0].status, TrackingStatus::Normal);
+    assert_eq!(
+        data.runs
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<String>(),
+        "old link"
+    );
+    assert!(data.runs.iter().all(|r| r.status == TrackingStatus::Normal));
 }
 
 /// Domain rule (the completeness half of the fix): a selected id that
@@ -4394,7 +4469,10 @@ fn resolve_selected_revisions_rejects_nonexistent_hyperlink_revision_id() {
     )
     .expect_err("an id matching no carrier must be refused");
 
-    assert_eq!(err, vec![999_999_u32]);
+    assert_eq!(
+        err,
+        stemma::tracked_model::SelectionError::UnknownIds(vec![999_999_u32])
+    );
     assert_eq!(result, before, "a refused request must mutate nothing");
 }
 
@@ -4428,6 +4506,7 @@ fn replace_hyperlink_text_preserves_url_and_anchor() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
             source_run_attrs: Vec::new(),
             joins_following_text_run: false,
             raw_xml: None,
@@ -4582,6 +4661,7 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
             source_run_attrs: Vec::new(),
             joins_following_text_run: false,
             raw_xml: None,
@@ -4695,6 +4775,7 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
             source_run_attrs: Vec::new(),
             joins_following_text_run: false,
             raw_xml: None,
@@ -4799,12 +4880,16 @@ fn insert_after_section_break_exemplar_does_not_duplicate_sectpr() {
             rationale: None,
             blocks: vec![
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some("default".to_string()),
                     content: parse_paragraph_markup("first item").unwrap(),
                     restart_numbering: false,
                     list: None,
                 }),
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some("default".to_string()),
                     content: parse_paragraph_markup("second item").unwrap(),
                     restart_numbering: false,
@@ -4884,11 +4969,14 @@ fn insert_table_cell_paragraph_does_not_clone_exemplar_sectpr() {
             blocks: vec![BlockSpec::Table(TableBlockSpec {
                 formatting: None,
                 rows: vec![TableRowSpec {
+                    cant_split: None,
                     is_header: false,
                     height: None,
                     height_rule: None,
                     cells: vec![TableCellSpec {
                         content: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                            tab_stops: None,
+                            format_from: None,
                             role: Some("default".to_string()),
                             content: parse_paragraph_markup("cell text").unwrap(),
                             restart_numbering: false,

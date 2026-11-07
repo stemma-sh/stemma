@@ -8,6 +8,952 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-06
+
+### Added
+
+- **Python scripts can edit Word documents (experimental).**
+  `pip install stemma-py` (import `stemma`) installs a self-contained wheel
+  with no dependencies for Linux, macOS and Windows. It opens a `.docx`,
+  reads it, applies v4 transactions, resolves revisions, reviews, compares,
+  audits, validates and saves, one call per `api::Document` facade method.
+  Engine refusals raise `stemma.StemmaError` subclasses carrying the engine's
+  code and structured details. The Python API may change before 1.0; see the
+  [Python reference](docs/reference/python.md).
+
+- **A new row can be formatted like another row.** `insert_row` takes
+  `format_from_row`: the row to copy, while `ref_row` and `position` still
+  place it. A row added at the end of a table whose last row is formatted
+  differently (a bullet in its cells) could only copy that last row, and the
+  agent's move of its own new row was refused.
+- **Two paragraphs can be joined.** `join_paragraphs` (`target` and `with`,
+  the paragraph right after it) deletes the paragraph mark between them, as
+  Delete at the end of the first does in Word, in the body or within a
+  table cell: tracked, Accept gives one paragraph and Reject the two; direct,
+  they are joined at once. Before, an
+  agent retyped one paragraph's text into the other and lost its run
+  formatting.
+- **A receipt says what a tracked paragraph reads once accepted.** A
+  changed paragraph's `text` is the redline reading (pending deletions
+  included); with tracked changes it now also carries `accepted_text`. A
+  whole-paragraph replace that kept only a phrase read as the old paragraph
+  run into the new phrase, and the agent took it for the intended sentence.
+- **A paragraph in a header or footer can be deleted.** `delete` takes
+  `header_part` or `footer_part`; before, only its text could be cleared,
+  leaving an empty line. The story keeps its last paragraph.
+- **List levels are discoverable.** The `set_numbering` entry shows `indent`
+  (and names `outdent`, `remove`, `split`, `set_list`, `format`); it offered
+  a `join` kind that does not exist. A paragraph moved to a level its list
+  does not define is refused: Word shows it unnumbered.
+- **A mark may be written as its name.** `"marks": ["bold"]` is read as
+  `[{"type": "bold"}]` for the six plain marks; it is the spelling agents
+  reach for first, and refusing it cost a retry. Any
+  other string is refused with the valid names, and a mark object with an
+  unknown key (`{"type": "bold", "x": 1}`, which serde accepted silently)
+  is now refused.
+- **A column operation can name the column it means.** `delete_column` and
+  `move_column` take `expect_header`, the text of the column's top cell; when
+  that column is headed otherwise the op is refused with every column's
+  index and header. Agents counted columns from the first data column,
+  missing a label column, and deleted the column next to the one asked for.
+- **A new link looks like a link.** Text an edit makes into a link takes
+  the document's Hyperlink character style (the style named "Hyperlink",
+  whatever its localized id), as Word styles a link it inserts; before, a new
+  link was written with no formatting and read as plain text. Links already
+  in the document keep their formatting as authored.
+- **Text and links in header and footer tables are editable.** A letterhead
+  is often a table in the header, its cells holding the address lines and an
+  e-mail link. The read listed those paragraphs, but none could be read by
+  id or edited, `find` did not search headers, and a header link's target was
+  never read. Now `edit_header` / `edit_footer` reach a paragraph inside a
+  table in the story; `replace` and `set_attr` on a link take `header_part` or
+  `footer_part`, and a new target is written to that part's own
+  relationships; `find` reports header and footer matches under
+  `story_matches` with the part to pass; and a header or footer link's target
+  is read from its part's relationships.
+- **Links in new text are taught where agents look.** A link asked for as
+  a `link` mark (the first thing agents try) is refused with the inline
+  hyperlink node it should be, and the `insert` shapes show one: an agent
+  told only the valid marks concluded links could not be created. The
+  `table_op` entry says row and column indices are 0-based.
+- **Merged cells can be seen and extended.** A table read gives a merged
+  cell its `row_span` / `col_span`; before, a vertical merge read as a cell
+  with empty cells below it, and an agent asked to make a new row part of a
+  merged group could not tell the group was there. `merge_cells` down one
+  column now works on a table that already has merged cells, extending or
+  joining existing vertical merges (it refuses to cut one, naming the row to
+  start or end at); a merge across columns still needs a table without
+  merged cells, and says so instead of describing a column insert. A new row
+  joins a merged group by `merge_cells` from the group's top row: neither
+  `insert_row` nor Word's Insert Row at the end of a group extends it.
+- **`doc_id` may be omitted while one document is open.** An agent that
+  opens a file and queries it in the same turn cannot know the id yet, so
+  agents routinely spent a call (and a model round trip) on a guessed id such
+  as `"x"`. A call that needs a
+  document and names none is now about the only open document; with none
+  or several open it is refused with `doc_id_required` and the open ids.
+- **Form field defaults.** `set_form_field_value` takes an optional
+  `default`: the text a FORMTEXT field shows when reset, or a FORMCHECKBOX's
+  default state, with or without a new value. No op could set a default, so
+  "set both its current value and its default to five" stopped half done.
+- **Moving columns and swapping cells.** `table_op` gains `move_column`
+  (relocate one column, by grid index, with each cell's content, formatting
+  and width; on a merged grid every cell must lie in the moving column, in
+  the columns it crosses, outside both, or span both) and `swap_cells`
+  (exchange two cells' contents, each keeping its cell formatting, for
+  swapping entries in some rows only). Both are direct edits: Word records no
+  column or cell moves, and a tracked request is refused with the tracked
+  alternative named.
+- **List label formats.** `set_numbering` kind `format` gives an item and the
+  following items of its list a different label format (`num_fmt`
+  `decimal`/`lowerLetter`/`upperLetter`/`lowerRoman`/`upperRoman` and an
+  `lvl_text` template such as `(%1)`), tracked like a list split: the items
+  move to a new list cloned from theirs with that level's format replaced, so
+  earlier items and other lists on the same definition keep their labels.
+
+- **Table row reordering.** `table_op` gains `move_row` (relocate one complete
+  row before or after a reference row) and `reorder_rows` (a complete target
+  order of source rows in one operation). Both keep each row's content and
+  formatting together and refuse tables with vertical merges or table-level
+  range boundaries.
+- **`unlink_hyperlink`** removes a hyperlink while keeping its text and
+  formatting, tracked as the link's deletion plus an ordinary-text insertion.
+- **Paragraph insertion inside table cells**, tracked or direct, including
+  nested cells, with native list numbering and local formatting retained.
+- **Paragraph templates and tab stops on insert.** `attrs.format_from` inserts
+  a paragraph formatted like an existing one; `attrs.tab_stops` sets or clears
+  direct tab stops.
+- **`set_block_form_text`** updates a legacy text form field's cached value.
+
+### Changed
+
+- **Ids read differently from 0.6.0.** Anchor ids restart in each paragraph,
+  so after reopen every paragraph after the first shows smaller anchor
+  indices; links an edit creates are `{paragraph}_hyperlink{n}` instead of
+  `edit_link_N`; and the cell paragraphs of a second inserted table carry
+  their own ids. Read ids from the enumerator, as always.
+
+- **The CLI worklist reaches table cells and edits inside another author's
+  insertion.** An unscoped item searches every body paragraph, the
+  paragraphs in table cells included (nested tables too); a scoped item may
+  name a cell paragraph. The receipt's default scope is
+  `all_body_and_table_paragraphs` and its coverage lists `body_paragraphs`
+  and `table_cell_paragraphs` (the `conditional_detection` field and the
+  `unreachable_match` refusal are gone). An approved change inside a pending
+  insertion is tracked stacked on it, the insertion staying its author's;
+  the receipt counts it under `preexisting_revisions_edited_inside`.
+  Resolving a pre-existing revision, or changing one outside the blocks the
+  worklist edited, is still refused.
+- **A joined paragraph keeps the first paragraph's properties.**
+  `join_paragraphs` now gives the joined paragraph the first paragraph's
+  paragraph properties, its mark keeping its own run properties, as Word's
+  join does; tracked, the second paragraph's old properties are recorded as
+  a formatting change. Before, Accept kept the second paragraph's
+  properties (a headnote joined across a page marker lost its hanging
+  indent).
+- **A note of several paragraphs is edited paragraph by paragraph.**
+  `edit_note`'s `body` gives one line per note paragraph (lines separated by
+  `\n`), each edited in place keeping its properties and list numbering;
+  another line count is refused (`NoteBodyLineCountMismatch`) instead of
+  being flattened into one paragraph.
+- **A run of spaces is as many spaces to the edit diff.** A change in the
+  length of a run of spaces keeps the spaces it shares, in their own runs,
+  instead of rewriting the whole run (padding runs of different formatting
+  collapsed into one, and a header line shifted).
+- **Body content controls are open.** A body-level `w:sdt` whose content is
+  paragraphs and tables (directly or through nested controls) imports as the
+  same `BlockSdtWrap` over ordinary blocks that `wrap_blocks_content_control`
+  authors, so every edit reaches its content and an authored control reopens
+  as itself. A control holding anything else directly in its content (a
+  body-level bookmark, custom XML) stays a preserved opaque block; the
+  boundaries of a tracked move into or out of it do not seal it.
+  `sdt_text_fill` addresses an open control by its first block's `block_id`
+  (no `sdt_id`) and sets its first paragraph with text as an ordinary text
+  replace; `semantic_hash` is that paragraph's guard. A control with content
+  after that paragraph is not fillable, and filling a control that shows its
+  placeholder clears `w:showingPlcHdr`. A sealed control is
+  still addressed by `body_index`. `BlockSdtTextTarget` reports either
+  address as `BlockSdtAddress`. `set_block_form_text` addresses form fields
+  in sealed blocks only; in an open control use `set_form_field_value`.
+- **Comparison keeps content controls both readings agree on.** Two blocks
+  align only inside the same chain of controls; a control added, removed or
+  changed around shared content makes that content a deletion and an
+  insertion. An edit inside an unchanged control is now a revision inside it
+  rather than a replacement of the whole control. Controls are matched by
+  Word's control id when they have one, so filling a placeholder control is
+  an edit inside it; the redline keeps the target's control properties.
+- **Snapshot blobs are a same-version cache.** Each blob (schema version 46)
+  records the engine release that wrote it, and every other release refuses
+  it on load with an explicit error. Blobs persisted by 0.6.0 are refused;
+  re-import the source DOCX.
+- **MCP `save_docx` reports the session audit instead of refusing on it.**
+  Outside a declared task, only a package-gate error refuses the save. When
+  the audit finds a change it cannot explain, the file is written and the
+  receipt's `verdict.status` is `needs_review`, with the audit counts and a
+  `verify_docx` pointer. Declared tasks still refuse a non-deliverable audit
+  before creating the output path.
+- **One spelling for comment references.** `InlineNode::CommentReference` is
+  removed: an engine-authored comment reference is now the same
+  `OpaqueInline` (kind `CommentReference`) that import produces, so a live
+  edit and its saved form agree. A paragraph replace no longer needs the
+  comment reference listed as an `opaque_ref`; like the comment's range
+  markers it is re-placed at its text offset (listing it is still accepted).
+  In extended markdown, `<comment id=..>` now shows the comment id, like
+  `<comment_start>` and `<comment_end>`, instead of the anchor's node id.
+- **The MCP transaction schema lists the operation names.** The `op` field of
+  the `transaction` parameter is now an enum generated from the engine's
+  operation catalog, so a client can validate op names before calling. The
+  core profile's startup guidance is shorter and describes the reporting save.
+
+### Migration
+
+- **Re-read ids rather than reusing ids read from 0.6.0.** Anchor ids restart
+  in each paragraph, links an edit creates are `{paragraph}_hyperlink{n}`, and
+  a saved revision-id part written by 0.6.0 is re-derived once on open.
+- **Rust callers matching exhaustively on engine enums need new arms.**
+  `EditError` gains `ExpectCrossesInlineObject` and
+  `ReplaceTextInsideInlineObjects`; `SelectionError` gains `BlockedJoin`;
+  `RevisionKind` gains `CellMerge` (wire name `cell_merge`); `NormalizeError`
+  gains `UnmodeledRevision`; `WordIrError` gains
+  `InvalidRunPropertyAttribute`.
+- **Three model fields changed type.**
+  `SectionProperties::doc_grid_char_space` is `Option<i32>` (it may be
+  negative); `RunBorder`'s `size` and `space` are `Option<u32>` and `color` is
+  `Option<String>`, absent when the document leaves them out;
+  `ParaMarkRprOff` gains `vert_align_baseline`.
+- **Some documents that opened before are refused, naming what is wrong.** An
+  on/off or numeric property no schema form admits (previously dropped), and
+  a tracked change whose previous numbering names a list but no level.
+- **CLI and MCP consumers switching on revision `kind` must handle
+  `cell_merge`.** While one is pending, every resolution refuses. CLI receipts
+  gain `withdrawn_revisions` per item, `coverage.searched_not_edited`, and the
+  refusal code `matches_inside_inline_objects`.
+
+### Fixed
+
+- **Two edits that crashed are refused instead.** A whole-paragraph replace
+  that named a repeated anchor id once panicked (over MCP the request never
+  returned), and so did `edit_note` on a note holding a line break. Both now
+  refuse `OpaqueDestroyed`, naming the anchor or `hard_break` left out.
+- **Resolving a tracked mark on a table cell's last paragraph keeps its
+  text.** Accept All (or Reject All, for an inserted mark) deleted the last
+  paragraph of a cell, untracked text included, whenever its mark was
+  tracked. A cell's last paragraph has nothing to join, so its text now
+  stays, as it already did on the byte-level path.
+- **Rejecting a move of text keeps the paragraphs it sat in.** Selectively
+  rejecting a move of runs inside paragraphs deleted the paragraph when both
+  halves sat in one, and merged the destination into the source when they
+  sat in two. Only moves whose paragraph mark is part of the move are laid
+  out as moved paragraphs now; moved runs resolve in place.
+- **A selective paragraph join never moves text into another author's
+  pending change.** Accepting a deleted paragraph mark whose next paragraph
+  was another author's whole inserted, deleted or moved paragraph made the
+  joined text part of that change, so resolving it later deleted the text.
+  Joined text now keeps its own status, in any order, equal to Accept All.
+- **An edit inside a moved run no longer duplicates text.** A deletion at a
+  move's destination, or an insertion later moved away, resolved on its own
+  when the move was of runs, so Accept or Reject All produced the text twice.
+  These now resolve with their move, as they already did for moved
+  paragraphs.
+- **A tracked cell merge is reported, and nothing claims to resolve it.** A
+  `w:cellMerge` that changes a cell's vertical merge (§17.13.5.3) was
+  invisible: the revision list skipped it, the CLI said there was nothing to
+  resolve, and Accept or Reject All returned a "resolved" document that still
+  carried it. The document still opens and reads, but the change now appears
+  in the revision list as kind `cell_merge`, naming its table and cell, and
+  every resolution refuses while it is pending. Resolving merge changes is not
+  supported yet. A `w:cellMerge` without merge attributes changes nothing and
+  is still ignored.
+- **Accepting a paragraph join blocked by another change's table is refused
+  on its own.** The result depended on the order of resolution. The
+  selection now names the revisions to resolve together; resolving both, or
+  the table first, gives the Accept All result.
+- **Saved revision ids survive an untracked reorder.** Reopening a document
+  whose same-author, same-date changes had been reordered with tracking off
+  gave each saved id to whichever change took its place. The saved-id check
+  now covers each change's kind and text, so such a document derives its ids
+  from content. Saved-id parts written by earlier versions are re-derived
+  once.
+- **An edit elsewhere no longer renumbers anchors on reopen.** Anchor ids
+  (`p_N_widget_K`, `_hyperlink_K`, `_brK`) were numbered across the whole
+  document, so a change in one paragraph renumbered every later paragraph's
+  anchors after save and reopen: an old id silently named a different
+  control, and untouched blocks failed their guards. Numbering now restarts
+  in each paragraph.
+- **Every object an edit creates has its own id.** A second content control,
+  image, equation or cross-reference in a paragraph reused the first one's
+  id; links authored in separate transactions or from one template shared
+  ids; every inserted table's cells were `__edit_table_r0_c0_b0`. Ids are now
+  `{paragraph}_{kind}{n}` and unique in the document, and a new control's
+  `w:id` no longer repeats.
+- **An inserted comment mark keeps its insertion when the comments are
+  saved.** A pending insertion wrapping only a comment's annotation mark was
+  dropped on save after any body edit, and its revision vanished. Marks that
+  Word writes as their own run now stay inside their tracked container.
+- **Resolving a change keeps a range end that sat in the removed text.**
+  Accepting a deletion or rejecting an insertion that held one end of a
+  bookmark, comment or permission range shrank the range to nothing beside
+  its other end, even when text inside it survived. The end now stays where
+  the removed text was (ECMA-376 §17.13.6), on both resolution paths and in
+  selective resolution. A range lying wholly in the removed text still goes.
+- **Replacing a paragraph that holds a pending insertion keeps its markers in
+  place.** A whole-paragraph replace slid every later bookmark, comment and
+  permission range right by the insertion's length, and Reject All no longer
+  restored the source.
+- **A marker at the edge of a replaced word stays outside its deletion.** A
+  whole-paragraph replace or `set_cell_text` put a bookmark touching the
+  rewritten text inside the new deletion, sometimes inside another author's.
+  Edge markers now stay with the kept text beside them.
+- **Reject All leaves no empty paragraph for a bookmark before a table.**
+  Rejecting an inserted or moved-in paragraph just before a table kept an
+  empty paragraph when it carried a bookmark or comment range. The paragraph
+  is removed and its markers move to the paragraph before it, in the body and
+  in cells, on both resolution paths.
+- **A table whose `bidiVisual` is off stays left to right.**
+  `<w:bidiVisual w:val="0"/>` was read as on, so any edit flipped untouched
+  tables to right-to-left. Table, row and cell on/off properties now honour
+  `w:val` and refuse values outside ST_OnOff.
+- **An explicit baseline overrides a style's superscript.** A run or
+  paragraph mark set to `vertAlign baseline` in a superscript paragraph style
+  lost the override on save and went back to superscript.
+- **Section, run-size and border numbers are read, never dropped.** A
+  negative document-grid character spacing, a decimal size such as
+  `w:sz="21.0"`, and other section and run numbers were silently dropped when
+  they didn't parse as unsigned integers. They are now read per their schema
+  type (decimals truncate, universal measures convert), and a value no schema
+  form admits is refused, naming the element and attribute. A run border
+  without colour, size or spacing no longer gains `w:color=""` and zeros.
+- **A tracked change's previous numbering without a level is refused, as a
+  direct one is.** The model invented level 0 and then dropped the numbering
+  on reject, while the byte path wrote a file the engine refused to reopen.
+- **Reject All of a compared label change restores the base label in
+  memory.** Comparing a paragraph whose typed label changed ("3." to "6.")
+  gave a redline whose in-memory Reject All still saved "6."; the reopened
+  redline rejected correctly. Both readings now agree.
+- **A bookmark end between paragraphs stays outside inserts and deletes.**
+  With Word's `_GoBack` bookmark end directly under the body, an insert after
+  the bookmarked paragraph took the wrong formatting and landed inside the
+  bookmark, and deleting that paragraph made Accept All fail validation.
+- **A replacement keeps the formatting of the characters it does not
+  change.** Rewriting a word made of differently formatted runs gave all of
+  the new word the last run's formatting, in replace, CLI worklists and
+  `set_cell_text`. Unchanged characters keep their own run, and new text
+  takes the formatting of the first character it replaces, as in Word.
+  Compare records a deleted word run by run, so Reject All restores each run.
+- **An `expect` copied from a block's `text` matches across its inline
+  anchors.** An `expect` equal to the block's read text was refused as stale,
+  with identical expected and actual text, whenever the paragraph held a
+  comment, link, field, line break, content control or proofing mark. No
+  anchor splits a match now. Where a span still can't be addressed,
+  `ExpectCrossesInlineObject` names the object it runs across.
+- **Comments, notes, bookmarks and other anchored ops reach table cells.**
+  `comment_create`, `insert_note`, `insert_bookmark`, `insert_cross_ref`,
+  `wrap_content_control`, `insert_image`, `insert_equation`, `apply_style`,
+  `set_numbering`, `replace_image` and `set_image_layout` refused a cell
+  paragraph id as "block not found". They now reach cell paragraphs, nested
+  tables included. `move` refuses a cell paragraph with an error naming
+  `move_row`.
+- **A CLI worklist item can revise or undo an earlier item's change.** The
+  run used to abort with exit 1 and no receipt, even with `--emit-partial`.
+  The worklist tracks its revisions as a net set, and each item's receipt
+  counts the earlier revisions it replaced or removed as
+  `withdrawn_revisions`.
+- **MCP block ranges include the revisions inside tables.** `by_range`,
+  `by_filter`'s `by_block_range` and the inventory filters skipped every
+  revision in a table and still reported the resolution deliverable; a cell
+  paragraph id from the inventory was "not found" as an endpoint.
+- **Text replacement refuses when the text also stands in a link or
+  control.** A worklist item (CLI or MCP, `replace_all` included) replaced
+  the plain-text occurrences and reported complete while an occurrence in a
+  hyperlink's text or a content control's value stayed. It now refuses,
+  naming each object, its paragraph and the op that edits it; the CLI's
+  coverage lists link text and control values as searched but not edited.
+- **MCP find reaches cell controls, cell links and textbox text**, and a
+  cell paragraph's read shows its content control's value.
+- **A comment's range start in a table cell has its read id**
+  (`comment_<id>_start`), so a cell replace naming it applies.
+- **Identical changes made one after another get distinct identities.** A
+  second change that looked exactly like an earlier one (same author, date
+  and text: "30 days" to "45 days" in clause 3 after clause 7) but landed
+  earlier in the document was refused, because the identity its content and
+  position derive was already the first change's. It now takes the next
+  identity among its lookalikes; a saved document records it, so it
+  survives reopen, and each change stays resolvable on its own. A genuine
+  digest collision between different revisions is still refused.
+- **Rejecting a move leaves no empty paragraph where it was moved to.** A
+  clause moved down to just before a table was restored at its origin on
+  Reject All, but an empty paragraph stayed at the destination: the move's
+  zero-width range brackets counted as content that kept it.
+- **A comment's range markers have their own ids.** The read showed a
+  comment's range start and end under the comment's id, so a replacement
+  could not name both (`DuplicateOpaqueRefInPayload`). They now read as
+  `comment_<id>_start` and `comment_<id>_end` (the comment id stays in
+  their metadata); a replacement may name them or leave them out, and the
+  comment stays on its text and appears once either way.
+- **An audit does not report a piece of a split revision as new.** An edit
+  inside another author's pending insertion leaves that insertion's text on
+  both sides of the edit; the second piece was reported as a new revision of
+  its author. A piece of a pre-existing revision now counts as that
+  revision, edited inside.
+- **A content control inside a table cell can be set.**
+  `set_content_control_value` found its paragraph only at the top level of
+  the body, so a form's checkboxes in table cells could not be ticked.
+- **`opaque_text_edit` on a hyperlink names the route that works**: it is
+  refused with the `replace` op it needs.
+- **A header or footer part edit changes only what differs.** The text
+  `expect` and the content share stays in its own runs; only what differs
+  is spliced.
+- **A zero table width keeps its declared type.** `w:w="0"` widths were
+  rewritten as `auto`; Word saves the declared type, and a layout reader can
+  tell them apart (untouched floating tables moved across the page).
+- **A section's decimal twips are read, never dropped.** Page margins and
+  header/footer distances written as decimals (`566.93`) were dropped, so
+  every page's footer moved to Word's default; they are now read as Word
+  reads them (truncated), and a value no schema form admits is refused.
+- **An extension text effect is not the shadow toggle.** `w14:shadow` was
+  read as `w:shadow`, so untouched text gained a legacy shadow and lost its
+  effect.
+- **A header or footer edit can change part of a line.** `edit_header` /
+  `edit_footer` treated `content` as the whole new paragraph, so plain
+  replacement text for a part ("March 2024 v3" for "November 2023 v2")
+  was refused beside page-number fields, and elsewhere replaced the whole
+  line with it ("Criminal Appeal" for "Civil Appeal" dropped " No.
+  82/12"). Content that is only the replacement (plain text repeating none
+  of the paragraph's text around `expect`, which must occur once) now
+  replaces just that part; content repeating the rest, or keeping the
+  paragraph's objects, rebuilds the paragraph as before.
+- **A picture's read shows its size.** A block read gave a drawing's size
+  only for a text box, and a cell paragraph's read never; an agent asked to
+  scale a picture to 80% scaled from the rounded inches in the request. Every
+  drawing's anchor now carries `size_emu`, in the body and in a table cell.
+- **An indented list item moves.** `set_numbering` `indent` / `outdent`
+  changed the item's level but kept its direct indentation, which in many
+  documents equals the old level's, so the item stayed where it was. As
+  Word's Increase Indent does (observed with Word: the direct `w:ind` is
+  removed into the tracked change, whatever its value), the direct
+  indentation is dropped and the new level's indent applies; Reject
+  restores both.
+- **A typed label in a table cell is read.** A cell paragraph starting
+  with a typed label ("b. " before an answer option) read without it, so an
+  agent formatting "the option" left the label out; a cell's text and its
+  paragraph view (`literal_prefix`) now carry it, as a body read does.
+- **New text in a marked paragraph is body text.** A paragraph inserted
+  with `format_from` takes the template's formatting by lining its words up
+  with the template's. When the caller marks some of its text (a bold italic
+  term, an italic title), unmarked new text could still pick up the bold or
+  italic of the template words it happened to replace (" means" after a
+  defined term). Such content now keeps the template's formatting on
+  unchanged words, and its new text is the template's body text plus the
+  marks given.
+- **Permission ranges ending between table rows survive an edit.** A
+  protected form's editable range that starts in a cell and ends between
+  rows, between cells or between a cell's blocks lost its end (and a range
+  wholly between blocks lost both halves) once the document was edited:
+  those positions were read as unknown elements. They are kept like
+  bookmarks at the same positions. Text typed into a paragraph holding only
+  range markers (an editable cell starting with `w:permStart`) now takes the
+  paragraph mark's formatting, as in any empty paragraph.
+- **A table indent not in twips is kept as written.** `w:tblInd` with
+  `w:type="pct"` was read as twips and rewritten as `dxa`, moving an edited
+  table; such an indent is now kept verbatim.
+- **A table nested in a cell is read.** A form that lays out its fields in
+  a table inside a cell showed that cell empty: the nested table's
+  paragraphs were neither listed nor in the cell's text, so they could not be
+  found, read or targeted (although an edit addressed to them applied). A
+  cell now lists them in document order and carries their text.
+- **A resized picture is drawn at its new size.** Resizing changed only the
+  drawing's frame (`wp:extent`) and left the picture's own size
+  (`a:xfrm/a:ext`) as it was, so a renderer that draws the picture at its own
+  size showed it unchanged; Word writes both. The picture (or shape, or
+  group) is now scaled with its frame, on resize and on image replace, and
+  the save audit accounts for exactly that scaled size. A picture in a table
+  cell (a letterhead's logo) can now be resized: its paragraph was not found.
+- **An edit to a data-bound content control is kept by Word.** A control
+  bound to a data store (`w:dataBinding`: a header showing the document
+  title, a cover page's company, a custom XML field) shows the store's value,
+  and Word refills it from the store on open, so an edit to the control alone
+  was silently undone. The edit now also writes the control's new text into
+  the bound node, as Word does when it edits the control; every other byte
+  of the store is kept. Controls sharing a binding given different texts, a
+  multi-line value and an XPath beyond plain element steps are refused. A
+  control the engine binds (`wrap_content_control` with a binding) now gets
+  a store whose root is in the namespace its XPath names, with the wrapped
+  text in the bound node; before, a namespaced XPath addressed nothing in
+  the authored store and Word opened the control unbound.
+- **Find and replace reaches text Word's spell check marked.** Word brackets
+  a word its proofing flagged with `w:proofErr` marks, which are not content
+  and are recomputed on open. A needle crossing one was refused as spanning
+  a wall; agents had to retry or rewrite the whole paragraph. Text across
+  proofing marks now matches and is replaced like any other.
+- **A tracked column deletion reopens as written.** The table's recorded
+  previous properties kept the pre-deletion grid, which the file cannot
+  carry there (only in the grid's own change record), so the saved document
+  reopened as a different state from the one edited.
+- **A table with no table properties gains none.** A table written without
+  `w:tblPr` was read as if every table property were set, so its first edit
+  wrote a `w:tblLook` it never had (which changes which conditional formats
+  of a table style apply). Such a table now comes back with no table
+  properties.
+- **A new link reads the same after a save.** A link inserted in a
+  paragraph built from a template carried the template's inherited font on
+  the link itself, which a reopened link never has (its formatting lives in
+  its runs).
+- **A footnote with a custom mark keeps its mark.** A footnote reference
+  whose number is replaced by a symbol (an asterisk written as `w:sym`)
+  shares its run with that symbol. Any edit in the document split the two
+  into separate runs; Word then attached the reference elsewhere on the
+  next save, and the paragraph it landed in read twice. The reference and
+  its custom mark are kept in one run, as a custom mark written as text
+  already was.
+- **A paragraph with tracked text changes can be reformatted.**
+  `set_para_format` refused any paragraph holding tracked insertions or
+  deletions, so editing a paragraph's words and then its indent (joining a
+  broken paragraph, then giving it the body indent) failed on the second
+  call. A tracked paragraph-format change records the paragraph's
+  properties, independent of the tracked text in it, as Word records it; it
+  is refused only on a paragraph that is itself a pending insertion or
+  deletion, or that already has one.
+- **A field whose instruction continues into the next paragraph stays a
+  field.** Word writes table-of-contents entry fields across two paragraphs
+  (`TC \l2 "` ends one, the entry's title fills the next, then the field's
+  end). The import read the continued instruction as ordinary text, so any
+  edit in the document wrote the title into the page as text and left the
+  field with an empty entry. A paragraph that closes a field it did not open
+  now starts inside that field.
+- **Renaming a contents entry keeps its page number a field.** Changing a
+  link's text rebuilt every run of the link from plain text, so a table of
+  contents entry renamed through `replace` on its link lost its PAGEREF
+  field (the page number became typed text Word no longer updates), and any
+  edit to a link flattened a field inside it even where the edit did not
+  reach. Only the words that differ between the old and new text now
+  change; every other run of the link is kept as it was. A change that
+  reaches into a field inside the link is refused with the way forward.
+- **Merging cells keeps every cell's text, as Word does.** A vertical merge
+  left the lower cells' text in continuation cells, where Word does not show
+  it, and a horizontal merge dropped the absorbed cells. The merged cell now
+  holds the paragraphs of every non-empty cell in reading order and each
+  continuation cell one empty paragraph, which is Word's Merge Cells result.
+  Like Word with Track Changes on, a merge itself is not tracked.
+- **A paragraph built from a template takes its formatting phrase by
+  phrase.** New text that replaces a stretch of the template takes the
+  formatting most of that stretch has, but the spaces between replaced
+  words counted as kept text and split the replacement word by word, so
+  each new word took the formatting of the template word it lined up with:
+  "for review within 30 days" built from "for a review *ab initio* before"
+  came out with "within 30 days" in italics. The spaces between replaced
+  words now belong to the replacement.
+- **A paragraph inserted before a text label takes none of the label.** A
+  label written as text (" 2.\tAim") stays with its paragraph, and the
+  paragraph inserted before it took the label's spacing anyway: the spaces
+  before the label and the tab after it. Nothing extra was written, but the
+  new paragraph read differently before and after a save and reopen.
+- **A turned-off underline keeps its colour.** Word turns off an inherited
+  underline with `w:u w:val="none"` and often keeps a colour on it. Since
+  underline colours are carried in the model, an edit anywhere in the
+  document wrote such an underline back without the colour, on runs and on
+  paragraph marks, so the document read differently after a save and reopen.
+- **A new note takes the document's paragraph alignment.** A footnote,
+  endnote or comment the engine creates has no paragraph style, so it takes
+  the default paragraph style; the engine read it as left-aligned regardless,
+  and in a document whose Normal style is justified the note read left until
+  saved and reopened. Every edit now re-derives the alignment of each
+  paragraph outside a table from its style chain, as import does. A style
+  whose `w:jc` holds a value outside ST_Jc is now refused when the document
+  opens, naming the style, as such a paragraph already was.
+- **A link's text shows its tabs.** A table-of-contents entry is a link
+  whose text is label, tab, title, tab, page; the read dropped the tabs
+  ("A.Pecuniary Reparations22"), so an agent renaming the entry rewrote it
+  without them. Link text now reads with its tabs, and new link text with
+  tabs is written as `w:tab`, as Word writes it.
+- **Text can be typed into an empty header or footer line.** `edit_header` /
+  `edit_footer` refused an empty `expect`, the only way to name an empty
+  paragraph, so an empty footer line could not be filled. An empty `expect`
+  now asserts the paragraph is empty (it is not a wildcard: against a line
+  with text it is refused).
+- **A column can be deleted under a cell that spans it.** Deleting a column
+  from a table with a title row spanning all columns was refused. In direct
+  mode the spanning cell now shrinks by the column, as Word's Delete Column
+  does; inserting a column into a merged grid, or a tracked column change on
+  one, is still refused, with that route named.
+- **A new paragraph can follow a heading labelled "6.0".** Inserting with
+  `format_from` a paragraph whose typed label is not a sequence Stemma
+  numbers ("6.0", "1.2.3") was refused outright. The label the caller types
+  at the start of the content ("7.0\tNext Steps") now stands as written; with
+  no typed label the refusal says how to write one.
+- **`format_from` accepts a template that holds a bookmark, field or link.**
+  Such a template was refused as "not text-only", though nothing of it is
+  copied but its formatting. Its text runs now supply the formatting and the
+  rest is passed over: never duplicated, never removed from the template.
+- **A negative line spacing no longer stops a document from opening.**
+  `w:spacing/@w:line` is a signed measure (ISO 29500-1 §17.3.1.33) and Word
+  documents carry values such as -20; the model held it unsigned and refused
+  the whole document. Line spacing is now signed in the model, the style
+  cascade and the edit wire.
+- **A label stays with its text when its paragraph mark is deleted.** In a
+  paragraph whose mark is a tracked deletion ("(a)" followed by deleted
+  text), import hoisted "(a)" into the paragraph's label. Accepting all then
+  lost it, and any resolution elsewhere wrote it inside the neighbouring
+  deletion. Such a paragraph is merging into the next one, so its leading
+  label now stays ordinary text.
+- **A line break in new text is no longer written as a space.** A line feed
+  inside `w:t` reads as a space in Word. In a new table row's cell text it
+  now starts a new paragraph in the cell, as Enter does in Word; in
+  paragraph text it is refused with a message to use separate paragraphs.
+- **A link authored in a table cell keeps its destination.** Table cells were
+  serialized without the relationship resolver, so a new hyperlink in a cell
+  was written as a bare `w:hyperlink` with no `r:id`: the save succeeded and
+  the link pointed nowhere. Cells now resolve relationships like body
+  paragraphs, and a new link that reaches a part without a resolver is an
+  error instead of a link without a target.
+- **Edits and saves of long documents are several times faster.** Every
+  stored run property was re-parsed inside a wrapper declaring all 42 known
+  OOXML namespaces, twenty times the cost of the property itself; a
+  91-page document took 30 seconds to reject six changes and 13 to save.
+  A fragment now declares only the prefixes it mentions (5.8 and 4.1
+  seconds on the same document).
+- **Resolving and reviewing skip markers that cannot match.** Projection
+  asked every bookmark and opaque run whether it was a customXml range marker
+  or held a note reference by parsing its XML; it now checks for the element
+  name first (rejecting six changes in a 91-page document: 5.8 to 3.5
+  seconds).
+- **The open-time validation is computed once per session.** Every save and
+  verify re-validated the unchanged source package; the MCP server now
+  validates it once, in the background right after `open_docx`, and reuses
+  the result (`SimpleRuntime::session_source_validation`).
+- **An edit normalizes its package once.** Applying or resolving passed one
+  package as both base and target of the merge and normalized it two or
+  three times; it is now normalized once (an edit to a 3 MB document: 4.2
+  to 3.1 seconds).
+- **Continuous sections keep the page setup they declare.** A continuous
+  section that left out its page size, margins or header and footer
+  distances took the preceding section's on import, and a save wrote them
+  out. Real Word reads the omitted values as its defaults (letter portrait,
+  1-inch margins, half-inch header and footer), so an untouched section
+  could change layout. Sections are now stored and written as authored.
+- **`find` locates link text.** A hyperlink's display text and its target
+  were invisible to `find`, so "change the link shown as http://…" started
+  with zero matches. A match now names the hyperlink (`matched_in:
+  "hyperlink"`, `anchor.id`), the id `replace` targets to change it.
+- **A typed label's formatting is readable.** The label is not a span, so its
+  run formatting was nowhere in the read: agents rewriting a heading with
+  styled content gave its label the underline of the text beside it. The
+  block view carries `literal_prefix_marks`, shown in the formatting detail.
+- **A table an edit creates has a column grid.** Inserted and converted
+  tables were written without `w:tblGrid`, which every table requires, so
+  renderers sized their columns by their own rules. A new table now gets the
+  grid Word writes: its width (twips, a percentage of the section's text
+  width, or the text width) split by its cells' widths, or equally. Widths
+  set later re-size the grid, as Word does (in direct mode, or while the
+  table is still a pending insertion; a tracked re-size of an existing table
+  keeps its grid, which a Reject could not restore). A section that states no
+  page size leaves the grid as it is rather than assume one.
+- **An author can format the content they are proposing.** Bolding a cell of
+  a table the same author had just inserted was refused ("has tracked status
+  'inserted'"); formatting inside one's own pending insertion now changes the
+  proposal itself (accept keeps the formatting, reject removes the insertion).
+  Another author's pending insertion is still refused.
+- **A role's exemplar has the role's typical formatting.** New text takes the
+  role exemplar's run formatting, and the exemplar was simply the role's first
+  paragraph: a document whose first body paragraph opened in italics made
+  every inserted body paragraph and table cell italic. The exemplar is now the
+  earliest paragraph with the role's most common run formatting.
+- **Table cells default to body text.** A cell paragraph with neither a role
+  nor `format_from` was refused for want of a host paragraph; it is now the
+  document's body text, as `blocks_to_table` cells are. The `insert` catalog
+  shows a formatted table in one op.
+- **Underline colour survives an edit.** The model kept only an underline's
+  style, so any edit — even one elsewhere in the document, since edits rewrite
+  paragraphs from the model — wrote every coloured underline back without its
+  `w:color` / theme colour. The underline's other attributes are now carried
+  with its style.
+- **Typed labels read as written.** Every read surface joined a typed label
+  and its text with a tab, whatever the document had: items reading
+  "(c) the design…" read as "(c)\tthe design…", and an agent copying that
+  wrote tabs the items never had. The label is now shown with the whitespace
+  around it as written (`literal_prefix_text` on the block view).
+- **An inserted item modelled on a typed-label item is labelled once,
+  correctly.** It takes its label from its position, but the saved file
+  replayed the template's label bytes ("(c)" where the model said "(b)"), and
+  content that also began with a label read "(b) (b)…". The template's label
+  bytes are no longer replayed, and such content is refused with the content
+  to send.
+- **Roman heading numbers can be relabelled.** "X." reads as a letter label
+  and "XI." as no label, so replacing a heading "X.\t…" with "XI.\t…" kept
+  "X." and added "XI." to its text. A leading token shaped like the
+  paragraph's typed label is that label rewritten. The worklist's zero-match
+  diagnosis for a typed label now names whole-paragraph `replace` as the way
+  to change it, also when the needle is the label alone.
+- **A filled form field keeps its look.** `set_form_field_value` wrote the new
+  value as an unformatted run, so a field set in Arial 10pt showed its value in
+  the document default. The value now takes the formatting of the result it
+  replaces, or, for an empty field, of the field's own runs.
+- **`format_from` no longer spreads formatting by position.** A new
+  paragraph's words that replace template text took the formatting of the
+  template character just before them, so an item modelled on one ending
+  "31st of March" set an unrelated word in superscript. Replacing text now
+  takes the formatting most of the replaced text has (a bold term replaced by
+  another stays bold).
+- **Pagination properties can be set.** `set_para_format` gains
+  `keep_with_next`, `keep_lines_together` and `page_break_before`, tracked
+  like the other paragraph properties; there was no way to keep a new heading
+  with the paragraph it introduces.
+- **Textboxes in headers and footers can be edited and resized.**
+  `opaque_text_edit` and `set_image_attrs` addressed body paragraphs only, so
+  a running label in a header textbox (a tab divider's "TAB 2") could be read
+  but not changed. Both take an optional `header_part` / `footer_part` (the
+  part name, as `edit_header` does). `set_image_attrs` also resizes a legacy
+  VML shape (`w:pict`) through its style width/height, which Word reads as the
+  shape's size; a drawing with both carriers has both resized.
+  `set_textbox_text` takes the same story address.
+- **A textbox's text and size are visible where its paragraph is read.** The
+  compact block view showed a textbox as an image anchor with no text, so its
+  words were invisible without `detail=formatting`; a textbox anchor now
+  carries `textbox_text` and `size_emu`. A VML shape's size is read from its
+  style (it has no `wp:extent`), so it was reported unknown.
+- **A typed list label can be changed.** A label written as text ("1." with no
+  list numbering behind it) is the paragraph's own characters, but `replace`
+  refused content starting with a different label and `set_numbering` refuses
+  typed labels, so it could not be changed at all. A whole-paragraph `replace`
+  whose content starts with a different label now rewrites it, tracked as the
+  old label's deletion and the new one's insertion. A different label on
+  automatic list numbering is still refused, and the refusal now points at
+  `set_numbering`.
+- **`blocks_to_table` keeps what the paragraphs carry.** Cells were built from
+  the visible text only, so run formatting and line breaks were lost and any
+  footnote reference made the conversion refuse. Each cell is now cut from its
+  source runs. In a tracked conversion each footnote/endnote reference in the
+  table points to its own copy of the note, since Word repairs a file that
+  references one note twice even when one reference is deleted; accept keeps
+  the copies, reject the originals. A direct conversion moves the references.
+- **Rows of a table with vertical merges can be moved.** `move_row` and
+  `reorder_rows` refused any table holding a vertical merge. They now refuse
+  only an order that would separate a merge group (a continuing cell must
+  stay directly below the cell it continues); rows outside a group, and whole
+  groups, move.
+- **A range marker between a content control's paragraphs no longer seals
+  it.** A bookmark, comment-range or permission start or end directly inside
+  a body control's content (Word writes them there) made the whole control a
+  preserved opaque block, so none of its paragraphs could be read, found or
+  edited. Such a control is now open: the markers are block-level markers in
+  it, written where they were.
+- **List labels are current right after an edit.** A list label is a view over
+  the list's sequence, but after an edit that changed the sequence (a split, a
+  new label format, an added or removed item) the open document still showed
+  the labels it was opened with until it was saved and reopened. They are now
+  re-derived from the saved numbering definitions after every edit.
+- **A text replacement that only finds the text inside a link says how to
+  change it.** Text replacement does not reach a hyperlink's visible text, so
+  such a needle matched nothing with no explanation. The zero-match diagnosis
+  now names the links and the edit that changes their text (`replace` on the
+  hyperlink id), and `set_attr`'s description points there too.
+- **A negative first-line indent opens.** `w:ind/@w:firstLine` is unsigned in
+  the schema, but Word opens a negative value and reads it as a hanging indent
+  of that size. Documents carrying one were refused at import; they now read
+  as Word reads them.
+- **A find match inside a table cell names the paragraph that holds it.**
+  `matching_cells[].block_id` was the cell's first paragraph whatever matched,
+  so an edit aimed "after the paragraph that begins …" landed after the wrong
+  one. It is now the matching paragraph, `null` with
+  `match_spans_paragraphs: true` when the match runs across two of the cell's
+  paragraphs, and `block_ids` lists all of them.
+- **Two refusals now name the way forward.** A call with an unknown `doc_id`
+  lists the documents that are open (`open_doc_ids`): an agent that opens a
+  file and queries it in the same turn has to guess the id. Deleting a table
+  cell's only paragraph explains that a cell always keeps a paragraph, that
+  deleting its text is the edit that remains, and that deleting the row also
+  deletes the row's other cells.
+- **Whitespace at the edge of a text run is read and written as Word does.**
+  It is content only under `xml:space="preserve"`, and XML whitespace is
+  space, tab, line feed and carriage return alike. Saving marked only text
+  that began or ended with a space, so a preserved line feed at a run's edge
+  was lost, also in paragraphs an edit made the engine rewrite but did not
+  touch; reading kept unpreserved edge whitespace that Word drops. Both now
+  follow the one rule, including `xml:space` inherited from an ancestor such
+  as the document root (XML 1.0 §2.10). A deletion whose text is only unpreserved whitespace
+  deletes nothing, and rejecting it no longer leaves deleted-form text that
+  made the save refuse.
+- **Resolving a tracked edit inside a text box or content control gives back
+  the run it split.** A tracked replacement inside one run splits it around
+  the change; after Accept All or Reject All the pieces stayed separate runs,
+  so rejecting did not reproduce the source's markup and accepting differed
+  from the same edit made directly. Runs that meet where a resolved change
+  was, with the same properties, are joined again, in the model's projections
+  and the package resolver alike, and a direct edit joins them the same way.
+- **`review()` and `audit` no longer certify a changed sealed content control
+  as untouched.** The untouched proof skipped the hash that is the model's
+  only record of a sealed block's content, so a fill inside one, tracked or
+  direct, was reported as no change at all. A tracked change inside one is
+  now a new revision in both reports, and a sealed block whose bytes changed
+  without one fails the untouched proof. `audit_documents` and
+  `audit_session_documents`, which receive models without those bytes,
+  report such a change as an untouched-proof failure.
+- **Tracked changes inside a sealed block content control are reported and
+  resolved.** A block-level control the block model cannot hold (for example
+  one with a bookmark directly in its content) keeps its XML outside the
+  model, so its tracked changes were missing from `revisions()` and survived
+  accept-all and reject-all. That included the change a tracked
+  `sdt_text_fill` writes. They are now listed (census-only, `revision_id` 0)
+  and resolved by both full projections, as Word resolves them. Selective
+  resolution cannot address them and leaves them pending and listed.
+- **A value filled into a content control that shows its placeholder is
+  formatted as entered text.** It takes the run properties the control keeps
+  for entered text (`w:sdtPr/w:rPr`), or none, as ISO 29500-1 §17.5.2.27
+  requires. Before, it kept the placeholder's formatting, such as the grey
+  Placeholder Text style, so the filled value still looked like a
+  placeholder. Filling an inline or sealed block control now also clears its
+  placeholder flag, as filling an open one already did, and setting a value
+  on a control that shows its value keeps that value's formatting (a
+  checkbox's glyph keeps its symbol font).
+- **Paragraph roles are the same on every read of a document.** Two font
+  sizes used for the same number of characters were tie-broken by map order,
+  so a role's name and members, and the `default` role an insert uses, could
+  change between reads.
+- **A typed number keeps its own formatting when the first word is
+  formatted.** In "16. Impossibilité", making "Impossibilité" italic saved the
+  "16." in the same italic run, so it reopened italic.
+- **Accept All and Reject All resolve every representation of a drawing.**
+  A text box saved with a legacy VML copy kept that copy's tracked changes
+  after the model resolved everything, while resolving the saved package
+  removed them. Both now resolve each copy the same way. Selecting revisions
+  by id still reaches the active copy only.
+- **Accept and reject on the package read a table grid width as import
+  does.** A decimal width such as `3908.5` opened fine but made resolving the
+  saved package refuse the document.
+- **A document's first footnote or endnote reopens as authored.** The notes
+  part it creates opens with Word's reserved separator notes; these were
+  added only on save, so the saved document reopened with two notes the
+  edited one did not have. The note verb now adds them to the document.
+- **A multi-paragraph append at the end of a story is one proposal per
+  paragraph: its content plus the break before it.** Before, the anchor's
+  displaced paragraph mark was a proposal of its own, so accepting or
+  rejecting it alone merged the anchor into the first appended paragraph,
+  and rejecting the last paragraph's content alone left an empty final
+  paragraph. The appended paragraphs now also reopen exactly as edited.
+- **A moved paragraph reopens as the move that saved it.** A paragraph mark's
+  own `w:moveFrom`/`w:moveTo` was read as its revision status and also kept as
+  an unknown run property, so it could be written twice; it is now read once.
+  The run-level move containers the serializer writes around a whole-block
+  move are recognized as derived on import, and a move to the end of a story
+  keeps the adopted final mark.
+- **Edits keep block content controls whole.** Inserting a paragraph inside
+  a control pushed the control's last paragraph out of it, because the
+  control was recorded as a span on its first block. Every edit now keeps
+  each block in its controls; a new block joins the control of the block it
+  replaced, else of the block before it (an insertion after a control's last
+  paragraph is inside it, one before its first paragraph is outside it, at
+  the start of a story too). An edit that would split a control refuses.
+- **A control's last paragraph mark is treated like the document-final mark.**
+  Word cannot resolve a revision on it (checked against Word 16): deleting a
+  control's last paragraph, or inserting after it, now attributes the change
+  to the mark before it, as at the end of the document, and resolving never
+  joins a paragraph across a control's boundary. A control whose content is
+  all inserted or all deleted keeps its last paragraph in both readings, so
+  rejecting an added control or accepting a removed one leaves the control,
+  emptied, as Word does. A direct edit follows the same rule, so it reads
+  as accepting the tracked one.
+- **A direct delete through a story's last paragraph reads as accepting the
+  tracked delete.** It left an empty final paragraph behind; the paragraph
+  before the deleted run now takes over the final mark, and only a delete
+  of every paragraph leaves one, emptied.
+- **Rejecting a paragraph appended at the end of a story restores the
+  original paragraph in Word too.** Word merges the anchor into the appended
+  paragraph, which keeps the final mark. That paragraph now carries the
+  original final paragraph's `w:rsid*` attributes, and a change to the
+  mark's formatting is recorded as the mark's `w:rPrChange` (a `w:pPrChange`
+  cannot hold run properties), so Reject on the saved file equals the
+  model's Reject.
+- **Resolving revisions inside a block content control keeps the control.**
+  Accept All of a tracked deletion of a control's first paragraph removed the
+  whole control, because the control was recorded on that paragraph; it now
+  keeps the paragraphs that remain. A preserved (sealed) control after an
+  open one could also be written with the open control's content after a
+  projection; each is now matched to its own bytes.
+- **Comparing a table-cell paragraph that gains or loses a comment reference
+  keeps its other objects in place.** The comment reference was counted
+  among the paragraph's fields, images and links but skipped when they were
+  placed, so every later object moved one slot and the last was dropped;
+  comparison then failed an internal assertion.
+- **A tracked hyperlink deletion or insertion reopens as the link.** A
+  `w:hyperlink` cannot sit inside `w:ins`/`w:del`, so a whole-link revision
+  (from `unlink_hyperlink`, or deleting or inserting text that holds a link)
+  is written as a complete HYPERLINK field. Import now reads that exact
+  lowering back as the hyperlink, so Reject All after a save restores the
+  source's `w:hyperlink` instead of an equivalent field. A HYPERLINK field
+  with anything the lowering does not write, Word's own included, stays a
+  field.
+- **A tracked `blocks_to_table` inserts its table the way `insert(table)`
+  does:** one proposal carried on the table's rows, which Word reads as a
+  single insertion of the whole table. It used to add a block carrier and mark
+  every cell and run as well, which reopened as separate proposals.
+- **An inserted table claims only the formatting it carries.** A table built
+  by `insert`, `replace` or `blocks_to_table` marked every table and cell
+  property as directly authored even when it had no value, and its empty
+  cells held an empty text run; it now reads exactly as it does after a save
+  and reopen. An inserted empty paragraph likewise has no runs.
+- **Deleting an empty paragraph reopens as the same deletion.** Import now
+  reads an empty paragraph whose paragraph mark is deleted as a whole-paragraph
+  deletion, as an engine-authored deletion of that paragraph is spelled.
+- **Blank first-section headers and footers follow section edits.** The blank
+  header/footer a first section without one displays (§17.10.5) is now
+  recomputed after every edit, so inserting a section break or turning on a
+  title page gives the same stories as reopening the saved document.
+- **A created header or footer is an empty paragraph, not an empty run.**
+  `create_header`/`create_footer` wrote a bare inserted `<w:r/>` into the new
+  part; an empty paragraph now has no runs, as Word writes one.
+- **Editing a footnote or endnote keeps its paragraph.** A direct
+  `edit_note` on a single-paragraph note now edits it in place, keeping its
+  style (`FootnoteText`), attributes and bookmarks; it used to rebuild the
+  paragraph from scratch. A tracked edit no longer loses a bookmark at the end
+  of the note on Reject All.
+- **A bookmark or other marker carried through a paragraph edit never joins
+  the inserted text.** It used to take the insertion's status when it sat at
+  the end of a replaced paragraph, so Reject All dropped it.
+- **A direct list split no longer authors tracked changes.** `set_numbering`
+  with `split` ignored the transaction mode and always recorded a tracked
+  pPrChange on every re-pointed paragraph.
+- **Directly deleting through the end of a story keeps its final paragraph.**
+  The story's final paragraph mark cannot be deleted; the paragraph is left
+  empty with its own properties, as Word and an accepted tracked deletion
+  leave it. Before, a direct delete of a document's only paragraph left an
+  empty body.
+- **An opaque resolved by Accept All or Reject All is hashed by its canonical
+  spelling,** like every other opaque, instead of by its raw bytes.
+- **A hyperlink's `text` is its visible text on import too.** Runs deleted
+  inside the link are left out, as edits already did; before, an imported link
+  with a pending deletion read with the deleted words as visible.
+- **An inserted field keeps one spelling across save and reopen.** A tracked
+  inserted TOC or cross-reference field is written as a complex field (Word
+  does not allow `w:fldSimple` inside `w:ins`); import now reads that exact
+  form back as the simple field that was authored. Authored fields also carry
+  the content hash of their saved form. A complex field with anything more,
+  such as Word's `w:dirty`, is read as written.
+
+- **Comparison no longer adds run formatting the inputs never set.** Text whose
+  font, size or language comes from styles or document defaults stays
+  inherited in the redline. Previously header and footer runs, and deleted body
+  runs, received those values as direct formatting, so Reject All and
+  re-comparison reported differences that were not in either input.
+- **Pictures are compared by the image they show.** Relationship ids are local
+  to a package, so the same picture can be `rId4` in one document and `rId8` in
+  another. Comparison now resolves each reference to its target: renumbering is
+  no longer reported as a change, and replacing a picture's image behind
+  unchanged markup is now detected (it was previously missed). An unchanged
+  picture keeps a reference that resolves in the redline's package.
+- **Comments and bookmarks keep their anchors when nearby text changes.**
+  Comparing documents with edits before an unchanged comment emitted its
+  markers twice and was refused by validation; edits around a comment could
+  also move its reference inside a word on Reject All. A tracked edit before a
+  comment no longer drops the comment from the Reject All reading.
+- **Comparison no longer reports what Word regenerates as changes:** section
+  editing-session ids (`w:rsid*`), the drawing ids Word assigns on save
+  (`wp14:anchorId`, `wp14:editId`), and the cached results of `PAGE`,
+  `NUMPAGES` and `SECTIONPAGES` fields, which Word recomputes on layout and
+  the redline already left untracked.
+- **Authored paragraphs and table rows always receive a `w14:paraId`.**
+  Without one, Word regenerates every paragraph id in the document on open.
+- Revision resolution and serialization preserve run context, ranges, note
+  resources, paragraph text versions and property-change dates.
+
 ## [0.6.0] — 2026-09-03
 
 ### Changed
@@ -755,7 +1701,8 @@ applications.
   per-cell data.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/stemma-sh/stemma/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/stemma-sh/stemma/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/stemma-sh/stemma/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/stemma-sh/stemma/compare/v0.5.0...v0.5.1

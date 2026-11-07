@@ -269,6 +269,19 @@ fn unbolding_one_word_emits_rprchange() {
     assert!(!fc[0].2, "the 'now' run is no longer bold, got {r:?}");
     assert!(fc[0].4, "bold REMOVE → previous_marks HAD bold, got {r:?}");
 
+    // The saved file says the same: Word reads 'now' as not bold.
+    let reopened = Document::parse(
+        &unbolded
+            .serialize(&stemma::ExportOptions::default())
+            .expect("serialize un-bolded document"),
+    )
+    .expect("reopen un-bolded document");
+    let saved = fmt_runs(&reopened.snapshot().canonical);
+    assert!(
+        saved.iter().any(|(_, t, b, _, _)| t == "now" && !*b),
+        "the saved 'now' run is not bold, got {saved:?}"
+    );
+
     // accept → not bold; reject → bold restored.
     let acc = unbolded.project(Resolution::AcceptAll).unwrap();
     assert!(

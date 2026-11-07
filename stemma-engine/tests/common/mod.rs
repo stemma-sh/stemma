@@ -171,3 +171,117 @@ pub fn paragraph_text(p: &stemma::ParagraphNode) -> String {
     }
     out
 }
+
+// ─── Zero-width marker streams ─────────────────────────────────────────────
+
+/// Pack a minimal DOCX whose `w:body` holds `body_inner` (before a bare
+/// `w:sectPr`), with a `word/comments.xml` defining each of `comment_ids`.
+#[allow(dead_code)]
+pub fn docx_with_body_and_comments(body_inner: &str, comment_ids: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
+    );
+    let comment_elems: String = comment_ids
+        .iter()
+        .map(|id| {
+            format!(
+                r#"<w:comment w:id="{id}" w:author="Reviewer" w:date="2026-06-01T00:00:00Z" w:initials="R"><w:p><w:r><w:t>Note {id}.</w:t></w:r></w:p></w:comment>"#
+            )
+        })
+        .collect();
+    let comments_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{comment_elems}</w:comments>"#
+    );
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/></Relationships>"#;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions = zip::write::FileOptions::default();
+        for (name, data) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+            ("word/comments.xml", comments_xml.as_str()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// The body of a `word/document.xml` as one line of text with its zero-width
+/// markers spelled inline, so a test can state where each marker sits
+/// relative to the text in a single readable string:
+///
+/// - `{bs1}` / `{be1}` bookmark start / end with `w:id` 1, `{cs0}` / `{ce0}`
+///   comment range start / end, `{cr0}` comment reference, `{ps2}` / `{pe2}`
+///   permission start / end;
+/// - `<+…+>` the content of a `w:ins`, `<-…->` the content of a `w:del`
+///   (deleted text included);
+/// - `|` each paragraph end, `[tbl` / `tbl]` a table's bounds.
+#[allow(dead_code)]
+pub fn marker_stream(document_xml: &str) -> String {
+    let mut out = String::new();
+    let mut reader = Reader::from_str(document_xml);
+    let mut in_text = false;
+    let mut in_body = false;
+    loop {
+        let event = reader.read_event().expect("document.xml parses");
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let name = e.name();
+                let local = std::str::from_utf8(name.local_name().into_inner()).unwrap();
+                let empty = matches!(event, Event::Empty(_));
+                let id = e
+                    .attributes()
+                    .flatten()
+                    .find(|a| a.key.local_name().as_ref() == b"id")
+                    .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                    .unwrap_or_default();
+                match local {
+                    "body" => in_body = true,
+                    "t" | "delText" if !empty => in_text = true,
+                    // A self-closing w:ins/w:del is a paragraph-mark or
+                    // property revision, not a content carrier.
+                    "ins" if !empty => out.push_str("<+"),
+                    "del" if !empty => out.push_str("<-"),
+                    "tbl" if in_body => out.push_str("[tbl"),
+                    "bookmarkStart" => out.push_str(&format!("{{bs{id}}}")),
+                    "bookmarkEnd" => out.push_str(&format!("{{be{id}}}")),
+                    "commentRangeStart" => out.push_str(&format!("{{cs{id}}}")),
+                    "commentRangeEnd" => out.push_str(&format!("{{ce{id}}}")),
+                    "commentReference" => out.push_str(&format!("{{cr{id}}}")),
+                    "permStart" => out.push_str(&format!("{{ps{id}}}")),
+                    "permEnd" => out.push_str(&format!("{{pe{id}}}")),
+                    _ => {}
+                }
+            }
+            Event::End(e) => {
+                let name = e.name();
+                match name.local_name().into_inner() {
+                    b"t" | b"delText" => in_text = false,
+                    b"ins" => out.push_str("+>"),
+                    b"del" => out.push_str("->"),
+                    b"p" if in_body => out.push('|'),
+                    b"tbl" if in_body => out.push_str("tbl]"),
+                    b"body" => in_body = false,
+                    _ => {}
+                }
+            }
+            Event::Text(t) if in_text => out.push_str(&t.unescape().expect("text unescapes")),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}

@@ -6,6 +6,9 @@ what they refer to. [CONTRIBUTING.md](CONTRIBUTING.md) has the full setup and
 PR expectations; [docs/internals/architecture.md](docs/internals/architecture.md)
 is the codemap.
 
+[INTENTION.md](INTENTION.md) says what Stemma is for and how to decide when
+goals conflict. Read it before a product or design decision.
+
 ## Build & test
 
 ```bash

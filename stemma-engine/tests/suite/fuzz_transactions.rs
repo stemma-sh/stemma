@@ -438,7 +438,6 @@ fn body_paragraphs(canon: &CanonDoc) -> Vec<ParaInfo> {
                         | InlineNode::Decoration(_)
                         | InlineNode::CommentRangeStart { .. }
                         | InlineNode::CommentRangeEnd { .. }
-                        | InlineNode::CommentReference { .. }
                 )
             });
             out.push(ParaInfo {
@@ -643,6 +642,9 @@ fn gen_step(
                 },
                 borders: None,
                 shading: None,
+                keep_next: None,
+                keep_lines: None,
+                page_break_before: None,
             },
             rationale: None,
         }),
@@ -732,6 +734,8 @@ fn gen_step(
                 position: InsertPosition::After,
                 rationale: None,
                 blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.to_string()),
                     content: text_content(&format!("Inserted clause {}", rng.below(100000))),
                     restart_numbering: false,
@@ -810,6 +814,8 @@ fn gen_steps(rng: &mut Rng, base: &CanonDoc) -> Vec<EditStep> {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some(role.clone()),
                 content: text_content(&format!("Inserted clause {}", rng.below(100000))),
                 restart_numbering: false,

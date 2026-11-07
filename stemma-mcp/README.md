@@ -36,9 +36,16 @@ default whole-body scope without flattening them. A cell paragraph `block_id`
 can still restrict an ambiguous replacement.
 `verify_docx` audits either the open session or a producer-neutral before/after
 pair. Every audit list is paged at 16 rows by default (64 maximum), with totals
-and continuation metadata rather than an unbounded structural-diff echo. Only
-after its intent, untouched-scope, prior-revision, and validator checks pass
-should `save_docx` commit to a new path.
+and continuation metadata rather than an unbounded structural-diff echo.
+`save_docx` reruns the same audit, commits to a new path, and reports the
+result as `verdict.status`: `pass`, or `needs_review` when it found a direct
+change or a changed prior revision it cannot explain. Only a package-gate
+error refuses the save; on `needs_review`, inspect with `verify_docx` and fix
+or disclose each finding before delivering.
+
+While exactly one document is open, the other tools may omit `doc_id`. With
+none or several open, such a call refuses with `doc_id_required` and lists
+`open_doc_ids`.
 
 For a multi-document instruction, the first task-bearing `open_docx` can bind
 the complete replacement set and every input by hash. Earlier target saves stay
@@ -78,7 +85,7 @@ startup rather than silently selecting a surface.
 | Tool | What it does |
 |---|---|
 | `open_docx` | Open a workspace-confined `.docx`; returns a `doc_id`, exact `input_artifact` identity, import `diagnostics`, and a compact `index`. It also hosts the optional complete task declaration (`task`) or a later target binding (`task_id`). |
-| `save_docx` | Export an open doc (including tracked changes) to a new `.docx` path. Gates the bytes through the engine's post-serialization OOXML linker and refuses an existing destination or input alias. |
+| `save_docx` | Export an open doc (including tracked changes) to a new `.docx` path. Gates the bytes through the engine's post-serialization OOXML linker, refuses an existing destination or input alias, and reports the session audit's `verdict` (`pass` or `needs_review`). |
 | `compare_docx` | Diff two `.docx` files and commit a redline to a new path (target with tracked changes vs base). Reports semantic `change_count`, pending Word `revision_count`, and source-labelled import diagnostics. |
 
 ### Read / navigate (comprehension)
@@ -394,7 +401,7 @@ fail-loud startup error, not a silent fallback):
   `0` to disable eviction entirely. If you use a `doc_id` after its document was
   evicted, the tool returns a structured `doc_evicted` error telling you to
   re-open the file with `open_docx` (distinct from the `unknown_doc_id` error for
-  a `doc_id` that was never opened). Coupled source-identity state has no second
+  a `doc_id` that was never opened, which lists the `open_doc_ids`). Coupled source-identity state has no second
   idle clock and is removed only after the runtime confirms the handle was
   evicted.
 - **Open-size cap.** `open_docx` refuses a file larger than
@@ -415,12 +422,12 @@ with `0`. Keep them enabled on untrusted workloads.
 ## Status / limits (PoC)
 
 - The outline reports **block-level** tracking status. Inline tracked changes
-  (text inserted/deleted inside a paragraph) live in segments and are present in
-  the exported DOCX but not separately broken out in the read view yet.
+  (text inserted/deleted inside a paragraph) are in each block's spans
+  (`read_block`) and in `list_revisions`.
 - Edit breadth is whatever the v4 schema + engine support today. Unsupported cases
-  (e.g. tables with merged cells) fail loudly with a named error rather than a
-  best-effort mutation. Growing breadth is the point: see the engine's `EditStep`
-  set in `stemma-engine/src/edit.rs`.
+  (e.g. a tracked column move) fail loudly with a named error rather than a
+  best-effort mutation. Growing breadth is the point: see the
+  [operation reference](../docs/reference/operations.md).
 - Workspace confinement and no-clobber commits reduce accidental authority and
   mutation; they do not isolate the server from a hostile same-user process.
   See [SECURITY.md](../SECURITY.md).

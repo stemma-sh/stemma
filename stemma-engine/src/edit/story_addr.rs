@@ -204,6 +204,8 @@ mod tests {
             block: BlockNode::from(OpaqueBlockNode {
                 id: NodeId::from(id),
                 kind: OpaqueKind::Drawing,
+                note_references: Default::default(),
+                source_paragraph_ids: Vec::new(),
                 opaque_ref: format!("{id}:opaque"),
                 proof_ref: ProofRef {
                     part: DocPart::DocumentXml,

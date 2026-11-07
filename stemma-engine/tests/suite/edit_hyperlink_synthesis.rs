@@ -34,7 +34,195 @@ use stemma::{BlockNode, ExportMode, ExportOptions, InlineNode, OpaqueKind, Valid
 use zip::ZipWriter;
 use zip::write::FileOptions;
 
+#[test]
+fn unlink_keeps_real_formatted_text_and_reject_restores_destination() {
+    check_unlink_formatted_text();
+}
+
+pub(super) fn check_unlink_formatted_text() {
+    let source = make_docx_with_styles(
+        r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r><w:hyperlink r:id="rLink" w:history="1"><w:r w:rsidRPr="00112233"><w:rPr><w:rStyle w:val="Emphasis"/><w:u w:val="double"/><w:sz w:val="28"/></w:rPr><w:t>Resource</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> after.</w:t></w:r></w:p>"#,
+        r#"<Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.test/resource" TargetMode="External"/>"#,
+        Some(
+            r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Normal" w:default="1"><w:name w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="character" w:styleId="Emphasis"><w:name w:val="Emphasis"/><w:rPr><w:i/></w:rPr></w:style></w:styles>"#,
+        ),
+    );
+    let original = Document::parse(&source).unwrap();
+    let link_id = first_paragraph_opaques(&original)[0].0.clone();
+    let txn = parse_transaction(
+        &serde_json::json!({
+            "ops": [{"op": "unlink_hyperlink", "target": link_id, "expect": "Resource"}],
+            "revision": {"author": "Reviewer", "date": "2026-01-01T00:00:00Z"}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_edit_transaction()
+    .unwrap();
+    let edited = original.apply(&txn).unwrap();
+    let bytes = edited.serialize(&ExportOptions::default()).unwrap();
+    let reopened = Document::parse(&bytes).unwrap();
+    let accepted = reopened.project(stemma::Resolution::AcceptAll).unwrap();
+    assert_eq!(accepted.to_text(), "Before Resource after.");
+    assert!(first_paragraph_opaques(&accepted).is_empty());
+    let BlockNode::Paragraph(p) = &accepted.snapshot().canonical.blocks[0].block else {
+        panic!()
+    };
+    let text = p
+        .all_inlines()
+        .find_map(|node| match node {
+            InlineNode::Text(text) if text.text == "Resource" => Some(text),
+            _ => None,
+        })
+        .expect("unlink must produce real editable text");
+    assert!(text.marks.contains(&stemma::Mark::Bold));
+    assert!(text.marks.contains(&stemma::Mark::Italic));
+    assert_eq!(
+        text.source_run_attrs,
+        vec![("w:rsidRPr".into(), "00112233".into())]
+    );
+    let accepted_xml = document_xml_of(&accepted);
+    assert!(accepted_xml.contains("w:val=\"double\""));
+    assert!(accepted_xml.contains("w:val=\"28\""));
+    assert!(
+        !accepted_xml.contains("<w:b ")
+            && !accepted_xml.contains("<w:b>")
+            && !accepted_xml.contains("<w:b/"),
+        "inherited bold must not become direct"
+    );
+    let rejected = reopened.project(stemma::Resolution::RejectAll).unwrap();
+    let rejected_xml = document_xml_of(&rejected);
+    // Reject restores the source's link: its destination and its history.
+    let restored: Vec<stemma::domain::HyperlinkData> = first_paragraph_opaques(&rejected)
+        .into_iter()
+        .filter_map(|(_, kind)| match kind {
+            OpaqueKind::Hyperlink(link) => Some(link),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(restored.len(), 1, "Reject must restore the link object");
+    assert_eq!(
+        restored[0].url.as_deref(),
+        Some("https://example.test/resource")
+    );
+    assert_eq!(
+        restored[0].extra_attrs,
+        vec![("w:history".to_string(), "1".to_string())]
+    );
+    assert!(
+        !rejected_xml.contains("\\h"),
+        "Reject must retain enabled history"
+    );
+    assert!(rejected_xml.contains("Resource"));
+    assert_opens_clean(&accepted);
+    assert_opens_clean(&rejected);
+}
+
 // ─── DOCX fixtures (bytes-in) ────────────────────────────────────────────────
+
+#[test]
+fn unlink_preserves_unrelated_revision_and_supports_selective_resolution() {
+    let source = make_docx(
+        r#"<w:p><w:hyperlink r:id="rLink"><w:r><w:rPr><w:b/></w:rPr><w:t>Re</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>source</w:t></w:r></w:hyperlink><w:ins w:id="40" w:author="Other" w:date="2026-01-01T00:00:00Z"><w:r><w:t>Pending</w:t></w:r></w:ins></w:p>"#,
+        r#"<Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.test/resource" TargetMode="External"/>"#,
+    );
+    let original = Document::parse(&source).unwrap();
+    let link = first_paragraph_opaques(&original)[0].0.clone();
+    let txn = parse_transaction(
+        &serde_json::json!({
+            "ops": [{"op": "unlink_hyperlink", "target": link, "expect": "Resource"}],
+            "revision": {"author": "Reviewer"}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_edit_transaction()
+    .unwrap();
+    let edited = original.apply(&txn).unwrap();
+    let reopened = Document::parse(&edited.serialize(&ExportOptions::default()).unwrap()).unwrap();
+    let revisions = reopened.revisions();
+    assert_eq!(
+        revisions
+            .iter()
+            .filter(|r| r.author.as_deref() == Some("Other"))
+            .count(),
+        1
+    );
+    let own: std::collections::HashSet<_> = revisions
+        .iter()
+        .filter(|r| r.author.as_deref() == Some("Reviewer"))
+        .map(|r| r.revision_id)
+        .collect();
+    assert_eq!(
+        own.len(),
+        2,
+        "complete link deletion plus ordinary text insertion"
+    );
+    for action in [
+        stemma::ResolveSelectionAction::Accept,
+        stemma::ResolveSelectionAction::Reject,
+    ] {
+        let projected = reopened
+            .project(stemma::Resolution::Selective {
+                ids: own.clone(),
+                action,
+            })
+            .unwrap();
+        let saved = projected.serialize(&ExportOptions::default()).unwrap();
+        let saved = Document::parse(&saved).unwrap();
+        let remaining = saved.revisions();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].author.as_deref(), Some("Other"));
+        assert_opens_clean(&saved);
+    }
+    let mut direct_txn = txn.clone();
+    direct_txn.materialization_mode = stemma::edit::MaterializationMode::Direct;
+    let direct = original.apply(&direct_txn).unwrap();
+    assert!(first_paragraph_opaques(&direct).is_empty());
+    assert_eq!(direct.revisions().len(), 1);
+    assert_eq!(direct.to_text(), "ResourcePending");
+}
+
+#[test]
+fn unlink_refuses_nontext_payload_without_mutating_source() {
+    // Each link's whole text, which unlink's `expect` must equal (a tab is part
+    // of the text, so the refusal comes from the payload, not the expect).
+    for (run, text) in [
+        (r#"<w:r><w:t>Resource</w:t><w:tab/></w:r>"#, "Resource\t"),
+        (
+            r#"<w:r><w:rPr/><w:rPr/><w:t>Resource</w:t></w:r>"#,
+            "Resource",
+        ),
+        (
+            r#"<w:ins w:id="4" w:author="Other"><w:r><w:t>Resource</w:t></w:r></w:ins>"#,
+            "Resource",
+        ),
+    ] {
+        let source = make_docx(
+            &format!(r#"<w:p><w:hyperlink w:anchor="target">{run}</w:hyperlink></w:p>"#),
+            "",
+        );
+        let doc = Document::parse(&source).unwrap();
+        let before = doc.serialize(&ExportOptions::default()).unwrap();
+        let id = first_paragraph_opaques(&doc)[0].0.clone();
+        let txn = parse_transaction(
+            &serde_json::json!({
+                "ops": [{"op": "unlink_hyperlink", "target": id, "expect": text}],
+                "revision": {"author": "Reviewer"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .into_edit_transaction()
+        .unwrap();
+        let error = doc
+            .apply(&txn)
+            .err()
+            .expect("unsupported unlink must refuse");
+        assert!(error.message.contains("cannot unlink"), "{}", error.message);
+        assert_eq!(doc.serialize(&ExportOptions::default()).unwrap(), before);
+    }
+}
 
 const CONTENT_TYPES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
 
@@ -44,20 +232,34 @@ const PACKAGE_RELS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalon
 /// Build a `.docx` from a body fragment and an optional document-rels fragment
 /// (the inner `<Relationship>` entries; the namespace wrapper is added here).
 fn make_docx(body_inner: &str, extra_doc_rels: &str) -> Vec<u8> {
+    make_docx_with_styles(body_inner, extra_doc_rels, None)
+}
+
+fn make_docx_with_styles(body_inner: &str, extra_doc_rels: &str, styles: Option<&str>) -> Vec<u8> {
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
     );
+    let style_rel = if styles.is_some() {
+        r#"<Relationship Id="rStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#
+    } else {
+        ""
+    };
     let doc_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{extra_doc_rels}</Relationships>"#
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{extra_doc_rels}{style_rel}</Relationships>"#
     );
     let mut buf = Vec::new();
     {
         let mut zip = ZipWriter::new(Cursor::new(&mut buf));
         let opts: FileOptions = FileOptions::default();
         zip.start_file("[Content_Types].xml", opts).unwrap();
-        zip.write_all(CONTENT_TYPES_XML.as_bytes()).unwrap();
+        let content_types = if styles.is_some() {
+            CONTENT_TYPES_XML.replace("</Types>", r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#)
+        } else {
+            CONTENT_TYPES_XML.to_string()
+        };
+        zip.write_all(content_types.as_bytes()).unwrap();
         zip.start_file("_rels/.rels", opts).unwrap();
         zip.write_all(PACKAGE_RELS_XML.as_bytes()).unwrap();
         zip.start_file("word/_rels/document.xml.rels", opts)
@@ -65,6 +267,10 @@ fn make_docx(body_inner: &str, extra_doc_rels: &str) -> Vec<u8> {
         zip.write_all(doc_rels.as_bytes()).unwrap();
         zip.start_file("word/document.xml", opts).unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
+        if let Some(styles) = styles {
+            zip.start_file("word/styles.xml", opts).unwrap();
+            zip.write_all(styles.as_bytes()).unwrap();
+        }
         zip.finish().unwrap();
     }
     buf
@@ -346,10 +552,11 @@ fn replace_with_new_hyperlink_inserts_one_opaque_link_minimally_and_reverts() {
         word_occurs_outside_ins(&redline_xml, "for more"),
         "unchanged trailing text must not be re-inserted (minimal change)"
     );
-    // The new hyperlink itself is an inserted change: a <w:hyperlink> appears.
+    // The destination is part of the inserted HYPERLINK field, not an
+    // untracked wrapper around tracked display text.
     assert!(
-        redline_xml.contains("<w:hyperlink"),
-        "redline emits the new <w:hyperlink>"
+        redline_xml.contains("HYPERLINK") && !redline_xml.contains("<w:hyperlink"),
+        "redline tracks the whole link as a field"
     );
 
     // (c) reject-all => link gone, original text intact.
@@ -585,12 +792,9 @@ fn new_hyperlink_lands_next_to_a_preexisting_opaque_which_survives() {
 // ─── Bug pin: a synthesized hyperlink must serialize as a tracked insertion ───
 
 // DOMAIN RULE (tracked-change reversibility at the serialized-bytes layer): a
-// segment-Inserted hyperlink must serialize as
-// `<w:hyperlink><w:ins><w:r>..</w:r></w:ins></w:hyperlink>` (ECMA-376 §17.13.5
-// permits w:ins around the hyperlink's inner runs) so Word treats the new link
-// as a tracked insertion and reject-all reverts to baseline. Fixed in
-// serialize/mod.rs (emit_tracked_chunks DirectInline branch →
-// append_tracked_hyperlink_paragraph_opaque).
+// segment-Inserted hyperlink must track its destination as well as its text.
+// Inner-run-only tracking leaves a live empty hyperlink after Word Reject.
+// A complete HYPERLINK field inside w:ins gives the required whole-object law.
 #[test]
 fn synthesized_hyperlink_serializes_with_insertion_tracking() {
     // DOMAIN RULE (tracked-change reversibility at the SERIALIZED-bytes layer):
@@ -599,15 +803,8 @@ fn synthesized_hyperlink_serializes_with_insertion_tracking() {
     // must be a TRACKED insertion in the redline so that "reject all" in Word
     // removes it and the document reverts to baseline.
     //
-    // In OOXML a `<w:hyperlink>` is paragraph-level (EG_PContent) and cannot be a
-    // child of `<w:ins>` (whose content is EG_RunLevelElts). The spec-legal
-    // encoding wraps the hyperlink's INNER run(s) in `<w:ins>`:
-    //     <w:hyperlink ...><w:ins ...><w:r><w:t>the policy</w:t></w:r></w:ins></w:hyperlink>
-    // which is exactly the shape `word_ir`'s importer already round-trips
-    // (see the "runs inside <w:ins>/<w:del> within a hyperlink" test in word_ir).
-    //
-    // Today the serializer emits the hyperlink with no insertion tracking at all,
-    // so this assertion fails — a real serialization bug, not a test bug.
+    // A w:hyperlink cannot be a child of w:ins; field controls and instruction
+    // runs can. This tests the revision boundary, not just visible text.
     let doc = Document::parse(&plain_docx("see here for more")).expect("parse");
     let (id, guard) = first_id_and_guard(&doc);
     let json = format!(
@@ -657,33 +854,31 @@ fn synthesized_hyperlink_serializes_with_insertion_tracking() {
 
     // The serialized redline must carry insertion tracking on the new link.
     let redline_xml = document_xml_of(&edited);
-    let h_start = redline_xml
-        .find("<w:hyperlink")
-        .expect("redline emits the new <w:hyperlink>");
-    let h_end = redline_xml[h_start..]
-        .find("</w:hyperlink>")
-        .map(|e| h_start + e)
-        .expect("hyperlink element closes");
-    let hyperlink_inner = &redline_xml[h_start..h_end];
-    assert!(
-        hyperlink_inner.contains("<w:ins"),
-        "a synthesized (segment-Inserted) hyperlink must carry an in-hyperlink \
-         <w:ins> envelope so Word treats the link as a tracked insertion and \
-         reject-all reverts to baseline; got:\n{hyperlink_inner}"
-    );
+    assert!(!redline_xml.contains("<w:hyperlink"));
+    let instruction = redline_xml
+        .find("HYPERLINK")
+        .expect("link destination instruction");
+    let start = redline_xml[..instruction]
+        .rfind("<w:ins ")
+        .expect("instruction is inserted");
+    let end = instruction
+        + redline_xml[instruction..]
+            .find("</w:ins>")
+            .expect("insertion closes");
+    let field = &redline_xml[start..end];
+    for marker in ["begin", "separate", "end"] {
+        assert!(field.contains(&format!("w:fldCharType=\"{marker}\"")));
+    }
+    assert!(field.contains("the policy"));
 }
 
 // ─── Regression: a synthesized link's URL must survive a byte round-trip ──────
 
 #[test]
 fn synthesized_hyperlink_url_survives_serialize_and_reimport() {
-    // DOMAIN RULE: a new hyperlink is inserted with r_id: None and its external
-    // relationship is allocated at export. The redline must therefore serialize
-    // BOTH the <w:hyperlink r:id=..> element AND a backing relationship in
-    // word/_rels/document.xml.rels — otherwise the link is dangling and its URL
-    // is lost on the next save/reopen (a dead link). The in-memory accept view
-    // can't catch this (the URL is already on the IR); only a round-trip through
-    // bytes exercises the rels part.
+    // DOMAIN RULE: the authored destination survives bytes and projection.
+    // A whole-link revision carries it in a field instruction; an ordinary
+    // w:hyperlink uses a relationship. Neither may become a dangling link.
     let doc = Document::parse(&plain_docx("see here for more")).expect("parse");
     let (id, guard) = first_id_and_guard(&doc);
     let json = format!(
@@ -710,11 +905,114 @@ fn synthesized_hyperlink_url_survives_serialize_and_reimport() {
         .into_iter()
         .filter_map(|(_, k)| match k {
             OpaqueKind::Hyperlink(d) => d.url,
+            OpaqueKind::Field(d) => match d.semantic {
+                Some(stemma::domain::FieldSemantic::Hyperlink(spec)) => match spec.target {
+                    stemma::domain::HyperlinkTarget::Url { url } => Some(url),
+                    _ => None,
+                },
+                _ => None,
+            },
             _ => None,
         })
         .collect();
     assert!(
-        urls.iter().any(|u| u == "https://example.com/policy"),
+        urls == ["https://example.com/policy"],
         "the inserted hyperlink URL must survive serialize -> reimport; got {urls:?}"
+    );
+}
+
+/// The same rule for a direct edit, in a table cell (the shape that lost its
+/// relationship): a cell paragraph whose whole content becomes a new link keeps
+/// the link's destination through serialize and reimport.
+#[test]
+fn direct_new_hyperlink_in_a_cell_keeps_its_url() {
+    let doc = Document::parse(&make_docx(
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>www.example.com</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+        "",
+    ))
+    .expect("parse");
+    let view = doc.read();
+    let cell_paragraph = &view.blocks[0].cells[0].paragraphs[0];
+    let (id, guard) = (
+        cell_paragraph.block_id.to_string(),
+        cell_paragraph.guard.clone(),
+    );
+    let json = format!(
+        r#"{{ "ops": [{{ "op": "replace", "target": "{id}", "guard": "{guard}",
+             "content": {{ "type": "paragraph", "content": [
+               {{ "type": "hyperlink", "attrs": {{ "href": "https://www.example.com/" }},
+                  "content": [{{ "type": "text", "text": "www.example.com" }}] }} ] }} }}],
+             "materialization_mode": "direct",
+             "revision": {{ "author": "rels-test" }} }}"#
+    );
+    let edited = apply_v4(&doc, &json);
+    let bytes = edited
+        .serialize(&ExportOptions {
+            mode: ExportMode::Redline,
+            validator_level: ValidatorLevel::Off,
+            validator: None,
+        })
+        .expect("serialize");
+    let xml = read_document_xml(&bytes);
+    let link = &xml[xml.find("<w:hyperlink").expect("a hyperlink is written")..];
+    let link = &link[..link.find('>').unwrap() + 1];
+    assert!(
+        link.contains("r:id="),
+        "the new link names a relationship: {link}"
+    );
+    let mut rels = String::new();
+    zip::ZipArchive::new(Cursor::new(&bytes[..]))
+        .unwrap()
+        .by_name("word/_rels/document.xml.rels")
+        .unwrap()
+        .read_to_string(&mut rels)
+        .unwrap();
+    assert!(
+        rels.contains(r#"Target="https://www.example.com/""#),
+        "the relationship carries the link's destination: {rels}"
+    );
+}
+
+/// A table-of-contents entry is a link whose text is label, tab, title, tab,
+/// page. The read shows its tabs, and new link text with tabs is written with
+/// w:tab, as Word writes it.
+#[test]
+fn a_links_tabs_are_read_and_written_as_tabs() {
+    let doc = Document::parse(&make_docx(
+        r#"<w:p><w:hyperlink w:anchor="_Toc1"><w:r><w:t>A.</w:t></w:r><w:r><w:tab/><w:t>Pecuniary Reparations</w:t></w:r><w:r><w:tab/><w:t>22</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="0" w:name="_Toc1"/><w:r><w:t>Target</w:t></w:r><w:bookmarkEnd w:id="0"/></w:p>"#,
+        "",
+    ))
+    .expect("parse");
+    let link = first_paragraph_opaques(&doc)
+        .into_iter()
+        .find_map(|(id, kind)| match kind {
+            OpaqueKind::Hyperlink(data) => Some((id, data.text)),
+            _ => None,
+        })
+        .expect("the entry is a link");
+    assert_eq!(
+        link.1, "A.\tPecuniary Reparations\t22",
+        "the read keeps the tabs"
+    );
+
+    let (id, guard) = first_id_and_guard(&doc);
+    let json = format!(
+        r#"{{ "ops": [{{ "op": "replace", "target": "{}", "expect": "A.\tPecuniary Reparations\t22",
+             "content": {{ "type": "hyperlink", "attrs": {{ "anchor": "_Toc1" }},
+               "content": [{{ "type": "text", "text": "A.\tPecuniary Reparations for Moral Prejudice\t22" }}] }} }}],
+             "materialization_mode": "direct", "revision": {{ "author": "rels-test" }} }}"#,
+        link.0
+    );
+    let _ = (id, guard);
+    let xml = document_xml_of(&apply_v4(&doc, &json));
+    let entry = &xml[..xml.find("_Toc1\"/>").unwrap_or(xml.len())];
+    assert_eq!(
+        entry.matches("<w:tab").count(),
+        2,
+        "both tabs are w:tab: {entry}"
+    );
+    assert!(
+        !entry.contains("\t"),
+        "no tab character inside w:t: {entry}"
     );
 }

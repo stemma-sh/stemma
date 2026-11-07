@@ -295,6 +295,8 @@ fn insert_after(anchor: &NodeId, role: &str, text: &str) -> EditTransaction {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some(role.to_string()),
                 content: ParagraphContent {
                     fragments: vec![ContentFragment::Text(text.to_string())],

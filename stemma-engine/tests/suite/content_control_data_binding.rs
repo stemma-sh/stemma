@@ -218,6 +218,15 @@ fn data_bound_wrap_emits_databinding_and_authors_datastore_part() {
         .expect("item index");
     let props_path = format!("customXml/itemProps{n}.xml");
     let rels_path = format!("customXml/_rels/item{n}.xml.rels");
+    // The store has the node the XPath addresses — its root in the namespace
+    // ns0 maps to — holding the wrapped text the control shows.
+    let store = String::from_utf8(archive.get(&item_path).unwrap().to_vec()).unwrap();
+    assert!(
+        store.contains(
+            r#"<root xmlns="urn:contract"><party xmlns="urn:contract">Counterparty</party></root>"#
+        ),
+        "store={store}"
+    );
     assert!(
         names.contains(&props_path),
         "itemProps must be authored; parts={names:?}"
@@ -365,13 +374,15 @@ fn data_bound_wrap_does_not_shrink_opaque_inventory() {
 
 /// Two bindings sharing one storeItemID collapse to a single authored datastore
 /// part (reuse / dedup) — the second binding's storeItemID already resolves.
+/// They bind different nodes: controls bound to one node show one value, and
+/// each node holds the text of the control bound to it.
 #[test]
 fn two_bindings_sharing_store_item_id_author_one_part() {
     let base = Document::parse(&make_docx("Party A and Party B both sign.")).expect("parse");
     let block_id = first_block_id(&base.snapshot().canonical);
     let mk = |expect: &str| {
         let binding = DataBinding {
-            xpath: "/contract/party".to_string(),
+            xpath: format!("/contract/{}", expect.replace(' ', "_")),
             store_item_id: STORE_ID.to_string(),
             prefix_mappings: None,
         };
@@ -394,6 +405,19 @@ fn two_bindings_sharing_store_item_id_author_one_part() {
     assert_eq!(
         data_parts, 1,
         "shared storeItemID must author exactly one datastore part"
+    );
+    let store = archive
+        .list()
+        .find(|n| {
+            n.starts_with("customXml/item") && !n.contains("itemProps") && !n.contains("_rels")
+        })
+        .expect("the datastore part")
+        .to_string();
+    let store = String::from_utf8(archive.get(&store).unwrap().to_vec()).unwrap();
+    assert!(
+        store.contains("<Party_A>Party A</Party_A>")
+            && store.contains("<Party_B>Party B</Party_B>"),
+        "each bound node holds its control's text: {store}"
     );
 }
 

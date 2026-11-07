@@ -1,11 +1,12 @@
 # Benchmark archive: per-tier tables and wave history
 
-This is the archival record behind [the benchmark report](benchmarks.md):
+This is the archival record behind [the benchmark history](benchmarks.md),
+which covers releases v0.1 to v0.5:
 per-lane tables for the older/cheaper model pins, the document-size detail,
 and the full wave-by-wave history, including the cells that were later
 corrected, disqualified, or overturned, kept here so the corrections stay
-auditable. The headline numbers, methodology, caveats, and every claim we
-currently stand behind live in the main report; nothing here supersedes it.
+auditable. The headline numbers, methodology, and caveats live in the main
+history page; nothing here supersedes it.
 Every number is machine-checkable against the
 [per-cell data](benchmark-data-model-sweeps-2026-07.json) or, for the wave
 tables, the held-out results inventory described in the main report's

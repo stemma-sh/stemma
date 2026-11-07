@@ -252,3 +252,58 @@ fn humira_epar_large_doc() {
         vocab.paragraph_roles.len()
     );
 }
+
+/// Paragraph roles are a function of the document: two font sizes used for
+/// the same number of characters must not make the roles change between
+/// reads of one document.
+#[test]
+fn roles_are_the_same_on_every_read_when_font_sizes_tie() {
+    let run = |size: u32, text: &str| {
+        format!(r#"<w:r><w:rPr><w:sz w:val="{size}"/></w:rPr><w:t>{text}</w:t></w:r>"#)
+    };
+    let body = format!(
+        "<w:p>{}{}</w:p><w:p>{}</w:p><w:p>{}</w:p><w:p>{}</w:p>",
+        run(20, "aaaa"),
+        run(28, "bbbb"),
+        run(20, "cccc"),
+        run(28, "dddd"),
+        run(24, "ee"),
+    );
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+    );
+    let doc = stemma::api::Document::parse(&minimal_docx(&document)).expect("parse");
+    let canon = &doc.snapshot().canonical;
+    let read = || {
+        vocabulary::extract_vocabulary(canon)
+            .paragraph_roles
+            .iter()
+            .map(|role| (role.id.clone(), role.exemplar.to_string(), role.count))
+            .collect::<Vec<_>>()
+    };
+    let first = read();
+    for _ in 0..64 {
+        assert_eq!(read(), first);
+    }
+}
+
+fn minimal_docx(document_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options: zip::write::FileOptions = zip::write::FileOptions::default();
+        for (name, content) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", rels),
+            ("word/document.xml", document_xml),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}

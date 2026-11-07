@@ -1,0 +1,40 @@
+[build-system]
+# >= 1.9.4: maturin sets PYO3_BUILD_EXTENSION_MODULE itself (see Cargo.toml).
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "stemma-py"
+# Taken from Cargo.toml, which the release version guard checks with the rest
+# of the workspace.
+dynamic = ["version"]
+description = "Edit existing Word documents with native tracked changes: the Stemma DOCX engine for Python (experimental)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+keywords = ["docx", "word", "tracked-changes", "redline", "ooxml"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Office Suites",
+    "Topic :: Text Processing :: Markup :: XML",
+    "Typing :: Typed",
+]
+# Deliberately none: the wheel is the engine plus a thin binding.
+dependencies = []
+
+[project.urls]
+Homepage = "https://stemma.sh"
+Documentation = "https://stemma.sh/docs/reference/python"
+Repository = "https://github.com/stemma-sh/stemma"
+Changelog = "https://github.com/stemma-sh/stemma/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+python-source = "python"
+module-name = "stemma._native"

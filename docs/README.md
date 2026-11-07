@@ -19,6 +19,7 @@ two Word documents and produces one native tracked-changes comparison.
 | Fix an error or refusal | [Troubleshooting](help/troubleshooting.md) |
 | Read working code for a common flow | [Examples](examples.md) |
 | Embed the Rust engine | [`stemma-engine` README](https://github.com/stemma-sh/stemma/blob/main/stemma-engine/README.md) |
+| Script edits from Python (experimental) | [Python reference](reference/python.md) |
 | Build a viewer, renderer, or service | Use [`stemma read`](reference/cli.md#read) for the structured lean view and revision census; [embed the engine](reference/embedding.md) for the full render view. See the [surface matrix](reference/read-model.md#choosing-a-surface) |
 | Store documents and edits durably | [Persist and replay](guide/persistence.md) |
 
@@ -45,6 +46,8 @@ The guide explains the ideas that make Stemma safe:
 - [MCP core reference](reference/mcp.md): the default five-tool agent surface.
 - [MCP advanced reference](reference/mcp-advanced.md): optional expert tools,
   v4 transactions, and advanced recipes.
+- [Python reference](reference/python.md): the experimental `stemma-py`
+  package: install, the edit cycle, compare, audit, and errors.
 - [v4 operation reference](reference/operations.md): every transaction
   operation, its accepted fields, and canonical shapes, generated from the
   engine's parser table.
@@ -58,9 +61,10 @@ The guide explains the ideas that make Stemma safe:
 
 ## Evidence and internals
 
-- [Agent benchmarks](benchmarks.md): current results, methodology, caveats, and
-  corrections.
-- [Benchmark archive](benchmarks-history.md): retired pins and earlier waves.
+- [Benchmark history](benchmarks.md): agent benchmark results for releases
+  v0.1 to v0.5, with methodology, caveats, and corrections.
+- [Benchmark archive](benchmarks-history.md): per-tier tables and wave history
+  behind it.
 - [Architecture](internals/architecture.md): workspace and engine map.
 - [Testing](internals/testing.md): validation tiers and contributor test commands.
 - [Design notes](internals/design-notes.md): decisions behind shipped designs.

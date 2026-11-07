@@ -510,11 +510,8 @@ fn spec_footnote_props_section_2() {
 // 8. CONTINUOUS SECTION WITH OWN MARGINS (ISO 29500-1 sections 17.6.22)
 // ==========================================================================
 
-/// ISO 29500-1 sections 17.6.22: Continuous section with its own margins
-/// should keep those margins, not inherit from the previous section.
-///
-/// inherit_page_properties only fills in None fields. If S2 specifies
-/// margins, they should be preserved.
+/// ISO 29500-1 sections 17.6.22: a continuous section with its own margins
+/// keeps those margins.
 #[test]
 fn spec_continuous_section_keeps_own_margins() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "continuous-own-margins");

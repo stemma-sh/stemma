@@ -109,6 +109,10 @@ fn serialize_element(element: &Element) -> Vec<u8> {
 pub enum WordIrError {
     UnknownParagraphElement(String),
     UnknownRunElement(String),
+    UnsupportedEmptyRunFormattingRevision {
+        run_index: usize,
+        revision_id: u32,
+    },
     MissingTrackedChangeAttribute(&'static str),
     InvalidTrackedChangeAttribute {
         attribute: &'static str,
@@ -139,6 +143,21 @@ pub enum WordIrError {
         attribute: &'static str,
         value: String,
         model: &'static str,
+    },
+    /// A numeric run property attribute (`w:sz/@w:val`, `w:bdr/@w:space`, ...)
+    /// no schema form admits, or outside the model's range.
+    InvalidRunPropertyAttribute {
+        element: &'static str,
+        attribute: &'static str,
+        value: String,
+    },
+    /// A section twips or integer attribute (`w:pgMar/@w:header`,
+    /// `w:docGrid/@w:charSpace`, ...) no schema form admits, or outside the
+    /// model's range.
+    InvalidSectionPropertyAttribute {
+        element: &'static str,
+        attribute: &'static str,
+        value: String,
     },
     /// `w:numPr` is schema-valid with either coordinate omitted, but the
     /// standard does not define an effective numbering pair for that partial
@@ -212,6 +231,15 @@ impl fmt::Display for WordIrError {
             WordIrError::UnknownRunElement(name) => {
                 write!(f, "unknown run-level element: {name}")
             }
+            WordIrError::UnsupportedEmptyRunFormattingRevision {
+                run_index,
+                revision_id,
+            } => {
+                write!(
+                    f,
+                    "empty run {run_index} with formatting revision {revision_id} requires an explicit zero-width formatting-revision model"
+                )
+            }
             WordIrError::MissingTrackedChangeAttribute(attr) => {
                 write!(f, "missing required tracked change attribute: {attr}")
             }
@@ -238,6 +266,22 @@ impl fmt::Display for WordIrError {
                 attribute,
                 value,
             } => write!(f, "invalid w:{element}/@w:{attribute} value: {value:?}"),
+            WordIrError::InvalidRunPropertyAttribute {
+                element,
+                attribute,
+                value,
+            } => write!(
+                f,
+                "invalid run property w:{element}/@w:{attribute} value: {value:?}"
+            ),
+            WordIrError::InvalidSectionPropertyAttribute {
+                element,
+                attribute,
+                value,
+            } => write!(
+                f,
+                "invalid section w:{element}/@w:{attribute} value: {value:?}"
+            ),
             WordIrError::ParagraphPropertyAttributeOutOfRange {
                 element,
                 attribute,
@@ -342,6 +386,10 @@ pub enum AtomKind {
     /// Does NOT contribute to block_text().
     /// Stores the element name and raw XML bytes for roundtripping.
     Decoration { name: String, raw_xml: Vec<u8> },
+    /// Complete source w:r with no displayed content; zero logical width.
+    /// Kept distinct from named decorations so foreign elements named "r"
+    /// cannot be mistaken for an empty Word run.
+    EmptyRun { raw_xml: Vec<u8> },
     /// Comment range start marker — preserves w:id for round-tripping.
     CommentRangeStart { id: String },
     /// Comment range end marker — preserves w:id for round-tripping.
@@ -522,6 +570,10 @@ pub struct TextMarks {
     pub highlight: Option<String>,
     /// Underline style from w:u w:val (e.g., "single", "double", "dotted").
     pub underline_style: Option<String>,
+    /// The other attributes of a w:u that has a w:val (§17.3.2.40: `color`,
+    /// `themeColor`, `themeTint`, `themeShade`), in source order. `Some`
+    /// exactly when `underline_style` is, so both resolve from one level.
+    pub underline_extra_attrs: Option<Vec<(String, String)>>,
     /// East Asian font family from w:rFonts w:eastAsia.
     pub font_east_asia: Option<IStr>,
     /// Theme font reference for eastAsia slot (e.g., "majorEastAsia", "minorEastAsia").
@@ -534,6 +586,8 @@ pub struct TextMarks {
     pub lang: Option<IStr>,
     /// East Asian language tag from w:lang w:eastAsia (e.g., "ja-JP").
     pub lang_east_asia: Option<IStr>,
+    /// Complex-script language tag from w:lang w:bidi.
+    pub lang_bidi: Option<IStr>,
     /// Character spacing in twips from w:spacing w:val in rPr.
     pub char_spacing: Option<i32>,
     /// Font hint from w:rFonts w:hint (MS-OI29500 §17.3.2.26(b)).
@@ -571,6 +625,9 @@ pub struct TextMarks {
     pub run_border_space: Option<u32>,
     /// Run border color as hex RGB from w:bdr w:color.
     pub run_border_color: Option<IStr>,
+    /// None means no border at this level; Some(empty) is an authored border
+    /// with no extra effects and must override inherited frame/shadow values.
+    pub run_border_extra_attrs: Option<Vec<(String, String)>>,
     /// Vertical position offset in half-points from w:position (ISO 29500-1 §17.3.2.19).
     pub position: Option<i64>,
     /// Kerning threshold in half-points from w:kern (ISO 29500-1 §17.3.2.19a).
@@ -586,8 +643,8 @@ pub struct TextMarks {
     /// Snap to document grid from w:snapToGrid (§17.3.2.34).
     pub snap_to_grid: MarkValue,
     /// Run-level shading from w:shd (§17.3.2.32).
-    /// Stored as (fill, val, color) matching the paragraph shading pattern.
-    pub run_shading: Option<(Option<String>, Option<String>, Option<String>)>,
+    /// Retains the complete attribute set until validation at domain import.
+    pub run_shading: Option<RawRunShading>,
     /// East Asian emphasis mark from w:em w:val (§17.3.2.11).
     pub emphasis_mark: Option<String>,
     /// Animated text effect from w:effect w:val (§17.3.2.12).
@@ -600,6 +657,58 @@ pub struct TextMarks {
     /// `crate::domain::PreservedProp`) so they survive re-serialization even
     /// though this parser has no typed field for them.
     pub preserved: Vec<crate::domain::PreservedProp>,
+}
+
+/// Run shading before the pattern is validated at domain import. Attribute
+/// presence and theme modifiers are part of the property, not derived colors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawRunShading {
+    pub fill: Option<String>,
+    pub val: Option<String>,
+    pub color: Option<String>,
+    pub extra_attrs: Vec<crate::domain::QualifiedAttribute>,
+}
+
+pub(crate) fn parse_run_shading(element: &Element) -> RawRunShading {
+    let mut shading = RawRunShading {
+        fill: None,
+        val: None,
+        color: None,
+        extra_attrs: Vec::new(),
+    };
+    for (name, value) in &element.attributes {
+        if name.prefix.as_deref() == Some("xmlns") || name.local_name == "xmlns" {
+            continue;
+        }
+        let is_word = match name.namespace.as_deref() {
+            Some(namespace) => namespace == WORD_NS,
+            None => name.prefix.as_deref() == Some("w"),
+        };
+        if is_word {
+            match name.local_name.as_str() {
+                "fill" => {
+                    shading.fill = Some(value.clone());
+                    continue;
+                }
+                "val" => {
+                    shading.val = Some(value.clone());
+                    continue;
+                }
+                "color" => {
+                    shading.color = Some(value.clone());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        shading.extra_attrs.push(crate::domain::QualifiedAttribute {
+            local_name: name.local_name.clone(),
+            prefix: name.prefix.clone(),
+            namespace: name.namespace.clone(),
+            value: value.clone(),
+        });
+    }
+    shading
 }
 
 /// Tracked formatting change metadata from w:rPrChange.
@@ -966,7 +1075,8 @@ pub struct SpacingProps {
     /// §17.3.1.33: when true, `after` and `after_lines` are ignored and spacing
     /// is automatically determined by the consumer (matching HTML default `<p>` margins).
     pub after_autospacing: Option<bool>,
-    pub line: Option<u32>,
+    /// Signed: `w:line` is ST_SignedTwipsMeasure (§17.3.1.33).
+    pub line: Option<i32>,
     pub line_rule: Option<String>,
 }
 
@@ -990,6 +1100,9 @@ pub struct BorderEdge {
     /// w:space — border offset from the object edge, in points (§17.3.4).
     /// The pBdr path previously dropped this; cell/table borders kept it.
     pub space: Option<u32>,
+    /// Remaining CT_Border properties (including frame, shadow and theme
+    /// attributes) must survive extraction into the domain border.
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 /// A single tab stop definition from w:pPr/w:tabs/w:tab.
@@ -1107,12 +1220,12 @@ impl ParagraphView {
                     extract_section_property_change(element).or(section_property_change);
                 ppr_change = extract_ppr_change(element)?.or(ppr_change);
                 section_properties =
-                    extract_section_properties(element, rel_lookup).or(section_properties);
+                    extract_section_properties(element, rel_lookup)?.or(section_properties);
                 para_mark_status = extract_para_mark_status(element).or(para_mark_status);
                 // For the LIVE mark, an absent rPr genuinely means "no direct
                 // mark properties" — only the pPrChange SNAPSHOT distinguishes
                 // absent (= unchanged) from empty.
-                if let Some(marks) = extract_paragraph_mark_rpr(element) {
+                if let Some(marks) = extract_paragraph_mark_rpr(element)? {
                     paragraph_mark_rpr = marks;
                 }
                 mirror_indents = extract_optional_bool(element, "mirrorIndents").or(mirror_indents);
@@ -1174,6 +1287,10 @@ impl ParagraphView {
 
             // Handle tracked changes containers (del/ins) - recurse into their runs
             if is_w_tag(element, "del") || is_w_tag(element, "ins") {
+                if let Some(link) = lowered_tracked_hyperlink_atom(element, index)? {
+                    atoms.push(link);
+                    continue;
+                }
                 atoms.extend(tracked_change_atoms(element, index, &mut run_ordinal)?);
                 continue;
             }
@@ -1185,6 +1302,7 @@ impl ParagraphView {
             if is_paragraph_widget(&local_name) {
                 let (marks, source_run_attrs) = if local_name == "fldSimple" {
                     simple_field_result_run_context(element)
+                        .transpose()?
                         .unwrap_or_else(|| (TextMarks::default(), Vec::new()))
                 } else {
                     (TextMarks::default(), Vec::new())
@@ -1739,6 +1857,7 @@ impl ParagraphView {
                 AtomKind::Widget { .. } => out.push(BARRIER_CHAR),
                 AtomKind::Hyperlink(_) => out.push(BARRIER_CHAR),
                 AtomKind::Decoration { .. }
+                | AtomKind::EmptyRun { .. }
                 | AtomKind::CommentRangeStart { .. }
                 | AtomKind::CommentRangeEnd { .. } => {} // Zero-width, no contribution
                 AtomKind::TrackedMoveStart { .. } | AtomKind::TrackedMoveEnd { .. } => {} // Zero-width
@@ -1797,13 +1916,16 @@ fn is_paragraph_widget(local_name: &str) -> bool {
     // ordinary document text; §17.5.1.3 / §17.5.1.9).
 }
 
+/// The formatting and source attributes of a `fldSimple` result run.
+type SimpleFieldRunContext = (TextMarks, Vec<(String, String)>);
+
 /// Project the formatting carrier of the one-run `fldSimple` subset into the
 /// widget atom. The complete field remains raw-preserved; returning `None`
 /// for richer shapes does not reinterpret them and the proof lowerer refuses
 /// those shapes before it could rebuild them.
 fn simple_field_result_run_context(
     element: &Element,
-) -> Option<(TextMarks, Vec<(String, String)>)> {
+) -> Option<Result<SimpleFieldRunContext, WordIrError>> {
     let runs = element
         .children
         .iter()
@@ -1821,7 +1943,7 @@ fn simple_field_result_run_context(
     }) {
         return None;
     }
-    Some((extract_text_marks(run), source_run_attrs(run)))
+    Some(extract_text_marks(run).map(|marks| (marks, source_run_attrs(run))))
 }
 
 /// Local names of run-level widget elements (members of EG_RunInnerContent that
@@ -1893,15 +2015,13 @@ fn next_run_ordinal(counter: &mut usize) -> usize {
 fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> {
     let mut atoms = Vec::new();
     let source_run_attrs = source_run_attrs(run);
-    let marks = extract_text_marks(run);
+    let marks = extract_text_marks(run)?;
 
-    // MCE resolution (§9.3) precedes content classification: resolve any
-    // `mc:AlternateContent` among the run's children to its selected branch, so
-    // an AC wrapping run content is modeled identically to that content held
-    // bare — and identically whether or not the run sits inside a tracked-change
-    // container. Only clone the child list when an AC is actually present (the
-    // overwhelmingly common case is none). rPr is untouched: an AC INSIDE run
-    // properties is not run content and is not resolved here.
+    // MCE selection (§9.3) precedes content classification. Editable run content
+    // expands into its selected atoms; one drawing keeps its complete envelope
+    // while being classified by its selected branch. Tracking the parent run
+    // does not change either rule. Clone only when AC is present. rPr is
+    // untouched: AC inside properties is not run content.
     let resolved_children;
     let run_children: &[XMLNode] = if run
         .children
@@ -1929,7 +2049,9 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 
         // Text content (t = normal text, delText = deleted text in tracked changes)
         if local_name == "t" || local_name == "delText" {
-            let text = text_from_element(element);
+            // Edge whitespace is content only under xml:space="preserve", as
+            // Word and every other reader take it.
+            let text = crate::word_xml::active_word_text(element);
             if text.is_empty() {
                 continue;
             }
@@ -1999,11 +2121,21 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             continue;
         }
 
-        // Widgets (occupy space)
-        if is_run_widget(&local_name) {
+        // A drawing's selected branch determines its kind, but the complete
+        // compatibility envelope owns its serialization. Inactive legacy
+        // representations can carry reconstruction properties (MS-OI29500
+        // §3.1.4) not present in the active drawing.
+        let widget = if is_mc_alternate_content(element) {
+            selected_mc_drawing(element)?
+        } else if is_run_widget(&local_name) {
+            Some(element)
+        } else {
+            None
+        };
+        if let Some(widget) = widget {
             atoms.push(Atom {
                 kind: AtomKind::Widget {
-                    name: element.name.clone(),
+                    name: widget.name.clone(),
                     raw_xml: serialize_element(element),
                 },
                 utf16_len: 1,
@@ -2039,9 +2171,8 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
             continue;
         }
 
-        // `mc:AlternateContent` never reaches here: it is resolved to its
-        // selected branch's content above (see `resolve_run_alternate_content`),
-        // so the loop only ever sees the resolved content, never the wrapper.
+        // Selected drawing envelopes were consumed as widgets above. Other
+        // run-level AlternateContent was expanded before content classification.
 
         // Wild-input tolerance (Word-verified, wave campaign): LibreOffice
         // 24.2 emits a stray childless COPY of the run's own rPr/rPrChange as
@@ -2072,6 +2203,32 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 
         // Unknown run-level element - fail fast
         return Err(WordIrError::UnknownRunElement(element.name.clone()));
+    }
+    if atoms.is_empty() {
+        // CT_R permits zero run-content children (§17.3.2.25). Preserve the
+        // complete zero-width run, including authored rPr and provenance.
+        // A formatting revision on such a run needs its own revision model;
+        // raw preservation alone must not hide that unresolved revision.
+        if let Some(change) = marks.rpr_change.as_deref() {
+            return Err(WordIrError::UnsupportedEmptyRunFormattingRevision {
+                run_index,
+                revision_id: change.revision_id,
+            });
+        }
+        atoms.push(Atom {
+            kind: AtomKind::EmptyRun {
+                raw_xml: serialize_element(run),
+            },
+            utf16_len: 0,
+            source_run_attrs,
+            origin: AtomOrigin {
+                run_index: Some(run_index),
+                child_index: None,
+                paragraph_child_index: None,
+            },
+            marks,
+            tracking: None,
+        });
     }
     // Text and tab children from one source w:r are one formatting/layout
     // carrier. Keep them in one atom when they are contiguous so the canonical
@@ -2204,7 +2361,7 @@ fn tracked_change_revision_id(element: &Element) -> Result<u32, WordIrError> {
 }
 
 /// Resolve every `mc:AlternateContent` directly inside a tracked-change container
-/// (or inside one of its direct-child runs) to its selected branch's content,
+/// to its selected branch's content,
 /// returning a clone of `container` with the AC wrappers replaced in place.
 ///
 /// MCE preprocessing precedes revision semantics (ISO/IEC 29500-3 §9.4 + ECMA-376
@@ -2215,10 +2372,9 @@ fn tracked_change_revision_id(element: &Element) -> Result<u32, WordIrError> {
 /// readings — silent content loss. We reuse [`select_mc_branch`] (the shared
 /// resolution helper) so the branch choice matches the standalone path exactly.
 ///
-/// Scope: only AC that is a direct child of the container, or a child of a
-/// direct-child `w:r`, is resolved here — the shapes Word emits for a tracked
-/// shape/extension insertion. Standalone (non-tracked) AC is untouched and stays
-/// opaque (preserving the wrapper for rebuild fidelity).
+/// Scope: only AC directly under the tracked container resolves here. Child
+/// runs retain their own markup and enter run_atoms, which owns the common
+/// tracked/untracked rule for editable atoms and preserved drawing envelopes.
 fn resolve_alternate_content_in_tracked(container: &Element) -> Result<Element, WordIrError> {
     /// Selected-branch child elements of an AC, as cloned `XMLNode`s spliced into
     /// the parent in place of the AC wrapper. A non-selected AC (no Choice
@@ -2240,31 +2396,9 @@ fn resolve_alternate_content_in_tracked(container: &Element) -> Result<Element, 
                 // branch's content (runs, widgets, …) in place.
                 new_children.extend(branch_nodes(el)?);
             }
-            XMLNode::Element(el) if is_w_tag(el, "r") => {
-                // A run that may itself contain an AC (e.g. an inserted shape run).
-                // Resolve any AC among its children in place; leave everything
-                // else untouched.
-                let has_ac = el
-                    .children
-                    .iter()
-                    .any(|c| matches!(c, XMLNode::Element(e) if is_mc_alternate_content(e)));
-                if !has_ac {
-                    new_children.push(child.clone());
-                    continue;
-                }
-                let mut new_run = el.clone();
-                let mut run_children: Vec<XMLNode> = Vec::with_capacity(el.children.len());
-                for run_child in el.children.iter() {
-                    match run_child {
-                        XMLNode::Element(e) if is_mc_alternate_content(e) => {
-                            run_children.extend(branch_nodes(e)?);
-                        }
-                        other => run_children.push(other.clone()),
-                    }
-                }
-                new_run.children = run_children;
-                new_children.push(XMLNode::Element(new_run));
-            }
+            // Runs go through run_atoms, the same classification and envelope
+            // ownership boundary used for untracked runs. Expanding their AC
+            // here would destroy drawing payload before that boundary sees it.
             other => new_children.push(other.clone()),
         }
     }
@@ -2276,15 +2410,10 @@ fn resolve_alternate_content_in_tracked(container: &Element) -> Result<Element, 
 /// branch's content (ISO/IEC 29500-3 §9.3), returning the run's child list with
 /// each AC wrapper replaced in place by the branch's children.
 ///
-/// An AC carrying run-level content — a `w:drawing` shape in its `wps` Choice, a
-/// plain `w:t`/`w:sym` in a Fallback — thereby models EXACTLY as the same content
-/// would if the run held it directly: an AC-wrapped drawing and a bare drawing
-/// produce the identical `Drawing` widget, and the SAME AC resolves the SAME way
-/// whether or not its run sits inside a tracked-change container. This closes a
-/// positional inconsistency: previously an AC inside a `w:ins`/`w:del` run was
-/// resolved (via [`resolve_alternate_content_in_tracked`]) while a structurally
-/// identical AC in an untracked run was kept verbatim as one opaque widget, so
-/// two identical constructs in one document resolved differently.
+/// A single selected drawing remains one Drawing widget with the complete AC
+/// envelope as its serialization payload. Editable run content (text, symbols,
+/// tabs, etc.) still expands into its selected atoms, never an opaque widget.
+/// Both tracked and untracked runs enter this same ownership boundary.
 ///
 /// Branch selection is the shared [`select_mc_branch`] (Choice whose `Requires`
 /// namespaces we understand, else the Fallback), matching the tracked and
@@ -2296,7 +2425,9 @@ fn resolve_run_alternate_content(children: &[XMLNode]) -> Result<Vec<XMLNode>, W
     for child in children {
         match child {
             XMLNode::Element(el) if is_mc_alternate_content(el) => {
-                if let Some(branch) = select_mc_branch(el)? {
+                if selected_mc_drawing(el)?.is_some() {
+                    out.push(child.clone());
+                } else if let Some(branch) = select_mc_branch(el)? {
                     out.extend(resolve_run_alternate_content(&branch.children)?);
                 }
             }
@@ -2306,35 +2437,216 @@ fn resolve_run_alternate_content(children: &[XMLNode]) -> Result<Vec<XMLNode>, W
     Ok(out)
 }
 
+/// An alternate representation of one drawing still has one active object.
+/// This classification does not turn selected text or multiple atoms into an
+/// opaque object merely because a compatibility wrapper surrounds them.
+fn selected_mc_drawing(element: &Element) -> Result<Option<&Element>, WordIrError> {
+    let Some(branch) = select_mc_branch(element)? else {
+        return Ok(None);
+    };
+    let mut children = branch.children.iter().filter_map(|node| match node {
+        XMLNode::Element(child) => Some(child),
+        _ => None,
+    });
+    let Some(child) = children.next() else {
+        return Ok(None);
+    };
+    if children.next().is_some() {
+        return Ok(None);
+    }
+    if is_mc_alternate_content(child) {
+        return selected_mc_drawing(child);
+    }
+    Ok(["drawing", "pict", "object"]
+        .iter()
+        .any(|name| is_w_tag(child, name))
+        .then_some(child))
+}
+
+/// Path to the selected single drawing within a retained compatibility
+/// envelope. Indices include non-element nodes so mutation reaches the same
+/// source owner without flattening or rebuilding sibling representations.
+pub(crate) fn selected_mc_drawing_path(element: &Element) -> Result<Vec<usize>, WordIrError> {
+    let selected = selected_mc_drawing(element)?
+        .ok_or_else(|| WordIrError::UnknownRunElement(element.name.clone()))?;
+    fn path_to(element: &Element, target: &Element, path: &mut Vec<usize>) -> bool {
+        if std::ptr::eq(element, target) {
+            return true;
+        }
+        for (index, child) in element.children.iter().enumerate() {
+            if let XMLNode::Element(child) = child {
+                path.push(index);
+                if path_to(child, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+    let mut path = Vec::new();
+    assert!(path_to(element, selected, &mut path));
+    Ok(path)
+}
+
+/// Read-only active representation of an opaque drawing. The original envelope
+/// stays owned by the opaque payload; callers must not serialize this reading
+/// as an unchanged drawing. In particular, fallback-only text is not visible.
+pub(crate) fn active_drawing_representation(element: &Element) -> Result<Element, WordIrError> {
+    fn active_children(children: &[XMLNode]) -> Result<Vec<XMLNode>, WordIrError> {
+        let mut out = Vec::new();
+        for child in children {
+            match child {
+                XMLNode::Element(element) if is_mc_alternate_content(element) => {
+                    if let Some(branch) = select_mc_branch(element)? {
+                        out.extend(active_children(&branch.children)?);
+                    }
+                }
+                XMLNode::Element(element) => {
+                    let mut selected = element.clone();
+                    selected.children = active_children(&element.children)?;
+                    out.push(XMLNode::Element(selected));
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        Ok(out)
+    }
+    let mut selected = if is_mc_alternate_content(element) {
+        selected_mc_drawing(element)?
+            .ok_or_else(|| WordIrError::UnknownRunElement(element.name.clone()))?
+            .clone()
+    } else {
+        element.clone()
+    };
+    selected.children = active_children(&selected.children)?;
+    Ok(selected)
+}
+
 /// Process a tracked change container (w:del, w:ins, w:moveFrom, w:moveTo) which contains runs.
 /// Extracts revision attributes and tags all produced atoms with tracking context.
 /// moveFrom → Deleted, moveTo → Inserted (same semantics as del/ins).
+/// The revision a `w:ins`/`w:del`/`w:moveFrom`/`w:moveTo` container gives
+/// the atoms inside it; `None` for any other element.
+fn tracked_container_context(
+    container: &Element,
+) -> Result<Option<AtomTrackingContext>, WordIrError> {
+    if !(is_w_tag(container, "ins")
+        || is_w_tag(container, "del")
+        || is_w_tag(container, "moveFrom")
+        || is_w_tag(container, "moveTo"))
+    {
+        return Ok(None);
+    }
+    let is_insertion = is_w_tag(container, "ins") || is_w_tag(container, "moveTo");
+    let revision_id = tracked_change_revision_id(container)?;
+    let author = attr_value(container, "author")
+        .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
+        .to_string();
+    let date = attr_value(container, "date").map(|s| s.to_string());
+    Ok(Some(AtomTrackingContext {
+        is_insertion,
+        revision_id,
+        author,
+        date,
+        stacked_deletion: None,
+    }))
+}
+
+/// Read a tracked whole-hyperlink revision back as the hyperlink it was.
+///
+/// A `w:hyperlink` cannot sit inside `w:ins`/`w:del`, so the serializer
+/// writes an inserted or deleted link as one complete HYPERLINK field inside
+/// the revision (`append_tracked_hyperlink_paragraph_opaque`). Without this,
+/// a tracked link and its saved form are two spellings of one state. Only
+/// that exact lowering folds: the link is rebuilt from the field's target and
+/// display runs, lowered again, and every run must match canonically. Any
+/// other tracked field, Word's own included, stays a field.
+fn lowered_tracked_hyperlink_atom(
+    container: &Element,
+    container_index: usize,
+) -> Result<Option<Atom>, WordIrError> {
+    let deleted = is_w_tag(container, "del");
+    if !deleted && !is_w_tag(container, "ins") {
+        return Ok(None);
+    }
+    let runs: Vec<&Element> = container
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) => Some(element),
+            _ => None,
+        })
+        .collect();
+    // begin, instruction, separate, at least one display run, end
+    if runs.len() < 5 || !runs.iter().all(|run| is_w_tag(run, "r")) {
+        return Ok(None);
+    }
+    let instruction_tag = if deleted { "delInstrText" } else { "instrText" };
+    let Some(instruction) = runs[1].children.iter().find_map(|child| match child {
+        XMLNode::Element(element) if is_w_tag(element, instruction_tag) => element.get_text(),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let Ok(crate::domain::FieldSemantic::Hyperlink(spec)) =
+        crate::domain::parse_field_instruction(&instruction)
+    else {
+        return Ok(None);
+    };
+    let (url, anchor) = match spec.target {
+        crate::domain::HyperlinkTarget::Url { url } => (Some(url), None),
+        crate::domain::HyperlinkTarget::Bookmark { anchor } => (None, Some(anchor)),
+        _ => return Ok(None),
+    };
+    let mut display = Element::new("hyperlink");
+    display.children = runs[3..runs.len() - 1]
+        .iter()
+        .map(|run| XMLNode::Element((*run).clone()))
+        .collect();
+    let display_runs = extract_runs_from_hyperlink(&display);
+    let data = HyperlinkData {
+        url,
+        anchor,
+        text: display_runs.iter().map(|run| run.text.as_str()).collect(),
+        r_id: None,
+        runs: display_runs,
+        // The lowering writes `\h` unless the link records history.
+        extra_attrs: if spec.no_history {
+            Vec::new()
+        } else {
+            vec![("w:history".to_string(), "1".to_string())]
+        },
+    };
+    let expected = crate::serialize::lowered_tracked_hyperlink_runs(&data, deleted);
+    let lowered = expected.len() == runs.len()
+        && expected.iter().zip(&runs).all(|(expected, run)| {
+            crate::import::canonical_raw_hash(&crate::word_xml::serialize_raw_fragment(expected))
+                == crate::import::canonical_raw_hash(&serialize_element(run))
+        });
+    if !lowered {
+        return Ok(None);
+    }
+    Ok(Some(Atom {
+        kind: AtomKind::Hyperlink(data),
+        utf16_len: 1, // Occupies space as a single barrier, like any link
+        source_run_attrs: Vec::new(),
+        origin: AtomOrigin {
+            run_index: None,
+            child_index: None,
+            paragraph_child_index: Some(container_index),
+        },
+        marks: TextMarks::default(),
+        tracking: tracked_container_context(container)?,
+    }))
+}
+
 fn tracked_change_atoms(
     container: &Element,
     container_index: usize,
     run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
-    let tracking = if is_w_tag(container, "ins")
-        || is_w_tag(container, "del")
-        || is_w_tag(container, "moveFrom")
-        || is_w_tag(container, "moveTo")
-    {
-        let is_insertion = is_w_tag(container, "ins") || is_w_tag(container, "moveTo");
-        let revision_id = tracked_change_revision_id(container)?;
-        let author = attr_value(container, "author")
-            .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
-            .to_string();
-        let date = attr_value(container, "date").map(|s| s.to_string());
-        Some(AtomTrackingContext {
-            is_insertion,
-            revision_id,
-            author,
-            date,
-            stacked_deletion: None,
-        })
-    } else {
-        None
-    };
+    let tracking = tracked_container_context(container)?;
 
     // MCE preprocessing precedes revision semantics (§9.4 + §17.13.5.18): resolve
     // any AlternateContent directly inside this container (or inside its
@@ -2440,6 +2752,7 @@ fn tracked_change_atoms(
         if is_paragraph_widget(&local_name) {
             let (marks, source_run_attrs) = if local_name == "fldSimple" {
                 simple_field_result_run_context(element)
+                    .transpose()?
                     .unwrap_or_else(|| (TextMarks::default(), Vec::new()))
             } else {
                 (TextMarks::default(), Vec::new())
@@ -2868,10 +3181,14 @@ fn local_element_name_str(name: &str) -> &str {
 /// An unknown/absent fldCharType does not change the depth (it parses per the
 /// unknown-fldCharType leniency and stays an opaque widget).
 ///
-/// Scope note: a complex field that is split across paragraph boundaries is not
-/// tracked here (depth resets per paragraph) — Word keeps a field's codes within
-/// one paragraph in practice, and the conformant shapes this guards against are
-/// single-paragraph.
+/// A complex field may span paragraphs: Word writes table-of-contents entry
+/// fields as `TC \l2 "` at the end of one paragraph and the entry's title, still
+/// field code, in the next, followed by the field's `end`. Such a paragraph
+/// starts inside a field opened earlier, which shows as `end`s with no `begin`
+/// before them in this paragraph; the paragraph's starting depth is their count,
+/// so its instrText before them stays field code. (A paragraph lying wholly
+/// inside a field, with instruction text and no fldChar at all, cannot be told
+/// from an orphan without the story's earlier paragraphs and is read as one.)
 fn reclassify_orphan_instr_text(atoms: &mut [Atom]) {
     // Conservative guard: a fldChar whose fldCharType is missing/unreadable
     // makes the paragraph's field structure ambiguous (CT_FldChar requires the
@@ -2886,7 +3203,18 @@ fn reclassify_orphan_instr_text(atoms: &mut [Atom]) {
         return;
     }
 
-    let mut field_depth: u32 = 0;
+    // Fields this paragraph closes without opening were opened before it.
+    let mut opened_before: u32 = 0;
+    let mut depth: u32 = 0;
+    for atom in atoms.iter() {
+        match fld_char_type(atom).as_deref() {
+            Some("begin") => depth += 1,
+            Some("end") if depth == 0 => opened_before += 1,
+            Some("end") => depth -= 1,
+            _ => {}
+        }
+    }
+    let mut field_depth: u32 = opened_before;
     for atom in atoms.iter_mut() {
         // Update field nesting depth from fldChar markers BEFORE deciding about
         // a co-located instrText (they are distinct atoms, so order is by their
@@ -2957,7 +3285,7 @@ fn source_run_attrs(run: &Element) -> Vec<(String, String)> {
 
 /// Extract formatting marks from w:rPr child of a w:r element.
 /// Delegates to `parse_rpr_element` — the single canonical rPr parser.
-fn extract_text_marks(run: &Element) -> TextMarks {
+fn extract_text_marks(run: &Element) -> Result<TextMarks, WordIrError> {
     let mut rpr = None;
     let mut rpr_index = None;
     let mut content_index = None;
@@ -2973,17 +3301,21 @@ fn extract_text_marks(run: &Element) -> TextMarks {
         }
     }
     let Some(rpr) = rpr else {
-        return TextMarks::default();
+        return Ok(TextMarks::default());
     };
-    let mut marks = parse_rpr_element(rpr);
+    let mut marks = parse_rpr_element(rpr)?;
     marks.rpr_after_content =
         matches!((rpr_index, content_index), (Some(rpr), Some(content)) if rpr > content);
-    marks
+    Ok(marks)
 }
 
 /// Canonical parser for a w:rPr element. All rPr parsing goes through here.
 /// Handles every CT_RPr / EG_RPrBase child element per ECMA-376 §17.3.2.
-pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
+///
+/// A numeric value no schema form admits is refused with its element and
+/// attribute rather than dropped: a dropped size or spacing silently becomes
+/// the style's value on the next save.
+pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError> {
     let mut marks = TextMarks::default();
 
     for child in &rpr.children {
@@ -2992,6 +3324,10 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             _ => continue,
         };
 
+        if !is_word_core_element(el) {
+            marks.preserved.push(preserved_rpr_child(el));
+            continue;
+        }
         let local_name = local_element_name(el);
 
         match local_name.as_str() {
@@ -3017,6 +3353,10 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             "u" => {
                 marks.underline = parse_underline_value(el);
                 marks.underline_style = attr_value(el, "val").cloned();
+                marks.underline_extra_attrs = marks
+                    .underline_style
+                    .is_some()
+                    .then(|| crate::xml_attrs::capture_extra_attrs(el, &["val"]));
                 if marks.underline_style.is_none() && !el.attributes.is_empty() {
                     marks.preserve_val_absent_underline = true;
                     marks.preserved.push(crate::domain::PreservedProp {
@@ -3091,10 +3431,11 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             // --- Font sizes ---
             "sz" => {
                 // w:sz w:val="24" — half-points (24 = 12pt)
-                marks.font_size = attr_value(el, "val").and_then(|v| v.parse().ok());
+                marks.font_size = rpr_unsigned(el, "sz", "val", rpr_half_points(el, "sz", false)?)?;
             }
             "szCs" => {
-                marks.font_size_cs = attr_value(el, "val").and_then(|v| v.parse::<u32>().ok());
+                marks.font_size_cs =
+                    rpr_unsigned(el, "szCs", "val", rpr_half_points(el, "szCs", false)?)?;
             }
 
             // --- Color & highlight ---
@@ -3121,24 +3462,32 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             "lang" => {
                 marks.lang = attr_value(el, "val").map(|s| IStr::from(s.as_str()));
                 marks.lang_east_asia = attr_value(el, "eastAsia").map(|s| IStr::from(s.as_str()));
+                marks.lang_bidi = attr_value(el, "bidi").map(|s| IStr::from(s.as_str()));
             }
 
             // --- Spacing / positioning / scaling ---
             "spacing" => {
-                marks.char_spacing = attr_value(el, "val").and_then(|v| v.parse::<i32>().ok());
+                // ST_SignedTwipsMeasure (§17.3.2.35).
+                marks.char_spacing = rpr_twips(el, "spacing", "val", true)?
+                    .map(|twips| {
+                        i32::try_from(twips)
+                            .map_err(|_| invalid_rpr_attribute(el, "spacing", "val"))
+                    })
+                    .transpose()?;
             }
             "position" => {
                 // w:position w:val="6" — vertical displacement in half-points (ISO 29500-1 §17.3.2.19)
-                marks.position = attr_value(el, "val").and_then(|v| v.parse::<i64>().ok());
+                // ST_SignedHpsMeasure.
+                marks.position = rpr_half_points(el, "position", true)?;
             }
             "kern" => {
                 // w:kern w:val="28" — kerning threshold in half-points (ISO 29500-1 §17.3.2.19a)
-                marks.kern = attr_value(el, "val").and_then(|v| v.parse::<i64>().ok());
+                // ST_HpsMeasure.
+                marks.kern = rpr_half_points(el, "kern", false)?;
             }
             "w" => {
                 // w:w w:val="150" — character width scaling percentage (ISO 29500-1 §17.3.2.43)
-                marks.char_width_scaling =
-                    attr_value(el, "val").and_then(|v| v.parse::<i64>().ok());
+                marks.char_width_scaling = rpr_text_scale(el)?;
             }
 
             // --- Character style reference ---
@@ -3151,10 +3500,15 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             "bdr" => {
                 // w:bdr — run border (ISO 29500-1 §17.3.2.4)
                 marks.run_border_style = attr_value(el, "val").map(|s| IStr::from(s.as_str()));
-                marks.run_border_size = attr_value(el, "sz").and_then(|v| v.parse::<u32>().ok());
+                // sz is ST_EighthPointMeasure, space ST_PointMeasure: both
+                // unsigned ST_DecimalNumber.
+                marks.run_border_size =
+                    rpr_unsigned(el, "bdr", "sz", rpr_decimal(el, "bdr", "sz")?)?;
                 marks.run_border_space =
-                    attr_value(el, "space").and_then(|v| v.parse::<u32>().ok());
+                    rpr_unsigned(el, "bdr", "space", rpr_decimal(el, "bdr", "space")?)?;
                 marks.run_border_color = attr_value(el, "color").map(|s| IStr::from(s.as_str()));
+                marks.run_border_extra_attrs =
+                    Some(capture_extra_attrs(el, &["val", "sz", "space", "color"]));
             }
 
             // --- Tracked formatting change ---
@@ -3173,7 +3527,7 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
                 // tracked change (mirrors parse_tbl_pr_change's missing-inner
                 // handling).
                 let previous = match find_w_child(el, "rPr") {
-                    Some(inner_rpr) => parse_rpr_element(inner_rpr),
+                    Some(inner_rpr) => parse_rpr_element(inner_rpr)?,
                     None => TextMarks::default(),
                 };
                 marks.rpr_change = Some(Box::new(RprChange {
@@ -3193,12 +3547,7 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             // --- Value-carrying rPr children ---
             "shd" => {
                 // §17.3.2.32 — run shading (same CT_Shd as paragraph/cell shading).
-                let fill = attr_value(el, "fill").cloned();
-                let val = attr_value(el, "val").cloned();
-                let color = attr_value(el, "color").cloned();
-                if fill.is_some() || val.is_some() || color.is_some() {
-                    marks.run_shading = Some((fill, val, color));
-                }
+                marks.run_shading = Some(parse_run_shading(el));
             }
             "em" => {
                 // §17.3.2.11 — east asian emphasis mark.
@@ -3210,13 +3559,21 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
             }
             "fitText" => {
                 // §17.3.2.14 — fit text within specified width.
-                marks.fit_text_width = attr_value(el, "val").and_then(|v| v.parse::<u32>().ok());
-                marks.fit_text_id = attr_value(el, "id").and_then(|v| v.parse::<u32>().ok());
+                // val is ST_TwipsMeasure, id ST_DecimalNumber.
+                marks.fit_text_width = rpr_unsigned(
+                    el,
+                    "fitText",
+                    "val",
+                    rpr_twips(el, "fitText", "val", false)?,
+                )?;
+                marks.fit_text_id =
+                    rpr_unsigned(el, "fitText", "id", rpr_decimal(el, "fitText", "id")?)?;
             }
 
-            // Paragraph-mark revision markers (§17.13.5.19/.28) — parsed by
+            // Paragraph-mark revision markers (§17.13.5.19/.28, and the mark's
+            // move carriers §17.13.5.21/.26) — parsed by
             // extract_para_mark_status, not text marks. No-op here.
-            "ins" | "del" => {}
+            "ins" | "del" | "moveFrom" | "moveTo" => {}
 
             // --- Preserved remainder: unmodeled rPr child ---
             //
@@ -3233,16 +3590,22 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> TextMarks {
                     element = %unknown,
                     "parse_rpr_element: unmodeled rPr child element captured verbatim as a preserved remainder"
                 );
-                marks.preserved.push(crate::domain::PreservedProp {
-                    name: qualified_element_name(el),
-                    raw_xml: String::from_utf8(serialize_element(el))
-                        .expect("serialize_element always emits valid UTF-8 XML"),
-                });
+                marks.preserved.push(preserved_rpr_child(el));
             }
         }
     }
 
-    marks
+    Ok(marks)
+}
+
+/// An rPr child kept verbatim: an unmodeled core element, or any extension
+/// element (round-tripped byte-for-byte as a preserved remainder).
+fn preserved_rpr_child(el: &Element) -> crate::domain::PreservedProp {
+    crate::domain::PreservedProp {
+        name: qualified_element_name(el),
+        raw_xml: String::from_utf8(serialize_element(el))
+            .expect("serialize_element always emits valid UTF-8 XML"),
+    }
 }
 
 /// Parse a toggle property value (CT_OnOff, like w:b, w:i).
@@ -3298,6 +3661,23 @@ fn is_w_tag(element: &Element, local: &str) -> bool {
         return element.namespace.as_deref() == Some(WORD_NS);
     }
     element.name == format!("w:{local}")
+}
+
+/// True iff `element` is a WordprocessingML core element. An extension element
+/// can share a core local name — `w14:shadow` (a DrawingML text effect, MS-DOCX
+/// §2.6) is not `w:shadow` (the legacy shadow toggle, §17.3.2.32) — so a
+/// property parser must check the namespace, not just the local name.
+pub(crate) fn is_word_core_element(element: &Element) -> bool {
+    match element.namespace.as_deref() {
+        Some(namespace) => namespace == WORD_NS,
+        None => match element.prefix.as_deref() {
+            Some(prefix) => prefix == "w",
+            None => element
+                .name
+                .split_once(':')
+                .is_none_or(|(prefix, _)| prefix == "w"),
+        },
+    }
 }
 
 /// True iff `element` lives in a FOREIGN namespace: it has an explicit
@@ -4062,7 +4442,11 @@ fn extract_indentation(p_pr: &Element) -> Result<Option<IndentProps>, WordIrErro
             })?,
         )
     } else if attr_value(ind, "firstLine").is_some() {
-        parse_twips_i32("firstLine", false)?
+        // The schema types firstLine as unsigned, but Word opens a negative one
+        // and reads it as a hanging indent of that size (it saves
+        // firstLine="-360" as hanging="360"), which is the signed first-line
+        // value the model already holds for a hanging indent.
+        parse_twips_i32("firstLine", true)?
     } else {
         None
     };
@@ -4369,7 +4753,16 @@ fn extract_spacing(p_pr: &Element) -> Result<Option<SpacingProps>, WordIrError> 
     // is automatically determined by the consumer.
     let before_autospacing = parse_on_off("beforeAutospacing")?;
     let after_autospacing = parse_on_off("afterAutospacing")?;
-    let line = parse_spacing_twips(sp, "line", true)?;
+    let line = parse_paragraph_twip_measure(sp, "spacing", "line", true)?
+        .map(|twips| {
+            i32::try_from(twips).map_err(|_| WordIrError::ParagraphPropertyAttributeOutOfRange {
+                element: "spacing",
+                attribute: "line",
+                value: attr_value(sp, "line").cloned().unwrap_or_default(),
+                model: "i32 twips",
+            })
+        })
+        .transpose()?;
     // Per §17.3.1.33: "If [lineRule] is omitted, then it shall be assumed
     // to be of a value auto if a line attribute value is present."
     let line_rule = attr_value(sp, "lineRule")
@@ -4659,6 +5052,7 @@ fn extract_border_edge(
         color,
         size,
         space,
+        extra_attrs: capture_extra_attrs(edge, &["val", "color", "sz", "space"]),
     }))
 }
 
@@ -4794,15 +5188,142 @@ fn extract_ppr_change(p_pr: &Element) -> Result<Option<PprChange>, WordIrError> 
             }
         }),
         previous_cnf_style: extract_cnf_style(inner_ppr)?,
-        previous_paragraph_mark_rpr: extract_paragraph_mark_rpr(inner_ppr),
+        previous_paragraph_mark_rpr: extract_paragraph_mark_rpr(inner_ppr)?,
         preserved,
         author,
         date,
     }))
 }
 
-fn extract_paragraph_mark_rpr(p_pr: &Element) -> Option<TextMarks> {
-    find_w_child(p_pr, "rPr").map(parse_rpr_element)
+fn extract_paragraph_mark_rpr(p_pr: &Element) -> Result<Option<TextMarks>, WordIrError> {
+    find_w_child(p_pr, "rPr").map(parse_rpr_element).transpose()
+}
+
+fn invalid_rpr_attribute(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> WordIrError {
+    WordIrError::InvalidRunPropertyAttribute {
+        element: element_name,
+        attribute,
+        value: attr_value(element, attribute).cloned().unwrap_or_default(),
+    }
+}
+
+/// An ST_DecimalNumber attribute of a run property: an integer, or a
+/// tolerated decimal spelling ("21.0") read truncated, as the import reads
+/// every decimal integer. Anything else is refused.
+fn rpr_decimal(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    if let Ok(number) = value.parse::<i64>() {
+        return Ok(Some(number));
+    }
+    let invalid = || invalid_rpr_attribute(element, element_name, attribute);
+    if !crate::import::is_schema_decimal(value) {
+        return Err(invalid());
+    }
+    let truncated = value.parse::<f64>().map_err(|_| invalid())?.trunc();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&truncated) {
+        return Err(invalid());
+    }
+    Ok(Some(truncated as i64))
+}
+
+/// The `w:val` of a half-point run property: ST_HpsMeasure (`w:sz`,
+/// `w:szCs`, `w:kern`) or, when `signed`, ST_SignedHpsMeasure
+/// (`w:position`). Either is an integer of half-points (a decimal spelling
+/// truncates, as [`rpr_decimal`]) or a universal measure, converted to the
+/// nearest half-point ("10.5pt" is 21).
+fn rpr_half_points(
+    element: &Element,
+    element_name: &'static str,
+    signed: bool,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, "val") else {
+        return Ok(None);
+    };
+    let invalid = || invalid_rpr_attribute(element, element_name, "val");
+    let universal = (value.len() > 2 && value.is_char_boundary(value.len() - 2))
+        .then(|| value.split_at(value.len() - 2))
+        .and_then(|(number, unit)| {
+            crate::import::universal_measure_unit_to_twips(unit).map(|twips| (number, twips))
+        });
+    let half_points = match universal {
+        Some((number, twips_per_unit)) => {
+            if !crate::import::is_schema_decimal(number) {
+                return Err(invalid());
+            }
+            // A half-point is ten twips.
+            let half_points =
+                (number.parse::<f64>().map_err(|_| invalid())? * twips_per_unit / 10.0).round();
+            if !(i64::MIN as f64..=i64::MAX as f64).contains(&half_points) {
+                return Err(invalid());
+            }
+            half_points as i64
+        }
+        None => rpr_decimal(element, element_name, "val")?.expect("w:val is present"),
+    };
+    if half_points < 0 && !signed {
+        return Err(invalid());
+    }
+    Ok(Some(half_points))
+}
+
+/// A twips run property attribute: ST_TwipsMeasure or, when `signed`,
+/// ST_SignedTwipsMeasure, read as import reads every twips measure.
+fn rpr_twips(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+    signed: bool,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    match crate::import::parse_measurement_or_percent(
+        value,
+        &format!("w:{element_name}/@w:{attribute}"),
+    ) {
+        Ok(
+            crate::import::MeasurementOrPercent::Number(twips)
+            | crate::import::MeasurementOrPercent::UniversalTwips(twips),
+        ) if signed || twips >= 0 => Ok(Some(twips)),
+        _ => Err(invalid_rpr_attribute(element, element_name, attribute)),
+    }
+}
+
+/// `w:w/@w:val` (§17.3.2.43, ST_TextScale): a percentage of the normal
+/// character width, written as an integer or, in the strict form, "150%".
+fn rpr_text_scale(element: &Element) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, "val") else {
+        return Ok(None);
+    };
+    match value.strip_suffix('%').unwrap_or(value).parse::<i64>() {
+        Ok(percent) if percent >= 0 => Ok(Some(percent)),
+        _ => Err(invalid_rpr_attribute(element, "w", "val")),
+    }
+}
+
+/// `number` narrowed to an unsigned model field; outside it is refused.
+fn rpr_unsigned(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+    number: Option<i64>,
+) -> Result<Option<u32>, WordIrError> {
+    number
+        .map(|number| {
+            u32::try_from(number)
+                .map_err(|_| invalid_rpr_attribute(element, element_name, attribute))
+        })
+        .transpose()
 }
 
 /// Extract paragraph mark tracking status from w:pPr/w:rPr (§17.13.5.28).
@@ -4902,21 +5423,145 @@ pub(crate) fn parse_header_footer_kind(type_attr: Option<&str>) -> crate::domain
     }
 }
 
+/// A twips attribute of a section property (`w:pgSz`, `w:pgMar`, `w:cols`,
+/// `w:col`, `w:lnNumType`): ST_TwipsMeasure or ST_SignedTwipsMeasure, decimal
+/// twips or a universal measure. Read as import reads every twips measure: a
+/// decimal truncates, as Word reads it (`w:header="566.93"` saves as 566), and
+/// a universal measure rounds. A value neither form admits is refused, not
+/// dropped: the section is rebuilt from the model on save, so a dropped value
+/// would silently become Word's default.
+fn section_twips(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    match crate::import::parse_measurement_or_percent(
+        value,
+        &format!("w:{element_name}/@w:{attribute}"),
+    ) {
+        Ok(
+            crate::import::MeasurementOrPercent::Number(twips)
+            | crate::import::MeasurementOrPercent::UniversalTwips(twips),
+        ) => Ok(Some(twips)),
+        _ => Err(invalid_section_attribute(element, element_name, attribute)),
+    }
+}
+
+/// [`section_twips`] for an ST_TwipsMeasure (unsigned) attribute.
+fn section_twips_unsigned(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<u32>, WordIrError> {
+    section_twips(element, element_name, attribute)?
+        .map(|twips| {
+            u32::try_from(twips)
+                .map_err(|_| invalid_section_attribute(element, element_name, attribute))
+        })
+        .transpose()
+}
+
+/// [`section_twips`] for an ST_SignedTwipsMeasure attribute.
+fn section_twips_signed(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<i32>, WordIrError> {
+    section_twips(element, element_name, attribute)?
+        .map(|twips| {
+            i32::try_from(twips)
+                .map_err(|_| invalid_section_attribute(element, element_name, attribute))
+        })
+        .transpose()
+}
+
+/// An ST_DecimalNumber attribute of a section property (`w:docGrid`,
+/// `w:lnNumType`, `w:pgNumType`, `w:cols`, `w:pgSz/@w:code`, `w:paperSrc`):
+/// a signed integer. A decimal spelling ("312.0") is read truncated, as the
+/// import reads every tolerated decimal integer; anything else is refused,
+/// not dropped, for the same reason as [`section_twips`].
+fn section_decimal(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    if let Ok(number) = value.parse::<i64>() {
+        return Ok(Some(number));
+    }
+    let invalid = || invalid_section_attribute(element, element_name, attribute);
+    if !crate::import::is_schema_decimal(value) {
+        return Err(invalid());
+    }
+    let number: f64 = value.parse().map_err(|_| invalid())?;
+    let truncated = number.trunc();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&truncated) {
+        return Err(invalid());
+    }
+    Ok(Some(truncated as i64))
+}
+
+/// [`section_decimal`] for a model field that holds a non-negative count,
+/// pitch or start value (`u32`); a negative value is outside it and refused.
+fn section_decimal_unsigned(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<u32>, WordIrError> {
+    section_decimal(element, element_name, attribute)?
+        .map(|number| {
+            u32::try_from(number)
+                .map_err(|_| invalid_section_attribute(element, element_name, attribute))
+        })
+        .transpose()
+}
+
+/// [`section_decimal`] for a signed `i32` model field.
+fn section_decimal_signed(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> Result<Option<i32>, WordIrError> {
+    section_decimal(element, element_name, attribute)?
+        .map(|number| {
+            i32::try_from(number)
+                .map_err(|_| invalid_section_attribute(element, element_name, attribute))
+        })
+        .transpose()
+}
+
+fn invalid_section_attribute(
+    element: &Element,
+    element_name: &'static str,
+    attribute: &'static str,
+) -> WordIrError {
+    WordIrError::InvalidSectionPropertyAttribute {
+        element: element_name,
+        attribute,
+        value: attr_value(element, attribute).cloned().unwrap_or_default(),
+    }
+}
+
 pub(crate) fn parse_section_properties(
     sect_pr: &Element,
     rel_lookup: &std::collections::HashMap<String, String>,
-) -> SectionProperties {
+) -> Result<SectionProperties, WordIrError> {
     // w:pgSz -- page size, orientation, and paper size code (§17.6.14)
     let (page_width, page_height, orientation, paper_size_code) =
         if let Some(pg_sz) = find_w_child(sect_pr, "pgSz") {
-            let w = attr_value(pg_sz, "w").and_then(|v| v.parse::<u32>().ok());
-            let h = attr_value(pg_sz, "h").and_then(|v| v.parse::<u32>().ok());
+            let w = section_twips_unsigned(pg_sz, "pgSz", "w")?;
+            let h = section_twips_unsigned(pg_sz, "pgSz", "h")?;
             let orient = attr_value(pg_sz, "orient").and_then(|v| match v.as_str() {
                 "landscape" => Some(PageOrientation::Landscape),
                 "portrait" => Some(PageOrientation::Portrait),
                 _ => None,
             });
-            let code = attr_value(pg_sz, "code").and_then(|v| v.parse::<i64>().ok());
+            let code = section_decimal(pg_sz, "pgSz", "code")?;
             (w, h, orient, code)
         } else {
             (None, None, None, None)
@@ -4925,8 +5570,8 @@ pub(crate) fn parse_section_properties(
     // w:cols -- column layout (§17.6.4)
     let (columns, column_space, column_separator, equal_width) =
         if let Some(cols) = find_w_child(sect_pr, "cols") {
-            let num = attr_value(cols, "num").and_then(|v| v.parse::<u32>().ok());
-            let space = attr_value(cols, "space").and_then(|v| v.parse::<u32>().ok());
+            let num = section_decimal_unsigned(cols, "cols", "num")?;
+            let space = section_twips_unsigned(cols, "cols", "space")?;
             let sep = attr_value(cols, "sep").map(|v| v == "1" || v == "true");
             // §17.6.4 equalWidth (CT_OnOff). Word defaults to true; capture an
             // explicit value so a sectPr rebuild preserves unequal columns.
@@ -4947,13 +5592,13 @@ pub(crate) fn parse_section_properties(
         gutter,
     ) = if let Some(pg_mar) = find_w_child(sect_pr, "pgMar") {
         (
-            attr_value(pg_mar, "top").and_then(|v| v.parse::<i32>().ok()),
-            attr_value(pg_mar, "bottom").and_then(|v| v.parse::<i32>().ok()),
-            attr_value(pg_mar, "left").and_then(|v| v.parse::<i32>().ok()),
-            attr_value(pg_mar, "right").and_then(|v| v.parse::<i32>().ok()),
-            attr_value(pg_mar, "header").and_then(|v| v.parse::<u32>().ok()),
-            attr_value(pg_mar, "footer").and_then(|v| v.parse::<u32>().ok()),
-            attr_value(pg_mar, "gutter").and_then(|v| v.parse::<u32>().ok()),
+            section_twips_signed(pg_mar, "pgMar", "top")?,
+            section_twips_signed(pg_mar, "pgMar", "bottom")?,
+            section_twips_signed(pg_mar, "pgMar", "left")?,
+            section_twips_signed(pg_mar, "pgMar", "right")?,
+            section_twips_unsigned(pg_mar, "pgMar", "header")?,
+            section_twips_unsigned(pg_mar, "pgMar", "footer")?,
+            section_twips_unsigned(pg_mar, "pgMar", "gutter")?,
         )
     } else {
         (None, None, None, None, None, None, None)
@@ -4965,55 +5610,65 @@ pub(crate) fn parse_section_properties(
         .and_then(|s| crate::domain::SectionType::from_xml_str(s).ok());
 
     // w:pgBorders -- page borders (§17.6.7)
-    let page_borders = find_w_child(sect_pr, "pgBorders").and_then(|pg_borders| {
-        use crate::domain::{Border, BorderStyle, PageBorders};
-        let parse_edge = |name: &str| -> Option<Border> {
-            let el = find_w_child(pg_borders, name)?;
-            let style_str = attr_value(el, "val").map(|s| s.as_str()).unwrap_or("none");
-            let style = BorderStyle::from_page_border_xml_str(style_str).unwrap_or_else(|error| {
-                panic!("invalid w:pgBorders/{name} w:val={style_str:?}: {error}")
-            });
-            Some(Border {
-                style,
-                size: attr_value(el, "sz").and_then(|v| v.parse::<u32>().ok()),
-                color: attr_value(el, "color").map(|s| s.to_string()),
-                space: attr_value(el, "space").and_then(|v| v.parse::<u32>().ok()),
-                extra_attrs: Vec::new(),
-            })
-        };
-        let top = parse_edge("top");
-        let bottom = parse_edge("bottom");
-        let left = parse_edge("left");
-        let right = parse_edge("right");
-        if top.is_some() || bottom.is_some() || left.is_some() || right.is_some() {
-            // MS-OI29500 §17.6.10: defaults are zOrder="front", offsetFrom="text"
-            let z_order = attr_value(pg_borders, "zOrder")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "front".to_string());
-            let offset_from = attr_value(pg_borders, "offsetFrom")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "text".to_string());
-            Some(PageBorders {
-                top,
-                bottom,
-                left,
-                right,
-                z_order,
-                offset_from,
-            })
-        } else {
-            None
+    let page_borders = match find_w_child(sect_pr, "pgBorders") {
+        None => None,
+        Some(pg_borders) => {
+            use crate::domain::{Border, BorderStyle, PageBorders};
+            let parse_edge = |name: &'static str| -> Result<Option<Border>, WordIrError> {
+                let Some(el) = find_w_child(pg_borders, name) else {
+                    return Ok(None);
+                };
+                let style_str = attr_value(el, "val").map(|s| s.as_str()).unwrap_or("none");
+                let style =
+                    BorderStyle::from_page_border_xml_str(style_str).unwrap_or_else(|error| {
+                        panic!("invalid w:pgBorders/{name} w:val={style_str:?}: {error}")
+                    });
+                // sz is ST_EighthPointMeasure, space ST_PointMeasure: both
+                // unsigned ST_DecimalNumber.
+                Ok(Some(Border {
+                    style,
+                    size: section_decimal_unsigned(el, name, "sz")?,
+                    color: attr_value(el, "color").map(|s| s.to_string()),
+                    space: section_decimal_unsigned(el, name, "space")?,
+                    extra_attrs: Vec::new(),
+                }))
+            };
+            let top = parse_edge("top")?;
+            let bottom = parse_edge("bottom")?;
+            let left = parse_edge("left")?;
+            let right = parse_edge("right")?;
+            if top.is_some() || bottom.is_some() || left.is_some() || right.is_some() {
+                // MS-OI29500 §17.6.10: defaults are zOrder="front", offsetFrom="text"
+                let z_order = attr_value(pg_borders, "zOrder")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "front".to_string());
+                let offset_from = attr_value(pg_borders, "offsetFrom")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "text".to_string());
+                Some(PageBorders {
+                    top,
+                    bottom,
+                    left,
+                    right,
+                    z_order,
+                    offset_from,
+                })
+            } else {
+                None
+            }
         }
-    });
+    };
 
     // w:lnNumType -- line numbering (§17.6.8)
-    let line_numbering =
-        find_w_child(sect_pr, "lnNumType").map(|ln| crate::domain::LineNumbering {
-            count_by: attr_value(ln, "countBy").and_then(|v| v.parse::<u32>().ok()),
-            start: attr_value(ln, "start").and_then(|v| v.parse::<u32>().ok()),
+    let line_numbering = match find_w_child(sect_pr, "lnNumType") {
+        Some(ln) => Some(crate::domain::LineNumbering {
+            count_by: section_decimal_unsigned(ln, "lnNumType", "countBy")?,
+            start: section_decimal_unsigned(ln, "lnNumType", "start")?,
             restart: attr_value(ln, "restart").map(|s| s.to_string()),
-            distance: attr_value(ln, "distance").and_then(|v| v.parse::<u32>().ok()),
-        });
+            distance: section_twips_unsigned(ln, "lnNumType", "distance")?,
+        }),
+        None => None,
+    };
 
     // w:vAlign -- vertical alignment (§17.6.20)
     let v_align = find_w_child(sect_pr, "vAlign")
@@ -5021,34 +5676,31 @@ pub(crate) fn parse_section_properties(
         .and_then(|s| crate::domain::SectionVAlign::from_xml_str(s).ok());
 
     // w:pgNumType -- page number type (§17.6.12)
-    let page_number_type =
-        find_w_child(sect_pr, "pgNumType").map(|pn| crate::domain::PageNumberType {
+    let page_number_type = match find_w_child(sect_pr, "pgNumType") {
+        Some(pn) => Some(crate::domain::PageNumberType {
             fmt: attr_value(pn, "fmt").map(|s| s.to_string()),
-            start: attr_value(pn, "start").and_then(|v| v.parse::<u32>().ok()),
-            chap_style: attr_value(pn, "chapStyle").and_then(|v| v.parse::<i64>().ok()),
+            start: section_decimal_unsigned(pn, "pgNumType", "start")?,
+            chap_style: section_decimal(pn, "pgNumType", "chapStyle")?,
             chap_sep: attr_value(pn, "chapSep").map(|s| s.to_string()),
-        });
+        }),
+        None => None,
+    };
 
     // w:cols/w:col -- individual column definitions (MS-OI29500 §17.6.3/§17.6.4)
     let column_defs = if let Some(cols) = find_w_child(sect_pr, "cols") {
         cols.children
             .iter()
-            .filter_map(|child| {
-                if let xmltree::XMLNode::Element(el) = child
-                    && is_w_tag(el, "col")
-                {
-                    let width = attr_value(el, "w")
-                        .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    // MS-OI29500 §17.6.3: missing space attr defaults to 0
-                    let space = attr_value(el, "space")
-                        .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(0);
-                    return Some(crate::domain::ColumnDef { width, space });
-                }
-                None
+            .filter_map(|child| match child {
+                xmltree::XMLNode::Element(el) if is_w_tag(el, "col") => Some(el),
+                _ => None,
             })
-            .collect()
+            .map(|el| {
+                let width = section_twips_unsigned(el, "col", "w")?.unwrap_or(0);
+                // MS-OI29500 §17.6.3: missing space attr defaults to 0
+                let space = section_twips_unsigned(el, "col", "space")?.unwrap_or(0);
+                Ok(crate::domain::ColumnDef { width, space })
+            })
+            .collect::<Result<_, WordIrError>>()?
     } else {
         Vec::new()
     };
@@ -5070,8 +5722,9 @@ pub(crate) fn parse_section_properties(
             (
                 attr_value(doc_grid, "type")
                     .and_then(|s| crate::domain::DocGridType::from_xml_str(s).ok()),
-                attr_value(doc_grid, "linePitch").and_then(|v| v.parse::<u32>().ok()),
-                attr_value(doc_grid, "charSpace").and_then(|v| v.parse::<u32>().ok()),
+                section_decimal_unsigned(doc_grid, "docGrid", "linePitch")?,
+                // Signed: Word writes a negative charSpace to tighten pitch.
+                section_decimal_signed(doc_grid, "docGrid", "charSpace")?,
             )
         } else {
             (None, None, None)
@@ -5143,10 +5796,13 @@ pub(crate) fn parse_section_properties(
     // w:paperSrc — printer tray codes (§17.6.9). Both attributes are
     // ST_DecimalNumber, defaulting to 1 (auto). We preserve the
     // omitted/present distinction.
-    let paper_source = find_w_child(sect_pr, "paperSrc").map(|el| crate::domain::PaperSource {
-        first: attr_value(el, "first").and_then(|v| v.parse::<i64>().ok()),
-        other: attr_value(el, "other").and_then(|v| v.parse::<i64>().ok()),
-    });
+    let paper_source = match find_w_child(sect_pr, "paperSrc") {
+        Some(el) => Some(crate::domain::PaperSource {
+            first: section_decimal(el, "paperSrc", "first")?,
+            other: section_decimal(el, "paperSrc", "other")?,
+        }),
+        None => None,
+    };
 
     // w:printerSettings — relationship to printer settings part (§17.6.14).
     // Stored as the raw rId; the underlying part survives package roundtrip
@@ -5155,7 +5811,13 @@ pub(crate) fn parse_section_properties(
         .and_then(|el| attr_value(el, "id"))
         .map(|s| s.to_string());
 
-    SectionProperties {
+    Ok(SectionProperties {
+        source_section_attrs: ["w:rsidR", "w:rsidRPr", "w:rsidSect", "w:rsidDel"]
+            .into_iter()
+            .filter_map(|name| {
+                attr_get(sect_pr, name).map(|value| (name.to_string(), value.clone()))
+            })
+            .collect(),
         page_width,
         page_height,
         orientation,
@@ -5192,7 +5854,7 @@ pub(crate) fn parse_section_properties(
         footer_refs,
         paper_source,
         printer_settings_rid,
-    }
+    })
 }
 
 /// Extract section properties from a pPr element's sectPr child.
@@ -5200,9 +5862,10 @@ pub(crate) fn parse_section_properties(
 fn extract_section_properties(
     p_pr: &Element,
     rel_lookup: &std::collections::HashMap<String, String>,
-) -> Option<SectionProperties> {
-    let sect_pr = find_w_child(p_pr, "sectPr")?;
-    Some(parse_section_properties(sect_pr, rel_lookup))
+) -> Result<Option<SectionProperties>, WordIrError> {
+    find_w_child(p_pr, "sectPr")
+        .map(|sect_pr| parse_section_properties(sect_pr, rel_lookup))
+        .transpose()
 }
 
 /// Extract tab stops from w:pPr/w:tabs element.
@@ -5362,12 +6025,13 @@ fn extract_hyperlink_data(element: &Element) -> HyperlinkData {
     // Extract per-run data (text + rPr) from direct and container-nested w:r children.
     let runs = extract_runs_from_hyperlink(element);
 
-    // Concatenate all run texts for the backward-compatible `text` field.
+    // The link's visible text: its runs, without runs deleted inside it (the
+    // same definition edits keep it at).
     let text = runs
         .iter()
+        .filter(|r| !matches!(r.status, TrackingStatus::Deleted(_)))
         .map(|r| r.text.as_str())
-        .collect::<Vec<_>>()
-        .join("");
+        .collect::<String>();
 
     HyperlinkData {
         url: None, // Resolved later via relationship lookup using r_id
@@ -5516,14 +6180,30 @@ fn collect_hyperlink_runs_with_status(
                 let additional_rpr_xml = rpr_elements.map(serialize_element).collect();
                 let mut text = String::new();
                 extract_text_recursive(el, &mut text);
-                out.push(HyperlinkRun {
+                let mut run = HyperlinkRun {
                     text,
                     rpr_xml,
                     additional_rpr_xml,
-                    source_xml: Some(serialize_element(el)),
+                    source_xml: None,
                     source_run_attrs: source_run_attrs(el),
                     status: status.clone(),
+                };
+                // Keep the verbatim run only when it says more than the fields
+                // above: if the serializer rebuilds this exact run from them,
+                // the bytes are a second spelling of the same run.
+                let source = serialize_element(el);
+                let deleted = el.children.iter().any(|child| {
+                    matches!(child, XMLNode::Element(e) if local_element_name(e) == "delText")
                 });
+                let rebuilt = crate::word_xml::serialize_raw_fragment(
+                    &crate::serialize::build_hyperlink_run(&run, deleted),
+                );
+                if crate::import::canonical_raw_hash(&source)
+                    != crate::import::canonical_raw_hash(&rebuilt)
+                {
+                    run.source_xml = Some(source);
+                }
+                out.push(run);
             }
             // Tracked-change envelopes inside a hyperlink: capture revision
             // metadata so child runs inherit the surrounding status. Per
@@ -5565,6 +6245,10 @@ fn extract_text_recursive(element: &Element, out: &mut String) {
             // w:t is the text element
             if local_name == "t" || local_name == "delText" {
                 out.push_str(&crate::word_xml::active_word_text(el));
+            } else if local_name == "tab" {
+                // A run-level w:tab is part of the visible text (§17.3.3.32):
+                // a table of contents entry reads "A.\tTitle\t22".
+                out.push('\t');
             } else if local_name == "noBreakHyphen" {
                 // Non-text run leaf: project to its Unicode character so it is
                 // not silently dropped. U+2011 NON-BREAKING HYPHEN is the exact
@@ -5698,7 +6382,7 @@ mod tests {
         let rpr = parse_with_whitespace(
             r#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b/><w:totallyMadeUpElement w:val="x"/><w:i/></w:rPr>"#,
         );
-        let marks = parse_rpr_element(&rpr);
+        let marks = parse_rpr_element(&rpr).unwrap();
         assert_eq!(
             marks.bold,
             MarkValue::On,
@@ -5720,7 +6404,7 @@ mod tests {
         let rpr = parse_with_whitespace(
             r#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b w:val="maybe"/></w:rPr>"#,
         );
-        let marks = parse_rpr_element(&rpr);
+        let marks = parse_rpr_element(&rpr).unwrap();
         assert_eq!(
             marks.bold,
             MarkValue::On,
@@ -6003,6 +6687,61 @@ mod tests {
     }
 
     #[test]
+    fn property_only_run_preserves_zero_width_authored_payload() {
+        // CT_R allows EG_RPr followed by zero EG_RunInnerContent children
+        // (ECMA-376 Part 1, §17.3.2.25). No displayed text does not mean no
+        // authored payload: an untouched formatting-only run must survive.
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            w:rsidRPr="00112233"><w:rPr><w:highlight w:val="yellow"/></w:rPr></w:r>"#;
+        let element = parse_with_whitespace(xml);
+        let atoms = run_atoms(&element, 7).expect("valid property-only run");
+        assert_eq!(atoms.len(), 1, "authored empty-run payload must not vanish");
+        assert_eq!(atoms[0].utf16_len, 0, "an empty run adds no displayed text");
+        assert_eq!(atoms[0].origin.run_index, Some(7));
+        let AtomKind::EmptyRun { raw_xml } = &atoms[0].kind else {
+            panic!("a zero-width preserved run must not become displayed text");
+        };
+        let preserved = parse_with_whitespace(std::str::from_utf8(raw_xml).unwrap());
+        assert_eq!(
+            preserved, element,
+            "retain complete properties and provenance"
+        );
+    }
+
+    #[test]
+    fn empty_run_shapes_preserve_complete_source_without_displayed_text() {
+        for body in ["", "<w:t/>", "<w:rPr/>"] {
+            let xml = format!(
+                r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{body}</w:r>"#
+            );
+            let element = parse_with_whitespace(&xml);
+            let atoms = run_atoms(&element, 3).unwrap();
+            assert_eq!(atoms.len(), 1);
+            assert_eq!(atoms[0].utf16_len, 0);
+            let AtomKind::EmptyRun { raw_xml } = &atoms[0].kind else {
+                panic!("empty source run must have its own zero-width representation");
+            };
+            assert_eq!(
+                parse_with_whitespace(std::str::from_utf8(raw_xml).unwrap()),
+                element
+            );
+        }
+    }
+
+    #[test]
+    fn empty_run_formatting_revision_refuses_instead_of_hiding_history() {
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:rPr><w:rPrChange w:id="27" w:author="Editor"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr></w:r>"#;
+        let element = parse_with_whitespace(xml);
+        assert!(matches!(
+            run_atoms(&element, 3),
+            Err(WordIrError::UnsupportedEmptyRunFormattingRevision {
+                run_index: 3,
+                revision_id: 27
+            })
+        ));
+    }
+
+    #[test]
     fn run_atoms_preserve_only_sorted_source_rsid_attrs() {
         let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             w:rsidRPr="00BB" w:rsidR="00AA" w:custom="discard-me">
@@ -6108,13 +6847,11 @@ mod tests {
 
     #[test]
     fn test_mc_alternate_content_run_level() {
-        // A run-level AlternateContent whose Choice requires an understood
-        // namespace (wps) RESOLVES to that Choice (§9.3): the widget is the
-        // Choice's `w:drawing`, exactly as if the run held the drawing bare. The
-        // non-selected Fallback (legacy VML) is dropped, and the wrapper is not
-        // carried — an AC-wrapped drawing and a bare drawing are indistinguishable
-        // in the model, and the SAME construct resolves the SAME way regardless of
-        // where it sits (matching the tracked-container and paragraph-level paths).
+        // MCE selects the active reading (§9.3), not a license to destroy an
+        // unchanged drawing's alternate serialization. MS-OI29500 §3.1.4
+        // permits legacy representations to retain reconstruction properties
+        // absent from the active drawing. Classify the selected drawing as one
+        // widget, but retain its complete compatibility envelope for export.
         let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                          xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
                          xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
@@ -6151,16 +6888,26 @@ mod tests {
                     "raw_xml should be the resolved Choice content"
                 );
                 assert!(
-                    !raw_str.contains("AlternateContent"),
-                    "the AC wrapper must NOT survive resolution"
+                    raw_str.contains("AlternateContent"),
+                    "an unchanged drawing must retain its compatibility envelope"
                 );
                 assert!(
-                    !raw_str.contains("legacy shape"),
-                    "the non-selected Fallback must be dropped"
+                    raw_str.contains("legacy shape"),
+                    "the inactive representation remains part of the preserved drawing"
                 );
             }
             other => panic!("expected Widget, got {:?}", other),
         }
+        let tracked = parse_with_whitespace(&format!(
+            r#"<w:ins xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:id="7" w:author="Reviewer">{xml}</w:ins>"#
+        ));
+        let mut ordinal = 0;
+        let tracked_atoms = tracked_change_atoms(&tracked, 0, &mut ordinal).unwrap();
+        assert_eq!(tracked_atoms.len(), 1);
+        assert_eq!(
+            tracked_atoms[0].kind, atoms[0].kind,
+            "tracking the run must not change drawing representation ownership"
+        );
     }
 
     #[test]
@@ -6681,7 +7428,7 @@ mod tests {
     fn extract_indentation_refuses_invalid_or_unrepresentable_twip_measures() {
         for (attribute, value, out_of_range) in [
             ("start", "10%", false),
-            ("firstLine", "-1pt", false),
+            ("firstLine", "1em", false),
             ("start", "2147483648", true),
         ] {
             let xml = format!(
@@ -6809,22 +7556,27 @@ mod tests {
 
     #[test]
     fn extract_spacing_distinguishes_schema_valid_negative_line_from_malformed_input() {
-        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        // ISO 29500-1 §17.3.1.33: w:line is ST_SignedTwipsMeasure, so a negative
+        // universal measure is valid ("-1pt" is -20 twips) and kept.
+        let valid = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pPr><w:spacing w:line="-1pt"/></w:pPr>
             <w:r><w:t>text</w:t></w:r>
         </w:p>"#;
-        let el = parse_with_whitespace(xml);
-        let error = ParagraphView::from_paragraph(&el, &Default::default()).expect_err(
-            "the unsigned canonical spacing model cannot represent negative line twips",
-        );
+        let view =
+            ParagraphView::from_paragraph(&parse_with_whitespace(valid), &Default::default())
+                .expect("a negative line spacing is schema-valid");
+        assert_eq!(view.spacing.and_then(|spacing| spacing.line), Some(-20));
+
+        let malformed = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:spacing w:line="tall"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let error =
+            ParagraphView::from_paragraph(&parse_with_whitespace(malformed), &Default::default())
+                .expect_err("a value that is no measure is refused");
         assert!(matches!(
             error,
-            WordIrError::ParagraphPropertyAttributeOutOfRange {
-                element: "spacing",
-                attribute: "line",
-                model: "non-negative u32 twips",
-                ..
-            }
+            WordIrError::InvalidParagraphPropertyAttribute { .. }
         ));
     }
 
@@ -7470,7 +8222,8 @@ mod tests {
                 <w:pgSz w:w="12240" w:h="15840"/>
             </w:sectPr>"#;
         let el = Element::parse(xml.as_bytes()).unwrap();
-        let sp = super::parse_section_properties(&el, &Default::default());
+        let sp = super::parse_section_properties(&el, &Default::default())
+            .expect("the test sectPr parses");
 
         let fp = sp.footnote_pr.expect("footnote_pr should be parsed");
         assert_eq!(fp.position, Some(crate::domain::NotePosition::BeneathText));
