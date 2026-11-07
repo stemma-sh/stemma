@@ -100,6 +100,7 @@ fn hyperlink_not_found_is_anchor_not_found_not_invalid_range() {
     // verb walks the whole doc, finds no inline with this id, and raises
     // `EditError::HyperlinkNotFound` (verb: edit/mod.rs:8461-8475).
     let step = EditStep::ReplaceHyperlinkText {
+        story: stemma::edit::StoryRef::Body,
         hyperlink_id: NodeId::from("nonexistent-hyperlink-id"),
         rationale: None,
         expect: "anything".to_string(),

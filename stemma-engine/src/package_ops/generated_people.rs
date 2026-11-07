@@ -341,7 +341,7 @@ mod tests {
     }
 
     fn authors() -> Vec<String> {
-        vec!["Andreas & Team".to_string(), "Reviewer <Two>".to_string()]
+        vec!["Jordan & Team".to_string(), "Reviewer <Two>".to_string()]
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
         assert!(
             std::str::from_utf8(operation.people_xml())
                 .expect("generated XML is UTF-8")
-                .contains("Andreas &amp; Team")
+                .contains("Jordan &amp; Team")
         );
     }
 
@@ -448,7 +448,7 @@ mod tests {
         let operation = plan_generated_people_operation(&base, &authors()).expect("merge plan");
         let merged = std::str::from_utf8(operation.people_xml()).expect("merged UTF-8 XML");
         assert!(merged.contains("Existing"));
-        assert!(merged.contains("Andreas &amp; Team"));
+        assert!(merged.contains("Jordan &amp; Team"));
         operation
             .apply_to(&mut base)
             .expect("apply merged collection");

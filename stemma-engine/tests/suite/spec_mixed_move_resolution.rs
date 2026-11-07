@@ -178,7 +178,7 @@ fn full_resolution_removes_every_imported_move_carrier() {
 #[test]
 fn full_resolution_clears_proofing_ranges_but_identity_preserves_them() {
     let source = make_docx_with_body(
-        r#"<w:p><w:r><w:t>Stem</w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t>m</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r><w:t>a</w:t></w:r><w:ins w:id="1" w:author="Editor" w:date="2026-01-01T00:00:00Z"><w:r><w:t> works</w:t></w:r></w:ins></w:p>"#,
+        r#"<w:p><w:r><w:t>Stem</w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t>m</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r><w:t>a</w:t></w:r><w:ins w:id="1" w:author="Editor" w:date="2026-01-01T00:00:00Z"><w:r><w:t xml:space="preserve"> works</w:t></w:r></w:ins></w:p>"#,
     );
 
     let identity = Document::parse(&source)
@@ -213,6 +213,59 @@ fn full_resolution_clears_proofing_ranges_but_identity_preserves_them() {
                 xml.contains(&literal) || xml.contains(&preserved),
                 "expected run {expected:?} after full resolution: {xml}"
             );
+        }
+    }
+}
+
+#[test]
+fn proofing_cleanup_preserves_distinct_run_session_provenance() {
+    check_proofing_run_session_provenance();
+}
+
+pub(super) fn check_proofing_run_session_provenance() {
+    // Equal appearance does not erase authored provenance: Word retains
+    // different run session IDs when removing a proofing-error boundary.
+    for distinct in [false, true] {
+        let right_id = if distinct { "00220044" } else { "00110033" };
+        let body = format!(
+            r#"<w:p><w:r w:rsidR="00110033"><w:t>Left</w:t></w:r><w:proofErr w:type="spellStart"/><w:r w:rsidR="{right_id}"><w:t>Right</w:t></w:r><w:proofErr w:type="spellEnd"/></w:p><w:p><w:r><w:t>Anchor</w:t></w:r><w:ins w:id="7" w:author="Reviewer"><w:r><w:t>Added</w:t></w:r></w:ins></w:p>"#
+        );
+        let source = make_docx_with_body(&body);
+        for resolution in [Resolution::AcceptAll, Resolution::RejectAll] {
+            let projected = Document::parse(&source)
+                .unwrap()
+                .project(resolution)
+                .unwrap();
+            let bytes = projected.serialize(&ExportOptions::default()).unwrap();
+            let reopened = Document::parse(&bytes).unwrap();
+            for candidate in [&projected, &reopened] {
+                let stemma::BlockNode::Paragraph(paragraph) =
+                    &candidate.snapshot().canonical.blocks[0].block
+                else {
+                    panic!("first block is a paragraph");
+                };
+                let runs: Vec<_> = paragraph
+                    .segments
+                    .iter()
+                    .flat_map(|segment| &segment.inlines)
+                    .filter_map(|inline| match inline {
+                        stemma::InlineNode::Text(text) => {
+                            Some((text.text.as_str(), text.source_run_attrs.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let attrs = |value: &str| vec![("w:rsidR".to_string(), value.to_string())];
+                let expected = if distinct {
+                    vec![("Left", attrs("00110033")), ("Right", attrs(right_id))]
+                } else {
+                    vec![("LeftRight", attrs("00110033"))]
+                };
+                assert_eq!(
+                    runs, expected,
+                    "proofing cleanup must respect run provenance"
+                );
+            }
         }
     }
 }

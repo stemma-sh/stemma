@@ -738,13 +738,19 @@ fn removed_body_level_sdt_tracks_its_inner_content_as_deleted() {
             && sdt_content[0].contains("<w:delText>Removed control text</w:delText>"),
         "a removed block SDT must express its visible content as a deletion: {xml}"
     );
+    // The last paragraph mark inside a block control cannot be resolved
+    // away: Word keeps an emptied control (checked against Word 16), so the
+    // mark is plain and the content alone carries the deletion.
     assert!(
-        sdt_content[0].contains("<w:pPr><w:rPr><w:del "),
-        "the SDT paragraph mark must be deleted with its runs: {xml}"
+        !sdt_content[0].contains("<w:pPr><w:rPr><w:del "),
+        "the control's last paragraph mark stays: {xml}"
     );
+    // A whole link in a revision is written as one HYPERLINK field inside
+    // it: `w:hyperlink` cannot sit in `w:del`, and tracking only its runs
+    // leaves an empty live link behind (the body's rule for any link).
     assert!(
-        sdt_content[0].contains("<w:hyperlink w:anchor=\"inside\"><w:del "),
-        "a hyperlink remains paragraph-level and tracks its runs internally: {xml}"
+        sdt_content[0].contains(r#"<w:delInstrText xml:space="preserve">HYPERLINK \l "inside""#),
+        "the removed link is deleted whole: {xml}"
     );
     assert_opens_clean(&redline, "body-SDT deletion redline must be conformant");
 }
@@ -781,13 +787,18 @@ fn added_body_level_sdt_tracks_its_inner_content_as_inserted() {
             && sdt_content[0].contains("<w:t>Added control text</w:t>"),
         "an added block SDT must express its visible content as an insertion: {xml}"
     );
+    // The last paragraph mark inside a block control cannot be resolved
+    // away: Word keeps an emptied control (checked against Word 16), so the
+    // mark is plain and the content alone carries the insertion.
     assert!(
-        sdt_content[0].contains("<w:pPr><w:rPr><w:ins "),
-        "the SDT paragraph mark must be inserted with its runs: {xml}"
+        !sdt_content[0].contains("<w:pPr><w:rPr><w:ins "),
+        "the control's last paragraph mark stays: {xml}"
     );
+    // A whole link in a revision is written as one HYPERLINK field inside
+    // it, the body's rule for any inserted link.
     assert!(
-        sdt_content[0].contains("<w:hyperlink w:anchor=\"inside\"><w:ins "),
-        "a hyperlink remains paragraph-level and tracks its runs internally: {xml}"
+        sdt_content[0].contains(r#"<w:instrText xml:space="preserve">HYPERLINK \l "inside""#),
+        "the added link is inserted whole: {xml}"
     );
     assert_opens_clean(
         &redline_bytes,
@@ -809,9 +820,11 @@ fn added_body_level_sdt_tracks_its_inner_content_as_inserted() {
         .serialize(&ExportOptions::default())
         .expect("serialize rejected insertion");
     let rejected_xml = document_xml_of(&rejected_bytes);
+    // A control has no revision: Reject All removes its content and Word
+    // keeps the emptied control (checked against Word 16).
     assert!(
-        !rejected_xml.contains("<w:sdt>") && !rejected_xml.contains("Added control text"),
-        "reject-all must restore the base without the target content control: {rejected_xml}"
+        !rejected_xml.contains("Added control text"),
+        "reject-all removes the added content: {rejected_xml}"
     );
 }
 
@@ -833,9 +846,15 @@ fn removed_body_sdt_tracks_inside_a_nested_inline_sdt_without_wrapping_it() {
         .serialize(&ExportOptions::default())
         .expect("serialize nested content-control redline");
     let xml = document_xml_of(&redline);
-    let nested_start = xml
-        .find(r#"<w:sdt><w:sdtPr><w:tag w:val="inner""#)
+    let inner_tag = xml
+        .find(r#"<w:tag w:val="inner""#)
         .expect("nested inline SDT remains present");
+    let nested_start = xml[..inner_tag]
+        .match_indices("<w:sdt")
+        .map(|(index, _)| index)
+        .filter(|&index| matches!(xml.as_bytes()[index + 6], b' ' | b'>'))
+        .last()
+        .expect("the inner tag sits in an SDT");
     let preceding = &xml[..nested_start];
     let last_del_start = preceding.rfind("<w:del ");
     let last_del_end = preceding.rfind("</w:del>");

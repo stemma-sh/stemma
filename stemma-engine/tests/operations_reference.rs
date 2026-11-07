@@ -103,10 +103,11 @@ of the durable edit format. See the
 The `content` field of `replace`, `insert`, `edit_header`, and `edit_footer`
 takes the nodes below, each shown here inside a complete op.
 
-One `marks` vocabulary is used everywhere: an ARRAY of tagged objects
-(`[{{\"type\":\"bold\"}}]`), never bare strings. A text node's `marks` authors
-inline content; `set_format`'s `marks` replaces a span's mark set, with the
-value-carrying formatting (color, font, size) in sibling fields.
+A text node's `marks` is an ARRAY of marks (`[{{\"type\":\"bold\"}}]`; a plain
+mark may also be written as its bare name, `[\"bold\"]`). `set_format`'s `marks`
+is a different shape: a tri-state patch (`{{\"bold\":true,\"italic\":false}}`)
+where an omitted property is unchanged, with the value-carrying formatting
+(color, font, size) in sibling fields.
 "
     );
 

@@ -22,6 +22,11 @@ pub struct DocumentDiff {
     pub base_fingerprint: DocFingerprint,
     pub target_fingerprint: DocFingerprint,
     pub changes: Vec<DiffChange>,
+    /// Body blocks aligned as the same block, as (base id, target id). Both
+    /// sit in the same chain of block content controls, which is how the
+    /// merged document's controls are rebuilt (`controls`).
+    #[serde(default)]
+    pub aligned_blocks: Vec<(NodeId, NodeId)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

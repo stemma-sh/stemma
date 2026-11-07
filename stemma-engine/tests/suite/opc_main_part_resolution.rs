@@ -134,6 +134,57 @@ fn strict_docx(body_text: &str) -> Vec<u8> {
     )
 }
 
+/// ECMA-376 Part 1 §11.2: the minimal package has only content types,
+/// root relationships, and the main document part. No outgoing relationships
+/// means no main-part relationship part is required.
+fn docx_without_main_relationships(main_part: &str, body: &str) -> Vec<u8> {
+    let content_types = format!(
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/{main_part}" ContentType="{MAIN_CT}"/></Types>"#
+    );
+    let root_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDoc" Type="{OFFICE_DOCUMENT_REL}" Target="{main_part}"/></Relationships>"#
+    );
+    let document = format!(
+        r#"<w:document xmlns:w="{TRANSITIONAL_WML_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_parts(&[
+        ("[Content_Types].xml", &content_types),
+        ("_rels/.rels", &root_rels),
+        (main_part, &document),
+    ])
+}
+
+#[test]
+fn absent_main_relationship_part_is_valid_and_round_trips() {
+    for main_part in ["word/document.xml", "document.xml", "nested/content.xml"] {
+        let input = docx_without_main_relationships(
+            main_part,
+            "<w:p><w:r><w:t>Minimal package</w:t></w:r></w:p><w:sectPr/>",
+        );
+        assert!(stemma::api::validate(&input).ok);
+        let doc = stemma::api::Document::parse(&input).expect("no outgoing relationships");
+        let output = doc
+            .serialize(&ExportOptions::default())
+            .expect("serialize minimal package");
+        let audit = stemma::api::audit(&input, &output).expect("audit round trip");
+        assert!(audit.validator.ok);
+        assert!(audit.direct_changes.is_empty());
+        assert!(audit.untouched.violations.is_empty());
+    }
+}
+
+#[test]
+fn absent_main_relationship_part_does_not_make_dangling_references_valid() {
+    let input = docx_without_main_relationships(
+        "word/document.xml",
+        r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="missingHeader"/></w:sectPr>"#,
+    );
+    assert!(
+        !stemma::api::validate(&input).ok,
+        "a header reference still needs its relationship"
+    );
+}
+
 fn zip_parts(parts: &[(&str, &str)]) -> Vec<u8> {
     let mut buf = Vec::new();
     {

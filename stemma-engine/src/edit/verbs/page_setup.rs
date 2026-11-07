@@ -14,12 +14,11 @@
 //! original. The serializer already emits `w:sectPrChange` from that field and
 //! `normalize.rs` already does byte-level accept/reject of the wrapper.
 //!
-//! §17.6.22 Continuous-section inheritance: a `Continuous` section inherits its
-//! page properties from the **preceding** section (a known drafting-error
-//! workaround the import already implements via
-//! `propagate_continuous_section_properties`). `SetSectionType` only flips the
-//! `section_type`; it never invents page geometry, so the preceding-section
-//! inheritance the importer established is preserved untouched.
+//! §17.6.22 continuous sections: a section's page properties are stored as
+//! authored. Real Word reads a property a continuous section omits as its own
+//! default ([`WORD_DEFAULT_PAGE_WIDTH`] and friends), not as the preceding
+//! section's value, so nothing is copied in on import. `SetSectionType` only
+//! flips the `section_type`; it never invents page geometry.
 //!
 //! v1 scope (fail loud beyond it):
 //! - `SetPageSetup` / `SetSectionType` target the body section or a top-level

@@ -425,6 +425,21 @@ pub struct BlockSdtWrap {
     /// Number of consecutive blocks enclosed by the `w:sdtContent`, counting the
     /// marked block itself. Invariant: `span >= 1`.
     pub span: usize,
+    /// Direct child controls in document order. Their offsets are relative to
+    /// this control's first block. Siblings are disjoint; descendants are
+    /// contained by their parent, including coincident starts and ends.
+    #[serde(default)]
+    pub nested: Vec<NestedBlockSdtWrap>,
+}
+
+/// A child control's position within its parent's block content. Keeping a
+/// hierarchy, rather than overlapping flat ranges, preserves distinct controls
+/// that begin on the same block and makes crossing ownership unrepresentable
+/// after range validation.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NestedBlockSdtWrap {
+    pub start: usize,
+    pub control: BlockSdtWrap,
 }
 
 /// A block-level structured document tag (`w:sdt`, §17.5.2) wrapping a
@@ -760,8 +775,18 @@ pub struct ParagraphNode {
     pub frame_pr: Option<FrameProperties>,
     /// Paragraph ID from w14:paraId (hex string, used by GDocs/Word for identity).
     pub para_id: Option<String>,
-    /// Text ID from w14:textId (hex string).
+    /// Optional paragraph-content version from w14:textId (MS-DOCX §2.6.2.4),
+    /// not the paragraph's identity. Content-changing producers invalidate an
+    /// old version instead of assigning it to different text; para_id remains.
     pub text_id: Option<String>,
+    /// Source paragraph session attributes used by Word when combining runs
+    /// during save and revision resolution. Preserve verbatim on existing
+    /// paragraphs. Fresh constructors have none; cloning a source paragraph
+    /// retains its session defaults along with its run-formatting context.
+    /// JSON states without this field carry no retained source attributes.
+    /// The positional binary snapshot schema is versioned separately.
+    #[serde(default)]
+    pub source_paragraph_attrs: Vec<(String, String)>,
     /// Conditional formatting flags (w:cnfStyle, §17.3.1.8).
     /// Present on paragraphs inside table cells to indicate which table
     /// conditional formats apply.
@@ -1217,19 +1242,25 @@ impl ParagraphNode {
             has_direct_borders: false,
             tab_stops: vec![],
             effective_tab_stops_rel: vec![],
-            segments: vec![TrackedSegment {
-                status: TrackingStatus::Normal,
-                inlines: vec![InlineNode::from(TextNode {
-                    id: NodeId::from(format!("{id}_r0")),
-                    text_role: None,
-                    text: text.to_string(),
-                    marks: vec![],
-                    style_props: StyleProps::default(),
-                    rpr_authored: RunRprAuthored::default(),
-                    source_run_attrs: Vec::new(),
-                    formatting_change: None,
-                })],
-            }],
+            // An empty paragraph has no inlines, the form import reads one in;
+            // an empty text node would save as a bare run.
+            segments: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![TrackedSegment {
+                    status: TrackingStatus::Normal,
+                    inlines: vec![InlineNode::from(TextNode {
+                        id: NodeId::from(format!("{id}_r0")),
+                        text_role: None,
+                        text: text.to_string(),
+                        marks: vec![],
+                        style_props: StyleProps::default(),
+                        rpr_authored: RunRprAuthored::default(),
+                        source_run_attrs: Vec::new(),
+                        formatting_change: None,
+                    })],
+                }]
+            },
             block_text_hash: None,
             numbering: None,
             has_direct_numbering: false,
@@ -1274,6 +1305,7 @@ impl ParagraphNode {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }
@@ -1842,6 +1874,10 @@ pub struct NoteProperties {
 /// All dimension values are in twips (1/1440 inch).
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SectionProperties {
+    /// Supplied section editing-session provenance (ISO 29500-1 §17.6.18):
+    /// w:rsidR, w:rsidRPr, w:rsidSect and w:rsidDel. These are retained
+    /// independently of page formatting and pending formatting proposals.
+    pub source_section_attrs: Vec<(String, String)>,
     /// Page width from w:pgSz w:w.
     pub page_width: Option<u32>,
     /// Page height from w:pgSz w:h.
@@ -1902,8 +1938,10 @@ pub struct SectionProperties {
     pub doc_grid_type: Option<DocGridType>,
     /// Line pitch from w:docGrid w:linePitch (twips).
     pub doc_grid_line_pitch: Option<u32>,
-    /// Character space from w:docGrid w:charSpace (twips).
-    pub doc_grid_char_space: Option<u32>,
+    /// Character pitch adjustment from w:docGrid w:charSpace: 4096ths of a
+    /// point added to each character's grid pitch (ST_DecimalNumber, signed;
+    /// negative tightens the pitch).
+    pub doc_grid_char_space: Option<i32>,
 
     // ── Boolean section flags ──
     /// Distinct first-page header/footer from w:titlePg (§17.6.18).
@@ -1952,6 +1990,18 @@ pub struct SectionProperties {
     /// Stored verbatim — references survive package roundtrip via the
     /// untyped relationship carry-over.
     pub printer_settings_rid: Option<String>,
+}
+
+impl SectionProperties {
+    /// These properties without their editing-session provenance
+    /// (`source_section_attrs`): what two sections must share to be the same
+    /// section content.
+    pub fn without_provenance(&self) -> SectionProperties {
+        SectionProperties {
+            source_section_attrs: Vec::new(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Printer tray codes for first vs subsequent pages (§17.6.9).
@@ -2082,8 +2132,10 @@ pub struct ParagraphSpacing {
     /// §17.3.1.33: when true, `after` and `after_lines` are ignored and spacing
     /// is automatically determined by the consumer (matching HTML default `<p>` margins).
     pub after_autospacing: Option<bool>,
-    /// Line spacing value (interpretation depends on `line_rule`).
-    pub line: Option<u32>,
+    /// Line spacing value (interpretation depends on `line_rule`). Signed:
+    /// `w:line` is ST_SignedTwipsMeasure (ISO 29500-1 §17.3.1.33), and Word
+    /// documents carry negative values.
+    pub line: Option<i32>,
     /// How to interpret the `line` value.
     pub line_rule: Option<LineSpacingRule>,
 }
@@ -2238,7 +2290,12 @@ pub fn paragraph_property_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> bool
         && a.adjust_right_ind == b.adjust_right_ind
         && a.word_wrap == b.word_wrap
         && a.frame_pr == b.frame_pr
-        && a.section_properties == b.section_properties
+        && a.section_properties
+            .as_ref()
+            .map(SectionProperties::without_provenance)
+            == b.section_properties
+                .as_ref()
+                .map(SectionProperties::without_provenance)
         && a.cnf_style == b.cnf_style
         && a.preserved_ppr == b.preserved_ppr
 }
@@ -2286,6 +2343,9 @@ impl HeadingLevel {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TableNode {
     pub id: NodeId,
+    /// Cross-structure ranges owned by the table, not a cell paragraph.
+    /// Their boundary includes the intervening row/cell terminators.
+    pub range_markers: Vec<TableRangeMarker>,
     pub rows: Vec<TableRowNode>,
     /// Hash of table structure (row count, column layout, merge info).
     /// Used for quick structure comparison during diffing.
@@ -2296,9 +2356,29 @@ pub struct TableNode {
     pub formatting_change: Option<TableFormattingChange>,
 }
 
+/// A direct table child at a structural boundary. A row anchor must resolve
+/// to exactly one current row.
+/// Markers sharing a boundary retain their source order in the vector.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TableRangeMarker {
+    pub position: TableRangePosition,
+    pub marker: RangeMarkerMeta,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TableRangePosition {
+    BeforeProperties,
+    BeforeRow(NodeId),
+    End,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TableRowNode {
     pub id: NodeId,
+    /// Supplied row editing-session provenance (ISO 29500-1 §17.4.78):
+    /// w:rsidR, w:rsidRPr, w:rsidTr and w:rsidDel. Retained independently
+    /// of formatting and tracked proposals. Newly authored rows have none.
+    pub source_row_attrs: Vec<(String, String)>,
     pub cells: Vec<TableCellNode>,
     /// Number of empty grid columns before the first cell (from w:gridBefore).
     pub grid_before: u32,
@@ -2320,9 +2400,10 @@ pub struct TableRowNode {
     pub para_id: Option<String>,
     /// Text ID from w14:textId (hex string).
     pub text_id: Option<String>,
-    /// Whether this row may not be split across pages (from w:cantSplit, §17.4.6).
+    /// Direct row pagination (`w:cantSplit`, §17.4.6). Absence inherits
+    /// from the table style; `Some(false)` explicitly allows splitting.
     #[serde(default)]
-    pub cant_split: bool,
+    pub cant_split: Option<bool>,
     /// Row-level table justification (from w:jc in trPr, §17.4.28).
     #[serde(default)]
     pub jc: Option<Alignment>,
@@ -2370,7 +2451,7 @@ pub struct TableCellNode {
     pub v_merge: VerticalMerge,
     /// Cell-level formatting (borders, shading, width, alignment).
     pub formatting: CellFormatting,
-    /// Tracked cell formatting change from w:tcPrChange (§17.13.5.37).
+    /// Tracked cell formatting change from w:tcPrChange (§17.13.5.36).
     pub formatting_change: Option<CellFormattingChange>,
     /// Tracked change status (from w:cellIns / w:cellDel in tcPr).
     pub tracking_status: Option<TrackingStatus>,
@@ -2409,6 +2490,22 @@ pub struct SdtWrapper {
     pub sdt_pr_xml: Vec<u8>,
     /// Raw XML bytes of the `w:sdtEndPr` element, if present.
     pub sdt_end_pr_xml: Option<Vec<u8>>,
+}
+
+impl SdtWrapper {
+    /// Word's id for this control (`w:sdtPr/w:id/@w:val`, §17.5.2.18), when
+    /// its properties carry one. A control keeps its id while its other
+    /// properties change, e.g. when filling it clears `w:showingPlcHdr`.
+    pub fn control_id(&self) -> Option<String> {
+        let sdt_pr = crate::word_xml::parse_raw_fragment(&self.sdt_pr_xml)
+            .expect("w:sdtPr bytes are an element written by import or an authoring verb");
+        sdt_pr.children.iter().find_map(|child| match child {
+            xmltree::XMLNode::Element(element) if crate::word_xml::is_w_tag(element, "id") => {
+                crate::xml_attrs::attr_get(element, "w:val").cloned()
+            }
+            _ => None,
+        })
+    }
 }
 
 /// The control type of a structured document tag (`w:sdt`, §17.5.2). This is the
@@ -2485,6 +2582,10 @@ pub struct TableFormatting {
     pub width: Option<TableMeasurement>,
     /// Column widths from w:tblGrid/w:gridCol (in twips).
     pub grid_cols: Vec<u32>,
+    /// Auxiliary grid for pending table properties (§17.13.5.33). Word may
+    /// include both old and current cell boundaries in this grid. It is not
+    /// independently selectable: the cell/row property records own the edit.
+    pub grid_history: Option<TableGridHistory>,
     /// Default cell margins from w:tblCellMar (twips).
     pub default_cell_margins: Option<CellMargins>,
     /// Table alignment from w:jc (§17.4.28).
@@ -2550,6 +2651,7 @@ impl Default for TableFormatting {
             borders: None,
             width: None,
             grid_cols: Vec::new(),
+            grid_history: None,
             default_cell_margins: None,
             alignment: None,
             indent: None,
@@ -3630,11 +3732,17 @@ pub struct OpaqueBlockNode {
     pub kind: OpaqueKind,
     pub opaque_ref: String,
     pub proof_ref: ProofRef,
+    /// References retained inside the immutable source-template payload.
+    /// Captured at import so resource lifetime does not guess through opacity.
+    pub note_references: NoteResourceReferences,
+    /// Persisted w14:paraId values inside the source-only block payload.
+    /// Allocation must reserve these even when the block itself is not edited.
+    pub source_paragraph_ids: Vec<String>,
     /// Set when this opaque block IS one half of a paired range marker that
     /// stood as a DIRECT child of `w:body` (a `bookmarkStart`/`End`,
     /// `commentRangeStart`/`End`, or `permStart`/`End` between paragraphs, §17.13).
-    /// The block still serializes verbatim from its raw bytes — this is metadata,
-    /// not a new emitter, so byte fidelity is unchanged. It exists so the
+    /// Body blocks retain their source-template emission; story-root blocks
+    /// emit the marker payload at the same structural position. It also lets the
     /// tracked-change torn-range repair can SEE the marker's identity (family +
     /// id + role): without it a body-level half is invisible, and a projection
     /// that removes the paragraph holding its inline partner orphans the pair
@@ -3643,8 +3751,14 @@ pub struct OpaqueBlockNode {
     pub range_marker: Option<RangeMarkerMeta>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NoteResourceReferences {
+    pub footnotes: Vec<String>,
+    pub endnotes: Vec<String>,
+}
+
 /// Identity of a paired range marker carried on an [`OpaqueBlockNode`] (a
-/// body-level bookmark / comment-range / permission half). Lets the torn-range
+/// block-level bookmark / comment-range / permission half). Lets the torn-range
 /// repair pair a block-level half with its inline partner by `(family, id)` and
 /// know which end it is.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -3652,6 +3766,10 @@ pub struct RangeMarkerMeta {
     pub family: RangeMarkerFamily,
     pub id: String,
     pub role: RangeMarkerRole,
+    /// Complete marker attributes for structural emission in any story.
+    /// The typed id is authoritative after transport remapping; other
+    /// attributes (bookmark name, column bounds, displacement) are retained.
+    pub raw_xml: Vec<u8>,
 }
 
 /// The paired-range families the torn-range repair understands. `customXml` and
@@ -3699,10 +3817,6 @@ pub enum InlineNode {
     CommentRangeEnd {
         id: String,
     },
-    /// Comment reference marker (visible indicator in document).
-    CommentReference {
-        id: String,
-    },
 }
 
 impl From<TextNode> for InlineNode {
@@ -3728,12 +3842,17 @@ impl From<DecorationNode> for InlineNode {
 pub struct RunBorder {
     /// Border style (e.g., "single", "double", "dotted").
     pub style: String,
-    /// Border width in eighth-points.
-    pub size: u32,
-    /// Spacing offset in points.
-    pub space: u32,
-    /// Border color as hex RGB (e.g., "FF0000").
-    pub color: String,
+    /// Border width in eighth-points (w:sz), when authored.
+    pub size: Option<u32>,
+    /// Spacing offset in points (w:space), when authored.
+    pub space: Option<u32>,
+    /// Border color as hex RGB or "auto" (w:color), when authored; absent
+    /// means auto (§17.3.2.4).
+    pub color: Option<String>,
+    /// Authored CT_Border attributes outside the basic line/color projection.
+    /// Absent in older snapshots, which did not represent these properties.
+    #[serde(default)]
+    pub extra_attrs: Vec<(String, String)>,
 }
 
 /// Theme color reference from w:color attributes (§17.3.2.6).
@@ -3822,6 +3941,10 @@ pub struct StyleProps {
     pub highlight: Option<HighlightColor>,
     /// Underline style from w:u w:val per §17.18.99 `ST_Underline`.
     pub underline_style: Option<UnderlineStyle>,
+    /// The underline's other attributes (§17.3.2.40: `w:color`, `w:themeColor`,
+    /// `w:themeTint`, `w:themeShade`), written on the same w:u as the style.
+    #[serde(default)]
+    pub underline_extra_attrs: Vec<(String, String)>,
     /// East Asian font family from w:rFonts w:eastAsia.
     pub font_east_asia: Option<IStr>,
     /// Theme font reference for eastAsia slot (e.g., "minorEastAsia"). A
@@ -3836,6 +3959,8 @@ pub struct StyleProps {
     pub lang: Option<IStr>,
     /// East Asian language tag from w:lang w:eastAsia (e.g., "ja-JP").
     pub lang_east_asia: Option<IStr>,
+    /// Complex-script language from w:lang w:bidi, independent of the other slots.
+    pub lang_bidi: Option<IStr>,
     /// Character spacing in twips from w:spacing w:val in rPr.
     pub char_spacing: Option<i32>,
     /// Character style ID from w:rStyle (e.g., "BoldChar", "Emphasis").
@@ -3919,12 +4044,14 @@ impl StyleProps {
             && self.color_theme.is_none()
             && self.highlight.is_none()
             && self.underline_style.is_none()
+            && self.underline_extra_attrs.is_empty()
             && self.font_east_asia.is_none()
             && self.font_east_asia_theme.is_none()
             && self.font_cs.is_none()
             && self.font_cs_theme.is_none()
             && self.lang.is_none()
             && self.lang_east_asia.is_none()
+            && self.lang_bidi.is_none()
             && self.char_spacing.is_none()
             && self.char_style_id.is_none()
             && self.run_border.is_none()
@@ -4168,10 +4295,10 @@ impl ParagraphFormattingChangeCarrier {
 /// Present on tables whose formatting was changed via Word's Track Changes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TableFormattingChange {
-    /// Complete previous table-property projection. `grid_cols` is carried so
-    /// in-memory Reject can restore the complete canonical table frame, but it
-    /// is never emitted inside `w:tblPrChange`: `w:tblGrid` is not revisioned
-    /// by that construct and must remain identical across the change.
+    /// Complete previous tblPr projection. The shared TableFormatting shape
+    /// also has grid fields, but this record does not own them: Reject keeps
+    /// the independently resolved grid frame, and tblPrChange never emits
+    /// tblGrid. Authored snapshots leave auxiliary grid history absent here.
     pub previous: TableFormatting,
     /// Stable revision id (`w:id`) of this tracked formatting change — the
     /// SAME identity the accept/reject selectors address. `0` is the legacy
@@ -4187,10 +4314,14 @@ pub struct TableFormattingChange {
     /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
     /// document-unique handle the resolution surface addresses, distinct from
     /// the wire `revision_id` (which Word does not keep unique). `0` is the
-    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
-    /// on `revision_id`.
+    /// pre-identity sentinel. Positional additions are version-gated by the
+    /// runtime snapshot schema.
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date from MS-DOCX §2.12.2.1. Independent of
+    /// the optional legacy date; absence must not manufacture UTC metadata.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 /// Tracked per-row table-property-exception change from `w:tblPrExChange`
@@ -4208,10 +4339,21 @@ pub struct TablePropertyExceptionChange {
     pub identity: u32,
 }
 
-/// Tracked row formatting change: the "before" state from w:trPrChange (§17.13.5.36).
+/// Tracked row formatting change: the "before" state from w:trPrChange (§17.13.5.37).
 /// Present on table rows whose formatting was changed via Word's Track Changes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RowFormattingChange {
+    /// Previous row geometry and pagination, independent of row identity,
+    /// cell content, row insert/delete status and sibling tblPrEx revisions.
+    pub previous_grid_before: u32,
+    pub previous_grid_after: u32,
+    pub previous_cant_split: Option<bool>,
+    pub previous_is_header: bool,
+    pub previous_jc: Option<Alignment>,
+    pub previous_w_before: Option<TableMeasurement>,
+    pub previous_w_after: Option<TableMeasurement>,
+    pub previous_cell_spacing: Option<i64>,
+    pub previous_preserved: Vec<PreservedProp>,
     /// Previous row height in twips (before the change).
     pub previous_height: Option<u32>,
     /// Previous row height rule (before the change).
@@ -4232,16 +4374,33 @@ pub struct RowFormattingChange {
     /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
     /// document-unique handle the resolution surface addresses, distinct from
     /// the wire `revision_id` (which Word does not keep unique). `0` is the
-    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
-    /// on `revision_id`.
+    /// pre-identity sentinel. Positional additions are version-gated by the
+    /// runtime snapshot schema.
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date from MS-DOCX §2.12.2.1. Independent of
+    /// the optional legacy date; absence must not manufacture UTC metadata.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
-/// Tracked cell formatting change: the "before" state from w:tcPrChange (§17.13.5.37).
+/// Auxiliary prior grid geometry. Its OOXML annotation id has no referents or
+/// independent user revision identity; export allocates a fresh transport id.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TableGridHistory {
+    pub columns: Vec<u32>,
+}
+
+/// Tracked cell formatting change: the "before" state from w:tcPrChange (§17.13.5.36).
 /// Present on table cells whose formatting was changed via Word's Track Changes.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CellFormattingChange {
+    /// Complete prior structural state from tcPr (§17.13.5.36).
+    pub previous_grid_span: u32,
+    pub previous_v_merge: VerticalMerge,
+    pub previous_hide_mark: bool,
+    /// Prior properties not consumed by the typed cell property fields.
+    pub previous_preserved: Vec<PreservedProp>,
     /// Previous cell width (before the change).
     pub previous_width: Option<TableMeasurement>,
     /// Previous cell borders (before the change).
@@ -4274,10 +4433,14 @@ pub struct CellFormattingChange {
     /// ENGINE-MINTED revision identity (RFC-0004 §H7). The stable,
     /// document-unique handle the resolution surface addresses, distinct from
     /// the wire `revision_id` (which Word does not keep unique). `0` is the
-    /// pre-identity sentinel. Appended LAST for the bincode-positional reason
-    /// on `revision_id`.
+    /// pre-identity sentinel. Positional additions are version-gated by the
+    /// runtime snapshot schema.
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date from MS-DOCX §2.12.2.1. Independent of
+    /// the optional legacy date; absence must not manufacture UTC metadata.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 /// Previous effective run formatting retained by the proof model.
@@ -4398,6 +4561,37 @@ pub struct LiteralPrefixSourceRun {
     /// The prefix ended inside this source run. Its consumed text must be
     /// prepended to the first remaining body fragment in the same emitted run.
     pub joins_body: bool,
+    /// The live inline marker immediately preceding this consumed source run.
+    /// This is a reference, not another owning copy of a bookmark/comment.
+    /// Markers remain in `segments` for ordinary resource visitors.
+    #[serde(default)]
+    pub preceding_marker: Option<LiteralPrefixMarker>,
+}
+
+/// A position witness into the paragraph's ordinary inline stream.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum LiteralPrefixMarker {
+    Decoration(NodeId),
+    CommentStart(String),
+    CommentEnd(String),
+    CommentReference(String),
+}
+
+impl LiteralPrefixMarker {
+    pub(crate) fn from_inline(inline: &InlineNode) -> Option<Self> {
+        match inline {
+            InlineNode::Decoration(node) => Some(Self::Decoration(node.id.clone())),
+            InlineNode::CommentRangeStart { id } => Some(Self::CommentStart(id.clone())),
+            InlineNode::CommentRangeEnd { id } => Some(Self::CommentEnd(id.clone())),
+            InlineNode::OpaqueInline(opaque) => match &opaque.kind {
+                OpaqueKind::CommentReference(reference) => {
+                    Some(Self::CommentReference(reference.reference_id.clone()))
+                }
+                _ => None,
+            },
+            InlineNode::Text(_) | InlineNode::HardBreak(_) => None,
+        }
+    }
 }
 
 /// The paragraph MARK's authored OFF toggles from `w:pPr/w:rPr` (§17.3.1.29
@@ -4423,6 +4617,10 @@ pub struct ParaMarkRprOff {
     pub italic_off: bool,
     /// `<w:u w:val="none"/>` on the paragraph mark.
     pub underline_off: bool,
+    /// `<w:vertAlign w:val="baseline"/>` on the paragraph mark: the OFF form
+    /// of subscript/superscript, which overrides a style's vertical alignment.
+    #[serde(default)]
+    pub vert_align_baseline: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -4457,6 +4655,9 @@ pub struct RunRprAuthored {
     pub lang: bool,
     /// w:lang w:eastAsia.
     pub lang_east_asia: bool,
+    /// w:lang w:bidi was authored on this run, rather than inherited.
+    #[serde(default)]
+    pub lang_bidi: bool,
     /// w:kern (kerning threshold, §17.3.2.19a). No theme/literal precedence
     /// inversion here — gating is churn hygiene: an inherited kerning threshold
     /// must not be re-emitted as direct rPr on every run.
@@ -4575,6 +4776,7 @@ impl RunRprAuthored {
         color_theme: true,
         lang: true,
         lang_east_asia: true,
+        lang_bidi: true,
         kern: true,
         char_spacing: true,
         bold: true,
@@ -4672,6 +4874,9 @@ impl RunRprAuthored {
         }
         if !self.lang_east_asia {
             props.lang_east_asia = None;
+        }
+        if !self.lang_bidi {
+            props.lang_bidi = None;
         }
         if !self.kern {
             props.kern = None;
@@ -4810,6 +5015,7 @@ impl RunRprAuthored {
             color_theme: props.color_theme.is_some(),
             lang: props.lang.is_some(),
             lang_east_asia: props.lang_east_asia.is_some(),
+            lang_bidi: props.lang_bidi.is_some(),
             kern: props.kern.is_some(),
             char_spacing: props.char_spacing.is_some(),
             bold: marks.contains(&Mark::Bold),
@@ -4992,6 +5198,10 @@ pub struct OpaqueInlineNode {
     /// run-level opaque elements like `w:fldChar` or `w:instrText`.
     pub wrapper_marks: Vec<Mark>,
     pub wrapper_style_props: StyleProps,
+    /// Direct run-property provenance, including explicit bold/italic OFF.
+    /// Imported wrappers capture their source rPr; synthesized wrappers use
+    /// `RunRprAuthored::ALL` to emit the explicitly supplied properties.
+    pub wrapper_rpr_authored: RunRprAuthored,
     /// Source `w:r` attributes for run-level opaque elements. These are
     /// load-bearing for the same reason as text/break run attributes and must
     /// remain on a synthesized wrapper.
@@ -5013,6 +5223,10 @@ pub struct OpaqueInlineNode {
 /// Zero-width decoration node (bookmarks, comments, etc.).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DecorationNode {
+    /// Source host-run editing-session attributes (ECMA-376 §17.3.2.25).
+    /// Paragraph-level and newly authored markers have no source run.
+    #[serde(default)]
+    pub source_run_attrs: Vec<(String, String)>,
     pub id: NodeId,
     pub kind: DecorationType,
     pub opaque_ref: String,
@@ -5116,6 +5330,12 @@ pub enum DecorationType {
     /// NOTE: appended LAST so serialized snapshots that encode the enum by
     /// variant index stay readable.
     CustomXmlWrapperEnd,
+    /// A complete zero-width source run with no displayed content. CT_R permits
+    /// run properties without inner content (§17.3.2.25); the raw run preserves
+    /// those authored properties and provenance instead of silently dropping
+    /// them. Distinct from foreign markup and from a text node of length zero.
+    /// Appended to retain existing serialized enum indices.
+    EmptyRun,
 }
 
 /// A formatting mark.
@@ -5178,6 +5398,9 @@ pub struct TextMarks {
     pub highlight: Option<HighlightColor>,
     /// Underline style from w:u w:val per §17.18.99 `ST_Underline`.
     pub underline_style: Option<UnderlineStyle>,
+    /// The underline's other attributes; `Some` exactly when `underline_style`
+    /// is (see [`StyleProps::underline_extra_attrs`]).
+    pub underline_extra_attrs: Option<Vec<(String, String)>>,
     /// East Asian font family from w:rFonts w:eastAsia.
     pub font_east_asia: Option<IStr>,
     /// Complex script font family from w:rFonts w:cs.
@@ -5202,6 +5425,26 @@ pub enum Alignment {
     MediumKashida,
     NumTab,
     ThaiDistribute,
+}
+
+impl Alignment {
+    /// A paragraph `w:jc` value (ST_Jc, §17.18.44), strict and transitional
+    /// spellings both.
+    pub fn from_xml_str(s: &str) -> Result<Self, String> {
+        match s {
+            "left" | "start" => Ok(Self::Left),
+            "center" => Ok(Self::Center),
+            "right" | "end" => Ok(Self::Right),
+            "both" | "justify" => Ok(Self::Justify),
+            "distribute" => Ok(Self::Distribute),
+            "highKashida" => Ok(Self::HighKashida),
+            "lowKashida" => Ok(Self::LowKashida),
+            "mediumKashida" => Ok(Self::MediumKashida),
+            "numTab" => Ok(Self::NumTab),
+            "thaiDistribute" => Ok(Self::ThaiDistribute),
+            other => Err(format!("unrecognized alignment value {other:?}")),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -5383,7 +5626,9 @@ pub struct HyperlinkFieldSpec {
     pub tooltip: Option<String>,
     /// `\t "frame"` — target HTML frame.
     pub target_frame: Option<String>,
-    /// `\n` — open in new browser window / suppress history.
+    /// `\n` — open the destination in a new browser window (§17.16.5.25).
+    pub open_in_new_window: bool,
+    /// `\h` — suppress visited-link history (MS-OI29500 §2.1.477).
     pub no_history: bool,
     /// `\m` — image map / coordinates.
     pub image_map: bool,
@@ -5603,8 +5848,11 @@ impl HyperlinkFieldSpec {
             s.push_str(" \\t");
             push_quoted(&mut s, frame);
         }
-        if self.no_history {
+        if self.open_in_new_window {
             s.push_str(" \\n");
+        }
+        if self.no_history {
+            s.push_str(" \\h");
         }
         if self.image_map {
             s.push_str(" \\m");
@@ -6047,6 +6295,7 @@ fn parse_hyperlink(rest: &[FieldArg]) -> Result<FieldSemantic, FieldParseError> 
     let mut tooltip: Option<String> = None;
     let mut target_frame: Option<String> = None;
     let mut no_history = false;
+    let mut open_in_new_window = false;
     let mut image_map = false;
 
     let mut i = 0;
@@ -6074,7 +6323,8 @@ fn parse_hyperlink(rest: &[FieldArg]) -> Result<FieldSemantic, FieldParseError> 
                         continue;
                     }
                 }
-                'n' => no_history = true,
+                'n' => open_in_new_window = true,
+                'h' => no_history = true,
                 'm' => image_map = true,
                 _ => {}
             },
@@ -6099,6 +6349,7 @@ fn parse_hyperlink(rest: &[FieldArg]) -> Result<FieldSemantic, FieldParseError> 
         tooltip,
         target_frame,
         no_history,
+        open_in_new_window,
         image_map,
         format,
     }))
@@ -6337,8 +6588,9 @@ pub struct HyperlinkData {
     pub url: Option<String>,
     /// Internal bookmark anchor.
     pub anchor: Option<String>,
-    /// Display text of the hyperlink (concatenation of all runs).
-    /// Kept for backward-compatibility; prefer `runs` for formatting-aware access.
+    /// Display text of the hyperlink: its runs' text, without runs deleted
+    /// inside the link. Kept for backward-compatibility; prefer `runs` for
+    /// formatting-aware access.
     pub text: String,
     /// Relationship ID for external URLs (r:id attribute).
     /// Used for roundtripping: preserved from import so the same rId
@@ -6551,12 +6803,28 @@ pub enum InlineChange {
         text: String,
         marks: Vec<Mark>,
         style_props: StyleProps,
+        /// Which of `marks`/`style_props` the source run sets directly in its
+        /// own `w:rPr`; the remainder is inherited from styles and document
+        /// defaults. Materialization provenance, so a projection reproduces
+        /// its input run without baking inherited values into direct
+        /// formatting. Not part of the published read model: nothing
+        /// materializes from deserialized segments.
+        #[serde(skip)]
+        rpr_authored: RunRprAuthored,
         formatting_change: Option<FormattingChange>,
     },
     Inserted {
         text: String,
         marks: Vec<Mark>,
         style_props: StyleProps,
+        /// Which of `marks`/`style_props` the source run sets directly in its
+        /// own `w:rPr`; the remainder is inherited from styles and document
+        /// defaults. Materialization provenance, so a projection reproduces
+        /// its input run without baking inherited values into direct
+        /// formatting. Not part of the published read model: nothing
+        /// materializes from deserialized segments.
+        #[serde(skip)]
+        rpr_authored: RunRprAuthored,
         formatting_change: Option<FormattingChange>,
         /// Revision id of the tracked change this span belongs to (0 when there is
         /// no selectable revision — a pairwise-diff projection or a legacy
@@ -6569,6 +6837,14 @@ pub enum InlineChange {
         text: String,
         marks: Vec<Mark>,
         style_props: StyleProps,
+        /// Which of `marks`/`style_props` the source run sets directly in its
+        /// own `w:rPr`; the remainder is inherited from styles and document
+        /// defaults. Materialization provenance, so a projection reproduces
+        /// its input run without baking inherited values into direct
+        /// formatting. Not part of the published read model: nothing
+        /// materializes from deserialized segments.
+        #[serde(skip)]
+        rpr_authored: RunRprAuthored,
         formatting_change: Option<FormattingChange>,
         #[serde(default)]
         rev_id: u32,

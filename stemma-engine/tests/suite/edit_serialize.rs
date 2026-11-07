@@ -285,6 +285,8 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
                     position: InsertPosition::After,
                     rationale: Some("Metamorphic inserted follow-up paragraph".to_string()),
                     blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role.clone()),
                         content: parse_paragraph_markup(&inserted_text).unwrap(),
                         restart_numbering: false,
@@ -315,6 +317,8 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
                     position: InsertPosition::After,
                     rationale: Some("First insert after shared anchor".to_string()),
                     blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role.clone()),
                         content: parse_paragraph_markup(&first_insert).unwrap(),
                         restart_numbering: false,
@@ -326,6 +330,8 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
                     position: InsertPosition::After,
                     rationale: Some("Second insert after shared anchor".to_string()),
                     blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role),
                         content: parse_paragraph_markup(&second_insert).unwrap(),
                         restart_numbering: false,
@@ -355,6 +361,7 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
         let tx = EditTransaction {
             steps: vec![
                 EditStep::DeleteBlockRange {
+                    story: stemma::edit::StoryRef::Body,
                     from_block_id: delete_candidate.block_id.clone(),
                     to_block_id: delete_candidate.block_id.clone(),
                     rationale: Some("Metamorphic delete one paragraph".to_string()),
@@ -371,6 +378,8 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
                     position: InsertPosition::After,
                     rationale: Some("Insert after surviving anchor".to_string()),
                     blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role),
                         content: parse_paragraph_markup(&inserted_text).unwrap(),
                         restart_numbering: false,
@@ -422,12 +431,16 @@ fn build_transaction_scenarios(doc: &CanonDoc) -> Vec<TransactionScenario> {
                 semantic_hash: None,
                 blocks: vec![
                     BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role.clone()),
                         content: parse_paragraph_markup(&replacement_one).unwrap(),
                         restart_numbering: false,
                         list: None,
                     }),
                     BlockSpec::Paragraph(ParagraphBlockSpec {
+                        tab_stops: None,
+                        format_from: None,
                         role: Some(role),
                         content: parse_paragraph_markup(&replacement_two).unwrap(),
                         restart_numbering: false,
@@ -1535,9 +1548,9 @@ fn edit_insert_toc_block_emits_tracked_complex_field() {
         .flat_map(|segment| segment.inlines.iter())
         .filter_map(|inline| match inline {
             InlineNode::OpaqueInline(opaque) => match &opaque.kind {
-                OpaqueKind::Field(field) if field.field_kind == FieldKind::Instruction => {
-                    Some(field)
-                }
+                // The wire form is the complex field above, but it reopens as
+                // the simple field that was authored: one spelling.
+                OpaqueKind::Field(field) if field.field_kind == FieldKind::Simple => Some(field),
                 _ => None,
             },
             _ => None,
@@ -1629,6 +1642,8 @@ fn edit_insert_with_restart_numbering_emits_start_override() {
                 position: InsertPosition::After,
                 rationale: Some("Restart numbering for schedule heading.".to_string()),
                 blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.clone()),
                     content: parse_paragraph_markup(&inserted_text).unwrap(),
                     restart_numbering: true,
@@ -1827,12 +1842,16 @@ fn edit_insert_multi_item_new_list_shares_single_override() {
             ),
             blocks: vec![
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.clone()),
                     content: parse_paragraph_markup("foo").unwrap(),
                     restart_numbering: true,
                     list: None,
                 }),
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.clone()),
                     content: parse_paragraph_markup("bar").unwrap(),
                     restart_numbering: false,

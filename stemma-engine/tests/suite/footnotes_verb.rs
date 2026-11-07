@@ -42,6 +42,42 @@ fn make_docx(text: &str) -> Vec<u8> {
     pack(&document_xml)
 }
 
+/// A one-paragraph DOCX like [`make_docx`] with a styles part whose default
+/// paragraph style, Normal, is justified.
+fn make_docx_justified_normal(text: &str) -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+    );
+    let styles_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:jc w:val="both"/></w:pPr></w:style></w:styles>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+
+    use std::io::Write;
+    use zip::write::FileOptions;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: FileOptions = FileOptions::default();
+        for (name, body) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+            ("word/styles.xml", styles_xml),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
 /// Pack a `word/document.xml` body into a minimal DOCX with no extra parts.
 fn pack(document_xml: &str) -> Vec<u8> {
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
@@ -305,6 +341,111 @@ fn first_footnote_synthesizes_part_and_round_trips() {
         1,
         "authored footnote survives round-trip"
     );
+}
+
+/// A document's first note brings its part's separator notes (§17.11.10),
+/// and the document holds them as it would after a save and reopen.
+#[test]
+fn a_documents_first_note_reopens_as_authored() {
+    for note_kind in [NoteKind::Footnote, NoteKind::Endnote] {
+        for mode in [
+            MaterializationMode::TrackedChange,
+            MaterializationMode::Direct,
+        ] {
+            let base = Document::parse(&make_docx("A clause needing a note here.")).expect("parse");
+            let block_id = first_block_id(&base.snapshot().canonical);
+            let edited = base
+                .apply(&txn_mode(
+                    vec![EditStep::InsertNote {
+                        block_id,
+                        expect: "note".to_string(),
+                        semantic_hash: None,
+                        note_kind,
+                        body: "Note body.".to_string(),
+                        rationale: None,
+                    }],
+                    mode,
+                ))
+                .expect("apply");
+            let reopened = Document::parse(
+                &edited
+                    .serialize(&ExportOptions::default())
+                    .expect("serialize"),
+            )
+            .expect("reopen");
+            let differences = stemma::roundtrip_compare::compare_canon_docs(
+                &edited.snapshot().canonical,
+                &reopened.snapshot().canonical,
+            );
+            assert!(
+                differences.is_empty(),
+                "{note_kind:?} {mode:?}: {:?}",
+                &differences[..differences.len().min(3)]
+            );
+        }
+    }
+}
+
+/// A created note's paragraph carries no style, so it takes the default
+/// paragraph style (§17.7.4.17): in a document whose Normal is justified, the
+/// note reads justified, as Word and a reopen show it, not left.
+#[test]
+fn a_new_notes_paragraph_takes_the_default_paragraph_styles_alignment() {
+    for note_kind in [NoteKind::Footnote, NoteKind::Endnote] {
+        let base = Document::parse(&make_docx_justified_normal("A clause needing a note here."))
+            .expect("parse");
+        let block_id = first_block_id(&base.snapshot().canonical);
+        let edited = base
+            .apply(&txn(vec![EditStep::InsertNote {
+                block_id,
+                expect: "note".to_string(),
+                semantic_hash: None,
+                note_kind,
+                body: "Note body.".to_string(),
+                rationale: None,
+            }]))
+            .expect("apply");
+        let canonical = &edited.snapshot().canonical;
+        let normal = |note_type: &stemma::domain::NoteType| {
+            matches!(note_type, stemma::domain::NoteType::Normal)
+        };
+        let first_block = match note_kind {
+            NoteKind::Footnote => canonical
+                .footnotes
+                .iter()
+                .find(|s| normal(&s.note_type))
+                .map(|story| &story.blocks[0].block),
+            NoteKind::Endnote => canonical
+                .endnotes
+                .iter()
+                .find(|s| normal(&s.note_type))
+                .map(|story| &story.blocks[0].block),
+        }
+        .expect("the created note");
+        let BlockNode::Paragraph(paragraph) = first_block else {
+            panic!("{note_kind:?}: note story starts with a paragraph");
+        };
+        assert_eq!(
+            paragraph.align,
+            Some(stemma::domain::Alignment::Justify),
+            "{note_kind:?}"
+        );
+        let reopened = Document::parse(
+            &edited
+                .serialize(&ExportOptions::default())
+                .expect("serialize"),
+        )
+        .expect("reopen");
+        let differences = stemma::roundtrip_compare::compare_canon_docs(
+            canonical,
+            &reopened.snapshot().canonical,
+        );
+        assert!(
+            differences.is_empty(),
+            "{note_kind:?}: {:?}",
+            &differences[..differences.len().min(3)]
+        );
+    }
 }
 
 #[test]

@@ -142,6 +142,8 @@ fn insert_after(canon: &CanonDoc, anchor: NodeId) -> Result<CanonDoc, EditError>
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some(role),
                 content: parse_paragraph_markup("Inserted item body").unwrap(),
                 restart_numbering: false,

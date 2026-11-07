@@ -15,9 +15,11 @@ accepted base + accepted target -> stemma-diff -> engine operations -> redline
 - **`stemma-artifacts`** owns shared file identity and create-new persistence.
 - **`stemma-cli`** exposes local command-line workflows.
 - **`stemma-mcp`** exposes the engine to agents over stdio.
+- **`stemma-py`** is the experimental Python binding (PyPI `stemma-py`, import
+  `stemma`), built with PyO3 and maturin.
 - **`stemma-api`** is the local HTTP demonstration transport.
 
-The CLI, MCP, and HTTP crates are adapters over the engine's `api::Document`
+The CLI, MCP, Python, and HTTP crates are adapters over the engine's `api::Document`
 facade (plus `SimpleRuntime` for session management). A new consumer, a
 viewer, a renderer, a hosted service, depends on the facade the same way,
 not on a transport's JSON: see [Embed the engine](../reference/embedding.md);

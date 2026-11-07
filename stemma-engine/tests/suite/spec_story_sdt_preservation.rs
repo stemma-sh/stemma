@@ -135,8 +135,79 @@ fn assert_footer_keeps_gallery_envelope(footer_xml: &str) {
     );
 }
 
-/// The canonical case: Word's page-number footer gallery survives an unrelated
-/// document edit.
+#[test]
+fn untouched_story_row_keeps_editing_session_attributes() {
+    check_story_row_session_attributes();
+}
+
+pub(super) fn check_story_row_session_attributes() {
+    // ISO 29500-1 17.4.78: these values record row editing sessions.
+    // An unrelated body edit must not erase supplied row provenance.
+    let attributes = [
+        ("w:rsidR", "00110022"),
+        ("w:rsidRPr", "00330044"),
+        ("w:rsidTr", "00550066"),
+        ("w:rsidDel", "00770088"),
+    ];
+    let row_attributes = attributes
+        .iter()
+        .map(|(key, value)| format!("{key}=\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let footer = format!(
+        r#"<w:ftr xmlns:w="{W_NS}"><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="3600"/></w:tblGrid><w:tr {row_attributes}><w:tc><w:tcPr><w:tcW w:w="3600" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Retained footer entry</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:ftr>"#
+    );
+    let source = make_docx_with_footer(&footer);
+    let original = Document::parse(&source).unwrap();
+    let canonical = &original.snapshot().canonical;
+    assert!(stemma::roundtrip_compare::compare_canon_docs(canonical, canonical).is_empty());
+    for erase in [false, true] {
+        let mut changed = (**canonical).clone();
+        let stemma::BlockNode::Table(table) = &mut changed.footers[0].blocks[0].block else {
+            panic!("footer table");
+        };
+        if erase {
+            table.rows[0].source_row_attrs.clear();
+        } else {
+            table.rows[0].source_row_attrs[0].1 = "009900AA".to_string();
+        }
+        let differences = stemma::roundtrip_compare::compare_canon_docs(canonical, &changed);
+        assert!(
+            differences
+                .iter()
+                .any(|difference| difference.path.contains("source_row_attrs")),
+            "loss or alteration of row session provenance is not equivalent"
+        );
+    }
+    let edited = original.apply(&reserialize_trigger()).unwrap();
+    let bytes = edited.serialize(&ExportOptions::default()).unwrap();
+    let reopened = Document::parse(&bytes).unwrap();
+    let accepted = reopened.project(stemma::Resolution::AcceptAll).unwrap();
+    let rejected = reopened.project(stemma::Resolution::RejectAll).unwrap();
+    for candidate in [&edited, &reopened, &accepted, &rejected] {
+        let output = candidate.serialize(&ExportOptions::default()).unwrap();
+        let xml = part_of(&output, "word/footer1.xml");
+        let root = xmltree::Element::parse(xml.as_bytes()).unwrap();
+        let row = root.get_child("tbl").unwrap().get_child("tr").unwrap();
+        for (key, value) in attributes {
+            let actual = row
+                .attributes
+                .iter()
+                .find(|(name, _)| {
+                    name.namespace.as_deref() == Some(W_NS)
+                        && name.local_name == key.trim_start_matches("w:")
+                })
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                actual,
+                Some(value),
+                "untouched footer row must retain {key}"
+            );
+        }
+    }
+}
+
+/// Word's page-number footer gallery survives an unrelated document edit.
 #[test]
 fn footer_page_number_sdt_survives_edit_rebuild() {
     let docx = make_docx_with_footer(&page_number_footer(PAGE_FIELD_PARA));
@@ -200,4 +271,119 @@ fn footer_sdt_spanning_two_paragraphs_keeps_span_and_boundary() {
         close < outside,
         "trailing paragraph must stay OUTSIDE the envelope; footer1.xml: {footer_xml}"
     );
+}
+
+/// ECMA-376 §17.5.2.29/.34: each enclosing control owns its own properties
+/// and content. An unrelated edit must not flatten a nested control, including
+/// when its first block is also the first block of the outer control.
+#[test]
+fn nested_footer_controls_keep_properties_and_exact_content_boundaries() {
+    check_nested_footer_control_lifecycle();
+}
+
+pub(super) fn check_nested_footer_control_lifecycle() {
+    fn shape(node: &xmltree::Element) -> serde_json::Value {
+        let mut attributes: Vec<_> = node
+            .attributes
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.namespace.as_deref(),
+                    name.local_name.as_str(),
+                    value.as_str(),
+                )
+            })
+            .collect();
+        attributes.sort();
+        let children: Vec<_> = node
+            .children
+            .iter()
+            .map(|child| match child {
+                xmltree::XMLNode::Element(element) => shape(element),
+                other => serde_json::json!(["non_element", format!("{other:?}")]),
+            })
+            .collect();
+        serde_json::json!([node.namespace, node.name, attributes, children])
+    }
+    fn footer_shape(bytes: &[u8]) -> serde_json::Value {
+        let xml = part_of(bytes, "word/footer1.xml");
+        let root = xmltree::Element::parse(xml.as_bytes()).unwrap();
+        // A serializer may declare unused extension namespaces as Ignorable.
+        // This witness has exclusively WML payload, so that root declaration
+        // does not change MCE processing. Keep every payload attribute exact.
+        for (name, prefixes) in root.attributes.iter() {
+            assert_eq!(
+                name.namespace.as_deref(),
+                Some("http://schemas.openxmlformats.org/markup-compatibility/2006")
+            );
+            assert_eq!(name.local_name, "Ignorable");
+            for prefix in prefixes.split_whitespace() {
+                let uri = root.namespaces.as_ref().unwrap().get(prefix).unwrap();
+                assert_ne!(uri, W_NS);
+            }
+        }
+        fn assert_wml_payload(node: &xmltree::Element) {
+            assert_eq!(node.namespace.as_deref(), Some(W_NS));
+            assert!(
+                node.attributes
+                    .iter()
+                    .all(|(name, _)| name.namespace.as_deref() == Some(W_NS))
+            );
+            for child in &node.children {
+                if let xmltree::XMLNode::Element(child) = child {
+                    assert_wml_payload(child);
+                }
+            }
+        }
+        for child in &root.children {
+            if let xmltree::XMLNode::Element(child) = child {
+                assert_wml_payload(child);
+            }
+        }
+        let mut result = shape(&root);
+        result[2] = serde_json::json!([]);
+        result
+    }
+    for before_inner in ["", "<w:p><w:r><w:t>Before inner</w:t></w:r></w:p>"] {
+        let footer = format!(
+            r#"<w:ftr xmlns:w="{W_NS}"><w:sdt><w:sdtPr><w:id w:val="101"/><w:alias w:val="Outer"/></w:sdtPr><w:sdtContent>{before_inner}<w:sdt><w:sdtPr><w:id w:val="202"/><w:docPartObj><w:docPartGallery w:val="Page Numbers (Bottom of Page)"/><w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtEndPr><w:rPr><w:b/></w:rPr></w:sdtEndPr><w:sdtContent>{PAGE_FIELD_PARA}</w:sdtContent></w:sdt><w:p><w:r><w:t>After inner</w:t></w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Outside outer</w:t></w:r></w:p></w:ftr>"#
+        );
+        let source = make_docx_with_footer(&footer);
+        assert!(
+            stemma::api::validate(&source).ok,
+            "synthetic input must be valid"
+        );
+        let expected = footer_shape(&source);
+        let output = edit_and_serialize(&source);
+        let xml = part_of(&output, "word/footer1.xml");
+        assert_eq!(
+            xml.matches("<w:sdt>").count(),
+            2,
+            "both structural control envelopes must survive the unrelated edit"
+        );
+        assert_eq!(
+            footer_shape(&output),
+            expected,
+            "complete footer payload and nesting"
+        );
+        for resolution in [stemma::Resolution::AcceptAll, stemma::Resolution::RejectAll] {
+            let resolved = Document::parse(&output)
+                .unwrap()
+                .project(resolution)
+                .unwrap()
+                .serialize(&ExportOptions::default())
+                .unwrap();
+            assert!(stemma::api::validate(&resolved).ok);
+            assert_eq!(
+                footer_shape(&resolved),
+                expected,
+                "resolution cannot unwrap structural controls"
+            );
+            assert_eq!(
+                footer_shape(&edit_and_serialize(&resolved)),
+                expected,
+                "nested wrappers remain stable after re-import and another edit"
+            );
+        }
+    }
 }

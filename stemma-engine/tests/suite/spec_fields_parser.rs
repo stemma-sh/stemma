@@ -44,6 +44,36 @@ fn hyperlink_url_only() {
 }
 
 #[test]
+fn hyperlink_history_suppression_is_not_new_window_behavior() {
+    check_hyperlink_switch_independence();
+}
+
+pub(super) fn check_hyperlink_switch_independence() {
+    // ISO 29500-1 §17.16.5.25: \n opens a new browser window.
+    // MS-OI29500 §2.1.477: \h independently suppresses visited history.
+    for (switches, suppress_history) in [
+        ("", false),
+        (r" \n", false),
+        (r" \h", true),
+        (r" \n \h", true),
+    ] {
+        let instruction = format!(r#"HYPERLINK "https://example.test/resource"{switches}"#);
+        let FieldSemantic::Hyperlink(link) = parse_field_instruction(&instruction).unwrap() else {
+            panic!("expected hyperlink");
+        };
+        assert_eq!(link.no_history, suppress_history, "{instruction}");
+        assert_eq!(link.open_in_new_window, switches.contains(r"\n"));
+        let emitted = link.to_instruction_text();
+        assert_eq!(emitted.contains(r" \h"), suppress_history);
+        assert_eq!(emitted.contains(r" \n"), switches.contains(r"\n"));
+        assert_eq!(
+            parse_field_instruction(&emitted).unwrap(),
+            FieldSemantic::Hyperlink(link)
+        );
+    }
+}
+
+#[test]
 fn hyperlink_bookmark_only() {
     let s = parse_field_instruction(r#"HYPERLINK \l "section_5""#).unwrap();
     match s {

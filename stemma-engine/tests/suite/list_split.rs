@@ -268,6 +268,33 @@ fn part_bytes(docx: &[u8], part: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// A DIRECT split authors no revision: the tail moves to the new list with no
+/// tracked pPrChange on any paragraph, so the edited document already reads as
+/// accepting the tracked split would.
+#[test]
+fn direct_split_authors_no_tracked_change() {
+    let (doc, ids) = parse(&["One", "Two", "Three", "Four", "Five"]);
+    let mut step = split_step(&ids[2]);
+    step.materialization_mode = MaterializationMode::Direct;
+    let edited = doc.apply(&step).expect("direct split applies");
+    let canonical = &edited.snapshot().canonical;
+    for (index, block) in canonical.blocks.iter().enumerate() {
+        if let BlockNode::Paragraph(p) = &block.block {
+            assert!(
+                p.formatting_change.is_none(),
+                "paragraph {index} carries a tracked change after a direct split"
+            );
+        }
+    }
+    assert_eq!(num_id_of(canonical, 1), Some(1), "the head keeps its list");
+    assert_ne!(
+        num_id_of(canonical, 2),
+        Some(1),
+        "the tail moves to a new list"
+    );
+    assert_eq!(num_id_of(canonical, 2), num_id_of(canonical, 4));
+}
+
 // ─── 1 + 2: accept == two lists, reject == one list ──────────────────────────
 
 #[test]
@@ -585,3 +612,118 @@ fn split_allocates_above_a_footnote_only_numid() {
 // it impossible, which is the honest outcome. (The styles bootstrap is testable
 // because CreateStyle is a package-level op with no body precondition; Split is
 // body-anchored.)
+
+// ─── Label format (`set_numbering` kind `format`) ────────────────────────────
+//
+// Domain rule: changing the label format of an item and the items after it in
+// its list (1., 2., 3. → (a), (b), (c)) leaves the earlier items and the list's
+// shared definition as they were. The changed items read with the new format
+// once accepted, the original labels once rejected, and the saved package
+// defines the new format in a definition of its own.
+
+fn format_from(block_id: &str, mode: &str) -> EditTransaction {
+    let json = format!(
+        r#"{{"ops":[{{"op":"set_numbering","target":"{block_id}","change":{{"kind":"format","num_fmt":"lowerLetter","lvl_text":"(%1)"}}}}],"revision":{{"author":"Counsel"}},"materialization_mode":"{mode}"}}"#
+    );
+    stemma::edit_v4::parse_transaction(&json)
+        .expect("schema-valid format op")
+        .into_edit_transaction()
+        .expect("adapts")
+}
+
+fn labels(doc: &Document) -> Vec<String> {
+    let reopened = Document::parse(&doc.serialize(&ExportOptions::default()).expect("serialize"))
+        .expect("reopen");
+    reopened
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .filter_map(|tracked| match &tracked.block {
+            BlockNode::Paragraph(p) => p.numbering.as_ref().map(|n| n.synthesized_text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_label_format_change_reads_new_once_accepted_and_old_once_rejected() {
+    let (doc, ids) = parse(&["One", "Two", "Three", "Four", "Five"]);
+    let edited = doc
+        .apply(&format_from(&ids[2], "tracked_change"))
+        .expect("format");
+    assert_eq!(
+        labels(&edited.project(Resolution::AcceptAll).expect("accept")),
+        ["1.", "2.", "(a)", "(b)", "(c)"]
+    );
+    assert_eq!(
+        labels(&edited.project(Resolution::RejectAll).expect("reject")),
+        ["1.", "2.", "3.", "4.", "5."]
+    );
+
+    let numbering = String::from_utf8(
+        part_bytes(
+            &edited
+                .serialize(&ExportOptions::default())
+                .expect("serialize"),
+            "word/numbering.xml",
+        )
+        .expect("numbering part"),
+    )
+    .expect("utf-8");
+    // The source definition is untouched; a second one carries the new format.
+    assert_eq!(
+        numbering.matches(r#"<w:numFmt w:val="decimal""#).count(),
+        1,
+        "{numbering}"
+    );
+    assert!(
+        numbering.contains(r#"<w:numFmt w:val="lowerLetter""#),
+        "{numbering}"
+    );
+    assert!(
+        numbering.contains(r#"<w:lvlText w:val="(%1)""#),
+        "{numbering}"
+    );
+}
+
+#[test]
+fn a_direct_label_format_change_is_no_tracked_change() {
+    let (doc, ids) = parse(&["One", "Two", "Three"]);
+    let edited = doc.apply(&format_from(&ids[1], "direct")).expect("format");
+    assert!(edited.revisions().is_empty(), "{:?}", edited.revisions());
+    assert_eq!(labels(&edited), ["1.", "(a)", "(b)"]);
+}
+
+#[test]
+fn a_label_format_without_a_template_is_refused() {
+    let json = r#"{"ops":[{"op":"set_numbering","target":"p_1","change":{"kind":"format","num_fmt":"lowerLetter","lvl_text":""}}],"revision":{"author":"Counsel"}}"#;
+    let error =
+        stemma::edit_v4::parse_transaction(json).expect_err("an empty template is no format");
+    assert!(error.to_string().contains("lvl_text"), "{error}");
+}
+
+/// A list label is a view over the list sequence, so an edit that changes the
+/// sequence shows the new labels at once, not only after a save and reopen:
+/// a split's tail counts from 1 and a format change reads in its new format.
+#[test]
+fn an_edited_list_reads_its_new_labels_before_saving() {
+    let in_session = |doc: &Document| -> Vec<String> {
+        doc.snapshot()
+            .canonical
+            .blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(p) => p.numbering.as_ref().map(|n| n.synthesized_text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (doc, ids) = parse(&["One", "Two", "Three", "Four"]);
+    let split = doc.apply(&split_step(&ids[2])).expect("split");
+    assert_eq!(in_session(&split), ["1.", "2.", "1.", "2."]);
+    let formatted = doc
+        .apply(&format_from(&ids[2], "tracked_change"))
+        .expect("format");
+    assert_eq!(in_session(&formatted), ["1.", "2.", "(a)", "(b)"]);
+}

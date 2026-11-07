@@ -9,7 +9,7 @@ that a reviewer can accept or reject in Microsoft Word.
 - Rust and Cargo, if the `stemma` CLI is not installed yet.
 - The original `.docx`.
 - The revised `.docx`.
-- A new path for the output. Stemma never overwrites an existing file.
+- A new path for the output. The CLI never overwrites an existing file.
 
 ## 1. Install the CLI
 

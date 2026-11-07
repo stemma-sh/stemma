@@ -2,8 +2,8 @@
 
 A release is one manually started candidate run. CI builds and exposes the
 exact artifacts, a protected environment pauses promotion for Word
-qualification, and the same run binds the version tag, publishes npm, then
-publishes a verified GitHub release only after approval. This file is the
+qualification, and the same run binds the version tag, publishes npm and
+PyPI, then publishes a verified GitHub release only after approval. This file is the
 maintainer checklist; contributors never need it.
 
 ## One-time setup (before the first release)
@@ -80,18 +80,32 @@ maintainer checklist; contributors never need it.
    manual per release. The workspace also contains the unversioned,
    `publish = false` `stemma-doc-tests` compile guard; it is not a release
    package.
-9. **Mailboxes.** `security@stemma.sh` and `conduct@stemma.sh` must be live —
+9. **PyPI trusted publishing for `stemma-py`.** The Python package
+   (experimental) is published by `release.yml` through PyPI trusted
+   publishing (OIDC); no PyPI token is stored anywhere. Before the first
+   release, sign in to pypi.org with the account that will own the project,
+   then Account settings → Publishing → **Add a new pending publisher**
+   (GitHub): PyPI project name `stemma-py`, owner `stemma-sh`, repository
+   `stemma`, workflow `release.yml`, environment left empty (the
+   `pypi-publish` job declares none; promotion is already gated by the
+   `release` environment). The first successful publish creates the project
+   and turns the pending publisher into a normal one. Add a second owner
+   afterwards. A mistyped field surfaces only as an `invalid-publisher` error
+   at the next publish.
+10. **Mailboxes.** `security@stemma.sh` and `conduct@stemma.sh` must be live —
    SECURITY.md and CODE_OF_CONDUCT.md point at them.
 
 ## Per release
 
 1. Update versions. Releases use stable `MAJOR.MINOR.PATCH` versions only;
    prerelease and build metadata are refused rather than silently assigned to
-   npm's `latest` tag. All six release package versions and the MCPB and
-   Claude plugin manifests must match. `stemma-mcp/Cargo.toml` remains the
+   npm's `latest` tag. All seven release package versions (the six Rust
+   manifests and `stemma-py/Cargo.toml`, which is the PyPI version's only
+   source) and the MCPB and Claude plugin manifests must match. `stemma-mcp/Cargo.toml` remains the
    source from which the npm assembly script stamps every package.json. Update
    the `stemma`, `stemma-diff`, and `stemma-artifacts` registry requirements in
-   dependent manifests at the same time, then commit the resulting lockfile.
+   dependent manifests (`stemma-py` included) at the same time, then commit
+   the resulting lockfile.
 2. Move the `[Unreleased]` CHANGELOG section under the new version heading.
 3. If the README includes a captured Word demonstration, regenerate the
    synthetic redline through the promoted natural-language MCP workflow before
@@ -130,12 +144,23 @@ maintainer checklist; contributors never need it.
      span both compact-core and expert escape-hatch producers, and refuses the
      binary before running cases if any required tool is absent. Each uploaded
      target includes the JSON conformance report and exact binary SHA-256;
+   - **python-wheels** builds the experimental `stemma-py` wheels (manylinux
+     x86_64/aarch64, musllinux x86_64, macOS arm64/x86_64, Windows x86_64;
+     one abi3 wheel per platform) with a pinned maturin, refuses a wheel whose
+     version or platform tag is not the requested one, installs each into a
+     fresh virtual environment on its own platform (Alpine for musllinux, the
+     Python 3.9 floor on manylinux x86_64) and runs the Python suite;
+     **python-sdist** builds the source distribution and installs it from the
+     archive alone before running the same suite; **python-candidate**
+     requires exactly those seven files and records their SHA-256 sums as the
+     `python_dist` artifact;
    - **candidate-manifest** requires exactly those five native artifacts,
      independently re-hashes every binary/report, verifies native executable
      architecture, build stamp, platform, timestamps, the explicit conformance
      tool profile, and the stable 21-case result set, then uploads one
      content-minimized create-new manifest;
-   - **release-approval** waits at the protected `release` environment. While
+   - **release-approval** waits at the protected `release` environment (after
+     both the native candidate manifest and the Python distribution set). While
      it is pending, download the candidate manifest and exact artifacts, run
      the required Word/client qualification, and record the report. The
      qualification must include the exact natural-language workflow in
@@ -163,7 +188,13 @@ maintainer checklist; contributors never need it.
      step; if a retry tag already exists, its SHA must also match. The qualified
      native bytes embed the source SHA, so another source cannot reuse an
      already-published platform package at the same version and integrity;
-   - **github-release** runs only after npm completes, re-verifies the candidate
+   - **pypi-publish** runs after npm completes. It re-verifies the
+     `python_dist` files against their recorded sums and the tag against the
+     approved SHA, publishes through trusted publishing, then refuses unless
+     PyPI serves exactly the approved file set with identical SHA-256 digests.
+     A retried job skips files it already uploaded; that final check still
+     fails on any byte difference;
+   - **github-release** runs only after npm and PyPI complete, re-verifies the candidate
      again, and attaches deterministic tarballs/zip containing each binary and
      conformance JSON, the aggregate manifest, and `sha256sums.txt`. It stages
      the release as a draft, refuses a differently named or byte-different
@@ -203,6 +234,10 @@ maintainer checklist; contributors never need it.
    `<version>+g<first-12-characters-of-tag-commit>`, and (if
    crates were published) `cargo install stemma-cli --version <version>
    --locked && stemma --version` must install and print `stemma <version>`.
+   In a fresh virtual environment, `pip install stemma-py==<version>` must
+   install a wheel (not build from source) and
+   `python -c "import stemma; print(stemma.__version__)"` must print
+   `<version>`.
    Record the registry checksum for each `.crate`; crates.io consumers compile
    from that package and therefore do not inherit the MCP binary's git build
    stamp.
@@ -213,3 +248,8 @@ The `npm-launcher` job in `ci.yml` assembles the host-platform packages from a
 fresh build on every push and drives the full MCP protocol through npm's bin
 shim (`stemma-mcp/npm/smoke-launcher.sh` — also runnable locally). The
 packaging can't silently drift from the server.
+
+The `python` job in `ci.yml` (locally: `just py-test`) builds the `stemma-py`
+wheel with the release workflow's maturin pin on every push and runs the
+Python suite in a fresh virtual environment, including the published Python
+snippets in `docs/reference/python.md` and the READMEs.

@@ -94,6 +94,7 @@ fn para_ids(doc: &Document) -> Vec<NodeId> {
 fn tracked_delete_block(doc: &Document, block: &NodeId, expect: &str) -> Document {
     let txn = EditTransaction {
         steps: vec![EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: block.clone(),
             to_block_id: block.clone(),
             rationale: None,

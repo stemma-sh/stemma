@@ -102,6 +102,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -368,9 +369,11 @@ fn empty_marks_fails_loud() {
 }
 
 #[test]
-fn span_crossing_an_opaque_is_not_matched() {
-    // "see " <opaque> " the clause" — the match must lie within one contiguous
-    // run, so a phrase spanning the opaque is not found (fail loud).
+fn span_crossing_an_opaque_names_the_opaque() {
+    // "see " <opaque> " the clause" — the formatted span must lie within the
+    // text runs, so a phrase spanning the drawing is refused, and the refusal
+    // names the drawing rather than reporting text the paragraph reads as
+    // missing (fail loud, actionably).
     let para = make_para(
         "p1",
         normal_segment(vec![
@@ -386,6 +389,7 @@ fn span_crossing_an_opaque_is_not_matched() {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
                 source_run_attrs: Vec::new(),
                 joins_following_text_run: false,
                 raw_xml: Some(b"<w:drawing/>".to_vec()),
@@ -397,8 +401,12 @@ fn span_crossing_an_opaque_is_not_matched() {
     let doc = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
     let tx = format_tx("p1", "see  the clause", bold());
     match apply_transaction(&doc, &tx) {
-        Err(EditError::ExpectMismatch { .. }) => {}
-        other => panic!("expected ExpectMismatch for cross-opaque span, got {other:?}"),
+        Err(EditError::ExpectCrossesInlineObject {
+            object_id,
+            object_kind: "drawing",
+            ..
+        }) if object_id == NodeId::from("p1_op") => {}
+        other => panic!("expected ExpectCrossesInlineObject for cross-opaque span, got {other:?}"),
     }
 }
 

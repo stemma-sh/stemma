@@ -193,7 +193,7 @@ fn rfonts_ascii_name_with_comma_is_single_link_key() {
 /// the inserted text, reject drops it, package opens clean.
 #[test]
 fn absent_font_substitution_inside_w_ins_preserves_tracking() {
-    let body = r#"<w:p><w:r><w:t>base </w:t></w:r><w:ins w:id="1" w:author="a" w:date="2024-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:ascii="NoSuchFace-XYZ" w:hAnsi="NoSuchFace-XYZ"/></w:rPr><w:t>added</w:t></w:r></w:ins></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">base </w:t></w:r><w:ins w:id="1" w:author="a" w:date="2024-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:ascii="NoSuchFace-XYZ" w:hAnsi="NoSuchFace-XYZ"/></w:rPr><w:t>added</w:t></w:r></w:ins></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let doc = Document::parse(&b).expect("parse");
 
@@ -328,7 +328,7 @@ fn rfonts_eastasia_cs_distinct_slots_text_preserved_both_resolutions() {
 /// keeps inserted text, reject drops exactly it, package opens clean.
 #[test]
 fn rfonts_in_ins_named_font_is_property_not_revision() {
-    let body = r#"<w:p><w:r><w:t>base </w:t></w:r><w:ins w:id="7" w:author="a" w:date="2026-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/></w:rPr><w:t>added</w:t></w:r></w:ins></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">base </w:t></w:r><w:ins w:id="7" w:author="a" w:date="2026-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/></w:rPr><w:t>added</w:t></w:r></w:ins></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let doc = Document::parse(&b).expect("parse");
 
@@ -359,7 +359,7 @@ fn rfonts_in_ins_named_font_is_property_not_revision() {
 /// deleted text, accept removes exactly the delText, opens clean.
 #[test]
 fn vertical_at_prefixed_font_in_w_del_tracked_semantics() {
-    let body = r#"<w:p><w:r><w:t>keep </w:t></w:r><w:del w:id="2" w:author="a" w:date="2024-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:eastAsia="@MS Mincho"/></w:rPr><w:delText>gone</w:delText></w:r></w:del></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">keep </w:t></w:r><w:del w:id="2" w:author="a" w:date="2024-01-01T00:00:00Z"><w:r><w:rPr><w:rFonts w:eastAsia="@MS Mincho"/></w:rPr><w:delText>gone</w:delText></w:r></w:del></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let doc = Document::parse(&b).expect("parse");
 

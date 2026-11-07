@@ -63,9 +63,7 @@ fn extract_inline_text(inlines: &[InlineNode]) -> String {
             InlineNode::HardBreak(_) => out.push('\n'),
             InlineNode::OpaqueInline(_) => out.push('\u{FFFC}'),
             InlineNode::Decoration(_) => {} // Zero-width
-            InlineNode::CommentRangeStart { .. }
-            | InlineNode::CommentRangeEnd { .. }
-            | InlineNode::CommentReference { .. } => {} // Zero-width
+            InlineNode::CommentRangeStart { .. } | InlineNode::CommentRangeEnd { .. } => {} // Zero-width
         }
     }
     out

@@ -44,7 +44,10 @@
 //! - InsertImage target not a paragraph→ `NotAParagraph`
 //! - ReplaceImage target not a drawing → `NotADrawing` / `DrawingNotFound`
 
-use super::super::{EditError, MaterializationMode, find_block_index, validate_block_is_editable};
+use super::super::{
+    EditError, MaterializationMode, block_at, block_at_mut, find_editable_block_path,
+    find_paragraph_path,
+};
 use super::images::find_descendant_by_local_mut;
 use crate::domain::{
     BlockNode, CanonDoc, DocPart, InlineNode, NodeId, OpaqueInlineNode, OpaqueKind, ParagraphNode,
@@ -308,7 +311,7 @@ fn build_drawing_xml(src: &ImageSource, logical_rid: &str, doc_pr_id: u32) -> Ve
 
 /// Synthesize a fresh `OpaqueInline{Drawing}` whose `raw_xml` is `drawing_xml`.
 fn synthesize_drawing_inline(id: &NodeId, drawing_xml: Vec<u8>) -> InlineNode {
-    let content_hash = sha256_hex(&drawing_xml);
+    let content_hash = crate::import::canonical_raw_hash(&drawing_xml);
     InlineNode::from(OpaqueInlineNode {
         id: id.clone(),
         kind: OpaqueKind::Drawing,
@@ -320,6 +323,7 @@ fn synthesize_drawing_inline(id: &NodeId, drawing_xml: Vec<u8>) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(drawing_xml),
@@ -343,15 +347,8 @@ pub(crate) fn apply_insert(
     step_index: usize,
     pending: &mut Vec<PendingMedia>,
 ) -> Result<(), EditError> {
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-
-    // The host paragraph must be editable (Normal status, no existing tracked
-    // segments) and actually a paragraph.
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
-    match &doc.blocks[idx].block {
+    let path = find_editable_block_path(doc, block_id, step_index)?;
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -370,7 +367,7 @@ pub(crate) fn apply_insert(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -380,12 +377,12 @@ pub(crate) fn apply_insert(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
     let logical_rid = image.logical_rid();
-    let drawing_id = NodeId::from(format!("{}_img0", para.id.0));
+    let drawing_id = super::super::InlineIdMint::for_paragraph(para).mint("img");
     // wp:docPr @id must be a positive integer unique in the document. Derive it
     // from the logical rId digest so it is stable across replays and unlikely to
     // collide with existing drawings.
@@ -548,13 +545,13 @@ pub(crate) fn apply_replace(
     // Aspect guard (before locating the node so a refusal touches nothing).
     check_replace_aspect(req, drawing_id, step_index)?;
 
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+    // The hosting paragraph may be top-level or in a table cell.
+    let path = find_paragraph_path(doc, block_id).ok_or_else(|| EditError::BlockNotFound {
         block_id: block_id.clone(),
         step_index,
     })?;
 
-    let node =
-        super::images::locate_drawing_mut(&mut doc.blocks[idx].block, drawing_id, step_index)?;
+    let node = super::images::locate_drawing_mut(block_at_mut(doc, &path), drawing_id, step_index)?;
 
     if let Some(expected) = semantic_hash {
         let actual = node.content_hash.as_deref().unwrap_or("");
@@ -601,9 +598,8 @@ pub(crate) fn apply_replace(
     let new_rid = image.logical_rid();
     crate::xml_attrs::attr_set(blip, "r:embed", &new_rid);
 
-    // Apply the requested display extent. `wp:extent` carries the inline-display
-    // box; we write @cx/@cy there specifically (NOT the inner `a:ext` on the
-    // graphic frame, which is keyed separately), mirroring `SetImageAttributes`.
+    // Apply the requested display extent to `wp:extent` and to the framed
+    // picture's own size, as `SetImageAttributes` resizes.
     let extent = find_descendant_by_local_mut(&mut element, "extent").ok_or_else(|| {
         EditError::ImageAttributeTargetAbsent {
             drawing_id: drawing_id.clone(),
@@ -611,11 +607,23 @@ pub(crate) fn apply_replace(
             step_index,
         }
     })?;
+    let old = (
+        super::images::bare_emu(extent, "cx"),
+        super::images::bare_emu(extent, "cy"),
+    );
     crate::xml_attrs::attr_set(extent, "cx", image.cx_emu.to_string());
     crate::xml_attrs::attr_set(extent, "cy", image.cy_emu.to_string());
+    super::images::scale_graphic_frame(
+        &mut element,
+        old,
+        super::images::ImageResize {
+            cx_emu: image.cx_emu,
+            cy_emu: image.cy_emu,
+        },
+    );
 
     let new_raw = serialize_raw_fragment(&element);
-    node.content_hash = Some(sha256_hex(&new_raw));
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
 
     pending.push(image.pending_media(new_rid));

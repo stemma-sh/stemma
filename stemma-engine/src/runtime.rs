@@ -634,6 +634,9 @@ struct PersistedBodyTemplate {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 struct PersistedEditSnapshot {
     blob_schema_version: u32,
+    /// The engine release that wrote the blob. A blob is a same-version cache:
+    /// it is refused by any other release, whatever its schema number says.
+    engine_version: String,
     canonical: CanonDoc,
     package_bytes: Vec<u8>,
     body_template: PersistedBodyTemplate,
@@ -661,11 +664,28 @@ struct DocState {
     /// re-opening is the only reset. Cloning a handle carries the origin's
     /// baseline (the clone continues the same session lineage).
     baseline: Arc<CanonDoc>,
-    /// The byte package this handle's baseline corresponds to (the anchored
-    /// import bytes), retained so a session review can render its delta as a
-    /// redline by importing these as compare's base. One input-file-sized
-    /// copy per handle, immutable.
-    source_bytes: Arc<[u8]>,
+    /// The byte package this handle's baseline corresponds to, shared by the
+    /// handle's clones (see [`SessionSource`]).
+    source: Arc<SessionSource>,
+}
+
+/// The package a session was opened from: the anchored import bytes, retained
+/// so a session review can render its delta as a redline by importing them as
+/// compare's base (one input-file-sized copy, immutable), and how they
+/// validated, computed on first request. The bytes never change, so neither
+/// does their validation.
+struct SessionSource {
+    bytes: Arc<[u8]>,
+    validation: std::sync::OnceLock<ValidationReport>,
+}
+
+impl SessionSource {
+    fn new(bytes: Arc<[u8]>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            validation: std::sync::OnceLock::new(),
+        })
+    }
 }
 
 fn now_epoch_secs() -> u64 {
@@ -740,7 +760,33 @@ fn now_epoch_secs() -> u64 {
 // paragraph-mark run-property history so a mark-only change does not synthesize
 // an empty w:pPrChange. Positional IR shape change — breaking blob change,
 // fail-fast gated.
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 28;
+// v29: ParagraphNode retains source paragraph session attributes used during
+// native save and revision resolution. Positional IR shape change — breaking
+// blob change, fail-fast gated.
+// v30: RunBorder retains the authored attribute remainder (frame/shadow/theme).
+// Positional bincode layout changed; older blobs must be rejected explicitly.
+// v31: RowFormattingChange retains prior row geometry and property remainder.
+// v32: CellFormattingChange retains prior span, merge, hideMark and remainder.
+// Both extend positional bincode layouts and reject older blobs explicitly.
+// v33: TableFormatting retains coupled auxiliary prior-grid geometry.
+// v34: Structural range markers retain their complete attribute payload.
+// v35: TableNode retains structural range boundary ownership.
+// v36: BlockSdtWrap retains the nested control hierarchy.
+// v37: TableRowNode retains supplied editing-session attributes.
+// v38: SectionProperties retains supplied editing-session attributes.
+// v39: OpaqueBlockNode inventories retained note-resource references.
+// v40: Note stories retain their authored root-attribute envelopes.
+// v41: Run decorations retain source editing-session attributes.
+// v42: Opaque blocks reserve the paragraph identities in their source payload.
+// v43: Hyperlink fields distinguish new-window and visited-history switches.
+// v44: LiteralPrefixSourceRun gained a live-marker position witness.
+// v45: Table, row and cell property histories retain their explicit UTC dates.
+// v46: The writing engine release follows the version, and must match on load.
+// v47: The paragraph mark's OFF forms retain an authored vertAlign baseline.
+// v48: A section's document grid character space is signed.
+// v49: A run border's width, spacing and colour are optional, as authored.
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 49;
+const SNAPSHOT_BLOB_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
 
@@ -827,7 +873,7 @@ impl SimpleRuntime {
         cached_view_fingerprint: Option<DocFingerprint>,
         cached_docx_bytes: Option<Arc<[u8]>>,
         baseline: Arc<CanonDoc>,
-        source_bytes: Arc<[u8]>,
+        source: Arc<SessionSource>,
     ) -> DocHandle {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let handle = DocHandle(format!("doc_{id}"));
@@ -840,7 +886,7 @@ impl SimpleRuntime {
                 cached_view_fingerprint,
                 cached_docx_bytes,
                 baseline,
-                source_bytes,
+                source,
             },
         );
         handle
@@ -1026,7 +1072,7 @@ impl SimpleRuntime {
                 // The clone continues the same session lineage: same review
                 // baseline, same baseline bytes.
                 Arc::clone(&entry.baseline),
-                Arc::clone(&entry.source_bytes),
+                Arc::clone(&entry.source),
             )
         };
         Ok(self.insert_doc(
@@ -1068,15 +1114,41 @@ impl SimpleRuntime {
         // bytes, the current snapshot's from its serialization — so a rejected
         // paragraph-style change re-resolves style-inherited run marks on both
         // committed baselines (see `audit_documents`).
-        let before_styles = style_table_from_docx(&entry.source_bytes)?;
+        let before_styles = style_table_from_docx(&entry.source.bytes)?;
         let after_styles = style_table_from_docx(&bytes)?;
-        crate::audit::audit_documents(
+        crate::audit::audit_session_documents(
             &entry.baseline,
             &entry.snapshot.canonical,
             before_styles.as_ref(),
             after_styles.as_ref(),
             crate::api::validate(&bytes),
         )
+    }
+
+    /// [`crate::api::validate`] of [`Self::session_source_bytes`]: how the
+    /// open-time package stood before any edit. Computed once per session.
+    pub fn session_source_validation(
+        &self,
+        handle: &DocHandle,
+    ) -> Result<ValidationReport, RuntimeError> {
+        let source = {
+            let entry = self.docs.get(&handle.0).ok_or_else(|| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: "doc handle not found".to_string(),
+                details: ErrorDetails {
+                    context: Some(handle.0.clone()),
+                    ..ErrorDetails::default()
+                },
+            })?;
+            entry
+                .last_accessed_epoch_secs
+                .store(now_epoch_secs(), Ordering::Relaxed);
+            Arc::clone(&entry.source)
+        };
+        Ok(source
+            .validation
+            .get_or_init(|| crate::api::validate(&source.bytes))
+            .clone())
     }
 
     /// The byte package this handle's review baseline corresponds to (the
@@ -1094,7 +1166,7 @@ impl SimpleRuntime {
         entry
             .last_accessed_epoch_secs
             .store(now_epoch_secs(), Ordering::Relaxed);
-        Ok(Arc::clone(&entry.source_bytes))
+        Ok(Arc::clone(&entry.source.bytes))
     }
 
     /// Serialize a document's full working state ([`EditSnapshot`] +
@@ -1106,6 +1178,10 @@ impl SimpleRuntime {
     /// The blob format embeds the engine's IR types verbatim. Any change to
     /// those types in a future engine release invalidates older blobs and
     /// turns this into a migration problem.
+    ///
+    /// The blob records the engine release that wrote it, and every other
+    /// release refuses it on load. There is no compatibility promise across
+    /// releases.
     ///
     /// Use this for **hot, in-process handoff** between workers running the
     /// same engine build (for example, passing state across a request
@@ -1129,6 +1205,7 @@ impl SimpleRuntime {
             })?;
         let persisted = PersistedEditSnapshot {
             blob_schema_version: SNAPSHOT_BLOB_SCHEMA_VERSION,
+            engine_version: SNAPSHOT_BLOB_ENGINE_VERSION.to_string(),
             canonical,
             package_bytes: package_bytes.as_ref().to_vec(),
             body_template,
@@ -1161,9 +1238,9 @@ impl SimpleRuntime {
     /// # Warning: not for durable storage
     ///
     /// See the warning on [`Self::export_snapshot_blob`]. Blobs only
-    /// round-trip across processes running the **same engine build** — they
-    /// reject on schema-version mismatch but cannot reject on silent
-    /// internal IR-shape drift across builds.
+    /// round-trip across processes running the **same engine release**: a
+    /// blob from another release, or with another schema version, is refused.
+    /// Two unreleased builds of one version are not told apart.
     pub fn import_snapshot_blob(
         &self,
         snapshot_bytes: &[u8],
@@ -1171,16 +1248,35 @@ impl SimpleRuntime {
         let decoded = zstd::stream::decode_all(Cursor::new(snapshot_bytes)).map_err(|source| {
             invalid_snapshot(&format!("snapshot blob decompression failed: {source}"))
         })?;
+        // The version is the first positional field. Reject older layouts
+        // before decoding their payload using the current domain shape.
+        let blob_schema_version: u32 = bincode::deserialize_from(Cursor::new(decoded.as_slice()))
+            .map_err(|source| {
+            invalid_snapshot(&format!("snapshot blob header decode failed: {source}"))
+        })?;
+        if blob_schema_version != SNAPSHOT_BLOB_SCHEMA_VERSION {
+            return Err(invalid_snapshot(&format!(
+                "unsupported snapshot blob schema version {}, expected {}",
+                blob_schema_version, SNAPSHOT_BLOB_SCHEMA_VERSION
+            )));
+        }
+        // Same layout, so the writer's release is the next positional field.
+        // Check it before decoding a payload whose shape that release owns.
+        let (_, engine_version): (u32, String) =
+            bincode::deserialize_from(Cursor::new(decoded.as_slice())).map_err(|source| {
+                invalid_snapshot(&format!("snapshot blob header decode failed: {source}"))
+            })?;
+        if engine_version != SNAPSHOT_BLOB_ENGINE_VERSION {
+            return Err(invalid_snapshot(&format!(
+                "snapshot blob was written by engine {engine_version}, this is engine \
+                 {SNAPSHOT_BLOB_ENGINE_VERSION}; snapshot blobs are a same-version cache, \
+                 re-import the source DOCX"
+            )));
+        }
         let persisted: PersistedEditSnapshot =
             bincode::deserialize(&decoded).map_err(|source| {
                 invalid_snapshot(&format!("snapshot blob decode failed: {source}"))
             })?;
-        if persisted.blob_schema_version != SNAPSHOT_BLOB_SCHEMA_VERSION {
-            return Err(invalid_snapshot(&format!(
-                "unsupported snapshot blob schema version {}, expected {}",
-                persisted.blob_schema_version, SNAPSHOT_BLOB_SCHEMA_VERSION
-            )));
-        }
         if persisted.meta.snapshot_schema_version != EDIT_SNAPSHOT_SCHEMA_VERSION {
             return Err(invalid_snapshot(&format!(
                 "unsupported edit snapshot schema version {}, expected {}",
@@ -1240,7 +1336,7 @@ impl SimpleRuntime {
             None,
             Some(Arc::clone(&source_bytes)),
             Arc::clone(&canonical),
-            source_bytes,
+            SessionSource::new(source_bytes),
         );
         Ok(SnapshotImportResult {
             import: ImportResult {
@@ -3124,6 +3220,7 @@ fn apply_pending_numbering_ops(
         let NumberingOp::CreateDefinition {
             placeholder_num_id,
             cloned_from_num_id,
+            level_format,
         } = op;
 
         // Index the current part: numId set (+ its max, the allocator), the
@@ -3232,6 +3329,22 @@ fn apply_pending_numbering_ops(
                 || is_w_tag(el, "numStyleLink"))
         });
 
+        // A format change gives one level of the clone its new label format.
+        if let Some(format) = level_format {
+            set_level_format(&mut cloned_abstract, format).map_err(|message| {
+                pending_parts_error(
+                    format!(
+                        "list label format: source numId {cloned_from_num_id} (abstractNumId \
+                         {source_abstract_id}) {message}"
+                    ),
+                    format!(
+                        "apply_pending_numbering_ops: level format cloned_from={cloned_from_num_id} ilvl={}",
+                        format.ilvl
+                    ),
+                )
+            })?;
+        }
+
         // Build the fresh <w:num numId=real_num_id><w:abstractNumId val=new_abstract_id/></w:num>.
         let mut num_el = w_el("num");
         attr_set(&mut num_el, "w:numId", real_num_id.to_string());
@@ -3259,6 +3372,73 @@ fn apply_pending_numbering_ops(
     // `apply_pending_media`'s `logical_rid` rewrite of the body IR.
     remap_numids_in_blocks(&mut doc.blocks, &placeholder_to_real);
     Ok(())
+}
+
+/// Set the `w:numFmt` and `w:lvlText` of the `w:lvl` at `format.ilvl` in an
+/// abstractNum, creating either element if the level lacks it. Refuses when the
+/// definition has no such level: there is no format to replace.
+fn set_level_format(
+    abstract_num: &mut Element,
+    format: &crate::edit::LevelFormat,
+) -> Result<(), String> {
+    let ilvl = format.ilvl.to_string();
+    let level = abstract_num
+        .children
+        .iter_mut()
+        .find_map(|child| match child {
+            XMLNode::Element(el)
+                if is_w_tag(el, "lvl") && attr_get(el, "ilvl").is_some_and(|v| *v == ilvl) =>
+            {
+                Some(el)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("defines no level {ilvl} to give a new label format"))?;
+    for (local, value) in [
+        ("numFmt", format.num_fmt.as_ooxml()),
+        ("lvlText", format.lvl_text.as_str()),
+    ] {
+        match level.children.iter_mut().find_map(|child| match child {
+            XMLNode::Element(el) if is_w_tag(el, local) => Some(el),
+            _ => None,
+        }) {
+            Some(el) => attr_set(el, "w:val", value),
+            None => {
+                let mut el = w_el(local);
+                attr_set(&mut el, "w:val", value);
+                level.children.push(XMLNode::Element(el));
+            }
+        }
+    }
+    // CT_Lvl is an ordered sequence: start, numFmt, lvlRestart, pStyle,
+    // isLgl, suff, lvlText, ...; keep the children in that order.
+    level.children.sort_by_key(lvl_child_order);
+    Ok(())
+}
+
+/// Position of a `w:lvl` child in the CT_Lvl sequence (ISO 29500-1 §17.9.6).
+fn lvl_child_order(node: &XMLNode) -> usize {
+    const ORDER: [&str; 12] = [
+        "start",
+        "numFmt",
+        "lvlRestart",
+        "pStyle",
+        "isLgl",
+        "suff",
+        "lvlText",
+        "lvlPicBulletId",
+        "legacy",
+        "lvlJc",
+        "pPr",
+        "rPr",
+    ];
+    match node {
+        XMLNode::Element(el) => ORDER
+            .iter()
+            .position(|local| is_w_tag(el, local))
+            .unwrap_or(ORDER.len()),
+        _ => ORDER.len(),
+    }
 }
 
 /// Author (or reuse) custom-XML datastore parts for content-control data
@@ -3710,7 +3890,7 @@ fn rewrite_relationship_rids_in_block(
                         })?;
                     if rewrite_relationship_attrs(&mut root, remap) {
                         let rewritten = word_xml::serialize_raw_fragment(&root);
-                        opaque.content_hash = Some(sha256_hex_bytes(&rewritten));
+                        opaque.content_hash = Some(crate::import::canonical_raw_hash(&rewritten));
                         opaque.raw_xml = Some(rewritten);
                     }
                 }
@@ -3774,7 +3954,7 @@ fn rewrite_opaque_drawing_rid(
     };
     if rewrite_relationship_attrs(&mut root, remap) {
         let rewritten = word_xml::serialize_raw_fragment(&root);
-        opaque.content_hash = Some(sha256_hex_bytes(&rewritten));
+        opaque.content_hash = Some(crate::import::canonical_raw_hash(&rewritten));
         opaque.raw_xml = Some(rewritten);
     }
 }
@@ -5040,6 +5220,8 @@ fn apply_opaque_child_text_sets(
                 set.body_index,
             ));
         };
+        let value_rpr = crate::edit::verbs::sdt_text_fill::leave_placeholder(el)
+            .map_err(|reason| fail(&reason, set.body_index))?;
         let content =
             crate::opaque_splice::first_descendant_mut(el, "sdtContent").ok_or_else(|| {
                 fail(
@@ -5056,6 +5238,7 @@ fn apply_opaque_child_text_sets(
         crate::opaque_splice::set_region_text_with_ids(
             para,
             &set.value,
+            &value_rpr,
             &set.author,
             set.date.as_deref(),
             set.revision_ids,
@@ -5503,6 +5686,7 @@ fn relocate_pending_body_range_markers(
                     RangeMarkerFamily::CommentRange => unreachable!("comments handled above"),
                 };
                 Ok(InlineNode::from(DecorationNode {
+                    source_run_attrs: Vec::new(),
                     id: opaque.id.clone(),
                     kind,
                     opaque_ref: opaque.opaque_ref.clone(),
@@ -5519,12 +5703,20 @@ fn relocate_pending_body_range_markers(
 
     let mut retained = Vec::with_capacity(doc.blocks.len());
     let mut relocated = Vec::new();
-    for tracked in std::mem::take(&mut doc.blocks) {
+    for mut tracked in std::mem::take(&mut doc.blocks) {
         let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
             retained.push(tracked);
             continue;
         };
         if opaque.range_marker.is_none() || tracked.status == TrackingStatus::Normal {
+            retained.push(tracked);
+            continue;
+        }
+        // A marker between the blocks of an open control stays a block there:
+        // a block-level marker is no content, so it carries no revision (Word
+        // writes it untracked), and moving it would shift the control's span.
+        if opaque.proof_ref.docx_anchor == crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR {
+            tracked.status = TrackingStatus::Normal;
             retained.push(tracked);
             continue;
         }
@@ -5677,20 +5869,30 @@ pub(crate) fn serialize_canonical_docx(
     // boundary. Source package parts used to satisfy that model must pass
     // through the same boundary: a Strict package expresses relationship types
     // in the purl namespace, while the canonical output is Transitional.
-    let target_package_archive =
-        crate::normalize::normalize_if_needed(&target_archive).map_err(|source| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: format!("failed to normalize target package for reconciliation: {source:?}"),
-            details: ErrorDetails {
-                context: Some("serialize_canonical_docx: target package".to_string()),
-                ..ErrorDetails::default()
-            },
-        })?;
+    // An edit or resolution passes one package as both base and target;
+    // normalization is a function of the bytes, so normalize it once.
+    let normalized_target_package;
+    let target_package_archive: &DocxArchive = if target_bytes == base_bytes {
+        &base_archive
+    } else {
+        normalized_target_package = crate::normalize::normalize_if_needed(&target_archive)
+            .map_err(|source| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message: format!(
+                    "failed to normalize target package for reconciliation: {source:?}"
+                ),
+                details: ErrorDetails {
+                    context: Some("serialize_canonical_docx: target package".to_string()),
+                    ..ErrorDetails::default()
+                },
+            })?;
+        &normalized_target_package
+    };
 
     // Parse both archives into typed package models.
     let mut base_pkg = DocxPackage::from_archive(&base_archive).map_err(map_package_error)?;
     let target_pkg =
-        DocxPackage::from_archive(&target_package_archive).map_err(map_package_error)?;
+        DocxPackage::from_archive(target_package_archive).map_err(map_package_error)?;
 
     // The main document part is located by the OPC officeDocument relationship
     // (ECMA-376 Part 2 §9.3); its name is not fixed. Every main-part read/write
@@ -5822,6 +6024,32 @@ pub(crate) fn serialize_canonical_docx(
     // the fill and minted its tracked-change ids; the save path performs the
     // whole-value set — the same PendingParts seam custom-XML/media/styles use.
     apply_opaque_child_text_sets(&mut opaque_body_children, &pending.opaque_child_text_sets)?;
+    for set in &pending.block_form_text_sets {
+        let fail = |message: String| RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!("nested form field update: {message}"),
+            details: ErrorDetails {
+                context: Some(format!(
+                    "body_index={}, paragraph_index={}, field_index={}",
+                    set.body_index, set.paragraph_index, set.field_index
+                )),
+                ..ErrorDetails::default()
+            },
+        };
+        let node = opaque_body_children
+            .get_mut(&set.body_index)
+            .ok_or_else(|| fail("containing block not found".into()))?;
+        let targets =
+            crate::opaque_targets::block_form_field_targets(set.body_index, node).map_err(&fail)?;
+        let target = targets
+            .iter()
+            .find(|t| t.paragraph_index == set.paragraph_index && t.field_index == set.field_index)
+            .ok_or_else(|| fail("form field not found at the declared address".into()))?;
+        if target.semantic_hash != set.semantic_hash {
+            return Err(fail("stale containing-block hash".into()));
+        }
+        crate::opaque_targets::set_block_form_field_text(node, target, &set.text).map_err(fail)?;
+    }
 
     let mut sect_pr_nodes = sect_pr_nodes;
     let mut opaque_body_children = opaque_body_children;
@@ -5880,23 +6108,11 @@ pub(crate) fn serialize_canonical_docx(
         })?;
         let target_root = word_xml::parse_document_xml(target_xml).map_err(map_word_xml_error)?;
         let target_body = body_element(&target_root).map_err(map_word_xml_error)?;
-        let normalized_target = if target_opaque_sources.values().any(|is_sdt| *is_sdt) {
-            Some(
-                crate::normalize::normalize_if_needed(&target_archive).map_err(|e| {
-                    RuntimeError {
-                        code: ErrorCode::InvalidDocx,
-                        message: format!(
-                            "failed to normalize target archive for serialization: {e:?}"
-                        ),
-                        details: ErrorDetails::default(),
-                    }
-                })?,
-            )
-        } else {
-            None
-        };
+        let normalized_target = target_opaque_sources
+            .values()
+            .any(|is_sdt| *is_sdt)
+            .then_some(target_package_archive);
         let normalized_root = normalized_target
-            .as_ref()
             .map(|archive| {
                 let main = crate::docx_package::resolve_main_document_part(archive)
                     .map_err(crate::import::map_package_error)?;
@@ -6030,78 +6246,20 @@ pub(crate) fn serialize_canonical_docx(
         }
     }
 
-    // Stream each block.
-    //
-    // Block-level content-control wrapping (`WrapBlocksInContentControl`):
-    // a `block_sdt_wrap` marker on the FIRST block of a range opens a
-    // `<w:sdt><w:sdtPr>…</w:sdtPr><w:sdtContent>` envelope that encloses the
-    // marker block plus `span - 1` following blocks. The wrap is UNTRACKED
-    // structure (OOXML has no `w:sdtChange`), so it is emitted verbatim and
-    // survives accept/reject. We track `sdt_remaining` = how many already-opened
-    // wrap blocks are still due to be emitted; it is decremented for the
-    // previously-emitted block at the top of the next iteration (the per-block
-    // emission paths below use `continue`, so close-after-emit can't run at the
-    // loop's foot) and flushed once more after the loop.
-    let mut sdt_remaining: usize = 0;
-    for tracked in &doc.blocks {
-        // Close a wrap that completed on the previous iteration: account for the
-        // block emitted last time round, and emit `</w:sdtContent></w:sdt>` when
-        // the range is exhausted.
-        if sdt_remaining > 0 {
-            sdt_remaining -= 1;
-            if sdt_remaining == 0 {
-                w.end_tag("w:sdtContent").map_err(map_xml_write_error)?;
-                w.end_tag("w:sdt").map_err(map_xml_write_error)?;
-            }
-        }
-        // Open a new block-level SDT if this block starts a wrap range. A wrap
-        // must never start while another is still open (the verb forbids nesting
-        // an authored body wrap inside an authored one); fail loud rather than
-        // emit an unbalanced `w:sdt`.
-        if let Some(wrap) = &tracked.block_sdt_wrap {
-            if sdt_remaining > 0 {
-                return Err(RuntimeError {
-                    code: ErrorCode::UnsupportedEdit,
-                    message: "overlapping block-level content-control wraps".to_string(),
-                    details: ErrorDetails {
-                        block_id: Some(block_id_of_tracked(tracked).clone()),
-                        context: Some(format!("span={}", wrap.span)),
-                        ..ErrorDetails::default()
-                    },
-                });
-            }
-            w.start_tag("w:sdt").map_err(map_xml_write_error)?;
-            let sdt_pr = crate::word_xml::parse_raw_fragment(&wrap.wrapper.sdt_pr_xml).map_err(
-                |source| RuntimeError {
-                    code: ErrorCode::InvalidDocx,
-                    message: "failed to parse block content-control properties".to_string(),
-                    details: ErrorDetails {
-                        block_id: Some(block_id_of_tracked(tracked).clone()),
-                        context: Some(format!("err={source}")),
-                        ..ErrorDetails::default()
-                    },
-                },
-            )?;
-            w.write_element(&sdt_pr).map_err(map_xml_write_error)?;
-            if let Some(ref end_pr_xml) = wrap.wrapper.sdt_end_pr_xml {
-                let sdt_end_pr =
-                    crate::word_xml::parse_raw_fragment(end_pr_xml).map_err(|source| {
-                        RuntimeError {
-                            code: ErrorCode::InvalidDocx,
-                            message: "failed to parse block content-control end properties"
-                                .to_string(),
-                            details: ErrorDetails {
-                                block_id: Some(block_id_of_tracked(tracked).clone()),
-                                context: Some(format!("err={source}")),
-                                ..ErrorDetails::default()
-                            },
-                        }
-                    })?;
-                w.write_element(&sdt_end_pr).map_err(map_xml_write_error)?;
-            }
-            w.start_tag("w:sdtContent").map_err(map_xml_write_error)?;
-            sdt_remaining = wrap.span;
-        }
+    // Validate the full hierarchy before streaming. Boundary events preserve
+    // coincident nested starts/ends even on emission paths that use `continue`.
+    let sdt_boundaries = block_sdt_boundaries(&doc.blocks)?;
+    let mut emitted_move_ranges = std::collections::HashSet::new();
+    let same_move_side = |a: &TrackedBlock, b: &TrackedBlock| {
+        a.move_id == b.move_id
+            && matches!(
+                (&a.status, &b.status),
+                (TrackingStatus::Deleted(_), TrackingStatus::Deleted(_))
+                    | (TrackingStatus::Inserted(_), TrackingStatus::Inserted(_))
+            )
+    };
+    for (block_index, tracked) in doc.blocks.iter().enumerate() {
+        write_block_sdt_boundary(&mut w, &sdt_boundaries[block_index], block_index)?;
         // Handle opaque blocks: look up the pre-cloned body child and stream it.
         // Base-origin blocks use "body_index:N"; target-origin blocks use
         // "target_body_index:N" until the rebuilt snapshot re-anchors them.
@@ -6109,6 +6267,16 @@ pub(crate) fn serialize_canonical_docx(
         // structural envelope is retained and its inner paragraph/content is
         // tracked. Other target-origin opaque block kinds still have no honest
         // tracked representation and are refused rather than silently lost.
+        if let BlockNode::OpaqueBlock(opaque) = &tracked.block
+            && opaque.proof_ref.docx_anchor == crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR
+        {
+            // A range marker between an open control's blocks is written from
+            // its metadata; pending ones were made Normal above.
+            let element =
+                serialize_tracked_block(tracked, &mut annotation_id, &body_bookmark_policy, None)?;
+            w.write_element(&element).map_err(map_xml_write_error)?;
+            continue;
+        }
         if let BlockNode::OpaqueBlock(opaque) = &tracked.block {
             let (index_str, source_children, target_origin) = if let Some(idx) =
                 opaque.proof_ref.docx_anchor.strip_prefix("body_index:")
@@ -6209,6 +6377,31 @@ pub(crate) fn serialize_canonical_docx(
         if let Some(mid) = &tracked.move_id
             && let Some(&(from_bm, to_bm)) = move_bookmark_ids.get(mid)
         {
+            // One named move may span several adjacent blocks. The container
+            // belongs to the range, not each block (17.13.5.24 / .28).
+            let starts_range =
+                block_index == 0 || !same_move_side(&doc.blocks[block_index - 1], tracked);
+            let ends_range = block_index + 1 == doc.blocks.len()
+                || !same_move_side(tracked, &doc.blocks[block_index + 1]);
+            if starts_range
+                && matches!(
+                    tracked.status,
+                    TrackingStatus::Deleted(_) | TrackingStatus::Inserted(_)
+                )
+                && !emitted_move_ranges.insert((
+                    mid.clone(),
+                    matches!(tracked.status, TrackingStatus::Deleted(_)),
+                ))
+            {
+                return Err(RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: "cannot serialize a discontiguous block move as one range".to_string(),
+                    details: ErrorDetails {
+                        context: Some(format!("move={mid} block_index={block_index}")),
+                        ..ErrorDetails::default()
+                    },
+                });
+            }
             let (author, date) = match &tracked.status {
                 TrackingStatus::Deleted(rev) | TrackingStatus::Inserted(rev) => (
                     rev.author.as_deref().unwrap_or(""),
@@ -6224,10 +6417,12 @@ pub(crate) fn serialize_canonical_docx(
             };
             match &tracked.status {
                 TrackingStatus::Deleted(_) => {
-                    w.write_element(&word_xml::w_move_from_range_start(
-                        from_bm, mid, author, date,
-                    ))
-                    .map_err(map_xml_write_error)?;
+                    if starts_range {
+                        w.write_element(&word_xml::w_move_from_range_start(
+                            from_bm, mid, author, date,
+                        ))
+                        .map_err(map_xml_write_error)?;
+                    }
                     let mut rid_resolver = |part_path: &str, rel_type: &str| -> String {
                         resolve_story_part_to_rid(part_path, rel_type, &mut base_pkg, &target_pkg)
                     };
@@ -6238,13 +6433,17 @@ pub(crate) fn serialize_canonical_docx(
                         Some(&mut rid_resolver),
                     )?;
                     w.write_element(&el).map_err(map_xml_write_error)?;
-                    w.write_element(&word_xml::w_move_from_range_end(from_bm))
-                        .map_err(map_xml_write_error)?;
+                    if ends_range {
+                        w.write_element(&word_xml::w_move_from_range_end(from_bm))
+                            .map_err(map_xml_write_error)?;
+                    }
                     continue;
                 }
                 TrackingStatus::Inserted(_) => {
-                    w.write_element(&word_xml::w_move_to_range_start(to_bm, mid, author, date))
-                        .map_err(map_xml_write_error)?;
+                    if starts_range {
+                        w.write_element(&word_xml::w_move_to_range_start(to_bm, mid, author, date))
+                            .map_err(map_xml_write_error)?;
+                    }
                     let mut rid_resolver = |part_path: &str, rel_type: &str| -> String {
                         resolve_story_part_to_rid(part_path, rel_type, &mut base_pkg, &target_pkg)
                     };
@@ -6255,8 +6454,10 @@ pub(crate) fn serialize_canonical_docx(
                         Some(&mut rid_resolver),
                     )?;
                     w.write_element(&el).map_err(map_xml_write_error)?;
-                    w.write_element(&word_xml::w_move_to_range_end(to_bm))
-                        .map_err(map_xml_write_error)?;
+                    if ends_range {
+                        w.write_element(&word_xml::w_move_to_range_end(to_bm))
+                            .map_err(map_xml_write_error)?;
+                    }
                     continue;
                 }
                 _ => {}
@@ -6276,18 +6477,7 @@ pub(crate) fn serialize_canonical_docx(
         w.write_element(&el).map_err(map_xml_write_error)?;
     }
 
-    // Flush a block-level SDT wrap whose last block was the final body block:
-    // the loop-top decrement accounts for every block except the one emitted in
-    // the final iteration, so close the still-open envelope here.
-    if sdt_remaining > 0 {
-        sdt_remaining -= 1;
-        debug_assert_eq!(
-            sdt_remaining, 0,
-            "block_sdt_wrap span ran past the end of the body"
-        );
-        w.end_tag("w:sdtContent").map_err(map_xml_write_error)?;
-        w.end_tag("w:sdt").map_err(map_xml_write_error)?;
-    }
+    write_block_sdt_boundary(&mut w, &sdt_boundaries[doc.blocks.len()], doc.blocks.len())?;
 
     // The story parts this save WRITES (every non-synthesized header and
     // footer). The sectPr reference remap keeps a reference only when its
@@ -6379,10 +6569,25 @@ pub(crate) fn serialize_canonical_docx(
                 section_properties_to_element(target_sp, None, None, Some(&mut rid_resolver));
             w.write_element(&new_sect_pr).map_err(map_xml_write_error)?;
         }
+    } else if let Some(ref target_sp) = doc.body_section_properties {
+        // No section property change: the typed properties are the section.
+        // Writing the base sectPr verbatim here would silently drop a direct
+        // edit (a direct page setup changes only the typed properties). Build
+        // the section from them, merging the base's unmodeled children and
+        // attributes, exactly as the tracked path does without its record.
+        let base_el = sect_pr_nodes.iter().find_map(|node| match node {
+            XMLNode::Element(el) if is_w_tag(el, "sectPr") => Some(el),
+            _ => None,
+        });
+        let mut rid_resolver = |part_path: &str, rel_type: &str| -> String {
+            resolve_story_part_to_rid(part_path, rel_type, &mut base_pkg, &target_pkg)
+        };
+        let new_sect_pr =
+            section_properties_to_element(target_sp, base_el, None, Some(&mut rid_resolver));
+        w.write_element(&new_sect_pr).map_err(map_xml_write_error)?;
     } else {
-        // No section property change — preserve the base sectPr opaquely.
-        // Still validate header/footer rIds in case the base sectPr carries
-        // references that were remapped or removed during package assembly.
+        // No typed section at all: preserve whatever the base carried,
+        // validating header/footer rIds against the assembled package.
         for node in &mut sect_pr_nodes {
             if let XMLNode::Element(el) = node
                 && is_w_tag(el, "sectPr")
@@ -6414,12 +6619,23 @@ pub(crate) fn serialize_canonical_docx(
             scan.scan_tracked_blocks(&header.blocks);
             scan.into_policy(&mut annotation_id)
         };
+        // A link given a new target in this story gets its relationship in
+        // the story part's own rels, not the document's.
+        ensure_story_part_rels(&mut base_pkg, &target_pkg, &part_path);
+        let rels_path = story_part_rels_path(&part_path);
+        let mut story_rels = base_pkg.story_rels.remove(&rels_path);
         write_story_blocks_with_sdt_envelopes(
             &mut hw,
             &header.blocks,
             &mut annotation_id,
             &story_bookmark_policy,
+            &mut |target: &str, rel_type: &str| {
+                story_hyperlink_rid(&mut story_rels, &rels_path, &part_path, target, rel_type)
+            },
         )?;
+        if let Some(rels) = story_rels {
+            base_pkg.story_rels.insert(rels_path, rels);
+        }
         hw.end_tag(&root_tag).map_err(map_xml_write_error)?;
         let xml = hw.into_inner();
         base_pkg.set_part(&part_path, xml);
@@ -6458,12 +6674,23 @@ pub(crate) fn serialize_canonical_docx(
             scan.scan_tracked_blocks(&footer.blocks);
             scan.into_policy(&mut annotation_id)
         };
+        // A link given a new target in this story gets its relationship in
+        // the story part's own rels, not the document's.
+        ensure_story_part_rels(&mut base_pkg, &target_pkg, &part_path);
+        let rels_path = story_part_rels_path(&part_path);
+        let mut story_rels = base_pkg.story_rels.remove(&rels_path);
         write_story_blocks_with_sdt_envelopes(
             &mut fw,
             &footer.blocks,
             &mut annotation_id,
             &story_bookmark_policy,
+            &mut |target: &str, rel_type: &str| {
+                story_hyperlink_rid(&mut story_rels, &rels_path, &part_path, target, rel_type)
+            },
         )?;
+        if let Some(rels) = story_rels {
+            base_pkg.story_rels.insert(rels_path, rels);
+        }
         fw.end_tag(&root_tag).map_err(map_xml_write_error)?;
         let xml = fw.into_inner();
         base_pkg.set_part(&part_path, xml);
@@ -7078,6 +7305,223 @@ fn ensure_story_part_rels(base_pkg: &mut DocxPackage, target_pkg: &DocxPackage, 
     }
 }
 
+/// Refuse a paragraph this transaction put on a list level (num_id, ilvl)
+/// that the list's definition lacks: Word shows it unnumbered, and the
+/// document reopens with the numbering unresolved. Lists the definitions do
+/// not know yet (a split stages its new list for the save path) have no
+/// levels to check against.
+fn check_new_list_levels(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    definitions: Option<&crate::numbering::NumberingDefinitions>,
+) -> Result<(), RuntimeError> {
+    let Some(definitions) = definitions else {
+        return Ok(());
+    };
+    fn levels<'a>(
+        blocks: impl IntoIterator<Item = &'a BlockNode>,
+        out: &mut HashMap<NodeId, (u32, u32)>,
+    ) {
+        for block in blocks {
+            match block {
+                BlockNode::Paragraph(p) => {
+                    if let Some(n) = &p.numbering {
+                        out.insert(p.id.clone(), (n.num_id, n.ilvl));
+                    }
+                }
+                BlockNode::Table(t) => {
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        levels(&cell.blocks, out);
+                    }
+                }
+                BlockNode::OpaqueBlock(_) => {}
+            }
+        }
+    }
+    let collect = |doc: &CanonDoc| {
+        let mut out = HashMap::new();
+        levels(doc.blocks.iter().map(|b| &b.block), &mut out);
+        out
+    };
+    let old = collect(before);
+    for (id, (num_id, ilvl)) in collect(after) {
+        if old.get(&id) == Some(&(num_id, ilvl))
+            || !definitions.num_instances.contains_key(&num_id)
+            || definitions.get_level(num_id, ilvl).is_some()
+        {
+            continue;
+        }
+        return Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!(
+                "paragraph {id} would be on level {ilvl} of list {num_id}, which defines no such \
+                 level, so Word would show it unnumbered; keep it at a level the list defines"
+            ),
+            details: ErrorDetails {
+                block_id: Some(id),
+                context: Some("list_level_undefined".to_string()),
+                ..ErrorDetails::default()
+            },
+        });
+    }
+    Ok(())
+}
+
+/// Give each hyperlink `edited` gained over `before` the document's Hyperlink
+/// character style (the character style named "Hyperlink", whatever its
+/// localized id), as Word styles a link it inserts. A link is new when its id
+/// was not in `before` and it has no relationship yet (every imported external
+/// link has one). A document without that style leaves new links unstyled.
+fn style_new_hyperlinks(
+    edited: &mut CanonDoc,
+    before: &CanonDoc,
+    styles_xml: Option<&[u8]>,
+) -> Result<(), RuntimeError> {
+    use crate::domain::{BlockNode, HyperlinkData, InlineNode, OpaqueKind};
+    let Some(xml) = styles_xml else {
+        return Ok(());
+    };
+    let projection = crate::styles::style_table_projection(xml)
+        .map_err(|message| invalid_docx(&format!("word/styles.xml: {message}")))?;
+    let Some(style_id) = projection
+        .styles
+        .iter()
+        .find(|style| {
+            style.style_type == "char"
+                && style
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("hyperlink"))
+        })
+        .map(|style| style.style_id.clone())
+    else {
+        return Ok(());
+    };
+
+    fn walk(
+        block: &mut BlockNode,
+        visit: &mut dyn FnMut(&crate::domain::NodeId, &mut HyperlinkData),
+    ) {
+        match block {
+            BlockNode::Paragraph(p) => {
+                for inline in p.segments.iter_mut().flat_map(|s| s.inlines.iter_mut()) {
+                    if let InlineNode::OpaqueInline(o) = inline
+                        && let OpaqueKind::Hyperlink(data) = &mut o.kind
+                    {
+                        visit(&o.id, data);
+                    }
+                }
+            }
+            BlockNode::Table(t) => {
+                for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                    for block in &mut cell.blocks {
+                        walk(block, visit);
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    fn every_story(
+        doc: &mut CanonDoc,
+        visit: &mut dyn FnMut(&crate::domain::NodeId, &mut HyperlinkData),
+    ) {
+        let stories = std::iter::once(&mut doc.blocks)
+            .chain(doc.headers.iter_mut().map(|s| &mut s.blocks))
+            .chain(doc.footers.iter_mut().map(|s| &mut s.blocks))
+            .chain(doc.footnotes.iter_mut().map(|s| &mut s.blocks))
+            .chain(doc.endnotes.iter_mut().map(|s| &mut s.blocks))
+            .chain(doc.comments.iter_mut().map(|s| &mut s.blocks));
+        for blocks in stories {
+            for tracked in blocks.iter_mut() {
+                walk(&mut tracked.block, visit);
+            }
+        }
+    }
+
+    fn link_ids(block: &BlockNode, out: &mut std::collections::HashSet<crate::domain::NodeId>) {
+        match block {
+            BlockNode::Paragraph(p) => {
+                out.extend(p.all_inlines().filter_map(|inline| match inline {
+                    InlineNode::OpaqueInline(o) if matches!(o.kind, OpaqueKind::Hyperlink(_)) => {
+                        Some(o.id.clone())
+                    }
+                    _ => None,
+                }))
+            }
+            BlockNode::Table(t) => t
+                .rows
+                .iter()
+                .flat_map(|r| r.cells.iter())
+                .flat_map(|c| c.blocks.iter())
+                .for_each(|block| link_ids(block, out)),
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    let mut existing = std::collections::HashSet::new();
+    std::iter::once(&before.blocks)
+        .chain(before.headers.iter().map(|s| &s.blocks))
+        .chain(before.footers.iter().map(|s| &s.blocks))
+        .chain(before.footnotes.iter().map(|s| &s.blocks))
+        .chain(before.endnotes.iter().map(|s| &s.blocks))
+        .chain(before.comments.iter().map(|s| &s.blocks))
+        .flatten()
+        .for_each(|tracked| link_ids(&tracked.block, &mut existing));
+    let mut failure = None;
+    every_story(edited, &mut |id, data| {
+        if existing.contains(id) || data.r_id.is_some() || failure.is_some() {
+            return;
+        }
+        for run in &mut data.runs {
+            match with_char_style(run.rpr_xml.as_deref(), &style_id) {
+                Ok(rpr) => run.rpr_xml = Some(rpr),
+                Err(error) => failure = Some(error),
+            }
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+/// `rpr_xml` (a run's w:rPr, if any) with `w:rStyle` set to `style_id` unless
+/// it already names a character style. rStyle is the first child of rPr.
+fn with_char_style(rpr_xml: Option<&[u8]>, style_id: &str) -> Result<Vec<u8>, RuntimeError> {
+    let mut rpr = match rpr_xml {
+        Some(bytes) => crate::word_xml::parse_raw_fragment(bytes)
+            .map_err(|error| invalid_docx(&format!("new hyperlink run rPr: {error:?}")))?,
+        None => crate::word_xml::w_el("rPr"),
+    };
+    let has_style = rpr
+        .children
+        .iter()
+        .any(|child| matches!(child, xmltree::XMLNode::Element(el) if el.name == "rStyle"));
+    if !has_style {
+        let mut r_style = crate::word_xml::w_el("rStyle");
+        crate::xml_attrs::attr_set(&mut r_style, "w:val", style_id);
+        rpr.children.insert(0, xmltree::XMLNode::Element(r_style));
+    }
+    Ok(crate::word_xml::serialize_raw_fragment(&rpr))
+}
+
+/// The relationship id for a hyperlink target written in a story part: an
+/// external relationship in that part's rels, created for a story that had no
+/// rels part. Hyperlinks are the only relationship the serializer allocates
+/// while writing blocks; any other request is a programming error.
+fn story_hyperlink_rid(
+    story_rels: &mut Option<crate::docx_package::RelationshipSet>,
+    rels_path: &str,
+    part_path: &str,
+    target: &str,
+    rel_type: &str,
+) -> String {
+    assert_eq!(
+        rel_type, HYPERLINK_REL_TYPE,
+        "story part {part_path} asked to allocate a {rel_type} relationship while writing blocks"
+    );
+    story_rels
+        .get_or_insert_with(|| crate::docx_package::RelationshipSet::empty().rebased(rels_path))
+        .add_external(rel_type, target)
+}
+
 /// Convert a story part path to its `.rels` file path.
 /// e.g. `word/footer3.xml` → `word/_rels/footer3.xml.rels`
 fn story_part_rels_path(part_path: &str) -> String {
@@ -7359,83 +7803,126 @@ fn story_root_tag(root: &Element) -> String {
 /// page-number gallery `docPartObj`, repeating-section bindings, …) would be
 /// silently unwrapped on the first edit of anything in the document.
 ///
-/// Same invariants as the body loop: a wrap must never open while another is
-/// still open (import records only the outermost story envelope), and a span
-/// running past the last block is a programmer bug.
+/// Uses the same validated nested-boundary schedule as the body writer.
 fn write_story_blocks_with_sdt_envelopes(
     w: &mut XmlWriter,
     blocks: &[crate::domain::TrackedBlock],
     annotation_id: &mut u32,
     bookmark_policy: &crate::serialize::BookmarkIdPolicy,
+    resolve_rel_rid: &mut dyn FnMut(&str, &str) -> String,
 ) -> Result<(), RuntimeError> {
-    let mut sdt_remaining: usize = 0;
-    for tracked in blocks {
-        // Close a wrap that completed on the previous iteration (mirrors the
-        // body loop: decrement for the previously-emitted block, then flush).
-        if sdt_remaining > 0 {
-            sdt_remaining -= 1;
-            if sdt_remaining == 0 {
-                w.end_tag("w:sdtContent").map_err(map_xml_write_error)?;
-                w.end_tag("w:sdt").map_err(map_xml_write_error)?;
-            }
-        }
-        if let Some(wrap) = &tracked.block_sdt_wrap {
-            if sdt_remaining > 0 {
-                return Err(RuntimeError {
-                    code: ErrorCode::UnsupportedEdit,
-                    message: "overlapping block-level content-control wraps in story part"
-                        .to_string(),
-                    details: ErrorDetails {
-                        block_id: Some(block_id_of_tracked(tracked).clone()),
-                        context: Some(format!("span={}", wrap.span)),
-                        ..ErrorDetails::default()
-                    },
-                });
-            }
-            w.start_tag("w:sdt").map_err(map_xml_write_error)?;
-            let sdt_pr = crate::word_xml::parse_raw_fragment(&wrap.wrapper.sdt_pr_xml).map_err(
-                |source| RuntimeError {
-                    code: ErrorCode::InvalidDocx,
-                    message: "failed to parse story content-control properties".to_string(),
-                    details: ErrorDetails {
-                        block_id: Some(block_id_of_tracked(tracked).clone()),
-                        context: Some(format!("err={source}")),
-                        ..ErrorDetails::default()
-                    },
-                },
-            )?;
-            w.write_element(&sdt_pr).map_err(map_xml_write_error)?;
-            if let Some(ref end_pr_xml) = wrap.wrapper.sdt_end_pr_xml {
-                let sdt_end_pr =
-                    crate::word_xml::parse_raw_fragment(end_pr_xml).map_err(|source| {
-                        RuntimeError {
-                            code: ErrorCode::InvalidDocx,
-                            message: "failed to parse story content-control end properties"
-                                .to_string(),
-                            details: ErrorDetails {
-                                block_id: Some(block_id_of_tracked(tracked).clone()),
-                                context: Some(format!("err={source}")),
-                                ..ErrorDetails::default()
-                            },
-                        }
-                    })?;
-                w.write_element(&sdt_end_pr).map_err(map_xml_write_error)?;
-            }
-            w.start_tag("w:sdtContent").map_err(map_xml_write_error)?;
-            sdt_remaining = wrap.span;
-        }
-        let el = serialize_tracked_block(tracked, annotation_id, bookmark_policy, None)?;
+    let boundaries = block_sdt_boundaries(blocks)?;
+    for (index, tracked) in blocks.iter().enumerate() {
+        write_block_sdt_boundary(w, &boundaries[index], index)?;
+        let el = serialize_tracked_block(
+            tracked,
+            annotation_id,
+            bookmark_policy,
+            Some(&mut *resolve_rel_rid),
+        )?;
         w.write_element(&el).map_err(map_xml_write_error)?;
     }
-    // Flush a wrap that ends on the final block.
-    if sdt_remaining > 0 {
-        sdt_remaining -= 1;
-        assert_eq!(
-            sdt_remaining, 0,
-            "block_sdt_wrap span ran past the end of the story part"
-        );
-        w.end_tag("w:sdtContent").map_err(map_xml_write_error)?;
-        w.end_tag("w:sdt").map_err(map_xml_write_error)?;
+    write_block_sdt_boundary(w, &boundaries[blocks.len()], blocks.len())?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct BlockSdtBoundary<'a> {
+    /// All ending controls close before any following sibling opens.
+    closes: usize,
+    /// Preorder traversal puts enclosing controls before their descendants.
+    opens: Vec<&'a crate::domain::SdtWrapper>,
+}
+
+fn invalid_block_sdt_range(start: usize, span: usize, limit: usize) -> RuntimeError {
+    RuntimeError {
+        code: ErrorCode::UnsupportedEdit,
+        message: "invalid block content-control hierarchy: ranges must be nonempty, contained, and sibling-disjoint".into(),
+        details: ErrorDetails {
+            context: Some(format!("start={start}, span={span}, containing_end={limit}")),
+            ..ErrorDetails::default()
+        },
+    }
+}
+
+/// Validate ownership before emitting any control. Flat roots are disjoint;
+/// nested children are relative to their parent and may share its boundaries.
+fn block_sdt_boundaries(
+    blocks: &[TrackedBlock],
+) -> Result<Vec<BlockSdtBoundary<'_>>, RuntimeError> {
+    fn add<'a>(
+        wrap: &'a crate::domain::BlockSdtWrap,
+        start: usize,
+        limit: usize,
+        boundaries: &mut [BlockSdtBoundary<'a>],
+    ) -> Result<usize, RuntimeError> {
+        let end = start
+            .checked_add(wrap.span)
+            .filter(|end| wrap.span > 0 && *end <= limit)
+            .ok_or_else(|| invalid_block_sdt_range(start, wrap.span, limit))?;
+        boundaries[start].opens.push(&wrap.wrapper);
+        boundaries[end].closes += 1;
+        let mut previous_end = start;
+        for nested in &wrap.nested {
+            let child_start = start
+                .checked_add(nested.start)
+                .filter(|child_start| *child_start >= previous_end && *child_start < end)
+                .ok_or_else(|| invalid_block_sdt_range(start, nested.control.span, end))?;
+            previous_end = add(&nested.control, child_start, end, boundaries)?;
+        }
+        Ok(end)
+    }
+    let mut boundaries: Vec<_> = (0..=blocks.len())
+        .map(|_| BlockSdtBoundary::default())
+        .collect();
+    let mut previous_end = 0;
+    for (start, tracked) in blocks.iter().enumerate() {
+        if let Some(wrap) = &tracked.block_sdt_wrap {
+            if start < previous_end {
+                let mut error = invalid_block_sdt_range(start, wrap.span, previous_end);
+                error.details.block_id = Some(block_id_of_tracked(tracked).clone());
+                return Err(error);
+            }
+            previous_end =
+                add(wrap, start, blocks.len(), &mut boundaries).map_err(|mut error| {
+                    error.details.block_id = Some(block_id_of_tracked(tracked).clone());
+                    error
+                })?;
+        }
+    }
+    Ok(boundaries)
+}
+
+fn write_block_sdt_boundary(
+    writer: &mut XmlWriter,
+    boundary: &BlockSdtBoundary<'_>,
+    index: usize,
+) -> Result<(), RuntimeError> {
+    for _ in 0..boundary.closes {
+        writer
+            .end_tag("w:sdtContent")
+            .map_err(map_xml_write_error)?;
+        writer.end_tag("w:sdt").map_err(map_xml_write_error)?;
+    }
+    for wrapper in &boundary.opens {
+        writer.start_tag("w:sdt").map_err(map_xml_write_error)?;
+        for raw in std::iter::once(&wrapper.sdt_pr_xml).chain(wrapper.sdt_end_pr_xml.iter()) {
+            let properties =
+                crate::word_xml::parse_raw_fragment(raw).map_err(|error| RuntimeError {
+                    code: ErrorCode::InvalidDocx,
+                    message: "failed to parse block content-control properties".into(),
+                    details: ErrorDetails {
+                        context: Some(format!("block boundary={index}; {error}")),
+                        ..ErrorDetails::default()
+                    },
+                })?;
+            writer
+                .write_element(&properties)
+                .map_err(map_xml_write_error)?;
+        }
+        writer
+            .start_tag("w:sdtContent")
+            .map_err(map_xml_write_error)?;
     }
     Ok(())
 }
@@ -7512,7 +7999,7 @@ impl DocxRuntime for SimpleRuntime {
             cached_view_fingerprint,
             Some(Arc::clone(&source_bytes)),
             Arc::clone(&canonical),
-            source_bytes,
+            SessionSource::new(source_bytes),
         );
         if runtime_timing_logs_enabled() {
             eprintln!(
@@ -7752,6 +8239,26 @@ pub fn serialize_snapshot(
     Ok(bytes)
 }
 
+/// Rewrite the opaque hashes of `doc`, a comparison-local copy of
+/// `snapshot`'s document, to their package-independent identities: each
+/// relationship reference is hashed as what it resolves to in `snapshot`'s
+/// package. Pair with [`restore_opaque_transport_hashes`] on anything built
+/// from the copy before it leaves the comparison.
+#[doc(hidden)]
+pub fn resolve_opaque_relationship_identities(
+    snapshot: &EditSnapshot,
+    doc: &mut CanonDoc,
+) -> Result<(), RuntimeError> {
+    crate::package_ops::relationship_identity::resolve(&snapshot.scaffold.package, doc)
+}
+
+/// Return relationship-bearing opaques in `doc` to the transport hash (the
+/// SHA-256 of their raw XML) that every other engine path maintains.
+#[doc(hidden)]
+pub fn restore_opaque_transport_hashes(doc: &mut CanonDoc) -> Result<(), RuntimeError> {
+    crate::package_ops::relationship_identity::restore_transport_hashes(doc)
+}
+
 /// Prepare one target snapshot for source-based package coexistence by
 /// remapping only package-local numbering identities whose definitions collide
 /// semantically with the source. This is a generic engine operation: it keeps
@@ -7922,15 +8429,15 @@ pub(crate) fn first_quarantined_block(doc: &CanonDoc) -> Option<&crate::domain::
 }
 
 /// Scan every opaque inline (body + all stories) for a `raw_xml` fragment that
-/// the accept/reject descent cannot parse YET carries a revision marker. Such a
+/// the accept/reject descent cannot parse or safely resolve. Such a
 /// fragment would have its revisions silently left unresolved by the projection
 /// (the exact silent-fallback M0.1 exists to kill), so `project` refuses on it —
 /// mirroring the quarantine guard's "revisions invisible to this operation"
-/// precedent. Returns the offending opaque's id.
-pub(crate) fn first_unparseable_opaque_with_revisions(
+/// precedent. Returns the offending opaque's id and concrete failure reason.
+pub(crate) fn first_unresolvable_opaque_with_revisions(
     doc: &CanonDoc,
-) -> Option<crate::domain::NodeId> {
-    fn scan_inline(inline: &InlineNode) -> Option<crate::domain::NodeId> {
+) -> Option<(crate::domain::NodeId, String)> {
+    fn scan_inline(inline: &InlineNode) -> Option<(crate::domain::NodeId, String)> {
         let InlineNode::OpaqueInline(o) = inline else {
             return None;
         };
@@ -7943,11 +8450,17 @@ pub(crate) fn first_unparseable_opaque_with_revisions(
         let raw = o.raw_xml.as_deref()?;
         // keep_inserted is irrelevant to the parse outcome; pick one.
         match crate::normalize::resolve_opaque_fragment_revisions(raw, true) {
-            crate::normalize::FragmentResolution::UnparseableWithRevisions => Some(o.id.clone()),
+            crate::normalize::FragmentResolution::UnparseableWithRevisions => Some((
+                o.id.clone(),
+                "raw_xml carrying tracked state could not be parsed".to_owned(),
+            )),
+            crate::normalize::FragmentResolution::InvalidTableHistory(reason) => {
+                Some((o.id.clone(), reason))
+            }
             _ => None,
         }
     }
-    fn scan_block(block: &BlockNode) -> Option<crate::domain::NodeId> {
+    fn scan_block(block: &BlockNode) -> Option<(crate::domain::NodeId, String)> {
         match block {
             BlockNode::Paragraph(p) => p
                 .segments
@@ -7963,7 +8476,9 @@ pub(crate) fn first_unparseable_opaque_with_revisions(
             BlockNode::OpaqueBlock(_) => None,
         }
     }
-    fn scan_story_blocks(blocks: &[crate::domain::TrackedBlock]) -> Option<crate::domain::NodeId> {
+    fn scan_story_blocks(
+        blocks: &[crate::domain::TrackedBlock],
+    ) -> Option<(crate::domain::NodeId, String)> {
         blocks.iter().find_map(|tb| scan_block(&tb.block))
     }
     if let Some(id) = doc.blocks.iter().find_map(|tb| scan_block(&tb.block)) {
@@ -8031,6 +8546,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         EditError::OpaqueTextTargetNotFound { .. } => ErrorCode::AnchorNotFound,
         EditError::OpaqueTextRegionNotFound { .. } => ErrorCode::AnchorNotFound,
         EditError::SdtFillBlockNotFound { .. } => ErrorCode::AnchorNotFound,
+        EditError::SdtFillControlNotFound { .. } => ErrorCode::AnchorNotFound,
         EditError::FormFieldNotFound { .. } => ErrorCode::AnchorNotFound,
         EditError::BlockRangeInvalid { .. } => ErrorCode::AnchorNotFound,
         EditError::CommentTargetNotFound { .. }
@@ -8046,13 +8562,15 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         EditError::NoteAnchorNotAParagraph { .. }
         | EditError::NoteEmptyBody { .. }
         | EditError::NoteIdNotNumeric { .. }
-        | EditError::NoteBodyMultiParagraph { .. } => ErrorCode::UnsupportedEdit,
+        | EditError::NoteBodyMultiParagraph { .. }
+        | EditError::NoteBodyLineCountMismatch { .. } => ErrorCode::UnsupportedEdit,
         EditError::ExpectMismatch { .. }
         | EditError::BlockSemanticHashMismatch { .. }
         | EditError::SpanHandleStale { .. }
         | EditError::SpanTextMismatch { .. } => ErrorCode::StaleEdit,
         EditError::AnchorNotFound { .. } => ErrorCode::AnchorNotFound,
         EditError::SpanCrossesTrackedSegment { .. }
+        | EditError::ExpectCrossesInlineObject { .. }
         | EditError::SpanSplitsBracketPair { .. }
         | EditError::SpanStyledContentUnsupported { .. } => ErrorCode::UnsupportedEdit,
         EditError::BlockHasTrackedStatus { .. }
@@ -8081,13 +8599,21 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::TableRowIndexOutOfRange { .. }
         | EditError::TableColumnIndexOutOfRange { .. }
         | EditError::TableColumnOpOnMergedGrid { .. }
+        | EditError::TableColumnHeaderMismatch { .. }
+        | EditError::JoinNeedsFollowingParagraph { .. }
+        | EditError::TrackedColumnMoveUnsupported { .. }
+        | EditError::UnsupportedTableColumnGeometry { .. }
+        | EditError::UnsupportedTableRowMove { .. }
+        | EditError::UnsupportedBlockMoveIdentity { .. }
         | EditError::MergeRegionNotRectangular { .. }
+        | EditError::MergeCellsUnsupported { .. }
         | EditError::TableWouldBeEmpty { .. }
         | EditError::TableInsertRowCellCountExceedsColumns { .. }
         | EditError::TableCellNotEditable { .. }
         | EditError::TableMidRedline { .. }
         | EditError::TableSpecFormattingRequiresDirect { .. }
-        | EditError::FindReplaceBarrierStraddle { .. } => ErrorCode::UnsupportedEdit,
+        | EditError::FindReplaceBarrierStraddle { .. }
+        | EditError::ReplaceTextInsideInlineObjects { .. } => ErrorCode::UnsupportedEdit,
         EditError::BookmarkDuplicateName { .. }
         | EditError::BookmarkOrphanEnd { .. }
         | EditError::BookmarkEmptyName { .. }
@@ -8125,6 +8651,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::TextboxHasTrackedChanges { .. }
         | EditError::MultipleDistinctTextboxes { .. }
         | EditError::OpaqueTextMissingRawXml { .. }
+        | EditError::OpaqueTextEditOnHyperlink { .. }
         | EditError::OpaqueTextRawXmlParse { .. }
         | EditError::OpaqueTextNotFound { .. }
         | EditError::OpaqueTextRegionHasTrackedChanges { .. }
@@ -8132,6 +8659,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::SdtFillAmbiguousTarget { .. }
         | EditError::SdtFillEmpty { .. }
         | EditError::SdtFillComplexContent { .. }
+        | EditError::SdtFillControlNotFillable { .. }
+        | EditError::ContentControlSplit { .. }
         | EditError::SdtFillBlockHashUnsupported { .. }
         | EditError::SdtFillDuplicateBlockTarget { .. }
         | EditError::OpaqueTextMirrorDivergence { .. }
@@ -8141,7 +8670,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::DocDefaultsEmpty { .. } => ErrorCode::UnsupportedEdit,
         EditError::OpaqueDestroyed { .. } => ErrorCode::OpaqueDestroyed,
         EditError::NoOpEdit { .. } | EditError::NoFormattingChange { .. } => ErrorCode::NoOpEdit,
-        EditError::PrefixDuplicatesLabel { .. } => ErrorCode::PrefixDuplicatesLabel,
+        EditError::PrefixDuplicatesLabel { .. }
+        | EditError::InsertedParagraphDuplicatesLabel { .. } => ErrorCode::PrefixDuplicatesLabel,
         EditError::AmbiguousAnchorAfterMove { .. } => ErrorCode::AmbiguousAnchorAfterMove,
         EditError::FormatRevisionConflict { .. } => ErrorCode::FormatRevisionConflict,
         EditError::AmbiguousFormatTarget { .. } => ErrorCode::AmbiguousFormatTarget,
@@ -8175,6 +8705,7 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::MoveDestinationInsideSource { .. }
         | EditError::NotAHyperlink { .. }
         | EditError::HyperlinkContainsTrackedChanges { .. }
+        | EditError::UnsupportedHyperlinkUnlink { .. }
         | EditError::HyperlinkSetAttrNoOp { .. }
         | EditError::NotATable { .. }
         | EditError::EmptyTableStructure { .. }
@@ -8274,6 +8805,21 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             context: Some(format!(
                 "formatting patch has no visible or provenance effect; \
                  target already reads {current_formatting}"
+            )),
+            ..ErrorDetails::default()
+        },
+        EditError::InsertedParagraphDuplicatesLabel {
+            block_id,
+            step_index,
+            label,
+            assigned_label,
+            corrected_content,
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            context: Some(format!(
+                "content label {label:?} vs assigned label {assigned_label:?}; \
+                 corrected_content {corrected_content:?}"
             )),
             ..ErrorDetails::default()
         },
@@ -8399,6 +8945,17 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
             ))),
             ..ErrorDetails::default()
         },
+        EditError::ExpectCrossesInlineObject {
+            block_id,
+            object_id,
+            step_index,
+            ..
+        } => ErrorDetails {
+            block_id: Some(block_id.clone()),
+            step_index: Some(*step_index),
+            context: Some(format!("object_id={object_id}")),
+            ..ErrorDetails::default()
+        },
         _ => ErrorDetails::default(),
     };
     RuntimeError {
@@ -8476,13 +9033,31 @@ pub(crate) fn rebuild_snapshot(
         .map(crate::numbering::NumberingDefinitions::parse)
         .transpose()
         .map_err(|message| invalid_docx(&format!("numbering.xml: {message}")))?;
-    if let Some(style_defs) = style_definitions_from_package(&package)? {
-        crate::tracked_model::reresolve_document_style_inherited_marks(
-            &mut new_canonical,
-            &style_defs,
-            numbering_defs.as_ref(),
-        );
-    }
+    let style_defs = style_definitions_from_package(&package)?;
+    crate::tracked_model::reresolve_document_style_inherited_marks(
+        &mut new_canonical,
+        &style_defs,
+        numbering_defs.as_ref(),
+    );
+    let default_tab_stop =
+        crate::settings::parse_default_tab_stop_bytes(package.get_part("word/settings.xml"))
+            .map_err(|message| {
+                invalid_docx(&format!("word/settings.xml defaultTabStop: {message}"))
+            })?
+            .unwrap_or(720);
+    crate::tracked_model::rederive_document_views(
+        &mut new_canonical,
+        crate::tracked_model::ResolutionDefinitions {
+            styles: Some(&style_defs),
+            numbering: numbering_defs.as_ref(),
+            default_tab_stop,
+        },
+    );
+    // List labels are a view over the list sequence an edit may have changed
+    // (a split, a new label format, an added or removed item); derive them from
+    // the definitions just saved, as a reopen would.
+    crate::tracked_model::renumber_list_labels(&mut new_canonical.blocks, numbering_defs.as_ref());
+    crate::import::rederive_synthesized_blank_stories(&mut new_canonical);
     let body_template =
         reanchor_body_opaque_blocks(&mut new_canonical, &prev.scaffold.body_template, &archive)?;
     Ok(EditSnapshot {
@@ -8530,6 +9105,11 @@ fn reanchor_body_opaque_blocks(
         let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
             continue;
         };
+        // A marker inside an open control is written from the model and lives
+        // in no scaffold slot: nothing to re-anchor.
+        if opaque.proof_ref.docx_anchor == crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR {
+            continue;
+        }
         let previous_node = if let Some(index) = opaque
             .proof_ref
             .docx_anchor
@@ -8590,10 +9170,15 @@ fn reanchor_body_opaque_blocks(
                 });
                 // A body-SDT fill intentionally changes the preserved node's
                 // XML, so exact equality with the previous scaffold cannot
-                // hold. SDTs remain in opaque document order; matching the
-                // next direct body SDT is therefore the durable alignment.
+                // hold. Sealed SDTs remain in opaque document order; matching
+                // the next direct body SDT that is sealed is therefore the
+                // durable alignment. An SDT holding only blocks is the written
+                // form of an OPEN control (a `BlockSdtWrap` over model blocks),
+                // never a preserved opaque.
                 let sdt_match = opaque.kind == OpaqueKind::Sdt
-                    && matches!(candidate, XMLNode::Element(element) if is_w_tag(element, "sdt"));
+                    && matches!(candidate, XMLNode::Element(element)
+                        if is_w_tag(element, "sdt")
+                            && !crate::import::body_sdt_holds_only_blocks(element));
                 (exact_match || range_match || sdt_match).then_some(index)
             })
             .ok_or_else(|| RuntimeError {
@@ -8775,9 +9360,12 @@ const BUILTIN_STYLE_IDS: &[&str] = &[
 /// no styles part. The single style-table loader shared by the runtime
 /// projection ([`EditSnapshot::style_definitions`]) and the public
 /// [`style_table_from_docx`], so both resolve against the same table import used.
+/// The package's resolvable style table, loaded exactly as import loads it: a
+/// package without `word/styles.xml` still has Word's run-property fallbacks
+/// (Times New Roman when no font resolves), modeled as an empty table.
 pub(crate) fn style_definitions_from_package(
     package: &DocxPackage,
-) -> Result<Option<crate::styles::StyleDefinitions>, RuntimeError> {
+) -> Result<crate::styles::StyleDefinitions, RuntimeError> {
     let invalid = |context: &str, message: String| RuntimeError {
         code: ErrorCode::InvalidDocx,
         message,
@@ -8786,17 +9374,17 @@ pub(crate) fn style_definitions_from_package(
             ..Default::default()
         },
     };
-    let Some(bytes) = package.get_part("word/styles.xml") else {
-        return Ok(None);
+    let mut style_defs = match package.get_part("word/styles.xml") {
+        Some(bytes) => crate::styles::StyleDefinitions::parse(bytes)
+            .map_err(|m| invalid("style_definitions_from_package styles.xml", m))?,
+        None => crate::styles::StyleDefinitions::default(),
     };
-    let mut style_defs = crate::styles::StyleDefinitions::parse(bytes)
-        .map_err(|m| invalid("style_definitions_from_package styles.xml", m))?;
     if let Some(theme_bytes) = package.get_part("word/theme/theme1.xml") {
         let theme_fonts = crate::styles::ThemeFonts::parse(theme_bytes)
             .map_err(|m| invalid("style_definitions_from_package theme1.xml", m))?;
         style_defs.set_theme_fonts(theme_fonts);
     }
-    Ok(Some(style_defs))
+    Ok(style_defs)
 }
 
 fn numbering_definitions_from_package(
@@ -8841,7 +9429,12 @@ pub fn style_table_from_docx(
         message: format!("style_table_from_docx: package decode failed: {source}"),
         details: ErrorDetails::default(),
     })?;
-    Ok(style_definitions_from_package(&package)?.map(crate::styles::StyleTable))
+    if package.get_part("word/styles.xml").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(crate::styles::StyleTable(
+        style_definitions_from_package(&package)?,
+    )))
 }
 
 fn defined_style_ids(package: &DocxPackage) -> HashSet<String> {
@@ -8874,20 +9467,51 @@ fn style_id_is_known(style_id: &str, defined: &HashSet<String>) -> bool {
 }
 
 impl EditSnapshot {
-    /// Discover fillable body-level (block) content controls from the serialize
-    /// scaffold — their bytes live there, not on the IR node, so they are
-    /// invisible to the `CanonDoc`-level `opaque_targets::opaque_text_targets`.
-    /// Each carries the `body_index` `sdt_text_fill` addresses (RFC-0002
-    /// §Phase-2). Sorted by `body_index` for a stable order.
+    /// Enumerate legacy fields inside opaque body carriers. Names may repeat;
+    /// address ordinals are bound to the returned containing-block hash.
+    pub fn block_form_field_targets(
+        &self,
+    ) -> Result<Vec<crate::opaque_targets::BlockFormFieldTarget>, RuntimeError> {
+        let mut out = Vec::new();
+        for (index, node) in &self.scaffold.body_template.opaque_children {
+            out.extend(
+                crate::opaque_targets::block_form_field_targets(*index, node).map_err(
+                    |message| RuntimeError {
+                        code: ErrorCode::UnsupportedEdit,
+                        message: format!("cannot inspect nested form fields: {message}"),
+                        details: ErrorDetails {
+                            context: Some(format!("body_index={index}")),
+                            ..ErrorDetails::default()
+                        },
+                    },
+                )?,
+            );
+        }
+        out.sort_by_key(|t| (t.body_index, t.paragraph_index, t.field_index));
+        Ok(out)
+    }
+
+    /// Discover fillable body-level (block) content controls, each with the
+    /// address `sdt_text_fill` takes (RFC-0002 §Phase-2): open controls (their
+    /// content is ordinary blocks) by first block id, in document order, then
+    /// sealed controls by body index. A sealed control's bytes live in the
+    /// serialize scaffold, not on the IR node.
     pub fn block_content_control_targets(&self) -> Vec<crate::opaque_targets::BlockSdtTextTarget> {
-        let mut out: Vec<_> = self
+        let mut sealed: Vec<_> = self
             .scaffold
             .body_template
             .opaque_children
             .iter()
             .filter_map(|(idx, node)| crate::opaque_targets::block_sdt_target(*idx, node))
             .collect();
-        out.sort_by_key(|t| t.body_index);
+        sealed.sort_by_key(|t| match t.address {
+            crate::opaque_targets::BlockSdtAddress::BodyIndex(index) => index,
+            crate::opaque_targets::BlockSdtAddress::FirstBlock(_) => {
+                unreachable!("scaffold controls are sealed")
+            }
+        });
+        let mut out = crate::opaque_targets::open_block_sdt_targets(&self.canonical);
+        out.extend(sealed);
         out
     }
 
@@ -8958,6 +9582,11 @@ impl EditSnapshot {
             )
         });
 
+        let placeholder_fills = crate::edit::verbs::sdt_text_fill::filled_placeholder_controls(
+            &self.canonical,
+            &txn.steps,
+        )
+        .map_err(map_edit_error)?;
         let (mut edited, pending) = crate::edit::apply_transaction_with_id_floor(
             &self.canonical,
             txn,
@@ -8991,13 +9620,48 @@ impl EditSnapshot {
             numbering: numbering_defs.as_ref(),
             default_tab_stop: self.default_tab_stop()?,
         };
+        // A paragraph whose list level changed takes its new level's indent
+        // when it has no direct one (Word's list indent removes it).
+        let previous_levels: HashMap<crate::domain::NodeId, (u32, u32)> = self
+            .canonical
+            .blocks
+            .iter()
+            .filter_map(|tracked| match &tracked.block {
+                crate::domain::BlockNode::Paragraph(p) => p
+                    .numbering
+                    .as_ref()
+                    .map(|n| (p.id.clone(), (n.num_id, n.ilvl))),
+                _ => None,
+            })
+            .collect();
         for tracked in &mut edited.blocks {
-            if let crate::domain::BlockNode::Paragraph(paragraph) = &mut tracked.block
-                && !existing_paragraph_ids.contains(&paragraph.id)
-            {
-                crate::tracked_model::reresolve_paragraph_indent(paragraph, insert_defs);
+            if let crate::domain::BlockNode::Paragraph(paragraph) = &mut tracked.block {
+                let level = paragraph.numbering.as_ref().map(|n| (n.num_id, n.ilvl));
+                let relevelled = existing_paragraph_ids.contains(&paragraph.id)
+                    && level.is_some()
+                    && previous_levels.get(&paragraph.id).copied() != level;
+                if !existing_paragraph_ids.contains(&paragraph.id) || relevelled {
+                    crate::tracked_model::reresolve_paragraph_indent(paragraph, insert_defs);
+                }
             }
         }
+        // A paragraph moved to a list level its list does not define would
+        // read as numbered here and unnumbered on reopen: refuse it.
+        check_new_list_levels(&self.canonical, &edited, numbering_defs.as_ref())?;
+        // A value that replaced a placeholder is formatted as entered text,
+        // which needs the style table too.
+        crate::edit::verbs::sdt_text_fill::format_placeholder_values(
+            &mut edited,
+            &placeholder_fills,
+            style_defs.as_ref(),
+        )?;
+        // A link this transaction created reads as a link: Word applies the
+        // document's Hyperlink character style to a link it inserts.
+        style_new_hyperlinks(
+            &mut edited,
+            &self.canonical,
+            self.scaffold.package.get_part("word/styles.xml"),
+        )?;
 
         // Single-document edit: base and target are the same archive. This
         // re-zips the UNMODIFIED input scaffold as merge input — an internal
@@ -9015,23 +9679,32 @@ impl EditSnapshot {
         // fills are therefore already present in `next` exactly once; applying
         // the pending set again would try to nest a second redline inside the
         // first and correctly refuse with RegionHasTrackedChanges.
-        let next = rebuild_snapshot(self, edited, &redline_bytes)?;
+        let mut next = rebuild_snapshot(self, edited, &redline_bytes)?;
 
+        // A content control bound to a data store shows the store's value, and
+        // Word refills it from the store on open: text this transaction gave a
+        // bound control goes into the store too, as Word writes it.
+        let mut package_changed = crate::data_binding::sync_bound_stores(
+            &self.scaffold.package,
+            &mut next.scaffold.package,
+        )?;
         if inserts_toc {
             // Documented product default (see `edit/verbs/update_fields.rs`):
-            // force `w:updateFields` ON as part of this same commit, via the
-            // same mutate-then-refingerprint helper `set_update_fields_on_open`
-            // already uses (`rebuild_metadata_snapshot`) — NOT a second,
-            // separate `apply` — so this stays one logical transaction (one
-            // `document_version` bump) with a package whose fingerprint
-            // matches its actual bytes.
-            let mut with_settings = next;
+            // force `w:updateFields` ON as part of this same commit.
             crate::edit::verbs::update_fields::set_update_fields_on_open(
-                &mut with_settings.scaffold.package,
+                &mut next.scaffold.package,
                 Some(true),
             )
             .map_err(map_update_fields_error)?;
-            return rebuild_metadata_snapshot(self, with_settings);
+            package_changed = true;
+        }
+        if package_changed {
+            // Package-only changes ride the same mutate-then-refingerprint
+            // helper `set_update_fields_on_open` already uses
+            // (`rebuild_metadata_snapshot`) — NOT a second, separate `apply` —
+            // so this stays one logical transaction (one `document_version`
+            // bump) with a package whose fingerprint matches its actual bytes.
+            return rebuild_metadata_snapshot(self, next);
         }
 
         Ok(next)
@@ -9060,11 +9733,11 @@ impl EditSnapshot {
             return Ok(());
         };
         if self.meta.origin_authors.contains(author) {
-            let existing_revision_count =
-                crate::tracked_model::enumerate_revisions(&self.canonical)
-                    .into_iter()
-                    .filter(|revision| revision.author.as_deref() == Some(author))
-                    .count();
+            let existing_revision_count = self
+                .revisions()
+                .into_iter()
+                .filter(|revision| revision.author.as_deref() == Some(author))
+                .count();
             return Err(RuntimeError {
                 code: ErrorCode::AuthorLabelCollision,
                 message: format!(
@@ -9238,12 +9911,11 @@ impl EditSnapshot {
     }
 
     /// Parse `word/styles.xml` (plus theme fonts) into resolvable
-    /// [`crate::styles::StyleDefinitions`], or `None` when the package has no
-    /// styles part. Mirrors the import-time load (`import_docx`) so accept/reject
-    /// re-resolution of style-inherited run marks uses the SAME style table the
-    /// canonical was originally resolved against.
+    /// [`crate::styles::StyleDefinitions`], exactly as import loads them, so
+    /// accept/reject re-resolution of style-inherited run marks uses the SAME
+    /// style table the canonical was originally resolved against.
     fn style_definitions(&self) -> Result<Option<crate::styles::StyleDefinitions>, RuntimeError> {
-        style_definitions_from_package(&self.scaffold.package)
+        style_definitions_from_package(&self.scaffold.package).map(Some)
     }
 
     fn numbering_definitions(
@@ -9279,6 +9951,25 @@ impl EditSnapshot {
         Ok(self.style_definitions()?.map(crate::styles::StyleTable))
     }
 
+    /// Every pending revision in the document: the model's census
+    /// ([`crate::tracked_model::enumerate_revisions`]) followed by the
+    /// census-only records for revisions inside body-level opaque blocks, whose
+    /// bytes this snapshot's scaffold holds instead of the model.
+    pub fn revisions(&self) -> Vec<crate::tracked_model::RevisionRecord> {
+        let mut out = crate::tracked_model::enumerate_revisions(&self.canonical);
+        out.extend(self.sealed_revisions());
+        out
+    }
+
+    /// The census-only records for revisions inside this snapshot's sealed
+    /// body blocks, alone.
+    pub(crate) fn sealed_revisions(&self) -> Vec<crate::tracked_model::RevisionRecord> {
+        crate::tracked_model::enumerate_body_opaque_block_revisions(
+            &self.canonical,
+            &self.scaffold.body_template.opaque_children,
+        )
+    }
+
     /// Resolve tracked deltas: accept-all, reject-all, or a selective set.
     ///
     /// Pure twin of [`SimpleRuntime::resolve_tracked_revisions`] (and the
@@ -9305,6 +9996,29 @@ impl EditSnapshot {
         // interiors because they have no engine identity and leaves them
         // disclosed by preflight.
         let mut full_resolution: Option<bool> = None;
+        // A pending tracked vertical cell merge (§17.13.5.3) is reported by
+        // the census but not modeled: no resolution may proceed and report a
+        // resolved document that still carries it.
+        if let Some(merge) = crate::tracked_model::first_pending_cell_merge(&resolved) {
+            return Err(RuntimeError {
+                code: ErrorCode::UnsupportedEdit,
+                message: format!(
+                    "resolution refused: the {:?} table {} has a pending tracked cell merge \
+                     (w:cellMerge, §17.13.5.3) at {}; resolving vertical merge changes is not \
+                     supported, so no change in this document can be accepted or rejected \
+                     while it is pending",
+                    merge.location, merge.block_id.0, merge.excerpt
+                ),
+                details: ErrorDetails {
+                    block_id: Some(merge.block_id),
+                    context: Some(format!(
+                        "revision_kind=cell_merge wire_id={}",
+                        merge.wire_id
+                    )),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
         // Preflight (M0.1 fail-loud): the accept/reject descent resolves
         // revisions inside opaque `raw_xml` by reparsing the fragment. If a
         // fragment cannot be parsed yet its bytes carry a revision marker, the
@@ -9315,14 +10029,12 @@ impl EditSnapshot {
         // opaques; Selective does not touch inner-opaque revisions, so it keeps
         // its own (quarantine) guard below and is not affected here.
         if matches!(resolution, Resolution::AcceptAll | Resolution::RejectAll)
-            && let Some(opaque_id) = first_unparseable_opaque_with_revisions(&resolved)
+            && let Some((opaque_id, reason)) = first_unresolvable_opaque_with_revisions(&resolved)
         {
             return Err(RuntimeError {
                 code: ErrorCode::UnsupportedEdit,
                 message: format!(
-                    "accept/reject refused: opaque '{opaque_id}' carries tracked changes inside \
-                     raw_xml that could not be parsed to resolve them; resolving would silently \
-                     leave pending revisions in the document"
+                    "accept/reject refused: opaque '{opaque_id}' cannot resolve its tracked state: {reason}"
                 ),
                 details: ErrorDetails::default(),
             });
@@ -9430,7 +10142,41 @@ impl EditSnapshot {
                     defs,
                 ) {
                     Ok(result) => body_section_resolution = result,
-                    Err(unresolved) => {
+                    Err(crate::tracked_model::SelectionError::PartialSharedGrid {
+                        table_id,
+                        required_ids,
+                    }) => {
+                        return Err(RuntimeError {
+                            code: ErrorCode::UnsupportedEdit,
+                            message: format!(
+                                "selective resolution refused: shared table grid in {} requires resolving all property and structural owners {required_ids:?}; partial geometry rebasing is not supported",
+                                table_id.0
+                            ),
+                            details: ErrorDetails {
+                                block_id: Some(table_id),
+                                context: Some(format!("required_revision_ids={required_ids:?}")),
+                                ..ErrorDetails::default()
+                            },
+                        });
+                    }
+                    Err(crate::tracked_model::SelectionError::BlockedJoin {
+                        paragraph_id,
+                        required_ids,
+                    }) => {
+                        return Err(RuntimeError {
+                            code: ErrorCode::UnsupportedEdit,
+                            message: format!(
+                                "selective resolution refused: removing the paragraph mark of {} joins it across blocks another pending revision removes; resolve {required_ids:?} together",
+                                paragraph_id.0
+                            ),
+                            details: ErrorDetails {
+                                block_id: Some(paragraph_id),
+                                context: Some(format!("required_revision_ids={required_ids:?}")),
+                                ..ErrorDetails::default()
+                            },
+                        });
+                    }
+                    Err(crate::tracked_model::SelectionError::UnknownIds(unresolved)) => {
                         return Err(RuntimeError {
                             code: ErrorCode::InvalidRange,
                             message: format!(
@@ -9492,6 +10238,13 @@ impl EditSnapshot {
         // raw element tree, so unmodeled section props (cols, docGrid,
         // header/footer refs, …) survive untouched.
         let mut body_template = self.scaffold.body_template.clone();
+        // Revisions inside body-level opaque blocks (a sealed content control)
+        // live in this scaffold, out of the model's reach. A full projection
+        // resolves them with the package resolver, as Word does; Selective
+        // cannot address them, so they stay pending and census-visible.
+        if let Some(accept) = full_resolution {
+            resolve_body_opaque_block_revisions(&resolved, &mut body_template, accept)?;
+        }
         if let Some(keep_new) = body_section_resolution {
             for node in &mut body_template.sect_pr_nodes {
                 if let XMLNode::Element(el) = node
@@ -9526,6 +10279,70 @@ impl EditSnapshot {
         };
         rebuild_snapshot(self, resolved, &projected_bytes)
     }
+}
+
+/// Resolve every revision inside the body-level opaque blocks `template`
+/// holds, keeping insertions when `accept`. Each block is resolved inside an
+/// envelope standing in for the body, so a carrier wrapping the whole block
+/// is handled as the package resolver handles it in the body; a block that
+/// would not survive as exactly one element is refused, since its anchor would
+/// then address nothing. Quarantined blocks are carried through unresolved
+/// (see `first_quarantined_block`).
+fn resolve_body_opaque_block_revisions(
+    canonical: &CanonDoc,
+    template: &mut BodyTemplate,
+    accept: bool,
+) -> Result<(), RuntimeError> {
+    let quarantined: HashSet<usize> = canonical
+        .blocks
+        .iter()
+        .filter_map(|tracked| match &tracked.block {
+            BlockNode::OpaqueBlock(opaque)
+                if opaque.kind == OpaqueKind::QuarantinedNestedTracking =>
+            {
+                opaque
+                    .proof_ref
+                    .docx_anchor
+                    .strip_prefix("body_index:")?
+                    .parse()
+                    .ok()
+            }
+            _ => None,
+        })
+        .collect();
+    for (index, node) in &mut template.opaque_children {
+        if quarantined.contains(index) {
+            continue;
+        }
+        let XMLNode::Element(element) = node else {
+            continue;
+        };
+        if !crate::tracked_model::has_fragment_carrier(element) {
+            continue;
+        }
+        let fail = |message: String| RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!("accept/reject refused: body block {index}: {message}"),
+            details: ErrorDetails {
+                context: Some(format!("body_index={index}")),
+                ..ErrorDetails::default()
+            },
+        };
+        let mut envelope = Element::new("body");
+        envelope.children.push(XMLNode::Element(element.clone()));
+        crate::normalize::resolve_opaque_children(&mut envelope, accept, "word/document.xml")
+            .map_err(|error| fail(format!("{error:?}")))?;
+        let mut children = envelope.children.into_iter();
+        match (children.next(), children.next()) {
+            (Some(XMLNode::Element(resolved)), None) => *element = resolved,
+            _ => {
+                return Err(fail(
+                    "resolving its revisions removes or splits the block".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn first_conflicting_quarantined_move_mixture(
@@ -10113,6 +10930,7 @@ fn import_and_anchor(
 
     // Resolve external hyperlink URLs from document relationships
     resolve_hyperlink_urls(&mut canonical, &rels.hyperlinks);
+    crate::import::resolve_story_hyperlink_urls(&mut canonical, &archive, &main_dir)?;
 
     // Extract cached body nodes for later use by serialize_canonical_docx,
     // avoiding a redundant full xmltree re-parse of document.xml.
@@ -10557,6 +11375,10 @@ pub fn section_properties_to_element(
     resolve_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
 ) -> Element {
     let mut sect_pr = w_el("sectPr");
+
+    for (name, value) in &sp.source_section_attrs {
+        attr_set(&mut sect_pr, name, value);
+    }
 
     // Append rebuilt known children from the parsed struct fields.
     append_modeled_children(&mut sect_pr, sp, resolve_rid);
@@ -11487,6 +12309,7 @@ mod tests {
         let document_xml = wrap_body(
             r#"
     <w:p>
+      <w:pPr><w:sectPr w:rsidR="00112233" w:rsidSect="00445566"><w:type w:val="continuous"/></w:sectPr></w:pPr>
       <w:r><w:t>The liability cap is one million dollars.</w:t></w:r>
     </w:p>"#,
         );
@@ -11531,6 +12354,20 @@ mod tests {
         let decoded = decode_snapshot_blob(&snapshot_blob);
         assert_eq!(decoded.blob_schema_version, SNAPSHOT_BLOB_SCHEMA_VERSION);
         assert_eq!(decoded.meta.document_version, 2);
+        let BlockNode::Paragraph(paragraph) = &decoded.canonical.blocks[0].block else {
+            panic!("expected section-ending paragraph");
+        };
+        assert_eq!(
+            paragraph
+                .section_properties
+                .as_ref()
+                .unwrap()
+                .source_section_attrs,
+            vec![
+                ("w:rsidR".to_string(), "00112233".to_string()),
+                ("w:rsidSect".to_string(), "00445566".to_string()),
+            ]
+        );
 
         let restored = runtime
             .import_snapshot_blob(&snapshot_blob)
@@ -11546,7 +12383,111 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_blob_rejects_pre_numbering_resolution_schema() {
+    fn block_sdt_hierarchy_validates_nested_boundaries() {
+        use crate::domain::{BlockSdtWrap, NestedBlockSdtWrap, SdtWrapper};
+        fn control(span: usize) -> BlockSdtWrap {
+            BlockSdtWrap {
+                wrapper: SdtWrapper {
+                    sdt_pr_xml: br#"<w:sdtPr><w:alias w:val="Control"/></w:sdtPr>"#.to_vec(),
+                    sdt_end_pr_xml: None,
+                },
+                span,
+                nested: Vec::new(),
+            }
+        }
+        let bytes = build_docx(&wrap_body(
+            "<w:p><w:r><w:t>A</w:t></w:r></w:p><w:p><w:r><w:t>B</w:t></w:r></w:p><w:p><w:r><w:t>C</w:t></w:r></w:p>",
+        ));
+        let runtime = SimpleRuntime::new();
+        let imported = runtime.import_docx(&bytes).unwrap();
+        let mut blocks = imported.canonical.blocks.clone();
+        assert_eq!(blocks.len(), 3);
+        let mut root = control(3);
+        root.nested = vec![
+            NestedBlockSdtWrap {
+                start: 0,
+                control: control(1),
+            },
+            NestedBlockSdtWrap {
+                start: 1,
+                control: control(2),
+            },
+        ];
+        blocks[0].block_sdt_wrap = Some(root.clone());
+        let events = block_sdt_boundaries(&blocks).unwrap();
+        assert_eq!(events[0].opens.len(), 2, "outer before coincident child");
+        assert_eq!(
+            (events[1].closes, events[1].opens.len()),
+            (1, 1),
+            "close child before sibling"
+        );
+        assert_eq!(events[3].closes, 2, "last child and parent close together");
+
+        let mut middle = control(3);
+        middle.nested.push(NestedBlockSdtWrap {
+            start: 0,
+            control: control(3),
+        });
+        let mut coincident = control(3);
+        coincident.nested.push(NestedBlockSdtWrap {
+            start: 0,
+            control: middle,
+        });
+        blocks[0].block_sdt_wrap = Some(coincident);
+        let events = block_sdt_boundaries(&blocks).unwrap();
+        assert_eq!(events[0].opens.len(), 3);
+        assert_eq!(events[3].closes, 3);
+
+        for (start, span) in [(0, 0), (2, 2), (usize::MAX, 1), (1, usize::MAX)] {
+            let mut invalid = control(3);
+            invalid.nested.push(NestedBlockSdtWrap {
+                start,
+                control: control(span),
+            });
+            blocks[0].block_sdt_wrap = Some(invalid);
+            let error = block_sdt_boundaries(&blocks)
+                .err()
+                .expect("invalid nested ownership must refuse");
+            assert!(
+                error
+                    .message
+                    .contains("invalid block content-control hierarchy")
+            );
+            assert!(error.details.block_id.is_some());
+        }
+        root.nested[0].control.span = 2;
+        blocks[0].block_sdt_wrap = Some(root);
+        assert!(
+            block_sdt_boundaries(&blocks).is_err(),
+            "crossing sibling ranges cannot serialize"
+        );
+        blocks[0].block_sdt_wrap = Some(control(2));
+        blocks[1].block_sdt_wrap = Some(control(1));
+        assert!(
+            block_sdt_boundaries(&blocks).is_err(),
+            "nested ownership cannot be encoded as crossing flat roots"
+        );
+    }
+
+    #[test]
+    fn snapshot_blob_checks_version_before_decoding_positional_payload() {
+        let old_version = SNAPSHOT_BLOB_SCHEMA_VERSION - 1;
+        let mut encoded = bincode::serialize(&old_version).unwrap();
+        // A previous positional layout must be rejected from its header,
+        // without interpreting any of its payload as the current domain.
+        encoded.extend_from_slice(&[0xff; 32]);
+        let blob =
+            zstd::stream::encode_all(Cursor::new(encoded), SNAPSHOT_BLOB_ZSTD_LEVEL).unwrap();
+        let error = SimpleRuntime::new()
+            .import_snapshot_blob(&blob)
+            .unwrap_err();
+        assert!(error.message.contains(&format!(
+            "unsupported snapshot blob schema version {old_version}, expected {SNAPSHOT_BLOB_SCHEMA_VERSION}"
+        )), "unexpected error: {error:?}");
+    }
+
+    #[test]
+    fn snapshot_blob_rejects_pre_numbering_paragraph_session_and_border_schemas() {
         let bytes = build_docx(&wrap_body(
             r#"<w:p><w:r><w:t>Schema witness.</w:t></w:r></w:p>"#,
         ));
@@ -11556,18 +12497,50 @@ mod tests {
             .export_snapshot_blob(&imported.doc_handle)
             .expect("export current snapshot blob");
         let mut persisted = decode_snapshot_blob(&blob);
-        persisted.blob_schema_version = 26;
-        let encoded = bincode::serialize(&persisted).expect("encode prior-version witness");
-        let old_blob = zstd::stream::encode_all(Cursor::new(encoded), SNAPSHOT_BLOB_ZSTD_LEVEL)
-            .expect("compress prior-version witness");
+        for old_version in [
+            26, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+        ] {
+            persisted.blob_schema_version = old_version;
+            let encoded = bincode::serialize(&persisted).expect("encode prior-version witness");
+            let old_blob = zstd::stream::encode_all(Cursor::new(encoded), SNAPSHOT_BLOB_ZSTD_LEVEL)
+                .expect("compress prior-version witness");
+
+            let error = runtime
+                .import_snapshot_blob(&old_blob)
+                .expect_err("older schemas must not decode without the current positional fields");
+            assert!(
+                error.message.contains(&format!(
+                    "unsupported snapshot blob schema version {old_version}, expected {SNAPSHOT_BLOB_SCHEMA_VERSION}"
+                )),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_blob_from_another_engine_release_is_refused() {
+        let bytes = build_docx(&wrap_body(
+            r#"<w:p><w:r><w:t>Release witness.</w:t></w:r></w:p>"#,
+        ));
+        let runtime = SimpleRuntime::new();
+        let imported = runtime.import_docx(&bytes).expect("import clean docx");
+        let blob = runtime
+            .export_snapshot_blob(&imported.doc_handle)
+            .expect("export current snapshot blob");
+        let mut persisted = decode_snapshot_blob(&blob);
+        assert_eq!(persisted.engine_version, env!("CARGO_PKG_VERSION"));
+        persisted.engine_version = "0.0.1".to_string();
+        let encoded = bincode::serialize(&persisted).expect("encode other-release witness");
+        let other = zstd::stream::encode_all(Cursor::new(encoded), SNAPSHOT_BLOB_ZSTD_LEVEL)
+            .expect("compress other-release witness");
 
         let error = runtime
-            .import_snapshot_blob(&old_blob)
-            .expect_err("schema 26 must not decode without typed numbering resolution");
+            .import_snapshot_blob(&other)
+            .expect_err("a blob is a same-version cache");
         assert!(
             error
                 .message
-                .contains("unsupported snapshot blob schema version 26, expected 28"),
+                .contains("snapshot blob was written by engine 0.0.1"),
             "unexpected error: {error:?}"
         );
     }
@@ -12626,6 +13599,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }
@@ -12874,6 +13848,7 @@ mod tests {
         };
 
         let sp = SectionProperties {
+            source_section_attrs: Vec::new(),
             page_width: None,
             page_height: None,
             orientation: None,
@@ -12953,7 +13928,8 @@ mod tests {
         );
 
         // Now parse it back
-        let parsed = crate::word_ir::parse_section_properties(&el, &Default::default());
+        let parsed = crate::word_ir::parse_section_properties(&el, &Default::default())
+            .expect("the test sectPr parses");
         let fp = parsed.footnote_pr.expect("footnote_pr should parse back");
         assert_eq!(fp.position, Some(NotePosition::BeneathText));
         assert_eq!(fp.num_fmt, Some(NumberFormat::LowerRoman));
@@ -12990,8 +13966,10 @@ mod tests {
     /// Helper: make a minimal table with one row and one cell containing the given blocks.
     fn make_table(cell_blocks: Vec<BlockNode>) -> TableNode {
         TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl1"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("row1"),
                 cells: vec![TableCellNode {
                     id: NodeId::from("cell1"),
@@ -13028,7 +14006,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -13045,6 +14023,7 @@ mod tests {
                 borders: None,
                 width: None,
                 grid_cols: vec![],
+                grid_history: None,
                 default_cell_margins: None,
                 alignment: None,
                 indent: None,
@@ -13457,6 +14436,7 @@ mod tests {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
                 source_run_attrs: Vec::new(),
                 joins_following_text_run: false,
                 raw_xml: Some(drawing_xml.into_bytes()),
@@ -13509,6 +14489,7 @@ mod tests {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
                 source_run_attrs: Vec::new(),
                 joins_following_text_run: false,
                 raw_xml: None,
@@ -13591,6 +14572,7 @@ mod tests {
                 },
                 wrapper_marks: Vec::new(),
                 wrapper_style_props: StyleProps::default(),
+                wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
                 source_run_attrs: Vec::new(),
                 joins_following_text_run: false,
                 raw_xml: Some(raw.to_vec()),
@@ -13614,9 +14596,18 @@ mod tests {
             let raw = br#"<w:sdt><w:sdtContent><w:ins w:id="1"><w:r><w:t>NEW</w:t></w:sdtContent></w:sdt>"#;
             let doc = doc_with_opaque_raw(OpaqueKind::Sdt, raw);
             assert_eq!(
-                first_unparseable_opaque_with_revisions(&doc),
+                first_unresolvable_opaque_with_revisions(&doc).map(|(id, _)| id),
                 Some(NodeId::from("op1"))
             );
+        }
+
+        #[test]
+        fn preflight_flags_malformed_auxiliary_grid_with_context() {
+            let raw = br#"<w:sdt><w:sdtContent><w:tbl><w:tblGrid><w:tblGridChange w:id="1"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc></w:tr></w:tbl></w:sdtContent></w:sdt>"#;
+            let doc = doc_with_opaque_raw(OpaqueKind::Sdt, raw);
+            let (id, reason) = first_unresolvable_opaque_with_revisions(&doc).unwrap();
+            assert_eq!(id, NodeId::from("op1"));
+            assert!(reason.contains("exactly one previous tblGrid"));
         }
 
         #[test]
@@ -13624,13 +14615,13 @@ mod tests {
             // A well-formed opaque (parses fine) → not flagged.
             let ok = br#"<w:sdt><w:sdtContent><w:ins w:id="1"><w:r><w:t>NEW</w:t></w:r></w:ins></w:sdtContent></w:sdt>"#;
             assert_eq!(
-                first_unparseable_opaque_with_revisions(&doc_with_opaque_raw(OpaqueKind::Sdt, ok)),
+                first_unresolvable_opaque_with_revisions(&doc_with_opaque_raw(OpaqueKind::Sdt, ok)),
                 None
             );
             // Malformed but with NO revision marker → not flagged (nothing to lose).
             let no_marker = br#"<w:sdt><w:sdtContent><w:r><w:t>NEW</w:sdtContent></w:sdt>"#;
             assert_eq!(
-                first_unparseable_opaque_with_revisions(&doc_with_opaque_raw(
+                first_unresolvable_opaque_with_revisions(&doc_with_opaque_raw(
                     OpaqueKind::Sdt,
                     no_marker
                 )),

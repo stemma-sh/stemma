@@ -10,7 +10,8 @@
 //!
 //! ## Addressing
 //!
-//! `(block_id, opaque_id)` locate the hosting paragraph and the opaque inline; the
+//! `(story, block_id, opaque_id)` locate the hosting paragraph — in the body or
+//! a header/footer story — and the opaque inline; the
 //! `container_index`/`paragraph_index` (from `opaque_targets::opaque_text_targets`)
 //! pick the text region. Textbox Choice/Fallback copies share one logical interior
 //! — the edit mirrors across every byte-identical copy so no branch is left stale.
@@ -23,17 +24,18 @@
 //! - `find` not present / region already tracked / span crosses a barrier →
 //!   the mapped `OpaqueText*` splice errors (never a partial write)
 
-use super::super::{EditError, block_at_mut, find_paragraph_path};
+use super::super::story_addr::{StoryRef, story_blocks_mut};
+use super::super::{EditError, block_at_mut_in, find_paragraph_path_in};
 use crate::domain::{BlockNode, CanonDoc, InlineNode, NodeId, OpaqueKind, RevisionInfo};
-use crate::import::sha256_hex;
 use crate::opaque_splice::{SpliceError, splice_region_text};
 use crate::opaque_targets::textbox_paragraph_texts;
-use crate::word_xml::{is_w_tag, parse_raw_fragment, serialize_raw_fragment};
+use crate::word_xml::{OpaqueFragment, is_w_tag};
 use xmltree::{Element, XMLNode};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     doc: &mut CanonDoc,
+    story: &StoryRef,
     block_id: &NodeId,
     opaque_id: &NodeId,
     container_index: usize,
@@ -46,12 +48,21 @@ pub(crate) fn apply(
     tracked: bool,
     step_index: usize,
 ) -> Result<(), EditError> {
-    // Host paragraph — `find_paragraph_path` reaches into table cells.
-    let path = find_paragraph_path(doc, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
+    // Host paragraph, in the addressed story — the path reaches into table
+    // cells.
+    let blocks = story_blocks_mut(doc, story, step_index)?;
+    let path = find_paragraph_path_in(blocks, block_id).ok_or_else(|| match story {
+        StoryRef::Body => EditError::BlockNotFound {
+            block_id: block_id.clone(),
+            step_index,
+        },
+        _ => EditError::StoryBlockNotFound {
+            story: story.clone(),
+            block_id: block_id.clone(),
+            step_index,
+        },
     })?;
-    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
+    let BlockNode::Paragraph(para) = block_at_mut_in(blocks, &path) else {
         return Err(EditError::OpaqueTextTargetNotFound {
             opaque_id: opaque_id.clone(),
             step_index,
@@ -83,6 +94,12 @@ pub(crate) fn apply(
         }
     }
 
+    if matches!(node.kind, crate::domain::OpaqueKind::Hyperlink(_)) {
+        return Err(EditError::OpaqueTextEditOnHyperlink {
+            opaque_id: opaque_id.clone(),
+            step_index,
+        });
+    }
     let raw = node
         .raw_xml
         .as_deref()
@@ -90,15 +107,18 @@ pub(crate) fn apply(
             opaque_id: opaque_id.clone(),
             step_index,
         })?;
-    let mut element = parse_raw_fragment(raw).map_err(|e| EditError::OpaqueTextRawXmlParse {
-        opaque_id: opaque_id.clone(),
-        reason: e.to_string(),
-        step_index,
-    })?;
+    let mut fragment =
+        OpaqueFragment::parse(raw).map_err(|e| EditError::OpaqueTextRawXmlParse {
+            opaque_id: opaque_id.clone(),
+            reason: e.to_string(),
+            step_index,
+        })?;
+    let active = fragment.active().clone();
 
     match &node.kind {
         OpaqueKind::Drawing => edit_textbox(
-            &mut element,
+            fragment.envelope_mut(),
+            &active,
             opaque_id,
             container_index,
             paragraph_index,
@@ -110,7 +130,7 @@ pub(crate) fn apply(
             step_index,
         )?,
         OpaqueKind::Sdt => edit_inline_sdt(
-            &mut element,
+            fragment.active_mut(),
             opaque_id,
             container_index,
             paragraph_index,
@@ -129,8 +149,8 @@ pub(crate) fn apply(
         }
     }
 
-    let new_raw = serialize_raw_fragment(&element);
-    node.content_hash = Some(sha256_hex(&new_raw));
+    let new_raw = fragment.serialize();
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
     Ok(())
 }
@@ -138,6 +158,7 @@ pub(crate) fn apply(
 #[allow(clippy::too_many_arguments)]
 fn edit_textbox(
     element: &mut Element,
+    active: &Element,
     opaque_id: &NodeId,
     container_index: usize,
     paragraph_index: usize,
@@ -148,11 +169,11 @@ fn edit_textbox(
     tracked: bool,
     step_index: usize,
 ) -> Result<(), EditError> {
-    // Immutable pass: the DISTINCT textbox interiors (byte-deduped Choice/Fallback
-    // copies collapse to one), in document order — the same enumeration discovery
-    // used to mint the address. Validate the (container, paragraph) address here.
+    // Address against the active representation, as discovery does. The later
+    // mutation still mirrors the addressed text into matching representations
+    // of the full envelope; fallback-only text is never a separate address.
     let mut copies = Vec::new();
-    crate::opaque_meta::collect_descendants_by_local(element, "txbxContent", &mut copies);
+    crate::opaque_meta::collect_descendants_by_local(active, "txbxContent", &mut copies);
     let mut distinct: Vec<Vec<String>> = Vec::new();
     for c in &copies {
         let paras = textbox_paragraph_texts(c);

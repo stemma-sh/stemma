@@ -4,12 +4,14 @@
 //! `serialize_comments_part` / `sync_note_like_part` out of `serialize.rs`
 //! must be a pure refactor: the emitted `word/footnotes.xml` and
 //! `word/endnotes.xml` parts for a note-bearing redline must be **identical**
-//! to the bytes captured before the split.
+//! to the characterization baseline, including documented fidelity fixes.
 //!
 //! The golden bytes in `testdata/notes_carveout_baseline/` were captured from
-//! the `safe-us-vs-singapore` redline export at HEAD before the split. If this
-//! test fails, the carve-out changed serialization output — that is a
-//! regression, not a test-expectation problem.
+//! the `safe-us-vs-singapore` redline export at HEAD before the split. They are
+//! characterization evidence, not a specification of Word semantics. The
+//! paragraph-session preservation fix adds only the source `w:rsidR` and
+//! `w:rsidRDefault` attributes (both `007E5010`) from before.docx to the four
+//! separator paragraphs; all other baseline bytes remain unchanged.
 
 use std::fs;
 use std::io::{Cursor, Read};
@@ -64,7 +66,7 @@ fn notes_parts_byte_identical_after_carveout() {
         assert_eq!(
             emitted, golden,
             "{part} bytes drifted after the serialize/notes.rs carve-out \
-             (golden = pre-split capture in {golden_path})"
+             (golden = corrected characterization baseline in {golden_path})"
         );
     }
 }

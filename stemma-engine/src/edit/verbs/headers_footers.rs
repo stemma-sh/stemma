@@ -31,14 +31,13 @@
 //!   fails `OpaqueDestroyed`.
 
 use super::super::story_addr::{
-    StoryRef, find_block_index_in_story, footer_part_for_kind, header_part_for_kind,
-    story_blocks_mut,
+    StoryRef, footer_part_for_kind, header_part_for_kind, story_blocks, story_blocks_mut,
 };
 use super::super::{
     EditError, MaterializationMode, ParagraphContent, apply_replace_paragraph_text,
-    apply_segment_replace_paragraph, collect_anchor_inventory, extract_text_sections,
-    is_identity_replacement, next_revision, normalize_expect_punctuation, paragraph_visible_text,
-    validate_block_is_editable, validate_preserved_inlines,
+    apply_segment_replace_paragraph, collect_anchor_inventory, expect_matches_paragraph,
+    is_identity_replacement, next_revision, paragraph_visible_text, validate_block_is_editable,
+    validate_preserved_inlines,
 };
 use crate::domain::{
     BlockNode, CanonDoc, FooterStory, HeaderFooterKind, HeaderStory, NodeId, ParagraphNode,
@@ -89,19 +88,45 @@ pub(crate) fn apply_edit(
         }
     }
 
-    // Resolve the block index within the named story (StoryNotFound /
-    // StoryBlockNotFound on failure — never a silent fallback to the body).
-    let idx = find_block_index_in_story(doc, story, block_id, step_index)?;
+    // Resolve the paragraph within the named story, at the top level or inside
+    // a table of it (a letterhead's contact cell), never in the body: block ids
+    // are story-local and the body has its own.
+    let path = {
+        let blocks = story_blocks(doc, story, step_index)?;
+        let path = super::super::find_paragraph_path_in(blocks, block_id).ok_or_else(|| {
+            EditError::StoryBlockNotFound {
+                story: story.clone(),
+                block_id: block_id.clone(),
+                step_index,
+            }
+        })?;
+        // Block-status + segment-Normal preconditions: a top-level paragraph
+        // by its own status, a cell paragraph by the table, rows and cells
+        // above it and by its own runs.
+        if path.is_top_level() {
+            validate_block_is_editable(&blocks[path.top_block], step_index)?;
+        } else {
+            super::super::check_ancestor_table_tracking_in(blocks, &path, block_id, step_index)?;
+            if let BlockNode::Paragraph(p) = super::super::block_at_in(blocks, &path)
+                && p.segments
+                    .iter()
+                    .any(|seg| seg.status != TrackingStatus::Normal)
+            {
+                return Err(EditError::ParagraphContainsTrackedSegments {
+                    block_id: block_id.clone(),
+                    step_index,
+                });
+            }
+        }
+        path
+    };
 
-    // Validate + run the body materializer over the resolved story paragraph.
-    // This is the SAME validation + lowering the body path uses; we operate on a
-    // story-scoped `&mut ParagraphNode` rather than a body BlockPath.
+    // Run the body materializer over the resolved story paragraph: the SAME
+    // validation + lowering the body path uses, on a story-scoped block.
     let blocks = story_blocks_mut(doc, story, step_index)?;
+    let block = super::super::block_at_mut_in(blocks, &path);
 
-    // Block-status + segment-Normal preconditions.
-    validate_block_is_editable(&blocks[idx], step_index)?;
-
-    match &blocks[idx].block {
+    match &*block {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -119,13 +144,9 @@ pub(crate) fn apply_edit(
         }
     }
 
-    let BlockNode::Paragraph(para) = &blocks[idx].block else {
-        unreachable!("checked paragraph above");
-    };
-
     // Optional semantic-hash precondition (stale-snapshot detection).
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block, expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -135,13 +156,19 @@ pub(crate) fn apply_edit(
         });
     }
 
-    // `expect` must appear within a single text section (same contract as body
-    // replace). Punctuation-normalized on both sides.
-    let text_sections = extract_text_sections(para);
-    let expect_norm = normalize_expect_punctuation(expect);
-    let expect_found = text_sections
-        .iter()
-        .any(|section| normalize_expect_punctuation(section).contains(&expect_norm));
+    let BlockNode::Paragraph(para) = &*block else {
+        unreachable!("checked paragraph above");
+    };
+
+    // `expect` matches the paragraph's read text, as for a body replace
+    // (`expect_matches_paragraph`). An empty `expect` is not a substring that
+    // matches anything: it asserts the paragraph is empty, which is the only way
+    // to name an empty footer line before typing into it.
+    let expect_found = if expect.trim().is_empty() {
+        paragraph_visible_text(para).trim().is_empty()
+    } else {
+        expect_matches_paragraph(para, expect)
+    };
     if !expect_found {
         return Err(EditError::ExpectMismatch {
             block_id: block_id.clone(),
@@ -151,10 +178,58 @@ pub(crate) fn apply_edit(
         });
     }
 
+    // `expect` names text in the paragraph and `content` what replaces it.
+    // Content that is only the replacement (plain text repeating none of the
+    // paragraph's text around `expect`: "March 2024 v3" for "November 2023
+    // v2" beside a footer's page fields) replaces just that part, keeping the
+    // fields and the rest. Content that rebuilds the paragraph (it repeats
+    // the surrounding text, or carries formatting, links or kept objects)
+    // replaces the whole paragraph, as when `expect` is its whole text.
+    if let Some(replacement) = part_replacement(para, expect, content) {
+        let occurrences = super::find_replace::paragraph_match_count(para, expect);
+        if occurrences != 1 {
+            return Err(EditError::UnsupportedParagraphStructure {
+                block_id: block_id.clone(),
+                reason: format!(
+                    "expect {expect:?} occurs {occurrences} times in the paragraph as editable \
+                     text; name a part that occurs once, or give the paragraph's whole text"
+                ),
+                step_index,
+            });
+        }
+        let options = super::find_replace::ReplaceTextOptions {
+            old: expect.to_string(),
+            new: replacement,
+            author: revision.author.clone().unwrap_or_default(),
+            scope: super::find_replace::ReplaceTextScope::WholeDoc,
+            expected: super::find_replace::ExpectedMatches::Count(1),
+            match_mode: super::find_replace::MatchMode::Exact,
+            on_barrier_match: super::find_replace::BarrierPolicy::Fail,
+        };
+        let (start, end, splice) =
+            super::find_replace::plan_paragraph_part_splice_range(para, &options)?
+                .expect("a once-occurring expect plans a splice");
+        let BlockNode::Paragraph(para_mut) = &mut *block else {
+            unreachable!("checked paragraph above");
+        };
+        super::super::apply_span_splice(
+            para_mut,
+            (start, end),
+            &splice,
+            revision,
+            None,
+            rev_counter,
+            mode == MaterializationMode::Direct,
+        );
+        return Ok(());
+    }
+
     // Opaque-preservation + preserved-inline-order validation (OpaqueDestroyed on
     // a PAGE field run dropped, etc.). Same check the body path runs.
     let anchors = collect_anchor_inventory(para);
     validate_preserved_inlines(para, block_id, content, &anchors, step_index)?;
+    let without_range_refs = super::super::without_comment_range_refs(para, content);
+    let content = &without_range_refs;
 
     // Identity short-circuit: a no-op replace must not author empty changes.
     if is_identity_replacement(para, content) {
@@ -165,7 +240,7 @@ pub(crate) fn apply_edit(
     // whole-paragraph segment replace; everything else to the word-level diff —
     // identical dispatch to the body `ReplaceParagraphText` arm.
     let needs_segment_replace = content.fragments.iter().any(|f| f.is_styled());
-    let BlockNode::Paragraph(para_mut) = &mut blocks[idx].block else {
+    let BlockNode::Paragraph(para_mut) = &mut *block else {
         unreachable!("checked paragraph above");
     };
     // No enclosing block insertion: `validate_block_is_editable` above refuses a
@@ -180,10 +255,38 @@ pub(crate) fn apply_edit(
     // Direct mode: resolve the freshly-authored tracked changes so the story
     // paragraph returns to all-Normal (mirrors the body Direct path).
     if mode == MaterializationMode::Direct {
-        project_block_for_accept_reject(&mut blocks[idx].block, true);
+        project_block_for_accept_reject(block, true);
     }
 
     Ok(())
+}
+
+/// The replacement text when `content` replaces only the part of `para` that
+/// `expect` names: `expect` is part of the paragraph's text (not all of it),
+/// the content is plain text, and it repeats neither the text before nor the
+/// text after that part. None when the content rebuilds the paragraph.
+fn part_replacement(
+    para: &ParagraphNode,
+    expect: &str,
+    content: &ParagraphContent,
+) -> Option<String> {
+    let replacement: String = content
+        .fragments
+        .iter()
+        .map(|fragment| match fragment {
+            crate::edit::ContentFragment::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Option<String>>()?;
+    let text = paragraph_visible_text(para);
+    if expect.trim().is_empty() || expect.trim() == text.trim() {
+        return None;
+    }
+    let at = text.find(expect)?;
+    let before = text[..at].trim();
+    let after = text[at + expect.len()..].trim();
+    let repeats = |part: &str| !part.is_empty() && replacement.contains(part);
+    (!repeats(before) && !repeats(after)).then_some(replacement)
 }
 
 /// `CreateHeader` / `CreateFooter` — author a NET-NEW, blank header/footer story
@@ -308,22 +411,40 @@ pub(crate) fn apply_create(
         MaterializationMode::Direct => blank_story_paragraph(&part_name),
     };
     let blocks = vec![blank_block];
+    // Real parts precede the blank stories synthesized for sections without
+    // a reference (§17.10.5), the order import reads them in.
     if is_header {
-        doc.headers.push(HeaderStory {
-            part_name,
-            kind: kind.clone(),
-            blocks,
-            content_hash: String::new(),
-            synthesized: false,
-        });
+        let position = doc
+            .headers
+            .iter()
+            .position(|story| story.synthesized)
+            .unwrap_or(doc.headers.len());
+        doc.headers.insert(
+            position,
+            HeaderStory {
+                part_name,
+                kind: kind.clone(),
+                blocks,
+                content_hash: String::new(),
+                synthesized: false,
+            },
+        );
     } else {
-        doc.footers.push(FooterStory {
-            part_name,
-            kind: kind.clone(),
-            blocks,
-            content_hash: String::new(),
-            synthesized: false,
-        });
+        let position = doc
+            .footers
+            .iter()
+            .position(|story| story.synthesized)
+            .unwrap_or(doc.footers.len());
+        doc.footers.insert(
+            position,
+            FooterStory {
+                part_name,
+                kind: kind.clone(),
+                blocks,
+                content_hash: String::new(),
+                synthesized: false,
+            },
+        );
     }
 
     // Force the tracked sectPr path so the new reference is a reviewable

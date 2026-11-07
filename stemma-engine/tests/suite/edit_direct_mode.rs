@@ -236,12 +236,16 @@ fn replace_block_range_direct_equals_accept_all_of_tracked() {
             semantic_hash: None,
             blocks: vec![
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.clone()),
                     content: parse_paragraph_markup("first replacement").unwrap(),
                     restart_numbering: false,
                     list: None,
                 }),
                 BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: None,
+                    format_from: None,
                     role: Some(role.clone()),
                     content: parse_paragraph_markup("second replacement").unwrap(),
                     restart_numbering: false,

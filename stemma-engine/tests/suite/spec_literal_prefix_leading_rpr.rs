@@ -238,6 +238,7 @@ fn rejecting_a_deletion_restores_a_space_indented_label_unchanged() {
     let deleted = doc
         .apply(&EditTransaction {
             steps: vec![EditStep::DeleteBlockRange {
+                story: stemma::edit::StoryRef::Body,
                 from_block_id: target.clone(),
                 to_block_id: target,
                 rationale: None,
@@ -289,6 +290,7 @@ fn a_labelled_whole_paragraph_deletion_reopens_as_a_block_deletion() {
     let deleted = doc
         .apply(&EditTransaction {
             steps: vec![EditStep::DeleteBlockRange {
+                story: stemma::edit::StoryRef::Body,
                 from_block_id: target.clone(),
                 to_block_id: target,
                 rationale: None,
@@ -328,4 +330,59 @@ fn a_labelled_whole_paragraph_deletion_reopens_as_a_block_deletion() {
     // what this test pins; the remaining field disagreement is recorded as
     // W8-F22 rather than asserted here, because closing it means choosing one
     // of the two rules and the campaign currently needs both.
+}
+
+/// A prefix typed in the same run as the first word ("16. Impossibilité")
+/// keeps its own formatting when an edit formats that word: it saves as its
+/// own run, not joined into the first word's now differently formatted run.
+#[test]
+fn a_prefix_keeps_its_formatting_when_the_first_word_is_formatted() {
+    let body = r#"<w:p><w:r><w:rPr><w:b/><w:u w:val="single"/></w:rPr><w:t>16. Impossibilité de participer</w:t></w:r></w:p>"#;
+    for mode in [
+        MaterializationMode::TrackedChange,
+        MaterializationMode::Direct,
+    ] {
+        let doc = Document::parse(&make_docx(body)).expect("parse");
+        let stemma::domain::BlockNode::Paragraph(paragraph) =
+            &doc.snapshot().canonical.blocks[0].block
+        else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(paragraph.literal_prefix.as_deref(), Some("16."));
+        let edited = doc
+            .apply(&EditTransaction {
+                steps: vec![EditStep::SetRunFormatting {
+                    block_id: paragraph.id.clone(),
+                    expect: "Impossibilité".into(),
+                    semantic_hash: None,
+                    marks: stemma::edit::InlineMarkSet {
+                        italic: true,
+                        ..Default::default()
+                    },
+                    style: stemma::edit::RunStyleEdit::default(),
+                    rationale: None,
+                }],
+                summary: None,
+                materialization_mode: mode,
+                revision: RevisionInfo {
+                    revision_id: 1,
+                    identity: 0,
+                    author: Some("Reviewer".into()),
+                    date: Some("2026-06-01T00:00:00Z".into()),
+                    apply_op_id: None,
+                },
+            })
+            .expect("format the first word");
+        let reopened = Document::parse(
+            &edited
+                .serialize(&ExportOptions::default())
+                .expect("serialize"),
+        )
+        .expect("reopen");
+        let differences = stemma::roundtrip_compare::compare_canon_docs(
+            &edited.snapshot().canonical,
+            &reopened.snapshot().canonical,
+        );
+        assert!(differences.is_empty(), "{mode:?}: {differences:?}");
+    }
 }

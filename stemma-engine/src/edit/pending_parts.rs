@@ -72,6 +72,18 @@ pub struct PendingParts {
     /// by `body_index`, sets its content-control value, and writes it back — the
     /// same PendingParts seam custom-XML/media/styles already use.
     pub opaque_child_text_sets: Vec<OpaqueChildTextSet>,
+    /// Explicit FORMTEXT result updates inside opaque body controls. Positional
+    /// addresses require the containing block's discovery hash.
+    pub block_form_text_sets: Vec<BlockFormTextSet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockFormTextSet {
+    pub body_index: usize,
+    pub paragraph_index: usize,
+    pub field_index: usize,
+    pub semantic_hash: String,
+    pub text: String,
 }
 
 /// A body-level content-control value fill staged for the save path (RFC-0002
@@ -160,7 +172,19 @@ pub enum NumberingOp {
         /// The existing `w:numId` whose `<w:abstractNum>` levels are cloned so
         /// the new list renders identically to the source.
         cloned_from_num_id: u32,
+        /// A label format to give one level of the clone instead of the
+        /// source's (`set_numbering` kind `format`); `None` for a plain split.
+        level_format: Option<LevelFormat>,
     },
+}
+
+/// The label format of one level of a cloned list definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelFormat {
+    pub ilvl: u32,
+    pub num_fmt: crate::edit::verbs::numbering::ListNumberFormat,
+    /// The `w:lvlText/@w:val` template ("%1." ...).
+    pub lvl_text: String,
 }
 
 /// One media binary to stage into the package at save time.

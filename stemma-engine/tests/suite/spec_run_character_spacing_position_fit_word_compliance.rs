@@ -365,7 +365,7 @@ fn eastasianlayout_vertcompress_ignored_layout_only_text_unchanged() {
 
 #[test]
 fn fittext_omitted_id_links_contiguous_runs_layout_only_text_unchanged() {
-    let body = r#"<w:p><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t>fit </w:t></w:r><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t>this</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t xml:space="preserve">fit </w:t></w:r><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t>this</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_opens_clean(

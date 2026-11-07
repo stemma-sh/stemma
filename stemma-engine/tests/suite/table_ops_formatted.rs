@@ -109,6 +109,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -171,6 +172,7 @@ fn formatted_cell(id: &str, text: &str) -> TableCellNode {
 
 fn formatted_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -182,7 +184,7 @@ fn formatted_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: true,
+        cant_split: Some(true),
         jc: None,
         w_before: None,
         w_after: None,
@@ -220,6 +222,7 @@ fn formatted_grid(rows: usize, cols: usize) -> TableNode {
         trows.push(formatted_row(&format!("t1_r{r}"), cells));
     }
     TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: trows,
         structure_hash: String::new(),
@@ -340,6 +343,10 @@ fn assert_surviving_cells_formatting_preserved(doc: &CanonDoc, base: &TableNode)
 
 #[test]
 fn insert_row_on_formatted_table_succeeds_and_preserves_formatting() {
+    check_inserted_row_presentation();
+}
+
+pub(super) fn check_inserted_row_presentation() {
     let base = formatted_grid(2, 2);
     let doc = doc_with(base.clone());
 
@@ -361,6 +368,17 @@ fn insert_row_on_formatted_table_succeeds_and_preserves_formatting() {
     );
     assert_table_formatting_preserved(&accepted, &base);
     assert_surviving_cells_formatting_preserved(&accepted, &base);
+
+    let inserted = &find_table(&accepted, "t1").rows[2];
+    let reference = &base.rows[1];
+    assert_eq!(inserted.height, reference.height);
+    assert_eq!(inserted.height_rule, reference.height_rule);
+    assert_eq!(inserted.cant_split, reference.cant_split);
+    assert!(inserted.source_row_attrs.is_empty());
+    for (cell, template) in inserted.cells.iter().zip(&reference.cells) {
+        assert_eq!(cell.formatting, template.formatting);
+        assert!(cell.formatting_change.is_none());
+    }
 
     let mut rejected = edited.clone();
     reject_all_with_styles(&mut rejected, None);
@@ -564,7 +582,8 @@ fn tracked_delete_column_on_explicit_grid_keeps_grid_consistent() {
     let t = find_table(&edited, "t1");
     assert_eq!(t.formatting.grid_cols.len(), 3);
 
-    // Accept: the deleted column AND its gridCol vanish → the middle width goes.
+    // Accept: settle the partitioned physical slots; all survivors retain their
+    // original grid widths rather than absorbing the removed source width.
     let mut accepted = edited.clone();
     accept_all(&mut accepted);
     let t = find_table(&accepted, "t1");
@@ -572,7 +591,7 @@ fn tracked_delete_column_on_explicit_grid_keeps_grid_consistent() {
     assert_eq!(
         t.formatting.grid_cols,
         vec![base.formatting.grid_cols[0], base.formatting.grid_cols[2]],
-        "accept drops the deleted column's gridCol (the middle width)"
+        "accept preserves every surviving column's intended width"
     );
 
     // Reject: the column survives; grid unchanged.
@@ -581,6 +600,41 @@ fn tracked_delete_column_on_explicit_grid_keeps_grid_consistent() {
     let t = find_table(&rejected, "t1");
     assert_eq!(t.rows[0].cells.len(), 3, "reject keeps all 3 columns");
     assert_eq!(t.formatting.grid_cols, base.formatting.grid_cols);
+    assert_eq!(
+        t.formatting, base.formatting,
+        "complete prior table properties restored"
+    );
+    for (row, source) in t.rows.iter().zip(&base.rows) {
+        for (cell, source) in row.cells.iter().zip(&source.cells) {
+            // This constructed source has not baked inherited table borders.
+            // Compare authored properties, not that uncomputed effective view;
+            // the parsed-package sentinel checks complete canonical equality.
+            assert_eq!(cell.formatting.width, source.formatting.width);
+            assert_eq!(cell.formatting.shading, source.formatting.shading);
+            assert_eq!(cell.formatting.v_align, source.formatting.v_align);
+            assert_eq!(cell.formatting.margins, source.formatting.margins);
+            assert_eq!(
+                cell.formatting.authored_borders,
+                source.formatting.authored_borders
+            );
+        }
+    }
+}
+
+#[test]
+fn tracked_column_deletion_refuses_an_unrepresentable_partition() {
+    let mut base = formatted_grid(2, 3);
+    base.formatting.grid_cols[0] = 719;
+    let error = try_apply(
+        &doc_with(base),
+        &table_op_json("t1", r#"{ "kind": "delete_column", "col_index": 1 }"#),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        EditError::UnsupportedTableColumnGeometry { .. }
+    ));
+    assert!(error.to_string().contains("719 twips"));
 }
 
 // ─── The narrow guard: refuse only a mid-redline base ───────────────────────
@@ -590,6 +644,10 @@ fn structural_op_on_table_with_pending_cell_change_refuses() {
     let mut base = formatted_grid(2, 2);
     // Simulate an unresolved tracked tcPrChange on one cell.
     base.rows[0].cells[0].formatting_change = Some(CellFormattingChange {
+        previous_grid_span: 1,
+        previous_v_merge: stemma::domain::VerticalMerge::None,
+        previous_hide_mark: false,
+        previous_preserved: Vec::new(),
         previous_width: None,
         previous_borders: None,
         previous_shading: None,
@@ -603,6 +661,7 @@ fn structural_op_on_table_with_pending_cell_change_refuses() {
         identity: 0,
         author: "Prior".to_string(),
         date: None,
+        date_utc: None,
     });
     let doc = doc_with(base);
 
@@ -817,4 +876,96 @@ fn structural_op_on_table_with_tracked_row_refuses() {
     )
     .expect_err("a structural edit over a tracked row ins/del must be refused");
     assert!(matches!(err, EditError::TableMidRedline { .. }));
+}
+
+/// A line break in a new cell's text starts a new paragraph in that cell, as
+/// Enter does in a Word cell; written into one w:t it would read as a space.
+#[test]
+fn insert_row_cell_text_with_a_line_break_makes_two_paragraphs() {
+    let doc = doc_with(formatted_grid(2, 2));
+    let edited = try_apply(
+        &doc,
+        &table_op_json_direct(
+            "t1",
+            r#"{ "kind": "insert_row", "ref_row": 1, "position": "after", "cells": ["Joint reasons:\n(paras. 1 to 74)", "Abella J."] }"#,
+        ),
+    )
+    .expect("insert_row with a two-line cell");
+    let row = &find_table(&edited, "t1").rows[2];
+    let texts = |cell: &TableCellNode| -> Vec<String> {
+        cell.blocks
+            .iter()
+            .map(|block| match block {
+                BlockNode::Paragraph(p) => p
+                    .segments
+                    .iter()
+                    .flat_map(|s| &s.inlines)
+                    .filter_map(|i| match i {
+                        InlineNode::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => panic!("a cell paragraph"),
+            })
+            .collect()
+    };
+    assert_eq!(texts(&row.cells[0]), ["Joint reasons:", "(paras. 1 to 74)"]);
+    assert_eq!(texts(&row.cells[1]), ["Abella J."]);
+}
+
+/// Paragraph text cannot carry a line break: Word would show it as a space.
+/// The edge refuses it and names the way to write two lines.
+#[test]
+fn paragraph_text_with_a_line_break_is_refused() {
+    let json = r#"{ "ops": [{ "op": "insert", "target": { "anchor": "p1", "position": "after" },
+        "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "one\ntwo" }] }] }],
+        "revision": { "author": "Counsel" } }"#;
+    let error = parse_transaction(json)
+        .expect("schema check passes")
+        .into_edit_transaction()
+        .expect_err("a line break in text is refused");
+    assert!(
+        error.to_string().contains("own paragraph"),
+        "the refusal says how to write two lines: {error}"
+    );
+}
+
+/// A tracked column deletion reads back as written: `tblPrChange` cannot carry
+/// `tblGrid`, so its previous projection holds the current grid and the prior
+/// grid lives in `tblGridChange` alone. Before, the edit kept the prior grid in
+/// both places, and the saved file reopened as a different state.
+#[test]
+fn tracked_delete_column_reopens_as_the_same_state() {
+    use stemma::ExportOptions;
+    use stemma::api::Document;
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/synthesized/table-row-addition/before.docx"
+    ))
+    .expect("fixture");
+    let doc = Document::parse(&bytes).expect("parse");
+    let table = doc
+        .read()
+        .blocks
+        .iter()
+        .map(|b| b.id.to_string())
+        .find(|id| id.starts_with("tbl"))
+        .expect("the fixture has a table");
+    let edited = doc
+        .apply(&translate(&table_op_json(
+            &table,
+            r#"{ "kind": "delete_column", "col_index": 1 }"#,
+        )))
+        .expect("tracked delete_column applies");
+    let reopened = Document::parse(&edited.serialize(&ExportOptions::default()).expect("save"))
+        .expect("reopen");
+    let differences = stemma::roundtrip_compare::compare_canon_docs(
+        &edited.snapshot().canonical,
+        &reopened.snapshot().canonical,
+    );
+    assert!(
+        differences.is_empty(),
+        "{:?}",
+        &differences[..differences.len().min(2)]
+    );
 }

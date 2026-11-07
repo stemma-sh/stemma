@@ -89,11 +89,6 @@ fn marker_counts(doc: &CanonDoc, id: &str) -> (usize, usize, usize) {
                     match inline {
                         InlineNode::CommentRangeStart { id: i } if i == id => start += 1,
                         InlineNode::CommentRangeEnd { id: i } if i == id => end += 1,
-                        // The reference is a zero-width marker when freshly
-                        // authored (InlineNode::CommentReference) but normalizes
-                        // to an opaque run-level element on re-import. Both carry
-                        // the same w:id and serialize identically — count either.
-                        InlineNode::CommentReference { id: i } if i == id => reference += 1,
                         InlineNode::OpaqueInline(o) => {
                             if let OpaqueKind::CommentReference(rd) = &o.kind
                                 && rd.reference_id == id
@@ -279,7 +274,7 @@ fn comment_delete_orphan_fails_loud() {
         if let BlockNode::Paragraph(p) = &mut tb.block {
             for seg in &mut p.segments {
                 seg.inlines
-                    .retain(|i| !matches!(i, InlineNode::CommentReference { id } if *id == cid));
+                    .retain(|i| !matches!(i, InlineNode::OpaqueInline(o) if matches!(&o.kind, OpaqueKind::CommentReference(r) if r.reference_id == cid)));
             }
         }
     }
@@ -391,6 +386,81 @@ fn comment_range_survives_a_tracked_paragraph_edit() {
     }
 }
 
+/// The first body paragraph's text with its comment anchors made visible:
+/// `[`/`]` delimit the range and `^` is the reference.
+fn annotated_first_paragraph(document: &Document) -> String {
+    let canonical = &document.snapshot().canonical;
+    let stemma::domain::BlockNode::Paragraph(paragraph) = &canonical.blocks[0].block else {
+        panic!("fixture begins with a paragraph");
+    };
+    paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .map(|inline| match inline {
+            InlineNode::Text(text) => text.text.clone(),
+            InlineNode::CommentRangeStart { .. } => "[".to_string(),
+            InlineNode::CommentRangeEnd { .. } => "]".to_string(),
+            InlineNode::OpaqueInline(opaque)
+                if matches!(opaque.kind, stemma::domain::OpaqueKind::CommentReference(_)) =>
+            {
+                "^".to_string()
+            }
+            _ => String::new(),
+        })
+        .collect()
+}
+
+/// A tracked edit BEFORE a comment must leave the comment anchored to the
+/// same words in both readings: Reject All shows the original sentence with
+/// its comment, Accept All the edited one with the same comment.
+#[test]
+fn comment_range_keeps_its_words_when_preceding_text_is_edited() {
+    use stemma::edit::{ContentFragment, ParagraphContent};
+
+    let base = Document::parse(&make_docx("The original text here.")).expect("parse");
+    let block_id = first_block_id(&base.snapshot().canonical);
+    let commented = base
+        .apply(&txn(vec![EditStep::CommentCreate {
+            block_id,
+            expect: "text".to_string(),
+            semantic_hash: None,
+            body: "clarify".to_string(),
+            author: Some("Reviewer".to_string()),
+            rationale: None,
+        }]))
+        .expect("apply comment create");
+    let before = annotated_first_paragraph(&commented);
+    assert!(
+        before.contains("[text]"),
+        "fixture comments the word: {before}"
+    );
+
+    let bid = first_block_id(&commented.snapshot().canonical);
+    let edited = commented
+        .apply(&txn(vec![EditStep::ReplaceParagraphText {
+            block_id: bid,
+            rationale: None,
+            replacement_role: None,
+            expect: "original".to_string(),
+            semantic_hash: None,
+            content: ParagraphContent {
+                fragments: vec![ContentFragment::Text(
+                    "The much revised text here.".to_string(),
+                )],
+            },
+        }]))
+        .expect("edit before the comment");
+
+    let rejected = edited.project(Resolution::RejectAll).expect("reject all");
+    assert_eq!(annotated_first_paragraph(&rejected), before);
+    let accepted = edited.project(Resolution::AcceptAll).expect("accept all");
+    assert_eq!(
+        annotated_first_paragraph(&accepted),
+        before.replace("original", "much revised")
+    );
+}
+
 // ─── Reply anchoring ──────────────────────────────────────────────────────────
 
 /// The ordered `(kind, id)` sequence of comment markers across all body
@@ -406,7 +476,6 @@ fn body_marker_sequence(doc: &CanonDoc) -> Vec<(&'static str, String)> {
                     match inline {
                         InlineNode::CommentRangeStart { id } => out.push(("start", id.clone())),
                         InlineNode::CommentRangeEnd { id } => out.push(("end", id.clone())),
-                        InlineNode::CommentReference { id } => out.push(("ref", id.clone())),
                         InlineNode::OpaqueInline(o) => {
                             if let OpaqueKind::CommentReference(rd) = &o.kind {
                                 out.push(("ref", rd.reference_id.clone()));
@@ -689,8 +758,11 @@ fn reply_to_unanchored_parent_refuses() {
                     !matches!(
                         i,
                         InlineNode::CommentRangeStart { id }
-                            | InlineNode::CommentRangeEnd { id }
-                            | InlineNode::CommentReference { id } if *id == parent_id
+                            | InlineNode::CommentRangeEnd { id } if *id == parent_id
+                    ) && !matches!(
+                        i,
+                        InlineNode::OpaqueInline(o)
+                            if matches!(&o.kind, OpaqueKind::CommentReference(r) if r.reference_id == parent_id)
                     )
                 });
             }

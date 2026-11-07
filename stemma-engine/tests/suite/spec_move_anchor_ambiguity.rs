@@ -97,6 +97,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -368,6 +369,8 @@ fn insert_destination_anchor_on_just_moved_source_refuses() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("body_text".to_string()),
                 content: parse_paragraph_markup("nine").unwrap(),
                 restart_numbering: false,
@@ -410,6 +413,8 @@ fn insert_after(anchor: &str) -> EditStep {
         position: InsertPosition::After,
         rationale: None,
         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some("body_text".to_string()),
             content: parse_paragraph_markup("nine").unwrap(),
             restart_numbering: false,

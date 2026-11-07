@@ -32,19 +32,20 @@ fn first_table(doc: &CanonDoc) -> &TableNode {
 // Width type coercion when w=0 (MS-OI29500 §2.1.166)
 // =========================================================================
 //
-// MS-OI29500 §2.1.166: If the w attribute value is 0, the type attribute
-// is treated as "auto" regardless of the specified value. This applies to
-// both tblW and tcW elements.
+// MS-OI29500 §2.1.166/§2.1.171: Word lays out a width whose w attribute is 0
+// as "auto", whatever its declared type. That is how Word READS it; Word
+// SAVES the declared type as written (observed with the Word oracle:
+// `w:w="0" w:type="dxa"` survives a Word open/save next to `w:type="auto"`).
+// The model is the document, not a layout, so it keeps the declared type.
 //
 // Fixture: width-type-nil
-//   - Table width: w=0 type=pct  (should coerce to auto)
-//   - Cell 0: w=5000 type=pct   (normal, no coercion)
-//   - Cell 1: w=0 type=dxa      (should coerce to auto)
+//   - Table width: w=0 type=pct  (kept as pct)
+//   - Cell 0: w=5000 type=pct   (normal)
+//   - Cell 1: w=0 type=dxa      (kept as dxa)
 
-/// MS-OI29500 §2.1.166: Table width w=0 should force type to auto,
-/// regardless of the declared type attribute (pct in this case).
+/// A table width w=0 keeps its declared type (pct here).
 #[test]
-fn spec_table_width_zero_coerced_to_auto() {
+fn spec_table_width_zero_keeps_its_declared_type() {
     let (_runtime, doc) = common::import_fixture(FIXTURES, "width-type-nil");
     let table = first_table(&doc);
 
@@ -55,18 +56,17 @@ fn spec_table_width_zero_coerced_to_auto() {
         .expect("table should have a width element");
     assert_eq!(
         width.width_type,
-        stemma::domain::WidthType::Auto,
-        "MS-OI29500 §2.1.166: table width w=0 with type=pct should be coerced to auto. \
+        stemma::domain::WidthType::Pct,
+        "a table width w=0 type=pct is kept as written, as Word saves it. \
          Got type={:?}, w={}",
         width.width_type,
         width.w,
     );
 }
 
-/// MS-OI29500 §2.1.171: Cell width w=0 should force type to auto,
-/// regardless of the declared type attribute (dxa in this case).
+/// A cell width w=0 keeps its declared type (dxa here).
 #[test]
-fn spec_cell_width_zero_coerced_to_auto() {
+fn spec_cell_width_zero_keeps_its_declared_type() {
     let (_runtime, doc) = common::import_fixture(FIXTURES, "width-type-nil");
     let table = first_table(&doc);
 
@@ -78,8 +78,8 @@ fn spec_cell_width_zero_coerced_to_auto() {
         .expect("cell 1 should have a width element");
     assert_eq!(
         cell_width.width_type,
-        stemma::domain::WidthType::Auto,
-        "MS-OI29500 §2.1.171: cell width w=0 with type=dxa should be coerced to auto. \
+        stemma::domain::WidthType::Dxa,
+        "a cell width w=0 type=dxa is kept as written, as Word saves it. \
          Got type={:?}, w={}",
         cell_width.width_type,
         cell_width.w,

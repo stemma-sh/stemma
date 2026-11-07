@@ -103,6 +103,15 @@ than guessing. Additive producer or diagnostic information therefore still
 requires an explicit schema decision instead of silently changing what an
 offline verifier trusts.
 
+### Python package: experimental
+
+The [`stemma-py` package](../reference/python.md) is new and **experimental**:
+its classes, methods, and returned dict shapes may change in any minor release
+before 1.0, with a changelog entry. It carries the same v4 transaction JSON as
+every other transport, so the transaction contract above applies unchanged;
+the dicts it returns are the engine's read shapes and, like them, must not be
+persisted.
+
 ### HTTP API: demo surface, no stability promise
 
 [`stemma-api`](../reference/http.md) is demo infrastructure for the browser
@@ -124,5 +133,6 @@ embed the Rust `api::Document` facade or drive the MCP tools.
 | `stemma-diff` facade | stable within the matching minor line | may break, with changelog |
 | v4 transaction JSON | additive; unknown fields rejected | breaking meaning-changes get a changelog entry |
 | MCP tool schema | additive (optional params) | renames/removals get a changelog entry |
+| Python package (`stemma-py`) | experimental | may change, with changelog |
 | Task manifest JSON | exact versioned schema; unknown fields rejected | incompatible shapes get a new schema identifier |
 | HTTP API | no promise | no promise |

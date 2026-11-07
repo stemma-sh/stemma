@@ -126,6 +126,15 @@ pub enum Block {
     },
 }
 
+/// A form field default on the wire: a string for a text field, a boolean for
+/// a checkbox.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FormFieldDefaultWire {
+    Text(String),
+    Checked(bool),
+}
+
 /// Wire shape for `Block::Toc.levels`: the `\o "from-to"` heading-level range
 /// (§17.16.5.68). Schema-validated at the wire edge (`validate_block`) to
 /// `1 <= from <= to <= 9` — OOXML/Word support nine heading levels; an
@@ -189,8 +198,11 @@ pub enum Inline {
 /// resolves against the document's role catalogue. The plain marks
 /// (bold/italic/underline/strike/subscript/superscript) map to the universal
 /// marks table applicable to any text span.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+///
+/// A plain mark may also be written as its bare name (`"bold"` for
+/// `{"type":"bold"}`), the form agents write most often: it has exactly one
+/// reading. Any other string is refused with the valid names.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mark {
     Bold,
     Italic,
@@ -199,6 +211,86 @@ pub enum Mark {
     Subscript,
     Superscript,
     InlineRole { id: String },
+}
+
+/// The tagged object form of [`Mark`], derived so its errors stay serde's.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TaggedMark {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Subscript,
+    Superscript,
+    InlineRole { id: String },
+}
+
+impl From<TaggedMark> for Mark {
+    fn from(mark: TaggedMark) -> Self {
+        match mark {
+            TaggedMark::Bold => Mark::Bold,
+            TaggedMark::Italic => Mark::Italic,
+            TaggedMark::Underline => Mark::Underline,
+            TaggedMark::Strike => Mark::Strike,
+            TaggedMark::Subscript => Mark::Subscript,
+            TaggedMark::Superscript => Mark::Superscript,
+            TaggedMark::InlineRole { id } => Mark::InlineRole { id },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Mark {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MarkVisitor;
+        impl<'de> serde::de::Visitor<'de> for MarkVisitor {
+            type Value = Mark;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a mark: {"type":"bold"} or the name "bold""#)
+            }
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Mark, E> {
+                match name {
+                    "bold" => Ok(Mark::Bold),
+                    "italic" => Ok(Mark::Italic),
+                    "underline" => Ok(Mark::Underline),
+                    "strike" => Ok(Mark::Strike),
+                    "subscript" => Ok(Mark::Subscript),
+                    "superscript" => Ok(Mark::Superscript),
+                    other => Err(E::custom(format!(
+                        "unknown mark {other:?}: a mark is one of \"bold\", \"italic\", \
+                         \"underline\", \"strike\", \"subscript\", \"superscript\" (or \
+                         {{\"type\":\"bold\"}}), or {{\"type\":\"inline_role\",\"id\":\"<role>\"}}"
+                    ))),
+                }
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Mark, A::Error> {
+                use serde::de::Error;
+                // serde ignores unknown keys on a unit variant of an internally
+                // tagged enum even under deny_unknown_fields; check them here.
+                let object = serde_json::Map::<String, serde_json::Value>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                // The type first, so an unknown one (e.g. `link`) is reported
+                // as serde reports it; then any key the type does not take.
+                let mark =
+                    serde_json::from_value::<TaggedMark>(serde_json::Value::Object(object.clone()))
+                        .map(Mark::from)
+                        .map_err(A::Error::custom)?;
+                let takes_id = matches!(mark, Mark::InlineRole { .. });
+                if let Some(key) = object
+                    .keys()
+                    .find(|key| *key != "type" && !(takes_id && *key == "id"))
+                {
+                    return Err(A::Error::custom(format!(
+                        "unknown field `{key}` on a mark: a mark is {{\"type\":\"bold\"}} \
+                         (or its name \"bold\"), or {{\"type\":\"inline_role\",\"id\":\"<role>\"}}"
+                    )));
+                }
+                Ok(mark)
+            }
+        }
+        deserializer.deserialize_any(MarkVisitor)
+    }
 }
 
 /// Boolean marks accepted by `set_format`. The object form is the v0.5
@@ -293,11 +385,54 @@ impl FormatMarksPatch {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParagraphAttrs {
+    /// Insert-only replacement of direct tab stops. Empty removes direct
+    /// stops; inherited stops require explicit alignment="clear" entries.
+    pub tab_stops: Option<Vec<TabStopWire>>,
+    /// Existing paragraph whose exact formatting is copied for new content.
+    /// Insert-only; mutually exclusive with a vocabulary role.
+    pub format_from: Option<String>,
     /// Numbering restart. Currently the only paragraph-level attribute the
     /// engine routes through `set_attr` is `role`, which sits on the block
     /// directly. `restart_numbering` lives here to track the v3 field.
     #[serde(default)]
     pub restart_numbering: bool,
+}
+
+/// Explicit Word tab stop; positions are signed twips from the page text edge.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabStopWire {
+    pub position: i32,
+    pub alignment: String,
+    pub leader: Option<String>,
+}
+
+fn inserted_tabs(
+    attrs: Option<&ParagraphAttrs>,
+    op_index: usize,
+) -> Result<Option<Vec<crate::word_ir::TabStopDef>>, AdapterError> {
+    let Some(stops) = attrs.and_then(|a| a.tab_stops.as_ref()) else {
+        return Ok(None);
+    };
+    let invalid = |reason| AdapterError::InvalidTabStops { op_index, reason };
+    let parsed = stops
+        .iter()
+        .map(|stop| {
+            Ok(crate::word_ir::TabStopDef {
+                position: stop.position,
+                alignment: crate::domain::TabAlignment::from_xml_str(&stop.alignment)
+                    .map_err(&invalid)?,
+                leader: stop
+                    .leader
+                    .as_deref()
+                    .map(crate::domain::TabLeader::from_xml_str)
+                    .transpose()
+                    .map_err(&invalid)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AdapterError>>()?;
+    crate::edit::verbs::paragraph_tabs::validate(&parsed).map_err(invalid)?;
+    Ok(Some(parsed))
 }
 
 /// Wire shape for an inserted/replaced paragraph's list membership
@@ -339,6 +474,10 @@ pub struct TableAttrs {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableRowAttrs {
+    /// Direct keep-row-together setting (`w:cantSplit`, §17.4.6).
+    /// Omission inherits; false explicitly permits splitting.
+    #[serde(default)]
+    pub cant_split: Option<bool>,
     /// Repeated header row (`w:tblHeader`, §17.4.49). Maps to
     /// `TableRowSpec.is_header`.
     #[serde(default)]
@@ -554,6 +693,15 @@ pub enum Op {
         guard: Option<String>,
         #[serde(default)]
         semantic_hash: Option<String>,
+        /// The header story holding a hyperlink `target`, by part name (e.g.
+        /// "header2.xml"); omitted for the body. Only a link is addressed this
+        /// way: a header paragraph is edited with `edit_header`. At most one of
+        /// `header_part` / `footer_part`.
+        #[serde(default)]
+        header_part: Option<String>,
+        /// The footer story holding a hyperlink `target`, by part name.
+        #[serde(default)]
+        footer_part: Option<String>,
         #[serde(default)]
         rationale: Option<String>,
     },
@@ -569,6 +717,25 @@ pub enum Op {
         expect: Option<String>,
         /// Block staleness guard; spec-named alias for `semantic_hash` (supply
         /// either; both-and-disagree => `ConflictingGuard`).
+        #[serde(default)]
+        guard: Option<String>,
+        #[serde(default)]
+        semantic_hash: Option<String>,
+        /// The header or footer part holding the paragraph; absent for the body.
+        #[serde(default)]
+        header_part: Option<String>,
+        #[serde(default)]
+        footer_part: Option<String>,
+        #[serde(default)]
+        rationale: Option<String>,
+    },
+    /// Join a paragraph with the one after it (deletes the paragraph mark
+    /// between them). Mirrors `EditStep::JoinParagraphs`.
+    JoinParagraphs {
+        target: NodeId,
+        /// The paragraph right after `target`, which it joins.
+        with: NodeId,
+        expect: String,
         #[serde(default)]
         guard: Option<String>,
         #[serde(default)]
@@ -597,6 +764,8 @@ pub enum Op {
         #[serde(default)]
         rationale: Option<String>,
     },
+    /// Remove a plain-text hyperlink without changing its display formatting.
+    UnlinkHyperlink { target: NodeId, expect: String },
     SetAttr {
         target: NodeId,
         attrs: AttrPatch,
@@ -611,6 +780,13 @@ pub enum Op {
         /// set. Ignored for paragraph-role mutations.
         #[serde(default)]
         expect_anchor: Option<String>,
+        /// The header story holding a hyperlink `target`, by part name;
+        /// omitted for the body. At most one of `header_part` / `footer_part`.
+        #[serde(default)]
+        header_part: Option<String>,
+        /// The footer story holding a hyperlink `target`, by part name.
+        #[serde(default)]
+        footer_part: Option<String>,
         #[serde(default)]
         rationale: Option<String>,
     },
@@ -678,6 +854,15 @@ pub enum Op {
         /// is rejected at the wire edge.
         #[serde(default)]
         shading: Option<ShadingWire>,
+        /// Keep with the next paragraph on one page (`w:keepNext`, §17.3.1.14).
+        #[serde(default)]
+        keep_with_next: Option<bool>,
+        /// Keep the paragraph's lines on one page (`w:keepLines`, §17.3.1.15).
+        #[serde(default)]
+        keep_lines_together: Option<bool>,
+        /// Start the paragraph on a new page (`w:pageBreakBefore`, §17.3.1.23).
+        #[serde(default)]
+        page_break_before: Option<bool>,
         #[serde(default)]
         rationale: Option<String>,
     },
@@ -851,6 +1036,14 @@ pub enum Op {
         /// string (`Some(Some(s))`) sets it. Mirrors `Option<Option<String>>`.
         #[serde(default, deserialize_with = "deserialize_double_option")]
         alt_text: Option<Option<String>>,
+        /// The header story holding `target`, by part name (e.g.
+        /// "header2.xml"); omitted for the body. At most one of
+        /// `header_part` / `footer_part`.
+        #[serde(default)]
+        header_part: Option<String>,
+        /// The footer story holding `target`, by part name.
+        #[serde(default)]
+        footer_part: Option<String>,
         #[serde(default)]
         rationale: Option<String>,
     },
@@ -1149,6 +1342,13 @@ pub enum Op {
     /// `w:fldChar`/`w:ffData` carrier). Mirrors `EditStep::SetFormFieldValue`.
     /// `field_id` is the BEGIN anchor's opaque id. Exactly one of
     /// `text`/`checked`/`selected` must be present (validated in `validate_schema`).
+    SetBlockFormText {
+        body_index: usize,
+        paragraph_index: usize,
+        field_index: usize,
+        semantic_hash: String,
+        text: String,
+    },
     SetFormFieldValue {
         target: NodeId,
         field_id: NodeId,
@@ -1158,6 +1358,10 @@ pub enum Op {
         checked: Option<bool>,
         #[serde(default)]
         selected: Option<String>,
+        /// The field's default (what it shows when reset): a string for a text
+        /// field, a boolean for a checkbox.
+        #[serde(default)]
+        default: Option<FormFieldDefaultWire>,
         #[serde(default)]
         semantic_hash: Option<String>,
         #[serde(default)]
@@ -1231,6 +1435,13 @@ pub enum Op {
         paragraphs: Vec<String>,
         #[serde(default)]
         semantic_hash: Option<String>,
+        /// The header story holding `target`, by part name; omitted for the
+        /// body. At most one of `header_part` / `footer_part`.
+        #[serde(default)]
+        header_part: Option<String>,
+        /// The footer story holding `target`, by part name.
+        #[serde(default)]
+        footer_part: Option<String>,
         #[serde(default)]
         rationale: Option<String>,
     },
@@ -1251,13 +1462,22 @@ pub enum Op {
         paragraph_index: usize,
         #[serde(default)]
         semantic_hash: Option<String>,
+        /// The header story holding `target`, by part name; omitted for the
+        /// body. At most one of `header_part` / `footer_part`.
+        #[serde(default)]
+        header_part: Option<String>,
+        /// The footer story holding `target`, by part name.
+        #[serde(default)]
+        footer_part: Option<String>,
         #[serde(default)]
         rationale: Option<String>,
     },
     /// Set a content control's text VALUE (whole-value replace), tracked. Mirrors
     /// `EditStep::SdtTextFill`. Exactly one target: an INLINE control via
-    /// `block_id` + `sdt_id`, or a BLOCK-level control via `body_index` (both from
-    /// `opaque_text_targets`). The forms "fill this field" op.
+    /// `block_id` + `sdt_id` (from `opaque_text_targets`), an open BLOCK-level
+    /// control via its first block's `block_id` alone, or a sealed block-level
+    /// control via `body_index` (both from `block_content_control_targets`). The
+    /// forms "fill this field" op.
     SdtTextFill {
         #[serde(default)]
         block_id: Option<NodeId>,
@@ -1425,17 +1645,53 @@ pub enum TableOpWire {
         position: String,
         #[serde(default)]
         cells: Option<Vec<String>>,
+        /// The row whose formatting the new row copies; `ref_row` when absent.
+        #[serde(default)]
+        format_from_row: Option<usize>,
     },
     /// Delete the row at `row_index`.
     DeleteRow { row_index: usize },
+    /// Move an existing complete row. Both indices are in the pre-operation
+    /// table; position is required and must be before or after.
+    MoveRow {
+        row_index: usize,
+        ref_row: usize,
+        position: String,
+    },
+    /// Target-order source indices; each existing row must occur exactly once.
+    ReorderRows { row_order: Vec<usize> },
+    /// Move one column (grid index, as the read view's cell `col`) before or
+    /// after another, with its cells' content, formatting and width. Direct
+    /// mode only; position is required. `expect_header`, when given, must be
+    /// the text of the column's top cell, or the op is refused.
+    MoveColumn {
+        col_index: usize,
+        ref_col: usize,
+        position: String,
+        #[serde(default)]
+        expect_header: Option<String>,
+    },
+    /// Exchange the contents of two cells (row, grid column as the read
+    /// view's cell `row`/`col`); each keeps its cell properties. Direct mode.
+    SwapCells {
+        row: usize,
+        col: usize,
+        with_row: usize,
+        with_col: usize,
+    },
     /// Insert an empty column before/after `ref_col` (simple-grid only).
     InsertColumn {
         ref_col: usize,
         #[serde(default = "default_after")]
         position: String,
     },
-    /// Delete the column at `col_index` (simple-grid only).
-    DeleteColumn { col_index: usize },
+    /// Delete the column at `col_index` (simple-grid only). `expect_header`
+    /// guards the address as on `MoveColumn`.
+    DeleteColumn {
+        col_index: usize,
+        #[serde(default)]
+        expect_header: Option<String>,
+    },
     /// Merge the rectangular region [start_row..=end_row] × [start_col..=end_col].
     MergeCells {
         start_row: usize,
@@ -1793,9 +2049,10 @@ pub struct SpacingPatch {
     /// Space after the paragraph, in twips.
     #[serde(default)]
     pub after: Option<u32>,
-    /// Line spacing value (interpreted per `line_rule`).
+    /// Line spacing value (interpreted per `line_rule`); signed, as
+    /// `w:line` is (§17.3.1.33).
     #[serde(default)]
-    pub line: Option<u32>,
+    pub line: Option<i32>,
     /// Line rule: `auto` | `exact` | `at_least`. Required when `line` is set;
     /// an unknown rule is rejected at the wire edge.
     #[serde(default)]
@@ -1995,6 +2252,32 @@ pub enum NumberingChangeWire {
     /// drives it by reading the split item's `list.num_id` from the read surface
     /// and targeting that block. Refused on an unnumbered paragraph.
     Split,
+    /// Give this item and the contiguous following items at its num_id/ilvl a
+    /// different label format, leaving earlier items and any other list on the
+    /// same definition as they are: `num_fmt` numbers the level and `lvl_text`
+    /// is the label template ("(%1)" with lowerLetter reads "(a)", "(b)", …).
+    /// The items move to a new list cloned from theirs. Refused on an
+    /// unnumbered paragraph.
+    Format {
+        num_fmt: ListNumberFormatWire,
+        lvl_text: String,
+    },
+}
+
+/// The label formats `set_numbering` kind `format` accepts, in their OOXML
+/// spelling (`w:numFmt/@w:val`).
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub enum ListNumberFormatWire {
+    #[serde(rename = "decimal")]
+    Decimal,
+    #[serde(rename = "lowerLetter")]
+    LowerLetter,
+    #[serde(rename = "upperLetter")]
+    UpperLetter,
+    #[serde(rename = "lowerRoman")]
+    LowerRoman,
+    #[serde(rename = "upperRoman")]
+    UpperRoman,
 }
 
 impl SpacingPatch {
@@ -2215,13 +2498,34 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "expect",
             "guard",
             "semantic_hash",
+            "header_part",
+            "footer_part",
             "rationale",
         ],
     ),
     ("insert", &["target", "content", "rationale"]),
     (
         "delete",
-        &["target", "expect", "guard", "semantic_hash", "rationale"],
+        &[
+            "target",
+            "expect",
+            "guard",
+            "semantic_hash",
+            "header_part",
+            "footer_part",
+            "rationale",
+        ],
+    ),
+    (
+        "join_paragraphs",
+        &[
+            "target",
+            "with",
+            "expect",
+            "guard",
+            "semantic_hash",
+            "rationale",
+        ],
     ),
     (
         "move",
@@ -2241,6 +2545,8 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "attrs",
             "expect_href",
             "expect_anchor",
+            "header_part",
+            "footer_part",
             "rationale",
         ],
     ),
@@ -2271,6 +2577,9 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "spacing",
             "borders",
             "shading",
+            "keep_with_next",
+            "keep_lines_together",
+            "page_break_before",
             "rationale",
         ],
     ),
@@ -2350,6 +2659,8 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "semantic_hash",
             "resize",
             "alt_text",
+            "header_part",
+            "footer_part",
             "rationale",
         ],
     ),
@@ -2493,8 +2804,19 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "text",
             "checked",
             "selected",
+            "default",
             "semantic_hash",
             "rationale",
+        ],
+    ),
+    (
+        "set_block_form_text",
+        &[
+            "body_index",
+            "paragraph_index",
+            "field_index",
+            "semantic_hash",
+            "text",
         ],
     ),
     (
@@ -2533,6 +2855,8 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "drawing_id",
             "paragraphs",
             "semantic_hash",
+            "header_part",
+            "footer_part",
             "rationale",
         ],
     ),
@@ -2546,6 +2870,8 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "container_index",
             "paragraph_index",
             "semantic_hash",
+            "header_part",
+            "footer_part",
             "rationale",
         ],
     ),
@@ -2627,6 +2953,7 @@ const OP_FIELDS: &[(&str, &[&str])] = &[
             "rationale",
         ],
     ),
+    ("unlink_hyperlink", &["target", "expect"]),
     // ─── add new wire ops above ──────────────────────────────────────────────
     // Mirror a new `Op` variant's field list here. See `edit/AGENTS.md`.
 ];
@@ -2669,8 +2996,17 @@ pub mod catalog;
 /// where in the transaction the problem is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaError {
+    EmptyBlockFormHash {
+        op_index: usize,
+    },
+    InvalidParagraphFormatSource {
+        path: NodePath,
+        reason: &'static str,
+    },
     /// JSON parse failure surfaced from serde (line/col in `message`).
-    JsonParseError { message: String },
+    JsonParseError {
+        message: String,
+    },
 
     /// The transaction has no ops.
     EmptyOps,
@@ -2678,72 +3014,118 @@ pub enum SchemaError {
     /// `insert.content` is an empty list. Per the schema, an insert with no
     /// blocks has no effect and is almost certainly a programmer error;
     /// failing loudly preserves "no silent fallbacks".
-    EmptyInsertContent { op_index: usize },
+    EmptyInsertContent {
+        op_index: usize,
+    },
 
     /// A hyperlink carries neither `href` nor `anchor`. At least one must be
     /// set — a hyperlink with no target is meaningless.
-    HyperlinkHasNoTarget { path: NodePath },
+    HyperlinkHasNoTarget {
+        path: NodePath,
+    },
 
     /// `set_attr.attrs` sets no fields. An empty attribute patch has no
     /// effect; failing loudly catches the case where a caller forgot to
     /// include the change.
-    EmptyAttrPatch { op_index: usize },
+    EmptyAttrPatch {
+        op_index: usize,
+    },
     /// A `set_format` op supplied no marks.
-    EmptyFormatMarks { op_index: usize },
+    EmptyFormatMarks {
+        op_index: usize,
+    },
     /// The new object-form marks were mixed with legacy top-level toggles.
-    MixedFormatMarkForms { op_index: usize },
+    MixedFormatMarkForms {
+        op_index: usize,
+    },
     /// A `set_para_format` op set no alignment, indentation, spacing, borders,
     /// or shading.
-    EmptyParaFormat { op_index: usize },
+    EmptyParaFormat {
+        op_index: usize,
+    },
     /// A `set_cell_format` op set no borders, shading, width, vertical
     /// alignment, or margins.
-    EmptyCellFormat { op_index: usize },
+    EmptyCellFormat {
+        op_index: usize,
+    },
     /// A `set_row_format` op set no height or height rule.
-    EmptyRowFormat { op_index: usize },
+    EmptyRowFormat {
+        op_index: usize,
+    },
     /// A `set_table_format` op set no borders, width, or default cell margins.
-    EmptyTableFormat { op_index: usize },
+    EmptyTableFormat {
+        op_index: usize,
+    },
     /// An `insert_cross_ref` op carried an empty `bookmark`.
-    CrossRefEmptyBookmark { op_index: usize },
+    CrossRefEmptyBookmark {
+        op_index: usize,
+    },
     /// An `insert_cross_ref` op carried a `ref_kind` not in `ref`/`pageref`/`noref`.
-    UnknownRefKind { op_index: usize, value: String },
+    UnknownRefKind {
+        op_index: usize,
+        value: String,
+    },
     /// A `set_numbering` op requested a non-bullet level with empty
     /// `synthesized_text` (the caller failed to resolve the counter text).
-    EmptyNumberingText { op_index: usize },
+    EmptyNumberingText {
+        op_index: usize,
+    },
+    /// A `set_numbering` kind `format` carried an empty `lvl_text`: the items
+    /// would show no label at all, which is a removal, not a format.
+    EmptyLevelText {
+        op_index: usize,
+    },
     /// An `insert_bookmark` / `rename_bookmark` op carried an empty bookmark
     /// name. A nameless bookmark is unreferenceable; refused rather than
     /// defaulted.
-    BookmarkEmptyName { op_index: usize },
+    BookmarkEmptyName {
+        op_index: usize,
+    },
     /// An `apply_style` op carried an empty `style_id`. A `w:pStyle` with no
     /// `w:val` is meaningless; we refuse rather than default it.
-    EmptyStyleId { op_index: usize },
+    EmptyStyleId {
+        op_index: usize,
+    },
 
     /// A `replace` payload's root node is a kind that is not addressable.
     /// `replace` accepts paragraph, table, and hyperlink payloads. `text` and
     /// `opaque_ref` payloads are rejected by this schema check.
-    UnaddressableReplaceContent { op_index: usize, kind: &'static str },
+    UnaddressableReplaceContent {
+        op_index: usize,
+        kind: &'static str,
+    },
 
     /// The same `opaque_ref` id appears more than once in a single payload's
     /// subtree. The engine's set-equality invariant (named invariant 2) is
     /// over a *set*; structurally, a duplicate would mean the same opaque
     /// node was placed in two positions, which is meaningless and almost
     /// certainly a caller bug.
-    DuplicateOpaqueRefInPayload { op_index: usize, opaque_id: String },
+    DuplicateOpaqueRefInPayload {
+        op_index: usize,
+        opaque_id: String,
+    },
 
     /// A `Block::Table` carries an empty `content` (no rows). A table
     /// with no rows is structurally meaningless and would crash the
     /// engine's diff machinery, which assumes at least one row. Failing
     /// at the schema layer keeps the engine's invariants honest.
-    EmptyTableRows { path: NodePath },
+    EmptyTableRows {
+        path: NodePath,
+    },
 
     /// A `TableRow` carries an empty `content` (no cells). Same
     /// reasoning as `EmptyTableRows` — a row with no cells is not a
     /// valid OOXML row.
-    EmptyTableRowCells { path: NodePath },
+    EmptyTableRowCells {
+        path: NodePath,
+    },
 
     /// A `TableCell` carries an empty `content` (no blocks). OOXML
     /// requires every cell to contain at least one paragraph; an empty
     /// cell would fail validation.
-    EmptyTableCellBlocks { path: NodePath },
+    EmptyTableCellBlocks {
+        path: NodePath,
+    },
 
     /// A `TableCell` carries `attrs.grid_span = Some(0)`. A horizontal merge
     /// must span at least one grid column (`w:gridSpan` ≥ 1, §17.4.17); zero is
@@ -2752,30 +3134,45 @@ pub enum SchemaError {
     /// are deeper, cross-row constraints validated by the engine's
     /// `validate_merge_spec`, which emits `RaggedTableGrid` /
     /// `OrphanVMergeContinue`.)
-    ZeroGridSpan { path: NodePath },
+    ZeroGridSpan {
+        path: NodePath,
+    },
 
     /// An inserted/replaced paragraph's `list.ilvl` is outside 0..=8 (`w:ilvl`,
     /// §17.9.3). OOXML defines nine list levels; a level above 8 is structurally
     /// meaningless. Refused at the wire edge rather than clamped.
-    InsertListLevelOutOfBounds { path: NodePath, ilvl: u32 },
+    InsertListLevelOutOfBounds {
+        path: NodePath,
+        ilvl: u32,
+    },
 
     /// A `Block::Toc.levels` pair violates `1 <= from <= to <= 9`. Word's TOC
     /// field switch `\o "from-to"` (§17.16.5.68) addresses nine heading
     /// levels; an inverted or out-of-range pair is structurally meaningless.
     /// Refused at the wire edge rather than clamped.
-    TocLevelsOutOfBounds { path: NodePath, from: u8, to: u8 },
+    TocLevelsOutOfBounds {
+        path: NodePath,
+        from: u8,
+        to: u8,
+    },
 
     /// A `replace` op's content was a `toc` block. Day-one scope: a ToC can
     /// only be authored via `insert` (it has no prior content to replace
     /// against — there is no meaningful "replace this ToC's text").
-    TocNotReplaceable { op_index: usize },
+    TocNotReplaceable {
+        op_index: usize,
+    },
 
     /// A `toc` block appeared inside a table cell's content. Day-one scope:
     /// ToC insertion is top-level only.
-    TocNotAllowedInTableCell { path: NodePath },
+    TocNotAllowedInTableCell {
+        path: NodePath,
+    },
 
     /// A `set_image_attrs` op requested neither a resize nor an alt-text edit.
-    EmptyImageAttrs { op_index: usize },
+    EmptyImageAttrs {
+        op_index: usize,
+    },
 
     /// A `set_image_attrs` resize carried a negative `cx` or `cy`. EMU
     /// dimensions are non-negative (`wp:extent` is a `ST_PositiveCoordinate`,
@@ -2787,11 +3184,16 @@ pub enum SchemaError {
     },
 
     /// A `set_image_layout` op requested no crop/position/wrap — a no-op.
-    EmptyImageLayout { op_index: usize },
+    EmptyImageLayout {
+        op_index: usize,
+    },
 
     /// A `set_image_layout` position axis set neither `offset` nor `align`, or
     /// set both. Exactly one is required (`wp:posOffset` XOR `wp:align`).
-    ImageLayoutPositionAmbiguous { op_index: usize, axis: &'static str },
+    ImageLayoutPositionAmbiguous {
+        op_index: usize,
+        axis: &'static str,
+    },
 
     /// A `set_image_layout` crop edge inset is outside `0..=100000` (1000ths of
     /// a percent, `ST_Percentage`). A crop beyond 100% is meaningless.
@@ -2803,32 +3205,49 @@ pub enum SchemaError {
 
     /// A `set_image_layout` `wrap` token is not one of `none` / `square` /
     /// `tight` / `through` / `top_and_bottom`. Refused rather than defaulted.
-    ImageLayoutUnknownWrap { op_index: usize, token: String },
+    ImageLayoutUnknownWrap {
+        op_index: usize,
+        token: String,
+    },
 
     /// A `comment_create` / `comment_reply` op carried an empty `body`. A
     /// comment with no text is meaningless; refused rather than defaulted.
-    CommentEmptyBody { op_index: usize },
+    CommentEmptyBody {
+        op_index: usize,
+    },
 
     /// A `comment_reply` op carried an empty `parent_comment_id`. Without a
     /// parent there is nothing to thread under.
-    CommentMissingParent { op_index: usize },
+    CommentMissingParent {
+        op_index: usize,
+    },
 
     /// A `comment_resolve` / `comment_delete` op carried an empty `comment_id`.
-    CommentMissingId { op_index: usize },
+    CommentMissingId {
+        op_index: usize,
+    },
 
     /// An `insert_note` op carried an empty `expect` anchor. Without it the
     /// reference run has no insertion point.
-    NoteEmptyExpect { op_index: usize },
+    NoteEmptyExpect {
+        op_index: usize,
+    },
 
     /// An `insert_note` / `edit_note` op carried an empty `body`. A note with no
     /// text is meaningless; refused rather than defaulted.
-    NoteEmptyBody { op_index: usize },
+    NoteEmptyBody {
+        op_index: usize,
+    },
 
     /// An `edit_note` / `delete_note` op carried an empty `note_id`.
-    NoteMissingId { op_index: usize },
+    NoteMissingId {
+        op_index: usize,
+    },
 
     /// A `set_page_setup` op carried no page-setup fields (empty patch).
-    EmptyPageSetup { op_index: usize },
+    EmptyPageSetup {
+        op_index: usize,
+    },
 
     /// An `edit_header` / `edit_footer` op carried an empty `header_part` /
     /// `footer_part` or `expect`. Without the part name the story is
@@ -2838,34 +3257,58 @@ pub enum SchemaError {
         field: &'static str,
     },
 
+    /// An op that can address a header or footer story named both, or named
+    /// one with an empty part name.
+    StoryPartInvalid {
+        op_index: usize,
+        reason: &'static str,
+    },
+
     /// A `set_header_footer_mode` op requested no change (no `title_page`,
     /// `even_and_odd`, or `link`).
-    EmptyHeaderFooterMode { op_index: usize },
+    EmptyHeaderFooterMode {
+        op_index: usize,
+    },
 
     /// An `insert_equation` op carried an empty `expect` anchor.
-    EquationEmptyExpect { op_index: usize },
+    EquationEmptyExpect {
+        op_index: usize,
+    },
 
     /// An `insert_equation` op carried an empty `omml` fragment. An equation
     /// with no math markup is meaningless; refused rather than defaulted.
-    EquationEmptyOmml { op_index: usize },
+    EquationEmptyOmml {
+        op_index: usize,
+    },
 
     /// An `insert_equation` op carried a `placement` not in `inline`/`block`.
-    UnknownEquationPlacement { op_index: usize, value: String },
+    UnknownEquationPlacement {
+        op_index: usize,
+        value: String,
+    },
 
     /// A `blocks_to_table` op carried an empty `delimiter`. Cells can't be split
     /// without one; refused rather than defaulted.
-    BlocksToTableEmptyDelimiter { op_index: usize },
+    BlocksToTableEmptyDelimiter {
+        op_index: usize,
+    },
 
     /// A `blocks_to_table` op supplied a `header` with no cells. An empty header
     /// can't fix a column count; refused rather than defaulted.
-    BlocksToTableEmptyHeader { op_index: usize },
+    BlocksToTableEmptyHeader {
+        op_index: usize,
+    },
 
     /// A `wrap_content_control` op carried an empty `expect` anchor.
-    ContentControlEmptyExpect { op_index: usize },
+    ContentControlEmptyExpect {
+        op_index: usize,
+    },
 
     /// A `wrap_content_control` op carried no distinguishing data (no tag, no
     /// alias, default rich-text control). Refused rather than authored.
-    EmptyContentControlSpec { op_index: usize },
+    EmptyContentControlSpec {
+        op_index: usize,
+    },
 
     /// A `wrap_content_control` op carried a `data_binding` with an empty
     /// `xpath` or empty `store_item_id`. A binding with no target is
@@ -2877,39 +3320,58 @@ pub enum SchemaError {
 
     /// A `set_content_control_value` op set other than exactly one of
     /// `text` / `checked` / `selected`. `present` is how many were set.
-    ContentControlValueArity { op_index: usize, present: u8 },
+    ContentControlValueArity {
+        op_index: usize,
+        present: u8,
+    },
 
     /// A `set_form_field_value` op set other than exactly one of
     /// `text` / `checked` / `selected`. `present` is how many were set.
-    FormFieldValueArity { op_index: usize, present: u8 },
+    FormFieldValueArity {
+        op_index: usize,
+        present: u8,
+    },
 
     /// An `insert_image` / `replace_image` op carried empty `bytes_base64`. An
     /// image with no bytes is meaningless; refused rather than authored.
-    ImageBytesEmpty { op_index: usize },
+    ImageBytesEmpty {
+        op_index: usize,
+    },
 
     /// A `create_style` / `modify_style` op carried an empty `style_id`. A
     /// `w:style` with no `w:styleId` is unaddressable; refused.
-    StyleDefEmptyId { op_index: usize },
+    StyleDefEmptyId {
+        op_index: usize,
+    },
 
     /// A `create_style` / `modify_style` op carried an empty `name`. A usable
     /// `w:style` needs a `w:name`; refused rather than defaulted.
-    StyleDefEmptyName { op_index: usize },
+    StyleDefEmptyName {
+        op_index: usize,
+    },
 
     /// A `set_doc_defaults` op carried neither `font_family` nor
     /// `font_size_half_points`. An op that would set nothing is refused rather
     /// than authored as a no-op.
-    DocDefaultsEmpty { op_index: usize },
+    DocDefaultsEmpty {
+        op_index: usize,
+    },
 
     /// A `replace` op carried a sub-block `span` selector but the payload is not
     /// a paragraph (table / hyperlink). Span addressing is paragraph-only; a
     /// span on another target is meaningless and refused rather than ignored.
-    SpanOnNonParagraph { op_index: usize, kind: &'static str },
+    SpanOnNonParagraph {
+        op_index: usize,
+        kind: &'static str,
+    },
 
     /// A `replace` op carried a sub-block `span` selector without a block
     /// guard (`guard`/`semantic_hash`). The guard is REQUIRED for span ops:
     /// it is what makes the ephemeral span handle safe, and what refuses the
     /// second of two same-paragraph ops in one transaction.
-    SpanRequiresGuard { op_index: usize },
+    SpanRequiresGuard {
+        op_index: usize,
+    },
 
     /// An op supplied BOTH `guard` and `semantic_hash`, and they disagree.
     /// `guard` is the spec alias for `semantic_hash`; when both are present they
@@ -2925,6 +3387,13 @@ pub enum SchemaError {
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SchemaError::EmptyBlockFormHash { op_index } => write!(
+                f,
+                "ops[{op_index}]: set_block_form_text requires the containing-block semantic_hash from field discovery"
+            ),
+            SchemaError::InvalidParagraphFormatSource { path, reason } => {
+                write!(f, "{path}: invalid format_from: {reason}")
+            }
             SchemaError::JsonParseError { message } => write!(f, "json parse error: {message}"),
             SchemaError::EmptyOps => write!(f, "transaction has no ops"),
             SchemaError::EmptyInsertContent { op_index } => {
@@ -2947,7 +3416,8 @@ impl std::fmt::Display for SchemaError {
             SchemaError::EmptyParaFormat { op_index } => write!(
                 f,
                 "ops[{op_index}]: set_para_format sets no alignment, indentation, \
-                 spacing, borders, or shading"
+                 spacing, borders, shading, or pagination (keep_with_next, \
+                 keep_lines_together, page_break_before)"
             ),
             SchemaError::EmptyCellFormat { op_index } => write!(
                 f,
@@ -2977,6 +3447,12 @@ impl std::fmt::Display for SchemaError {
                 f,
                 "ops[{op_index}]: set_numbering requested a non-bullet level with empty \
                  synthesized_text; resolve the counter text against the numbering definitions"
+            ),
+            SchemaError::EmptyLevelText { op_index } => write!(
+                f,
+                "ops[{op_index}]: set_numbering kind format needs a non-empty lvl_text, the \
+                 label template (\"(%1)\" reads \"(a)\" with lowerLetter); to drop the \
+                 labels, use kind remove"
             ),
             SchemaError::BookmarkEmptyName { op_index } => write!(
                 f,
@@ -3096,6 +3572,9 @@ impl std::fmt::Display for SchemaError {
                 f,
                 "ops[{op_index}]: edit_header/edit_footer has an empty {field}"
             ),
+            SchemaError::StoryPartInvalid { op_index, reason } => {
+                write!(f, "ops[{op_index}]: {reason}")
+            }
             SchemaError::EmptyHeaderFooterMode { op_index } => write!(
                 f,
                 "ops[{op_index}]: set_header_footer_mode requests no change \
@@ -3140,8 +3619,8 @@ impl std::fmt::Display for SchemaError {
             ),
             SchemaError::FormFieldValueArity { op_index, present } => write!(
                 f,
-                "ops[{op_index}]: set_form_field_value must set exactly one of \
-                 text/checked/selected (got {present})"
+                "ops[{op_index}]: set_form_field_value sets at most one of \
+                 text/checked/selected (got {present}), and a default or a value"
             ),
             SchemaError::ImageBytesEmpty { op_index } => write!(
                 f,
@@ -3269,6 +3748,26 @@ pub fn parse_transaction(json: &str) -> Result<EditTransactionV4, SchemaError> {
 
 /// Walk an already-parsed transaction and enforce the schema-layer invariants
 /// that the type system can't express directly.
+/// The story an op's optional `header_part` / `footer_part` names: the body
+/// when neither is given. Naming both, or an empty part name, is refused.
+fn story_of_parts(
+    op_index: usize,
+    header_part: Option<String>,
+    footer_part: Option<String>,
+) -> Result<StoryRef, SchemaError> {
+    let invalid = |reason| SchemaError::StoryPartInvalid { op_index, reason };
+    match (header_part, footer_part) {
+        (None, None) => Ok(StoryRef::Body),
+        (Some(_), Some(_)) => Err(invalid(
+            "header_part and footer_part are both given; a target lives in one story",
+        )),
+        (Some(part), None) if part.trim().is_empty() => Err(invalid("header_part is empty")),
+        (None, Some(part)) if part.trim().is_empty() => Err(invalid("footer_part is empty")),
+        (Some(part), None) => Ok(StoryRef::Header(part)),
+        (None, Some(part)) => Ok(StoryRef::Footer(part)),
+    }
+}
+
 pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
     if txn.ops.is_empty() {
         return Err(SchemaError::EmptyOps);
@@ -3285,6 +3784,16 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 // `guard`/`semantic_hash` are aliases: reject a conflicting pair
                 // at the schema edge before translation.
                 reconcile_guard(op_index, guard.clone(), semantic_hash.clone())?;
+                if let ReplaceContent::Block(Block::Paragraph {
+                    attrs: Some(attrs), ..
+                }) = content
+                    && (attrs.format_from.is_some() || attrs.tab_stops.is_some())
+                {
+                    return Err(SchemaError::InvalidParagraphFormatSource {
+                        path: NodePath::op(op_index),
+                        reason: "format_from and tab_stops create new paragraphs; they are not paragraph replacement attributes",
+                    });
+                }
                 // Day-one scope: a toc block has no prior content to replace
                 // against — it is insert-only. Reject before the span check
                 // below so a span-on-toc gets this message, not the generic
@@ -3389,9 +3898,17 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 guard,
                 semantic_hash,
                 ..
+            }
+            | Op::JoinParagraphs {
+                guard,
+                semantic_hash,
+                ..
             } => {
                 reconcile_guard(op_index, guard.clone(), semantic_hash.clone())?;
             }
+            // Required typed target and exact display-text precondition are
+            // validated against the snapshot by the unlink adapter.
+            Op::UnlinkHyperlink { .. } => {}
             Op::SetAttr { attrs, .. } => {
                 if attrs.is_empty() {
                     return Err(SchemaError::EmptyAttrPatch { op_index });
@@ -3431,11 +3948,17 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 spacing,
                 borders,
                 shading,
+                keep_with_next,
+                keep_lines_together,
+                page_break_before,
                 ..
             } => {
                 let has_indent = indent.as_ref().is_some_and(|p| !p.is_empty());
                 let has_spacing = spacing.as_ref().is_some_and(|p| !p.is_empty());
-                if align.is_none() && !has_indent && !has_spacing {
+                let has_pagination = keep_with_next.is_some()
+                    || keep_lines_together.is_some()
+                    || page_break_before.is_some();
+                if align.is_none() && !has_indent && !has_spacing && !has_pagination {
                     // borders/shading still make the op non-empty.
                     let has_borders = borders.as_ref().is_some_and(|p| !p.is_empty());
                     let has_shading = shading.as_ref().is_some_and(|p| !p.is_empty());
@@ -3526,6 +4049,12 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                     | NumberingChangeWire::Restart
                     | NumberingChangeWire::Continue
                     | NumberingChangeWire::Split => false,
+                    NumberingChangeWire::Format { lvl_text, .. } => {
+                        if lvl_text.is_empty() {
+                            return Err(SchemaError::EmptyLevelText { op_index });
+                        }
+                        false
+                    }
                 };
                 if bad {
                     return Err(SchemaError::EmptyNumberingText { op_index });
@@ -3548,8 +4077,13 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 }
             }
             Op::SetImageAttrs {
-                resize, alt_text, ..
+                resize,
+                alt_text,
+                header_part,
+                footer_part,
+                ..
             } => {
+                story_of_parts(op_index, header_part.clone(), footer_part.clone())?;
                 if resize.is_none() && alt_text.is_none() {
                     return Err(SchemaError::EmptyImageAttrs { op_index });
                 }
@@ -3691,41 +4225,25 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
             // CreateHeader / CreateFooter carry a required header/footer `kind`
             // token validated (and rejected if unknown) in `translate_op`.
             Op::CreateHeader { .. } | Op::CreateFooter { .. } => {}
-            Op::EditHeader {
-                header_part,
-                expect,
-                ..
-            } => {
+            Op::EditHeader { header_part, .. } => {
                 if header_part.trim().is_empty() {
                     return Err(SchemaError::HeaderFooterEmptyField {
                         op_index,
                         field: "header_part",
                     });
                 }
-                if expect.trim().is_empty() {
-                    return Err(SchemaError::HeaderFooterEmptyField {
-                        op_index,
-                        field: "expect",
-                    });
-                }
+                // An empty `expect` names an empty paragraph; the engine checks
+                // the target is empty (headers_footers::apply_edit).
             }
-            Op::EditFooter {
-                footer_part,
-                expect,
-                ..
-            } => {
+            Op::EditFooter { footer_part, .. } => {
                 if footer_part.trim().is_empty() {
                     return Err(SchemaError::HeaderFooterEmptyField {
                         op_index,
                         field: "footer_part",
                     });
                 }
-                if expect.trim().is_empty() {
-                    return Err(SchemaError::HeaderFooterEmptyField {
-                        op_index,
-                        field: "expect",
-                    });
-                }
+                // An empty `expect` names an empty paragraph; the engine checks
+                // the target is empty (headers_footers::apply_edit).
             }
             Op::SetHeaderFooterMode {
                 title_page,
@@ -3833,11 +4351,13 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 text,
                 checked,
                 selected,
+                default,
                 ..
             } => {
+                // At most one value kind; a default alone is a complete request.
                 let present =
                     text.is_some() as u8 + checked.is_some() as u8 + selected.is_some() as u8;
-                if present != 1 {
+                if present > 1 || (present == 0 && default.is_none()) {
                     return Err(SchemaError::FormFieldValueArity { op_index, present });
                 }
             }
@@ -3905,14 +4425,32 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
             // strings are acceptable (an empty list becomes one empty paragraph
             // in the verb), and the txbxContent/tracked-interior checks are
             // structural and live in the verb.
-            Op::SetTextboxText { .. } => {}
+            Op::SetTextboxText {
+                header_part,
+                footer_part,
+                ..
+            } => {
+                story_of_parts(op_index, header_part.clone(), footer_part.clone())?;
+            }
             // OpaqueTextEdit needs no schema-layer validation: an absent/empty
             // `find` fails loud in the splice core (`OpaqueTextNotFound`), and the
             // container/paragraph address is validated structurally in the verb.
-            Op::OpaqueTextEdit { .. } => {}
+            // A header/footer address is checked here.
+            Op::OpaqueTextEdit {
+                header_part,
+                footer_part,
+                ..
+            } => {
+                story_of_parts(op_index, header_part.clone(), footer_part.clone())?;
+            }
             // SdtTextFill's exactly-one-target and empty-fill rules are enforced
             // in the verb where the resolved control is in scope.
             Op::SdtTextFill { .. } => {}
+            Op::SetBlockFormText { semantic_hash, .. } => {
+                if semantic_hash.trim().is_empty() {
+                    return Err(SchemaError::EmptyBlockFormHash { op_index });
+                }
+            }
         }
     }
     Ok(())
@@ -3941,8 +4479,27 @@ const MAX_TOC_LEVEL: u8 = 9;
 
 fn validate_block(block: &Block, path: &NodePath) -> Result<(), SchemaError> {
     match block {
-        Block::Paragraph { content, list, .. } => {
+        Block::Paragraph {
+            content,
+            list,
+            role,
+            attrs,
+        } => {
             let path = path.pushed(NodePathSegment::Field("paragraph"));
+            if let Some(source) = attrs.as_ref().and_then(|a| a.format_from.as_ref()) {
+                if source.trim().is_empty() {
+                    return Err(SchemaError::InvalidParagraphFormatSource {
+                        path: path.clone(),
+                        reason: "paragraph id must not be empty",
+                    });
+                }
+                if role.is_some() {
+                    return Err(SchemaError::InvalidParagraphFormatSource {
+                        path: path.clone(),
+                        reason: "choose either format_from or role, not both",
+                    });
+                }
+            }
             // List level bounds (`w:ilvl`, §17.9.3): OOXML defines 9 levels,
             // 0..=8. A level outside that range is structurally invalid; refused
             // at the wire edge rather than clamped (no silent fallback). The
@@ -4049,29 +4606,52 @@ fn validate_block(block: &Block, path: &NodePath) -> Result<(), SchemaError> {
 /// best-effort; an unrouted surface stops the transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterError {
+    InvalidTabStops {
+        op_index: usize,
+        reason: String,
+    },
     /// `insert` with a non-paragraph block. The engine's insert path only
     /// resolves paragraph blocks today.
-    InsertNonParagraphNotSupported { op_index: usize, kind: &'static str },
+    InsertNonParagraphNotSupported {
+        op_index: usize,
+        kind: &'static str,
+    },
 
     /// `set_attr` carries fields that don't apply to a single resolved kind.
     /// Either a paragraph-only field is mixed with a hyperlink-only field,
     /// or no fields disambiguate the target kind.
-    AmbiguousSetAttrAttrs { op_index: usize },
+    AmbiguousSetAttrAttrs {
+        op_index: usize,
+    },
 
     /// `set_attr` on a hyperlink set `attrs.href` without supplying the
     /// matching `expect_href`, or set `attrs.anchor` without `expect_anchor`.
     /// The optimistic-concurrency precondition is required for hyperlink
     /// attribute mutations: without it a stale caller could retarget the
     /// wrong link entirely.
-    MissingHyperlinkAttrExpect { op_index: usize, attr: &'static str },
+    MissingHyperlinkAttrExpect {
+        op_index: usize,
+        attr: &'static str,
+    },
 
     /// A v4 `Mark::InlineRole` appeared on a text node. The engine's
     /// `InlineMarkSet` does not yet carry document-vocabulary inline roles.
-    InlineRoleMarkNotSupported { op_index: usize, role_id: String },
+    InlineRoleMarkNotSupported {
+        op_index: usize,
+        role_id: String,
+    },
 
     /// A hyperlink's `title` attribute was set. The engine does not yet
     /// thread hyperlink tooltips through the IR.
-    HyperlinkTitleNotSupported { op_index: usize },
+    HyperlinkTitleNotSupported {
+        op_index: usize,
+    },
+
+    /// Paragraph text carried a line feed or carriage return. Inside w:t it
+    /// would read as a space, losing the line break the caller meant.
+    LineBreakInText {
+        op_index: usize,
+    },
 
     /// A hyperlink contained a non-text inline (a nested hyperlink, an
     /// opaque_ref, or marked text). OOXML does not support nested
@@ -4086,92 +4666,159 @@ pub enum AdapterError {
     /// `validate_schema` normally catches this first; this is the local
     /// re-check so translation never silently picks one of two disagreeing
     /// guards. Carries the rendered `SchemaError::ConflictingGuard` message.
-    SchemaConflict { message: String },
+    SchemaConflict {
+        message: String,
+    },
 
     /// The engine requires a staleness precondition for paragraph-replace to
     /// anchor the rewrite against a known snapshot. Under the unified-guard
     /// contract this means a `guard` (block hash) **or** a legacy `expect`
     /// substring; an op with neither is refused. (When a guard is present,
     /// `expect` is advisory and may be absent.)
-    MissingExpect { op_index: usize },
+    MissingExpect {
+        op_index: usize,
+    },
 
     /// `delete` was supplied without an `expect` precondition. Same
     /// reasoning as `MissingExpect` above.
-    MissingDeleteExpect { op_index: usize },
+    MissingDeleteExpect {
+        op_index: usize,
+    },
 
     /// `set_format.color` was neither a 6-hex-digit RGB value nor `auto`.
     /// Refused at the wire edge rather than coerced.
-    InvalidColorValue { op_index: usize, value: String },
+    InvalidColorValue {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_format.highlight` was not a known `ST_HighlightColor` name.
-    UnsupportedHighlightColor { op_index: usize, value: String },
+    UnsupportedHighlightColor {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_para_format.align` was not one of the accepted alignment tokens
     /// (`left` | `center` | `right` | `both` | `distribute`). Refused at the
     /// wire edge rather than coerced.
-    UnknownAlignment { op_index: usize, value: String },
+    UnknownAlignment {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_para_format.spacing.line_rule` was not one of `auto` | `exact` |
     /// `at_least`. Refused at the wire edge rather than coerced.
-    UnknownLineRule { op_index: usize, value: String },
+    UnknownLineRule {
+        op_index: usize,
+        value: String,
+    },
 
     /// A border `style` token (in `set_para_format.borders` /
     /// `set_cell_format.borders`) was not a known `ST_Border` value. Refused at
     /// the wire edge rather than coerced.
-    UnknownBorderStyle { op_index: usize, value: String },
+    UnknownBorderStyle {
+        op_index: usize,
+        value: String,
+    },
     /// A border `color` was neither `auto` nor six hex digits.
-    InvalidBorderColor { op_index: usize, value: String },
+    InvalidBorderColor {
+        op_index: usize,
+        value: String,
+    },
     /// A shading `fill`/`color` was neither `auto` nor six hex digits.
-    InvalidShadingColor { op_index: usize, value: String },
+    InvalidShadingColor {
+        op_index: usize,
+        value: String,
+    },
     /// A shading `pattern` token was not a known `ST_Shd` value.
-    UnknownShadingPattern { op_index: usize, value: String },
+    UnknownShadingPattern {
+        op_index: usize,
+        value: String,
+    },
     /// A width `width_type` token was not a known `ST_TblWidth` value.
-    UnknownWidthType { op_index: usize, value: String },
+    UnknownWidthType {
+        op_index: usize,
+        value: String,
+    },
     /// `set_cell_format.v_align` was not `top` | `center` | `bottom`.
-    UnknownVerticalAlignment { op_index: usize, value: String },
+    UnknownVerticalAlignment {
+        op_index: usize,
+        value: String,
+    },
     /// `set_row_format.height_rule` was not a known `ST_HeightRule` value
     /// (`exact` | `atLeast` | `auto`).
-    UnknownHeightRule { op_index: usize, value: String },
+    UnknownHeightRule {
+        op_index: usize,
+        value: String,
+    },
     /// `insert_cross_ref.ref_kind` was not `ref`/`pageref`/`noref` (adapter-side
     /// defence for direct callers that bypass `validate_schema`).
-    UnknownRefKind { op_index: usize, value: String },
+    UnknownRefKind {
+        op_index: usize,
+        value: String,
+    },
 
     /// `insert_note`/`edit_note`/`delete_note`'s `note_kind` was not `footnote`
     /// or `endnote`. Refused at the wire edge — NEVER defaulted to footnote.
-    UnknownNoteKind { op_index: usize, value: String },
+    UnknownNoteKind {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_section_type` / `insert_section_break`'s `section_type` was not one
     /// of `next_page` | `continuous` | `even_page` | `odd_page` | `next_column`.
     /// Refused at the wire edge — NEVER mapped to a default `Other`.
-    UnknownSectionType { op_index: usize, value: String },
+    UnknownSectionType {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_page_setup` / `insert_section_break`'s `orientation` was not
     /// `portrait` | `landscape`. Refused at the wire edge, never coerced.
-    UnknownOrientation { op_index: usize, value: String },
+    UnknownOrientation {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_header_footer_mode.link.kind` was not `default` | `first` | `even`.
     /// Refused at the wire edge.
-    UnknownHeaderFooterKind { op_index: usize, value: String },
+    UnknownHeaderFooterKind {
+        op_index: usize,
+        value: String,
+    },
 
     /// `insert_equation.placement` was not `inline` | `block` (adapter-side
     /// defence for direct callers that bypass `validate_schema`).
-    UnknownEquationPlacement { op_index: usize, value: String },
+    UnknownEquationPlacement {
+        op_index: usize,
+        value: String,
+    },
 
     /// `set_content_control_value` did not set exactly one value kind (adapter-
     /// side defence for direct callers that bypass `validate_schema`).
-    AmbiguousContentControlValue { op_index: usize },
+    AmbiguousContentControlValue {
+        op_index: usize,
+    },
 
     /// `set_form_field_value` did not set exactly one value kind (adapter-side
     /// defence for direct callers that bypass `validate_schema`).
-    AmbiguousFormFieldValue { op_index: usize },
+    AmbiguousFormFieldValue {
+        op_index: usize,
+    },
 
     /// `insert_image` / `replace_image`'s `format` was not `png` | `jpeg` | `gif`.
     /// Refused at the wire edge — NEVER mapped to a default.
-    UnknownImageFormat { op_index: usize, value: String },
+    UnknownImageFormat {
+        op_index: usize,
+        value: String,
+    },
 
     /// `insert_image` / `replace_image`'s `bytes_base64` failed to decode. The
     /// decode error is surfaced rather than swallowed.
-    InvalidImageBase64 { op_index: usize, reason: String },
+    InvalidImageBase64 {
+        op_index: usize,
+        reason: String,
+    },
 
     /// `insert_image` / `replace_image` omitted `cx`/`cy` (asking for the
     /// intrinsic-size default) but the image header could not be decoded to
@@ -4185,20 +4832,32 @@ pub enum AdapterError {
 
     /// `create_style` / `modify_style`'s `style_type` was not
     /// `para` | `char` | `table` | `numbering`. Refused at the wire edge.
-    UnknownStyleType { op_index: usize, value: String },
+    UnknownStyleType {
+        op_index: usize,
+        value: String,
+    },
 
     /// `create_style.para_props.alignment` was not a recognized justification
     /// token. Refused at the wire edge, never coerced.
-    UnknownStyleAlignment { op_index: usize, value: String },
+    UnknownStyleAlignment {
+        op_index: usize,
+        value: String,
+    },
 
     /// A `table_op` insert's `position` was not `before` | `after`. Refused at
     /// the wire edge — never coerced to a default.
-    UnknownTablePosition { op_index: usize, value: String },
+    UnknownTablePosition {
+        op_index: usize,
+        value: String,
+    },
 }
 
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AdapterError::InvalidTabStops { op_index, reason } => {
+                write!(f, "ops[{op_index}]: invalid tab_stops: {reason}")
+            }
             AdapterError::InsertNonParagraphNotSupported { op_index, kind } => write!(
                 f,
                 "ops[{op_index}]: insert of a `{kind}` block is not yet supported"
@@ -4219,6 +4878,11 @@ impl std::fmt::Display for AdapterError {
             AdapterError::HyperlinkTitleNotSupported { op_index } => write!(
                 f,
                 "ops[{op_index}]: hyperlink `title` attribute is not yet threaded through the IR"
+            ),
+            AdapterError::LineBreakInText { op_index } => write!(
+                f,
+                "ops[{op_index}]: text contains a line break, which Word would show as a space; \
+                 put each line in its own paragraph node"
             ),
             AdapterError::UnsupportedInlineInsideHyperlink { op_index, reason } => write!(
                 f,
@@ -4395,8 +5059,36 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             expect,
             guard,
             semantic_hash,
+            header_part,
+            footer_part,
             rationale,
         } => {
+            let story = story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?;
+            if story != StoryRef::Body {
+                // A link in a header or footer is addressed by its part; a
+                // header paragraph has its own verb.
+                if span.is_some()
+                    || !matches!(content, ReplaceContent::Inline(Inline::Hyperlink { .. }))
+                {
+                    return Err(AdapterError::SchemaConflict {
+                        message: format!(
+                            "op {op_index}: header_part/footer_part on replace address a link \
+                             (content type hyperlink); change a header or footer paragraph \
+                             with edit_header / edit_footer"
+                        ),
+                    });
+                }
+                let mut step =
+                    translate_replace(op_index, target, content, expect, None, rationale)?;
+                if let EditStep::ReplaceHyperlinkText { story: slot, .. } = &mut step {
+                    *slot = story;
+                }
+                return Ok(step);
+            }
             // `guard`/`semantic_hash` are aliases; `validate_schema` already
             // rejected a conflicting pair, so collapsing to whichever is present
             // is exact (not a fallback). Re-check here keeps the invariant local.
@@ -4439,6 +5131,8 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             expect,
             guard,
             semantic_hash,
+            header_part,
+            footer_part,
             rationale,
         } => {
             let semantic_hash = reconcile_guard(op_index, guard, semantic_hash).map_err(|e| {
@@ -4446,13 +5140,40 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                     message: e.to_string(),
                 }
             })?;
+            let story = story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?;
             let expect = expect.ok_or(AdapterError::MissingDeleteExpect { op_index })?;
             Ok(EditStep::DeleteBlockRange {
+                story,
                 from_block_id: target.clone(),
                 to_block_id: target,
                 rationale,
                 expect,
                 semantic_hash,
+            })
+        }
+        Op::JoinParagraphs {
+            target,
+            with,
+            expect,
+            guard,
+            semantic_hash,
+            rationale,
+        } => {
+            let semantic_hash = reconcile_guard(op_index, guard, semantic_hash).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?;
+            Ok(EditStep::JoinParagraphs {
+                block_id: target,
+                with_block_id: with,
+                expect,
+                semantic_hash,
+                rationale,
             })
         }
         Op::Move {
@@ -4482,20 +5203,45 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                 semantic_hash,
             })
         }
+        Op::UnlinkHyperlink { target, expect } => Ok(EditStep::UnlinkHyperlink {
+            hyperlink_id: target,
+            expect,
+        }),
         Op::SetAttr {
             target,
             attrs,
             expect_href,
             expect_anchor,
+            header_part,
+            footer_part,
             rationale,
-        } => translate_set_attr(
-            op_index,
-            target,
-            attrs,
-            expect_href,
-            expect_anchor,
-            rationale,
-        ),
+        } => {
+            let story = story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?;
+            let mut step = translate_set_attr(
+                op_index,
+                target,
+                attrs,
+                expect_href,
+                expect_anchor,
+                rationale,
+            )?;
+            if story != StoryRef::Body {
+                let EditStep::SetHyperlinkAttr { story: slot, .. } = &mut step else {
+                    return Err(AdapterError::SchemaConflict {
+                        message: format!(
+                            "op {op_index}: header_part/footer_part on set_attr address a link \
+                             (href / anchor)"
+                        ),
+                    });
+                };
+                *slot = story;
+            }
+            Ok(step)
+        }
         Op::SetFormat {
             target,
             expect,
@@ -4589,6 +5335,9 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             spacing,
             borders,
             shading,
+            keep_with_next,
+            keep_lines_together,
+            page_break_before,
             rationale,
         } => {
             // Parse/validate every value-bearing field at the wire edge so a bad
@@ -4645,6 +5394,9 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                 spacing,
                 borders,
                 shading,
+                keep_next: keep_with_next,
+                keep_lines: keep_lines_together,
+                page_break_before,
             };
 
             Ok(EditStep::SetParagraphFormatting {
@@ -4876,6 +5628,19 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                     is_bullet,
                 },
                 NumberingChangeWire::Split => NumberingChange::Split,
+                NumberingChangeWire::Format { num_fmt, lvl_text } => {
+                    use crate::edit::verbs::numbering::ListNumberFormat;
+                    NumberingChange::SetFormat {
+                        num_fmt: match num_fmt {
+                            ListNumberFormatWire::Decimal => ListNumberFormat::Decimal,
+                            ListNumberFormatWire::LowerLetter => ListNumberFormat::LowerLetter,
+                            ListNumberFormatWire::UpperLetter => ListNumberFormat::UpperLetter,
+                            ListNumberFormatWire::LowerRoman => ListNumberFormat::LowerRoman,
+                            ListNumberFormatWire::UpperRoman => ListNumberFormat::UpperRoman,
+                        },
+                        lvl_text,
+                    }
+                }
             };
             Ok(EditStep::SetParagraphNumbering {
                 block_id: target,
@@ -4952,8 +5717,15 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             semantic_hash,
             resize,
             alt_text,
+            header_part,
+            footer_part,
             rationale,
         } => {
+            let story = story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?;
             // Non-negativity is enforced in `validate_schema` (which runs before
             // translation); map the wire shape onto the domain type.
             let resize = resize.map(|r| ImageResize {
@@ -4961,6 +5733,7 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                 cy_emu: r.cy,
             });
             Ok(EditStep::SetImageAttributes {
+                story,
                 block_id: target,
                 drawing_id,
                 semantic_hash,
@@ -5302,29 +6075,53 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                 rationale,
             })
         }
+        Op::SetBlockFormText {
+            body_index,
+            paragraph_index,
+            field_index,
+            semantic_hash,
+            text,
+        } => Ok(EditStep::SetBlockFormText {
+            body_index,
+            paragraph_index,
+            field_index,
+            semantic_hash,
+            text,
+        }),
         Op::SetFormFieldValue {
             target,
             field_id,
             text,
             checked,
             selected,
+            default,
             semantic_hash,
             rationale,
         } => {
-            // Exactly one value kind must be present (validated in
-            // `validate_schema`); map it onto the distinct FormFieldValue type.
+            // At most one value kind (validated in `validate_schema`); map it
+            // onto the distinct FormFieldValue type.
             let value = match (text, checked, selected) {
-                (Some(t), None, None) => FormFieldValue::Text(t),
-                (None, Some(c), None) => FormFieldValue::Checked(c),
-                (None, None, Some(s)) => FormFieldValue::Selected(s),
+                (Some(t), None, None) => Some(FormFieldValue::Text(t)),
+                (None, Some(c), None) => Some(FormFieldValue::Checked(c)),
+                (None, None, Some(s)) => Some(FormFieldValue::Selected(s)),
+                (None, None, None) if default.is_some() => None,
                 _ => {
                     return Err(AdapterError::AmbiguousFormFieldValue { op_index });
                 }
             };
+            let default = default.map(|default| match default {
+                FormFieldDefaultWire::Text(text) => {
+                    crate::edit::verbs::form_fields::FormFieldDefault::Text(text)
+                }
+                FormFieldDefaultWire::Checked(checked) => {
+                    crate::edit::verbs::form_fields::FormFieldDefault::Checked(checked)
+                }
+            });
             Ok(EditStep::SetFormFieldValue {
                 block_id: target,
                 field_id,
                 value,
+                default,
                 semantic_hash,
                 rationale,
             })
@@ -5376,8 +6173,15 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             drawing_id,
             paragraphs,
             semantic_hash,
+            header_part,
+            footer_part,
             rationale,
         } => Ok(EditStep::SetTextboxText {
+            story: story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?,
             block_id: target,
             drawing_id,
             paragraphs,
@@ -5392,8 +6196,15 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
             container_index,
             paragraph_index,
             semantic_hash,
+            header_part,
+            footer_part,
             rationale,
         } => Ok(EditStep::OpaqueTextEdit {
+            story: story_of_parts(op_index, header_part, footer_part).map_err(|e| {
+                AdapterError::SchemaConflict {
+                    message: e.to_string(),
+                }
+            })?,
             block_id: target,
             opaque_id,
             container_index,
@@ -6115,6 +6926,7 @@ fn translate_replace(
             let new_text = flatten_hyperlink_content_to_text(op_index, &content)?;
             let expect = expect.ok_or(AdapterError::MissingExpect { op_index })?;
             Ok(EditStep::ReplaceHyperlinkText {
+                story: StoryRef::Body,
                 hyperlink_id: target,
                 rationale,
                 expect,
@@ -6164,6 +6976,11 @@ fn translate_insert_blocks(
                     attrs.as_ref().map(|a| a.restart_numbering).unwrap_or(false);
                 let content = v4_inlines_to_paragraph_content(op_index, content)?;
                 out.push(BlockSpec::Paragraph(ParagraphBlockSpec {
+                    tab_stops: inserted_tabs(attrs.as_ref(), op_index)?,
+                    format_from: attrs
+                        .as_ref()
+                        .and_then(|a| a.format_from.as_ref())
+                        .map(|id| NodeId::from(id.clone())),
                     role: role.clone(),
                     content,
                     restart_numbering,
@@ -6260,6 +7077,7 @@ fn translate_set_attr(
         // would require a schema-layer addition later.
         let new_anchor = attrs.anchor.map(Some);
         return Ok(EditStep::SetHyperlinkAttr {
+            story: StoryRef::Body,
             hyperlink_id: target,
             new_href: attrs.href,
             new_anchor,
@@ -6304,17 +7122,57 @@ fn translate_table_op(op_index: usize, op: TableOpWire) -> Result<TableOp, Adapt
             ref_row,
             position,
             cells,
+            format_from_row,
         } => Ok(TableOp::InsertRow {
             ref_row,
             position: parse_pos(position)?,
             cells,
+            format_from_row,
         }),
         TableOpWire::DeleteRow { row_index } => Ok(TableOp::DeleteRow { row_index }),
+        TableOpWire::MoveRow {
+            row_index,
+            ref_row,
+            position,
+        } => Ok(TableOp::MoveRow {
+            row_index,
+            ref_row,
+            position: parse_pos(position)?,
+        }),
+        TableOpWire::ReorderRows { row_order } => Ok(TableOp::ReorderRows { row_order }),
+        TableOpWire::MoveColumn {
+            col_index,
+            ref_col,
+            position,
+            expect_header,
+        } => Ok(TableOp::MoveColumn {
+            col_index,
+            ref_col,
+            position: parse_pos(position)?,
+            expect_header,
+        }),
+        TableOpWire::SwapCells {
+            row,
+            col,
+            with_row,
+            with_col,
+        } => Ok(TableOp::SwapCells {
+            row_index: row,
+            col_index: col,
+            with_row,
+            with_col,
+        }),
         TableOpWire::InsertColumn { ref_col, position } => Ok(TableOp::InsertColumn {
             ref_col,
             position: parse_pos(position)?,
         }),
-        TableOpWire::DeleteColumn { col_index } => Ok(TableOp::DeleteColumn { col_index }),
+        TableOpWire::DeleteColumn {
+            col_index,
+            expect_header,
+        } => Ok(TableOp::DeleteColumn {
+            col_index,
+            expect_header,
+        }),
         TableOpWire::MergeCells {
             start_row,
             start_col,
@@ -6360,6 +7218,11 @@ fn v4_table_rows_to_table_spec(
                             attrs.as_ref().map(|a| a.restart_numbering).unwrap_or(false);
                         let content = v4_inlines_to_paragraph_content(op_index, content)?;
                         block_specs.push(BlockSpec::Paragraph(ParagraphBlockSpec {
+                            tab_stops: inserted_tabs(attrs.as_ref(), op_index)?,
+                            format_from: attrs
+                                .as_ref()
+                                .and_then(|a| a.format_from.as_ref())
+                                .map(|id| NodeId::from(id.clone())),
                             role: role.clone(),
                             content,
                             restart_numbering,
@@ -6399,17 +7262,18 @@ fn v4_table_rows_to_table_spec(
                 formatting,
             });
         }
-        let (is_header, height, height_rule) = match &row.attrs {
-            None => (false, None, None),
+        let (is_header, height, height_rule, cant_split) = match &row.attrs {
+            None => (false, None, None, None),
             Some(a) => {
                 let height_rule = match &a.height_rule {
                     Some(t) => Some(parse_height_rule(op_index, t)?),
                     None => None,
                 };
-                (a.header, a.height, height_rule)
+                (a.header, a.height, height_rule, a.cant_split)
             }
         };
         row_specs.push(TableRowSpec {
+            cant_split,
             cells: cell_specs,
             is_header,
             height,
@@ -6527,6 +7391,9 @@ fn v4_inlines_to_paragraph_content(
     for inline in inlines {
         match inline {
             Inline::Text { text, marks } => {
+                if text.contains(['\n', '\r']) {
+                    return Err(AdapterError::LineBreakInText { op_index });
+                }
                 if marks.is_empty() {
                     fragments.push(ContentFragment::Text(text.clone()));
                 } else {
@@ -6708,6 +7575,76 @@ fn find_duplicate(ids: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inserted_tab_stops_are_strict_and_preserve_empty_clear_intent() {
+        let transaction = |stops: serde_json::Value| {
+            serde_json::json!({
+                "revision": {"author": "Reviewer"},
+                "ops": [{"op": "insert", "target": {"anchor": "p_1", "position": "after"},
+                    "content": [{"type": "paragraph", "attrs": {"tab_stops": stops},
+                        "content": [{"type": "text", "text": "New paragraph"}]}]}]
+            })
+            .to_string()
+        };
+        for stops in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"position": -31680, "alignment": "clear"},
+                {"position": 31680, "alignment": "end", "leader": "underscore"}
+            ]),
+        ] {
+            super::parse_transaction(&transaction(stops))
+                .unwrap()
+                .into_edit_transaction()
+                .unwrap();
+        }
+        for stops in [
+            serde_json::json!([{"position": 0, "alignment": "guess"}]),
+            serde_json::json!([{"position": 0, "alignment": "left", "leader": "guess"}]),
+            serde_json::json!([{"position": 31681, "alignment": "left"}]),
+            serde_json::json!([{"position": -31681, "alignment": "left"}]),
+            serde_json::json!([{"position": 720, "alignment": "clear"}, {"position": 720, "alignment": "left"}]),
+        ] {
+            let error = super::parse_transaction(&transaction(stops))
+                .unwrap()
+                .into_edit_transaction()
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid tab_stops"));
+        }
+        assert!(
+            super::parse_transaction(&transaction(serde_json::json!([
+                {"position": 720, "alignment": "left", "unknown": true}
+            ])))
+            .is_err()
+        );
+        let replacement = r#"{"revision":{"author":"Reviewer"},"ops":[{"op":"replace","target":"p_1","expect":"old","content":{"type":"paragraph","attrs":{"tab_stops":[]},"content":[{"type":"text","text":"new"}]}}]}"#;
+        assert!(
+            super::parse_transaction(replacement).is_err(),
+            "insert-only attrs must not disappear in replacement translation"
+        );
+    }
+
+    #[test]
+    fn format_from_rejects_conflicting_empty_and_replacement_sources() {
+        for block in [
+            r#"{"type":"paragraph","role":"body_text","attrs":{"format_from":"p_1"},"content":[]}"#,
+            r#"{"type":"paragraph","attrs":{"format_from":" "},"content":[]}"#,
+        ] {
+            let json = format!(
+                r#"{{"ops":[{{"op":"insert","target":{{"anchor":"p_1","position":"after"}},"content":[{block}]}}],"revision":{{"author":"Reviewer"}}}}"#
+            );
+            assert!(matches!(
+                super::parse_transaction(&json),
+                Err(super::SchemaError::InvalidParagraphFormatSource { .. })
+            ));
+        }
+        let json = r#"{"ops":[{"op":"replace","target":"p_1","expect":"old","content":{"type":"paragraph","attrs":{"format_from":"p_2"},"content":[{"type":"text","text":"new"}]}}],"revision":{"author":"Reviewer"}}"#;
+        assert!(matches!(
+            super::parse_transaction(json),
+            Err(super::SchemaError::InvalidParagraphFormatSource { .. })
+        ));
+    }
+
     use super::*;
 
     /// Domain rule: a style op whose property fields are MISNAMED must be
@@ -7683,6 +8620,40 @@ mod tests {
         );
     }
 
+    /// A plain mark's bare name has one reading, its tagged object; an
+    /// unknown name is refused with the valid ones.
+    #[test]
+    fn a_plain_mark_may_be_written_as_its_name() {
+        let named: Vec<Mark> = serde_json::from_str(
+            r#"["bold", "italic", "underline", "strike", "subscript", "superscript"]"#,
+        )
+        .expect("names parse");
+        let tagged: Vec<Mark> = serde_json::from_str(
+            r#"[{"type":"bold"},{"type":"italic"},{"type":"underline"},{"type":"strike"},{"type":"subscript"},{"type":"superscript"}]"#,
+        )
+        .expect("objects parse");
+        assert_eq!(named, tagged);
+        let err = serde_json::from_str::<Mark>(r#""bolded""#).expect_err("unknown name");
+        assert!(
+            err.to_string().contains(r#"unknown mark "bolded""#),
+            "{err}"
+        );
+        let err =
+            serde_json::from_str::<Mark>(r#"{"type":"bold","x":1}"#).expect_err("unknown field");
+        assert!(
+            err.to_string().contains("unknown field `x` on a mark"),
+            "{err}"
+        );
+        let inline_role: Mark =
+            serde_json::from_str(r#"{"type":"inline_role","id":"defined_term"}"#).unwrap();
+        assert_eq!(
+            inline_role,
+            Mark::InlineRole {
+                id: "defined_term".to_string()
+            }
+        );
+    }
+
     #[test]
     fn adapter_rejects_inline_role_mark() {
         let json = r#"
@@ -8096,6 +9067,8 @@ mod tests {
                 expect: Some("x".to_string()),
                 guard: None,
                 semantic_hash: None,
+                header_part: None,
+                footer_part: None,
                 rationale: None,
             }],
             summary: None,

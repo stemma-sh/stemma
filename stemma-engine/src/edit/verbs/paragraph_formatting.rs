@@ -34,7 +34,7 @@ use super::super::{
     block_at, block_at_mut, check_ancestor_table_tracking, find_paragraph_path,
     validate_block_is_editable,
 };
-use crate::domain::{BlockNode, CanonDoc, NodeId, ParagraphNode, RevisionInfo};
+use crate::domain::{BlockNode, CanonDoc, NodeId, ParagraphNode, RevisionInfo, TrackingStatus};
 use crate::semantic_hash::check_block_guard;
 
 #[allow(clippy::too_many_arguments)]
@@ -62,10 +62,29 @@ pub(crate) fn apply(
         block_id: block_id.clone(),
         step_index,
     })?;
-    if path.is_top_level() {
-        validate_block_is_editable(&doc.blocks[path.top_block], step_index)?;
+    // Content the author is still proposing (their own pending insertion) is
+    // formatted directly: the format is part of the proposal.
+    let own_insertion = mode == MaterializationMode::TrackedChange
+        && super::super::inside_own_pending_insertion(doc, &path, revision.author.as_deref());
+    let mode = if own_insertion {
+        MaterializationMode::Direct
     } else {
-        check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
+        mode
+    };
+    if !own_insertion {
+        if path.is_top_level() {
+            // A tracked paragraph-format change records the paragraph's
+            // properties, independent of tracked insertions and deletions in
+            // its runs (Word carries a pPrChange beside them), so pending text
+            // changes do not block it; a paragraph that is itself a pending
+            // insertion or deletion does.
+            let tracked = &doc.blocks[path.top_block];
+            if tracked.status != TrackingStatus::Normal {
+                validate_block_is_editable(tracked, step_index)?;
+            }
+        } else {
+            check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
+        }
     }
 
     // Block kind + staleness guard (immutable borrow, released before the apply).
@@ -153,7 +172,12 @@ fn apply_to_paragraph(
         && patch
             .shading
             .as_ref()
-            .is_none_or(|s| Some(s) == para.shading.as_ref());
+            .is_none_or(|s| Some(s) == para.shading.as_ref())
+        && patch.keep_next.is_none_or(|k| para.keep_next == Some(k))
+        && patch.keep_lines.is_none_or(|k| para.keep_lines == Some(k))
+        && patch
+            .page_break_before
+            .is_none_or(|b| b == para.page_break_before);
     if no_change {
         return;
     }
@@ -190,6 +214,18 @@ fn apply_to_paragraph(
     if let Some(shading) = &patch.shading {
         para.shading = Some(shading.clone());
         para.has_direct_shading = true;
+    }
+    if let Some(keep) = patch.keep_next {
+        para.keep_next = Some(keep);
+        para.has_direct_keep_next = true;
+    }
+    if let Some(keep) = patch.keep_lines {
+        para.keep_lines = Some(keep);
+        para.has_direct_keep_lines = true;
+    }
+    if let Some(page_break) = patch.page_break_before {
+        para.page_break_before = page_break;
+        para.has_direct_page_break_before = true;
     }
 
     // Clear cached text hash / rendered text so any downstream consumer that
@@ -228,6 +264,9 @@ mod tests {
             spacing: None,
             borders: None,
             shading: None,
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         };
         assert!(!patch.is_empty());
     }
@@ -248,6 +287,9 @@ mod tests {
             spacing: None,
             borders: None,
             shading: None,
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         };
         assert!(!patch.is_empty());
     }
@@ -265,6 +307,9 @@ mod tests {
                 color: None,
                 extra_attrs: Vec::new(),
             }),
+            keep_next: None,
+            keep_lines: None,
+            page_break_before: None,
         };
         assert!(!patch.is_empty());
     }

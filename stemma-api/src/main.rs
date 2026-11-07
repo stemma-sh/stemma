@@ -72,10 +72,7 @@ use stemma::edit::MaterializationMode;
 use stemma::edit_v4::catalog::operation_catalog;
 use stemma::edit_v4::parse_transaction;
 use stemma::view::{RevisionView, TextMark};
-use stemma::{
-    ExportMode, ExportOptions, Resolution, ResolveSelectionAction, ValidatorLevel,
-    enumerate_revisions,
-};
+use stemma::{ExportMode, ExportOptions, Resolution, ResolveSelectionAction, ValidatorLevel};
 use stemma_diff::block_semantic_hash_for_full_doc_block;
 
 // ─── Session store ────────────────────────────────────────────────────────────
@@ -695,7 +692,8 @@ async fn revisions(
         .ok_or_else(|| ApiError::not_found(&doc_id))?;
     // `enumerate_revisions` is the SAME walk the accept/reject selector lowers
     // against, so a row here is resolvable by its `revision_id` below.
-    let rows: Vec<Value> = enumerate_revisions(&doc.snapshot().canonical)
+    let rows: Vec<Value> = doc
+        .revisions()
         .into_iter()
         .filter(|r| r.revision_id != 0)
         .map(|r| {

@@ -66,11 +66,15 @@ The intended tool sequence is:
 3. `execute_plan` previews the explicit edit, then applies the same plan.
 4. `verify_docx` checks tracked-only change, untouched content, existing
    revisions, and validation.
-5. `save_docx` reruns the session audit, refuses a non-deliverable result
-   before creating the output path, then commits a new output path.
+5. `save_docx` reruns the session audit, commits a new output path, and
+   reports the audit verdict: `pass`, or `needs_review` with the finding
+   counts.
 
 The explicit verification step lets you inspect and remediate the evidence
-before delivery. Saving remains independently verification-gated.
+before delivery. Saving refuses only bytes the package gate rejects; the
+audit verdict is the agent's to act on: check the save receipt's
+`verdict.status`, and on `needs_review` inspect with `verify_docx` and fix or
+disclose each finding.
 The source is never overwritten. An existing destination is refused.
 
 ## 3. Review what was saved

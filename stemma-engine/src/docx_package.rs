@@ -599,8 +599,9 @@ impl RelationshipSet {
 
 /// A DOCX package with parsed metadata and raw part bytes.
 ///
-/// The three metadata files (`[Content_Types].xml`, `_rels/.rels`, and
-/// `word/_rels/document.xml.rels`) are parsed into typed structures.
+/// Content types, root relationships, and any main-part relationships are
+/// parsed into typed structures. An absent main-part relationship part means
+/// an empty set of outgoing relationships.
 /// All other parts are stored as raw bytes in `parts`.
 #[derive(Clone, Debug)]
 pub struct DocxPackage {
@@ -753,11 +754,13 @@ impl DocxPackage {
         let main_part_name = main_document_part_from_root_rels(&root_rels, archive)?;
         let document_rels_path = rels_part_path(&main_part_name);
 
-        // Parse the main part's relationships (required).
-        let doc_rels_bytes = archive
-            .get(&document_rels_path)
-            .ok_or_else(|| PackageError::MissingPart(document_rels_path.clone()))?;
-        let document_rels = RelationshipSet::parse(doc_rels_bytes, &document_rels_path)?;
+        // ECMA-376 Part 1 §11.2 permits no outgoing main-part relationships.
+        // Keep the owner's directory even for an empty set: later authored
+        // relationships must resolve against the actual main part, not word/.
+        let document_rels = match archive.get(&document_rels_path) {
+            Some(bytes) => RelationshipSet::parse(bytes, &document_rels_path)?,
+            None => RelationshipSet::empty().rebased(&document_rels_path),
+        };
 
         // Parse every non-root, non-main relationships part. This includes
         // headers/footers as well as customXml and arbitrary extension parts:
@@ -1128,6 +1131,32 @@ mod tests {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#.to_vec()
+    }
+
+    #[test]
+    fn absent_main_relationships_keep_owner_directory() {
+        for main_part in ["word/document.xml", "document.xml", "nested/content.xml"] {
+            let archive = DocxArchive::from_parts(vec![
+                crate::docx::DocxFile {
+                    name: CONTENT_TYPES_PATH.to_string(),
+                    data: format!(r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/{main_part}" ContentType="{MAIN_DOCUMENT_CONTENT_TYPE}"/></Types>"#).into_bytes(),
+                },
+                crate::docx::DocxFile {
+                    name: ROOT_RELS_PATH.to_string(),
+                    data: format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDoc" Type="{OFFICE_DOCUMENT_REL_TYPE}" Target="{main_part}"/></Relationships>"#).into_bytes(),
+                },
+                crate::docx::DocxFile {
+                    name: main_part.to_string(),
+                    data: br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/></w:body></w:document>"#.to_vec(),
+                },
+            ]);
+            let package = DocxPackage::from_archive(&archive).expect("optional relationship part");
+            assert!(package.document_rels.entries.is_empty());
+            assert_eq!(
+                package.document_rels.resolve_internal_target("new.xml"),
+                format!("{}new.xml", part_dir(main_part))
+            );
+        }
     }
 
     fn minimal_document_rels_xml() -> Vec<u8> {

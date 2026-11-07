@@ -348,6 +348,7 @@ fn delete_block_range_composed_states_agree() {
     let pids = para_ids(&base);
     let d = base
         .apply(&txn(EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: pids[1].clone(),
             to_block_id: pids[2].clone(),
             rationale: None,
@@ -376,6 +377,8 @@ fn replace_block_range_composed_states_agree() {
             expect: String::new(),
             semantic_hash: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("default".to_string()),
                 content: ParagraphContent {
                     fragments: vec![ContentFragment::Text("Replacement line".to_string())],
@@ -465,6 +468,8 @@ fn insert_then_delete_chain_composed_states_agree() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("default".to_string()),
                 content: ParagraphContent {
                     fragments: vec![ContentFragment::Text("Inserted middle".to_string())],
@@ -478,6 +483,7 @@ fn insert_then_delete_chain_composed_states_agree() {
     // Delete the last two original paragraphs (now shifted by the insert).
     let d = inserted
         .apply(&txn(EditStep::DeleteBlockRange {
+            story: stemma::edit::StoryRef::Body,
             from_block_id: ins_pids[ins_pids.len() - 2].clone(),
             to_block_id: ins_pids[ins_pids.len() - 1].clone(),
             rationale: None,

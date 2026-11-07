@@ -43,7 +43,7 @@
 //!   target (no silent fallback);
 //! - repeating-section instance add/remove is OUT (structural multi-block, v2).
 
-use super::super::{EditError, find_block_index, validate_block_is_editable};
+use super::super::{EditError, block_at, block_at_mut, find_block_index, find_editable_block_path};
 use crate::domain::DocPart;
 use crate::domain::{
     BlockNode, CanonDoc, InlineNode, NodeId, OpaqueInlineNode, OpaqueKind, ProofRef, SdtControl,
@@ -166,13 +166,9 @@ pub(crate) fn apply_wrap(
         }
     }
 
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -191,8 +187,7 @@ pub(crate) fn apply_wrap(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) =
-            crate::semantic_hash::check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = crate::semantic_hash::check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -202,31 +197,18 @@ pub(crate) fn apply_wrap(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
-    // Derive a stable decimal SDT id from the paragraph id hash (the value only
-    // needs to be unique within the document; Word treats it as opaque).
-    let sdt_id_num = stable_sdt_id(&para.id.0);
-    let sdt_node_id = NodeId::from(format!("{}_sdt0", para.id.0));
+    // Derive a stable decimal SDT id from the control's own id hash (the value
+    // only needs to be unique within the document; Word treats it as opaque).
+    // The paragraph id alone gave a second control in the paragraph the same.
+    let sdt_node_id = super::super::InlineIdMint::for_paragraph(para).mint("sdt");
+    let sdt_id_num = stable_sdt_id(&sdt_node_id.0);
 
     let plan = find_text_span(&para.segments, expect).ok_or_else(|| {
-        let visible: String = para
-            .segments
-            .iter()
-            .flat_map(|s| s.inlines.iter())
-            .filter_map(|i| match i {
-                InlineNode::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        EditError::ExpectMismatch {
-            block_id: block_id.clone(),
-            expected: expect.to_string(),
-            actual_text: visible,
-            step_index,
-        }
+        super::super::unlocatable_expect(para, block_id, expect, true, step_index)
     })?;
 
     // Build the inner run XML from the matched text (run-span wrap, v1). The
@@ -244,7 +226,7 @@ pub(crate) fn apply_wrap(
         &inner_run,
     );
     let raw = sdt_xml.into_bytes();
-    let content_hash = Some(sha256_hex(&raw));
+    let content_hash = Some(crate::import::canonical_raw_hash(&raw));
 
     // When the control is data-bound, stage the backing custom-XML datastore
     // part so the save path authors (or reuses) a `customXml/item*.xml` whose
@@ -256,7 +238,7 @@ pub(crate) fn apply_wrap(
         pending_custom_xml.push(crate::edit::CustomXmlPart {
             store_item_id: b.store_item_id.clone(),
             root_element: datastore_root_from_xpath(&b.xpath),
-            namespace: None,
+            namespace: datastore_root_namespace(&b.xpath, b.prefix_mappings.as_deref()),
         });
     }
 
@@ -271,6 +253,7 @@ pub(crate) fn apply_wrap(
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(raw),
@@ -368,12 +351,23 @@ pub(crate) fn apply_set_value(
     value: &SdtValue,
     step_index: usize,
 ) -> Result<(), EditError> {
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
+    // The hosting paragraph may sit in a table cell (a form's checkboxes
+    // usually do), so resolve it as the other paragraph edits do.
+    let Some(path) = super::super::find_paragraph_path(doc, block_id) else {
+        // A block that is not a paragraph (a table) hosts no inline control.
+        return Err(match find_block_index(&doc.blocks, block_id) {
+            Some(_) => EditError::ContentControlNotFound {
+                sdt_id: sdt_id.clone(),
+                step_index,
+            },
+            None => EditError::BlockNotFound {
+                block_id: block_id.clone(),
+                step_index,
+            },
+        });
+    };
 
-    let node = locate_sdt_mut(&mut doc.blocks[idx].block, sdt_id, step_index)?;
+    let node = locate_sdt_mut(super::super::block_at_mut(doc, &path), sdt_id, step_index)?;
     let raw = node
         .raw_xml
         .as_deref()
@@ -391,7 +385,7 @@ pub(crate) fn apply_set_value(
     apply_value_to_sdt(&mut element, value, sdt_id, step_index)?;
 
     let new_raw = serialize_raw_fragment(&element);
-    node.content_hash = Some(sha256_hex(&new_raw));
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
     Ok(())
 }
@@ -411,7 +405,13 @@ fn apply_value_to_sdt(
     // text, not a real value. Leaving it set would make Word render the new text
     // as placeholder (greyed, replaced on next focus). Clear it for every value
     // kind, before the value-specific mutation below.
-    clear_showing_placeholder(sdt);
+    let value_rpr = super::sdt_text_fill::leave_placeholder(sdt).map_err(|reason| {
+        EditError::ContentControlRawXmlParse {
+            sdt_id: sdt_id.clone(),
+            reason,
+            step_index,
+        }
+    })?;
     match value {
         SdtValue::Checked(checked) => {
             if kind != DetectedKind::Checkbox {
@@ -424,7 +424,11 @@ fn apply_value_to_sdt(
             }
             set_checkbox_state(sdt, *checked);
             // The displayed glyph (sdtContent run text) tracks the state.
-            set_sdt_content_text(sdt, if *checked { "\u{2612}" } else { "\u{2610}" });
+            set_sdt_content_text(
+                sdt,
+                if *checked { "\u{2612}" } else { "\u{2610}" },
+                &value_rpr,
+            );
         }
         SdtValue::Text(text) => {
             // Text is valid for text-bearing controls but NOT a checkbox (whose
@@ -437,7 +441,7 @@ fn apply_value_to_sdt(
                     step_index,
                 });
             }
-            set_sdt_content_text(sdt, text);
+            set_sdt_content_text(sdt, text, &value_rpr);
         }
         SdtValue::Selected(value) => {
             if kind != DetectedKind::Dropdown && kind != DetectedKind::ComboBox {
@@ -459,7 +463,7 @@ fn apply_value_to_sdt(
                     step_index,
                 }
             })?;
-            set_sdt_content_text(sdt, &display);
+            set_sdt_content_text(sdt, &display, &value_rpr);
         }
     }
     Ok(())
@@ -516,16 +520,6 @@ fn detect_control_kind(sdt: &Element) -> DetectedKind {
     DetectedKind::from(crate::opaque_meta::sdt_control_kind(sdt))
 }
 
-/// Remove `<w:showingPlcHdr/>` from the control's `w:sdtPr` if present, taking
-/// it out of the placeholder state (§17.5.2.39). A no-op when the control was
-/// not showing placeholder text.
-fn clear_showing_placeholder(sdt: &mut Element) {
-    if let Some(pr) = child_by_local_mut(sdt, "sdtPr") {
-        pr.children
-            .retain(|c| !matches!(c, XMLNode::Element(el) if el.name == "showingPlcHdr"));
-    }
-}
-
 /// Set the `w14:checked` @val under `w14:checkbox` to 1/0.
 fn set_checkbox_state(sdt: &mut Element, checked: bool) {
     if let Some(pr) = child_by_local_mut(sdt, "sdtPr")
@@ -548,20 +542,57 @@ fn list_item_display(sdt: &Element, value: &str) -> Option<String> {
 
 /// Replace the `w:sdtContent` with a single run carrying `text`, preserving the
 /// content element so the control stays well-formed.
-fn set_sdt_content_text(sdt: &mut Element, text: &str) {
+fn set_sdt_content_text(sdt: &mut Element, text: &str, value_rpr: &crate::opaque_splice::ValueRpr) {
     let Some(content) = child_by_local_mut(sdt, "sdtContent") else {
         return;
     };
-    // Build a single <w:r><w:t xml:space="preserve">text</w:t></w:r>.
+    let rpr = match value_rpr {
+        crate::opaque_splice::ValueRpr::OfReplacedText => first_text_run_rpr(content),
+        crate::opaque_splice::ValueRpr::Given(rpr) => rpr.clone(),
+    };
+    // Build a single <w:r>[rPr]<w:t xml:space="preserve">text</w:t></w:r>.
     let mut t = crate::word_xml::w_el("t");
     crate::xml_attrs::attr_set(&mut t, "xml:space", "preserve");
     t.children.push(XMLNode::Text(text.to_string()));
     let mut r = crate::word_xml::w_el("r");
+    if let Some(rpr) = rpr {
+        r.children.push(XMLNode::Element(rpr));
+    }
     r.children.push(XMLNode::Element(t));
     content.children = vec![XMLNode::Element(r)];
 }
 
 // ─── element helpers (xmltree-ns: `name` is the LOCAL name) ───────────────────
+
+/// The run properties of the first run with text under `parent`, in document
+/// order: the formatting the value it is replaced by keeps.
+fn first_text_run_rpr(parent: &Element) -> Option<Element> {
+    first_text_run(parent)?
+        .children
+        .iter()
+        .find_map(|child| match child {
+            XMLNode::Element(element) if element.name == "rPr" => Some(element.clone()),
+            _ => None,
+        })
+}
+
+fn first_text_run(parent: &Element) -> Option<&Element> {
+    parent.children.iter().find_map(|child| {
+        let XMLNode::Element(element) = child else {
+            return None;
+        };
+        let is_text_run = element.name == "r"
+            && element
+                .children
+                .iter()
+                .any(|c| matches!(c, XMLNode::Element(el) if el.name == "t"));
+        if is_text_run {
+            Some(element)
+        } else {
+            first_text_run(element)
+        }
+    })
+}
 
 fn child_by_local_mut<'a>(parent: &'a mut Element, local: &str) -> Option<&'a mut Element> {
     parent.children.iter_mut().find_map(|c| match c {
@@ -664,6 +695,16 @@ fn datastore_root_from_xpath(xpath: &str) -> String {
     }
 }
 
+/// The namespace of the datastore root the binding's first XPath step names:
+/// the one its prefix maps to in the binding's `w:prefixMappings`. An
+/// unprefixed step names a root in no namespace. Without it a prefixed XPath
+/// would address no node of the authored store.
+fn datastore_root_namespace(xpath: &str, prefix_mappings: Option<&str>) -> Option<String> {
+    let step = xpath.split('/').map(str::trim).find(|s| !s.is_empty())?;
+    let (prefix, _) = step.split('[').next()?.split_once(':')?;
+    crate::data_binding::parse_prefix_mappings(prefix_mappings?)?.remove(prefix)
+}
+
 /// A stable, document-unique positive decimal id for `w:id`, derived from the
 /// host id text. The value is opaque to Word — uniqueness is all that matters.
 fn stable_sdt_id(seed: &str) -> i32 {
@@ -750,7 +791,11 @@ mod tests {
             "<w:r><w:t>old</w:t></w:r>",
         );
         let mut el = parse_raw_fragment(xml.as_bytes()).unwrap();
-        set_sdt_content_text(&mut el, "new");
+        set_sdt_content_text(
+            &mut el,
+            "new",
+            &crate::opaque_splice::ValueRpr::OfReplacedText,
+        );
         let out = String::from_utf8(serialize_raw_fragment(&el)).unwrap();
         assert!(out.contains("new"));
         assert!(!out.contains("old"));

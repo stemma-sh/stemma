@@ -47,6 +47,44 @@ pub(crate) fn tracked_class_survives(
     }
 }
 
+/// Resolve physical slots of a simple tracked column grid. Accepting a
+/// deletion transfers its slot to the preceding surviving column, or to the
+/// following survivor when deleting the leading column. Rejecting an insertion
+/// removes its slot without transfer. Stacked origins never transfer a slot.
+/// Returned indices refer to the original frame, so both XML and model callers
+/// can update cell widths before removing their physical carriers.
+pub(crate) fn resolved_column_slots(
+    widths: &[u32],
+    removed: &[bool],
+    absorb: &[bool],
+) -> Result<Vec<(usize, u32)>, String> {
+    if widths.len() != removed.len() || widths.len() != absorb.len() {
+        return Err("column geometry and carrier counts differ".to_owned());
+    }
+    let mut result: Vec<_> = widths
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, _)| !removed[*index])
+        .collect();
+    for (index, width) in widths.iter().copied().enumerate() {
+        if !removed[index] || !absorb[index] {
+            continue;
+        }
+        let recipient = result
+            .iter()
+            .rposition(|(slot, _)| *slot < index)
+            .or_else(|| (!result.is_empty()).then_some(0));
+        if let Some(recipient) = recipient {
+            result[recipient].1 = result[recipient]
+                .1
+                .checked_add(width)
+                .ok_or_else(|| format!("column {index} width transfer overflows twips"))?;
+        }
+    }
+    Ok(result)
+}
+
 /// Whether removing a paragraph's terminating mark JOINS its content into the
 /// following paragraph for the given resolution direction (ECMA-376
 /// §17.13.5.15 / §17.13.5.20): accepting a mark DELETION, or rejecting a mark
@@ -142,6 +180,41 @@ pub(crate) fn table_emptied_by_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_slots_transfer_only_deleted_geometry() {
+        assert_eq!(
+            resolved_column_slots(
+                &[1000, 1000, 2200],
+                &[true, false, false],
+                &[true, false, false]
+            )
+            .unwrap(),
+            vec![(1, 2000), (2, 2200)]
+        );
+        assert_eq!(
+            resolved_column_slots(
+                &[1800, 1000, 1000, 2400],
+                &[false, false, true, false],
+                &[false, false, true, false]
+            )
+            .unwrap(),
+            vec![(0, 1800), (1, 2000), (3, 2400)]
+        );
+        // Rejecting an insertion and dropping a stacked-origin carrier do not
+        // donate its width to a pre-existing neighboring cell.
+        assert_eq!(
+            resolved_column_slots(
+                &[1800, 1000, 2400],
+                &[false, true, false],
+                &[false, false, false]
+            )
+            .unwrap(),
+            vec![(0, 1800), (2, 2400)]
+        );
+        assert!(resolved_column_slots(&[u32::MAX, 1], &[false, true], &[false, true]).is_err());
+        assert!(resolved_column_slots(&[1], &[], &[]).is_err());
+    }
 
     // Post-condition: the four-origin-rule survival table. Justified from the
     // domain (accept keeps insertions/drops deletions; reject the converse;

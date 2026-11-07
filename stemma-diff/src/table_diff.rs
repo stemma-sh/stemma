@@ -2,14 +2,27 @@
 //!
 //! Uses patience diff on row/column signatures to align rows between tables,
 //! then performs cell-level diffing within aligned rows.
+//!
+//! Row alignment is comparison-specific on purpose. Comparison keeps an
+//! aligned row whose content is unrelated as a `Replacement` and shows it as
+//! one replaced row; the engine's explicit table edits instead split a
+//! low-similarity match into a deleted and an inserted row. Cell text diffing
+//! and everything after alignment is the engine's.
 
 use similar::{Algorithm, DiffOp};
+use stemma::diff_cell_text;
 
 use crate::domain::{
-    BlockNode, CanonicalCell, CanonicalTable, InlineChange, InlineNode, NestedTableDiff,
-    StyleProps, TableNode, TrackedSegment, TrackingStatus,
+    BlockNode, CanonicalTable, InlineChange, NestedTableDiff, RunRprAuthored, StyleProps, TableNode,
 };
 use crate::table::canonicalize_table;
+// Shared with the engine: one implementation of the change pipeline.
+pub(crate) use stemma::{
+    CellDiff, CellDiffType, extract_tracked_table_new_text, extract_tracked_table_old_text,
+    table_has_tracked_changes,
+};
+use stemma::{extract_paragraph_text, find_cell_index};
+// Shared with the engine: one implementation of the change pipeline.
 
 /// Result of diffing two canonical tables.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,36 +51,6 @@ pub enum RowAlignment {
     Deleted { old_row: usize },
     /// Row was inserted in new table.
     Inserted { new_row: usize },
-}
-
-/// Diff result for a single cell.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CellDiff {
-    /// Index in old_table.cells (None if inserted).
-    pub old_cell_idx: Option<usize>,
-    /// Index in new_table.cells (None if deleted).
-    pub new_cell_idx: Option<usize>,
-    /// Type of change.
-    pub diff_type: CellDiffType,
-    /// Word-level text diff (for Modified cells with paragraph content).
-    pub text_diff: Option<Vec<InlineChange>>,
-    /// Diffs for nested tables within this cell (for Modified cells).
-    pub nested_table_diffs: Vec<NestedTableDiff>,
-}
-
-/// Type of cell change.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CellDiffType {
-    /// Cell content unchanged.
-    Unchanged,
-    /// Cell text modified.
-    Modified,
-    /// Cell inserted in new table.
-    Inserted,
-    /// Cell deleted from old table.
-    Deleted,
-    /// Cell merge (rowspan/colspan) changed but text may be same.
-    MergeChanged,
 }
 
 /// Diff two tables and produce a structured TableDiff.
@@ -433,17 +416,6 @@ fn diff_row_cells(
     diffs
 }
 
-/// Extract text only from paragraph blocks (not nested tables).
-fn extract_paragraph_text(blocks: &[BlockNode]) -> String {
-    use crate::table::extract_cell_text;
-    let para_blocks: Vec<_> = blocks
-        .iter()
-        .filter(|b| matches!(b, BlockNode::Paragraph(_)))
-        .cloned()
-        .collect();
-    extract_cell_text(&para_blocks)
-}
-
 /// Diff nested tables within a cell's blocks.
 ///
 /// Walks block pairs positionally and produces `NestedTableDiff` entries
@@ -474,62 +446,6 @@ fn diff_cell_nested_tables(
         .collect()
 }
 
-/// Find the index of a cell in the table's cells vector.
-fn find_cell_index(table: &CanonicalTable, cell: &CanonicalCell) -> Option<usize> {
-    table.cells.iter().position(|c| c.id == cell.id)
-}
-
-/// Diff cell text at token level.
-fn diff_cell_text(old_text: &str, new_text: &str) -> Vec<InlineChange> {
-    use crate::compiler::{cleanup_inline_changes, tokenize};
-    use similar::{Algorithm, ChangeTag, TextDiff};
-
-    let old_tokens = tokenize(old_text);
-    let new_tokens = tokenize(new_text);
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Patience)
-        .diff_slices(&old_tokens, &new_tokens);
-    let mut changes = Vec::new();
-
-    for change in diff.iter_all_changes() {
-        let text = change.to_string_lossy().into_owned();
-        if text.is_empty() {
-            continue;
-        }
-
-        match change.tag() {
-            ChangeTag::Equal => {
-                changes.push(InlineChange::Unchanged {
-                    text,
-                    marks: Vec::new(),
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                });
-            }
-            ChangeTag::Delete => {
-                changes.push(InlineChange::Deleted {
-                    text,
-                    marks: Vec::new(),
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                    rev_id: 0,
-                });
-            }
-            ChangeTag::Insert => {
-                changes.push(InlineChange::Inserted {
-                    text,
-                    marks: Vec::new(),
-                    style_props: StyleProps::default(),
-                    formatting_change: None,
-                    rev_id: 0,
-                });
-            }
-        }
-    }
-
-    cleanup_inline_changes(changes)
-}
-
 /// Describe an unrelated physical replacement without preserving coincidental
 /// common tokens as semantic content lineage.
 fn diff_cell_text_unrelated(old_text: &str, new_text: &str) -> Vec<InlineChange> {
@@ -539,6 +455,7 @@ fn diff_cell_text_unrelated(old_text: &str, new_text: &str) -> Vec<InlineChange>
             text: old_text.to_string(),
             marks: Vec::new(),
             style_props: StyleProps::default(),
+            rpr_authored: RunRprAuthored::default(),
             formatting_change: None,
             rev_id: 0,
         });
@@ -548,6 +465,7 @@ fn diff_cell_text_unrelated(old_text: &str, new_text: &str) -> Vec<InlineChange>
             text: new_text.to_string(),
             marks: Vec::new(),
             style_props: StyleProps::default(),
+            rpr_authored: RunRprAuthored::default(),
             formatting_change: None,
             rev_id: 0,
         });
@@ -563,126 +481,6 @@ fn diff_cell_text_unrelated(old_text: &str, new_text: &str) -> Vec<InlineChange>
 // decide whether a tracked table needs a diff entry at all, and to align
 // its tracked content with adjacent atoms.
 // ---------------------------------------------------------------------------
-
-fn tracked_text_from_inlines(inlines: &[InlineNode]) -> String {
-    let mut out = String::new();
-    for inline in inlines {
-        match inline {
-            InlineNode::Text(t) => out.push_str(&t.text),
-            InlineNode::HardBreak(_) => out.push('\n'),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn tracked_text_from_segments_filtered(
-    segments: &[TrackedSegment],
-    filter: impl Fn(&TrackingStatus) -> bool,
-) -> String {
-    let mut out = String::new();
-    for seg in segments {
-        if filter(&seg.status) {
-            out.push_str(&tracked_text_from_inlines(&seg.inlines));
-        }
-    }
-    out
-}
-
-/// Extract "old" text from a table's tracked segments (Normal + Deleted, skip Inserted).
-/// Matches the separator conventions of `diff::extract_table_text`.
-pub fn extract_tracked_table_old_text(table: &TableNode) -> String {
-    let mut out = String::new();
-    for row in &table.rows {
-        // Inserted rows are not in the base; neither are stacked
-        // (inserted-then-deleted) rows — their content never existed there.
-        if matches!(
-            row.tracking_status,
-            Some(TrackingStatus::Inserted(_)) | Some(TrackingStatus::InsertedThenDeleted(_))
-        ) {
-            continue;
-        }
-        for cell in &row.cells {
-            for block in &cell.blocks {
-                if let BlockNode::Paragraph(p) = block {
-                    let text = tracked_text_from_segments_filtered(&p.segments, |status| {
-                        !matches!(
-                            status,
-                            TrackingStatus::Inserted(_) | TrackingStatus::InsertedThenDeleted(_)
-                        )
-                    });
-                    if !text.trim().is_empty() {
-                        if !out.is_empty() {
-                            out.push(' ');
-                        }
-                        out.push_str(&text);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Extract "new" text from a table's tracked segments (Normal + Inserted, skip Deleted).
-/// Matches the separator conventions of `diff::extract_table_text`.
-pub fn extract_tracked_table_new_text(table: &TableNode) -> String {
-    let mut out = String::new();
-    for row in &table.rows {
-        // Deleted rows leave the accepted reading; so do stacked rows
-        // (accepting the deletion settles the insertion's claim).
-        if matches!(
-            row.tracking_status,
-            Some(TrackingStatus::Deleted(_)) | Some(TrackingStatus::InsertedThenDeleted(_))
-        ) {
-            continue;
-        }
-        for cell in &row.cells {
-            for block in &cell.blocks {
-                if let BlockNode::Paragraph(p) = block {
-                    let text = tracked_text_from_segments_filtered(&p.segments, |status| {
-                        !matches!(
-                            status,
-                            TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_)
-                        )
-                    });
-                    if !text.trim().is_empty() {
-                        if !out.is_empty() {
-                            out.push(' ');
-                        }
-                        out.push_str(&text);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Check whether a table has any tracked changes (any non-Normal segments or
-/// non-Normal row/cell tracking status).
-pub fn table_has_tracked_changes(table: &TableNode) -> bool {
-    for row in &table.rows {
-        if row.tracking_status.is_some() {
-            return true;
-        }
-        for cell in &row.cells {
-            if cell.tracking_status.is_some() {
-                return true;
-            }
-            for block in &cell.blocks {
-                if let BlockNode::Paragraph(p) = block {
-                    for seg in &p.segments {
-                        if !matches!(seg.status, TrackingStatus::Normal) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {
@@ -776,6 +574,7 @@ mod tests {
                 text_id: None,
                 text_direction: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             })],
             grid_span: 1,
@@ -793,11 +592,13 @@ mod tests {
 
     fn make_table(rows: Vec<Vec<&str>>) -> TableNode {
         TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: rows
                 .into_iter()
                 .enumerate()
                 .map(|(r, cells)| TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from(format!("tbl_0_r{}", r)),
                     cells: cells
                         .into_iter()
@@ -813,7 +614,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -1096,6 +897,7 @@ mod tests {
         let inner_table = make_table(inner_rows);
         // Adjust inner table ID to be unique based on cell
         let inner_table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from(format!("{}_inner_tbl", id)),
             ..inner_table
         };
@@ -1180,6 +982,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         });
 
@@ -1204,8 +1007,10 @@ mod tests {
         // Outer table has one row with one cell containing a nested table.
         // The nested table's inner cell text changes.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1221,7 +1026,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1237,8 +1042,10 @@ mod tests {
         };
 
         let new = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1254,7 +1061,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1312,8 +1119,10 @@ mod tests {
     fn test_nested_table_both_para_and_table_change() {
         // Both the paragraph text and nested table content change.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1329,7 +1138,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1345,8 +1154,10 @@ mod tests {
         };
 
         let new = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1362,7 +1173,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,
@@ -1403,8 +1214,10 @@ mod tests {
     fn test_nested_table_unchanged() {
         // Nested table content is the same — no diffs should be generated.
         let old = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("outer"),
             rows: vec![TableRowNode {
+                source_row_attrs: Vec::new(),
                 id: NodeId::from("outer_r0"),
                 cells: vec![make_nested_table_cell(
                     "outer_c0",
@@ -1420,7 +1233,7 @@ mod tests {
                 formatting_change: None,
                 para_id: None,
                 text_id: None,
-                cant_split: false,
+                cant_split: None,
                 jc: None,
                 w_before: None,
                 w_after: None,

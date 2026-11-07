@@ -99,6 +99,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -123,6 +124,7 @@ fn make_cell(id: &str, paragraph_text: &str) -> TableCellNode {
 
 fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -134,7 +136,7 @@ fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -148,6 +150,7 @@ fn make_row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 
 fn make_table(id: &str, rows: Vec<TableRowNode>) -> TableNode {
     TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from(id),
         rows,
         structure_hash: String::new(),

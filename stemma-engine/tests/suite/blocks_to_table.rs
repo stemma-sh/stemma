@@ -209,38 +209,27 @@ fn three_bullets_to_two_col_table_with_header() {
         "table + 3 deleted source paragraphs"
     );
     assert!(
-        matches!(redline.blocks[0].status, TrackingStatus::Inserted(_)),
-        "first block is the tracked-inserted table"
-    );
-    assert!(
         matches!(redline.blocks[0].block, BlockNode::Table(_)),
         "first block is a table"
     );
-    // The table is tracked-inserted at EVERY level: rows, cells, and cell runs.
+    // The table is ONE insertion proposal carried natively on its rows
+    // (§17.13.5.17), the form insert(table) authors and the table reopens
+    // as: no separate block carrier. Word reads it as a single insertion
+    // covering the whole table, content included.
+    assert!(
+        matches!(redline.blocks[0].status, TrackingStatus::Normal),
+        "the insertion is carried by the rows, not an extra block carrier"
+    );
     if let BlockNode::Table(t) = &redline.blocks[0].block {
-        for row in &t.rows {
-            assert!(
-                matches!(row.tracking_status, Some(TrackingStatus::Inserted(_))),
-                "every inserted-table row must carry Inserted tracking (w:trPr/w:ins)"
-            );
-            for cell in &row.cells {
-                assert!(
-                    matches!(cell.tracking_status, Some(TrackingStatus::Inserted(_))),
-                    "every inserted-table cell must carry Inserted tracking (w:cellIns)"
-                );
-                for block in &cell.blocks {
-                    if let BlockNode::Paragraph(p) = block {
-                        for seg in &p.segments {
-                            assert!(
-                                matches!(seg.status, TrackingStatus::Inserted(_)),
-                                "inserted-table cell runs must be Inserted (w:ins) so a \
-                                 run-level reader rejects them too"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let identities: std::collections::BTreeSet<u32> = t
+            .rows
+            .iter()
+            .map(|row| match &row.tracking_status {
+                Some(TrackingStatus::Inserted(r)) => r.identity,
+                other => panic!("every inserted-table row carries the insertion: {other:?}"),
+            })
+            .collect();
+        assert_eq!(identities.len(), 1, "one proposal for the whole table");
     }
     // The source range ends the DOCUMENT here, so the tail rule applies: every
     // source paragraph but the last is tracked-deleted (block + mark); the LAST
@@ -534,5 +523,321 @@ fn non_paragraph_in_range_is_refused() {
             }
         ),
         "got {err:?}"
+    );
+}
+
+// ─── Cells carry their source content, footnote references included ─────────
+
+/// A capital-structure list whose amounts carry footnote references, with a
+/// bold label run: "Estimated Total Value: $100¹", "Secured Debt: $40²",
+/// followed by a paragraph that stays (so the range does not end the body).
+fn footnoted_list_docx() -> Vec<u8> {
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Estimated Total Value</w:t></w:r>"#,
+            r#"<w:r><w:t xml:space="preserve">: $100</w:t></w:r>{}</w:p>"#,
+            r#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Secured Debt</w:t></w:r>"#,
+            r#"<w:r><w:t xml:space="preserve">: $40</w:t></w:r>{}</w:p>"#,
+            r#"<w:p><w:r><w:t>After the list.</w:t></w:r></w:p>"#,
+        ),
+        note_ref(1),
+        note_ref(2)
+    );
+    footnoted_docx(&body)
+}
+
+fn note_ref(id: u32) -> String {
+    format!(
+        r#"<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="{id}"/></w:r>"#
+    )
+}
+
+/// A package with `body` and footnotes 1 and 2.
+fn footnoted_docx(body: &str) -> Vec<u8> {
+    let note = |id: u32, text: &str| {
+        format!(
+            r#"<w:footnote w:id="{id}"><w:p><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> {text}</w:t></w:r></w:p></w:footnote>"#
+        )
+    };
+    let footnotes = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="{W_NS}"><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>{}{}</w:footnotes>"#,
+        note(1, "Valuation as of the petition date."),
+        note(2, "Secured by the plant.")
+    );
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W_NS}" xmlns:r="{R_NS}"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+    );
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdFn" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#;
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions = zip::write::FileOptions::default();
+        for (name, data) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", rels),
+            ("word/_rels/document.xml.rels", doc_rels),
+            ("word/document.xml", document_xml.as_str()),
+            ("word/footnotes.xml", footnotes.as_str()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+fn colon_table_step(canon: &CanonDoc) -> EditStep {
+    EditStep::BlocksToTable {
+        from_block_id: block_id_at(canon, 0),
+        to_block_id: block_id_at(canon, 1),
+        delimiter: ": ".to_string(),
+        header: Some(vec!["Item".to_string(), "Amount".to_string()]),
+        rationale: None,
+    }
+}
+
+/// The ids of the footnote references in a table cell, in order.
+fn cell_note_references(canon: &CanonDoc, row: usize, column: usize) -> Vec<String> {
+    let table = canon
+        .blocks
+        .iter()
+        .find_map(|tb| match &tb.block {
+            BlockNode::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("a table");
+    table.rows[row].cells[column]
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            BlockNode::Paragraph(p) => Some(p),
+            _ => None,
+        })
+        .flat_map(|p| p.all_inlines())
+        .filter_map(|inline| match inline {
+            InlineNode::OpaqueInline(o) => match &o.kind {
+                stemma::domain::OpaqueKind::FootnoteReference(r) => Some(r.reference_id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The normal (non-separator) notes' ids and texts.
+fn normal_notes(canon: &CanonDoc) -> Vec<(String, String)> {
+    canon
+        .footnotes
+        .iter()
+        .filter(|note| note.note_type == stemma::domain::NoteType::Normal)
+        .map(|note| {
+            let text = note
+                .blocks
+                .iter()
+                .filter_map(|tb| match &tb.block {
+                    BlockNode::Paragraph(p) => Some(p),
+                    _ => None,
+                })
+                .flat_map(|p| p.all_inlines())
+                .filter_map(|inline| match inline {
+                    InlineNode::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            (note.id.clone(), text)
+        })
+        .collect()
+}
+
+fn saved_document_xml(doc: &Document) -> String {
+    let bytes = doc.serialize(&ExportOptions::default()).expect("serialize");
+    String::from_utf8(
+        stemma::docx::DocxArchive::read(&bytes)
+            .expect("read")
+            .get("word/document.xml")
+            .expect("document part")
+            .to_vec(),
+    )
+    .expect("utf-8")
+}
+
+/// Domain rule: converting a list to a table keeps what the list says — the
+/// footnote references after the amounts and the notes they point to (the
+/// conversion changes layout, not content). In a tracked conversion the list
+/// stays as a deletion beside the inserted table, and Word repairs a file in
+/// which one note is referenced twice (Word-verified, even with one reference
+/// deleted and one inserted). So each reference in the table points to its own
+/// copy of the note: accept keeps the table with the copies, reject the list
+/// with the originals, and either way every note is referenced once.
+#[test]
+fn a_tracked_conversion_carries_footnote_references_with_their_own_notes() {
+    let doc = Document::parse(&footnoted_list_docx()).expect("parse");
+    let canon = doc.snapshot().canonical.clone();
+    let edited = doc
+        .apply(&txn(
+            vec![colon_table_step(&canon)],
+            MaterializationMode::TrackedChange,
+        ))
+        .expect("a list whose amounts carry footnote references converts");
+
+    let redline = &edited.snapshot().canonical;
+    let copies = [
+        cell_note_references(redline, 1, 1),
+        cell_note_references(redline, 2, 1),
+    ];
+    assert_eq!(copies[0].len(), 1, "the reference follows its amount");
+    assert_eq!(copies[1].len(), 1, "the reference follows its amount");
+    assert!(
+        !["1", "2"].contains(&copies[0][0].as_str()) && copies[0] != copies[1],
+        "each table reference points to a note of its own: {copies:?}"
+    );
+    let notes = normal_notes(redline);
+    for (copy, original) in [(&copies[0][0], "1"), (&copies[1][0], "2")] {
+        let text_of = |id: &str| {
+            notes
+                .iter()
+                .find(|(note, _)| note == id)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_else(|| panic!("note {id} exists: {notes:?}"))
+        };
+        assert_eq!(
+            text_of(copy),
+            text_of(original),
+            "the copy has the same content"
+        );
+    }
+
+    // Saved: every note referenced exactly once, and the package is clean.
+    let xml = saved_document_xml(&edited);
+    for (id, _) in &notes {
+        let references = xml
+            .split("<w:footnoteReference ")
+            .skip(1)
+            .filter(|element| {
+                element[..element.find("/>").expect("an empty element")]
+                    .contains(&format!(r#"w:id="{id}""#))
+            })
+            .count();
+        assert_eq!(references, 1, "note {id} is referenced once: {xml}");
+    }
+    let bytes = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let report = validate(&bytes);
+    assert!(report.ok, "{report:?}");
+
+    // Accept: the table, its amounts with their references, the copies only.
+    let accepted = edited.project(Resolution::AcceptAll).expect("accept");
+    let accepted = &accepted.snapshot().canonical;
+    assert_eq!(
+        first_table_cell_texts(accepted),
+        vec![
+            vec!["Item".to_string(), "Amount".to_string()],
+            vec!["Estimated Total Value".to_string(), "$100".to_string()],
+            vec!["Secured Debt".to_string(), "$40".to_string()],
+        ]
+    );
+    assert_eq!(cell_note_references(accepted, 1, 1), copies[0]);
+    assert_eq!(
+        normal_notes(accepted)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        vec![copies[0][0].clone(), copies[1][0].clone()],
+        "the originals went with the list"
+    );
+
+    // Reject: the list with the original notes only.
+    let rejected = edited.project(Resolution::RejectAll).expect("reject");
+    let rejected = &rejected.snapshot().canonical;
+    assert_eq!(table_count(rejected), 0);
+    assert_eq!(
+        normal_notes(rejected),
+        vec![
+            (
+                "1".to_string(),
+                " Valuation as of the petition date.".to_string()
+            ),
+            ("2".to_string(), " Secured by the plant.".to_string()),
+        ]
+    );
+}
+
+/// Without tracking the list simply becomes the table: the references move
+/// with their amounts and the notes stay as they are.
+#[test]
+fn a_direct_conversion_moves_footnote_references() {
+    let doc = Document::parse(&footnoted_list_docx()).expect("parse");
+    let canon = doc.snapshot().canonical.clone();
+    let converted = doc
+        .apply(&txn(
+            vec![colon_table_step(&canon)],
+            MaterializationMode::Direct,
+        ))
+        .expect("direct conversion");
+    let converted = &converted.snapshot().canonical;
+    assert_eq!(cell_note_references(converted, 1, 1), vec!["1".to_string()]);
+    assert_eq!(cell_note_references(converted, 2, 1), vec!["2".to_string()]);
+    assert_eq!(normal_notes(converted).len(), 2, "no note is copied");
+}
+
+/// A cell keeps its source runs' formatting: the bold label stays bold.
+#[test]
+fn a_cell_keeps_its_source_formatting() {
+    let doc = Document::parse(&footnoted_list_docx()).expect("parse");
+    let canon = doc.snapshot().canonical.clone();
+    let converted = doc
+        .apply(&txn(
+            vec![colon_table_step(&canon)],
+            MaterializationMode::Direct,
+        ))
+        .expect("direct conversion");
+    let xml = saved_document_xml(&converted);
+    let label = xml
+        .find(">Estimated Total Value</w:t>")
+        .expect("the label is written");
+    let run = &xml[xml[..label].rfind("<w:r>").expect("its run")..label];
+    let bold = |run: &str| run.contains("<w:b/>") || run.contains("<w:b />");
+    assert!(bold(run), "the label keeps its bold: {run}");
+    let amount = xml.find(">$100</w:t>").expect("the amount is written");
+    let run = &xml[xml[..amount].rfind("<w:r>").expect("its run")..amount];
+    assert!(!bold(run), "the amount was never bold: {run}");
+}
+
+/// A note reference inside the delimiter belongs to no cell; the conversion
+/// refuses rather than drop it.
+#[test]
+fn a_reference_inside_the_delimiter_is_refused() {
+    // "Value:¹ $100": the reference sits between the ":" and the " " of ": ".
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:t>Value:</w:t></w:r>{}<w:r><w:t xml:space="preserve"> $100</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>Debt:</w:t></w:r>{}<w:r><w:t xml:space="preserve"> $40</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>After the list.</w:t></w:r></w:p>"#,
+        ),
+        note_ref(1),
+        note_ref(2)
+    );
+    let doc = Document::parse(&footnoted_docx(&body)).expect("parse");
+    let canon = doc.snapshot().canonical.clone();
+    let err = apply_transaction(
+        &canon,
+        &txn(
+            vec![colon_table_step(&canon)],
+            MaterializationMode::TrackedChange,
+        ),
+    )
+    .expect_err("a reference no cell can hold is refused");
+    assert!(
+        err.to_string().contains("inside the delimiter"),
+        "the refusal names the cause: {err}"
     );
 }

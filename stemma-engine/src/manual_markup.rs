@@ -797,6 +797,7 @@ mod tests {
                 para_id: None,
                 text_id: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             }),
             move_id: None,

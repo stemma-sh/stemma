@@ -91,10 +91,15 @@
 pub mod api;
 pub mod audit;
 mod audit_delta;
+mod audit_image;
 
 // --- Tier 2: the typed IR / domain model ----------------------------------
+#[doc(hidden)]
+pub mod block_controls;
 pub mod domain;
-mod local_change;
+mod literal_prefix;
+#[doc(hidden)]
+pub mod local_change;
 pub mod redline_extract;
 pub mod roundtrip_compare;
 pub mod semantic_hash;
@@ -129,6 +134,7 @@ pub mod view;
 // Referenced only via `crate::` inside stemma. Sealed to keep the semver
 // surface to the tiers above.
 pub(crate) mod compat;
+pub(crate) mod data_binding;
 pub(crate) mod docx_package;
 pub(crate) mod docx_validate_namespaces;
 pub(crate) mod docx_validate_ordering;

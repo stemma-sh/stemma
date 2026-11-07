@@ -32,6 +32,14 @@ All of these are enumerable (`Document::revisions()` in Rust,
 `list_revisions` over MCP, `extract` in the CLI) and resolvable across
 every story, including the body, footnotes, tables, and section properties.
 
+One kind is enumerated but not resolvable: a tracked vertical cell merge
+(`w:cellMerge` carrying `w:vMerge` or `w:vMergeOrig`, §17.13.5.3), reported
+as kind `cell_merge` with `revision_id` 0. While one is pending, every
+resolution (Accept All, Reject All, and any selection) refuses with an error
+naming the cell, rather than return a "resolved" document that still carries
+it. A `w:cellMerge` with neither attribute changes nothing, as the standard
+allows, and is ignored.
+
 ## Word author labels
 
 Every revision carries a Word author label. It is a free-form display string,
@@ -85,10 +93,21 @@ disambiguating ordinal among identical duplicates. Two consequences:
 
 Practical discipline: read ids from the enumerator (`Document::revisions()`,
 MCP `list_revisions`, the CLI's `extract` or `read`, or a receipt), never
-from raw XML. Re-enumerating after each step is
-always safe and costs one read; author/all selectors need no id carrying at
-all. A selection naming an id that no longer exists fails loud (the CLI's
+from raw XML. (The one id that does mirror the XML is a change inside a
+textbox: it is the change's own `w:id`, and it is selectable only while that
+`w:id` is unique in the document; otherwise the enumerator reports it with
+id `0` and it is resolved only by accepting or rejecting everything.)
+Re-enumerating after each step is always safe and costs one read;
+author/all selectors need no id carrying at all. A selection naming an id that no longer exists fails loud (the CLI's
 refusal lists the ids actually pending) rather than resolving something else.
+
+A selection is also refused, naming the ids to resolve together, when part of
+it has no result that is the same in every order. Accepting a deleted
+paragraph mark whose join into the next paragraph is blocked only by a table
+another pending change deletes is one such case: the join depends on that
+table's fate, so the two must be resolved together (or the table first).
+Resolving only some of the changes that share one table's earlier grid is the
+other.
 
 ## Accept and reject are not symmetric erasures
 

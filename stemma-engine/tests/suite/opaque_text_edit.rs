@@ -105,6 +105,7 @@ fn interior_text(canon: &CanonDoc, kind: OpaqueTextTargetKind) -> String {
 
 fn edit_step(t: &OpaqueTextTarget, find: &str, replacement: &str) -> EditStep {
     EditStep::OpaqueTextEdit {
+        story: stemma::edit::StoryRef::Body,
         block_id: t.host_block_id.clone(),
         opaque_id: t.opaque_id.clone(),
         container_index: t.address.container_index,

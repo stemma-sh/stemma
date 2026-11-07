@@ -164,7 +164,7 @@ fn list_item_mark_formatting_leaves_run_text() {
 
 #[test]
 fn deleted_mark_with_mark_bold_merges_keeping_both_run_texts() {
-    let body = r#"<w:p><w:pPr><w:rPr><w:b/><w:del w:id="5" w:author="a"/></w:rPr></w:pPr><w:r><w:t>Hello </w:t></w:r></w:p><w:p><w:r><w:t>World</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:pPr><w:rPr><w:b/><w:del w:id="5" w:author="a"/></w:rPr></w:pPr><w:r><w:t xml:space="preserve">Hello </w:t></w:r></w:p><w:p><w:r><w:t>World</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_eq!(

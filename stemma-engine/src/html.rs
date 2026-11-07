@@ -65,7 +65,7 @@ fn write_block(out: &mut String, block: &BlockView) {
             }
             write_block_status_attr(out, &block.block_status);
             out.push('>');
-            write_literal_prefix(out, block.literal_prefix.as_deref());
+            write_literal_prefix(out, block);
             write_segments(out, &block.segments);
             out.push_str(&format!("</h{tag_level}>"));
         }
@@ -73,7 +73,7 @@ fn write_block(out: &mut String, block: &BlockView) {
             out.push_str(&format!("<p id=\"{}\"", escape_attr(&id)));
             write_block_status_attr(out, &block.block_status);
             out.push('>');
-            write_literal_prefix(out, block.literal_prefix.as_deref());
+            write_literal_prefix(out, block);
             write_segments(out, &block.segments);
             out.push_str("</p>");
         }
@@ -135,18 +135,21 @@ fn write_block_status_attr(out: &mut String, status: &TrackStatus) {
 }
 
 /// Emit a paragraph's typed-in enumeration label (`"1."`, `"(a)"`) ahead of its
-/// body, as `<span data-numbering-text="...">{label}\t</span>`. The label is
+/// body, as `<span data-numbering-text="{label}">` holding the label as written
+/// (with its separator, `BlockView::literal_prefix_text`). The label is
 /// real text Word reads (the serializer emits it as a run); it lives outside
 /// `segments` (in `literal_prefix`), so it is rendered here, untracked and
 /// HTML-escaped. The `data-numbering-text` attribute mirrors the frontend's
 /// own enumeration hook so the marker is distinguishable from body text. No-op
 /// when the paragraph carries no literal prefix.
-fn write_literal_prefix(out: &mut String, label: Option<&str>) {
-    let Some(label) = label else { return };
+fn write_literal_prefix(out: &mut String, block: &BlockView) {
+    let (Some(label), Some(written)) = (&block.literal_prefix, &block.literal_prefix_text) else {
+        return;
+    };
     out.push_str(&format!(
-        "<span data-numbering-text=\"{}\">{}\t</span>",
+        "<span data-numbering-text=\"{}\">{}</span>",
         escape_attr(label),
-        escape_text(label),
+        escape_text(written),
     ));
 }
 
@@ -320,6 +323,8 @@ mod tests {
             paragraph_mark_status: TrackStatus::Normal,
             guard: String::new(),
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             segments,
             opaque_label: None,
         }
@@ -344,6 +349,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![text_seg("H", vec![])],
                 opaque_label: None,
             };
@@ -369,6 +376,8 @@ mod tests {
             paragraph_mark_status: TrackStatus::Normal,
             guard: String::new(),
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             segments: vec![text_seg("Deep", vec![])],
             opaque_label: None,
         };
@@ -478,6 +487,8 @@ mod tests {
                 paragraph_mark_status: TrackStatus::Normal,
                 guard: String::new(),
                 literal_prefix: None,
+                literal_prefix_text: None,
+                literal_prefix_marks: Vec::new(),
                 segments: vec![],
                 opaque_label: None,
             },
@@ -504,6 +515,8 @@ mod tests {
         let mut block = para("p_5", vec![text_seg("Events", vec![])]);
         block.role = BlockRole::Heading { level: 1 };
         block.literal_prefix = Some("1.".to_string());
+        // The label as written: a label followed by a tab.
+        block.literal_prefix_text = Some("1.\t".to_string());
         let html = to_html_blocks(&[block]);
         assert!(
             html.contains(r#"<span data-numbering-text="1.">1.&#9;</span>"#)
@@ -533,6 +546,8 @@ mod tests {
             paragraph_mark_status: TrackStatus::Normal,
             guard: String::new(),
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             segments: vec![],
             opaque_label: Some("quarantined_nested_tracked_changes".to_string()),
         };
@@ -561,6 +576,8 @@ mod tests {
             paragraph_mark_status: TrackStatus::Normal,
             guard: String::new(),
             literal_prefix: None,
+            literal_prefix_text: None,
+            literal_prefix_marks: Vec::new(),
             segments: vec![],
             opaque_label: None,
         };

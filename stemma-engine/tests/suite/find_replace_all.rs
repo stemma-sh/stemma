@@ -62,6 +62,7 @@ fn make_hyperlink(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(
@@ -144,6 +145,7 @@ fn build_paragraph(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         text_direction: None,
         cnf_style: None,
         formatting_change: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }

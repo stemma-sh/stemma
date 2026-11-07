@@ -1,8 +1,9 @@
 //! A comment range whose two halves straddle a tracked change must stay ANCHORED
-//! when the change is resolved: the `commentRangeStart`/`commentRangeEnd` pair
-//! collapses to a POINT at the surviving half (ECMA-376 §17.13.6, Word's behavior
-//! when a commented range's interior is removed), the `commentReference` run keeps
-//! the comment alive, and the comment stays retrievable from `word/comments.xml`.
+//! when the change is resolved: the removed half stays at the removal point
+//! (ECMA-376 §17.13.6 — a range is a pair of positions), so the pair stays
+//! whole, a point when the removal took the whole interior; the
+//! `commentReference` run keeps the comment alive, and the comment stays
+//! retrievable from `word/comments.xml`.
 //!
 //! Before the fix the MODEL path (`Document::project`) left a lone half: a
 //! `commentRangeStart`/`End` sitting inside a `w:ins`/`w:del` was dropped at
@@ -140,10 +141,10 @@ fn comment_ids(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Assert the comment range `id` collapsed to a paired point (exactly one start,
-/// one end, ADJACENT in document order), the commentReference for `id` survived,
-/// and the comment is still retrievable from comments.xml.
-fn assert_comment_anchored_at_point(bytes: &[u8], id: &str) {
+/// Assert the comment range `id` stayed whole (exactly one start, then one
+/// end), the commentReference for `id` survived, and the comment is still
+/// retrievable from comments.xml.
+fn assert_comment_anchored(bytes: &[u8], id: &str) {
     let xml = document_xml_of(bytes);
     assert_eq!(
         xml.matches("<w:commentRangeStart").count(),
@@ -155,8 +156,7 @@ fn assert_comment_anchored_at_point(bytes: &[u8], id: &str) {
         1,
         "the torn commentRangeEnd is re-paired: {xml}"
     );
-    // Collapsed to a point: start immediately followed by end for this id, with
-    // no intervening content between the two range halves.
+    // Whole: this id's start, then its end.
     let markers = ordered_markers(&xml);
     let range_only: Vec<(String, String)> = markers
         .iter()
@@ -169,7 +169,7 @@ fn assert_comment_anchored_at_point(bytes: &[u8], id: &str) {
             ("commentRangeStart".to_string(), id.to_string()),
             ("commentRangeEnd".to_string(), id.to_string()),
         ],
-        "comment range collapses to a point (start immediately followed by end): {xml}"
+        "comment range stays whole (start followed by end): {xml}"
     );
     // The commentReference run survives (comment stays anchored). Match by
     // (name, id) rather than a literal attribute string: the serializer may emit
@@ -215,7 +215,7 @@ fn torn_comment_survivor_start_collapses_on_reject() {
     </w:p>"#;
     let bytes = pack_with_comments(body, &["1"]);
     let out = model_resolve(&bytes, /*accept=*/ false);
-    assert_comment_anchored_at_point(&out, "1");
+    assert_comment_anchored(&out, "1");
     assert!(
         !document_xml_of(&out).contains("inserted"),
         "the rejected insertion content is gone"
@@ -276,8 +276,8 @@ fn import_models_comment_end_inside_tracked_container() {
 // ── (b) survivor END-half, on ACCEPT ─────────────────────────────────────────
 
 /// commentRangeStart INSIDE a w:del, its commentRangeEnd in base (survivor).
-/// Accepting removes the deletion (and the start); the pair must collapse to a
-/// point at the surviving end.
+/// Accepting removes the deleted text; the start stays at the removal point,
+/// so the surviving "mid" stays inside the range.
 #[test]
 fn torn_comment_survivor_end_collapses_on_accept() {
     let body = r#"<w:p>
@@ -293,19 +293,24 @@ fn torn_comment_survivor_end_collapses_on_accept() {
     </w:p>"#;
     let bytes = pack_with_comments(body, &["2"]);
     let out = model_resolve(&bytes, /*accept=*/ true);
-    assert_comment_anchored_at_point(&out, "2");
+    assert_comment_anchored(&out, "2");
+    let xml = document_xml_of(&out);
     assert!(
-        !document_xml_of(&out).contains("deleted"),
+        !xml.contains("deleted"),
         "the accepted deletion content is gone"
     );
+    let start = xml.find("<w:commentRangeStart").unwrap();
+    let mid = xml.find(">mid<").unwrap();
+    let end = xml.find("<w:commentRangeEnd").unwrap();
+    assert!(start < mid && mid < end, "\"mid\" stays commented: {xml}");
 }
 
 // ── (c) comment tear + bookmark tear, same paragraph (family independence) ────
 
 /// A comment range and a bookmark that share the numeric id 3, both torn by the
-/// same rejected insertion. Each must collapse to its OWN family's point — the
-/// family-keyed repair must not cross-pair a bookmarkEnd with a commentRangeStart
-/// — and the comment must stay anchored/retrievable.
+/// same rejected insertion. Each end stays at the removal point within its OWN
+/// family — a bookmarkEnd must not pair with a commentRangeStart — and the
+/// comment must stay anchored/retrievable.
 #[test]
 fn comment_and_bookmark_tears_collapse_independently() {
     let body = r#"<w:p>
@@ -324,7 +329,7 @@ fn comment_and_bookmark_tears_collapse_independently() {
     let out = model_resolve(&bytes, /*accept=*/ false);
 
     // Comment collapsed and anchored.
-    assert_comment_anchored_at_point(&out, "3");
+    assert_comment_anchored(&out, "3");
 
     // Bookmark collapsed independently: exactly one start + one end, paired.
     let xml = document_xml_of(&out);
@@ -338,8 +343,8 @@ fn comment_and_bookmark_tears_collapse_independently() {
         1,
         "bookmarkEnd re-paired: {xml}"
     );
-    // No cross-pairing: restricting to the range markers, each family's start is
-    // immediately followed by its own end.
+    // The ends keep their document order at the removal point: the comment
+    // range stays nested inside the bookmark, as in the source.
     let markers: Vec<(String, String)> = ordered_markers(&xml)
         .into_iter()
         .filter(|(n, _)| n.starts_with("bookmark") || n.starts_with("commentRange"))
@@ -348,11 +353,11 @@ fn comment_and_bookmark_tears_collapse_independently() {
         markers,
         vec![
             ("bookmarkStart".to_string(), "3".to_string()),
-            ("bookmarkEnd".to_string(), "3".to_string()),
             ("commentRangeStart".to_string(), "3".to_string()),
             ("commentRangeEnd".to_string(), "3".to_string()),
+            ("bookmarkEnd".to_string(), "3".to_string()),
         ],
-        "each family collapses to its own point, no cross-pairing: {xml}"
+        "each family keeps its own pair, no cross-pairing: {xml}"
     );
 }
 

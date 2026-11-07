@@ -20,6 +20,46 @@ Two materialization modes:
   Use it only when the
   task explicitly wants untracked changes.
 
+Some operations are inherently direct because Word records no tracked change
+for them:
+
+- image resize and alt-text edits (`set_image_attrs`);
+- `move_column` and `swap_cells`, which are refused in a tracked transaction
+  (Word records no column or cell moves); send them with direct mode;
+- `set_block_form_text` and `set_textbox_text`, which update the field result
+  or the textbox's paragraphs in place;
+- `merge_cells`, which is applied untracked even inside a tracked
+  transaction, as Word's Merge Cells is with Track Changes on.
+
+Accepting or rejecting revisions does not undo these changes. The audit
+reports them as direct changes.
+
+## Paragraph insertion
+
+Paragraphs can be inserted before or after a body paragraph or a paragraph in
+a table cell, including nested cells. Native list numbering and local paragraph
+formatting are retained. Without a role, insertion inherits the anchor's
+formatting for `before`, or the following paragraph's formatting for `after`
+(the anchor's when there is no following paragraph in the same container).
+An explicit role selects its vocabulary exemplar, which need not have the
+same formatting as the nearest paragraph.
+
+Cell insertion currently accepts paragraph blocks only. It refuses pending
+tracked table/row/cell ancestors, cell content-control ranges, and literal
+text numbering that would require renumbering. Resolve the enclosing change
+first or use native list numbering where applicable; no weaker export path is
+selected automatically.
+
+## Body content controls
+
+A body-level content control whose content is paragraphs and tables is
+**open**: its blocks are ordinary blocks with their own ids, every edit
+reaches them, and `sdt_text_fill` addresses the control by its first block's
+id. A control holding anything else directly (a body-level bookmark, custom
+XML) is **sealed**: it is preserved as one opaque block, `sdt_text_fill`
+addresses it by `body_index`, and `set_block_form_text` reaches the form
+fields inside it.
+
 ## Receipts and refusals
 
 Every successful write returns a receipt: the ids of blocks that actually
@@ -55,7 +95,14 @@ survives everything else.
 
 The MCP `review_session` verb and the Rust `Document::review()` are the same
 read-back. Both return the census of what you changed, the direct untracked
-delta, and proof that everything else is untouched:
+delta, and proof that everything else is untouched.
+
+The proof is scoped to the canonical block model, not natural-language task
+correctness or identical rendering in every Word consumer. Session review uses
+retained block identities. File-pair audit uses explicit insertion markers and
+conservative baseline positions; independently imported numeric IDs do not
+establish lineage. Package validation is a separate structural check, not a
+visual comparison. Always verify the requested content and formatting as well.
 
 ```rust
 let report = doc.review().expect("review the session");
@@ -73,9 +120,11 @@ let out = doc.serialize(&ExportOptions::default()).expect("serialize validated D
 
 Runnable: `cargo run -p stemma --example review_before_save`.
 
-Saving always targets a new, unused path. Inputs and every existing destination
-are refused; there is no overwrite option. MCP paths must also stay inside its
-configured workspace root. Successful transport commits report the exact byte
+The CLI and MCP always save to a new, unused path: inputs and every existing
+destination are refused, and there is no overwrite option. MCP paths must also
+stay inside its configured workspace root. The Python binding follows the same
+rule by default; its `save(path, overwrite=True)` replaces an existing file
+atomically. Successful transport commits report the exact byte
 length and SHA-256 of the create-new artifact.
 
 MCP also binds path-backed media to the session and output receipt. See the

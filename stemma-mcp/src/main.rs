@@ -60,7 +60,8 @@ struct OpenArgs {
     /// Path to a .docx under the MCP workspace root. Relative paths resolve
     /// from that root.
     path: String,
-    /// Complete task declaration. Valid only on the first open for a task and
+    /// Omit for ordinary single-document editing: opening with path alone is
+    /// sufficient. Complete multi-document task declaration, valid only on the first open for a task and
     /// mutually exclusive with task_id.
     #[serde(default)]
     task: Option<TaskDeclarationArg>,
@@ -114,6 +115,11 @@ enum InspectQuery {
     Rejected,
     /// Footnote/endnote inventory with note ids, kinds, and editable body text.
     Notes,
+    /// Paged authored header/footer blocks, including part names and field anchors.
+    /// Synthesized blank stories have no editable package part and are excluded.
+    HeadersFooters,
+    /// Legacy form-field addresses inside opaque body controls; not SDT first-text targets.
+    NestedFormFields,
     /// Complete transaction-operation vocabulary; optionally filter by name.
     Operations,
 }
@@ -130,22 +136,26 @@ enum InspectBlockDetail {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InspectDocxArgs {
-    /// The doc_id returned by open_docx.
+    /// The doc_id returned by open_docx. May be omitted while exactly one
+    /// document is open: the call is then about that document.
+    #[serde(default)]
     doc_id: String,
     /// Projection to return. Omit for the first compact index page.
     #[serde(default)]
     query: InspectQuery,
     /// Required for query="block" or query="section"; use an id from
-    /// open_docx or the document projection.
+    /// open_docx or the document projection. Optional exact selection for
+    /// query="headers_footers", using a story-local id from that query.
     #[serde(default)]
     block_id: Option<String>,
-    /// Valid only for query="block": "compact" (default) or "formatting".
+    /// Valid for query="block" or "headers_footers": "compact" (default) or "formatting".
     /// Compact retains exact editable identity and opaque anchors; formatting
     /// adds complete run-level marks, style properties, and metadata.
     #[serde(default)]
     detail: Option<InspectBlockDetail>,
     /// Required for query="find". For query="operations", optionally pass one
-    /// exact operation name to retrieve only that entry.
+    /// exact operation name to retrieve only that entry. For query="headers_footers",
+    /// an exact part_name scopes the read to one authored story.
     #[serde(default)]
     pattern: Option<String>,
     /// Additive batch form for query="find": one to eight non-empty patterns.
@@ -219,6 +229,12 @@ impl schemars::JsonSchema for TransactionArg {
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // The op names come from the engine's operation catalog, the same
+        // source `inspect_docx query=operations` and the parser use.
+        let op_names: Vec<&str> = op_catalog::operation_catalog()
+            .iter()
+            .map(|spec| spec.name)
+            .collect();
         // A faithful-but-shallow schema for the v4 transaction. It pins the
         // top-level shape (so a client can validate before sending and the
         // bridge transmits an object) without duplicating the ~40-op catalog,
@@ -244,7 +260,10 @@ impl schemars::JsonSchema for TransactionArg {
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "description": "The op kind (snake_case)."
+                                "enum": op_names,
+                                "description": "The op kind, from the engine's operation \
+                                                catalog (inspect_docx query=operations \
+                                                lists each op's fields and examples)."
                             }
                         },
                         "required": ["op"]
@@ -505,11 +524,20 @@ fn augment_schema_error(txn_json: &str, base: &str) -> String {
             }
         }
     }
+    // A link is the one formatting agents ask for as a mark that the model
+    // carries as an inline node; name that node when the parser rejects it.
+    let link_hint = if base.contains("unknown variant `link`") {
+        "\nA link is not a mark: put it in the paragraph's content as an inline node, \
+         {\"type\":\"hyperlink\",\"attrs\":{\"href\":\"<url>\"},\"content\":[{\"type\":\"text\",\"text\":\"<link text>\"}]}, \
+         between the text nodes before and after it."
+    } else {
+        ""
+    };
     if shapes.is_empty() {
-        base.to_string()
+        format!("{base}{link_hint}")
     } else {
         format!(
-            "{base}\nExpected op shape(s) — fill the <…> placeholders:\n{}",
+            "{base}{link_hint}\nExpected op shape(s) — fill the <…> placeholders:\n{}",
             shapes.join("\n")
         )
     }
@@ -623,8 +651,13 @@ struct ApplyEditArgs {
     /// destination) without a follow-up read.
     ///
     /// A `table_op` carries `{ "op": "table_op", "target": "<table_block_id>",
-    /// "table_op": { "kind": "insert_row" | "delete_row" | "insert_column" |
-    /// "delete_column" | "merge_cells" | "set_cell_text", ... } }`. For
+    /// "table_op": { "kind": "insert_row" | "delete_row" | "move_row" | "reorder_rows" | "insert_column" |
+    /// "delete_column" | "move_column" | "swap_cells" | "merge_cells" | "set_cell_text", ... } }`.
+    /// `swap_cells` exchanges two cells' contents, each keeping its cell formatting:
+    /// `{ "kind": "swap_cells", "row": <r>, "col": <c>, "with_row": <r2>, "with_col": <c2> }`.
+    /// `move_column` moves one column with its cells' formatting and width:
+    /// `{ "kind": "move_column", "col_index": <c>, "ref_col": <r>, "position":
+    /// "before" | "after" }` (grid indices, as the cells' `col`; direct mode). For
     /// set_cell_text supply the `{ "row", "col" }` from the table block's `cells`
     /// (read_block / read_outline / find expose per-cell `{row, col, text, block_id}`).
     ///
@@ -649,6 +682,18 @@ struct ApplyEditArgs {
     /// deletion: `{ "kind": "delete_row", "row_index": <r> }`. Deleting the
     /// table's last remaining row is refused — delete the whole table block
     /// instead.
+    ///
+    /// `move_row` relocates the complete existing row, including its content
+    /// and formatting: `{ "kind": "move_row", "row_index": <source>,
+    /// "ref_row": <reference>, "position": "before" | "after" }`.
+    /// Both indices refer to the table before this operation. It authors a
+    /// row deletion/insertion; it does not rebuild cells from plain text.
+    /// Tables with vertical merges or table-level range boundaries are refused.
+    ///
+    /// `reorder_rows` gives all source-row indices in target order, each exactly
+    /// once: `{ "kind": "reorder_rows", "row_order": [2,0,1] }`. It authors
+    /// the complete permutation without intermediate revision resolution;
+    /// a source table with pending changes is refused.
     ///
     /// `set_para_format` sets paragraph-level formatting in place as a tracked
     /// `w:pPrChange` (no role swap): `{ "op": "set_para_format", "target":
@@ -841,7 +886,9 @@ struct SectionArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SaveArgs {
-    /// The doc_id returned by open_docx.
+    /// The doc_id returned by open_docx. May be omitted while exactly one
+    /// document is open: the call is then about that document.
+    #[serde(default)]
     doc_id: String,
     /// New path under the MCP workspace root. Relative paths resolve from the
     /// root; an existing destination is refused.
@@ -1229,25 +1276,24 @@ const SERVER_VERSION: &str = match option_env!("STEMMA_MCP_BUILD_STAMP") {
 /// not fork this guidance into a separate skill.
 const INSTRUCTIONS: &str = include_str!("instructions.md");
 const CORE_INSTRUCTIONS: &str = "Stemma core profile: open_docx -> inspect_docx -> \
-execute_plan -> save_docx. Inspect before editing. execute_plan previews or \
-applies one explicit v4 transaction or revision-resolution selection through the typed engine; for several literal \
-substitutions use its explicit replacement_worklist path instead of one read/edit round trip per phrase. Never invent block \
-ids, span handles, guards, revision authors, or unsupported operations. Inspect query=operations before an unfamiliar \
-transaction and query=notes before editing a footnote/endnote. The operations catalog is parser-derived and also maps every \
-historical tool to its five-tool route. For several known phrases, use inspect_docx query=find with patterns=[...] once; each ordered pattern has its own exact total and bounded continuation. Use execute_plan comparison (without doc_id) to produce a redline from two files. Treat any plan error, \
-unexplained direct_delta row, unexpected changed pre-existing revision, untouched violation, or NEW validator issue as \
-incomplete. Comment-story rows are requested annotations, and property_change rows are direct \
-OOXML property edits such as image resizing or hyperlink retargeting; reconcile them with the \
-user's requested operations and disclose them rather than rejecting a valid output. Rows carrying \
-coincides_with_resolution disclose a possible resolution effect; session_resolution_evidenced=true \
-means the row's exact ordered content transition reconciles with successful typed resolution commands. \
-Validator findings unchanged from baseline are \
-pre-existing evidence, not a regression; \
-disclose them, but do not withhold an otherwise valid requested output. Ordinary edits must remain pending tracked changes: resolution is not a finalize \
-step, and must be used only when the user explicitly asks to accept, reject, or clean up \
-revisions. save_docx runs a fresh session audit, refuses a non-deliverable result before path creation, then runs the serialized package gate and commits to a new path. \
-Use verify_docx to inspect detailed session evidence without saving or to audit a producer-neutral before/after pair; it is not a required call before save_docx. Set \
-STEMMA_MCP_PROFILE=advanced only for expert escape-hatch tools, not broader semantics.";
+execute_plan -> save_docx. open_docx needs only the input path. While one document is open, the \
+other tools may omit doc_id, so it can be queried in the same turn it is opened. A task declaration is an optional \
+multi-document delivery contract, and an existing task binding must never be bypassed or broadened. \
+Inspect before editing and never invent block ids, span handles, guards, revision authors, or \
+operations: inspect_docx query=operations gives the parser-derived operation vocabulary with exact \
+examples; query=notes, query=headers_footers and query=nested_form_fields give those addresses \
+(use set_block_form_text for FORMTEXT fields). For several known phrases, call inspect_docx \
+query=find with patterns=[...] once. execute_plan previews or applies one explicit v4 transaction, \
+a replacement_worklist for literal substitutions, or a revision-resolution selection; its \
+comparison path writes a redline from two files. To match a neighbor on insert, use \
+paragraph attrs.format_from=<its block id> without role. Ordinary edits stay pending tracked changes: \
+resolution is not a finalize step; accept or reject only when the user asks. save_docx writes a \
+new path and returns the session audit: verdict pass, or needs_review when it found a direct \
+change or a changed prior revision it cannot explain. On needs_review, inspect with verify_docx \
+and fix or disclose each finding. Comment-story and property_change rows that match the requested \
+operations are expected, and findings unchanged from the input are pre-existing, not yours. \
+verify_docx is not a required call before save_docx. Set STEMMA_MCP_PROFILE=advanced only for \
+expert escape-hatch tools.";
 
 // ─── Runtime configuration (parsed at the edge) ──────────────────────────────
 
@@ -1960,7 +2006,15 @@ fn block_row(view: &BlockView, tracked: &TrackedBlock) -> Value {
 /// genuinely needed. Non-table rows retain the normal compact outline shape.
 fn receipt_block_row(view: &BlockView, tracked: &TrackedBlock) -> Value {
     if !matches!(view.role, BlockRole::Table) {
-        return block_row(view, tracked);
+        let mut row = block_row(view, tracked);
+        // `text` is the redline reading (pending deletions included). When
+        // the paragraph carries tracked changes, also say what it reads once
+        // they are accepted: a replace that tracked-deleted most of a
+        // paragraph reads as the intended sentence in `text` alone.
+        if let Some(accepted) = accepted_paragraph_text(&tracked.block) {
+            row["accepted_text"] = json!(accepted);
+        }
+        return row;
     }
     let status = match &tracked.status {
         TrackingStatus::Normal => "normal",
@@ -1978,6 +2032,39 @@ fn receipt_block_row(view: &BlockView, tracked: &TrackedBlock) -> Value {
         "content_omitted": true,
         "inspect": "inspect_docx query=block with this id for full table content",
     })
+}
+
+/// A paragraph's text with its pending changes accepted: the text of its
+/// unchanged and inserted segments. None for other blocks and for a
+/// paragraph with no tracked text.
+fn accepted_paragraph_text(block: &BlockNode) -> Option<String> {
+    let BlockNode::Paragraph(paragraph) = block else {
+        return None;
+    };
+    if paragraph
+        .segments
+        .iter()
+        .all(|segment| matches!(segment.status, TrackingStatus::Normal))
+    {
+        return None;
+    }
+    Some(
+        paragraph
+            .segments
+            .iter()
+            .filter(|segment| {
+                matches!(
+                    segment.status,
+                    TrackingStatus::Normal | TrackingStatus::Inserted(_)
+                )
+            })
+            .flat_map(|segment| &segment.inlines)
+            .filter_map(|inline| match inline {
+                stemma::domain::InlineNode::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 // ─── DocumentView → JSON (detail-on-demand) ────────────────────────────────────
@@ -2026,9 +2113,11 @@ struct RevisionRow {
     /// Which OOXML change element carries the revision; serialized as the
     /// wire name (`"insert"`, `"delete"`, `"format_run"`, `"format_paragraph"`,
     /// `"format_table"`, `"format_row"`, `"format_cell"`, `"format_section"`,
-    /// or `"opaque_interior"` — a tracked change inside embedded content
+    /// `"opaque_interior"` — a tracked change inside embedded content
     /// (textbox/object), reported with `revision_id` 0 and NOT individually
-    /// resolvable).
+    /// resolvable — `"move"`, or `"cell_merge"` — a tracked vertical cell
+    /// merge, reported with `revision_id` 0; every resolution refuses while
+    /// one is pending).
     kind: RevisionKind,
     block_id: String,
     /// ≤ 80 chars of the affected text, truncated on a char boundary.
@@ -2051,7 +2140,46 @@ struct RevisionRow {
 /// row/cell structure, cell-interior paragraphs, and run/paragraph/table/row/
 /// cell formatting changes.
 fn revision_rows(canonical: &stemma::CanonDoc) -> Vec<RevisionRow> {
-    stemma::tracked_model::enumerate_revisions(canonical)
+    rows_of(stemma::tracked_model::enumerate_revisions(canonical))
+}
+
+/// Every block id of the body in document order: each top-level block, and
+/// right after a table the blocks of its cells, row by row (nested tables
+/// too). Each entry carries the index of the last entry it contains — itself
+/// for a paragraph, its last descendant for a table.
+fn body_block_order(blocks: &[stemma::TrackedBlock]) -> Vec<(String, usize)> {
+    fn push(block: &stemma::BlockNode, out: &mut Vec<(String, usize)>) {
+        let at = out.len();
+        let id = match block {
+            stemma::BlockNode::Paragraph(p) => p.id.to_string(),
+            stemma::BlockNode::Table(t) => t.id.to_string(),
+            stemma::BlockNode::OpaqueBlock(o) => o.id.to_string(),
+        };
+        out.push((id, at));
+        if let stemma::BlockNode::Table(table) = block {
+            for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                for inner in &cell.blocks {
+                    push(inner, out);
+                }
+            }
+        }
+        out[at].1 = out.len() - 1;
+    }
+    let mut out = Vec::new();
+    for tracked in blocks {
+        push(&tracked.block, &mut out);
+    }
+    out
+}
+
+/// The listing surface's rows: the snapshot census, which adds the
+/// census-only records for revisions inside sealed body blocks.
+fn listed_revision_rows(snapshot: &stemma::EditSnapshot) -> Vec<RevisionRow> {
+    rows_of(snapshot.revisions())
+}
+
+fn rows_of(records: Vec<stemma::tracked_model::RevisionRecord>) -> Vec<RevisionRow> {
+    records
         .into_iter()
         .map(|r| RevisionRow {
             revision_id: r.revision_id,
@@ -2094,6 +2222,63 @@ fn match_excerpt(text: &str, needle_lower: &str, limit: usize) -> String {
     text.chars().skip(start).take(limit).collect()
 }
 
+/// A cell paragraph's text in the current-redline reading: deleted text left out,
+/// an opaque run's visible text kept.
+fn cell_paragraph_text(paragraph: &stemma::view::CellParagraphView) -> String {
+    let mut text = paragraph.literal_prefix.clone().unwrap_or_default();
+    for segment in &paragraph.segments {
+        match segment {
+            stemma::InlineChange::Unchanged { text: part, .. }
+            | stemma::InlineChange::Inserted { text: part, .. } => text.push_str(part),
+            stemma::InlineChange::Deleted { .. } => {}
+            stemma::InlineChange::Opaque { text: part, .. } => {
+                if let Some(part) = part {
+                    text.push_str(part);
+                }
+            }
+        }
+    }
+    text
+}
+
+/// Matches in the authored headers and footers, which the body page does not
+/// search: one entry per story with hits, naming the part an edit passes as
+/// `header_part` / `footer_part` (block ids are story-local). Stories are small,
+/// so each lists its first `limit` matches without a continuation.
+fn story_find_matches(
+    snap: &stemma::runtime::EditSnapshot,
+    pattern: &str,
+    limit: usize,
+    cell_limit: usize,
+) -> Result<Value, String> {
+    let canonical = snap.canonical.as_ref();
+    let stories = canonical
+        .headers
+        .iter()
+        .filter(|story| !story.synthesized)
+        .map(|story| ("header", "header_part", &story.part_name, &story.blocks))
+        .chain(
+            canonical
+                .footers
+                .iter()
+                .filter(|story| !story.synthesized)
+                .map(|story| ("footer", "footer_part", &story.part_name, &story.blocks)),
+        );
+    let mut out = Vec::new();
+    for (story_type, part_key, part_name, blocks) in stories {
+        let view = stemma::view::build_story_view(blocks);
+        let page = find_page(&view, pattern, 0, limit, 0, cell_limit)?;
+        if page["count"].as_u64().unwrap_or(0) > 0 {
+            out.push(json!({
+                "story_type": story_type,
+                part_key: part_name,
+                "matches": page["matches"],
+            }));
+        }
+    }
+    Ok(json!(out))
+}
+
 /// Build one bounded find page from an already-built view.
 ///
 /// Singular and batch find both call this function, so batching changes only
@@ -2111,11 +2296,28 @@ fn find_page(
     let mut matches = Vec::new();
     for block in &view.blocks {
         let is_table = matches!(block.role, BlockRole::Table);
-        let all_matching_cells: Vec<_> = if is_table {
+        // A cell matches on its text or on its paragraphs' text, which also
+        // holds the link text and content-control values a body paragraph is
+        // searched for (through its anchors' metadata).
+        let all_matching_cells: Vec<(&stemma::view::TableCellView, String)> = if is_table {
             block
                 .cells
                 .iter()
-                .filter(|cell| cell.text.to_lowercase().contains(&needle))
+                .filter_map(|cell| {
+                    if cell.text.to_lowercase().contains(&needle) {
+                        return Some((cell, cell.text.clone()));
+                    }
+                    let searched = cell
+                        .paragraphs
+                        .iter()
+                        .map(cell_paragraph_text)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    searched
+                        .to_lowercase()
+                        .contains(&needle)
+                        .then_some((cell, searched))
+                })
                 .collect()
         } else {
             Vec::new()
@@ -2125,18 +2327,32 @@ fn find_page(
             .into_iter()
             .skip(cell_offset)
             .take(cell_limit)
-            .map(|cell| {
-                let text_chars = cell.text.chars().count();
-                let text_excerpt =
-                    match_excerpt(&cell.text, &needle, FIND_CELL_EXCERPT_CHARS);
-                json!({
+            .map(|(cell, searched)| {
+                let text_chars = searched.chars().count();
+                let text_excerpt = match_excerpt(&searched, &needle, FIND_CELL_EXCERPT_CHARS);
+                // The paragraph that holds the match is the one to edit. A match
+                // that runs across two of the cell's paragraphs has none.
+                let matched = cell.paragraphs.iter().find(|paragraph| {
+                    cell_paragraph_text(paragraph)
+                        .to_lowercase()
+                        .contains(&needle)
+                });
+                let mut entry = json!({
                     "row": cell.row,
                     "col": cell.col,
-                    "block_id": cell.paragraphs.first().map(|paragraph| paragraph.block_id.as_str()),
+                    "block_id": matched.map(|paragraph| paragraph.block_id.as_str()),
+                    "match_spans_paragraphs": matched.is_none(),
+                    "block_ids": cell
+                        .paragraphs
+                        .iter()
+                        .map(|paragraph| paragraph.block_id.as_str())
+                        .collect::<Vec<_>>(),
                     "text_excerpt": text_excerpt,
                     "text_chars": text_chars,
                     "text_truncated": text_chars > FIND_CELL_EXCERPT_CHARS,
-                })
+                });
+                add_cell_spans(&mut entry, cell);
+                entry
             })
             .collect();
         let matching_cells_returned = matching_cells.len();
@@ -2171,7 +2387,9 @@ fn find_page(
             }
             row
         };
-        if block.text.to_lowercase().contains(&needle) {
+        // A table row stands for its matching cells, which may match on text
+        // the table's own text leaves out (a cell link or control value).
+        if block.text.to_lowercase().contains(&needle) || matching_cell_count > 0 {
             matches.push(base("text"));
         }
         for (matched_in, anchor) in opaque_metadata_matches(block, &needle) {
@@ -2272,14 +2490,23 @@ fn mark_strs(marks: &[TextMark]) -> Vec<&'static str> {
 ///   anchor's ffData) → `matched_in: "form_field"`. The field RESULT is already
 ///   findable as ordinary block text (`paragraph_text` includes it), so it is
 ///   NOT re-matched here; the instruction text is noise and deliberately skipped.
-/// - Drawing: `alt_text` → `matched_in: "image_alt"`.
+/// - Drawing: `alt_text` → `matched_in: "image_alt"`; a textbox's interior
+///   text → `matched_in: "textbox"`, naming the drawing `opaque_text_edit`
+///   edits.
+/// - Hyperlink: its display text, which the block's text leaves out (text
+///   replacement does not reach inside a link), and its target (URL or
+///   `#bookmark`) → `matched_in: "hyperlink"`, naming the id `replace` targets.
 ///
 /// Other kinds carry nothing an agent searches for and contribute no match.
 fn opaque_metadata_matches(block: &BlockView, needle: &str) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
     for seg in &block.segments {
         let SegmentView::Opaque {
-            id, kind, metadata, ..
+            id,
+            kind,
+            text,
+            metadata,
+            ..
         } = seg
         else {
             continue;
@@ -2317,15 +2544,47 @@ fn opaque_metadata_matches(block: &BlockView, needle: &str) -> Vec<(&'static str
                     }),
                 ));
             }
-            OpaqueMetadata::Drawing { alt_text, .. } if hit(alt_text) => {
-                out.push((
-                    "image_alt",
-                    json!({
-                        "id": id.to_string(),
-                        "anchor_kind": anchor_kind_str(kind),
-                        "alt_text": alt_text,
-                    }),
-                ));
+            OpaqueMetadata::Drawing {
+                alt_text,
+                textbox_text,
+                ..
+            } => {
+                if hit(alt_text) {
+                    out.push((
+                        "image_alt",
+                        json!({
+                            "id": id.to_string(),
+                            "anchor_kind": anchor_kind_str(kind),
+                            "alt_text": alt_text,
+                        }),
+                    ));
+                }
+                if hit(textbox_text) {
+                    out.push((
+                        "textbox",
+                        json!({
+                            "id": id.to_string(),
+                            "anchor_kind": anchor_kind_str(kind),
+                            "text": textbox_text,
+                        }),
+                    ));
+                }
+            }
+            OpaqueMetadata::Hyperlink { url, anchor } => {
+                let target = url
+                    .clone()
+                    .or_else(|| anchor.as_ref().map(|name| format!("#{name}")));
+                if hit(text) || hit(&target) {
+                    out.push((
+                        "hyperlink",
+                        json!({
+                            "id": id.to_string(),
+                            "anchor_kind": anchor_kind_str(kind),
+                            "text": text,
+                            "target": target,
+                        }),
+                    ));
+                }
             }
             _ => {}
         }
@@ -2468,6 +2727,12 @@ fn block_detail_json(block: &BlockView) -> Value {
         // paragraphs without a literal prefix (and for auto-numbered paragraphs,
         // whose marker lives in `list`).
         "literal_prefix": block.literal_prefix,
+        // The label's own run marks: a paragraph rewritten with styled content
+        // gives its label these, not the marks of the text beside it.
+        "literal_prefix_marks": block
+            .literal_prefix
+            .as_ref()
+            .map(|_| mark_strs(&block.literal_prefix_marks)),
         // The block staleness guard — a write op carries this as `guard`; if
         // the block changed since the read, the op fails loud (StaleEdit).
         "guard": block.guard,
@@ -2491,18 +2756,34 @@ fn compact_block_detail_json(block: &BlockView) -> Value {
                 status,
                 text,
                 handle,
-                ..
+                metadata,
             } = segment
             else {
                 return None;
             };
-            Some(json!({
+            let mut anchor = json!({
                 "id": id.to_string(),
                 "handle": handle.as_ref().map(|h| h.0.clone()),
                 "anchor_kind": anchor_kind_str(kind),
                 "status": track_status_json(status),
                 "text": text,
-            }))
+            });
+            // A drawing's size is what a resize starts from, and a textbox's
+            // words are content the agent may be asked to change: show both
+            // without a second read.
+            if let Some(OpaqueMetadata::Drawing {
+                textbox_text,
+                extent_cx_emu,
+                extent_cy_emu,
+                ..
+            }) = metadata
+            {
+                anchor["size_emu"] = json!({"cx": extent_cx_emu, "cy": extent_cy_emu});
+                if let Some(textbox_text) = textbox_text {
+                    anchor["textbox_text"] = json!(textbox_text);
+                }
+            }
+            Some(anchor)
         })
         .collect();
     let level = match &block.role {
@@ -2534,6 +2815,19 @@ fn compact_block_detail_json(block: &BlockView) -> Value {
 /// paragraph id in a cell is returned, so exact text, anchors, and formatting
 /// remain one explicit block inspection away; the advanced `read_block`
 /// surface deliberately continues to return the complete table in one call.
+/// A merged cell's extent on its read entry: `row_span` / `col_span` when it
+/// covers more than one row / column (vMerge / gridSpan). A merge's continuation
+/// cells are folded into it, so the rows it covers name no cell of their own in
+/// that column; `merge_cells` down the column extends a merge.
+fn add_cell_spans(entry: &mut Value, cell: &stemma::view::TableCellView) {
+    if cell.row_span > 1 {
+        entry["row_span"] = json!(cell.row_span);
+    }
+    if cell.col_span > 1 {
+        entry["col_span"] = json!(cell.col_span);
+    }
+}
+
 fn core_block_detail_json(
     block: &BlockView,
     detail: InspectBlockDetail,
@@ -2583,7 +2877,7 @@ fn core_block_detail_json(
                 .iter()
                 .map(|paragraph| paragraph.block_id.as_str())
                 .collect();
-            json!({
+            let mut entry = json!({
                 "row": cell.row,
                 "col": cell.col,
                 "block_id": block_ids.first().copied(),
@@ -2591,7 +2885,9 @@ fn core_block_detail_json(
                 "text_excerpt": text_excerpt,
                 "text_chars": text_chars,
                 "text_truncated": text_chars > BLOCK_CELL_EXCERPT_CHARS,
-            })
+            });
+            add_cell_spans(&mut entry, cell);
+            entry
         })
         .collect();
     let returned = cells.len();
@@ -2631,19 +2927,7 @@ fn cell_paragraph_detail_json(
                 if paragraph.block_id != target {
                     continue;
                 }
-                let mut text = String::new();
-                for segment in &paragraph.segments {
-                    match segment {
-                        stemma::InlineChange::Unchanged { text: part, .. }
-                        | stemma::InlineChange::Inserted { text: part, .. } => text.push_str(part),
-                        stemma::InlineChange::Deleted { .. } => {}
-                        stemma::InlineChange::Opaque { text: part, .. } => {
-                            if let Some(part) = part {
-                                text.push_str(part);
-                            }
-                        }
-                    }
-                }
+                let text = cell_paragraph_text(paragraph);
                 let nested_in = json!({
                     "table_id": table.id.to_string(),
                     "row": cell.row,
@@ -2672,19 +2956,27 @@ fn cell_paragraph_detail_json(
                                     text,
                                     reference_id,
                                     content_hash,
+                                    asset_width_emu,
+                                    asset_height_emu,
                                     ..
                                 } = segment
                                 else {
                                     return None;
                                 };
-                                Some(json!({
+                                let mut anchor = json!({
                                     "id": opaque_id,
                                     "segment_type": segment_type,
                                     "anchor_kind": kind,
                                     "text": text,
                                     "reference_id": reference_id,
                                     "content_hash": content_hash,
-                                }))
+                                });
+                                // A picture in a cell (a letterhead's logo)
+                                // shows its size, as a body picture does.
+                                if let (Some(cx), Some(cy)) = (asset_width_emu, asset_height_emu) {
+                                    anchor["size_emu"] = json!({"cx": cx, "cy": cy});
+                                }
+                                Some(anchor)
                             })
                             .collect();
                         json!({
@@ -2735,12 +3027,14 @@ fn cells_json(block: &BlockView) -> Vec<Value> {
         .cells
         .iter()
         .map(|c| {
-            json!({
+            let mut entry = json!({
                 "row": c.row,
                 "col": c.col,
                 "text": c.text,
                 "block_id": c.paragraphs.first().map(|p| p.block_id.as_str()),
-            })
+            });
+            add_cell_spans(&mut entry, c);
+            entry
         })
         .collect()
 }
@@ -3397,7 +3691,11 @@ impl StemmaServer {
             .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
         let after_styles = stemma::style_table_from_docx(&after_bytes)
             .map_err(|error| fail(&format!("{:?}", error.code), error.message))?;
-        let report = stemma::audit::audit_documents(
+        // These are canonical snapshots on either side of the same typed
+        // session operation; serialization above only supplies their styles.
+        // Use the same identity policy as the final session audit so exact
+        // resolution transitions retain the same block correspondence.
+        let report = stemma::audit::audit_session_documents(
             &before.canonical,
             &after.canonical,
             before_styles.as_ref(),
@@ -3485,6 +3783,70 @@ impl StemmaServer {
         result
     }
 
+    /// The ids of the documents this server has opened that are still held.
+    fn open_doc_ids(&self) -> Vec<String> {
+        let mut open: Vec<String> = self
+            .issued_doc_ids
+            .lock()
+            .expect("issued_doc_ids mutex poisoned")
+            .iter()
+            .filter(|id| self.runtime.contains_handle(&DocHandle((*id).clone())))
+            .cloned()
+            .collect();
+        open.sort();
+        open
+    }
+
+    /// Documented default (see the core tools' `doc_id` descriptions): a call
+    /// that needs a document and names none is about the only open document.
+    /// An agent that opens a file and queries it in the same turn cannot know
+    /// the id yet; before this default nearly every session spent a call on a
+    /// guessed id. With no document or several open, the call is refused with
+    /// the open ids. A named id is left to the tool, and so is a mode that
+    /// takes no document: a comparison plan, or a verify of two paths.
+    fn fill_omitted_doc_id(
+        &self,
+        tool: &str,
+        arguments: &mut Option<serde_json::Map<String, Value>>,
+    ) -> Result<(), CallToolResult> {
+        let empty = serde_json::Map::new();
+        let present = arguments.as_ref().unwrap_or(&empty);
+        let has = |key: &str| present.get(key).is_some_and(|value| !value.is_null());
+        let needs_document = match tool {
+            "inspect_docx" | "save_docx" => true,
+            "execute_plan" => {
+                has("transaction") || has("resolution") || has("replacement_worklist")
+            }
+            "verify_docx" => !has("before_path") && !has("after_path"),
+            _ => false,
+        };
+        if !needs_document || has("doc_id") {
+            return Ok(());
+        }
+        let open = self.open_doc_ids();
+        match open.as_slice() {
+            [only] => {
+                arguments
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert("doc_id".to_string(), json!(only));
+                Ok(())
+            }
+            _ => Err(fail_json(json!({
+                "code": "doc_id_required",
+                "error": if open.is_empty() {
+                    format!("{tool} needs a doc_id and no document is open. Open the file first with open_docx.")
+                } else {
+                    format!(
+                        "{tool} needs a doc_id: {} documents are open ({}). Name the one to use.",
+                        open.len(),
+                        open.join(", ")
+                    )
+                },
+                "open_doc_ids": open,
+            }))),
+        }
+    }
+
     /// Upgrade an ambiguous "doc handle not found" tool error into an
     /// actionable one. The engine surfaces both "never opened" and "evicted
     /// after TTL" as `InvalidDocx: doc handle not found`; this server issued the
@@ -3541,13 +3903,26 @@ impl StemmaServer {
                 "ttl_secs": self.config.doc_ttl_secs,
             }))
         } else {
-            fail_json(json!({
-                "code": "unknown_doc_id",
-                "error": format!(
+            // An agent that opens a file and queries it in the same turn has to guess
+            // the id; naming the open ones makes the refusal a step forward.
+            let open = self.open_doc_ids();
+            let error = if open.is_empty() {
+                format!(
                     "no open document has doc_id '{doc_id}'. Open the file first with \
                      open_docx, which returns the doc_id to use."
-                ),
+                )
+            } else {
+                format!(
+                    "no open document has doc_id '{doc_id}'. Open: {}. Use the doc_id \
+                     open_docx returned.",
+                    open.join(", ")
+                )
+            };
+            fail_json(json!({
+                "code": "unknown_doc_id",
+                "error": error,
                 "doc_id": doc_id,
+                "open_doc_ids": open,
             }))
         }
     }
@@ -3701,6 +4076,8 @@ impl StemmaServer {
                        query='find' for known wording or query='index' with offset/limit for \
                        another page; do not request every page as a substitute for find/window. \
                        open_docx deliberately does not echo an unbounded document projection. \
+                       For an ordinary single-document edit, pass only the existing input path; \
+                       omit task/task_id and give the new output path to save_docx, not open_docx. \
                        For a multi-document delivery, the first task-bearing call supplies the \
                        complete task declaration; later declared targets use task_id."
     )]
@@ -3798,6 +4175,18 @@ impl StemmaServer {
         };
         let diagnostics = import.diagnostics.clone();
         let doc_id = import.doc_handle.0.clone();
+        // Warm the open-time validation that every save and verify reports, off
+        // the request path: it parses the whole package (tens of seconds for a
+        // very large document) and its answer cannot change. Nothing is lost if
+        // this fails (an evicted handle): the save or verify that needs the
+        // report computes it and returns that error itself.
+        {
+            let runtime = Arc::clone(&self.runtime);
+            let handle = import.doc_handle.clone();
+            std::thread::spawn(move || {
+                let _ = runtime.session_source_validation(&handle);
+            });
+        }
         // Record the handle we are about to hand out so a later "doc handle not
         // found" for this id can be attributed to eviction rather than a typo.
         self.issued_doc_ids
@@ -3837,6 +4226,7 @@ impl StemmaServer {
             "server_version": SERVER_VERSION,
             "task_id": task_id,
             "input_artifact": input_artifact,
+            "document_protection": import.canonical.document_protection,
             "diagnostics": diagnostics,
             "index": page["entries"],
             "index_offset": page["offset"],
@@ -3936,7 +4326,10 @@ impl StemmaServer {
                        to retrieve the rest. Inspect a returned cell block_id for exact text, \
                        anchors, or formatting. Use \
                        this when you know the wording but not the block id; inspect a returned \
-                       block id for exact full text."
+                       block id for exact full text. Text inside a hyperlink, content control, \
+                       form field, textbox or image alt text matches with matched_in naming \
+                       the kind and anchor.id naming the anchor to edit; in a table cell, link \
+                       text and content-control values match as cell text."
     )]
     async fn find(&self, Parameters(args): Parameters<FindArgs>) -> CallToolResult {
         let offset = args.offset.unwrap_or(0);
@@ -3960,7 +4353,9 @@ impl StemmaServer {
         let handle = DocHandle(args.doc_id.clone());
         let result = self.runtime.with(&handle, move |snap| {
             let view = build_document_view(snap);
-            find_page(&view, &args.pattern, offset, limit, cell_offset, cell_limit)
+            let mut page = find_page(&view, &args.pattern, offset, limit, cell_offset, cell_limit)?;
+            page["story_matches"] = story_find_matches(snap, &args.pattern, limit, cell_limit)?;
+            Ok::<_, String>(page)
         });
         match result {
             Ok(Ok(payload)) => ok(payload),
@@ -4227,10 +4622,14 @@ impl StemmaServer {
     #[tool(
         description = "Export an open document to a .docx file at the given path, \
                        including any tracked changes applied. Runs a fresh session audit and \
-                       refuses before path creation unless that audit is deliverable; then runs \
-                       the blocking serialization gate and commits create-new. Returns exact \
-                       input/output identities, the passing audit decision commitment, and \
-                       validation result. In a declared task, earlier target saves remain \
+                       the blocking serialization gate, then commits create-new; only a \
+                       validator error refuses the save. The audit is reported, not enforced: \
+                       when it finds unexplained changes the file is still written and the \
+                       receipt's verdict is needs_review with the audit counts and a verify_docx \
+                       pointer. Returns exact input/output identities, the audit decision \
+                       commitment, and validation result. A declared task refuses a \
+                       non-deliverable audit before path creation, because its manifest \
+                       certifies a passing audit. In a declared task, earlier target saves remain \
                        task-pending; the last target save writes a create-once complete or \
                        partial manifest and returns success only when every effect is satisfied."
     )]
@@ -4251,8 +4650,8 @@ impl StemmaServer {
             Ok(report) => report,
             Err(error) => return fail(&format!("{:?}", error.code), error.message),
         };
-        let baseline_bytes = match self.runtime.session_source_bytes(&handle) {
-            Ok(bytes) => bytes,
+        let baseline_validation = match self.runtime.session_source_validation(&handle) {
+            Ok(report) => report,
             Err(error) => return fail(&format!("{:?}", error.code), error.message),
         };
         let resolution_evidence = match self.session_resolution_evidence(&args.doc_id) {
@@ -4262,15 +4661,18 @@ impl StemmaServer {
         let mut audit =
             audit_report_json(&audit_report, Some(&resolution_evidence), None, None, None)
                 .expect("default audit page coordinates are valid");
-        attach_baseline_validation(
-            &mut audit,
-            &stemma::api::validate(&baseline_bytes),
-            &audit_report.validator,
-        );
-        if audit["verdict"]["deliverable"] != true {
+        attach_baseline_validation(&mut audit, &baseline_validation, &audit_report.validator);
+        // Outside a declared task the audit is information for the caller, not a
+        // gate: the receipt says what it found. A task manifest certifies a
+        // passing audit (`TaskAuditBinding::validate`), so a declared task still
+        // refuses before path creation. Task sessions only accept declared
+        // tracked replacements, so this refusal guards that invariant rather
+        // than a path callers normally reach.
+        let audit_deliverable = audit["verdict"]["deliverable"] == true;
+        if !audit_deliverable && task_binding.is_some() {
             return fail_json(json!({
                 "code": "verification_failed",
-                "error": "save refused: the fresh session audit is not deliverable; no output path was created",
+                "error": "save refused: the fresh session audit is not deliverable and a declared task certifies a passing audit; no output path was created",
                 "audit": {
                     "counts": audit["counts"],
                     "verdict": audit["verdict"],
@@ -4391,7 +4793,16 @@ impl StemmaServer {
         match task_outcome {
             TaskSaveOutcome::NotFinal if task_binding.is_none() => {
                 let mut payload = document_receipt;
-                payload["verdict"] = json!({"status": "pass", "deliverable": true});
+                if audit_deliverable {
+                    payload["verdict"] = json!({"status": "pass", "deliverable": true});
+                } else {
+                    payload["verdict"] = json!({"status": "needs_review", "deliverable": false});
+                    payload["review"] = json!({
+                        "reason": "the session audit found changes it cannot explain; the file was written, inspect before delivering it",
+                        "tool": "verify_docx",
+                        "arguments": {"doc_id": args.doc_id},
+                    });
+                }
                 payload["server_version"] = json!(SERVER_VERSION);
                 ok(payload)
             }
@@ -4744,6 +5155,18 @@ impl StemmaServer {
                     "diagnosis": diagnosis,
                 }));
             }
+            Err(stemma::edit::ReplaceTextError::Engine(
+                ref e @ stemma::edit::EditError::ReplaceTextInsideInlineObjects {
+                    ref occurrences,
+                    ..
+                },
+            )) => {
+                return fail_json(json!({
+                    "code": format!("{:?}", edit_error_code(e)),
+                    "error": e.to_string(),
+                    "unreached_matches": inline_object_matches_json(occurrences),
+                }));
+            }
             Err(stemma::edit::ReplaceTextError::Engine(e)) => {
                 return fail(&format!("{:?}", edit_error_code(&e)), e.to_string());
             }
@@ -5000,6 +5423,20 @@ impl StemmaServer {
                     );
                     failed += 1;
                 }
+                Err(stemma::edit::ReplaceTextError::Engine(
+                    ref e @ stemma::edit::EditError::ReplaceTextInsideInlineObjects {
+                        ref occurrences,
+                        ..
+                    },
+                )) => {
+                    // Text the item asked to replace stands inside a link or a
+                    // content control: refuse, naming each object to edit.
+                    items.push(json!({"index": index, "old": item.old, "status": "error",
+                        "code": "ReplaceTextInsideInlineObjects",
+                        "error": format!("{:?}: {}", edit_error_code(e), e),
+                        "unreached_matches": inline_object_matches_json(occurrences)}));
+                    failed += 1;
+                }
                 Err(stemma::edit::ReplaceTextError::Engine(e)) => {
                     items.push(json!({"index": index, "old": item.old, "status": "error",
                         "error": format!("{:?}: {}", edit_error_code(&e), e)}));
@@ -5075,6 +5512,25 @@ fn unreached_cells_json(
                 "row": m.row,
                 "col": m.col,
                 "excerpt": m.excerpt,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Occurrences inside links and content controls, in the receipt's
+/// `unreached_matches` shape: where each is and the op that edits it.
+fn inline_object_matches_json(occurrences: &[stemma::edit::InlineObjectMatch]) -> Value {
+    json!(
+        occurrences
+            .iter()
+            .map(|m| json!({
+                "region": match m.object {
+                    stemma::edit::InlineObjectText::HyperlinkText => "hyperlink_text",
+                    stemma::edit::InlineObjectText::ContentControlValue => "content_control_value",
+                },
+                "block_id": m.block_id.to_string(),
+                "object_id": m.object_id.to_string(),
+                "route": m.describe(),
             }))
             .collect::<Vec<_>>()
     )
@@ -5230,7 +5686,9 @@ struct RevisionFilter {
     #[serde(default)]
     by_kind: Option<String>,
     /// Keep only revisions touching a block in the inclusive id range
-    /// [from_block_id..to_block_id] in document order. Unknown endpoint =>
+    /// [from_block_id..to_block_id] in document order; a table in the range
+    /// contributes its cells, and any block id the inventory reports (a cell
+    /// paragraph's included) is an endpoint. Unknown endpoint =>
     /// AnchorNotFound; out-of-order endpoints => InvalidRange.
     #[serde(default)]
     by_block_range: Option<BlockRange>,
@@ -5272,7 +5730,9 @@ impl KindFilter {
                  change), \"format_run\", \"format_paragraph\", \"format_table\", \
                  \"format_row\", \"format_cell\", \"format_section\", or \
                  \"opaque_interior\" (tracked changes inside embedded content — \
-                 visible but not individually resolvable); got {raw:?}"
+                 visible but not individually resolvable), \"move\", or \
+                 \"cell_merge\" (a tracked vertical cell merge — visible, not \
+                 resolvable); got {raw:?}"
             )),
         }
     }
@@ -5825,8 +6285,9 @@ enum ChangeSelector {
     /// anonymous — the selector never invents an author to match it.
     ByAuthor { author: String },
     /// Every revision touching any block from `from_block_id`..=`to_block_id`
-    /// in read-view order. Unknown endpoint => AnchorNotFound; out-of-order
-    /// endpoints => InvalidRange.
+    /// in document order, table cells included (a cell paragraph id is an
+    /// endpoint). Unknown endpoint => AnchorNotFound; out-of-order endpoints
+    /// => InvalidRange.
     ByRange {
         from_block_id: String,
         to_block_id: String,
@@ -5993,8 +6454,10 @@ struct CoreReplacementItem {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecutePlanArgs {
-    /// The doc_id returned by open_docx. Required for transaction, resolution,
-    /// and replacement_worklist; omit only for a comparison producer plan.
+    /// The doc_id returned by open_docx, for transaction, resolution, and
+    /// replacement_worklist (omit it for a comparison producer plan). May be
+    /// omitted while exactly one document is open: the plan is then about that
+    /// document.
     #[serde(default)]
     doc_id: Option<String>,
     /// One atomic v4 edit transaction. Mutually exclusive with resolution.
@@ -6147,7 +6610,8 @@ struct AuditDocxArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct VerifyDocxArgs {
-    /// Verify changes made since open_docx. Mutually exclusive with the path pair.
+    /// Verify changes made since open_docx. Mutually exclusive with the path
+    /// pair. May be omitted while exactly one document is open.
     #[serde(default)]
     doc_id: Option<String>,
     /// Baseline for producer-neutral verification. Requires after_path and no doc_id.
@@ -6268,27 +6732,20 @@ impl StemmaServer {
         to_block_id: &str,
     ) -> Result<std::collections::HashSet<String>, CallToolResult> {
         let handle = DocHandle(doc_id.to_string());
-        // Block order comes from the canonical document order.
-        let order: Vec<String> = self
+        // Block order is the canonical document order, table cells included:
+        // a range holds every block between its endpoints, so a table inside
+        // it contributes its cell paragraphs (whose ids the census reports),
+        // and a cell paragraph is itself a valid endpoint.
+        let order: Vec<(String, usize)> = self
             .runtime
-            .with(&handle, |snap| {
-                snap.canonical
-                    .blocks
-                    .iter()
-                    .map(|tb| match &tb.block {
-                        stemma::BlockNode::Paragraph(p) => p.id.to_string(),
-                        stemma::BlockNode::Table(t) => t.id.to_string(),
-                        stemma::BlockNode::OpaqueBlock(o) => o.id.to_string(),
-                    })
-                    .collect()
-            })
+            .with(&handle, |snap| body_block_order(&snap.canonical.blocks))
             .map_err(|e| {
                 fail(
                     &format!("{:?}", e.code),
                     format!("doc not open: {}", e.message),
                 )
             })?;
-        let pos = |bid: &str| order.iter().position(|b| b == bid);
+        let pos = |bid: &str| order.iter().position(|(b, _)| b == bid);
         let Some(from) = pos(from_block_id) else {
             return Err(fail(
                 "AnchorNotFound",
@@ -6301,7 +6758,9 @@ impl StemmaServer {
                 format!("range end block '{to_block_id}' not found in doc '{doc_id}'"),
             ));
         };
-        if from > to {
+        // A table as the end of the range includes everything inside it.
+        let last = order[to].1;
+        if from > last {
             return Err(fail(
                 "InvalidRange",
                 format!(
@@ -6309,7 +6768,10 @@ impl StemmaServer {
                 ),
             ));
         }
-        Ok(order[from..=to].iter().cloned().collect())
+        Ok(order[from..=last]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect())
     }
 
     /// Enumerate pending revisions with the optional AND-combined filter
@@ -6345,15 +6807,15 @@ impl StemmaServer {
         // One walk, then the AND-combined filters. revision_rows is the shared
         // enumeration; the filters here mirror the accept/reject selectors.
         let handle = DocHandle(doc_id.to_string());
-        let rows: Vec<RevisionRow> = self
-            .runtime
-            .with(&handle, |snap| revision_rows(&snap.canonical))
-            .map_err(|e| {
-                fail(
-                    &format!("{:?}", e.code),
-                    format!("doc not open: {}", e.message),
-                )
-            })?;
+        let rows: Vec<RevisionRow> =
+            self.runtime
+                .with(&handle, listed_revision_rows)
+                .map_err(|e| {
+                    fail(
+                        &format!("{:?}", e.code),
+                        format!("doc not open: {}", e.message),
+                    )
+                })?;
         Ok(rows
             .into_iter()
             .filter(|r| {
@@ -6540,7 +7002,11 @@ impl StemmaServer {
                        selection, pass the same axes to execute_plan's resolution \
                        selector (by='by_filter') instead of enumerating ids. \
                        query='styles' returns authored styles and document defaults; query='notes' \
-                       returns footnote/endnote ids, kinds, and editable body text. The legacy \
+                       returns footnote/endnote ids, kinds, and editable body text. query='headers_footers' \
+                       pages authored story blocks (offset/limit), with part_name, kind, and exact block/field identities; \
+                       synthesized blank stories are excluded. Use pattern='<part_name>' to select a story, \
+                       then optionally block_id and detail='formatting'; block ids are story-local. \
+                       table blocks support cell_offset/cell_limit. The legacy \
                        comprehension projections remain explicit as query='text', query='html', \
                        query='redline', query='accepted', or query='rejected'. query='operations' \
                        returns every transaction op from \
@@ -6841,20 +7307,20 @@ impl StemmaServer {
                                 .iter()
                                 .enumerate()
                                 .map(|(pattern_index, pattern)| {
-                                    find_page(
+                                    let mut result = find_page(
                                         &view,
                                         pattern,
                                         offset,
                                         limit,
                                         cell_offset,
                                         cell_limit,
-                                    )
-                                    .map(|result| {
-                                        json!({
-                                            "pattern_index": pattern_index,
-                                            "result": result,
-                                        })
-                                    })
+                                    )?;
+                                    result["story_matches"] =
+                                        story_find_matches(snapshot, pattern, limit, cell_limit)?;
+                                    Ok::<_, String>(json!({
+                                        "pattern_index": pattern_index,
+                                        "result": result,
+                                    }))
                                 })
                                 .collect::<Result<Vec<_>, _>>()
                         });
@@ -7005,6 +7471,166 @@ impl StemmaServer {
                     doc_id: args.doc_id,
                 }))
                 .await
+            }
+            InspectQuery::NestedFormFields => {
+                if args.pattern.is_some()
+                    || args.patterns.is_some()
+                    || args.filter.is_some()
+                    || args.block_id.is_some()
+                    || args.detail.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                    || args.cell_offset.is_some()
+                    || args.cell_limit.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'nested_form_fields' accepts only doc_id, offset and limit",
+                    );
+                }
+                let offset = args.offset.unwrap_or(0);
+                let limit = args.limit.unwrap_or(8);
+                if limit == 0 || limit > 64 {
+                    return fail(
+                        "invalid_argument",
+                        "nested_form_fields limit must be between 1 and 64",
+                    );
+                }
+                let targets = match self
+                    .runtime
+                    .with(&DocHandle(args.doc_id.clone()), |snapshot| {
+                        snapshot.block_form_field_targets()
+                    }) {
+                    Ok(Ok(targets)) => targets,
+                    Ok(Err(error)) | Err(error) => {
+                        return fail(&format!("{:?}", error.code), error.message);
+                    }
+                };
+                if offset > targets.len() {
+                    return fail(
+                        "invalid_argument",
+                        "nested_form_fields offset exceeds total fields",
+                    );
+                }
+                let end = offset.saturating_add(limit).min(targets.len());
+                let fields: Vec<_> = targets[offset..end].iter().map(|t| json!({
+                    "body_index": t.body_index, "paragraph_index": t.paragraph_index, "field_index": t.field_index,
+                    "name": t.name, "instruction": t.instruction, "cached_result": t.cached_result,
+                    "paragraph_text": t.paragraph_text, "semantic_hash": t.semantic_hash,
+                    "text_update_operation": if t.instruction == "FORMTEXT" { Some("set_block_form_text") } else { None },
+                })).collect();
+                ok(
+                    json!({"doc_id": args.doc_id, "total_fields": targets.len(), "offset": offset, "limit": limit,
+                    "returned": fields.len(), "has_more": end < targets.len(), "next_offset": if end < targets.len() { Some(end) } else { None },
+                    "fields": fields, "server_version": SERVER_VERSION}),
+                )
+            }
+            InspectQuery::HeadersFooters => {
+                if args.patterns.is_some()
+                    || args.filter.is_some()
+                    || args.from_block_id.is_some()
+                    || args.to_block_id.is_some()
+                    || args.format.is_some()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "query 'headers_footers' accepts only doc_id, pattern (exact part_name), block_id, detail, offset, limit, cell_offset, and cell_limit",
+                    );
+                }
+                let offset = args.offset.unwrap_or(0);
+                let limit = args.limit.unwrap_or(8);
+                if limit == 0 || limit > 64 {
+                    return fail(
+                        "invalid_argument",
+                        "headers_footers limit must be between 1 and 64",
+                    );
+                }
+                if (args.cell_offset.is_some() || args.cell_limit.is_some())
+                    && args.block_id.is_none()
+                {
+                    return fail(
+                        "invalid_argument",
+                        "headers_footers cell paging requires block_id",
+                    );
+                }
+                let handle = DocHandle(args.doc_id.clone());
+                let rows = self.runtime.with(&handle, |snapshot| {
+                    let canonical = snapshot.canonical.as_ref();
+                    let stories = canonical.headers.iter().map(|s| ("header", &s.part_name, &s.kind, s.synthesized, &s.blocks))
+                        .chain(canonical.footers.iter().map(|s| ("footer", &s.part_name, &s.kind, s.synthesized, &s.blocks)));
+                    let mut rows = Vec::new();
+                    let mut matched_story = false;
+                    for (story_type, part_name, kind, synthesized, blocks) in stories {
+                        if synthesized || args.pattern.as_ref().is_some_and(|name| name != part_name) { continue; }
+                        matched_story = true;
+                        let view = stemma::view::build_story_view(blocks);
+                        let mut found = false;
+                        for block in &view.blocks {
+                            if args.block_id.as_ref().is_some_and(|id| id != &block.id.to_string()) { continue; }
+                            found = true;
+                            rows.push(json!({
+                                "story_type": story_type, "part_name": part_name, "kind": kind.to_xml_str(),
+                                "block": core_block_detail_json(block, args.detail.unwrap_or_default(), args.cell_offset, args.cell_limit)?,
+                            }));
+                        }
+                        // A paragraph inside a table of the story (a letterhead's
+                        // contact cell) is an edit target too; read it the way the
+                        // body reads a cell paragraph.
+                        if !found
+                            && let Some(id) = args.block_id.as_deref()
+                            && let Some(detail) = cell_paragraph_detail_json(&view, id, args.detail.unwrap_or_default())
+                        {
+                            rows.push(json!({
+                                "story_type": story_type, "part_name": part_name, "kind": kind.to_xml_str(),
+                                "block": detail,
+                            }));
+                        }
+                    }
+                    Ok::<_, String>((rows, matched_story))
+                });
+                let (rows, matched_story) = match rows {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => return fail("invalid_argument", error),
+                    Err(error) => return fail(&format!("{:?}", error.code), error.message),
+                };
+                if args.pattern.is_some() && !matched_story {
+                    return fail(
+                        "invalid_argument",
+                        format!("no authored header/footer part matches {:?}", args.pattern),
+                    );
+                }
+                if args.block_id.is_some() && rows.len() > 1 {
+                    return fail(
+                        "invalid_argument",
+                        "story-local block_id is ambiguous; select pattern='<part_name>'",
+                    );
+                }
+                if args.block_id.is_some() && rows.is_empty() {
+                    return fail(
+                        "invalid_argument",
+                        format!(
+                            "no authored header/footer block matches {:?}",
+                            args.block_id
+                        ),
+                    );
+                }
+                if offset > rows.len() {
+                    return fail(
+                        "invalid_argument",
+                        format!(
+                            "headers_footers offset {offset} exceeds total_blocks {}",
+                            rows.len()
+                        ),
+                    );
+                }
+                let end = offset.saturating_add(limit).min(rows.len());
+                ok(json!({
+                    "doc_id": args.doc_id, "total_blocks": rows.len(), "offset": offset,
+                    "limit": limit, "returned": end - offset, "has_more": end < rows.len(),
+                    "next_offset": if end < rows.len() { Some(end) } else { None },
+                    "blocks": &rows[offset..end], "server_version": SERVER_VERSION,
+                }))
             }
             InspectQuery::Notes => {
                 if has_query_args {
@@ -7797,11 +8423,10 @@ impl StemmaServer {
             Ok(payload) => payload,
             Err(message) => return fail("invalid_argument", message),
         };
-        let source = match self.runtime.session_source_bytes(&handle) {
-            Ok(bytes) => bytes,
+        let baseline_validation = match self.runtime.session_source_validation(&handle) {
+            Ok(report) => report,
             Err(error) => return fail(&format!("{:?}", error.code), error.message),
         };
-        let baseline_validation = stemma::api::validate(&source);
         attach_baseline_validation(&mut payload, &baseline_validation, &report.validator);
         payload["doc_id"] = json!(args.doc_id);
         payload["server_version"] = json!(SERVER_VERSION);
@@ -7811,6 +8436,10 @@ impl StemmaServer {
         };
         payload["input_artifacts"] = json!(input_artifacts);
         if let Some(render) = &args.render {
+            let source = match self.runtime.session_source_bytes(&handle) {
+                Ok(bytes) => bytes,
+                Err(error) => return fail(&format!("{:?}", error.code), error.message),
+            };
             // The current document as bytes, via the same gated export the
             // save path uses — an unsaveable document cannot render either,
             // and the failure names the gate finding.
@@ -8467,6 +9096,10 @@ impl ServerHandler for StemmaServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut request = request;
+        if let Err(refusal) = self.fill_omitted_doc_id(&request.name, &mut request.arguments) {
+            return Ok(refusal);
+        }
         let referenced_doc_id = request
             .arguments
             .as_ref()
@@ -9049,6 +9682,21 @@ mod tests {
             "each op is a typed object tagged by `op`: {txn}"
         );
         assert_eq!(txn["properties"]["revision"]["type"], "object");
+
+        // The advertised op names are exactly the engine's operation catalog,
+        // so a client validating against the schema cannot drift from the
+        // parser (the catalog's own test parses an example of every op).
+        let advertised: Vec<&str> = txn["properties"]["ops"]["items"]["properties"]["op"]["enum"]
+            .as_array()
+            .expect("op enum")
+            .iter()
+            .map(|name| name.as_str().expect("op name is a string"))
+            .collect();
+        let catalog: Vec<&str> = op_catalog::operation_catalog()
+            .iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(advertised, catalog);
     }
 
     /// `check_edit` and `apply_batch` share the same transaction parameter and
@@ -9611,6 +10259,133 @@ mod tests {
             .expect_err("an unrecognized extra field inside by_filter must be refused");
     }
 
+    /// A body paragraph with Other's insertion, a table whose cell and nested
+    /// cell each hold one of Other's insertions, and a final paragraph.
+    fn table_range_selector_docx() -> Vec<u8> {
+        let ins = |id: u32, text: &str| {
+            format!(
+                r#"<w:ins w:id="{id}" w:author="Other" w:date="2026-01-01T00:00:00Z"><w:r><w:t xml:space="preserve">{text} </w:t></w:r></w:ins>"#
+            )
+        };
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">Body </w:t></w:r>{}<w:r><w:t>end.</w:t></w:r></w:p>"#,
+                r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc>"#,
+                r#"<w:p><w:r><w:t xml:space="preserve">Cell </w:t></w:r>{}<w:r><w:t>end.</w:t></w:r></w:p>"#,
+                r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>"#,
+                r#"<w:p><w:r><w:t xml:space="preserve">Nested </w:t></w:r>{}<w:r><w:t>end.</w:t></w:r></w:p>"#,
+                r#"</w:tc></w:tr></w:tbl><w:p/></w:tc></w:tr></w:tbl>"#,
+                r#"<w:p><w:r><w:t>Final.</w:t></w:r></w:p>"#,
+            ),
+            ins(10, "alpha"),
+            ins(11, "beta"),
+            ins(12, "gamma"),
+        );
+        make_docx(&body, false)
+    }
+
+    /// Domain rule: a block range holds every block between its endpoints in
+    /// document order, so a table inside it contributes its cells' revisions,
+    /// and every block id the census reports — a cell paragraph's included —
+    /// is a valid endpoint. The inventory filter and the range selectors read
+    /// one range.
+    #[tokio::test]
+    async fn block_ranges_reach_revisions_inside_tables() {
+        let bytes = table_range_selector_docx();
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bytes).await;
+        let (top, rows) = server
+            .runtime
+            .with(&DocHandle(doc_id.clone()), |snapshot| {
+                let top: Vec<String> = snapshot
+                    .canonical
+                    .blocks
+                    .iter()
+                    .map(|tb| match &tb.block {
+                        stemma::BlockNode::Paragraph(p) => p.id.to_string(),
+                        stemma::BlockNode::Table(t) => t.id.to_string(),
+                        stemma::BlockNode::OpaqueBlock(o) => o.id.to_string(),
+                    })
+                    .collect();
+                (top, revision_rows(&snapshot.canonical))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3, "one insertion per paragraph: {top:?}");
+        let (first, table, last) = (&top[0], &top[1], &top[2]);
+        let cell = rows[1].block_id.clone();
+        let inventory = |from: &str, to: &str| {
+            let server = &server;
+            let doc_id = doc_id.clone();
+            let (from, to) = (from.to_string(), to.to_string());
+            async move {
+                structured(
+                    &server
+                        .inspect_docx(Parameters(
+                            serde_json::from_value(json!({
+                                "doc_id": doc_id,
+                                "query": "revisions",
+                                "filter": {"by_block_range": {"from_block_id": from, "to_block_id": to}},
+                            }))
+                            .expect("documented wire shape parses"),
+                        ))
+                        .await,
+                )
+            }
+        };
+        assert_eq!(inventory(first, last).await["total"], 3, "the whole body");
+        assert_eq!(inventory(table, table).await["total"], 2, "the table");
+        let one = inventory(&cell, &cell).await;
+        assert_eq!(one["total"], 1, "a cell paragraph endpoint: {one}");
+        assert_eq!(one["revisions"][0]["block_id"], cell.as_str(), "{one}");
+
+        // by_range over the table resolves both cell insertions.
+        let rejected = server
+            .reject_changes(Parameters(RejectArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByRange {
+                    from_block_id: table.clone(),
+                    to_block_id: table.clone(),
+                },
+            }))
+            .await;
+        let payload = structured(&rejected);
+        assert_eq!(rejected.is_error, Some(false), "{payload}");
+        assert_eq!(
+            payload["rejected_revision_ids"].as_array().map(Vec::len),
+            Some(2),
+            "{payload}"
+        );
+
+        // by_filter author ∧ the whole body resolves every one, cells too.
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bytes).await;
+        let accepted = server
+            .accept_changes(Parameters(AcceptArgs {
+                doc_id: doc_id.clone(),
+                selector: ChangeSelector::ByFilter {
+                    by_author: Some("Other".to_string()),
+                    by_kind: None,
+                    by_block_range: Some(BlockRange {
+                        from_block_id: first.clone(),
+                        to_block_id: last.clone(),
+                    }),
+                },
+            }))
+            .await;
+        let payload = structured(&accepted);
+        assert_eq!(accepted.is_error, Some(false), "{payload}");
+        let remaining = server
+            .runtime
+            .with(&DocHandle(doc_id), |snapshot| {
+                revision_rows(&snapshot.canonical).len()
+            })
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "no revision in the range stays pending: {payload}"
+        );
+    }
+
     // ─── inspect_docx revisions_summary: counts, not rows ─────────────────────
 
     /// Domain rule: a review round is triaged by exact author × kind counts
@@ -10079,6 +10854,253 @@ mod tests {
         assert_eq!(json.get("location"), Some(&json!("Body")));
     }
 
+    #[tokio::test]
+    async fn nested_form_inspect_edit_save_preserves_other_fields() {
+        let field = |value: &str| {
+            format!(
+                r#"<w:p><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Same"/><w:textInput><w:default w:val="Default"/></w:textInput></w:ffData></w:fldChar></w:r><w:r><w:instrText> FORMTEXT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>{value}</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+            )
+        };
+        let bytes = make_docx(
+            &format!(
+                // A customXml element directly inside the control keeps it
+                // a preserved opaque block, which nested_form_fields reads.
+                r#"<w:sdt><w:sdtPr><w:id w:val="23"/></w:sdtPr><w:sdtContent><w:customXml w:uri="urn:x" w:element="sealed"><w:p><w:r><w:t>Unchanged label</w:t></w:r></w:p>{}{}</w:customXml></w:sdtContent></w:sdt>"#,
+                field("Unchanged value"),
+                field("Old value")
+            ),
+            false,
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bytes).await;
+        let result = server
+            .inspect_docx(Parameters(
+                serde_json::from_value(json!({
+                    "doc_id": doc_id, "query": "nested_form_fields", "offset": 1, "limit": 1,
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let payload = structured(&result);
+        assert_eq!(payload["total_fields"], 2);
+        let field = &payload["fields"][0];
+        assert_eq!(field["cached_result"], "Old value");
+        let plan = json!({"doc_id": doc_id, "preview": false, "transaction": {
+            "revision": {"author": "Reviewer"}, "ops": [{"op": "set_block_form_text",
+                "body_index": field["body_index"], "paragraph_index": field["paragraph_index"],
+                "field_index": field["field_index"], "semantic_hash": field["semantic_hash"], "text": "New value"}]
+        }});
+        let edited = server
+            .execute_plan(Parameters(serde_json::from_value(plan).unwrap()))
+            .await;
+        assert_eq!(edited.is_error, Some(false), "{edited:?}");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.docx");
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: path.to_str().unwrap().into(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "{saved:?}");
+        let parsed = Document::parse(&std::fs::read(path).unwrap()).unwrap();
+        let fields = parsed.block_form_field_targets().unwrap();
+        assert_eq!(fields[0].cached_result, "Unchanged value");
+        assert_eq!(fields[1].cached_result, "New value");
+        for invalid in [
+            json!({"limit":0}),
+            json!({"offset":99}),
+            json!({"pattern":"guess"}),
+        ] {
+            let mut args = json!({"doc_id": doc_id,"query":"nested_form_fields"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert_eq!(
+                server
+                    .inspect_docx(Parameters(serde_json::from_value(args).unwrap()))
+                    .await
+                    .is_error,
+                Some(true)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headers_footers_query_exposes_story_local_edit_addresses() {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let parts = [
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="main" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            (
+                "word/document.xml",
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:r><w:t>Main body</w:t></w:r></w:p><w:sectPr><w:footerReference w:type="default" r:id="footer"/></w:sectPr></w:body></w:document>"#,
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="footer" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/></Relationships>"#,
+            ),
+            (
+                "word/footer1.xml",
+                r#"<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t xml:space="preserve">Confidential — </w:t></w:r><w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p></w:ftr>"#,
+            ),
+        ];
+        for (name, xml) in parts {
+            archive
+                .start_file(name, zip::write::FileOptions::default())
+                .unwrap();
+            archive.write_all(xml.as_bytes()).unwrap();
+        }
+        let bytes = archive.finish().unwrap().into_inner();
+        let document = Document::parse(&bytes).unwrap();
+        let snapshot = document.snapshot();
+        let footer = snapshot
+            .canonical
+            .footers
+            .iter()
+            .find(|story| !story.synthesized)
+            .unwrap();
+        let stemma::domain::BlockNode::Paragraph(paragraph) = &footer.blocks[0].block else {
+            panic!("fixture footer must be a paragraph");
+        };
+        let expected_id = &paragraph.id;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &bytes).await;
+        let args = serde_json::from_value(json!({
+            "doc_id": doc_id, "query": "headers_footers", "limit": 1
+        }))
+        .expect("the core read surface must expose header/footer addresses");
+        let result = server.inspect_docx(Parameters(args)).await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        let row = &payload["blocks"][0];
+        assert_eq!(row["story_type"], "footer");
+        assert_eq!(row["part_name"], footer.part_name);
+        assert_eq!(row["kind"], "default");
+        assert_eq!(row["block"]["id"], expected_id.to_string());
+        assert_eq!(
+            row["block"]["role_token"],
+            Value::Null,
+            "story-local ids must not inherit an unrelated body paragraph's role token"
+        );
+        assert!(row["block"].to_string().contains("Confidential"), "{row}");
+        assert!(
+            row["block"].to_string().contains("anchor"),
+            "field identity must remain visible: {row}"
+        );
+        assert_eq!(payload["returned"], 1);
+        assert_eq!(payload["has_more"], false);
+        assert_eq!(row["block"]["anchors"].as_array().unwrap().len(), 1);
+        let detail = server
+            .inspect_docx(Parameters(
+                serde_json::from_value(json!({
+                    "doc_id": doc_id, "query": "headers_footers", "block_id": row["block"]["id"],
+                    "pattern": row["part_name"],
+                    "detail": "formatting"
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_eq!(detail.is_error, Some(false), "{detail:?}");
+        assert_eq!(
+            structured(&detail)["blocks"][0]["block"]["detail"],
+            "formatting"
+        );
+        let end = server
+            .inspect_docx(Parameters(
+                serde_json::from_value(json!({
+                    "doc_id": doc_id, "query": "headers_footers", "offset": 1
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert_eq!(end.is_error, Some(false));
+        assert_eq!(structured(&end)["returned"], 0);
+        for invalid in [
+            json!({"limit": 0}),
+            json!({"limit": 65}),
+            json!({"offset": 2}),
+            json!({"block_id": "invented"}),
+            json!({"pattern": "ignored?"}),
+            json!({"cell_offset": 1}),
+        ] {
+            let mut wire = json!({"doc_id": doc_id, "query": "headers_footers"});
+            wire.as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            let result = server
+                .inspect_docx(Parameters(serde_json::from_value(wire).unwrap()))
+                .await;
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "invalid request must fail explicitly: {invalid}: {result:?}"
+            );
+        }
+        let edited = server.execute_plan(Parameters(serde_json::from_value(json!({
+            "doc_id": doc_id, "preview": false,
+            "transaction": {"revision": {"author": "Reviewer"}, "ops": [{
+                "op": "edit_footer", "footer_part": row["part_name"],
+                "target": row["block"]["id"], "expect": "Confidential",
+                "content": [
+                    {"type": "text", "text": "Internal — "},
+                    {"type": "opaque_ref", "attrs": {"id": row["block"]["anchors"][0]["id"]}}
+                ]
+            }]}
+        })).unwrap())).await;
+        assert_eq!(edited.is_error, Some(false), "{edited:?}");
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("edited.docx");
+        let saved = server
+            .save_docx(Parameters(SaveArgs {
+                doc_id: doc_id.clone(),
+                path: output.to_str().unwrap().to_owned(),
+            }))
+            .await;
+        assert_eq!(saved.is_error, Some(false), "{saved:?}");
+        let saved_bytes = std::fs::read(output).unwrap();
+        let reparsed = Document::parse(&saved_bytes).unwrap();
+        let saved_snapshot = reparsed.snapshot();
+        let saved_footer = saved_snapshot
+            .canonical
+            .footers
+            .iter()
+            .find(|s| s.part_name == footer.part_name)
+            .unwrap();
+        let view = stemma::view::build_story_view(&saved_footer.blocks);
+        let saved_detail = compact_block_detail_json(&view.blocks[0]);
+        assert_eq!(saved_detail["anchors"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            saved_detail["anchors"][0]["text"],
+            row["block"]["anchors"][0]["text"]
+        );
+        assert_eq!(
+            saved_snapshot.canonical.blocks, snapshot.canonical.blocks,
+            "a footer edit must not touch the main story"
+        );
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&saved_bytes)).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("word/footer1.xml").unwrap(), &mut xml)
+            .unwrap();
+        assert!(xml.contains("PAGE"), "page field must survive save: {xml}");
+        assert!(
+            xml.contains("Internal"),
+            "requested text must be saved: {xml}"
+        );
+        assert!(
+            xml.contains("w:ins") && xml.contains("w:del"),
+            "edit must remain tracked: {xml}"
+        );
+    }
+
     fn footnote_docx() -> Vec<u8> {
         // A minimal doc with one footnote body carrying a tracked insertion —
         // just enough to exercise the StoryScope::Footnote branch end to end.
@@ -10200,6 +11222,21 @@ mod tests {
             payload["notes"],
             json!([{"note_id": "1", "kind": "footnote", "text": "See Appendix C"}]),
             "the five-tool surface must expose everything edit_note requires: {payload}"
+        );
+    }
+
+    #[test]
+    fn replacement_catalog_teaches_existing_hyperlink_display_edit() {
+        let catalog = operation_catalog(Some("replace")).unwrap();
+        let examples = catalog["operations"][0]["examples"].as_array().unwrap();
+        assert!(
+            examples.iter().any(|example| {
+                let shape: Value = serde_json::from_str(example.as_str().unwrap()).unwrap();
+                shape["content"]["type"] == "hyperlink"
+                    && shape["target"] == "<hyperlink_id>"
+                    && shape["expect"].is_string()
+            }),
+            "replace discovery must expose its supported hyperlink target: {catalog}"
         );
     }
 
@@ -10514,9 +11551,9 @@ mod tests {
         let body: String = (0..n)
             .map(|i| {
                 format!(
-                    r#"<w:p><w:r><w:t>Paragraph {i}: the parties hereby agree that the foregoing \
-                       provisions shall be construed in accordance with the governing law and \
-                       interpreted to give effect to their evident commercial intent.</w:t></w:r></w:p>"#
+                    "<w:p><w:r><w:t>Paragraph {i}: the parties hereby agree that the foregoing \
+                     provisions shall be construed in accordance with the governing law and \
+                     interpreted to give effect to their evident commercial intent.</w:t></w:r></w:p>"
                 )
             })
             .collect();
@@ -11277,6 +12314,233 @@ mod tests {
         assert!(
             msg.contains("Expected op shape") && msg.contains(r#""op":"move""#),
             "the error teaches the move shape: {msg}"
+        );
+    }
+
+    /// Text in a table inside a header is found and readable where an edit
+    /// addresses it: `find` lists it under `story_matches` with the part to
+    /// pass, and the header read resolves its story-local id inside the table.
+    /// A picture's read shows its size, in the body and in a table cell (a
+    /// letterhead's seal): a resize starts from it, and an agent shown no size
+    /// scaled from a rounded figure instead.
+    #[tokio::test]
+    async fn a_pictures_read_shows_its_size_in_the_body_and_in_a_cell() {
+        use std::io::Write;
+        let server = StemmaServer::new();
+        let drawing = |id: u32| {
+            format!(
+                r#"<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><wp:extent cx="1038225" cy="1285875"/><wp:docPr id="{id}" name="Seal {id}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill><pic:spPr><a:xfrm><a:ext cx="1038225" cy="1285875"/></a:xfrm></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+            )
+        };
+        let document = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p>{}</w:p><w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl><w:p/><w:sectPr/></w:body></w:document>"#,
+            drawing(1),
+            drawing(2)
+        );
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default();
+            for (name, data) in [
+                ("[Content_Types].xml", r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_bytes()),
+                ("_rels/.rels", r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.as_bytes()),
+                ("word/_rels/document.xml.rels", r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#.as_bytes()),
+                ("word/document.xml", document.as_bytes()),
+                ("word/media/image1.png", b"\x89PNG\r\n\x1a\nfixture".as_slice()),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let doc_id = open_and_id(&server, &bytes).await;
+        let read = |block_id: &str| InspectDocxArgs {
+            doc_id: doc_id.clone(),
+            query: InspectQuery::Block,
+            block_id: Some(block_id.to_string()),
+            detail: None,
+            pattern: None,
+            patterns: None,
+            filter: None,
+            from_block_id: None,
+            to_block_id: None,
+            format: None,
+            offset: None,
+            limit: None,
+            cell_offset: None,
+            cell_limit: None,
+        };
+        let cell_paragraph = server
+            .runtime
+            .with(&DocHandle(doc_id.clone()), |snap| {
+                build_document_view(snap).blocks[1].cells[0].paragraphs[0]
+                    .block_id
+                    .clone()
+            })
+            .unwrap();
+        for block_id in ["p_1".to_string(), cell_paragraph] {
+            let payload = structured(&server.inspect_docx(Parameters(read(&block_id))).await);
+            assert_eq!(
+                payload["anchors"][0]["size_emu"],
+                json!({"cx": 1038225, "cy": 1285875}),
+                "{block_id}: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_table_text_is_found_and_read() {
+        use std::io::Write;
+        let server = StemmaServer::new();
+        let header = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tbl><w:tblGrid><w:gridCol w:w="0"/><w:gridCol w:w="0"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Council</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>townclerk@example.org</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:hdr>"#;
+        let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:r><w:t>Body text.</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdH1"/></w:sectPr></w:body></w:document>"#;
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let opts: zip::write::FileOptions = zip::write::FileOptions::default();
+            for (name, data) in [
+                (
+                    "[Content_Types].xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>"#,
+                ),
+                (
+                    "_rels/.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+                ),
+                (
+                    "word/_rels/document.xml.rels",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdH1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>"#,
+                ),
+                ("word/document.xml", document),
+                ("word/header1.xml", header),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(data.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let doc_id = open_and_id(&server, &bytes).await;
+        let found = structured(
+            &server
+                .find(Parameters(FindArgs {
+                    doc_id: doc_id.clone(),
+                    pattern: "townclerk".to_string(),
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(found["count"], 0, "the body has no match: {found}");
+        let story = &found["story_matches"][0];
+        assert_eq!(story["header_part"], "header1.xml", "{found}");
+        let cell = &story["matches"][0]["matching_cells"][0];
+        let paragraph_id = cell["block_id"]
+            .as_str()
+            .expect("the cell paragraph id")
+            .to_string();
+        let read = server
+            .inspect_docx(Parameters(InspectDocxArgs {
+                doc_id,
+                query: InspectQuery::HeadersFooters,
+                block_id: Some(paragraph_id.clone()),
+                detail: None,
+                pattern: Some("header1.xml".to_string()),
+                patterns: None,
+                filter: None,
+                from_block_id: None,
+                to_block_id: None,
+                format: None,
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+            .await;
+        let payload = structured(&read);
+        assert_eq!(read.is_error, Some(false), "{payload}");
+        assert_eq!(
+            payload["blocks"][0]["block"]["id"], paragraph_id,
+            "{payload}"
+        );
+        assert_eq!(
+            payload["blocks"][0]["block"]["text"],
+            "townclerk@example.org"
+        );
+    }
+
+    /// A link asked for as a mark (the first thing agents try) is refused with
+    /// the inline hyperlink node named, and the insert shapes show one: an
+    /// agent told only the valid marks concluded links could not be created.
+    #[tokio::test]
+    async fn a_link_mark_error_names_the_inline_hyperlink() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let result = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": [{ "op": "insert", "target": { "anchor": "p_1", "position": "after" },
+                        "content": [{ "type": "paragraph", "content": [
+                            { "type": "text", "text": "See " },
+                            { "type": "text", "text": "2783", "marks": [{ "type": "link",
+                                "attrs": { "href": "https://example.com/hb2783" } }] }
+                        ] }] }],
+                    "revision": { "author": "shape-test" },
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let msg = structured(&result)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(msg.contains("A link is not a mark"), "{msg}");
+        assert!(
+            msg.contains(r#"{"type":"hyperlink","attrs":{"href":"<url>"}"#),
+            "{msg}"
+        );
+    }
+
+    /// A receipt says what a tracked paragraph reads once accepted: a
+    /// whole-paragraph replace with a short phrase reads as the whole old
+    /// paragraph plus the phrase in the redline `text`, but as the phrase
+    /// alone in `accepted_text`.
+    #[tokio::test]
+    async fn a_receipt_shows_a_tracked_paragraphs_accepted_text() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let paragraph = server
+            .runtime
+            .with(&DocHandle(doc_id.clone()), |snap| {
+                build_document_view(snap).blocks[0].text.clone()
+            })
+            .unwrap();
+        let result = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": [{ "op": "replace", "target": "p_1", "expect": paragraph,
+                        "content": { "type": "paragraph", "content": [
+                            { "type": "text", "text": "A short phrase." }] } }],
+                    "revision": { "author": "receipt-test" },
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{:?}", structured(&result));
+        let row = &structured(&result)["changed_blocks"][0];
+        assert_eq!(row["accepted_text"], json!("A short phrase."), "{row}");
+        assert!(
+            row["text"]
+                .as_str()
+                .unwrap()
+                .contains("Paragraph 0: the parties"),
+            "the redline reading still shows the deleted text: {row}"
         );
     }
 
@@ -12168,6 +13432,69 @@ mod tests {
         }
     }
 
+    /// A vertically merged cell reads with its `row_span`; the rows it covers
+    /// list no cell of their own in that column. Without it an agent cannot
+    /// tell a merged group from empty cells (it said so on a bid table).
+    #[tokio::test]
+    async fn table_cells_show_their_merges() {
+        let server = StemmaServer::new();
+        let body = r#"<w:tbl><w:tblGrid><w:gridCol w:w="0"/><w:gridCol w:w="0"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Case 7</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Bid A</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc><w:tc><w:p><w:r><w:t>Bid B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let outline = structured(
+            &server
+                .read_outline(Parameters(ReadArgs {
+                    doc_id: doc_id.clone(),
+                }))
+                .await,
+        );
+        let table_id = table_block_id(&outline);
+        let spans = |detail: &Value| -> Vec<(u64, u64, Option<u64>)> {
+            detail["cells"]
+                .as_array()
+                .expect("cells array")
+                .iter()
+                .map(|cell| {
+                    (
+                        cell["row"].as_u64().unwrap(),
+                        cell["col"].as_u64().unwrap(),
+                        cell["row_span"].as_u64(),
+                    )
+                })
+                .collect()
+        };
+        let expected = [(0, 0, Some(2)), (0, 1, None), (1, 1, None)];
+        let legacy = structured(
+            &server
+                .read_block(Parameters(ReadBlockArgs {
+                    doc_id: doc_id.clone(),
+                    block_id: table_id.clone(),
+                }))
+                .await,
+        );
+        assert_eq!(spans(&legacy), expected, "read_block");
+        let core = structured(
+            &server
+                .inspect_docx(Parameters(InspectDocxArgs {
+                    doc_id,
+                    query: InspectQuery::Block,
+                    block_id: Some(table_id),
+                    detail: None,
+                    pattern: None,
+                    patterns: None,
+                    filter: None,
+                    from_block_id: None,
+                    to_block_id: None,
+                    format: None,
+                    offset: None,
+                    limit: None,
+                    cell_offset: None,
+                    cell_limit: None,
+                }))
+                .await,
+        );
+        assert_eq!(spans(&core), expected, "inspect_docx block");
+    }
+
     /// Every paragraph id surfaced inside a table is a real edit target and
     /// must therefore be inspectable through the compact core before editing.
     #[tokio::test]
@@ -12375,6 +13702,138 @@ mod tests {
         assert_eq!(ids.len(), 20, "all cell ids are retrievable exactly once");
     }
 
+    /// Domain rule: what the reader sees in a table cell — a content
+    /// control's value, a link's text — is findable there as it is in a body
+    /// paragraph, and a textbox's text is findable on the paragraph holding
+    /// it. A cell control's value is also on the cell paragraph's read, since
+    /// three ops write it.
+    #[tokio::test]
+    async fn find_reaches_cell_controls_cell_links_and_textboxes() {
+        let control = |value: &str| {
+            format!(
+                r#"<w:sdt><w:sdtPr><w:id w:val="9"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>{value}</w:t></w:r></w:sdtContent></w:sdt>"#
+            )
+        };
+        let textbox = r#"<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0"><wp:extent cx="2700000" cy="900000"/><wp:docPr id="1" name="TextBox 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:txbx><w:txbxContent><w:p><w:r><w:t>Textbox region words</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#;
+        let body = format!(
+            concat!(
+                r#"<w:p><w:r><w:t xml:space="preserve">Body </w:t></w:r>{}</w:p>"#,
+                r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p>"#,
+                r#"<w:r><w:t xml:space="preserve">Cell </w:t></w:r>{}"#,
+                r#"<w:r><w:t xml:space="preserve"> see </w:t></w:r>"#,
+                r#"<w:hyperlink w:anchor="terms"><w:r><w:t>cell link text</w:t></w:r></w:hyperlink>"#,
+                r#"</w:p></w:tc></w:tr></w:tbl>"#,
+                r#"<w:p><w:r><w:t xml:space="preserve">Shape: </w:t></w:r>{}</w:p>"#,
+            ),
+            control("Bodysdt value"),
+            control("Cellsdt value"),
+            textbox,
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(&body, false)).await;
+        let find = |pattern: &str| {
+            let server = &server;
+            let args = FindArgs {
+                doc_id: doc_id.clone(),
+                pattern: pattern.to_string(),
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            };
+            async move { structured(&server.find(Parameters(args)).await) }
+        };
+
+        let body_control = find("Bodysdt value").await;
+        assert_eq!(body_control["count"], 1, "{body_control}");
+
+        let cell_control = find("Cellsdt value").await;
+        assert_eq!(cell_control["count"], 1, "{cell_control}");
+        let cell = &cell_control["matches"][0]["matching_cells"][0];
+        let cell_paragraph = cell["block_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the match names the cell paragraph: {cell_control}"))
+            .to_string();
+
+        let cell_link = find("cell link text").await;
+        assert_eq!(cell_link["count"], 1, "{cell_link}");
+        assert_eq!(
+            cell_link["matches"][0]["matching_cells"][0]["block_id"],
+            cell_paragraph.as_str(),
+            "{cell_link}"
+        );
+
+        let shape = find("Textbox region").await;
+        assert_eq!(shape["count"], 1, "{shape}");
+        assert_eq!(shape["matches"][0]["matched_in"], "textbox", "{shape}");
+        assert!(
+            shape["matches"][0]["anchor"]["id"].is_string(),
+            "the match names the drawing: {shape}"
+        );
+
+        let read = structured(
+            &server
+                .inspect_docx(Parameters(
+                    serde_json::from_value(json!({
+                        "doc_id": doc_id.clone(),
+                        "query": "block",
+                        "block_id": cell_paragraph,
+                    }))
+                    .expect("documented wire shape parses"),
+                ))
+                .await,
+        );
+        assert!(
+            read["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Cellsdt value")),
+            "the cell paragraph's read shows the control's value: {read}"
+        );
+    }
+
+    /// A link's display text is on the page, so find must locate it. The block's
+    /// text leaves the link out (it is not reachable by text replacement), so the
+    /// match names the hyperlink anchor, the id `replace` targets to change it. Its
+    /// target is findable the same way.
+    #[tokio::test]
+    async fn find_locates_a_link_by_its_display_text_and_its_target() {
+        let body = r#"<w:p><w:r><w:t xml:space="preserve">Complaints go to the Authority (</w:t></w:r><w:hyperlink w:anchor="ContactUs"><w:r><w:t>its complaints page</w:t></w:r></w:hyperlink><w:r><w:t>).</w:t></w:r></w:p><w:p><w:bookmarkStart w:id="1" w:name="ContactUs"/><w:r><w:t>Write to us.</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let find = |pattern: &str| FindArgs {
+            doc_id: doc_id.clone(),
+            pattern: pattern.to_string(),
+            offset: None,
+            limit: None,
+            cell_offset: None,
+            cell_limit: None,
+        };
+
+        let by_text = structured(&server.find(Parameters(find("Complaints PAGE"))).await);
+        assert_eq!(
+            by_text["count"], 1,
+            "the link text is found once: {by_text}"
+        );
+        let hit = &by_text["matches"][0];
+        assert_eq!(hit["matched_in"], "hyperlink");
+        assert_eq!(hit["anchor"]["anchor_kind"], "hyperlink");
+        assert_eq!(hit["anchor"]["text"], "its complaints page");
+        assert!(
+            hit["anchor"]["id"]
+                .as_str()
+                .is_some_and(|id| id.contains("_hyperlink_")),
+            "the match names the link's id: {hit}"
+        );
+
+        let by_target = structured(&server.find(Parameters(find("contactus"))).await);
+        assert_eq!(
+            by_target["count"], 1,
+            "the link target is found: {by_target}"
+        );
+        assert_eq!(by_target["matches"][0]["matched_in"], "hyperlink");
+        assert_eq!(by_target["matches"][0]["anchor"]["target"], "#ContactUs");
+    }
+
     #[tokio::test]
     async fn find_bounds_long_paragraphs_while_exact_block_text_remains_retrievable() {
         let exact = format!(
@@ -12426,6 +13885,57 @@ mod tests {
                 .await,
         );
         assert_eq!(detail["text"], exact);
+    }
+
+    /// Domain rule: a replacement worklist edits a paragraph's own runs; a
+    /// content control's value and a hyperlink's display text are edited
+    /// through their objects. A replace_all item whose needle also stands in
+    /// one must not report would_apply/applied with that text left behind: it
+    /// refuses and names the object.
+    #[tokio::test]
+    async fn worklist_replace_all_refuses_text_left_in_a_content_control() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Acme Corp signs as </w:t></w:r>"#,
+            r#"<w:sdt><w:sdtPr><w:id w:val="7"/><w:text/></w:sdtPr><w:sdtContent>"#,
+            r#"<w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
+        );
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let preview = server
+            .execute_plan(Parameters(ExecutePlanArgs {
+                doc_id: Some(doc_id.clone()),
+                transaction: None,
+                resolution: None,
+                replacement_worklist: Some(ReplacementWorklistArg {
+                    author: "Reviewer".to_string(),
+                    replacements: vec![CoreReplacementItem {
+                        effect_id: None,
+                        old: "Acme Corp".to_string(),
+                        new: "Acme Inc".to_string(),
+                        scope: None,
+                        expected_matches: None,
+                        replace_all: true,
+                        match_mode: default_core_replacement_match_mode(),
+                        on_barrier_match: default_core_barrier_policy(),
+                    }],
+                }),
+                comparison: None,
+                preview: true,
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&preview);
+        assert_eq!(payload["would_apply"], 0, "{payload}");
+        assert_ne!(payload["apply_ready"], true, "{payload}");
+        let item = &payload["items"][0];
+        assert_eq!(item["status"], "error", "{payload}");
+        assert_eq!(item["code"], "ReplaceTextInsideInlineObjects", "{payload}");
+        assert_eq!(
+            item["unreached_matches"][0]["region"], "content_control_value",
+            "{payload}"
+        );
+        assert_eq!(item["unreached_matches"][0]["block_id"], "p_1", "{payload}");
     }
 
     #[tokio::test]
@@ -13273,7 +14783,7 @@ mod tests {
     /// exists. Returning "review_required" after writing would turn a failed
     /// trust decision into an apparently usable artifact.
     #[tokio::test]
-    async fn save_docx_refuses_non_deliverable_audit_before_path_creation() {
+    async fn save_docx_writes_and_reports_a_non_deliverable_audit() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::write(workspace.path().join("input.docx"), make_multi_para_docx(3))
             .expect("write input");
@@ -13304,22 +14814,24 @@ mod tests {
         let saved = server
             .save_docx(Parameters(SaveArgs {
                 doc_id,
-                path: "must-not-exist.docx".to_string(),
+                path: "needs-review.docx".to_string(),
             }))
             .await;
         let payload = structured(&saved);
-        assert_eq!(saved.is_error, Some(true), "{payload}");
-        assert_eq!(payload["code"], "verification_failed", "{payload}");
-        assert_eq!(payload["audit"]["verdict"]["deliverable"], false);
+        assert_eq!(saved.is_error, Some(false), "{payload}");
+        assert_eq!(payload["verdict"]["status"], "needs_review", "{payload}");
+        assert_eq!(payload["verdict"]["deliverable"], false, "{payload}");
+        assert_eq!(payload["audit_binding"]["verdict"]["deliverable"], false);
         assert!(
-            payload["audit"]["counts"]["unexplained_direct_changes"]
+            payload["audit_binding"]["counts"]["unexplained_direct_changes"]
                 .as_u64()
                 .is_some_and(|count| count > 0),
-            "the refusal exposes the blocking finding count: {payload}"
+            "the receipt exposes the finding count: {payload}"
         );
+        assert_eq!(payload["review"]["tool"], "verify_docx", "{payload}");
         assert!(
-            !workspace.path().join("must-not-exist.docx").exists(),
-            "a failed audit must not create a deliverable"
+            workspace.path().join("needs-review.docx").exists(),
+            "the audit informs the caller; only a validator error refuses the save"
         );
     }
 
@@ -13425,11 +14937,10 @@ mod tests {
             }))
             .await;
         assert_eq!(
-            structured(&refused_same_block)["code"],
-            "verification_failed",
+            structured(&refused_same_block)["verdict"]["status"],
+            "needs_review",
             "a later direct edit cannot inherit an earlier resolution transition"
         );
-        assert!(!workspace.path().join("same-block-direct.docx").exists());
 
         let bypass_authority =
             PathAuthority::rooted(workspace.path()).expect("second rooted authority");
@@ -13474,12 +14985,11 @@ mod tests {
             }))
             .await;
         let refused = structured(&refused);
-        assert_eq!(refused["code"], "verification_failed", "{refused}");
+        assert_eq!(refused["verdict"]["status"], "needs_review", "{refused}");
         assert_eq!(
-            refused["audit"]["counts"]["unexpected_changed_prior_revisions"], 1,
+            refused["audit_binding"]["counts"]["unexpected_changed_prior_revisions"], 1,
             "{refused}"
         );
-        assert!(!workspace.path().join("unexpected-resolution.docx").exists());
     }
 
     /// Resolution evidence follows the typed operation's structural footprint,
@@ -13574,15 +15084,9 @@ mod tests {
             }))
             .await;
         assert_eq!(
-            structured(&refused_before)["code"],
-            "verification_failed",
+            structured(&refused_before)["verdict"]["status"],
+            "needs_review",
             "an earlier direct edit cannot be absorbed into a later paragraph-join transition"
-        );
-        assert!(
-            !workspace
-                .path()
-                .join("direct-before-resolution.docx")
-                .exists()
         );
 
         let table = make_docx(
@@ -14663,6 +16167,112 @@ mod tests {
         assert_eq!(std::fs::read(existing).unwrap(), b"keep me");
     }
 
+    #[tokio::test]
+    async fn a_cell_match_names_the_paragraph_that_holds_it() {
+        // An agent edits the block a find returns. A cell match must name the
+        // paragraph holding the text, not the cell's first paragraph, or an
+        // insert "after" it lands in the wrong place.
+        let body = r#"<w:tbl><w:tblPr/><w:tr><w:tc><w:tcPr/><w:p><w:r><w:t>Opening line of the cell.</w:t></w:r></w:p><w:p><w:r><w:t>Target sentence lives here.</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let find = |pattern: &str| {
+            server.find(Parameters(FindArgs {
+                doc_id: doc_id.clone(),
+                pattern: pattern.to_string(),
+                offset: None,
+                limit: None,
+                cell_offset: None,
+                cell_limit: None,
+            }))
+        };
+        let found = structured(&find("Target sentence").await);
+        let cell = &found["matches"][0]["matching_cells"][0];
+        let ids = cell["block_ids"].as_array().expect("the cell's paragraphs");
+        assert_eq!(ids.len(), 2, "{cell}");
+        assert_eq!(cell["block_id"], ids[1], "{cell}");
+        assert_eq!(cell["match_spans_paragraphs"], false, "{cell}");
+        // Across the paragraph boundary no single paragraph holds the match.
+        let across = structured(&find("of the cell. Target").await);
+        let cell = &across["matches"][0]["matching_cells"][0];
+        assert!(cell["block_id"].is_null(), "{cell}");
+        assert_eq!(cell["match_spans_paragraphs"], true, "{cell}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_doc_id_names_the_open_documents() {
+        // An agent that opens a file and queries it in the same turn guesses the
+        // id. The refusal names the open one, so the next call can use it.
+        let server = StemmaServer::new();
+        let path = write_temp_docx(&make_docx("<w:p><w:r><w:t>Body</w:t></w:r></w:p>", false));
+        let opened = server
+            .open_docx(Parameters(OpenArgs {
+                path: path.clone(),
+                task: None,
+                task_id: None,
+            }))
+            .await;
+        let doc_id = structured(&opened)["doc_id"].as_str().unwrap().to_string();
+        let missing = fail("InvalidDocx", "doc handle not found");
+        let refused = structured(&server.attribute_missing_doc(missing, Some("x")));
+        assert_eq!(refused["code"], "unknown_doc_id");
+        assert_eq!(refused["open_doc_ids"], json!([doc_id]));
+        assert!(
+            refused["error"].as_str().unwrap().contains(&doc_id),
+            "{refused}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Protection is host policy, not an import refusal. The host must receive
+    /// the declaration and import warnings without credential material.
+    #[tokio::test]
+    async fn open_docx_reports_protection_and_import_diagnostics() {
+        for enforcement in [None, Some(false), Some(true)] {
+            let mut archive = stemma::docx::DocxArchive::read(&make_docx(
+                "<w:p><w:r><w:t>Protected form</w:t></w:r></w:p>",
+                false,
+            ))
+            .unwrap();
+            if let Some(enforced) = enforcement {
+                archive.upsert("word/settings.xml", format!(
+                    r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:documentProtection w:edit="forms" w:enforcement="{}" w:hash="not-a-real-credential"/></w:settings>"#,
+                    u8::from(enforced)
+                ).into_bytes());
+                archive.upsert("word/_rels/document.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/></Relationships>"#.to_vec());
+            }
+            let path = write_temp_docx(&archive.write().unwrap());
+            let result = StemmaServer::new()
+                .open_docx(Parameters(OpenArgs {
+                    path: path.clone(),
+                    task: None,
+                    task_id: None,
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(false));
+            let payload = structured(&result);
+            assert!(payload.get("document_protection").is_some());
+            let diagnostics = payload["diagnostics"]
+                .as_array()
+                .expect("import diagnostics");
+            if let Some(enforced) = enforcement {
+                assert_eq!(payload["document_protection"]["edit"], "Forms");
+                assert_eq!(payload["document_protection"]["enforcement"], enforced);
+                assert_eq!(payload["document_protection"]["has_credential"], true);
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .any(|d| d["context"] == "w:documentProtection" && d["level"] == "Warning"),
+                    enforced
+                );
+            } else {
+                assert!(payload["document_protection"].is_null());
+                assert!(diagnostics.is_empty());
+            }
+            assert!(!payload.to_string().contains("not-a-real-credential"));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     /// open_docx refuses a file larger than the configured cap, and the error
     /// names the size, the limit, and the env var to raise — checked on the
     /// file's metadata, before the bytes are read into memory.
@@ -14757,6 +16367,63 @@ mod tests {
             Some("doc_issued"),
         );
         assert_eq!(structured(&other)["code"], "StaleEdit");
+    }
+
+    /// An agent that opens a file and queries it in the same turn cannot know
+    /// the id yet. While exactly one document is open, a call that needs one and
+    /// names none is about that document; with none or several open, the call
+    /// is refused with the open ids. A call that names an id, or a mode that
+    /// takes no document (a comparison plan, a path-pair verify), is untouched.
+    #[tokio::test]
+    async fn an_omitted_doc_id_names_the_only_open_document() {
+        let server = StemmaServer::new();
+        let args = |value: Value| value.as_object().cloned();
+
+        let mut none_open = args(json!({"query": "index"}));
+        let refused = server
+            .fill_omitted_doc_id("inspect_docx", &mut none_open)
+            .expect_err("nothing is open");
+        assert_eq!(structured(&refused)["code"], "doc_id_required");
+
+        let first = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let mut inspect = args(json!({"query": "find", "pattern": "x"}));
+        server
+            .fill_omitted_doc_id("inspect_docx", &mut inspect)
+            .expect("one document is open");
+        assert_eq!(inspect.as_ref().unwrap()["doc_id"], json!(first));
+
+        let mut named = args(json!({"doc_id": "doc_typo", "query": "index"}));
+        server
+            .fill_omitted_doc_id("inspect_docx", &mut named)
+            .expect("a named id is left to the tool");
+        assert_eq!(named.as_ref().unwrap()["doc_id"], json!("doc_typo"));
+
+        let mut comparison = args(json!({"comparison": {}}));
+        server
+            .fill_omitted_doc_id("execute_plan", &mut comparison)
+            .expect("a comparison plan takes no document");
+        assert!(comparison.as_ref().unwrap().get("doc_id").is_none());
+
+        let mut worklist = args(json!({"replacement_worklist": {}}));
+        server
+            .fill_omitted_doc_id("execute_plan", &mut worklist)
+            .expect("an edit plan needs the document");
+        assert_eq!(worklist.as_ref().unwrap()["doc_id"], json!(first));
+
+        let mut path_pair = args(json!({"before_path": "a.docx", "after_path": "b.docx"}));
+        server
+            .fill_omitted_doc_id("verify_docx", &mut path_pair)
+            .expect("a path-pair verify takes no document");
+        assert!(path_pair.as_ref().unwrap().get("doc_id").is_none());
+
+        let second = open_and_id(&server, &make_multi_para_docx(2)).await;
+        let mut save = args(json!({"path": "out.docx"}));
+        let ambiguous = server
+            .fill_omitted_doc_id("save_docx", &mut save)
+            .expect_err("two documents are open");
+        let payload = structured(&ambiguous);
+        assert_eq!(payload["code"], "doc_id_required");
+        assert_eq!(payload["open_doc_ids"], json!([first, second]));
     }
 
     #[tokio::test]

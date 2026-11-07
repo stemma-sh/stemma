@@ -208,7 +208,7 @@ const BLOCK_VIEW_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "text",
-        "Concatenated visible text: the CURRENT redline reading, pending insertions and not-yet-accepted deletions both present (project the document for the accept-all or reject-all reading). What a plain `expect` matches against.",
+        "The block's text runs concatenated, after its `literal_prefix_text`: the CURRENT redline reading, pending insertions and not-yet-accepted deletions both present (project the document for the accept-all or reject-all reading). Inline anchors add no characters: a hyperlink's display text and a field's result are in that anchor's segment `text` and a content control's value in its `metadata`, and breaks, comment references and range markers are zero-width. What a plain `expect` matches against: any part of `text` outside pending deletions, or the whole of it; no anchor splits a match.",
     ),
     (
         "block_status",
@@ -237,6 +237,14 @@ const BLOCK_VIEW_FIELDS: &[(&str, &str)] = &[
     (
         "literal_prefix",
         r#"The typed-in enumeration label ("1.", "(a)") already prepended to `text`; surfaced separately because it is a structural marker, not a span an edit can address."#,
+    ),
+    (
+        "literal_prefix_text",
+        r#"That label as written, with the whitespace around it ("(c) " with a space, "1." with a tab): exactly what `text` starts with; null when `literal_prefix` is."#,
+    ),
+    (
+        "literal_prefix_marks",
+        r#"That label's own run marks ("bold", "underline", ...); empty when there is no label."#,
     ),
     (
         "segments",
@@ -370,11 +378,15 @@ const CELL_PARAGRAPH_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "block_id",
-        "The cell paragraph's own id; a `replace` or `set_format` can target it in place, like a body paragraph.",
+        "The cell paragraph's own id; every op that targets a paragraph (`replace`, `set_format`, `comment_create`, `insert_note`, `apply_style`, ...) can target it in place, like a body paragraph. `move` relocates top-level blocks only and refuses a cell paragraph.",
     ),
     (
         "guard",
         "The cell paragraph's own staleness guard, same mechanism as body blocks.",
+    ),
+    (
+        "literal_prefix",
+        "A typed label the paragraph starts with (`\"b. \"`), as written; the segments do not hold it. `null` when there is none or auto-numbering supplies the label.",
     ),
 ];
 
@@ -533,7 +545,10 @@ const INLINE_OPAQUE_FIELDS: &[(&str, &str)] = &[
         "inline_index",
         "Position of the anchor in the block's inline stream.",
     ),
-    ("text", "Visible label when known, else null."),
+    (
+        "text",
+        "Visible label when known (a link's text, a field's result; in a table cell paragraph, a content control's current value), else null.",
+    ),
     (
         "reference_id",
         "The `w:id` for footnote, endnote, and comment references; else null.",
@@ -593,6 +608,10 @@ const STYLE_PROPS_FIELDS: &[(&str, &str)] = &[
         r#"Underline style from `w:u` ("Single", "Double", "Dotted", ...), or null."#,
     ),
     (
+        "underline_extra_attrs",
+        r#"The underline's other `w:u` attributes as [name, value] pairs (`w:color`, `w:themeColor`, `w:themeTint`, `w:themeShade`); empty when it has none."#,
+    ),
+    (
         "font_east_asia",
         "East Asian font family from `w:rFonts` eastAsia.",
     ),
@@ -604,6 +623,10 @@ const STYLE_PROPS_FIELDS: &[(&str, &str)] = &[
     ("font_cs_theme", "Theme font reference for the cs slot."),
     ("lang", r#"Language tag from `w:lang` (e.g. "en-US")."#),
     ("lang_east_asia", "East Asian language tag."),
+    (
+        "lang_bidi",
+        "Complex-script language tag, independent of the Latin and East Asian slots.",
+    ),
     (
         "char_spacing",
         "Character spacing in twips from `w:spacing`.",
@@ -786,6 +809,10 @@ const TAB_STOP_FIELDS: &[(&str, &str)] = &[
 ];
 
 const SECTION_PROPERTIES_FIELDS: &[(&str, &str)] = &[
+    (
+        "source_section_attrs",
+        "Supplied section editing-session attributes as qualified-name/value pairs (rsidR, rsidRPr, rsidSect, rsidDel); provenance independent of page formatting.",
+    ),
     ("page_width", "Page width in twips (`w:pgSz`)."),
     ("page_height", "Page height in twips."),
     ("orientation", "Page orientation, when authored."),
@@ -813,7 +840,7 @@ const SECTION_PROPERTIES_FIELDS: &[(&str, &str)] = &[
     ("doc_grid_line_pitch", "Document grid line pitch in twips."),
     (
         "doc_grid_char_space",
-        "Document grid character space in twips.",
+        "Document grid character pitch adjustment, in 4096ths of a point; may be negative.",
     ),
     (
         "title_page",
@@ -897,6 +924,7 @@ const REVISION_KIND_TAGS: &[&str] = &[
     "format_section",
     "opaque_interior",
     "move",
+    "cell_merge",
 ];
 
 // ─── Compile-time pins ──────────────────────────────────────────────────────
@@ -916,7 +944,8 @@ fn enum_vocabularies_are_pinned() {
         | RevisionKind::FormatCell
         | RevisionKind::FormatSection
         | RevisionKind::OpaqueInterior
-        | RevisionKind::Move => (),
+        | RevisionKind::Move
+        | RevisionKind::CellMerge => (),
     };
     let _ = |m: Mark| match m {
         Mark::Bold | Mark::Italic | Mark::Underline | Mark::Subscript | Mark::Superscript => (),

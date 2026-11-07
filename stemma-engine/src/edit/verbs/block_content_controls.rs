@@ -139,8 +139,14 @@ pub(crate) fn apply_wrap_blocks(
         &spec.control,
         // Block-level wraps never carry a data binding (refused above).
         None,
-    )
-    .into_bytes();
+    );
+    // Store the self-contained fragment spelling import stores for a
+    // control's sdtPr, so an authored control and its saved form are one
+    // spelling.
+    let sdt_pr_xml = crate::word_xml::serialize_raw_fragment(
+        &crate::word_xml::parse_raw_fragment(sdt_pr_xml.as_bytes())
+            .expect("the sdtPr the builder writes is well-formed"),
+    );
 
     doc.blocks[start].block_sdt_wrap = Some(BlockSdtWrap {
         wrapper: SdtWrapper {
@@ -148,6 +154,7 @@ pub(crate) fn apply_wrap_blocks(
             sdt_end_pr_xml: None,
         },
         span,
+        nested: Vec::new(),
     });
 
     Ok(())

@@ -36,8 +36,8 @@
 //! (`merge_styles_xml_preferring_target`) and are deferred.
 
 use super::super::{
-    EditError, MaterializationMode, find_block_index, next_revision, snapshot_paragraph_formatting,
-    validate_block_is_editable,
+    EditError, MaterializationMode, block_at, block_at_mut, find_editable_block_path,
+    next_revision, snapshot_paragraph_formatting,
 };
 use crate::domain::{BlockNode, CanonDoc, IStr, NodeId, ParagraphNode, RevisionInfo};
 use crate::semantic_hash::check_block_guard;
@@ -53,18 +53,9 @@ pub(crate) fn apply(
     mode: MaterializationMode,
     step_index: usize,
 ) -> Result<(), EditError> {
-    // v1: top-level paragraphs only. A nested (table-cell) paragraph is not
-    // found here and surfaces as BlockNotFound.
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    // Block status + segment-Normal preconditions (same gate as a text replace
-    // / paragraph-formatting change).
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
-
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -83,7 +74,7 @@ pub(crate) fn apply(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -93,7 +84,7 @@ pub(crate) fn apply(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
@@ -251,6 +242,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }

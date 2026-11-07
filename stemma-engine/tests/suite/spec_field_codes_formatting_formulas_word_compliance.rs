@@ -293,7 +293,7 @@ fn date_picture_no_whitespace_stays_unquoted() {
 
 #[test]
 fn charformat_complex_field_result_reads_instruction_hidden() {
-    let body = r#"<w:p><w:r><w:t>Date: </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:instrText xml:space="preserve"> DATE \* CHARFORMAT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>1/4/2006</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">Date: </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:instrText xml:space="preserve"> DATE \* CHARFORMAT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>1/4/2006</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
     assert_eq!(

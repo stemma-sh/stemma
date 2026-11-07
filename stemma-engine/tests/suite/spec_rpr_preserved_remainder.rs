@@ -242,3 +242,77 @@ fn preserved_rpr_children_survive_reimport_after_unrelated_edit() {
         "preserved w14:glow must survive a second round-trip: {re_xml}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// (c) An extension element that shares a core local name is a different
+//     property: `w14:shadow` (a DrawingML text effect, MS-DOCX §2.6) is not
+//     `w:shadow` (the legacy shadow toggle, §17.3.2.32). An untouched run and
+//     paragraph mark carrying it keep it verbatim and gain no `w:shadow`.
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn an_extension_shadow_is_not_the_core_shadow_toggle() {
+    let w14_shadow = r#"<w14:shadow w14:blurRad="38100" w14:dist="19050" w14:dir="2700000" w14:sx="100000" w14:sy="100000" w14:kx="0" w14:ky="0" w14:algn="tl"><w14:schemeClr w14:val="dk1"><w14:alpha w14:val="60000"/></w14:schemeClr></w14:shadow>"#;
+    let body = format!(
+        r#"
+    <w:p>
+      <w:pPr><w:rPr><w:b/>{w14_shadow}</w:rPr></w:pPr>
+      <w:r><w:rPr><w:b/>{w14_shadow}</w:rPr><w:t>Shadowed heading</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>The Confidential Information is protected.</w:t></w:r>
+    </w:p>"#
+    );
+    let doc = Document::parse(&build_docx(&wrap_body(&body))).expect("parse");
+    let target_block = doc
+        .read()
+        .blocks
+        .get(1)
+        .expect("second paragraph")
+        .id
+        .clone();
+    let txn = EditTransaction {
+        steps: vec![EditStep::SetRunFormatting {
+            block_id: target_block,
+            expect: "Confidential".to_string(),
+            semantic_hash: None,
+            marks: InlineMarkSet {
+                bold: true,
+                ..Default::default()
+            },
+            style: RunStyleEdit::default(),
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::Direct,
+        revision: RevisionInfo {
+            revision_id: 1,
+            identity: 0,
+            author: Some("Spec".to_string()),
+            date: Some("2026-07-02T00:00:00Z".to_string()),
+            apply_op_id: None,
+        },
+    };
+    let bytes = doc
+        .apply(&txn)
+        .expect("apply unrelated edit")
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let xml = document_xml_of(&bytes);
+
+    assert!(
+        !xml.contains("<w:shadow"),
+        "no w:shadow toggle may appear: the source has none: {xml}"
+    );
+    assert_eq!(
+        xml.matches("<w14:shadow").count(),
+        2,
+        "the run's and the paragraph mark's w14:shadow both survive: {xml}"
+    );
+    assert!(
+        xml.contains(r#"w14:blurRad="38100""#) && xml.contains(r#"<w14:alpha w14:val="60000""#),
+        "w14:shadow survives with its attributes and nested colour: {xml}"
+    );
+    gate_serialized_bytes(&bytes, ValidatorLevel::Full)
+        .expect("output with a preserved w14:shadow must pass Full validation");
+}

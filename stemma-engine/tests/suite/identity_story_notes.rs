@@ -135,6 +135,7 @@ fn tracked_paragraph(id: &str) -> ParagraphNode {
         text_direction: None,
         cnf_style: None,
         formatting_change: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -220,6 +221,7 @@ fn doc_with_tracked_stories() -> CanonDoc {
             text_direction: None,
             cnf_style: None,
             formatting_change: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }))],
         meta: stemma::DocMeta {
@@ -230,12 +232,14 @@ fn doc_with_tracked_stories() -> CanonDoc {
         headers: vec![],
         footers: vec![],
         footnotes: vec![FootnoteStory {
+            source_attrs: Vec::new(),
             id: "1".to_string(),
             note_type: NoteType::Normal,
             blocks: vec![tracked_block("fn_p1")],
             content_hash: String::new(),
         }],
         endnotes: vec![EndnoteStory {
+            source_attrs: Vec::new(),
             id: "1".to_string(),
             note_type: NoteType::Normal,
             blocks: vec![tracked_block("en_p1")],

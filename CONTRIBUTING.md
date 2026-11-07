@@ -36,6 +36,12 @@ The engine crate has a richer, engine-scoped gate with optional host-only tiers:
 stress) skip gracefully when their env vars are unset and are not required for a
 PR.
 
+Changes that touch the Python binding (`stemma-py/`) or the facade it wraps
+also need `just py-test`, which builds the wheel and runs the Python suite in a
+fresh virtual environment. It needs [`uv`](https://docs.astral.sh/uv/) and
+network access to PyPI, which is why it is not part of `just gate`; CI runs it
+on every push.
+
 ## Where to start reading
 
 - [`docs/internals/architecture.md`](docs/internals/architecture.md) — the map:

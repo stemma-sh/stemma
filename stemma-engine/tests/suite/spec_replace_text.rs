@@ -486,9 +486,10 @@ fn one_diagnosis(err: ReplaceTextError) -> String {
     }
 }
 
-/// PROBE (b) — label-strip. A needle that includes the structural numbering label
+/// PROBE (b) — label-strip. A needle that includes the paragraph's typed label
 /// ("1.\tEvents") finds zero matches (the label lives in literal_prefix, not the
-/// runs), and the diagnosis names the label and the working label-stripped needle.
+/// runs). The diagnosis names the label, the op that rewrites a typed label
+/// (whole-paragraph replace) and the working label-stripped needle.
 #[test]
 fn zero_match_label_probe_teaches_dropping_the_label() {
     let doc = Document::parse(&numbered_heading_docx()).expect("parse");
@@ -498,8 +499,18 @@ fn zero_match_label_probe_teaches_dropping_the_label() {
         .expect_err("a needle including the numbering label matches nothing");
     let d = one_diagnosis(err);
     assert!(
-        d.contains("1.") && d.contains("Events") && d.contains("numbering label"),
-        "the label probe names the structural label and the working needle: {d}"
+        d.contains("'1.' is the typed label") && d.contains("op replace") && d.contains("'Events'"),
+        "the label probe names the typed label, the relabel route and the working needle: {d}"
+    );
+
+    // A needle that is only the label is answered the same way: the agent
+    // trying to renumber "1." to "2." learns which op does it.
+    let err = plan_replace_text(&canonical, &opts("1.", "2."))
+        .expect_err("a needle that is only the typed label matches nothing");
+    let d = one_diagnosis(err);
+    assert!(
+        d.contains("'1.' is the typed label") && d.contains("op replace"),
+        "the label-only needle is told how to change the label: {d}"
     );
 
     // The advice works: the label-stripped needle matches normally.
@@ -543,6 +554,40 @@ fn zero_match_straddle_probe_names_the_block_and_wall() {
     assert!(
         d.contains("wall") && (d.contains("p_") || d.contains("block")),
         "the straddle probe names the wall and the block: {d}"
+    );
+}
+
+/// Word's spelling and grammar marks (`w:proofErr`) are not content: they
+/// bracket a word Word's proofing flagged, and Word recomputes them on open.
+/// A needle crossing them is in one unbroken run of text, so it is replaced
+/// like any other (a Word user's selection and Find both cross them).
+#[test]
+fn a_needle_crossing_proofing_marks_is_replaced() {
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">Kim; U.S. v. </w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t>Romaszko</w:t></w:r><w:proofErr w:type="spellEnd"/><w:r><w:t xml:space="preserve">; and U.S. v. Thompson.</w:t></w:r></w:p>"#;
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let edited = apply(&doc, &opts("U.S. v. Romaszko; ", "")).expect("the needle is replaceable");
+    assert_eq!(
+        edited.read_accepted().expect("accept").read().blocks[0].text,
+        "Kim; and U.S. v. Thompson."
+    );
+    assert_eq!(
+        edited.read_rejected().expect("reject").read().blocks[0].text,
+        "Kim; U.S. v. Romaszko; and U.S. v. Thompson."
+    );
+    let reopened = Document::parse(
+        &edited
+            .serialize(&stemma::ExportOptions::default())
+            .expect("save"),
+    )
+    .expect("reopen");
+    let differences = stemma::roundtrip_compare::compare_canon_docs(
+        &edited.snapshot().canonical,
+        &reopened.snapshot().canonical,
+    );
+    assert!(
+        differences.is_empty(),
+        "{:?}",
+        &differences[..differences.len().min(2)]
     );
 }
 
@@ -639,5 +684,52 @@ fn zero_match_genuinely_absent_needle_has_empty_diagnosis() {
             );
         }
         other => panic!("expected MatchCountMismatch, got {other:?}"),
+    }
+}
+
+/// Inside a hyperlink. Text replacement does not reach a link's visible text,
+/// so a needle that occurs there refuses, naming the link and the op that
+/// changes its text.
+#[test]
+fn zero_match_inside_hyperlink_names_the_link_and_replace() {
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">Write to </w:t></w:r><w:hyperlink w:anchor="Contact"><w:r><w:t>old@example.com</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="1" w:name="Contact"/><w:r><w:t>Contact</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let canonical = doc.snapshot().canonical.as_ref().clone();
+    let err = plan_replace_text(&canonical, &opts("old@example.com", "new@example.com"))
+        .expect_err("link text is not reached by text replacement");
+    let d = inline_object_refusal(err);
+    assert!(
+        d.contains("hyperlink") && d.contains("replace") && d.contains("_hyperlink_"),
+        "the probe names the link id and the replace route: {d}"
+    );
+}
+
+/// On a SHORT count: a heading and a contents line both say "CONCLUSION", but
+/// the contents line is a hyperlink. Replacing the heading alone would leave
+/// the other occurrence; the refusal names the link holding it and the op that
+/// changes its text, so the agent is not left guessing.
+#[test]
+fn a_short_count_names_the_hyperlink_holding_the_missing_occurrence() {
+    let body = r#"<w:p><w:hyperlink w:anchor="Conclusion"><w:r><w:t xml:space="preserve">CONCLUSION	30</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="1" w:name="Conclusion"/><w:r><w:t>CONCLUSION</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let canonical = doc.snapshot().canonical.as_ref().clone();
+    let mut options = opts("CONCLUSION", "SECTION 5. CONCLUSION");
+    options.expected = ExpectedMatches::Count(2);
+    let d = inline_object_refusal(
+        plan_replace_text(&canonical, &options).expect_err("one of two is reachable"),
+    );
+    assert!(
+        d.contains("_hyperlink_") && d.contains("replace"),
+        "the link and the replace route are named: {d}"
+    );
+}
+
+/// The refusal for an occurrence inside an inline object, as its message.
+fn inline_object_refusal(err: ReplaceTextError) -> String {
+    match err {
+        ReplaceTextError::Engine(
+            error @ stemma::edit::EditError::ReplaceTextInsideInlineObjects { .. },
+        ) => error.to_string(),
+        other => panic!("expected ReplaceTextInsideInlineObjects, got {other:?}"),
     }
 }

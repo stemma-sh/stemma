@@ -6,7 +6,7 @@ This area covers `w:sectPr` section typing (`w:type@val=continuous|nextPage`), c
 
 ## Drafting-error correction
 
-ISO 29500-1 §17.6.22 literally says a continuous section's omitted page-level properties "shall be inherited from the **following** section". This is a **confirmed drafting error**; Word inherits from the **PRECEDING** section. stemma implements the corrected behavior in `src/import.rs::propagate_continuous_section_properties` (forward pass, fills None page-geometry fields of a `Continuous` section from `prev_props`). All tests here pin the corrected preceding-section semantics; none encode the literal "following" text.
+ISO 29500-1 §17.6.22 says a continuous section's omitted page-level properties "shall be inherited from the **following** section". Real Word does neither that nor preceding-section inheritance for the stored section: opened and saved by Word, a continuous section that omits `w:pgSz` or `w:pgMar` attributes comes back with Word's defaults (12240 x 15840 portrait, 1440 margins, 720 header and footer distance, 0 gutter), whatever its neighbours declare. stemma therefore stores each section as authored and copies nothing in on import; a consumer that needs the effective geometry reads an omitted value as Word's default (`WORD_DEFAULT_PAGE_WIDTH` and friends in `src/edit/verbs/page_setup.rs`). Earlier versions copied the preceding section's values in, which a save then wrote out as authored values.
 
 ## Confirmed incompliances
 

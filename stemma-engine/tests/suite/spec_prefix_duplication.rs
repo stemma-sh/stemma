@@ -20,11 +20,12 @@
 //! op by omitting the label. (Per task-1 review: this error is "the single most
 //! valuable string in the fix" — it breaks the doubling chain at step one.)
 //!
-//! A DIFFERENT label at the head (an attempted in-text renumber) is ALSO
-//! refused — the paragraph's own label is re-emitted untouched, so the result
-//! would stack ("1.2.\tEvents"). Its refusal message is intent-preserving: it
-//! names both labels and says label changes via text replace are unsupported
-//! (never "just omit it", which would silently abandon the renumber).
+//! A DIFFERENT label at the head is a relabel. When the label is typed text it
+//! is the paragraph's own characters, so the replace rewrites it (a tracked
+//! delete of the old label and insert of the new). When the label is list
+//! numbering it is refused — the generated label would stack ("1.2.\tEvents")
+//! — with a message that names both labels and points at `set_numbering`
+//! (never "just omit it", which would silently abandon the relabel).
 //!
 //! Legitimate cases that must NOT be refused (no overreach):
 //!   - a paragraph WITHOUT numbering keeps a literal "1.\t" as real content;
@@ -42,15 +43,36 @@ use stemma::{BlockNode, InlineNode, NodeId, RevisionInfo};
 // ─── Fixtures (mirror spec_span_splice.rs) ───────────────────────────────────
 
 fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
+    make_docx(body_inner, None)
+}
+
+/// A package whose paragraphs can use the given numbering part.
+fn make_docx_with_parts(body_inner: &str, numbering_xml: &str) -> Vec<u8> {
+    make_docx(body_inner, Some(numbering_xml))
+}
+
+fn make_docx(body_inner: &str, numbering_xml: Option<&str>) -> Vec<u8> {
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_inner}<w:sectPr/></w:body></w:document>"#
     );
-    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    let numbering_override = if numbering_xml.is_some() {
+        r#"<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#
+    } else {
+        ""
+    };
+    let content_types = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>{numbering_override}</Types>"#
+    );
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
-    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#;
+    let doc_rels = if numbering_xml.is_some() {
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdNum" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>"#
+    } else {
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#
+    };
     use std::io::Write;
     use zip::write::FileOptions;
     let mut buf = Vec::new();
@@ -66,6 +88,10 @@ fn make_docx_with_body(body_inner: &str) -> Vec<u8> {
         zip.write_all(doc_rels.as_bytes()).unwrap();
         zip.start_file("word/document.xml", opts).unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
+        if let Some(numbering_xml) = numbering_xml {
+            zip.start_file("word/numbering.xml", opts).unwrap();
+            zip.write_all(numbering_xml.as_bytes()).unwrap();
+        }
         zip.finish().unwrap();
     }
     buf
@@ -298,8 +324,8 @@ fn literal_number_on_unnumbered_paragraph_is_a_real_edit() {
 /// Adding a letter like "(b)" to an UNLETTERED paragraph
 /// — one with NO existing label — is real content. The guard only fires when the paragraph
 /// ALREADY carries a label, so writing "(b)\t…" onto an unlabeled paragraph is
-/// real content and applies. (Re-lettering an ALREADY-lettered paragraph is the
-/// corruption case, refused above; the agent uses the renumber verb for that.)
+/// real content and applies. (Re-lettering an ALREADY-lettered paragraph is
+/// covered below: a typed label is rewritten, list numbering is refused.)
 #[test]
 fn adding_a_letter_to_an_unlettered_paragraph_is_a_real_edit() {
     let doc = Document::parse(&make_docx_with_body(
@@ -332,29 +358,21 @@ fn adding_a_letter_to_an_unlettered_paragraph_is_a_real_edit() {
     );
 }
 
-/// A DIFFERENT label at the head ("2.\t" when the paragraph's label is "1.")
-/// also CORRUPTS, not renumbers. VERIFIED against the pre-guard behavior: the
-/// paragraph's hoisted "1." label survives and is re-emitted, so applying
-/// "2.\tEvents" verbatim renders the accepted text "1.2.\tEvents" — mixed
-/// doubling, the same corruption class this contract exists to kill, through a
-/// different door. (Making a literal in-body label SUPERSEDE the existing one
-/// would require stripping the hoisted label — that is the `set_numbering`
-/// renumber verb's job, not a side effect of typing a number into the body.)
-///
-/// So the guard refuses ANY enumeration label at the head of the content when
-/// the paragraph already carries one — but with a DIFFERENT, intent-preserving
-/// message than the echo case: it names BOTH labels, shows the stacking the
-/// agent didn't intend ("1.2.…"), and says label changes via text replace are
-/// unsupported. Telling a renumbering agent to "omit the label (the numbering
-/// is already present)" would be factually wrong and silently abandon its
-/// intent.
+/// A DIFFERENT label at the head of a paragraph whose label is TYPED text
+/// rewrites the label. The "1." here is the paragraph's own characters
+/// (§17.3.3.31 `w:t`, no `w:numPr`): import hoists it into `literal_prefix` so
+/// the read view can show it as a label, but it has no numbering behind it, so
+/// no numbering verb can change it. Retyping it is a text edit, and the redline
+/// records exactly that: the old label deleted, the new one inserted, the body
+/// untouched. (Before, the replace was refused and `set_numbering` refused the
+/// typed label too — the label could not be changed at all.)
 #[test]
-fn different_label_at_head_is_refused_too() {
+fn a_different_label_rewrites_a_typed_label() {
     let doc = Document::parse(&numbered_heading_docx()).expect("parse");
     let (block_id, _guard) = first_block_id_and_guard(&doc);
     assert_literal_prefix_present(&doc, &block_id);
 
-    let result = apply_steps(
+    let applied = apply_steps(
         &doc,
         vec![EditStep::ReplaceParagraphText {
             block_id: block_id.clone(),
@@ -362,46 +380,128 @@ fn different_label_at_head_is_refused_too() {
             replacement_role: None,
             expect: "Events".to_string(),
             semantic_hash: None,
-            // A different label — applying it verbatim would read "1.2.\tEvents".
+            content: text_content("(a)\tEvents"),
+        }],
+    )
+    .expect("a typed label is text, so a replace can rewrite it");
+
+    // As a reader sees each side: label, separator, body.
+    let accepted = applied.read_accepted().expect("accept");
+    assert_eq!(accepted.read().blocks[0].text, "(a)\tEvents");
+    let rejected = applied.read_rejected().expect("reject");
+    assert_eq!(rejected.read().blocks[0].text, "1.\tEvents");
+
+    // The redline: the old label deleted, the new one inserted, the body kept.
+    let bytes = applied
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+    let xml = String::from_utf8(
+        stemma::docx::DocxArchive::read(&bytes)
+            .expect("read")
+            .get("word/document.xml")
+            .expect("document part")
+            .to_vec(),
+    )
+    .expect("utf-8");
+    let deleted = xml.find("<w:delText>1.</w:delText>").expect(&xml);
+    let inserted = xml.find(">(a)</w:t>").expect(&xml);
+    let body = xml.find(">Events</w:t>").expect(&xml);
+    assert!(deleted < inserted && inserted < body, "{xml}");
+    assert_eq!(xml.matches("<w:ins ").count(), 1, "{xml}");
+    assert_eq!(xml.matches("<w:del ").count(), 1, "{xml}");
+
+    // Saved and reopened, the accepted document reads the new typed label.
+    let reopened = Document::parse(&bytes).expect("reopen");
+    let accepted = reopened.read_accepted().expect("accept");
+    assert_eq!(accepted.read().blocks[0].text, "(a)\tEvents");
+}
+
+/// The same relabel without tracking changes the characters in place.
+#[test]
+fn a_direct_relabel_changes_the_typed_label() {
+    let doc = Document::parse(&numbered_heading_docx()).expect("parse");
+    let (block_id, _guard) = first_block_id_and_guard(&doc);
+    let applied = doc
+        .apply(&EditTransaction {
+            steps: vec![EditStep::ReplaceParagraphText {
+                block_id: block_id.clone(),
+                rationale: None,
+                replacement_role: None,
+                expect: "Events".to_string(),
+                semantic_hash: None,
+                content: text_content("2.\tEvents"),
+            }],
+            summary: None,
+            materialization_mode: MaterializationMode::Direct,
+            revision: revision(),
+        })
+        .expect("direct relabel");
+    assert!(
+        applied.revisions().is_empty(),
+        "a direct edit leaves no revision"
+    );
+    let bytes = applied
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+    let reopened = Document::parse(&bytes).expect("reopen");
+    assert_eq!(reopened.read().blocks[0].text, "2.\tEvents");
+}
+
+/// A different label on a paragraph whose label is LIST NUMBERING (`w:numPr`)
+/// is still refused: that label is generated from the numbering definition, so
+/// typing another one in front of the body would stack ("1.2.\tEvents"). The
+/// refusal names both labels and points at the verb that changes the list's
+/// label format, without claiming the new label "duplicates" the old.
+#[test]
+fn a_different_label_on_list_numbering_is_refused() {
+    let numbering = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+        r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+        r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>"#,
+        r#"<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+    );
+    let doc = Document::parse(&make_docx_with_parts(
+        r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Events</w:t></w:r></w:p>"#,
+        numbering,
+    ))
+    .expect("parse");
+    let (block_id, _guard) = first_block_id_and_guard(&doc);
+    assert!(
+        find_paragraph(&doc, &block_id).has_resolved_numbering(),
+        "fixture precondition: the paragraph is list-numbered"
+    );
+
+    let err = match apply_steps(
+        &doc,
+        vec![EditStep::ReplaceParagraphText {
+            block_id: block_id.clone(),
+            rationale: None,
+            replacement_role: None,
+            expect: "Events".to_string(),
+            semantic_hash: None,
             content: text_content("2.\tEvents"),
         }],
-    );
-    let err = match result {
-        Ok(applied) => {
-            let text = accepted_full_text(&applied, &block_id);
-            panic!(
-                "a different head label on a numbered paragraph must be refused, but it applied \
-                 and reads {text:?} (doubled numbering)"
-            );
-        }
+    ) {
+        Ok(applied) => panic!(
+            "a different label on list numbering must be refused, but it applied and reads {:?}",
+            accepted_full_text(&applied, &block_id)
+        ),
         Err(e) => e,
     };
-    assert_eq!(
-        format!("{:?}", err.code),
-        "PrefixDuplicatesLabel",
-        "refusal carries the dedicated code, got {:?}: {}",
-        err.code,
-        err.message
-    );
-    // The message names the leading label it caught and what the paragraph reads.
+    assert_eq!(format!("{:?}", err.code), "PrefixDuplicatesLabel");
     assert!(
         err.message.contains("2.") && err.message.contains("1.\tEvents"),
         "message must name the offending label and the current text: {}",
         err.message
     );
-    // And it must be truthful for the renumber case: '2.' does NOT "duplicate"
-    // the label — it stacks onto it. The message says label changes via text
-    // replace are unsupported, preserving the agent's renumber intent instead
-    // of advising it away.
     assert!(
-        err.message.contains("not supported"),
-        "renumber refusal must say label changes via text replace are unsupported: {}",
+        err.message.contains("set_numbering"),
+        "the refusal points at the verb that changes list labels: {}",
         err.message
     );
     assert!(
         !err.message.contains("which duplicates"),
-        "renumber refusal must not claim a different label 'duplicates' the \
-         paragraph's label: {}",
+        "a different label does not 'duplicate' the paragraph's label: {}",
         err.message
     );
 }
@@ -529,5 +629,156 @@ fn a_completely_deleted_paragraph_keeps_its_label_inline() {
     assert!(
         text.starts_with("11."),
         "the deleted text must still include the label: {text:?}"
+    );
+}
+
+/// A roman heading number is relabelled too. The label recognizer reads "X."
+/// as a letter label and does not read "XI." as one, so renumbering the tenth
+/// heading of a roman sequence to "XI." used to keep "X." and add "XI." to the
+/// body ("X.\tXI.\tSchwab…"). A leading token shaped like the typed label (the
+/// same punctuation around a short core) is that label rewritten.
+#[test]
+fn a_roman_heading_number_is_relabelled() {
+    let doc = Document::parse(&make_docx_with_body(
+        r#"<w:p><w:r><w:t xml:space="preserve">X.</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>Schwab v. Oscar</w:t></w:r></w:p>"#,
+    ))
+    .expect("parse");
+    let (block_id, _guard) = first_block_id_and_guard(&doc);
+    assert_eq!(
+        find_paragraph(&doc, &block_id).literal_prefix.as_deref(),
+        Some("X."),
+        "fixture precondition: the number is a typed label"
+    );
+    let applied = apply_steps(
+        &doc,
+        vec![EditStep::ReplaceParagraphText {
+            block_id: block_id.clone(),
+            rationale: None,
+            replacement_role: None,
+            expect: "Schwab v. Oscar".to_string(),
+            semantic_hash: None,
+            content: text_content("XI.\tSchwab v. Oscar"),
+        }],
+    )
+    .expect("the heading number is relabelled");
+    let accepted = applied.read_accepted().expect("accept");
+    assert_eq!(accepted.read().blocks[0].text, "XI.\tSchwab v. Oscar");
+    let rejected = applied.read_rejected().expect("reject");
+    assert_eq!(rejected.read().blocks[0].text, "X.\tSchwab v. Oscar");
+}
+
+/// Shape matching does not make ordinary words labels: a heading "1." whose new
+/// content starts with a word is body text after the label, as before.
+#[test]
+fn a_word_after_a_typed_label_is_not_a_label() {
+    let doc = Document::parse(&numbered_heading_docx()).expect("parse");
+    let (block_id, _guard) = first_block_id_and_guard(&doc);
+    let applied = apply_steps(
+        &doc,
+        vec![EditStep::ReplaceParagraphText {
+            block_id: block_id.clone(),
+            rationale: None,
+            replacement_role: None,
+            expect: "Events".to_string(),
+            semantic_hash: None,
+            content: text_content("Notices"),
+        }],
+    )
+    .expect("a body edit");
+    let accepted = applied.read_accepted().expect("accept");
+    assert_eq!(accepted.read().blocks[0].text, "1.\tNotices");
+}
+
+/// A typed label is ordinary text even when everything after it is a tracked
+/// deletion (here the whole item, paragraph mark included, is proposed for
+/// deletion except its "(a)" label). Saving must keep the label as ordinary
+/// text: written inside the deletion, accepting all changes would remove a
+/// label the author never deleted.
+#[test]
+fn a_label_before_a_tracked_deletion_stays_ordinary_text_on_save() {
+    let body = r#"<w:p><w:pPr><w:rPr><w:del w:id="1" w:author="A" w:date="2021-08-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:tab/><w:t>(a)</w:t></w:r><w:r><w:tab/></w:r><w:del w:id="2" w:author="A" w:date="2021-08-01T00:00:00Z"><w:r><w:delText xml:space="preserve">the reviewer finds that — </w:delText></w:r></w:del></w:p><w:p><w:r><w:t>for a review fee</w:t></w:r></w:p>"#;
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let bytes = doc
+        .serialize(&stemma::ExportOptions::default())
+        .expect("serialize");
+    let mut xml = String::new();
+    use std::io::Read;
+    zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))
+        .unwrap()
+        .by_name("word/document.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
+    let label = xml.find("(a)").expect("the label is written");
+    // Deletion elements still open where the label is written (a self-closing
+    // w:del marks a deleted paragraph mark and encloses nothing).
+    let before = &xml[..label];
+    let opened = before
+        .match_indices("<w:del ")
+        .filter(|(at, _)| !before[*at..].split('>').next().unwrap_or("").ends_with('/'))
+        .count();
+    assert_eq!(
+        opened,
+        before.matches("</w:del>").count(),
+        "the label is not inside a deletion: {}",
+        &xml[before.rfind("<w:p").unwrap()..label + 40]
+    );
+    let accepted = Document::parse(&bytes)
+        .expect("reparse")
+        .read_accepted()
+        .expect("accept")
+        .to_text();
+    assert!(
+        accepted.contains("(a)"),
+        "accepting all keeps the label: {accepted:?}"
+    );
+}
+
+/// A heading labelled "6.0" is not a sequence the engine numbers. A new
+/// heading modelled on it carries the label its author typed ("7.0"), once;
+/// without a typed label the insert is refused with how to write one.
+#[test]
+fn a_new_paragraph_after_a_decimal_outline_label_keeps_the_typed_label() {
+    let body = r#"<w:p><w:pPr><w:spacing w:after="120"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>6.0</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:tab/><w:t>Facilitator Observations</w:t></w:r></w:p><w:p><w:r><w:t>Participants are keen.</w:t></w:r></w:p>"#;
+    let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
+    let view = doc.read();
+    let (heading, last) = (view.blocks[0].id.to_string(), view.blocks[1].id.to_string());
+    let insert = |text: &str| {
+        format!(
+            r#"{{ "ops": [{{ "op": "insert", "target": {{ "anchor": "{last}", "position": "after" }},
+               "content": [{{ "type": "paragraph", "attrs": {{ "format_from": "{heading}" }},
+                 "content": [{{ "type": "text", "text": "{text}" }}] }}] }}],
+               "materialization_mode": "direct", "revision": {{ "author": "Editor" }} }}"#
+        )
+    };
+    let txn = |json: String| {
+        stemma::edit_v4::parse_transaction(&json)
+            .expect("schema")
+            .into_edit_transaction()
+            .expect("adapt")
+    };
+
+    let edited = doc
+        .apply(&txn(insert("7.0\\tNext Steps")))
+        .expect("a typed 7.0 label is kept");
+    let text = edited.read_accepted().expect("accept").to_text();
+    assert!(
+        text.contains("7.0\tNext Steps"),
+        "the new heading reads as typed: {text:?}"
+    );
+    assert!(
+        !text.contains("6.0\t7.0") && text.matches("6.0").count() == 1,
+        "no copied label: {text:?}"
+    );
+
+    let Err(refused) = doc.apply(&txn(insert("Next Steps"))) else {
+        panic!("no label to number from: the insert is refused");
+    };
+    assert!(
+        refused
+            .message
+            .contains("start the new paragraph's content with its own label"),
+        "the refusal says how to label it: {}",
+        refused.message
     );
 }

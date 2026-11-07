@@ -198,6 +198,8 @@ fn edited_document_by(reedit_author: &str) -> Document {
         position: InsertPosition::After,
         rationale: None,
         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some("body".to_string()),
             content: parse_paragraph_markup(INSERTED).unwrap(),
             restart_numbering: false,
@@ -237,6 +239,8 @@ fn whole_paragraph_insertion_reopens_as_the_same_block_level_state() {
         position: InsertPosition::After,
         rationale: None,
         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some("body".to_string()),
             content: parse_paragraph_markup(INSERTED).unwrap(),
             restart_numbering: false,
@@ -303,6 +307,8 @@ fn empty_whole_paragraph_insertion_reopens_as_the_same_block_level_state() {
         position: InsertPosition::After,
         rationale: None,
         blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some("body".to_string()),
             content: ParagraphContent { fragments: vec![] },
             restart_numbering: false,

@@ -92,9 +92,7 @@ fn collect_section_props_bare<'a>(blocks: &'a [BlockNode], out: &mut Vec<&'a Sec
 ///
 /// Word promotes this to a nextPage break at rendering time. At the model
 /// level, S2 should retain its own declared page dimensions (landscape)
-/// because pgSz is explicitly present in S2's sectPr. The `inherit_page_
-/// properties` function only fills in None fields, so S2's explicit pgSz
-/// is preserved.
+/// because pgSz is explicitly present in S2's sectPr.
 #[test]
 fn spec_orientation_mismatch_s2_retains_own_dimensions() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "orientation-mismatch");
@@ -129,8 +127,7 @@ fn spec_orientation_mismatch_s2_retains_own_dimensions() {
         "S2 section_type should still be Continuous in the model (promotion is rendering-layer)"
     );
 
-    // S2 has explicit pgSz with landscape dimensions — these must NOT be
-    // overwritten by inheritance from S1.
+    // S2 has explicit pgSz with landscape dimensions; they are kept.
     assert_eq!(
         s2.page_width,
         Some(15840),
@@ -332,9 +329,8 @@ fn spec_same_orientation_control_remains_continuous() {
 // page-level and cannot change mid-page). Left/right margins CAN change
 // mid-page because they define the text area width, not the page geometry.
 //
-// At the model level, when S2 explicitly declares all four margins, no
-// inheritance occurs (the model fills in only None fields). These tests
-// verify that S2's distinct left/right margins are preserved.
+// At the model level, S2's declared margins are stored as authored. These
+// tests verify that S2's distinct left/right margins are preserved.
 
 /// ECMA-376 §17.6.22 / §17.6.11: Continuous section with different
 /// left/right margins from the preceding section.
@@ -438,18 +434,16 @@ fn spec_top_bottom_margins_same_on_shared_page() {
 // the section that started the chain. This is a pagination-layer concern.
 //
 // At the model level, we verify:
-// a) Each section carries distinct left margins through chained inheritance.
-// b) The enriched state flows correctly through the chain (same mechanism
-//    tested in spec_section_continuous_edge.rs but with more sections).
+// a) Each section keeps its own distinct left margin.
+// b) Nothing a section omits is copied down the chain.
 
 /// ECMA-376 §17.6.22: Chained continuous sections preserve distinct left
-/// margins through inheritance chain.
+/// margins.
 ///
 /// S1(nextPage, left=1440) -> S2(continuous, left=720)
 /// -> S3(continuous, left=360) -> S4(continuous, left=180)
 ///
-/// Each section declares only a left margin; all other margins are inherited
-/// from the preceding section.
+/// Each section declares only a left margin.
 #[test]
 fn spec_chained_page_spill_distinct_left_margins() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "chained-continuous-page-spill");
@@ -517,57 +511,30 @@ fn spec_chained_page_spill_distinct_left_margins() {
     );
 }
 
-/// ECMA-376 §17.6.22: Chained continuous sections inherit top/bottom/right
-/// margins from the chain starter (S1) when they only declare left.
-///
-/// S2, S3, S4 each declare only left margin. The other margins should be
-/// inherited from S1 (via the enrichment chain).
+/// ECMA-376 §17.6.22 with Word's reading: chained continuous sections that
+/// declare only a left margin keep top, bottom and right omitted. Word reads
+/// each omitted margin as its default, not the chain starter's value, so
+/// nothing is copied down the chain.
 #[test]
-fn spec_chained_page_spill_inherited_margins_flow_through() {
+fn spec_chained_page_spill_omitted_margins_stay_omitted() {
     let (_rt, doc) = common::import_fixture(FIXTURES, "chained-continuous-page-spill");
 
     let section_props = section_paragraphs(&doc);
-    let s1 = section_props[0];
-
-    // All sections should inherit top/bottom/right from S1 (1440)
-    for (label, sp) in [("S2", section_props[1]), ("S3", section_props[2])] {
-        assert_eq!(
-            sp.margin_top, s1.margin_top,
-            "{label} margin_top should inherit {:?} from S1, got {:?}",
-            s1.margin_top, sp.margin_top
-        );
-        assert_eq!(
-            sp.margin_bottom, s1.margin_bottom,
-            "{label} margin_bottom should inherit {:?} from S1, got {:?}",
-            s1.margin_bottom, sp.margin_bottom
-        );
-        assert_eq!(
-            sp.margin_right, s1.margin_right,
-            "{label} margin_right should inherit {:?} from S1, got {:?}",
-            s1.margin_right, sp.margin_right
-        );
-    }
-
-    // S4 (body-level) should also inherit top/bottom/right from the chain
     let s4 = doc
         .body_section_properties
         .as_ref()
         .expect("body_section_properties should exist (S4)");
-    assert_eq!(
-        s4.margin_top, s1.margin_top,
-        "S4 margin_top should inherit {:?} from chain, got {:?}",
-        s1.margin_top, s4.margin_top
-    );
-    assert_eq!(
-        s4.margin_bottom, s1.margin_bottom,
-        "S4 margin_bottom should inherit {:?} from chain, got {:?}",
-        s1.margin_bottom, s4.margin_bottom
-    );
-    assert_eq!(
-        s4.margin_right, s1.margin_right,
-        "S4 margin_right should inherit {:?} from chain, got {:?}",
-        s1.margin_right, s4.margin_right
-    );
+    for (label, sp) in [
+        ("S2", section_props[1]),
+        ("S3", section_props[2]),
+        ("S4", s4),
+    ] {
+        assert_eq!(
+            (sp.margin_top, sp.margin_bottom, sp.margin_right),
+            (None, None, None),
+            "{label} declares only its left margin; the others stay omitted"
+        );
+    }
 }
 
 /// ECMA-376 §17.6.22: Page spill layout determination is a rendering-layer
@@ -758,10 +725,8 @@ fn spec_mixed_footnote_settings_s3_independent() {
     );
 }
 
-/// ECMA-376 §17.11.3: Continuous section inheritance does NOT collapse
-/// footnote/endnote properties. These are section-specific settings,
-/// not page-level properties that get inherited via
-/// `propagate_continuous_section_properties`.
+/// ECMA-376 §17.11.3: continuous sections do NOT collapse footnote/endnote
+/// properties. These are section-specific settings.
 ///
 /// Even though S2 and S3 are continuous, they each retain their own
 /// footnote_pr and endnote_pr — the inheritance mechanism only applies

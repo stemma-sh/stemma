@@ -6,3 +6,4 @@
 
 pub mod generated_people;
 pub(crate) mod numbering_transport;
+pub(crate) mod relationship_identity;

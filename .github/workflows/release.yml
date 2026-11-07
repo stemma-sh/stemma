@@ -72,6 +72,7 @@ jobs:
               Path("stemma-cli/Cargo.toml"),
               Path("stemma-mcp/Cargo.toml"),
               Path("stemma-api/Cargo.toml"),
+              Path("stemma-py/Cargo.toml"),
           ]
           json_manifests = [
               Path("stemma-mcp/mcpb/manifest.json"),
@@ -97,6 +98,7 @@ jobs:
               Path("stemma-diff/Cargo.toml"): ["stemma"],
               Path("stemma-cli/Cargo.toml"): ["stemma", "stemma-diff", "stemma-artifacts"],
               Path("stemma-mcp/Cargo.toml"): ["stemma", "stemma-diff", "stemma-artifacts"],
+              Path("stemma-py/Cargo.toml"): ["stemma", "stemma-diff", "stemma-artifacts"],
           }
           dependency_mismatches = []
           for path, names in dependency_checks.items():
@@ -109,6 +111,17 @@ jobs:
               raise SystemExit(
                   "internal dependency versions do not match " + requested + ":\n  "
                   + "\n  ".join(dependency_mismatches)
+              )
+
+          # The PyPI version must come from stemma-py/Cargo.toml (checked
+          # above), never from a second hand-maintained field.
+          project = tomllib.loads(
+              Path("stemma-py/pyproject.toml").read_text(encoding="utf-8")
+          )["project"]
+          if "version" in project or project.get("dynamic") != ["version"]:
+              raise SystemExit(
+                  "stemma-py/pyproject.toml must declare dynamic = [\"version\"] "
+                  "and no static version"
               )
           PY
           if [ "$requested_sha" != "$GITHUB_SHA" ]; then
@@ -231,6 +244,184 @@ jobs:
           path: dist/${{ matrix.target }}
           if-no-files-found: error
 
+  python-wheels:
+    # The experimental stemma-py package (PyPI `stemma-py`, import `stemma`).
+    # One abi3 wheel per platform serves every CPython >= 3.9. Each wheel is
+    # installed into a fresh virtual environment on its own platform and runs
+    # the Python suite before upload, so the approved bytes are the exercised
+    # bytes. Artifact names carry no dash: the native jobs below select their
+    # artifacts with the "*-*-*" pattern.
+    name: python wheel (${{ matrix.label }})
+    needs: version-guard
+    strategy:
+      matrix:
+        include:
+          # manylinux2014 (glibc 2.17) is the widest glibc floor maturin builds
+          # for. The x86_64 leg runs the suite on the Python floor (3.9).
+          - { label: manylinux_x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, manylinux: "2_17", platform: 'manylinux_2_17_x86_64(\.manylinux2014_x86_64)?', smoke: native, python: "3.9" }
+          - { label: manylinux_aarch64, os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_17", platform: 'manylinux_2_17_aarch64(\.manylinux2014_aarch64)?', smoke: native, python: "3.12" }
+          - { label: musllinux_x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2, platform: 'musllinux_1_2_x86_64', smoke: alpine, python: "3.12" }
+          - { label: macos_arm64, os: macos-15, target: aarch64-apple-darwin, manylinux: "off", platform: 'macosx_[0-9]+_[0-9]+_arm64', smoke: native, python: "3.12" }
+          - { label: macos_x86_64, os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "off", platform: 'macosx_[0-9]+_[0-9]+_x86_64', smoke: native, python: "3.12" }
+          - { label: windows_x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "off", platform: 'win_amd64', smoke: native, python: "3.12" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist --manifest-path stemma-py/Cargo.toml
+      - name: Require exactly one wheel for this platform at the requested version
+        shell: bash
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          expected = re.compile(
+              r"stemma_py-{}-cp39-abi3-(?:{})\.whl".format(
+                  re.escape(os.environ["REQUESTED_VERSION"]), os.environ["EXPECTED_PLATFORM"]
+              )
+          )
+          found = sorted(path.name for path in Path("dist").iterdir())
+          if len(found) != 1 or not expected.fullmatch(found[0]):
+              raise SystemExit(
+                  "expected one wheel matching {}, built: {}".format(
+                      expected.pattern, ", ".join(found) or "nothing"
+                  )
+              )
+          print("built " + found[0])
+          PY
+      - name: Install into a fresh venv and run the Python suite
+        if: matrix.smoke == 'native'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          py="$RUNNER_TEMP/venv/${{ runner.os == 'Windows' && 'Scripts/python.exe' || 'bin/python' }}"
+          "$py" -m pip install --quiet dist/*.whl pytest
+          "$py" -m pytest -p no:cacheprovider stemma-py/tests
+      - name: Install into a fresh Alpine venv and run the Python suite
+        if: matrix.smoke == 'alpine'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src python:3.12-alpine sh -euc '
+            python -m venv /tmp/venv
+            /tmp/venv/bin/pip install --quiet dist/*.whl pytest
+            /tmp/venv/bin/python -m pytest -p no:cacheprovider stemma-py/tests
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python_wheel_${{ matrix.label }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  python-sdist:
+    # The source distribution is what pip builds on a platform without a
+    # wheel. Building it from the extracted archive, outside the workspace,
+    # proves it is complete (as package-check does for the crates).
+    name: python sdist
+    needs: version-guard
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          command: sdist
+          args: --out dist --manifest-path stemma-py/Cargo.toml
+      - name: Require exactly the expected sdist at the requested version
+        run: |
+          expected="stemma_py-${REQUESTED_VERSION}.tar.gz"
+          found="$(ls dist)"
+          if [ "$found" != "$expected" ]; then
+            echo "::error::Expected exactly $expected, built: $found"
+            exit 1
+          fi
+      - name: Build and install from the sdist alone, then run the Python suite
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          cp dist/*.tar.gz "$RUNNER_TEMP/"
+          (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/venv/bin/pip" install --quiet ./stemma_py-*.tar.gz pytest)
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -p no:cacheprovider stemma-py/tests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python_sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  python-candidate:
+    # Freeze the exact Python distribution set the approver qualifies: all six
+    # wheels plus the sdist, nothing else, with their SHA-256 sums.
+    name: freeze exact python distribution set
+    needs: [python-wheels, python-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python_*
+          path: python-candidate/dist
+          merge-multiple: true
+      - name: Verify the set and record checksums
+        run: |
+          python3 - python-candidate/dist <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          version = re.escape(os.environ["REQUESTED_VERSION"])
+          # One file per pattern: the sdist and each python-wheels matrix leg.
+          patterns = [r"stemma_py-{}\.tar\.gz".format(version)] + [
+              r"stemma_py-{}-cp39-abi3-(?:{})\.whl".format(version, platform)
+              for platform in (
+                  r"manylinux_2_17_x86_64(\.manylinux2014_x86_64)?",
+                  r"manylinux_2_17_aarch64(\.manylinux2014_aarch64)?",
+                  r"musllinux_1_2_x86_64",
+                  r"macosx_[0-9]+_[0-9]+_arm64",
+                  r"macosx_[0-9]+_[0-9]+_x86_64",
+                  r"win_amd64",
+              )
+          ]
+          found = sorted(path.name for path in Path(sys.argv[1]).iterdir())
+          problems = []
+          for pattern in patterns:
+              matches = [name for name in found if re.fullmatch(pattern, name)]
+              if len(matches) != 1:
+                  problems.append("{} matched {}".format(pattern, matches or "nothing"))
+          unexpected = [
+              name for name in found if not any(re.fullmatch(p, name) for p in patterns)
+          ]
+          if unexpected:
+              problems.append("unexpected files: " + ", ".join(unexpected))
+          if problems:
+              raise SystemExit("python distribution set is not exact:\n  " + "\n  ".join(problems))
+          print("python distribution set is exact: " + ", ".join(found))
+          PY
+          cd python-candidate
+          sha256sum dist/* > sha256sums.txt
+          cat sha256sums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python_dist
+          path: python-candidate
+          if-no-files-found: error
+
   candidate-manifest:
     name: freeze exact five-target candidate manifest
     needs: build
@@ -242,6 +433,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # Only the native target artifacts (Rust target triples, at least
+          # two dashes): the python_* artifacts of this run must not enter the
+          # exact five-target layout the manifest builder requires.
+          pattern: "*-*-*"
           path: candidate-inputs
       - name: Validate matrix and write create-new manifest
         run: |
@@ -261,7 +456,7 @@ jobs:
     # self-review. Reviewers approve only after downloading this run's build
     # artifacts and recording the exact-artifact Word qualification result.
     name: approve exact candidate after Word qualification
-    needs: candidate-manifest
+    needs: [candidate-manifest, python-candidate]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -441,9 +636,93 @@ jobs:
         # version, every binary it pins must already exist.
         run: bash stemma-mcp/npm/publish-npm-packages.sh out
 
+  pypi-publish:
+    # Deliberately minimal, like npm-publish: downloads the frozen python_dist
+    # set and publishes it; no builds, no test runs. Authentication is PyPI
+    # trusted publishing (OIDC): no PyPI token exists anywhere.
+    name: publish stemma-py to PyPI
+    needs: [npm-publish, python-candidate]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write # PyPI trusted publishing + attestations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: python_dist
+          path: python-dist
+      - name: Re-verify the approved distribution set
+        run: |
+          set -euo pipefail
+          cd python-dist
+          sha256sum -c sha256sums.txt
+          listed="$(awk '{print $2}' sha256sums.txt | sort)"
+          present="$(find dist -type f | sort)"
+          if [ "$listed" != "$present" ]; then
+            echo "::error::python_dist holds files outside the approved checksum list."
+            exit 1
+          fi
+      - name: Re-verify the release tag before irreversible publication
+        run: |
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag no longer identifies approved source $GITHUB_SHA."
+            exit 1
+          fi
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python-dist/dist
+          # A retried job finds its own earlier uploads; the next step refuses
+          # any file whose bytes on PyPI differ from the approved ones.
+          skip-existing: true
+      - name: Verify PyPI serves exactly the approved files
+        run: |
+          python3 - python-dist/sha256sums.txt <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          version = os.environ["REQUESTED_VERSION"]
+          approved = {}
+          for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+              digest, path = line.split(maxsplit=1)
+              approved[Path(path).name] = digest
+          url = "https://pypi.org/pypi/stemma-py/{}/json".format(version)
+          for attempt in range(1, 31):
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      release = json.load(response)
+                  served = {item["filename"]: item["digests"]["sha256"] for item in release["urls"]}
+                  if served == approved:
+                      print("PyPI serves exactly the approved {} files".format(len(served)))
+                      break
+                  if set(served) - set(approved) or any(
+                      served[name] != approved[name] for name in set(served) & set(approved)
+                  ):
+                      raise SystemExit(
+                          "PyPI stemma-py {} differs from the approved files: {}".format(version, served)
+                      )
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+              print("waiting for PyPI to serve stemma-py {} ({}/30)".format(version, attempt))
+              time.sleep(10)
+          else:
+              raise SystemExit("PyPI did not serve the approved stemma-py {} files within 5 minutes".format(version))
+          PY
+
   github-release:
     name: attach binaries to the GitHub release
-    needs: npm-publish
+    needs: [npm-publish, pypi-publish]
     runs-on: ubuntu-latest
     permissions:
       actions: read

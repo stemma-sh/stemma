@@ -28,10 +28,18 @@
 //! - every block in `[from..=to]` must be a top-level **paragraph** with Normal
 //!   tracking (else `BlocksToTableNonParagraph` / the standard editability
 //!   errors). A non-paragraph in the range has no text to project into cells.
-//! - **opaque preservation**: a source paragraph carrying an opaque inline
-//!   (drawing/field/hyperlink/footnote/comment ref) is refused
-//!   (`BlocksToTableOpaqueInline`). We project only *visible text* into cells, so
-//!   an opaque would be silently lost on accept-all. We never destroy one.
+//! - **cell content is the source content**: each cell is cut from its source
+//!   paragraph's own runs, so run formatting, line breaks and footnote/endnote
+//!   references come along. A tracked conversion leaves the source paragraphs
+//!   in place as a deletion, so each carried note reference gets its own copy
+//!   of the note (a new id, the same content): Word repairs a file in which one
+//!   note is referenced twice, even once deleted and once inserted. Accept-all
+//!   keeps the copy, reject-all the original; the reference graph drops the
+//!   other. A direct conversion moves the references.
+//! - **opaque preservation**: any other opaque inline (drawing/field/hyperlink/
+//!   comment reference) is refused (`BlocksToTableOpaqueInline`): copying one
+//!   needs its own identity rules, and dropping one would lose it on accept-all.
+//!   Bookmarks and comment ranges are not carried into cells.
 //! - column count: a `header` fixes it at `header.len()` columns — each body row
 //!   is split into at most that many cells and short rows padded with empty
 //!   trailing cells (lossless; extra delimiters fold into the last cell). Without
@@ -43,7 +51,9 @@ use super::super::{
     BlockSpec, EditError, ParagraphBlockSpec, ParagraphContent, TableBlockSpec, TableCellSpec,
     TableRowSpec, find_block_index, paragraph_visible_text,
 };
-use crate::domain::{BlockNode, CanonDoc, InlineNode, NodeId, TrackingStatus};
+use crate::domain::{
+    BlockNode, CanonDoc, InlineNode, NodeId, OpaqueKind, TrackedSegment, TrackingStatus,
+};
 use crate::edit::ContentFragment;
 use crate::vocabulary::default_body_role_id;
 
@@ -56,8 +66,11 @@ pub(crate) struct BlocksToTablePlan {
     pub start: usize,
     /// Inclusive end index of the source paragraph range in `doc.blocks`.
     pub end: usize,
-    /// The table to stage as a tracked insert.
+    /// The table to stage as a tracked insert. Its body cells hold their text
+    /// only; [`carry_cell_content`] replaces it with the source content.
     pub table: TableBlockSpec,
+    /// Each body row's cells as the source inlines they were cut from.
+    body_cells: Vec<Vec<Vec<InlineNode>>>,
 }
 
 /// Validate the step and build the [`BlocksToTablePlan`]. Pure: it does not
@@ -116,7 +129,7 @@ pub(crate) fn plan(
     // Each source paragraph -> one body row. We first collect the raw visible
     // text per row (validating editability + opaque-freedom along the way), then
     // split once the column count is fixed.
-    let mut body_rows: Vec<String> = Vec::with_capacity(end - start + 1);
+    let mut body_rows: Vec<Vec<InlineNode>> = Vec::with_capacity(end - start + 1);
     for tracked_block in &doc.blocks[start..=end] {
         // Block-level tracking must be Normal (no inserted/deleted source block).
         match &tracked_block.status {
@@ -172,23 +185,37 @@ pub(crate) fn plan(
             }
         }
 
-        // Opaque preservation: refuse rather than drop an opaque inline. Visible
-        // text would carry across, but the opaque (drawing/field/hyperlink/...)
-        // would vanish on accept-all.
-        for segment in &para.segments {
-            for inline in &segment.inlines {
-                if matches!(inline, InlineNode::OpaqueInline(_)) {
+        // The content a cell carries: text, breaks and note references. Any
+        // other opaque is refused rather than dropped (it would vanish on
+        // accept-all).
+        let mut carried = Vec::new();
+        for inline in para.segments.iter().flat_map(|segment| &segment.inlines) {
+            match inline {
+                InlineNode::Text(_) | InlineNode::HardBreak(_) => carried.push(inline.clone()),
+                InlineNode::OpaqueInline(opaque)
+                    if matches!(
+                        opaque.kind,
+                        OpaqueKind::FootnoteReference(_) | OpaqueKind::EndnoteReference(_)
+                    ) =>
+                {
+                    carried.push(inline.clone());
+                }
+                InlineNode::OpaqueInline(_) => {
                     return Err(EditError::BlocksToTableOpaqueInline {
                         block_id: para.id.clone(),
                         step_index,
                     });
                 }
+                InlineNode::Decoration(_)
+                | InlineNode::CommentRangeStart { .. }
+                | InlineNode::CommentRangeEnd { .. } => {}
             }
         }
+        debug_assert_eq!(inline_text(&carried), paragraph_visible_text(para));
 
         // Defer the split until the column count is fixed (it depends on the
         // header, which may impose more columns than the delimiter yields).
-        body_rows.push(paragraph_visible_text(para));
+        body_rows.push(carried);
     }
 
     // Column count, and the rectangularity contract, depend on whether a header
@@ -209,44 +236,62 @@ pub(crate) fn plan(
     //   than guess.
     let columns = match header {
         Some(cells) => cells.len(),
-        None => split_cells(&body_rows[0], delimiter).len(),
+        None => cell_ranges(&inline_text(&body_rows[0]), delimiter, None).len(),
     };
 
-    let mut split_rows: Vec<Vec<String>> = Vec::with_capacity(body_rows.len());
-    for (row_offset, text) in body_rows.iter().enumerate() {
-        let cells = if header.is_some() {
-            // splitn(columns, …): at most `columns` cells; any extra delimiters
-            // fold into the final cell (no text lost). Then pad to `columns`.
-            let mut cells: Vec<String> = text
-                .splitn(columns, delimiter)
-                .map(|c| c.trim().to_string())
-                .collect();
-            while cells.len() < columns {
-                cells.push(String::new());
-            }
-            cells
+    let mut body_cells: Vec<Vec<Vec<InlineNode>>> = Vec::with_capacity(body_rows.len());
+    for (row_offset, inlines) in body_rows.iter().enumerate() {
+        let text = inline_text(inlines);
+        let ranges = if header.is_some() {
+            // At most `columns` cells; any extra delimiters fold into the final
+            // cell (no text lost). Short rows are padded below.
+            cell_ranges(&text, delimiter, Some(columns))
         } else {
-            let cells = split_cells(text, delimiter);
-            if cells.len() != columns {
+            let ranges = cell_ranges(&text, delimiter, None);
+            if ranges.len() != columns {
                 let para_id = block_id_of(&doc.blocks[start + row_offset].block).clone();
                 return Err(EditError::BlocksToTableSplitMismatch {
                     block_id: para_id,
                     expected_columns: columns,
-                    actual_columns: cells.len(),
-                    text: text.clone(),
+                    actual_columns: ranges.len(),
+                    text,
                     step_index,
                 });
             }
-            cells
+            ranges
         };
-        split_rows.push(cells);
+        let mut cells: Vec<Vec<InlineNode>> = ranges
+            .iter()
+            .map(|range| slice_inlines(inlines, &text, range))
+            .collect();
+        // A break or note reference inside a delimiter belongs to no cell.
+        let anchored = |inlines: &[InlineNode]| {
+            inlines
+                .iter()
+                .filter(|inline| !matches!(inline, InlineNode::Text(_)))
+                .count()
+        };
+        if cells.iter().map(|cell| anchored(cell)).sum::<usize>() != anchored(inlines) {
+            return Err(EditError::UnsupportedParagraphStructure {
+                block_id: block_id_of(&doc.blocks[start + row_offset].block).clone(),
+                step_index,
+                reason: format!(
+                    "a line break or note reference sits inside the delimiter {delimiter:?}, \
+                     so it belongs to no cell; choose a delimiter that does not contain it"
+                ),
+            });
+        }
+        while cells.len() < columns {
+            cells.push(Vec::new());
+        }
+        body_cells.push(cells);
     }
-    let body_rows = split_rows;
 
     // Build the spec: an optional header row, then one row per source paragraph.
     let mut rows: Vec<TableRowSpec> = Vec::with_capacity(body_rows.len() + 1);
     if let Some(header_cells) = header {
         rows.push(TableRowSpec {
+            cant_split: None,
             cells: header_cells
                 .iter()
                 .map(|text| text_cell(text, &cell_role))
@@ -256,11 +301,12 @@ pub(crate) fn plan(
             height_rule: None,
         });
     }
-    for cells in &body_rows {
+    for cells in &body_cells {
         rows.push(TableRowSpec {
+            cant_split: None,
             cells: cells
                 .iter()
-                .map(|text| text_cell(text, &cell_role))
+                .map(|inlines| text_cell(&inline_text(inlines), &cell_role))
                 .collect(),
             is_header: false,
             height: None,
@@ -275,18 +321,127 @@ pub(crate) fn plan(
             rows,
             formatting: None,
         },
+        body_cells,
     })
 }
 
-/// Split a paragraph's visible text into trimmed cells on EVERY occurrence of
-/// `delimiter` (the unbounded split, used for the no-header column-count
-/// inference and the no-header rectangularity check). Cells are trimmed of
-/// surrounding whitespace so a `"Term — definition"` line yields
-/// `["Term", "definition"]`, not `["Term ", " definition"]`.
-fn split_cells(text: &str, delimiter: &str) -> Vec<String> {
-    text.split(delimiter)
-        .map(|cell| cell.trim().to_string())
+/// Replace each body cell's text with the source content it was cut from. The
+/// resolved table holds one paragraph per cell (built from the cell's text by
+/// [`plan`]); the carried inlines keep their formatting and get ids of the
+/// cell paragraph's own.
+pub(crate) fn carry_cell_content(table: &mut BlockNode, plan: &BlocksToTablePlan) {
+    let BlockNode::Table(table) = table else {
+        unreachable!("blocks_to_table resolves to a table");
+    };
+    let header_rows = table.rows.len() - plan.body_cells.len();
+    for (row, cells) in table.rows[header_rows..].iter_mut().zip(&plan.body_cells) {
+        assert_eq!(row.cells.len(), cells.len(), "one cell per planned column");
+        for (cell, inlines) in row.cells.iter_mut().zip(cells) {
+            let [BlockNode::Paragraph(paragraph)] = cell.blocks.as_mut_slice() else {
+                unreachable!("a planned cell holds one paragraph");
+            };
+            assert_eq!(
+                paragraph_visible_text(paragraph),
+                inline_text(inlines),
+                "the cell was built from the text of the inlines it carries"
+            );
+            let mut inlines = inlines.clone();
+            for (index, inline) in inlines.iter_mut().enumerate() {
+                let id = NodeId::from(format!("{}_carried_{index}", paragraph.id.0));
+                match inline {
+                    InlineNode::Text(text) => text.id = id,
+                    InlineNode::HardBreak(hard_break) => hard_break.id = id,
+                    InlineNode::OpaqueInline(opaque) => opaque.id = id,
+                    InlineNode::Decoration(_)
+                    | InlineNode::CommentRangeStart { .. }
+                    | InlineNode::CommentRangeEnd { .. } => {
+                        unreachable!("only text, breaks and note references are carried")
+                    }
+                }
+            }
+            paragraph.segments = if inlines.is_empty() {
+                Vec::new()
+            } else {
+                vec![TrackedSegment {
+                    status: TrackingStatus::Normal,
+                    inlines,
+                }]
+            };
+        }
+    }
+}
+
+/// The text of `inlines`, as [`paragraph_visible_text`] reads a paragraph.
+fn inline_text(inlines: &[InlineNode]) -> String {
+    inlines
+        .iter()
+        .filter_map(|inline| match inline {
+            InlineNode::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
         .collect()
+}
+
+/// A cell's place in its row's text (byte offsets): `outer` runs from the end
+/// of the previous delimiter to the start of the next, `text` is `outer`
+/// without surrounding whitespace, so a `"Term — definition"` line yields
+/// `"Term"` and `"definition"`.
+struct CellRange {
+    outer: (usize, usize),
+    text: (usize, usize),
+}
+
+/// The cells `text` splits into on `delimiter`: on every occurrence, or with
+/// `limit`, into at most that many cells (later delimiters stay in the last).
+fn cell_ranges(text: &str, delimiter: &str, limit: Option<usize>) -> Vec<CellRange> {
+    let mut bounds = Vec::new();
+    let mut from = 0;
+    for (at, _) in text.match_indices(delimiter) {
+        if limit.is_some_and(|limit| bounds.len() + 1 == limit) {
+            break;
+        }
+        bounds.push((from, at));
+        from = at + delimiter.len();
+    }
+    bounds.push((from, text.len()));
+    bounds
+        .into_iter()
+        .map(|(start, end)| {
+            let cell = &text[start..end];
+            let text_start = start + (cell.len() - cell.trim_start().len());
+            let text_end = (start + cell.trim_end().len()).max(text_start);
+            CellRange {
+                outer: (start, end),
+                text: (text_start, text_end),
+            }
+        })
+        .collect()
+}
+
+/// The part of a row's inlines that makes up one cell: the text inside the
+/// cell's trimmed range, cut at its byte offsets with the formatting it has,
+/// and every break or note reference positioned inside the cell.
+fn slice_inlines(inlines: &[InlineNode], text: &str, range: &CellRange) -> Vec<InlineNode> {
+    let mut cell = Vec::new();
+    let mut at = 0;
+    for inline in inlines {
+        match inline {
+            InlineNode::Text(node) => {
+                let (start, end) = (at, at + node.text.len());
+                at = end;
+                let from = start.max(range.text.0);
+                let to = end.min(range.text.1);
+                if from < to {
+                    let mut piece = node.clone();
+                    piece.text = text[from..to].to_string();
+                    cell.push(InlineNode::Text(piece));
+                }
+            }
+            _ if range.outer.0 <= at && at <= range.outer.1 => cell.push(inline.clone()),
+            _ => {}
+        }
+    }
+    cell
 }
 
 /// A single-paragraph table cell carrying one plain-text fragment. An empty
@@ -295,6 +450,8 @@ fn split_cells(text: &str, delimiter: &str) -> Vec<String> {
 fn text_cell(text: &str, role: &str) -> TableCellSpec {
     TableCellSpec {
         content: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+            tab_stops: None,
+            format_from: None,
             role: Some(role.to_string()),
             content: ParagraphContent {
                 fragments: vec![ContentFragment::Text(text.to_string())],
@@ -315,50 +472,5 @@ fn block_id_of(block: &BlockNode) -> &NodeId {
         BlockNode::Paragraph(p) => &p.id,
         BlockNode::Table(t) => &t.id,
         BlockNode::OpaqueBlock(o) => &o.id,
-    }
-}
-
-/// Stamp a freshly-resolved (Normal) table as a tracked INSERT all the way down:
-/// every row's `tracking_status` becomes `Inserted` (serializer emits
-/// `<w:trPr><w:ins/></w:trPr>`), every cell's `tracking_status` becomes
-/// `Inserted` (`<w:cellIns>`), and every cell paragraph's segments + paragraph
-/// mark become `Inserted` (cell runs wrapped in `<w:ins>`, the paragraph mark in
-/// `<w:rPr><w:ins/></w:rPr>`). This is BOTH levels of tracking the task calls for
-/// — row-level so Word removes the row on reject, and run-level so the change is
-/// a faithful tracked insertion at every granularity (and any tracked-change
-/// reader, not just Word's row-aware reject, projects it correctly).
-///
-/// `revision` is the shared insert revision for the whole table. All stamped
-/// statuses carry it (a single tracked insertion, one author/date).
-pub(crate) fn stamp_table_inserted(table: &mut crate::domain::TableNode, revision: TrackingStatus) {
-    for row in &mut table.rows {
-        row.tracking_status = Some(revision.clone());
-        for cell in &mut row.cells {
-            cell.tracking_status = Some(revision.clone());
-            stamp_cell_blocks_inserted(&mut cell.blocks, &revision);
-        }
-    }
-}
-
-fn stamp_cell_blocks_inserted(blocks: &mut [BlockNode], revision: &TrackingStatus) {
-    for block in blocks {
-        match block {
-            BlockNode::Paragraph(p) => {
-                for seg in &mut p.segments {
-                    seg.status = revision.clone();
-                }
-                p.para_mark_status = Some(revision.clone());
-            }
-            BlockNode::Table(t) => {
-                for row in &mut t.rows {
-                    row.tracking_status = Some(revision.clone());
-                    for cell in &mut row.cells {
-                        cell.tracking_status = Some(revision.clone());
-                        stamp_cell_blocks_inserted(&mut cell.blocks, revision);
-                    }
-                }
-            }
-            BlockNode::OpaqueBlock(_) => {}
-        }
     }
 }

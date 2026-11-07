@@ -1,0 +1,43 @@
+[package]
+name = "stemma-py"
+version = "0.7.0"
+edition = "2024"
+# Uniform workspace toolchain floor (see stemma-engine/Cargo.toml for the full
+# derivation). pyo3 0.30 itself requires >= 1.85.
+rust-version = "1.91"
+description = "Python bindings for the Stemma DOCX engine (experimental): open, read, edit with tracked changes, review, compare, and save."
+repository = "https://github.com/stemma-sh/stemma"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+# PyPI (`stemma-py`, import name `stemma`) is this crate's only channel; the
+# Rust API it wraps is published as the `stemma` crate.
+publish = false
+
+[lib]
+name = "stemma_py"
+crate-type = ["cdylib"]
+# The binding is exercised through the interpreter (tests/, run by
+# `just py-test`); a Rust test harness could not load Python symbols, which an
+# extension module deliberately does not link.
+test = false
+doctest = false
+
+[dependencies]
+# `extension-module`: never link libpython, for every build of this crate.
+# Wheels must not link it (manylinux), and the workspace-wide `cargo build` /
+# `cargo test` must not need Python development libraries on any CI runner.
+# PyO3 marks the feature deprecated in favour of maturin's
+# PYO3_BUILD_EXTENSION_MODULE variable, which only maturin builds would see.
+# The feature's documented cost (Rust tests cannot embed Python) does not apply:
+# this crate has no Rust tests.
+pyo3 = { version = "0.30", features = ["abi3-py39", "extension-module"] }
+# version alongside path: the sdist is built from the workspace copies.
+stemma = { path = "../stemma-engine", version = "0.7.0" }
+stemma-diff = { path = "../stemma-diff", version = "0.7.0" }
+stemma-artifacts = { path = "../stemma-artifacts", version = "0.7.0" }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+[build-dependencies]
+pyo3-build-config = "0.30"

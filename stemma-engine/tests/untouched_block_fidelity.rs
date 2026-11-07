@@ -225,6 +225,8 @@ fn sentinel_edit(anchor: NodeId) -> EditTransaction {
             position: InsertPosition::After,
             rationale: Some("untouched-block fidelity sentinel".to_string()),
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 // inserted paragraphs require an explicit role; "body" is the
                 // built-in default-role alias (DEFAULT_ROLE_ALIASES)
                 role: Some("body".to_string()),
@@ -286,11 +288,31 @@ fn block_text(el: &Element) -> String {
             out.push('\u{2011}');
             return;
         }
+        if is_text {
+            // Edge whitespace is content only under xml:space="preserve", as
+            // Word reads it (ISO 29500-1 §17.3.3.31).
+            let text: String = el
+                .children
+                .iter()
+                .filter_map(|child| match child {
+                    XMLNode::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let preserved = el
+                .attributes
+                .iter()
+                .any(|(name, value)| name.local_name == "space" && value == "preserve");
+            out.push_str(if preserved {
+                &text
+            } else {
+                text.trim_matches([' ', '\t', '\r', '\n'])
+            });
+            return;
+        }
         for child in &el.children {
-            match child {
-                XMLNode::Element(e) => collect(e, out),
-                XMLNode::Text(t) if is_text => out.push_str(t),
-                _ => {}
+            if let XMLNode::Element(e) = child {
+                collect(e, out);
             }
         }
     }

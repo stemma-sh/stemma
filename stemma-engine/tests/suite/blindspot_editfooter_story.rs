@@ -307,3 +307,34 @@ fn edited_footer_text_serializes_into_footer_part_not_body() {
         }
     }
 }
+
+/// An empty `expect` names an empty footer line: text can be typed into it.
+/// It is not a wildcard: against a line that has text it is refused.
+#[test]
+fn an_empty_expect_types_into_an_empty_footer_line_only() {
+    let edit = |footer: &str| {
+        let doc = Document::parse(&make_footer_docx(footer)).expect("parse");
+        let canon = doc.snapshot().canonical.as_ref().clone();
+        let (part, id) = footer_addr(&canon);
+        let json = format!(
+            r#"{{ "ops": [{{ "op": "edit_footer", "footer_part": "{part}", "target": "{}", "expect": "",
+                 "content": [{{ "type": "text", "text": "Case No. 12/2024" }}] }}],
+                 "materialization_mode": "direct", "revision": {{ "author": "Tester" }} }}"#,
+            id.0
+        );
+        let txn = stemma::edit_v4::parse_transaction(&json)
+            .expect("an empty expect passes the schema")
+            .into_edit_transaction()
+            .expect("adapt");
+        doc.apply(&txn)
+            .map(|edited| footer_text(edited.snapshot().canonical.as_ref(), &part))
+    };
+    assert_eq!(
+        edit("").expect("typed into the empty line"),
+        "Case No. 12/2024"
+    );
+    assert!(
+        edit("Page footer").is_err(),
+        "an empty expect does not match a line with text"
+    );
+}

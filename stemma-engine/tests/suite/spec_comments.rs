@@ -133,7 +133,7 @@ fn spec_comment_reference_in_body() {
     let has_reference = all_inlines.iter().any(|i| {
         matches!(
             i,
-            InlineNode::CommentReference { id } if id == "1"
+            InlineNode::OpaqueInline(o) if matches!(&o.kind, stemma::domain::OpaqueKind::CommentReference(r) if r.reference_id == "1")
         )
     });
 

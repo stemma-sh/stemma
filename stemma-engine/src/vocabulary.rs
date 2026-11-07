@@ -136,6 +136,10 @@ struct ParagraphInfo {
     numbering_source: Option<NumberingSource>,
     /// Short text snippet for the exemplar (≤80 chars).
     text_snippet: String,
+    /// The formatting of the paragraph's first text run — what text inserted
+    /// with this paragraph as exemplar takes — as a comparison key. `None`
+    /// for a paragraph without text.
+    first_run_format: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -266,7 +270,7 @@ pub fn extract_vocabulary(doc: &CanonDoc) -> DocumentVocabulary {
 
     for (i, (sig, indices)) in groups.iter().enumerate() {
         let description = describe_role(sig, default_font_size);
-        let exemplar_idx = indices[0];
+        let exemplar_idx = pick_exemplar(indices, &para_infos);
         let exemplar = para_infos[exemplar_idx].node_id.clone();
         let exemplar_text = pick_exemplar_text(indices, &para_infos);
         let has_numbering = sig.has_numbering;
@@ -334,10 +338,16 @@ fn compute_default_font_size(doc: &CanonDoc) -> Option<u32> {
             }
         }
     });
-    size_counts
+    most_common_size(size_counts)
+}
+
+/// The size with the most characters; of sizes tied on that count, the
+/// smallest, so the answer never depends on map order.
+fn most_common_size(counts: HashMap<u32, usize>) -> Option<u32> {
+    counts
         .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(sz, _)| sz)
+        .max_by_key(|&(size, count)| (count, std::cmp::Reverse(size)))
+        .map(|(size, _)| size)
 }
 
 /// Normalize a paragraph's dominant font size against the document default.
@@ -469,10 +479,7 @@ fn build_paragraph_info(
 
     let dominant_bold = total_chars > 0 && bold_chars * 2 > total_chars;
     let dominant_all_caps = total_chars > 0 && caps_chars * 2 > total_chars;
-    let raw_font_size = font_size_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(sz, _)| sz);
+    let raw_font_size = most_common_size(font_size_counts);
     let dominant_font_size = normalize_font_size(raw_font_size, default_font_size);
 
     // Numbering.
@@ -542,12 +549,48 @@ fn build_paragraph_info(
     // Exemplar text snippet: numbering prefix + body text, truncated.
     let text_snippet = extract_text_snippet(p);
 
+    let first_run_format = p.first_content_text_node().map(|text| {
+        format!(
+            "{:?}|{:?}|{:?}",
+            text.marks, text.style_props, text.rpr_authored
+        )
+    });
+
     ParagraphInfo {
         node_id: p.id.clone(),
         signature,
         numbering_source,
         text_snippet,
+        first_run_format,
     }
+}
+
+/// The role's exemplar: the earliest paragraph whose first-run formatting is
+/// the one most of the role's paragraphs have. A role groups paragraphs by
+/// paragraph-level formatting, and new text takes the exemplar's first-run
+/// formatting, so an exemplar that happens to open with italic or underlined
+/// text would make every inserted paragraph italic or underlined.
+fn pick_exemplar(indices: &[usize], infos: &[ParagraphInfo]) -> usize {
+    let mut counts: Vec<(&str, usize, usize)> = Vec::new(); // (format, paragraphs, first index)
+    for &idx in indices {
+        let Some(format) = infos[idx].first_run_format.as_deref() else {
+            continue;
+        };
+        match counts.iter_mut().find(|(seen, _, _)| *seen == format) {
+            Some((_, n, _)) => *n += 1,
+            None => counts.push((format, 1, idx)),
+        }
+    }
+    counts
+        .iter()
+        .fold(
+            None,
+            |best: Option<(usize, usize)>, &(_, n, first)| match best {
+                Some((most, _)) if most >= n => best,
+                _ => Some((n, first)),
+            },
+        )
+        .map_or(indices[0], |(_, first)| first)
 }
 
 fn classify_numbering(p: &ParagraphNode) -> NumberingKind {
@@ -801,10 +844,17 @@ fn assign_descriptive_ids(
     base_names: &[String],
     groups: &[(FormattingSignature, Vec<usize>)],
 ) -> Vec<String> {
-    // Find which base names collide.
-    let mut name_indices: HashMap<&str, Vec<usize>> = HashMap::new();
+    // Find which base names collide, in the order the names first occur, so a
+    // deduplicated id never depends on map order.
+    let mut name_indices: Vec<(&str, Vec<usize>)> = Vec::new();
     for (i, name) in base_names.iter().enumerate() {
-        name_indices.entry(name.as_str()).or_default().push(i);
+        match name_indices
+            .iter_mut()
+            .find(|(seen, _)| *seen == name.as_str())
+        {
+            Some((_, indices)) => indices.push(i),
+            None => name_indices.push((name.as_str(), vec![i])),
+        }
     }
 
     let mut result = vec![String::new(); base_names.len()];

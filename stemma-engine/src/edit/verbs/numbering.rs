@@ -27,7 +27,7 @@
 //! would allow style- or pStyle-inherited numbering to reappear after save.
 //!
 //! v1 scope (fail loud beyond it):
-//! - top-level paragraphs only (no table-cell numbering);
+//! - body paragraphs, top-level or in a table cell;
 //! - the target paragraph must have Normal tracking and no tracked segments;
 //! - the paragraph must not already carry a tracked formatting change (one
 //!   `w:pPrChange` per paragraph — accept/reject the existing one first);
@@ -37,8 +37,12 @@
 //!   does not convert manual prefixes to structural numbering;
 //! - a structurally-equal no-op request is refused.
 
-use super::super::{EditError, MaterializationMode, NumberingOp, snapshot_paragraph_formatting};
-use super::super::{find_block_index, validate_block_is_editable};
+use super::super::{
+    EditError, LevelFormat, MaterializationMode, NumberingOp, snapshot_paragraph_formatting,
+};
+use super::super::{
+    ParagraphPath, block_at, block_at_mut, find_editable_block_path, find_paragraph_path,
+};
 use crate::domain::{BlockNode, CanonDoc, NodeId, NumberingInfo, ParagraphNode, RevisionInfo};
 use crate::semantic_hash::check_block_guard;
 
@@ -123,6 +127,43 @@ pub enum NumberingChange {
     /// the real id and rewrite the placeholder. Refused on an unnumbered
     /// paragraph (`NumberingSplitOnUnnumbered`).
     Split,
+
+    /// Give the target item and the contiguous following items at its
+    /// `num_id`/`ilvl` (the run [`Self::Split`] takes) a different label
+    /// format: they move to a new list whose level at their `ilvl` numbers
+    /// with `num_fmt` and reads `lvl_text` ("(%1)" makes "(a)" with
+    /// `LowerLetter`); every other level is the source list's. Items before
+    /// the target, and other lists sharing the source definition, keep their
+    /// labels. Same tracked re-point and save-time definition as a split.
+    SetFormat {
+        num_fmt: ListNumberFormat,
+        lvl_text: String,
+    },
+}
+
+/// The label formats a list level can be given (ISO 29500-1 §17.18.59
+/// `ST_NumberFormat`, the counting subset): a closed set, so an unsupported
+/// format is refused at the edge rather than written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListNumberFormat {
+    Decimal,
+    LowerLetter,
+    UpperLetter,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl ListNumberFormat {
+    /// The `w:numFmt/@w:val` spelling.
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            ListNumberFormat::Decimal => "decimal",
+            ListNumberFormat::LowerLetter => "lowerLetter",
+            ListNumberFormat::UpperLetter => "upperLetter",
+            ListNumberFormat::LowerRoman => "lowerRoman",
+            ListNumberFormat::UpperRoman => "upperRoman",
+        }
+    }
 }
 
 /// OOXML list levels are 0..=8 (`w:ilvl`, §17.9.3 `ST_DecimalNumber` clamped to
@@ -164,28 +205,37 @@ pub(crate) fn apply(
 ) -> Result<(), EditError> {
     // Split is a whole-run operation that also authors a new list definition; it
     // does not fit the single-paragraph dispatch below, so it is handled first.
-    if matches!(change, NumberingChange::Split) {
-        return apply_split(
-            doc,
-            block_id,
-            semantic_hash,
-            revision,
-            step_index,
-            numbering_ops,
-        );
+    match change {
+        NumberingChange::Split => {
+            return apply_split(
+                doc,
+                block_id,
+                semantic_hash,
+                revision,
+                mode,
+                step_index,
+                numbering_ops,
+                None,
+            );
+        }
+        NumberingChange::SetFormat { num_fmt, lvl_text } => {
+            return apply_split(
+                doc,
+                block_id,
+                semantic_hash,
+                revision,
+                mode,
+                step_index,
+                numbering_ops,
+                Some((*num_fmt, lvl_text.clone())),
+            );
+        }
+        _ => {}
     }
 
-    // v1: top-level paragraphs only. A nested (table-cell) paragraph is not
-    // found here and surfaces as BlockNotFound.
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
-        block_id: block_id.clone(),
-        step_index,
-    })?;
+    let path = find_editable_block_path(doc, block_id, step_index)?;
 
-    // Block status + segment-Normal preconditions (same gate as a text replace).
-    validate_block_is_editable(&doc.blocks[idx], step_index)?;
-
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -204,7 +254,7 @@ pub(crate) fn apply(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -214,7 +264,7 @@ pub(crate) fn apply(
         });
     }
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
     apply_to_paragraph(para, block_id, change, revision, mode, step_index)
@@ -257,76 +307,77 @@ fn apply_to_paragraph(
     // suppression state, not structural absence: absence may inherit a list
     // from the paragraph style after serialization.
     let target_numbering_suppressed = matches!(change, NumberingChange::Remove);
-    let new_numbering: Option<NumberingInfo> =
-        match change {
-            NumberingChange::SetList {
-                num_id,
-                ilvl,
-                restart,
-                synthesized_text,
-                is_bullet,
-            } => Some(NumberingInfo {
-                num_id: *num_id,
+    let new_numbering: Option<NumberingInfo> = match change {
+        NumberingChange::SetList {
+            num_id,
+            ilvl,
+            restart,
+            synthesized_text,
+            is_bullet,
+        } => Some(NumberingInfo {
+            num_id: *num_id,
+            ilvl: *ilvl,
+            resolution: crate::domain::NumberingResolution::Resolved,
+            synthesized_text: synthesized_text.clone(),
+            is_bullet: *is_bullet,
+            restart_numbering: *restart,
+        }),
+        NumberingChange::SetLevel {
+            ilvl,
+            synthesized_text,
+            is_bullet,
+        } => {
+            // Indent/outdent keeps the current num_id; refuse if there is no
+            // current numbering to re-level.
+            let current =
+                para.numbering
+                    .as_ref()
+                    .ok_or_else(|| EditError::NumberingLevelOnUnnumbered {
+                        block_id: block_id.clone(),
+                        step_index,
+                    })?;
+            Some(NumberingInfo {
+                num_id: current.num_id,
                 ilvl: *ilvl,
                 resolution: crate::domain::NumberingResolution::Resolved,
                 synthesized_text: synthesized_text.clone(),
                 is_bullet: *is_bullet,
-                restart_numbering: *restart,
-            }),
-            NumberingChange::SetLevel {
-                ilvl,
-                synthesized_text,
-                is_bullet,
-            } => {
-                // Indent/outdent keeps the current num_id; refuse if there is no
-                // current numbering to re-level.
-                let current = para.numbering.as_ref().ok_or_else(|| {
-                    EditError::NumberingLevelOnUnnumbered {
+                // Re-leveling does not request a counter restart.
+                restart_numbering: false,
+            })
+        }
+        NumberingChange::Remove => None,
+        NumberingChange::Indent => Some(relevel(para, block_id, step_index, 1)?),
+        NumberingChange::Outdent => Some(relevel(para, block_id, step_index, -1)?),
+        NumberingChange::Restart => Some(set_restart(para, block_id, step_index, true)?),
+        NumberingChange::Continue => Some(set_restart(para, block_id, step_index, false)?),
+        NumberingChange::SetType {
+            num_id,
+            synthesized_text,
+            is_bullet,
+        } => {
+            // Swap the list kind by re-pointing at an existing num_id; keep the
+            // current level. Refused on an unnumbered paragraph.
+            let current =
+                para.numbering
+                    .as_ref()
+                    .ok_or_else(|| EditError::NumberingLevelOnUnnumbered {
                         block_id: block_id.clone(),
                         step_index,
-                    }
-                })?;
-                Some(NumberingInfo {
-                    num_id: current.num_id,
-                    ilvl: *ilvl,
-                    resolution: crate::domain::NumberingResolution::Resolved,
-                    synthesized_text: synthesized_text.clone(),
-                    is_bullet: *is_bullet,
-                    // Re-leveling does not request a counter restart.
-                    restart_numbering: false,
-                })
-            }
-            NumberingChange::Remove => None,
-            NumberingChange::Indent => Some(relevel(para, block_id, step_index, 1)?),
-            NumberingChange::Outdent => Some(relevel(para, block_id, step_index, -1)?),
-            NumberingChange::Restart => Some(set_restart(para, block_id, step_index, true)?),
-            NumberingChange::Continue => Some(set_restart(para, block_id, step_index, false)?),
-            NumberingChange::SetType {
-                num_id,
-                synthesized_text,
-                is_bullet,
-            } => {
-                // Swap the list kind by re-pointing at an existing num_id; keep the
-                // current level. Refused on an unnumbered paragraph.
-                let current = para.numbering.as_ref().ok_or_else(|| {
-                    EditError::NumberingLevelOnUnnumbered {
-                        block_id: block_id.clone(),
-                        step_index,
-                    }
-                })?;
-                Some(NumberingInfo {
-                    num_id: *num_id,
-                    ilvl: current.ilvl,
-                    resolution: crate::domain::NumberingResolution::Resolved,
-                    synthesized_text: synthesized_text.clone(),
-                    is_bullet: *is_bullet,
-                    restart_numbering: current.restart_numbering,
-                })
-            }
-            NumberingChange::Split => {
-                unreachable!("Split is dispatched in `apply` before reaching apply_to_paragraph")
-            }
-        };
+                    })?;
+            Some(NumberingInfo {
+                num_id: *num_id,
+                ilvl: current.ilvl,
+                resolution: crate::domain::NumberingResolution::Resolved,
+                synthesized_text: synthesized_text.clone(),
+                is_bullet: *is_bullet,
+                restart_numbering: current.restart_numbering,
+            })
+        }
+        NumberingChange::Split | NumberingChange::SetFormat { .. } => {
+            unreachable!("run changes are dispatched in `apply` before reaching apply_to_paragraph")
+        }
+    };
 
     // No-op guard: structural equality (num_id + ilvl) AND identical restart
     // intent means nothing changes. A bare restart of the same list IS a
@@ -361,17 +412,27 @@ fn apply_to_paragraph(
             para.formatting_change = None;
         }
     }
+    // Word's Increase / Decrease Indent on a list item changes its level and
+    // removes the paragraph's direct indentation, so the new level's own
+    // indent applies (observed with Word: ListIndent drops a direct w:ind,
+    // matching the old level's or not, into the pPrChange). Kept, a direct
+    // indent equal to the old level's leaves the item where it was.
+    if matches!(change, NumberingChange::Indent | NumberingChange::Outdent) {
+        para.has_direct_indent = false;
+        para.authored_indent = None;
+    }
 
     Ok(())
 }
 
 /// Split a list at `block_id`: re-point the split item and every CONTIGUOUS
-/// following top-level paragraph that shares its `num_id` at a freshly-allocated
+/// following paragraph of its container (the body, or the table cell holding
+/// it) that shares its `num_id` at a freshly-allocated
 /// `num_id`, and stage a [`NumberingOp::CreateDefinition`] so the save path
 /// authors that `num_id`'s definition (cloning the source list's levels).
 ///
 /// "Contiguous" means: starting at the split item, consume forward as long as
-/// the next top-level block is a paragraph whose live numbering points at the
+/// the next block of the container is a paragraph whose live numbering points at the
 /// SAME original `num_id` AND the same `ilvl`. A different num_id, a different
 /// level, a non-list paragraph, or a table ends the run. Items at a deeper
 /// `ilvl` between two split items are NOT re-pointed in v1 — the run is the flat
@@ -383,21 +444,26 @@ fn apply_to_paragraph(
 /// [`SPLIT_PLACEHOLDER_NUM_ID_BASE`]); the save path allocates the real
 /// `num_id` and matching `abstractNumId` against `word/numbering.xml` and
 /// rewrites the placeholder.
+#[allow(clippy::too_many_arguments)]
 fn apply_split(
     doc: &mut CanonDoc,
     block_id: &NodeId,
     semantic_hash: Option<&str>,
     revision: &RevisionInfo,
+    mode: MaterializationMode,
     step_index: usize,
     numbering_ops: &mut Vec<NumberingOp>,
+    format: Option<(ListNumberFormat, String)>,
 ) -> Result<(), EditError> {
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+    // The split item may be top-level or in a table cell; its run continues
+    // among the blocks that follow it in the same container.
+    let path = find_paragraph_path(doc, block_id).ok_or_else(|| EditError::BlockNotFound {
         block_id: block_id.clone(),
         step_index,
     })?;
 
     // Resolve the split point's current numbering. Must be a list item.
-    let (source_num_id, source_ilvl) = match &doc.blocks[idx].block {
+    let (source_num_id, source_ilvl) = match block_at(doc, &path) {
         BlockNode::Paragraph(p) => match &p.numbering {
             Some(n) => (n.num_id, n.ilvl),
             None => {
@@ -435,11 +501,12 @@ fn apply_split(
         .expect("list-split placeholder space exhausted — not reachable for real transactions");
 
     // Collect the contiguous run of block ids to re-point: the split item plus
-    // following top-level paragraphs at the SAME (num_id, ilvl). We collect ids
-    // (not indices) first so we can re-point each via the shared paragraph path.
+    // following paragraphs of its container at the SAME (num_id, ilvl). We
+    // collect ids (not indices) first so we can re-point each via the shared
+    // paragraph path.
     let mut run_ids: Vec<NodeId> = Vec::new();
-    for tb in &doc.blocks[idx..] {
-        match &tb.block {
+    for block in blocks_from(doc, &path) {
+        match block {
             BlockNode::Paragraph(p) => match &p.numbering {
                 Some(n) if n.num_id == source_num_id && n.ilvl == source_ilvl => {
                     run_ids.push(p.id.clone());
@@ -458,20 +525,16 @@ fn apply_split(
         "the split item itself always matches its own (num_id, ilvl)"
     );
 
-    // Re-point each item in the run at the new num_id, keeping ilvl, as a tracked
-    // pPrChange (same shape SetType produces). The split point carries the
+    // Re-point each item in the run at the new num_id, keeping ilvl, in the
+    // transaction's mode: a tracked pPrChange (same shape SetType produces) or a
+    // direct change. The split point carries the
     // caller-supplied semantic-hash guard; the rest are unguarded (they were
     // resolved from the live run, not addressed by the caller).
     for (run_pos, run_id) in run_ids.iter().enumerate() {
         let hash = if run_pos == 0 { semantic_hash } else { None };
-        let run_idx =
-            find_block_index(&doc.blocks, run_id).ok_or_else(|| EditError::BlockNotFound {
-                block_id: run_id.clone(),
-                step_index,
-            })?;
-        validate_block_is_editable(&doc.blocks[run_idx], step_index)?;
+        let run_path = find_editable_block_path(doc, run_id, step_index)?;
 
-        let BlockNode::Paragraph(para) = &mut doc.blocks[run_idx].block else {
+        let BlockNode::Paragraph(para) = block_at_mut(doc, &run_path) else {
             unreachable!("run ids were collected from paragraphs only");
         };
 
@@ -504,7 +567,7 @@ fn apply_split(
                 is_bullet,
             },
             revision,
-            MaterializationMode::TrackedChange,
+            mode,
             step_index,
         )?;
     }
@@ -515,9 +578,35 @@ fn apply_split(
     numbering_ops.push(NumberingOp::CreateDefinition {
         placeholder_num_id,
         cloned_from_num_id: source_num_id,
+        level_format: format.map(|(num_fmt, lvl_text)| LevelFormat {
+            ilvl: source_ilvl,
+            num_fmt,
+            lvl_text,
+        }),
     });
 
     Ok(())
+}
+
+/// The block at `path` and the blocks after it in its container: the body for
+/// a top-level block, the enclosing cell for a cell block.
+fn blocks_from<'a>(doc: &'a CanonDoc, path: &ParagraphPath) -> Vec<&'a BlockNode> {
+    let Some((last, outer)) = path.descent.split_last() else {
+        return doc.blocks[path.top_block..]
+            .iter()
+            .map(|tb| &tb.block)
+            .collect();
+    };
+    let table_path = ParagraphPath {
+        top_block: path.top_block,
+        descent: outer.to_vec(),
+    };
+    let BlockNode::Table(table) = block_at(doc, &table_path) else {
+        panic!("ParagraphPath descent through non-table block (invariant violation)");
+    };
+    table.rows[last.row_idx].cells[last.cell_idx].blocks[last.block_in_cell_idx..]
+        .iter()
+        .collect()
 }
 
 /// Compute the new `NumberingInfo` for an indent (`delta = 1`) or outdent
@@ -699,6 +788,7 @@ mod tests {
             text_id: None,
             text_direction: None,
             cnf_style: None,
+            source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
         }
     }

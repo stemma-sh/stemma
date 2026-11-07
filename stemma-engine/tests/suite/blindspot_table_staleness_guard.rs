@@ -119,6 +119,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -142,6 +143,7 @@ fn plain_cell(id: &str, text: &str) -> TableCellNode {
 
 fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -153,7 +155,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -173,6 +175,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 /// value is fine; what matters is whether a cell-text edit moves it.
 fn one_row_table() -> TableNode {
     TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![row(
             "t1_r0",

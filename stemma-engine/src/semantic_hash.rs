@@ -240,8 +240,7 @@ fn paragraph_guard_v2_hash(paragraph: &ParagraphNode) -> String {
                 }
                 InlineNode::Decoration(_)
                 | InlineNode::CommentRangeStart { .. }
-                | InlineNode::CommentRangeEnd { .. }
-                | InlineNode::CommentReference { .. } => {}
+                | InlineNode::CommentRangeEnd { .. } => {}
             }
         }
     }
@@ -298,8 +297,7 @@ pub fn block_semantic_hash_for_paragraph(paragraph: &ParagraphNode) -> String {
                 }),
                 InlineNode::Decoration(_)
                 | InlineNode::CommentRangeStart { .. }
-                | InlineNode::CommentRangeEnd { .. }
-                | InlineNode::CommentReference { .. } => {}
+                | InlineNode::CommentRangeEnd { .. } => {}
             }
         }
     }

@@ -110,6 +110,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         text_id: None,
         text_direction: None,
         cnf_style: None,
+        source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
     }
 }
@@ -188,6 +189,7 @@ fn plain_cell(id: &str, text: &str) -> TableCellNode {
 
 fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
     TableRowNode {
+        source_row_attrs: Vec::new(),
         id: NodeId::from(id),
         cells,
         grid_before: 0,
@@ -199,7 +201,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
         formatting_change: None,
         para_id: None,
         text_id: None,
-        cant_split: false,
+        cant_split: None,
         jc: None,
         w_before: None,
         w_after: None,
@@ -215,6 +217,7 @@ fn row(id: &str, cells: Vec<TableCellNode>) -> TableRowNode {
 /// formatted table the whole-table v4-replace guard refuses.
 fn formatted_table() -> TableNode {
     TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![
             row(
@@ -527,6 +530,7 @@ fn set_cell_format_addresses_logical_grid_column_across_a_span() {
     let mut wide = formatted_cell("t1_r0c0", "WIDE");
     wide.grid_span = 2;
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![
             row("t1_r0", vec![wide, plain_cell("t1_r0c2", "right")]),
@@ -569,6 +573,7 @@ fn set_cell_format_interior_of_merged_cell_refused() {
     let mut wide = plain_cell("t1_r0c0", "WIDE");
     wide.grid_span = 2;
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![
             row("t1_r0", vec![wide]),
@@ -598,6 +603,7 @@ fn set_cell_format_on_vmerge_continuation_refused() {
     let mut cont = plain_cell("t1_r1c0", "");
     cont.v_merge = VerticalMerge::Continue;
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![
             row("t1_r0", vec![anchor, plain_cell("t1_r0c1", "x")]),
@@ -661,6 +667,7 @@ fn set_cell_format_preserves_a_cell_opaque_inline() {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: stemma::domain::RunRprAuthored::ALL,
         source_run_attrs: Vec::new(),
         joins_following_text_run: false,
         raw_xml: Some(
@@ -688,6 +695,7 @@ fn set_cell_format_preserves_a_cell_opaque_inline() {
     };
     let base_cell = cell.clone();
     let table = TableNode {
+        range_markers: Vec::new(),
         id: NodeId::from("t1"),
         rows: vec![row("t1_r0", vec![cell, plain_cell("t1_r0c1", "x")])],
         structure_hash: String::new(),
@@ -918,6 +926,9 @@ fn a_tracked_paragraph_format_in_a_cell_survives_persistence() {
                     spacing: None,
                     borders: None,
                     shading: None,
+                    keep_next: None,
+                    keep_lines: None,
+                    page_break_before: None,
                 },
                 rationale: None,
             }],

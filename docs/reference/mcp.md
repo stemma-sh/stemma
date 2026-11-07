@@ -23,11 +23,30 @@ The complete 31-tool surface is in the
 | `verify_docx(...)` | Audit an open session or a before/after pair before delivery. |
 | `save_docx(doc_id, path)` | Validate and commit an open document to a new path. |
 
+While exactly one document is open, `doc_id` may be omitted from any call
+that needs a document: the call is about that document, so a file can be
+opened and queried in the same turn. With no document or several open, such a
+call is refused with `doc_id_required` and the `open_doc_ids`. A named
+`doc_id` is always used as given, and a two-file comparison or a
+`verify_docx` of a before/after pair never takes the open document.
+
 Every successful object response and structured error includes
 `server_version`. Tagged binaries report
 `version+g<12-character-commit>`.
 
+`open_docx` also returns `diagnostics` and `document_protection` (null when
+absent). Protection reports the edit mode, enforcement flag, and credential
+presence only, never credential material. Stemma does not enforce document
+protection; enforced protection produces an import warning. The caller must
+decide whether programmatic editing is appropriate for its workflow. Successful
+import does not imply that a host application permits every review operation.
+
 ## Golden path
+
+For an ordinary single-document edit, open with the existing input `path` alone;
+omit `task` and `task_id`. Supply the new output path only to `save_docx`.
+Task declarations are optional bounded multi-document delivery contracts, not
+required initialization. An existing task binding must not be bypassed or broadened.
 
 1. Call `open_docx(path)`. Keep the returned `doc_id` and exact input identity.
 2. Use `inspect_docx` to find relevant content, then inspect the exact block.
@@ -35,9 +54,10 @@ Every successful object response and structured error includes
 4. Resolve every refusal, then submit the same plan with `preview:false`.
 5. Call `verify_docx({doc_id})` and inspect every reported section.
 6. Call `save_docx(doc_id, path)` with a new output path. Save reruns the
-   session audit and refuses a
-   non-deliverable result before creating the output path. A passing result
-   is serialized, checked by the package gate, and committed create-new.
+   session audit, serializes, checks the bytes with the package gate, and
+   commits create-new. Only a package-gate error refuses the save. The
+   receipt's `verdict.status` is `pass`, or `needs_review` when the audit
+   found changes it cannot explain; act on it before delivering.
 
 A complete preview reports `apply_ready:true`. Do not rediscover or reformulate
 the plan between preview and apply unless the document state or intended scope
@@ -68,13 +88,15 @@ Prefer targeted `inspect_docx` queries:
 
 | Query | Use it for |
 |---|---|
-| `find` | Locate wording without reading every block. Pass `patterns` with up to eight known phrases to batch them in one request; each pattern, including a zero-match pattern, returns its own exact totals and paging. |
+| `find` | Locate wording without reading every block. Pass `patterns` with up to eight known phrases to batch them in one request; each pattern, including a zero-match pattern, returns its own exact totals and paging. Each match says where it hit in `matched_in`: `text`, or `hyperlink`, `textbox`, `content_control`, `form_field` or `image_alt` with the `anchor` that edits it. A table match lists its matching cells, each with the `block_id` of the paragraph holding the match (null, with `match_spans_paragraphs:true`, when the match runs across two) and all of the cell's `block_ids`. Header and footer matches are listed under `story_matches`, one entry per part with the `header_part` or `footer_part` an edit names. |
 | `block` | Read one exact paragraph, table locator set, guard, or formatting projection. |
 | `window` | Read an inclusive range of block ids. |
 | `document` | Page through the extended-Markdown document projection. |
 | `revisions` | List current pending revisions, optionally filtered by author, kind, or block range. |
 | `styles` | Inspect authored style state. |
 | `notes` | Read editable footnote and endnote rows. |
+| `headers_footers` | Discover authored header/footer part names, story kinds, block ids, text and opaque field anchors before `edit_header`/`edit_footer`. Page with `offset`/`limit` (default 8, maximum 64); select `pattern:"<part_name>"` and `block_id` for exact detail, optionally `detail:"formatting"` and table `cell_offset`/`cell_limit`. Block ids are story-local; an ambiguous id requires a part selection. Synthesized blank stories have no editable package part and are excluded. |
+| `nested_form_fields` | Discover legacy fields inside opaque body controls, with positional addresses, containing-block hashes, instructions, cached results and paragraph context. Page with `offset`/`limit` (default 8, maximum 64). Names may repeat. Use `set_block_form_text` for a FORMTEXT result, not the enclosing control's first-text fill. |
 | `redline`, `accepted`, `rejected` | Read the current, accept-all, or reject-all projection. |
 | `operations` | Retrieve the parser-derived transaction vocabulary and examples. |
 
@@ -83,6 +105,10 @@ block id before editing it. Request `detail:"formatting"` only when complete run
 spans, marks, and style properties are needed. The shapes these reads project
 are the engine's read model, documented field by field in the
 [read model reference](read-model.md).
+
+A block read lists the paragraph's opaque `anchors`. A drawing anchor carries
+its `size_emu` (`{cx, cy}`), and a textbox also its `textbox_text`, so a resize
+or a textbox edit starts without a second read.
 
 Reads are explicitly bounded. Find returns at most 16 matches by default.
 Document pages default to 16 top-level blocks. Table reads return paged cell
@@ -99,13 +125,21 @@ locators rather than an unbounded aggregate body.
 | revision selection | Accepts or rejects the explicit current revision selection. |
 | `comparison` | Produces a tracked redline from base and target paths. |
 
+A mutation receipt's `changed_blocks` rows carry each block's `text`, the
+redline reading with pending deletions included. A paragraph that carries
+tracked changes also has `accepted_text`, what it reads once they are
+accepted: check that against the intended sentence.
+
 For a replacement worklist:
 
 - use an integer `expected_matches` or `replace_all:true`, never both;
 - use `match_mode:"exact"` or `match_mode:"normalize_ws"`;
 - preview first;
 - reissue only refused items after correcting them;
-- scope by block id when the intended text is not unique.
+- scope by block id when the intended text is not unique;
+- edit text inside a hyperlink or content control through that object: an
+  item whose text also stands there refuses, listing each one in
+  `unreached_matches`.
 
 The omitted replacement scope covers top-level and table-cell paragraphs.
 Preview runs the ordered worklist against a throwaway snapshot, including the
@@ -117,8 +151,9 @@ For a two-file comparison, omit `doc_id` and pass
 ## Verification
 
 `verify_docx({doc_id})` audits the open session before delivery. `save_docx`
-recomputes the same audit and refuses a non-deliverable result before the
-destination exists, so a saved output is independently verification-gated.
+recomputes the same audit and reports it in the receipt (`audit_binding` and
+`verdict`). A declared task refuses a non-deliverable audit before the
+destination exists, because its manifest certifies a passing audit.
 The producer-neutral form audits any before/after pair. A deliverable result
 should report:
 
@@ -130,6 +165,17 @@ should report:
 `baseline_validator` reports findings that already existed when the source was
 opened. Unchanged baseline findings must be disclosed, but they are not new
 regressions.
+
+An audit pass is not proof that the requested field was edited or that every
+Word consumer will render the result identically. The untouched proof checks
+canonical block fidelity; package validation checks structural constraints.
+Session review uses shared block identities, while file-pair auditing uses
+native insertion evidence and conservative baseline positions rather than
+inferring document lineage from content similarity.
+
+Image resize and alt-text changes are inherently direct. They are accounted
+for only when the remaining paragraph and drawing content is unchanged; an
+unrelated formatting or drawing change does not receive an image exemption.
 
 Audit lists return 16 rows by default and 64 at most. Use `detail`, `offset`,
 and `limit` to retrieve all continuation pages.

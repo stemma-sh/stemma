@@ -41,10 +41,9 @@
 //! - the `pic:blipFill` a crop needs is absent → `ImageLayoutTargetAbsent`.
 //! - empty request (nothing set) → `NoImageLayoutRequested`.
 
-use super::super::{EditError, find_block_index};
+use super::super::{EditError, block_at_mut, find_paragraph_path};
 use super::images::locate_drawing_mut;
 use crate::domain::{NodeId, OpaqueInlineNode};
-use crate::import::sha256_hex;
 use crate::word_xml::{parse_raw_fragment, serialize_raw_fragment};
 use xmltree::{Element, XMLNode};
 
@@ -182,11 +181,12 @@ pub(crate) fn apply(
         return Err(EditError::NoImageLayoutRequested { step_index });
     }
 
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+    // The hosting paragraph may be top-level or in a table cell.
+    let path = find_paragraph_path(doc, block_id).ok_or_else(|| EditError::BlockNotFound {
         block_id: block_id.clone(),
         step_index,
     })?;
-    let node = locate_drawing_mut(&mut doc.blocks[idx].block, drawing_id, step_index)?;
+    let node = locate_drawing_mut(block_at_mut(doc, &path), drawing_id, step_index)?;
 
     if let Some(expected) = semantic_hash {
         let actual = node.content_hash.as_deref().unwrap_or("");
@@ -221,7 +221,7 @@ pub(crate) fn apply(
 }
 
 fn set_raw(node: &mut OpaqueInlineNode, new_raw: Vec<u8>) {
-    node.content_hash = Some(sha256_hex(&new_raw));
+    node.content_hash = Some(crate::import::canonical_raw_hash(&new_raw));
     node.raw_xml = Some(new_raw);
 }
 

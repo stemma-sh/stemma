@@ -16,8 +16,9 @@ and excerpt.
 Revision ids are the engine's content-derived identities: a revision whose
 own content is untouched keeps its id across save/reopen and across a
 `resolve` of *other* revisions, so ids read here remain valid against the
-resolved output. Never take ids from raw XML (`w:id` is not the same value),
-and re-extract if an operation may have altered a surviving revision's
+resolved output. Never take ids from raw XML (`w:id` is not the same value;
+the one exception is a change inside a textbox, kind `opaque_interior`, whose
+id is its own `w:id`), and re-extract if an operation may have altered a surviving revision's
 content; see [id durability](../reference/cli.md#extract).
 
 ## Resolve changes
@@ -51,7 +52,10 @@ stemma resolve redline.docx \
 ```
 
 Exactly one disposition is required. A selector that matches nothing is an
-error and creates no output.
+error and creates no output. While a table carries a pending tracked cell
+merge (kind `cell_merge`, id `0` in the extract), every resolution refuses,
+`--accept-all` and `--reject-all` included: resolving merge changes is not
+supported. Resolve that merge in Word first.
 
 A revision whose author is the empty string (Word anonymization writes
 `w:author=""`) is selectable as its own group: `--accept-author ""` /

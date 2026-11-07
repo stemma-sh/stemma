@@ -225,7 +225,6 @@ pub fn extract_inlines_text(inlines: &[InlineNode]) -> String {
             InlineNode::Decoration(_) => {}
             InlineNode::CommentRangeStart { .. } => {}
             InlineNode::CommentRangeEnd { .. } => {}
-            InlineNode::CommentReference { .. } => {}
         }
     }
     text
@@ -338,6 +337,7 @@ mod tests {
                 text_id: None,
                 text_direction: None,
                 cnf_style: None,
+                source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
             })],
             grid_span: 1,
@@ -368,9 +368,11 @@ mod tests {
     #[test]
     fn test_simple_3x3_table() {
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_text_cell("c00", "A"),
@@ -386,7 +388,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -397,6 +399,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_text_cell("c10", "D"),
@@ -412,7 +415,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -423,6 +426,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r2"),
                     cells: vec![
                         make_text_cell("c20", "G"),
@@ -438,7 +442,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -482,9 +486,11 @@ mod tests {
         // Row 0: [A spans 2 cols] [C]
         // Row 1: [D] [E] [F]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_merged_cell("c00", "A", 2, VerticalMerge::None),
@@ -499,7 +505,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -510,6 +516,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_text_cell("c10", "D"),
@@ -525,7 +532,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -573,9 +580,11 @@ mod tests {
         // Col 0: [A spans 2 rows] Col 1: [B]
         //                         Col 1: [D]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_merged_cell("c00", "A", 1, VerticalMerge::Restart),
@@ -590,7 +599,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -601,6 +610,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_merged_cell("c10", "", 1, VerticalMerge::Continue),
@@ -615,7 +625,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -660,9 +670,11 @@ mod tests {
         // [A spans 2 cols, 2 rows] [C]
         //                          [F]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_merged_cell("c00", "A", 2, VerticalMerge::Restart),
@@ -677,7 +689,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -688,6 +700,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_merged_cell("c10", "", 2, VerticalMerge::Continue),
@@ -702,7 +715,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -748,9 +761,11 @@ mod tests {
         // Row 0: [empty] [A] [B]
         // Row 1: [C] [D] [empty]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![make_text_cell("c01", "A"), make_text_cell("c02", "B")],
                     grid_before: 1,
@@ -762,7 +777,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -773,6 +788,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![make_text_cell("c10", "C"), make_text_cell("c11", "D")],
                     grid_before: 0,
@@ -784,7 +800,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -821,9 +837,11 @@ mod tests {
         // Row 0: [A spans 2 cols] [C]
         // Row 1: [D] [E] [F]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_merged_cell("c00", "A", 2, VerticalMerge::None),
@@ -838,7 +856,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -849,6 +867,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_text_cell("c10", "D"),
@@ -864,7 +883,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -896,9 +915,11 @@ mod tests {
         // Col 0: [A spans 2 rows]
         // Col 1: [B], [D]
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_merged_cell("c00", "A", 1, VerticalMerge::Restart),
@@ -913,7 +934,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -924,6 +945,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_merged_cell("c10", "", 1, VerticalMerge::Continue),
@@ -938,7 +960,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -969,9 +991,11 @@ mod tests {
     fn test_continue_without_restart() {
         // Word renders Continue without a prior Restart as a standalone cell.
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("tbl_0"),
             rows: vec![
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r0"),
                     cells: vec![
                         make_text_cell("c00", "A"), // No Restart
@@ -986,7 +1010,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -997,6 +1021,7 @@ mod tests {
                     preserved: Vec::new(),
                 },
                 TableRowNode {
+                    source_row_attrs: Vec::new(),
                     id: NodeId::from("tbl_0_r1"),
                     cells: vec![
                         make_merged_cell("c10", "X", 1, VerticalMerge::Continue), // Continue without Restart
@@ -1011,7 +1036,7 @@ mod tests {
                     formatting_change: None,
                     para_id: None,
                     text_id: None,
-                    cant_split: false,
+                    cant_split: None,
                     jc: None,
                     w_before: None,
                     w_after: None,
@@ -1041,6 +1066,7 @@ mod tests {
     #[test]
     fn test_word_orphan_continuation_below_grid_before_is_standalone() {
         let row = |id: &str, grid_before: u32, cells: Vec<TableCellNode>| TableRowNode {
+            source_row_attrs: Vec::new(),
             id: NodeId::from(id),
             cells,
             grid_before,
@@ -1052,7 +1078,7 @@ mod tests {
             formatting_change: None,
             para_id: None,
             text_id: None,
-            cant_split: false,
+            cant_split: None,
             jc: None,
             w_before: None,
             w_after: None,
@@ -1063,6 +1089,7 @@ mod tests {
             preserved: Vec::new(),
         };
         let table = TableNode {
+            range_markers: Vec::new(),
             id: NodeId::from("word-orphan-vmerge"),
             rows: vec![
                 row("r0", 1, vec![make_text_cell("c01", "right")]),

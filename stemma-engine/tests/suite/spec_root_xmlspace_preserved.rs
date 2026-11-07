@@ -17,8 +17,8 @@
 //! Assertion (a) — the output `<w:document>` still carries
 //! `xml:space="preserve"` — is the load-bearing witness: it is exactly what a
 //! downstream XML consumer (Word) needs to keep the inherited spaces. It fails
-//! without the fix. Assertion (b) confirms the opaque bytes are intact and the
-//! engine reads the interior text with its space.
+//! without the fix. Assertion (b) confirms the interior's space-only run is
+//! still there and the engine reads the interior text with its space.
 
 use std::io::Write;
 
@@ -94,6 +94,8 @@ fn root_xml_space_preserve_survives_rebuild_and_keeps_textbox_space() {
             position: InsertPosition::After,
             rationale: None,
             blocks: vec![BlockSpec::Paragraph(ParagraphBlockSpec {
+                tab_stops: None,
+                format_from: None,
                 role: Some("default".to_string()),
                 content: ParagraphContent {
                     fragments: vec![ContentFragment::Text("Inserted".to_string())],
@@ -140,11 +142,12 @@ fn root_xml_space_preserve_survives_rebuild_and_keeps_textbox_space() {
          inside the textbox) as insignificant; opening tag: {open_tag}"
     );
 
-    // (b) The opaque textbox bytes are intact: the bare space-only run survives.
+    // (b) The textbox interior keeps its space-only run, preserved by
+    // inheritance or, since the import makes inherited values explicit, on the
+    // run itself.
     assert!(
-        xml.contains(r#"<w:t> </w:t>"#),
-        "the byte-verbatim textbox interior must still carry the bare \
-         <w:t> </w:t> run; document.xml: {xml}"
+        xml.contains(r#"<w:t> </w:t>"#) || xml.contains(r#"<w:t xml:space="preserve"> </w:t>"#),
+        "the textbox interior must still carry its space-only run; document.xml: {xml}"
     );
 
     // (b, cont.) Reparse the output and read the textbox text through the engine's

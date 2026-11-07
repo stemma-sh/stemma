@@ -83,7 +83,7 @@
 //! the comment is retained, never orphaned.
 //!
 //! v1 scope (fail loud beyond it, per CLAUDE.md "start narrow"):
-//! - `CommentCreate` targets top-level body paragraphs only;
+//! - `CommentCreate` targets body paragraphs, top-level or in a table cell;
 //! - the body must be non-empty (an empty comment is refused, not defaulted);
 //! - `CommentDelete` deletes the whole discussion rooted at the target: the
 //!   comment PLUS every reply that threads under it, transitively. For each
@@ -93,12 +93,40 @@
 //!   thread) and keeps `commentsExtended` coherent — deleting a leaf reply
 //!   removes only that reply.
 
-use super::super::{EditError, find_block_index};
+use super::super::{
+    EditError, block_at, block_at_mut, check_ancestor_table_tracking_in, find_paragraph_path,
+};
 use crate::domain::{
     BlockNode, CanonDoc, CommentExtended, CommentStory, InlineNode, NodeId, OpaqueKind,
     ParagraphNode, RevisionInfo, TrackedBlock, TrackedSegment, TrackingStatus,
 };
 use crate::semantic_hash::check_block_guard;
+
+/// A comment reference authored by the engine. It is the same node import
+/// produces for `<w:commentReference w:id="N"/>`, minus the raw XML that only
+/// a reopened document carries, so a live edit and its saved form agree.
+fn comment_reference_inline(comment_id: &str) -> InlineNode {
+    let id = NodeId::from(format!("comment_ref_{comment_id}"));
+    InlineNode::from(crate::domain::OpaqueInlineNode {
+        id: id.clone(),
+        kind: OpaqueKind::CommentReference(crate::domain::NoteReferenceData {
+            reference_id: comment_id.to_string(),
+        }),
+        opaque_ref: format!("commentref_{}", id.0),
+        proof_ref: crate::domain::ProofRef {
+            part: crate::domain::DocPart::DocumentXml,
+            block_id: id,
+            docx_anchor: String::new(),
+        },
+        wrapper_marks: Vec::new(),
+        wrapper_style_props: crate::domain::StyleProps::default(),
+        wrapper_rpr_authored: crate::domain::RunRprAuthored::default(),
+        source_run_attrs: Vec::new(),
+        joins_following_text_run: false,
+        raw_xml: None,
+        content_hash: None,
+    })
+}
 
 /// A located comment span: TextNode run `[first..=last]` (contiguous in the
 /// segment) whose concatenated text contains the match at char range
@@ -176,21 +204,30 @@ pub(crate) fn apply_create(
         return Err(EditError::CommentEmptyBody { step_index });
     }
 
-    // v1: top-level body paragraphs only. A nested paragraph surfaces as
-    // BlockNotFound here, matching the other anchor-splice verbs.
-    let idx = find_block_index(&doc.blocks, block_id).ok_or_else(|| EditError::BlockNotFound {
+    // The paragraph may be top-level or in a table cell (nested tables too).
+    let path = find_paragraph_path(doc, block_id).ok_or_else(|| EditError::BlockNotFound {
         block_id: block_id.clone(),
         step_index,
     })?;
 
     // Block-level tracked status still refuses (a whole inserted/deleted block's
     // existence is contested), but tracked SEGMENTS do NOT — a comment legally
-    // anchors on a redlined clause. The refusal names the escape hatch.
-    let block_status = match &doc.blocks[idx].status {
-        TrackingStatus::Normal => None,
-        TrackingStatus::Inserted(_) => Some("inserted"),
-        TrackingStatus::Deleted(_) => Some("deleted"),
-        TrackingStatus::InsertedThenDeleted(_) => Some("inserted_then_deleted"),
+    // anchors on a redlined clause. The refusal names the escape hatch. For a
+    // cell paragraph the contested levels are the enclosing table, rows and
+    // cells.
+    let block_status = if path.is_top_level() {
+        match &doc.blocks[path.top_block].status {
+            TrackingStatus::Normal => None,
+            TrackingStatus::Inserted(_) => Some("inserted"),
+            TrackingStatus::Deleted(_) => Some("deleted"),
+            TrackingStatus::InsertedThenDeleted(_) => Some("inserted_then_deleted"),
+        }
+    } else {
+        match check_ancestor_table_tracking_in(&doc.blocks, &path, block_id, step_index) {
+            Ok(()) => None,
+            Err(EditError::BlockHasTrackedStatus { status, .. }) => Some(status),
+            Err(other) => return Err(other),
+        }
     };
     if let Some(status) = block_status {
         return Err(EditError::CommentOnTrackedBlock {
@@ -200,7 +237,7 @@ pub(crate) fn apply_create(
         });
     }
 
-    match &doc.blocks[idx].block {
+    match block_at(doc, &path) {
         BlockNode::Paragraph(_) => {}
         BlockNode::Table(_) => {
             return Err(EditError::NotAParagraph {
@@ -219,7 +256,7 @@ pub(crate) fn apply_create(
     }
 
     if let Some(expected) = semantic_hash
-        && let Err(actual) = check_block_guard(&doc.blocks[idx].block, expected)
+        && let Err(actual) = check_block_guard(block_at(doc, &path), expected)
     {
         return Err(EditError::BlockSemanticHashMismatch {
             block_id: block_id.clone(),
@@ -233,7 +270,7 @@ pub(crate) fn apply_create(
     let comment_id = fresh_comment_id(doc);
     let para_id = fresh_para_id(doc, &comment_id);
 
-    let BlockNode::Paragraph(para) = &mut doc.blocks[idx].block else {
+    let BlockNode::Paragraph(para) = block_at_mut(doc, &path) else {
         unreachable!("checked paragraph above");
     };
 
@@ -676,12 +713,6 @@ fn scan_block_for_markers(
                     match inline {
                         InlineNode::CommentRangeStart { id } if id == comment_id => *start = true,
                         InlineNode::CommentRangeEnd { id } if id == comment_id => *end = true,
-                        // The reference is either a freshly-authored zero-width
-                        // marker or (after import) an opaque run-level element;
-                        // both carry the comment id.
-                        InlineNode::CommentReference { id } if id == comment_id => {
-                            *reference = true
-                        }
                         InlineNode::OpaqueInline(o) => {
                             if let OpaqueKind::CommentReference(rd) = &o.kind
                                 && rd.reference_id == comment_id
@@ -711,9 +742,9 @@ fn scan_block_for_markers(
 /// (range start/end, or the reference in either its zero-width or opaque form).
 fn is_marker_for(inline: &InlineNode, comment_id: &str) -> bool {
     match inline {
-        InlineNode::CommentRangeStart { id }
-        | InlineNode::CommentRangeEnd { id }
-        | InlineNode::CommentReference { id } => id == comment_id,
+        InlineNode::CommentRangeStart { id } | InlineNode::CommentRangeEnd { id } => {
+            id == comment_id
+        }
         InlineNode::OpaqueInline(o) => {
             matches!(&o.kind, OpaqueKind::CommentReference(rd) if rd.reference_id == comment_id)
         }
@@ -724,6 +755,14 @@ fn is_marker_for(inline: &InlineNode, comment_id: &str) -> bool {
 fn remove_markers_in_block(block: &mut BlockNode, comment_id: &str) {
     match block {
         BlockNode::Paragraph(p) => {
+            let removed: Vec<_> = p
+                .segments
+                .iter()
+                .flat_map(|segment| &segment.inlines)
+                .filter(|inline| is_marker_for(inline, comment_id))
+                .filter_map(crate::domain::LiteralPrefixMarker::from_inline)
+                .collect();
+            crate::literal_prefix::remove_marker_references(p, &removed);
             let mut changed = false;
             for seg in &mut p.segments {
                 let before = seg.inlines.len();
@@ -758,7 +797,6 @@ fn remove_markers_in_block(block: &mut BlockNode, comment_id: &str) {
 /// import round-trip (both carry the comment id).
 fn is_reference_for(inline: &InlineNode, id: &str) -> bool {
     match inline {
-        InlineNode::CommentReference { id: i } => i == id,
         InlineNode::OpaqueInline(o) => {
             matches!(&o.kind, OpaqueKind::CommentReference(rd) if rd.reference_id == id)
         }
@@ -804,9 +842,7 @@ fn splice_reply_markers_in_block(
                         out.push(InlineNode::CommentRangeEnd {
                             id: reply_id.to_string(),
                         });
-                        out.push(InlineNode::CommentReference {
-                            id: reply_id.to_string(),
-                        });
+                        out.push(comment_reference_inline(reply_id));
                         *placed_ref = true;
                         changed = true;
                     }
@@ -963,9 +999,7 @@ fn splice_markers(segments: &mut [TrackedSegment], plan: SpanPlan, comment_id: &
                     rebuilt.push(InlineNode::CommentRangeEnd {
                         id: comment_id.to_string(),
                     });
-                    rebuilt.push(InlineNode::CommentReference {
-                        id: comment_id.to_string(),
-                    });
+                    rebuilt.push(comment_reference_inline(comment_id));
                 }
                 _ => unreachable!(),
             }
@@ -1146,9 +1180,7 @@ fn apply_cross_segment_markers(
                 InlineNode::CommentRangeEnd {
                     id: comment_id.to_string(),
                 },
-                InlineNode::CommentReference {
-                    id: comment_id.to_string(),
-                },
+                comment_reference_inline(comment_id),
             ]));
         }
     }
@@ -1186,9 +1218,7 @@ fn splice_markers_in_segment(
             out.push(InlineNode::CommentRangeEnd {
                 id: comment_id.to_string(),
             });
-            out.push(InlineNode::CommentReference {
-                id: comment_id.to_string(),
-            });
+            out.push(comment_reference_inline(comment_id));
         }
     };
 
@@ -1285,7 +1315,11 @@ mod tests {
                 InlineNode::Text(t) if t.text == "world" => "span",
                 InlineNode::CommentRangeStart { .. } => "start",
                 InlineNode::CommentRangeEnd { .. } => "end",
-                InlineNode::CommentReference { .. } => "ref",
+                InlineNode::OpaqueInline(o)
+                    if matches!(o.kind, OpaqueKind::CommentReference(_)) =>
+                {
+                    "ref"
+                }
                 _ => "other",
             })
             .collect();
@@ -1317,7 +1351,11 @@ mod tests {
             .filter_map(|i| match i {
                 InlineNode::CommentRangeStart { .. } => Some("start"),
                 InlineNode::CommentRangeEnd { .. } => Some("end"),
-                InlineNode::CommentReference { .. } => Some("ref"),
+                InlineNode::OpaqueInline(o)
+                    if matches!(o.kind, OpaqueKind::CommentReference(_)) =>
+                {
+                    Some("ref")
+                }
                 _ => None,
             })
             .collect();

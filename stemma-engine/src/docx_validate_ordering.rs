@@ -159,6 +159,30 @@ pub(crate) const TRPR_ORDER: &[&str] = &[
     "trPrChange",
 ];
 
+/// CT_SectPrBase property sequence (§17.6.17 / Annex A), after the leading
+/// header/footer references and before the trailing `sectPrChange`.
+pub(crate) const SECTPR_PROPERTY_ORDER: &[&str] = &[
+    "footnotePr",
+    "endnotePr",
+    "type",
+    "pgSz",
+    "pgMar",
+    "paperSrc",
+    "pgBorders",
+    "lnNumType",
+    "pgNumType",
+    "cols",
+    "formProt",
+    "vAlign",
+    "noEndnote",
+    "titlePg",
+    "textDirection",
+    "bidi",
+    "rtlGutter",
+    "docGrid",
+    "printerSettings",
+];
+
 /// CT_TcPrBase + CT_TcPr sequence (§17.4.70 / Annex A).
 pub(crate) const TCPR_ORDER: &[&str] = &[
     "cnfStyle",

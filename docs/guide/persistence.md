@@ -38,9 +38,10 @@ three product features fall out of it for free:
 Never persist the IR, an `EditSnapshot`, a snapshot blob, or any read view.
 The in-memory model is engine-version-bound; a stored copy becomes a
 migration problem on the next release. Snapshot blobs
-(`export_snapshot_blob`) are hot handoff between processes of the SAME
-engine build, schema-checked and fingerprint-checked, cache entries by
-contract.
+(`export_snapshot_blob`) are a same-version cache for hot handoff between
+processes: each blob records the engine release that wrote it, and every
+other release refuses it on load. There is no compatibility promise across
+releases; DOCX bytes are the durable format.
 
 ## Storing a transaction
 

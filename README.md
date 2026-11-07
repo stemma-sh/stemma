@@ -41,8 +41,8 @@ document content through tool calls; consult the client's data policy.
 [Documentation](https://stemma.sh/docs) ·
 [LLM documentation](https://stemma.sh/docs/llms.txt) ·
 [CLI reference](https://stemma.sh/docs/reference/cli) ·
+[Python](https://stemma.sh/docs/reference/python) ·
 [MCP setup](stemma-mcp/README.md) ·
-[Benchmarks](https://stemma.sh/docs/benchmarks) ·
 [Changelog](CHANGELOG.md)
 
 ## Quick start: with an AI assistant
@@ -174,6 +174,33 @@ silently choosing a target.
 
 See the [worklist format and complete CLI contract](https://stemma.sh/docs/reference/cli#apply).
 
+## Quick start: Python
+
+The experimental Python package wraps the same engine. Wheels need no compiler
+and have no dependencies:
+
+```bash
+pip install stemma-py
+```
+
+```python
+import stemma
+
+doc = stemma.Document.open("agreement.docx")
+block = doc.read()["blocks"][0]
+redline = doc.apply_authored({
+    "ops": [{"op": "replace", "target": block["id"], "guard": block["guard"],
+             "content": {"type": "paragraph", "content": [
+                 {"type": "text", "text": "Payment is due within 45 days."}]}}],
+    "revision": {"author": "Approved Reviewer"},
+})
+redline.save("agreement-redline.docx")
+```
+
+The PyPI name is `stemma-py` and the import name is `stemma`. Its API may change
+before 1.0. See the [Python reference](https://stemma.sh/docs/reference/python)
+for comparison, audit, and the error classes.
+
 ## Why Stemma
 
 Word documents are not plain text. They contain revisions, formatting,
@@ -193,19 +220,10 @@ rejecting each change must produce.
   before mutation, then emit a manifest that is independently checkable from
   the delivered files. The manifest does not prove undeclared intent.
 
-### Evidence
-
-In our maintainer-run agent benchmark on pinned pre-release v0.1-line builds,
-Stemma achieved 95% task success versus 82% for raw-XML editing. The
-[full report](https://stemma.sh/docs/benchmarks) documents the version basis,
-methodology, failures, corrections, and reproducibility limits. It is evidence
-about the agent interface, not a claim of independent validation or current
-v0.6 engine correctness.
-
 ## Current scope
 
 The focused CLI worklist currently supports explicit old-to-new changes in
-top-level body paragraphs. It can guard expected match counts, restrict a
+body paragraphs and table cells. It can guard expected match counts, restrict a
 replacement to a block or range, and normalize deliberate whitespace or quote
 differences. Unsupported or ambiguous cases are reported rather than guessed.
 
@@ -231,8 +249,8 @@ integration.
 - Verifying a multi-document delivery: [task-delivery guide](https://stemma.sh/docs/guides/verify-task-delivery)
 - Connecting an agent: [MCP setup](stemma-mcp/README.md)
 - Embedding the Rust engine: [engine README](stemma-engine/README.md)
+- Scripting from Python (experimental): [Python reference](https://stemma.sh/docs/reference/python)
 - Understanding revisions and fidelity: [guide](https://stemma.sh/docs/guide/concepts)
-- Reviewing evidence: [benchmarks](https://stemma.sh/docs/benchmarks)
 - Contributing: [contributor guide](CONTRIBUTING.md)
 
 ## Development
@@ -245,8 +263,8 @@ just gate
 ```
 
 The workspace contains the Rust engine, the opinionated `stemma-diff`
-comparison crate, CLI, MCP server, shared artifact boundary, and a local
-HTTP/editor demonstration. See the
+comparison crate, CLI, MCP server, Python bindings, shared artifact boundary,
+and a local HTTP/editor demonstration. See the
 [architecture map](https://stemma.sh/docs/internals/architecture) for the component layout.
 
 Most of the code was written with AI assistance. Human maintainers provide the
@@ -255,8 +273,7 @@ independent of code authorship: the public gate runs formatting and linting,
 workspace tests on Linux, macOS, and Windows, the supported Rust-version build,
 roughly 1,060 specification-focused conformance tests, documentation checks,
 and npm/MCP protocol smoke tests. Release candidates additionally require
-exact-artifact qualification, and published benchmark corrections remain in
-the report.
+exact-artifact qualification.
 
 [Try the synthetic demo](demo/README.md), then share a
 [content-safe first-use report](https://github.com/stemma-sh/stemma/issues/new?template=evaluation_report.yml).

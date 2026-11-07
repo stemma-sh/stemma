@@ -150,6 +150,7 @@ mod tests {
 
     fn row(cells: Vec<TableCellSpec>) -> TableRowSpec {
         TableRowSpec {
+            cant_split: None,
             cells,
             is_header: false,
             height: None,

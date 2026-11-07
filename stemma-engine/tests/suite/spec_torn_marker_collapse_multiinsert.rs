@@ -1,22 +1,20 @@
-//! Torn range-marker collapse under the shapes the O(D+T) single-walk repair
-//! makes newly risky (`tracked_model::collapse_resolution_torn_range_markers`).
+//! Torn range-marker repair under shapes with several pairs, nested tables
+//! and mixed families sharing one id space.
 //!
-//! The repair plans every torn pair keyed by its survivor, then re-materializes
-//! the missing halves in ONE walk instead of re-walking the story per pair. Three
-//! properties that walk must preserve, each argued from the domain rule (a torn
-//! range collapses to a POINT adjacent to its surviving half — Word's behavior
-//! when a bookmarked range's interior is removed, ECMA-376 §17.13.6):
+//! Domain rule (ECMA-376 §17.13.6): a range is a pair of positions, so a
+//! resolution that removes the content holding one half keeps that half at
+//! the removal point (`tracked_model::retain_segments_keeping_range_markers`);
+//! zero-width markers that end up at one position keep their document order.
+//! Three properties, each argued from that rule:
 //!
-//!  (a) Several pairs collapsing into the SAME segment must each land its partner
-//!      adjacent to its OWN survivor — index-shift stability. Inserting one
-//!      partner shifts the later inline indices, so the partners must be applied
-//!      highest-index-first; the wrong order strands a partner next to the wrong
-//!      survivor even though every marker is still "present".
-//!  (b) A survivor nested inside table cells must still be found and paired — the
-//!      single walk has to recurse cells, not just scan top-level blocks.
-//!  (c) Bookmark + comment-range + permission pairs torn in one document must all
-//!      collapse, each within its own family — the survivor-keyed plan must not
-//!      confuse families that happen to share a numeric id space.
+//!  (a) Several pairs whose ends sat in the SAME removed insertion keep their
+//!      ends at the removal point, in document order — no end is re-attached
+//!      next to the wrong start.
+//!  (b) A pair inside table cells nested within another table's cell is kept
+//!      paired there, not hoisted out of the table.
+//!  (c) Bookmark + comment-range + permission pairs torn in one document all
+//!      stay paired, each within its own family — families that happen to
+//!      share a numeric id space must not be confused.
 //!
 //! Daily tier: synthesized in-memory DOCX, no corpus, no real-Word oracle.
 
@@ -105,15 +103,11 @@ fn ordered_markers(xml: &str) -> Vec<(String, String)> {
 }
 
 /// (a) Two bookmark pairs whose ends are both inside one rejected insertion, so
-/// both surviving starts sit in the SAME base segment. Rejecting removes both
-/// ends; each must be re-inserted adjacent to its OWN start. The domain-correct
-/// collapse is two disjoint points in document order:
-///   start301, end301, start302, end302.
-/// If the partners were applied lowest-index-first, inserting end301 shifts
-/// start302 right, and end302 lands next to end301 instead — yielding
-///   start301, end301, end302, start302
-/// (every marker present, but 302 no longer a point at its start). This test
-/// pins the ordering, so that stale-index ordering fails it.
+/// both surviving starts sit in the SAME base segment. Rejecting removes the
+/// inserted text; both ends stay at the removal point, which is also where the
+/// starts are, so each range becomes a point and the four markers keep their
+/// document order:
+///   start301, start302, end301, end302.
 #[test]
 fn two_pairs_collapsing_into_one_segment_stay_each_a_point() {
     let body = r#"<w:p>
@@ -134,12 +128,11 @@ fn two_pairs_collapsing_into_one_segment_stay_each_a_point() {
         markers,
         vec![
             ("bookmarkStart".to_string(), "301".to_string()),
-            ("bookmarkEnd".to_string(), "301".to_string()),
             ("bookmarkStart".to_string(), "302".to_string()),
+            ("bookmarkEnd".to_string(), "301".to_string()),
             ("bookmarkEnd".to_string(), "302".to_string()),
         ],
-        "each torn pair must collapse to a point at its own start, in document \
-         order: {xml}"
+        "both ends stay at the removal point, in document order: {xml}"
     );
     assert!(
         !xml.contains("gone"),
@@ -157,9 +150,8 @@ fn two_pairs_collapsing_into_one_segment_stay_each_a_point() {
 }
 
 /// (b) The surviving half sits inside a table nested within another table's cell.
-/// The single insertion walk must recurse cells to find it and re-pair the
-/// partner there — a top-level-only scan would leave the pair torn and the
-/// serializer would refuse.
+/// The removed half must stay paired there — a pair left torn would make the
+/// serializer refuse.
 #[test]
 fn survivor_inside_nested_table_cell_is_repaired() {
     let inner_para = r#"<w:p>
@@ -215,22 +207,10 @@ fn survivor_inside_nested_table_cell_is_repaired() {
     );
 }
 
-/// (c) A bookmark and a permission range that share the SAME numeric pairing id
-/// (600), both torn in the same rejected insertion. The survivor-keyed repair
-/// plan keys on `(family, id, role)`, so the two must collapse to their OWN
-/// family's point — a plan keyed on id alone would cross-pair them (or drop one),
-/// re-inserting a permEnd next to a bookmarkStart or vice-versa. A comment range
-/// (also id 600) rides along to show a third family does not disturb the other
-/// two.
-///
-/// NOTE on the comment range: the inline comment-range half is left LONE here
-/// (its end is not re-inserted). That is a PRE-EXISTING engine behavior, not a
-/// regression from this refactor — the byte-identical result is produced by the
-/// pre-refactor collapse as well (verified out-of-band), and comment-range
-/// integrity is a non-blocking advisory (I-ANN-005). Repairing inline
-/// comment-range tears is a separate concern; this test only pins that the
-/// bookmark and permission collapses are correct and unaffected by the comment
-/// range's presence.
+/// (c) A bookmark, a comment range and a permission range that share the SAME
+/// numeric pairing id (600), all with their ends in the same rejected
+/// insertion. Each end stays at the removal point within its own family; a
+/// repair keyed on id alone would cross-pair them (or drop one).
 #[test]
 fn mixed_families_shared_id_do_not_cross_pair() {
     let body = r#"<w:p>
@@ -248,10 +228,10 @@ fn mixed_families_shared_id_do_not_cross_pair() {
     </w:p>"#;
     let (bytes, xml) = reject_all_xml(body);
 
-    // Bookmark and permission each collapse to their own point (start+end),
-    // despite sharing id 600 with each other and the comment range.
+    // Each family keeps one start and one end, despite sharing id 600.
     for (open, close) in [
         ("<w:bookmarkStart ", "<w:bookmarkEnd "),
+        ("<w:commentRangeStart ", "<w:commentRangeEnd "),
         ("<w:permStart ", "<w:permEnd "),
     ] {
         assert_eq!(xml.matches(open).count(), 1, "one surviving {open}: {xml}");
@@ -262,30 +242,20 @@ fn mixed_families_shared_id_do_not_cross_pair() {
         );
     }
 
-    // The re-materialized ends belong to the RIGHT family: a bookmarkEnd is
-    // adjacent to the bookmarkStart, a permEnd adjacent to the permStart — no
-    // cross-pairing. Restricting to the two collapsing families, the order is:
-    //   bookmarkStart, bookmarkEnd, permStart, permEnd.
-    let collapsing: Vec<(String, String)> = ordered_markers(&xml)
-        .into_iter()
-        .filter(|(name, _)| name.starts_with("bookmark") || name.starts_with("perm"))
-        .collect();
+    // The ends keep the document order they had in the insertion, after the
+    // starts that sat before it.
+    let markers = ordered_markers(&xml);
     assert_eq!(
-        collapsing,
+        markers,
         vec![
             ("bookmarkStart".to_string(), "600".to_string()),
-            ("bookmarkEnd".to_string(), "600".to_string()),
+            ("commentRangeStart".to_string(), "600".to_string()),
             ("permStart".to_string(), "600".to_string()),
+            ("bookmarkEnd".to_string(), "600".to_string()),
+            ("commentRangeEnd".to_string(), "600".to_string()),
             ("permEnd".to_string(), "600".to_string()),
         ],
-        "each family collapses to a point at its own start, no cross-pairing: {xml}"
-    );
-
-    // Comment range: pre-existing lone-survivor behavior (see NOTE above).
-    assert_eq!(
-        xml.matches("<w:commentRangeStart ").count(),
-        1,
-        "the comment-range start survives: {xml}"
+        "each end stays at the removal point within its own family: {xml}"
     );
 
     assert!(
