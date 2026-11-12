@@ -156,6 +156,7 @@ pub(crate) fn apply(
 /// fragment is the source of truth); `content_hash` over the fragment bytes.
 fn synthesize_equation_inline(id: &NodeId, kind: OpaqueKind, omml: &[u8]) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind,
         opaque_ref: format!("equationref_{}", id.0),

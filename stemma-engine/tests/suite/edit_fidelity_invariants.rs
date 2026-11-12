@@ -3350,6 +3350,7 @@ fn table_fidelity_para(id: &str, text: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -3392,11 +3393,13 @@ fn table_fidelity_para(id: &str, text: &str) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
 fn table_fidelity_cell(id: &str, text: &str) -> TableCellNode {
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks: vec![BlockNode::from(table_fidelity_para(
             &format!("{id}_p"),

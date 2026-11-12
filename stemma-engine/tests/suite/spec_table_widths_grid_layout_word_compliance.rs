@@ -343,21 +343,38 @@ fn tblw_and_tcw_percent_form_widths_survive_redline() {
 }
 
 #[test]
-fn tcw_illegal_width_value_still_fails_fast() {
+fn tcw_width_that_is_not_a_number_reads_as_zero() {
     use stemma::api::Document;
-    // Accepting the full ST_MeasurementOrPercent union must NOT open the door
-    // to garbage: "abc" matches none of the three legal forms (decimal,
-    // percent literal, universal measure) and stays a hard InvalidDocx error.
+    // Word 16 (verified) opens a tcW whose w:w is "abc" and saves w:w="0":
+    // the width reads as 0 of its declared type, with an import diagnostic
+    // naming the reading.
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="abc" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
-    let b = make_docx(body, &[]);
-    let err = match Document::parse(&b) {
-        Ok(_) => panic!("a non-numeric non-measure width must be rejected"),
-        Err(e) => e,
-    };
-    let msg = format!("{err:?}");
+    let doc = Document::parse(&make_docx(body, &[])).expect("Word opens it");
+    let table = doc
+        .snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .find_map(|block| match &block.block {
+            stemma::BlockNode::Table(table) => Some(table),
+            _ => None,
+        })
+        .expect("a table");
+    let width = table.rows[0].cells[0]
+        .formatting
+        .width
+        .as_ref()
+        .expect("a width");
+    assert_eq!(
+        (width.w, &width.width_type),
+        (0, &stemma::domain::WidthType::Dxa)
+    );
     assert!(
-        msg.contains("abc") && msg.contains("tcW"),
-        "error should name the bad value and the carrier element, got: {msg}"
+        doc.diagnostics()
+            .iter()
+            .any(|d| d.message.contains("w:tcW/@w:w") && d.message.contains("a width of 0")),
+        "{:?}",
+        doc.diagnostics()
     );
 }
 

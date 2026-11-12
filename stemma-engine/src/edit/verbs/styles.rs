@@ -141,6 +141,11 @@ fn apply_to_paragraph(
     let snapshot = snapshot_paragraph_formatting(para, &rev_for_change);
 
     para.style_id = Some(IStr::from(style_id));
+    // A list without a written level takes its level from the paragraph style
+    // when read. Word holds that level once the document is open (it writes
+    // it into the numPr on save), so a new style does not move the item: the
+    // resolved level becomes the written one.
+    para.direct_numbering_omits_ilvl = false;
 
     // Clear cached text hash / rendered text so any downstream consumer that
     // compares against a hash recomputes (mirrors paragraph_formatting.rs).
@@ -202,6 +207,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -244,6 +250,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 

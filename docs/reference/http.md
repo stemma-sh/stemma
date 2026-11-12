@@ -87,12 +87,9 @@ Each `GET /revisions` row carries `revision_id` (the engine-minted identity,
 see [revision identity](read-model.md#revision-identity-and-the-review-loop)),
 `author`, `kind`, `block_id`, `excerpt`, and `date`. The complete `kind`
 vocabulary is `insert`, `delete`, `format_run`, `format_paragraph`,
-`format_table`, `format_row`, `format_cell`, `format_section`,
-`opaque_interior`, `move`, and `cell_merge`. Records that exist but are not
-selectable (`revision_id` 0) are omitted, and a `cell_merge` is always one of
-them: a pending tracked vertical cell merge does not appear in
-`GET /revisions`, yet it makes every `POST /resolve` refuse until it is gone.
-The refusal names the table; the CLI's `extract` lists the record.
+`format_paragraph_mark`, `format_table`, `format_row`, `format_cell`,
+`format_section`, `opaque_interior`, `move`, and `cell_merge`. Records that exist but are not
+selectable (`revision_id` 0) are omitted.
 
 `POST /resolve` takes `{ "revision_ids": [...], "action": "accept" }` where
 `action` is exactly `accept` or `reject` (anything else is `400` `BadAction`).

@@ -313,6 +313,7 @@ fn build_drawing_xml(src: &ImageSource, logical_rid: &str, doc_pr_id: u32) -> Ve
 fn synthesize_drawing_inline(id: &NodeId, drawing_xml: Vec<u8>) -> InlineNode {
     let content_hash = crate::import::canonical_raw_hash(&drawing_xml);
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind: OpaqueKind::Drawing,
         opaque_ref: format!("drawingref_{}", id.0),

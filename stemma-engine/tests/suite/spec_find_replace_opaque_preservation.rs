@@ -41,6 +41,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
 /// A PAGE field (`w:fldSimple w:instr="PAGE"`), modeled as an opaque inline.
 fn make_field(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Field(stemma::FieldData {
             field_kind: stemma::FieldKind::Simple,
@@ -99,6 +100,7 @@ fn build_para(id: &str, inlines: Vec<InlineNode>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -141,6 +143,7 @@ fn build_para(id: &str, inlines: Vec<InlineNode>) -> ParagraphNode {
         formatting_change: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 

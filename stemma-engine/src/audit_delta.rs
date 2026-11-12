@@ -3,9 +3,12 @@
 //! This is deliberately not a document comparison algorithm. Audit compares a
 //! baseline with a later state of the same document and needs a total account
 //! of changed regions, not inferred lineage or review presentation. Blocks are
-//! paired by shared session identity or explicit insertion carriers plus
-//! baseline positions for independent parses. Pairing never
-//! exempts a matched block from content comparison.
+//! paired by shared session identity, or for independent parses by explicit
+//! insertion carriers plus a minimal edit script over the baseline blocks'
+//! exact text (so one deleted paragraph is one deletion, not a shifted
+//! modification of every paragraph after it). No similarity scoring and no
+//! inferred moves: blocks align only on identical text, in order. Pairing
+//! never exempts a matched block from content comparison.
 
 use crate::domain::{BlockNode, CanonDoc, HeaderFooterKind, NodeId, TrackedBlock, TrackingStatus};
 use crate::tracked_model::{block_node_id, extract_block_text_for_hash};
@@ -21,21 +24,23 @@ pub(crate) enum BlockIdentity {
 #[derive(PartialEq, Eq)]
 enum BlockKey {
     Session(NodeId),
-    BaselinePosition(usize),
+    BaselineText(String),
     Insertion { revision: u32, occurrence: usize },
 }
 
 fn block_keys(blocks: &[TrackedBlock], identity: BlockIdentity) -> Vec<BlockKey> {
-    let mut baseline_position = 0;
     let mut occurrences = std::collections::HashMap::<u32, usize>::new();
     blocks
         .iter()
         .map(|block| match identity {
             BlockIdentity::SharedSession => BlockKey::Session(block_node_id(&block.block)),
             BlockIdentity::IndependentParses => {
-                // Explicit whole-block insertions do not consume a baseline
-                // position. No text similarity, inferred moves, or import-local
-                // numeric IDs establish lineage between independently read files.
+                // Explicit whole-block insertions align by their carrier.
+                // Baseline blocks align by exact text only: no similarity,
+                // inferred moves, or import-local numeric IDs establish
+                // lineage between independently read files. Equal text that
+                // aligns is still compared in full, by the delta and by the
+                // untouched proof.
                 let insertion = match &block.status {
                     TrackingStatus::Inserted(revision) => Some(revision.identity),
                     TrackingStatus::InsertedThenDeleted(stacked) => Some(stacked.inserted.identity),
@@ -50,9 +55,7 @@ fn block_keys(blocks: &[TrackedBlock], identity: BlockIdentity) -> Vec<BlockKey>
                     *occurrence += 1;
                     key
                 } else {
-                    let key = BlockKey::BaselinePosition(baseline_position);
-                    baseline_position += 1;
-                    key
+                    BlockKey::BaselineText(text_without_comment_references(&block.block))
                 }
             }
         })
@@ -368,8 +371,8 @@ fn block_changes(
                         changes.extend(removed.iter().map(|b| deleted(&b.block)));
                         changes.extend(added.iter().map(|b| inserted(&b.block)));
                     }
-                    // Without shared IDs, compare unmatched regions
-                    // conservatively; no content-based lineage is inferred.
+                    // Without shared IDs, the blocks of a replaced region
+                    // pair positionally and are compared conservatively.
                     BlockIdentity::IndependentParses => {
                         changes.extend(positional_block_changes(removed, added))
                     }
@@ -393,8 +396,20 @@ fn positional_block_changes(before: &[TrackedBlock], after: &[TrackedBlock]) -> 
             (BlockNode::Table(source_table), BlockNode::Table(target_table)) => {
                 // Table identity and cached digests are addressing/derived
                 // state, not an edit. Use the same exhaustive fidelity
-                // comparison as the untouched proof, including cell content.
-                if crate::roundtrip_compare::compare_tracked_block_pair(source, target).is_empty() {
+                // comparison as the untouched proof, including cell content,
+                // except that a cell paragraph follows the top-level paragraph
+                // rule below: a same-text difference (a run split inside a
+                // link after a rejected edit, a rewritten revision wrapper) is
+                // left to the untouched proof, never claimed as a direct edit.
+                let mut comparable_target = target_table.clone();
+                adopt_same_text_cell_paragraphs(source_table, &mut comparable_target);
+                let comparable = TrackedBlock {
+                    block: BlockNode::Table(comparable_target),
+                    ..target.clone()
+                };
+                if crate::roundtrip_compare::compare_tracked_block_pair(source, &comparable)
+                    .is_empty()
+                {
                     continue;
                 }
                 changes.push(AuditDelta::TableStructureChanged {
@@ -441,6 +456,37 @@ fn positional_block_changes(before: &[TrackedBlock], after: &[TrackedBlock]) -> 
         changes.push(inserted(&target.block));
     }
     changes
+}
+
+/// Replace each cell paragraph of `target` whose text equals its positional
+/// counterpart in `source` with that counterpart, recursing into nested
+/// tables, so the table comparison sees only structure, properties, and text
+/// differences. Cells or rows that do not line up are left as they are: the
+/// comparator then reports the structural difference.
+fn adopt_same_text_cell_paragraphs(
+    source: &crate::domain::TableNode,
+    target: &mut crate::domain::TableNode,
+) {
+    for (source_row, target_row) in source.rows.iter().zip(target.rows.iter_mut()) {
+        for (source_cell, target_cell) in source_row.cells.iter().zip(target_row.cells.iter_mut()) {
+            for (source_block, target_block) in
+                source_cell.blocks.iter().zip(target_cell.blocks.iter_mut())
+            {
+                let same_text_paragraphs = matches!(
+                    (source_block, &*target_block),
+                    (BlockNode::Paragraph(_), BlockNode::Paragraph(_))
+                ) && text_without_comment_references(source_block)
+                    == text_without_comment_references(target_block);
+                if same_text_paragraphs {
+                    *target_block = source_block.clone();
+                } else if let (BlockNode::Table(source_nested), BlockNode::Table(target_nested)) =
+                    (source_block, target_block)
+                {
+                    adopt_same_text_cell_paragraphs(source_nested, target_nested);
+                }
+            }
+        }
+    }
 }
 
 fn deleted(block: &BlockNode) -> AuditDelta {

@@ -62,6 +62,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -104,6 +105,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -379,6 +381,7 @@ fn span_crossing_an_opaque_names_the_opaque() {
         normal_segment(vec![
             make_text("p1_a", "see "),
             InlineNode::from(OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("p1_op"),
                 kind: OpaqueKind::Drawing,
                 opaque_ref: "opaque_p1_op".to_string(),
@@ -664,6 +667,41 @@ fn v4_set_format_empty_request_is_schema_rejected() {
     }
 }
 
+/// `marks` holds the boolean toggles; colour and size are separate fields.
+/// A colour-only or size-only change names no toggle, so it needs no `marks`.
+#[test]
+fn v4_set_format_colour_or_size_alone_needs_no_marks() {
+    use stemma::edit_v4::parse_transaction;
+
+    for (field, value) in [("color", r#""C00000""#), ("font_size_half_points", "28")] {
+        let wire = format!(
+            r#"{{
+                "ops": [{{"op": "set_format", "target": "p1", "expect": "term", "{field}": {value}}}],
+                "revision": {{"author": "Agent"}}
+            }}"#
+        );
+        let txn = parse_transaction(&wire)
+            .unwrap_or_else(|error| panic!("{field} alone parses: {error}"))
+            .into_edit_transaction()
+            .unwrap_or_else(|error| panic!("{field} alone translates: {error:?}"));
+        let EditStep::SetRunFormatting { marks, .. } = &txn.steps[0] else {
+            panic!("expected run-format step")
+        };
+        assert_eq!(
+            *marks,
+            stemma::edit::InlineMarkSet::default(),
+            "{field} alone changes no toggle"
+        );
+    }
+
+    // Legacy top-level caps toggles also stand alone without `marks`.
+    let caps = r#"{
+        "ops": [{"op": "set_format", "target": "p1", "expect": "term", "caps": true}],
+        "revision": {"author": "Agent"}
+    }"#;
+    parse_transaction(caps).expect("caps alone parses");
+}
+
 #[test]
 fn v4_object_marks_can_turn_bold_off_and_reject_restores_directness() {
     use stemma::edit_v4::parse_transaction;
@@ -781,6 +819,25 @@ fn v4_refuses_mixed_and_empty_object_mark_forms() {
         parse_transaction(empty),
         Err(SchemaError::EmptyFormatMarks { .. })
     ));
+}
+
+#[test]
+fn v4_set_format_with_nothing_to_change_is_refused() {
+    use stemma::edit_v4::{SchemaError, parse_transaction};
+
+    let nothing = r#"{
+        "ops": [{"op": "set_format", "target": "p1", "expect": "term"}],
+        "revision": {"author": "Agent"}
+    }"#;
+    let error = parse_transaction(nothing).expect_err("nothing to change");
+    assert!(
+        matches!(error, SchemaError::EmptyFormatMarks { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("color"),
+        "the refusal names the fields that would make the op meaningful: {error}"
+    );
 }
 
 #[test]

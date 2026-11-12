@@ -14,6 +14,7 @@
 //! shared application facade.
 
 mod apply;
+mod delivery;
 mod verify_task;
 
 use std::collections::HashSet;
@@ -25,7 +26,6 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 use stemma::api::{BlockRole, Diagnostic, DiagnosticLevel, Document, RevisionRecord, validate};
-use stemma::audit::RevisionDisposition;
 use stemma::tracked_model::RevisionKind;
 use stemma::{ExportOptions, Resolution, ResolveSelectionAction};
 use stemma_artifacts::{
@@ -404,18 +404,9 @@ fn verify(
         )
     })?;
 
-    let modified_preexisting = report
-        .preexisting_revisions
-        .iter()
-        .filter(|row| !matches!(row.disposition, RevisionDisposition::Untouched))
-        .count();
+    let preexisting = delivery::preexisting_outcome(&report);
     let policy_pass = match policy {
-        VerifyPolicy::TrackedDeliveryV0 => {
-            report.validator.ok
-                && report.direct_changes.is_empty()
-                && report.untouched.violations.is_empty()
-                && modified_preexisting == 0
-        }
+        VerifyPolicy::TrackedDeliveryV0 => delivery::tracked_delivery_failure(&report).is_none(),
     };
 
     let after_doc = Document::parse(after.bytes())
@@ -464,7 +455,8 @@ fn verify(
         "summary": {
             "new_revisions": report.new_revisions.len(),
             "preexisting_revisions": report.preexisting_revisions.len(),
-            "modified_or_resolved_preexisting": modified_preexisting,
+            "preexisting_revisions_edited_inside": preexisting.edited_inside,
+            "modified_or_resolved_preexisting": preexisting.modified_or_resolved,
             "direct_changes": report.direct_changes.len(),
             "untouched_violations": report.untouched.violations.len(),
             "validator_ok": report.validator.ok,
@@ -719,13 +711,15 @@ fn role_label(role: &BlockRole) -> &'static str {
 /// guards, cells — the same typed view `docs/reference/read-model.md`
 /// documents. `revisions` is the canonical census (identical rows to `extract
 /// --format json`), carried alongside because the segment view alone omits
-/// formatting-change records.
+/// formatting-change records. `comments` is every comment with its author,
+/// date, text, resolved flag, and thread position.
 #[derive(Serialize)]
 struct ReadJson {
     schema: &'static str,
     input: ArtifactIdentity,
     blocks: Vec<stemma::api::BlockView>,
     revisions: Vec<RevisionJson>,
+    comments: Vec<stemma_diff::CommentReading>,
 }
 
 fn read_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
@@ -739,6 +733,7 @@ fn read_cmd(artifacts: &PathAuthority, file: &Path) -> Result<(), String> {
             .into_iter()
             .map(RevisionJson::from)
             .collect(),
+        comments: stemma_diff::comment_readings(&doc.snapshot().canonical),
     };
     let encoded = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("cannot encode read model for {}: {e}", file.display()))?;

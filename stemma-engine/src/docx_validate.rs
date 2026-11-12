@@ -269,8 +269,8 @@ fn check_annotations_and_structure(state: &PackageState, findings: &mut Vec<Vali
         check_annotation_id_uniqueness, check_bookmark_name_length, check_bookmark_pairing,
         check_colfirst_collast_pairing, check_comment_marker_pairing, check_comment_range_count,
         check_custom_xml_range_pairing, check_document_root, check_footnote_endnote_id_range,
-        check_no_nested_tracked_changes, check_omath_placement, check_para_id_range,
-        check_perm_id_validity, check_required_tracked_change_ids,
+        check_move_from_text_form, check_no_nested_tracked_changes, check_omath_placement,
+        check_para_id_range, check_perm_id_validity, check_required_tracked_change_ids,
         check_tracked_change_content_model,
     };
     use crate::docx_validate_ordering::check_element_ordering;
@@ -295,6 +295,7 @@ fn check_annotations_and_structure(state: &PackageState, findings: &mut Vec<Vali
     findings.extend(check_comment_range_count(&story_refs));
     findings.extend(check_omath_placement(&story_refs));
     findings.extend(check_perm_id_validity(&story_refs));
+    findings.extend(check_move_from_text_form(&story_refs));
     findings.extend(check_colfirst_collast_pairing(&story_refs));
 
     // Element ordering checks across all stories.
@@ -320,6 +321,7 @@ fn check_cross_part_references(state: &PackageState, findings: &mut Vec<Validati
     use crate::docx_validate_xref::{
         check_xref_001_style_ids, check_xref_002_num_ids, check_xref_003_comment_ids,
         check_xref_004_style_count, check_xref_005_style_id_length,
+        check_xref_006_note_reference_ids, check_xref_007_drawing_ids,
     };
 
     findings.extend(check_xref_001_style_ids(state));
@@ -327,6 +329,8 @@ fn check_cross_part_references(state: &PackageState, findings: &mut Vec<Validati
     findings.extend(check_xref_003_comment_ids(state));
     findings.extend(check_xref_004_style_count(state));
     findings.extend(check_xref_005_style_id_length(state));
+    findings.extend(check_xref_006_note_reference_ids(state));
+    findings.extend(check_xref_007_drawing_ids(state));
 }
 
 // =============================================================================

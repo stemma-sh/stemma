@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "stemma"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64",
  "bincode",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-api"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "axum",
  "serde",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-artifacts"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "same-file",
  "serde",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "clap",
  "serde",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-diff"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "stemma-py"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "pyo3",
  "pyo3-build-config",

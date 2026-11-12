@@ -690,95 +690,110 @@ fn spec_reject_moves_keeps_source_content() {
 
 // ── Test 8: Import preserves pre-existing move tracking ─────────────────
 
-/// ECMA-376 §17.13.5.21-28: When importing a DOCX that already has
-/// moveFrom/moveTo tracked changes linked by moveFromRangeStart/moveToRangeStart
-/// with matching w:name, the canonical model should preserve:
-/// - TrackingStatus::Deleted for moveFrom blocks
-/// - TrackingStatus::Inserted for moveTo blocks
-/// - Matching move_id on both, derived from w:name
+/// ECMA-376 §17.13.5.21-28: a DOCX that already holds a tracked move of a
+/// whole paragraph, in the shape Word writes it (the moved paragraph marks
+/// carry `w:moveFrom`/`w:moveTo`, the runs sit in `w:moveFrom`/`w:moveTo`
+/// containers, and the move ranges are linked by `w:name`), imports as ONE
+/// move: both halves share the move name, the source is the moved-from half,
+/// the destination the moved-to half, and the revision keeps its author and
+/// date.
 ///
-/// Fixture has:
-///   P1: "Paragraph Alpha stays in place."      (Normal)
-///   P2: moveTo[name="move_0"]: "Paragraph Charlie was moved here." (Inserted, move_id="move_0")
-///   P3: "Paragraph Bravo stays in place."      (Normal)
-///   P4: moveFrom[name="move_0"]: "Paragraph Charlie was moved here." (Deleted, move_id="move_0")
+/// Fixture (a Word-valid file; Word opens it without repair):
+///   P1: "Paragraph Alpha stays in place."
+///   P2: moved-to "Paragraph Charlie was moved here."  (range name "move_0")
+///   P3: "Paragraph Bravo stays in place."
+///   P4: moved-from "Paragraph Charlie was moved here." (range name "move_0")
+///   P5: "Paragraph Delta closes the document."
 #[test]
 fn spec_import_preserves_preexisting_moves() {
     let (_runtime, doc) = import_fixture_canonical("preexisting-moves");
 
-    // Should have 4 blocks total
-    assert!(
-        doc.blocks.len() >= 4,
-        "should have at least 4 blocks, got {}",
-        doc.blocks.len()
-    );
-
-    // Find blocks with move_id set
-    let move_blocks: Vec<&stemma::TrackedBlock> =
-        doc.blocks.iter().filter(|b| b.move_id.is_some()).collect();
-
-    assert_eq!(
-        move_blocks.len(),
-        2,
-        "should have exactly 2 blocks with move_id (one moveFrom, one moveTo). \
-         Got {} blocks with move_id. Block statuses: {:?}",
-        move_blocks.len(),
-        doc.blocks
-            .iter()
-            .map(|b| format!(
-                "status={:?} move_id={:?}",
-                std::mem::discriminant(&b.status),
-                b.move_id
-            ))
-            .collect::<Vec<_>>()
-    );
-
-    // Both should share the same move_id
-    let id0 = move_blocks[0].move_id.as_ref().unwrap();
-    let id1 = move_blocks[1].move_id.as_ref().unwrap();
-    assert_eq!(
-        id0, id1,
-        "moveFrom and moveTo blocks should share the same move_id. Got '{}' and '{}'",
-        id0, id1
-    );
-    assert_eq!(
-        id0, "move_0",
-        "move_id should be 'move_0' (from w:name attribute), got '{}'",
-        id0
-    );
-
-    // One should be Deleted (moveFrom), one should be Inserted (moveTo)
-    let has_deleted = move_blocks
+    let halves: Vec<(&stemma::TrackedBlock, &stemma::ParagraphNode)> = doc
+        .blocks
         .iter()
-        .any(|b| matches!(b.status, TrackingStatus::Deleted(_)));
-    let has_inserted = move_blocks
-        .iter()
-        .any(|b| matches!(b.status, TrackingStatus::Inserted(_)));
-
-    assert!(has_deleted, "should have a Deleted block (from moveFrom)");
-    assert!(has_inserted, "should have an Inserted block (from moveTo)");
-
-    // Verify RevisionInfo is preserved on the move blocks
-    for mb in &move_blocks {
-        match &mb.status {
-            TrackingStatus::InsertedThenDeleted(_) => {
-                unreachable!("move blocks are never stacked")
-            }
-            TrackingStatus::Deleted(rev) | TrackingStatus::Inserted(rev) => {
-                assert_eq!(
-                    rev.author.as_deref(),
-                    Some("Move Author"),
-                    "move block RevisionInfo author should be 'Move Author'"
-                );
-                assert_eq!(
-                    rev.date.as_deref(),
-                    Some("2025-06-01T12:00:00Z"),
-                    "move block RevisionInfo date should be '2025-06-01T12:00:00Z'"
-                );
-            }
-            TrackingStatus::Normal => panic!("move block should not have Normal status"),
-        }
+        .filter(|b| b.move_id.is_some())
+        .filter_map(|b| match &b.block {
+            stemma::BlockNode::Paragraph(p) => Some((b, &**p)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(halves.len(), 2, "one source and one destination paragraph");
+    for (block, _) in &halves {
+        assert_eq!(block.move_id.as_deref(), Some("move_0"), "named by w:name");
     }
+    let marks: Vec<&TrackingStatus> = halves
+        .iter()
+        .map(|(_, p)| {
+            p.para_mark_status
+                .as_ref()
+                .expect("a moved paragraph's mark moves")
+        })
+        .collect();
+    assert!(
+        marks
+            .iter()
+            .any(|m| matches!(m, TrackingStatus::Inserted(_)))
+            && marks
+                .iter()
+                .any(|m| matches!(m, TrackingStatus::Deleted(_))),
+        "one moved-to and one moved-from half: {marks:?}"
+    );
+
+    let revisions = stemma::enumerate_revisions(&doc);
+    assert_eq!(revisions.len(), 1, "one move: {revisions:?}");
+    assert_eq!(revisions[0].kind, stemma::RevisionKind::Move);
+    assert_eq!(revisions[0].author.as_deref(), Some("Move Author"));
+    assert_eq!(revisions[0].date.as_deref(), Some("2025-06-01T12:00:00Z"));
+}
+
+/// TOLERATED NON-CONFORMANT INPUT: body-level `w:moveFrom`/`w:moveTo` that
+/// wrap whole paragraphs. The schema allows only runs inside them, but Word
+/// opens such a file without repair and reads it as one ordinary move pair,
+/// the paragraph marks included (checked in Word 16 on an isolated probe), so
+/// the validator does not flag it. The importer reads the wrapped paragraphs
+/// the same way: the two halves of one move. (A leading `w:sectPr` is likewise
+/// not repaired: Word ignores it and writes its own on save.) The repair in
+/// the old version of the preexisting-moves fixture came from `w:delText`
+/// inside `w:moveFrom` alone, which the validator refuses (I-TC-004).
+#[test]
+fn body_level_move_containers_still_import_as_one_move() {
+    let m = r#"w:author="Move Author" w:date="2025-06-01T12:00:00Z""#;
+    let body = format!(
+        concat!(
+            r#"<w:p><w:r><w:t>Paragraph Alpha stays in place.</w:t></w:r></w:p>"#,
+            r#"<w:moveToRangeStart w:id="10" w:name="move_0" {m}/>"#,
+            r#"<w:moveTo w:id="200" {m}><w:p><w:r><w:t>Paragraph Charlie was moved here.</w:t></w:r></w:p></w:moveTo>"#,
+            r#"<w:moveToRangeEnd w:id="10"/>"#,
+            r#"<w:p><w:r><w:t>Paragraph Bravo stays in place.</w:t></w:r></w:p>"#,
+            r#"<w:moveFromRangeStart w:id="11" w:name="move_0" {m}/>"#,
+            r#"<w:moveFrom w:id="201" {m}><w:p><w:r><w:t>Paragraph Charlie was moved here.</w:t></w:r></w:p></w:moveFrom>"#,
+            r#"<w:moveFromRangeEnd w:id="11"/>"#,
+            r#"<w:p><w:r><w:t>Paragraph Delta closes the document.</w:t></w:r></w:p>"#,
+        ),
+        m = m
+    );
+    let bytes = common::docx_with_body_and_comments(&body, &[]);
+    let runtime = SimpleRuntime::new();
+    let import = runtime.import_docx(&bytes).expect("import");
+    let doc = &import.canonical;
+    let moved: Vec<&stemma::TrackedBlock> =
+        doc.blocks.iter().filter(|b| b.move_id.is_some()).collect();
+    assert_eq!(moved.len(), 2);
+    assert!(
+        moved
+            .iter()
+            .any(|b| matches!(b.status, TrackingStatus::Deleted(_)))
+    );
+    assert!(
+        moved
+            .iter()
+            .any(|b| matches!(b.status, TrackingStatus::Inserted(_)))
+    );
+    let revisions = stemma::enumerate_revisions(doc);
+    assert_eq!(
+        revisions.iter().map(|r| r.kind).collect::<Vec<_>>(),
+        vec![stemma::RevisionKind::Move]
+    );
 }
 
 // ── Test 9: Move roundtrip fidelity ─────────────────────────────────────

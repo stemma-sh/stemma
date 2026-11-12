@@ -22,8 +22,8 @@ use crate::domain::{
     FieldData, FieldKind, FieldSemantic, FormattingChange, HeaderFooterKind, HeightRule,
     HighlightColor, IStr, Indentation, InlineChange, InlineNode, Mark, MarkValue, NodeId,
     NumberingInfo, OpaqueKind, ParagraphFormattingChange, ParagraphNode, ParagraphSpacing,
-    RefFieldSpec, RevisionInfo, RowFormattingChange, RunRprAuthored, Shading, StyleProps,
-    TableCellNode, TableFormatting, TableFormattingChange, TableMeasurement, TableNode,
+    RefFieldSpec, RevisionInfo, RowFormattingChange, RunRprAuthored, Shading, StackedRevision,
+    StyleProps, TableCellNode, TableFormatting, TableFormattingChange, TableMeasurement, TableNode,
     TableRowNode, TextNode, TocFieldSpec, TocLevelsSpec, TrackedBlock, TrackedSegment,
     TrackingStatus, VerticalAlignment, VerticalMerge, normal_segment,
 };
@@ -750,11 +750,17 @@ pub enum EditStep {
     /// other than the paragraph count is refused (`NoteBodyLineCountMismatch`);
     /// a one-line body for a note of several paragraphs is rebuilt as one
     /// paragraph in `Direct` mode and refused (`NoteBodyMultiParagraph`) in
-    /// `TrackedChange` mode. Refuses (`BlockHasTrackedStatus`) a story
-    /// that already carries a pending tracked change rather than stacking.
-    /// `NoteNotFound` if the id has no story; `OpaqueDestroyed` if the
-    /// existing story carried an opaque inline the flat-text replace/diff
-    /// cannot reproduce.
+    /// `TrackedChange` mode. `TrackedChange` refuses a story that already
+    /// carries a pending tracked change rather than stacking
+    /// (`BlockHasTrackedStatus` for a pending block,
+    /// `ParagraphContainsTrackedSegments` for pending text); `Direct` accepts
+    /// those changes and edits the accepted content, which is what the notes
+    /// read (`note_body_text`) shows.
+    /// `NoteNotFound` if the id has no story. A paragraph's inline objects
+    /// and breaks stand in its line as one U+FFFC each, in order, and are
+    /// carried by reference (`NoteBodyObjectCountMismatch` otherwise);
+    /// `OpaqueDestroyed` if the story holds a table or block object, which a
+    /// line of text cannot carry.
     EditNote {
         /// The note id (`w:id`) to edit.
         note_id: String,
@@ -1413,6 +1419,24 @@ pub enum EditStep {
     UnlinkHyperlink {
         hyperlink_id: NodeId,
         expect: String,
+    },
+    /// Replace occurrences inside an inline object's own text: a hyperlink's
+    /// display text or an inline content control's value. Each edit is one
+    /// occurrence (its character position in the object's text, the text there
+    /// now, its replacement), in order and disjoint; each becomes its own
+    /// tracked change (or a direct replace), through the same cores as
+    /// `ReplaceHyperlinkText` and `OpaqueTextEdit`. The find/replace planners
+    /// emit it for occurrences inside links and controls. Fails loud: object
+    /// absent ⇒ `InlineObjectTextTargetNotFound`; locked, non-text, placeholder,
+    /// pending changes, emptied ⇒ `InlineObjectTextNotEditable`; text not where
+    /// an edit says ⇒ `ExpectMismatch`. See `verbs::object_text`.
+    ReplaceInlineObjectText {
+        /// The paragraph holding the object (body or table cell).
+        block_id: NodeId,
+        /// The hyperlink's or content control's opaque-inline id.
+        object_id: NodeId,
+        /// The occurrences to replace.
+        edits: Vec<verbs::object_text::ObjectTextEdit>,
     },
     // ─── add new authoring verbs above ───────────────────────────────────────
     // Keep each verb's validate/apply logic in `edit/verbs/<verb>.rs` and make
@@ -2200,11 +2224,11 @@ pub enum EditError {
 
     /// The resolved span range would split a paired range marker (the
     /// brackets predicate): one member of the pair is inside the targeted
-    /// range and its partner is outside. The load-bearing case is a bookmark
-    /// — a `REF` field targets it by name, so detaching a `bookmarkStart`
-    /// from the text it covers silently changes the cross-reference. Refused
-    /// rather than auto-extending the range (which would edit more than
-    /// asked).
+    /// range and its partner is outside. Detaching a marker from the text it
+    /// covers would silently change the range. Refused rather than
+    /// auto-extending the range (which would edit more than asked). Bookmark,
+    /// permission and comment range boundaries are exempt: the splice keeps
+    /// each at its text offset.
     SpanSplitsBracketPair {
         block_id: NodeId,
         /// The marker-pair kind that blocked the edit, e.g. "bookmark",
@@ -2717,21 +2741,29 @@ pub enum EditError {
         step_index: usize,
     },
 
-    /// A find-replace needle straddles a barrier anchor (opaque inline, field,
-    /// hyperlink, hard break) in this paragraph, and the caller chose
+    /// A find-replace needle straddles a barrier (an inline object or hard
+    /// break; for `replace_text` also struck text, the edge of a pending
+    /// insertion, or a structural marker such as a move range) in this
+    /// paragraph, and the caller chose
     /// `BarrierPolicy::Fail`. We never half-edit across a barrier — the planner
     /// surfaces the straddle instead of silently skipping it.
     FindReplaceBarrierStraddle {
         block_id: NodeId,
         needle: String,
+        /// What the occurrence runs across, named (an inline object or break
+        /// by id, a pending deletion by author, the edge of a pending
+        /// insertion, a move range marker, ...), in reading order.
+        walls: Vec<String>,
         step_index: usize,
     },
 
-    /// A replace-text needle also occurs inside inline objects that text
-    /// replacement does not reach: a hyperlink's display text or an inline
-    /// content control's value. Replacing only the reachable occurrences would
-    /// leave text the caller asked to replace, so the request refuses and
-    /// names each object and the op that edits it.
+    /// A replace-text needle also occurs inside inline objects whose text
+    /// cannot be replaced: a content control whose content is locked, whose
+    /// value is not free text or which shows its placeholder, a link or
+    /// control holding pending changes, an object in a note or comment, or a
+    /// replacement that would leave one empty. Replacing only the other
+    /// occurrences would leave text the caller asked to replace, so the
+    /// request refuses and names each object and why.
     ReplaceTextInsideInlineObjects {
         needle: String,
         occurrences: Vec<verbs::find_replace::InlineObjectMatch>,
@@ -2970,6 +3002,21 @@ pub enum EditError {
         step_index: usize,
     },
 
+    /// An `edit_note` body line holds a different number of U+FFFC
+    /// placeholders than its note paragraph has inline objects and breaks
+    /// (each stands in the line as one U+FFFC, in order, as the notes read
+    /// shows it). Objects are carried, never authored or dropped, by
+    /// `edit_note`.
+    NoteBodyObjectCountMismatch {
+        note_id: String,
+        note_kind: &'static str,
+        /// Zero-based paragraph (line) index within the note.
+        paragraph_index: usize,
+        object_count: usize,
+        placeholder_count: usize,
+        step_index: usize,
+    },
+
     /// `SetPageSetup` was dispatched with an empty patch (no page size,
     /// orientation, margins, columns, or gutter). Refusing a no-op mutation
     /// rather than authoring an empty `w:sectPrChange`.
@@ -3073,6 +3120,14 @@ pub enum EditError {
     /// `SetContentControlValue` could not find an `OpaqueInline` with the given
     /// `sdt_id` in the target block.
     ContentControlNotFound { sdt_id: NodeId, step_index: usize },
+    /// The content control's `w:lock` (§17.5.2.23) forbids editing its
+    /// contents (`contentLocked`, `sdtContentLocked`, or a value not known to
+    /// be open); carries the attribute value.
+    ContentControlLocked {
+        sdt_id: NodeId,
+        lock: String,
+        step_index: usize,
+    },
 
     /// `SetContentControlValue` resolved `sdt_id` to an opaque inline that is not
     /// a content control (a drawing, a field, an equation, …).
@@ -3207,6 +3262,22 @@ pub enum EditError {
         step_index: usize,
     },
 
+    /// `ReplaceInlineObjectText`: the paragraph holds no link or text-bearing
+    /// content control with that id.
+    InlineObjectTextTargetNotFound {
+        block_id: NodeId,
+        object_id: NodeId,
+        step_index: usize,
+    },
+    /// `ReplaceInlineObjectText`: the object's text cannot be edited by text
+    /// replacement, for the reason given (a content lock, a non-text control,
+    /// pending changes inside it, …).
+    InlineObjectTextNotEditable {
+        block_id: NodeId,
+        object_id: NodeId,
+        reason: verbs::object_text::ObjectTextBlock,
+        step_index: usize,
+    },
     /// `OpaqueTextEdit` named a hyperlink: its text is modeled content, edited
     /// by `replace` on the hyperlink's id, not by descending into raw markup.
     OpaqueTextEditOnHyperlink {
@@ -4222,11 +4293,13 @@ impl std::fmt::Display for EditError {
             EditError::FindReplaceBarrierStraddle {
                 block_id,
                 needle,
+                walls,
                 step_index,
             } => write!(
                 f,
-                "step {step_index}: find-replace needle '{needle}' straddles a barrier anchor \
-                 in paragraph '{block_id}'; cannot replace across an opaque/field/hyperlink/break"
+                "step {step_index}: find-replace needle '{needle}' runs across {} in paragraph \
+                 '{block_id}'; text is replaced only within one stretch between such walls",
+                walls.join(", ")
             ),
             EditError::ReplaceTextInsideInlineObjects {
                 needle,
@@ -4476,6 +4549,20 @@ impl std::fmt::Display for EditError {
                  the edit_note body has {line_count} lines; give one line per paragraph, in \
                  order (a paragraph's line may repeat its current text)"
             ),
+            EditError::NoteBodyObjectCountMismatch {
+                note_id,
+                note_kind,
+                paragraph_index,
+                object_count,
+                placeholder_count,
+                step_index,
+            } => write!(
+                f,
+                "step {step_index}: paragraph {paragraph_index} of {note_kind} '{note_id}' holds \
+                 {object_count} inline objects or breaks but its edit_note line has \
+                 {placeholder_count} U+FFFC placeholders; keep one U+FFFC per object, in order, \
+                 as the notes read shows it"
+            ),
             EditError::NoPageSetupRequested { step_index } => write!(
                 f,
                 "step {step_index}: set_page_setup requested no page-setup change \
@@ -4585,6 +4672,15 @@ impl std::fmt::Display for EditError {
                 f,
                 "step {step_index}: block '{block_id}' is already wrapped in a block-level \
                  content control; refusing to nest an authored wrap"
+            ),
+            EditError::ContentControlLocked {
+                sdt_id,
+                lock,
+                step_index,
+            } => write!(
+                f,
+                "step {step_index}: content control '{sdt_id}' is locked (w:lock=\"{lock}\"): \
+                 its contents cannot be edited"
             ),
             EditError::ContentControlNotFound { sdt_id, step_index } => write!(
                 f,
@@ -4730,6 +4826,25 @@ impl std::fmt::Display for EditError {
             } => write!(
                 f,
                 "step {step_index}: opaque '{opaque_id}' carries no raw_xml to descend into"
+            ),
+            EditError::InlineObjectTextTargetNotFound {
+                block_id,
+                object_id,
+                step_index,
+            } => write!(
+                f,
+                "step {step_index}: paragraph '{block_id}' holds no hyperlink or text content \
+                 control '{object_id}'"
+            ),
+            EditError::InlineObjectTextNotEditable {
+                block_id,
+                object_id,
+                reason,
+                step_index,
+            } => write!(
+                f,
+                "step {step_index}: the text of '{object_id}' in paragraph '{block_id}' cannot be \
+                 replaced: {reason}"
             ),
             EditError::OpaqueTextEditOnHyperlink {
                 opaque_id,
@@ -5038,7 +5153,7 @@ pub use verbs::table_ops::{TableInsertPosition, TableOp};
 // Re-export the note-family selector so callers can build
 // `EditStep::InsertNote`/`EditNote`/`DeleteNote` without reaching into the verb
 // module path (mirrors `NumberingChange`).
-pub use verbs::footnotes::NoteKind;
+pub use verbs::footnotes::{NoteKind, note_body_text};
 
 // Re-export the page-setup grammar so callers can build `EditStep::SetPageSetup`
 // / `SetSectionType` / `InsertSectionBreak` without reaching into the verb
@@ -5064,6 +5179,7 @@ pub use verbs::content_controls::{DataBinding, SdtSpec, SdtValue};
 pub use verbs::equations::EquationPlacement;
 pub use verbs::form_fields::FormFieldValue;
 pub use verbs::images::ImageResize;
+pub use verbs::object_text::{ObjectTextBlock, ObjectTextEdit};
 // Re-export the image-layout grammar (crop / position / wrap) so callers can
 // build `EditStep::SetImageLayout` without reaching into the verb module path.
 pub use verbs::image_layout::{ImageCrop, ImageLayoutPatch, ImagePositionAxis, ImageWrapType};
@@ -6306,6 +6422,7 @@ fn validate_expect_on_block(
     block_id: &NodeId,
     expect: &str,
     semantic_hash: Option<&str>,
+    stacking_author: Option<&str>,
     step_index: usize,
 ) -> Result<(), EditError> {
     let block_idx =
@@ -6314,7 +6431,14 @@ fn validate_expect_on_block(
             step_index,
         })?;
     let tracked_block = &doc.blocks[block_idx];
-    validate_block_is_editable(tracked_block, step_index)?;
+    // The caller checks a block it stacks a tracked change on itself.
+    let stacks = stacking_author.is_some_and(|author| {
+        is_other_authors_inserted_paragraph(tracked_block, Some(author))
+            && block_insertion_lowerable(tracked_block, block_idx + 1 == doc.blocks.len())
+    });
+    if !stacks {
+        validate_block_is_editable(tracked_block, step_index)?;
+    }
 
     let para = match &tracked_block.block {
         BlockNode::Paragraph(p) => p,
@@ -6407,7 +6531,7 @@ fn validate_move_expect(
             }),
         };
     };
-    validate_expect_on_block(doc, from_block_id, expect, semantic_hash, step_index)
+    validate_expect_on_block(doc, from_block_id, expect, semantic_hash, None, step_index)
 }
 
 fn validate_delete_step(
@@ -6416,11 +6540,28 @@ fn validate_delete_step(
     to_block_id: &NodeId,
     expect: &str,
     semantic_hash: Option<&str>,
+    stacking_author: Option<&str>,
     step_index: usize,
 ) -> Result<(usize, usize), EditError> {
-    validate_expect_on_block(doc, from_block_id, expect, semantic_hash, step_index)?;
+    validate_expect_on_block(
+        doc,
+        from_block_id,
+        expect,
+        semantic_hash,
+        stacking_author,
+        step_index,
+    )?;
     let (start, end) = normalize_block_range_indices(doc, from_block_id, to_block_id, step_index)?;
-    for tracked_block in &doc.blocks[start..=end] {
+    for (index, tracked_block) in doc.blocks.iter().enumerate().take(end + 1).skip(start) {
+        // A tracked deletion stacks on another author's inserted paragraph
+        // (`stack_deletion_on_block_insertion`).
+        if let Some(author) = stacking_author
+            && is_other_authors_inserted_paragraph(tracked_block, Some(author))
+            && block_insertion_lowerable(tracked_block, index + 1 == doc.blocks.len())
+        {
+            validate_segments_untracked(&tracked_block.block, step_index)?;
+            continue;
+        }
         validate_block_is_editable(tracked_block, step_index)?;
     }
     Ok((start, end))
@@ -7403,6 +7544,14 @@ pub(crate) fn apply_span_splice(
         outer_right,
         enclosing_insertion,
     );
+    // Zero-width markers inside the range (bookmark, comment-range,
+    // permission and proofing boundaries) keep their text offsets, as the
+    // whole-paragraph replace re-places them: the differ would flush them to
+    // the end of the range.
+    if has_structural_markers(&mid) {
+        strip_structural_markers(&mut mid_out);
+        crate::tracked_model::inject_structural_markers_at_offsets(&mut mid_out, &mid);
+    }
     if resolve_directly {
         mid_out = resolve_fresh_segments(mid_out);
     }
@@ -7446,7 +7595,19 @@ fn resolve_fresh_segments(segments: Vec<TrackedSegment>) -> Vec<TrackedSegment> 
     segments
         .into_iter()
         .filter_map(|seg| match seg.status {
-            TrackingStatus::Deleted(_) => None,
+            // A zero-width marker re-placed inside the removed text stays at
+            // the point of removal.
+            TrackingStatus::Deleted(_) => {
+                let markers: Vec<InlineNode> = seg
+                    .inlines
+                    .into_iter()
+                    .filter(crate::tracked_model::is_structural_marker)
+                    .collect();
+                (!markers.is_empty()).then_some(TrackedSegment {
+                    status: TrackingStatus::Normal,
+                    inlines: markers,
+                })
+            }
             TrackingStatus::Inserted(_) => Some(TrackedSegment {
                 status: TrackingStatus::Normal,
                 inlines: seg.inlines,
@@ -7483,6 +7644,12 @@ fn validate_span_replace_step(
         let tracked_block = &doc.blocks[path.top_block];
         match &tracked_block.status {
             TrackingStatus::Normal => {}
+            // A tracked splice inside a paragraph that is itself a pending
+            // insertion edits the proposal (own) or stacks on it (another
+            // author's), exactly as the whole-paragraph replace does
+            // (`enclosing_block_insertion`); a move destination stays out.
+            TrackingStatus::Inserted(_)
+                if in_place_author.is_some() && tracked_block.move_id.is_none() => {}
             TrackingStatus::Inserted(_) => {
                 return Err(EditError::BlockHasTrackedStatus {
                     block_id: block_id.clone(),
@@ -7748,6 +7915,12 @@ fn validate_range_brackets(
     let markers = collect_bracket_markers(para);
     for marker in &markers {
         if marker.flat_idx < start || marker.flat_idx >= end {
+            continue;
+        }
+        // The splice keeps a bookmark, permission or comment range boundary
+        // at its text offset (`apply_span_splice`), so the range it brackets
+        // is unchanged whichever side of the span its partner is on.
+        if matches!(marker.kind.as_str(), "bookmark" | "perm" | "commentRange") {
             continue;
         }
         let partner_inside = markers.iter().any(|other| {
@@ -10332,6 +10505,7 @@ fn synthesize_new_hyperlink_inline(
         crate::serialize::build_run_direct_rpr(&fmt.marks, &fmt.style_props, fmt.rpr_authored);
     let rpr_xml = crate::word_xml::serialize_raw_fragment(&rpr);
     let data = HyperlinkData {
+        flattened_wrappers: Vec::new(),
         url: href.clone(),
         anchor: anchor.clone(),
         text: text.to_string(),
@@ -10350,6 +10524,7 @@ fn synthesize_new_hyperlink_inline(
         extra_attrs: vec![],
     };
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind: OpaqueKind::Hyperlink(data),
         opaque_ref: format!("hyperlink_{}", id.0),
@@ -10668,8 +10843,9 @@ fn resolve_paragraph_spec(
             is_bullet: sibling.is_bullet,
             restart_numbering: false,
         });
-        // An inserted list item authors its own direct numPr.
+        // An inserted list item authors its own direct numPr, level included.
         para.has_direct_numbering = true;
+        para.direct_numbering_omits_ilvl = false;
     }
 
     if let Some(stops) = &spec.tab_stops {
@@ -10808,6 +10984,7 @@ fn resolve_toc_spec(
     let content_hash =
         crate::serialize::authored_simple_field_hash(&data, &[], &StyleProps::default());
     let field = InlineNode::from(crate::domain::OpaqueInlineNode {
+        formatting_change: None,
         id: field_id,
         kind: OpaqueKind::Field(data),
         opaque_ref: format!("generated_toc_{}", para.id.0),
@@ -11035,6 +11212,7 @@ fn resolve_table_spec(
                 Some(VerticalMergeSpec::Continue) => VerticalMerge::Continue,
             };
             cells.push(TableCellNode {
+                cell_merge: None,
                 id: cell_id,
                 blocks,
                 grid_span,
@@ -11409,9 +11587,27 @@ fn apply_delete_block_range(
     revision: &RevisionInfo,
     rev_counter: &mut u32,
 ) {
-    for tracked_block in &mut doc.blocks[start..=end] {
-        crate::tracked_model::mark_whole_block_deleted(tracked_block, revision, rev_counter);
+    let story_len = doc.blocks.len();
+    for (index, tracked_block) in doc.blocks.iter_mut().enumerate().take(end + 1).skip(start) {
+        if revision.author.is_some()
+            && is_other_authors_inserted_paragraph(tracked_block, revision.author.as_deref())
+            && block_insertion_lowerable(tracked_block, index + 1 == story_len)
+        {
+            stack_deletion_on_block_insertion(tracked_block, revision, rev_counter);
+        } else {
+            crate::tracked_model::mark_whole_block_deleted(tracked_block, revision, rev_counter);
+        }
     }
+}
+
+/// Whether the block is a paragraph that is wholly another author's pending
+/// insertion (not a move destination): a tracked edit by `author` stacks on
+/// it.
+fn is_other_authors_inserted_paragraph(tracked_block: &TrackedBlock, author: Option<&str>) -> bool {
+    matches!(&tracked_block.status, TrackingStatus::Inserted(inserted)
+        if inserted.author.as_deref() != author)
+        && tracked_block.move_id.is_none()
+        && matches!(tracked_block.block, BlockNode::Paragraph(_))
 }
 
 fn apply_delete_block_range_direct(doc: &mut CanonDoc, start: usize, end: usize) {
@@ -11587,13 +11783,6 @@ fn is_range_marker_block(tracked: &TrackedBlock) -> bool {
     matches!(&tracked.block, BlockNode::OpaqueBlock(o) if o.range_marker.is_some())
 }
 
-fn range_marker_role(tracked: &TrackedBlock) -> Option<crate::domain::RangeMarkerRole> {
-    match &tracked.block {
-        BlockNode::OpaqueBlock(o) => o.range_marker.as_ref().map(|m| m.role),
-        _ => None,
-    }
-}
-
 /// The body index new blocks are inserted at, next to the block at
 /// `anchor_idx`. Range markers adjacent to the anchor keep the ranges they
 /// delimit: content inserted after a block lands after the range ends that
@@ -11602,22 +11791,145 @@ fn range_marker_role(tracked: &TrackedBlock) -> Option<crate::domain::RangeMarke
 /// was around the anchor alone.
 fn insertion_index(blocks: &[TrackedBlock], anchor_idx: usize, position: InsertPosition) -> usize {
     use crate::domain::RangeMarkerRole;
+    // Bookmarks and permission ranges join the content inserted at their edge
+    // (Word, checked in the body and in cells: a paragraph added after the
+    // last covered paragraph, or before the first, is inside the range), so
+    // their markers are not stepped over. A comment range does not grow
+    // (Word, checked): content inserted beside the anchor stays outside it.
+    let stepped_over = |block: &TrackedBlock, role: RangeMarkerRole| {
+        matches!(&block.block, BlockNode::OpaqueBlock(o)
+        if o.range_marker.as_ref().is_some_and(|marker| {
+            marker.role == role
+                && marker.family == crate::domain::RangeMarkerFamily::CommentRange
+        }))
+    };
     match position {
         InsertPosition::After => {
             let mut idx = anchor_idx + 1;
-            while blocks.get(idx).and_then(range_marker_role) == Some(RangeMarkerRole::End) {
+            while blocks
+                .get(idx)
+                .is_some_and(|block| stepped_over(block, RangeMarkerRole::End))
+            {
                 idx += 1;
             }
             idx
         }
         InsertPosition::Before => {
             let mut idx = anchor_idx;
-            while idx > 0 && range_marker_role(&blocks[idx - 1]) == Some(RangeMarkerRole::Start) {
+            while idx > 0 && stepped_over(&blocks[idx - 1], RangeMarkerRole::Start) {
                 idx -= 1;
             }
             idx
         }
     }
+}
+
+/// The local name of a bookmark or permission range marker decoration.
+fn growing_range_marker_name(inline: &InlineNode) -> Option<String> {
+    let InlineNode::Decoration(decoration) = inline else {
+        return None;
+    };
+    if !matches!(
+        decoration.kind,
+        crate::domain::DecorationType::Bookmark | crate::domain::DecorationType::PermissionRange
+    ) {
+        return None;
+    }
+    let raw = decoration.raw_xml.as_deref()?;
+    let element = crate::word_xml::parse_raw_fragment(raw)
+        .expect("an imported range decoration holds its element");
+    Some(crate::import::local_element_name(&element).to_string())
+}
+
+fn zero_width(inline: &InlineNode) -> bool {
+    matches!(
+        inline,
+        InlineNode::Decoration(_)
+            | InlineNode::CommentRangeStart { .. }
+            | InlineNode::CommentRangeEnd { .. }
+    )
+}
+
+/// Word, inserting a paragraph before the first paragraph a bookmark or a
+/// permission range covers, moves the range's start onto the new first
+/// paragraph (checked in the body and in cells). Hand the bookmark and
+/// permission starts that open `anchor` (before any of its content) to the
+/// start of `first_new`.
+pub(in crate::edit) fn hand_leading_bookmark_starts(
+    anchor: &mut ParagraphNode,
+    first_new: &mut ParagraphNode,
+) {
+    let opens = |inline: &InlineNode| {
+        matches!(
+            growing_range_marker_name(inline).as_deref(),
+            Some("bookmarkStart" | "permStart")
+        )
+    };
+    let mut handed = Vec::new();
+    'leading: for segment in &mut anchor.segments {
+        let mut index = 0;
+        while index < segment.inlines.len() {
+            let inline = &segment.inlines[index];
+            if opens(inline) {
+                handed.push(segment.inlines.remove(index));
+                continue;
+            }
+            if !zero_width(inline) {
+                break 'leading;
+            }
+            index += 1;
+        }
+    }
+    if handed.is_empty() {
+        return;
+    }
+    anchor
+        .segments
+        .retain(|segment| !segment.inlines.is_empty());
+    first_new.segments.insert(
+        0,
+        TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: handed,
+        },
+    );
+}
+
+/// Word, adding a paragraph after one whose permission range ends inside it
+/// (after all its content), moves that end to the end of the new paragraph
+/// (checked in Word). Hand the permission ends that close `anchor` to the end
+/// of `last_new`. (Word writes a bookmark's end after the paragraph, at block
+/// level, where the insertion index already keeps the new paragraph inside.)
+pub(in crate::edit) fn hand_trailing_permission_ends(
+    anchor: &mut ParagraphNode,
+    last_new: &mut ParagraphNode,
+) {
+    let closes =
+        |inline: &InlineNode| growing_range_marker_name(inline).as_deref() == Some("permEnd");
+    let mut handed = Vec::new();
+    'trailing: for segment in anchor.segments.iter_mut().rev() {
+        let mut index = segment.inlines.len();
+        while index > 0 {
+            let inline = &segment.inlines[index - 1];
+            if closes(inline) {
+                handed.push(segment.inlines.remove(index - 1));
+            } else if !zero_width(inline) {
+                break 'trailing;
+            }
+            index -= 1;
+        }
+    }
+    if handed.is_empty() {
+        return;
+    }
+    handed.reverse();
+    anchor
+        .segments
+        .retain(|segment| !segment.inlines.is_empty());
+    last_new.segments.push(TrackedSegment {
+        status: TrackingStatus::Normal,
+        inlines: handed,
+    });
 }
 
 fn apply_insert_paragraphs(
@@ -11691,6 +12003,7 @@ fn apply_insert_paragraphs(
         inserted_indices.push(insert_idx);
         last_inserted_id = Some(block_id);
     }
+    hand_range_edges_to_inserted(&mut doc.blocks, &inserted_indices, position);
 
     adjust_literal_prefixes_after_insert(doc, &inserted_indices, ctx.step_index)?;
 
@@ -11701,6 +12014,50 @@ fn apply_insert_paragraphs(
     }
 
     Ok(())
+}
+
+/// [`hand_leading_bookmark_starts`] (inserted before the anchor) or
+/// [`hand_trailing_permission_ends`] (after it) for blocks just inserted at
+/// `inserted_indices` (consecutive) beside their anchor in `blocks`.
+fn hand_range_edges_to_inserted(
+    blocks: &mut [TrackedBlock],
+    inserted_indices: &[usize],
+    position: InsertPosition,
+) {
+    let (Some(&first), Some(&last)) = (inserted_indices.first(), inserted_indices.last()) else {
+        return;
+    };
+    match position {
+        InsertPosition::Before => {
+            let (before, after) = blocks.split_at_mut(last + 1);
+            if let (
+                BlockNode::Paragraph(first_new),
+                Some(TrackedBlock {
+                    block: BlockNode::Paragraph(anchor),
+                    ..
+                }),
+            ) = (&mut before[first].block, after.first_mut())
+            {
+                hand_leading_bookmark_starts(anchor, first_new);
+            }
+        }
+        InsertPosition::After => {
+            let Some(anchor_index) = first.checked_sub(1) else {
+                return;
+            };
+            let (before, after) = blocks.split_at_mut(first);
+            if let (
+                TrackedBlock {
+                    block: BlockNode::Paragraph(anchor),
+                    ..
+                },
+                BlockNode::Paragraph(last_new),
+            ) = (&mut before[anchor_index], &mut after[last - first].block)
+            {
+                hand_trailing_permission_ends(anchor, last_new);
+            }
+        }
+    }
 }
 
 fn apply_insert_paragraphs_direct(
@@ -11769,6 +12126,7 @@ fn apply_insert_paragraphs_direct(
         inserted_indices.push(insert_idx);
         last_inserted_id = Some(block_id);
     }
+    hand_range_edges_to_inserted(&mut doc.blocks, &inserted_indices, position);
 
     adjust_literal_prefixes_after_insert(doc, &inserted_indices, step_index)?;
 
@@ -11871,22 +12229,22 @@ fn apply_move_block_range(
     semantic_hash: Option<&str>,
     ctx: &mut ApplyBlockContext<'_>,
 ) -> Result<(), EditError> {
-    // A tracked block move marks whole top-level blocks moveFrom/moveTo; a
-    // paragraph inside a table cell carries no block-level tracking of its
-    // own, so the move cannot reach it. Say so rather than "not found".
-    for id in [from_block_id, to_block_id, dest_anchor_id] {
-        if find_block_index(&doc.blocks, id).is_none()
-            && find_paragraph_path(doc, id).is_some_and(|path| !path.is_top_level())
-        {
-            return Err(EditError::UnsupportedParagraphStructure {
-                block_id: id.clone(),
-                reason: "the block is inside a table cell, and `move` relocates top-level \
-                         body blocks only; move the whole row with `move_row`, or edit \
-                         the cell's paragraphs with `replace`, `insert` and `delete`"
-                    .to_string(),
-                step_index: ctx.step_index,
-            });
-        }
+    // A move into, out of, or between table cells: the cell paragraphs carry
+    // the move on their runs and marks (`verbs::cell_move`).
+    if [from_block_id, to_block_id, dest_anchor_id]
+        .into_iter()
+        .any(|id| verbs::cell_move::in_cell(doc, id))
+    {
+        return verbs::cell_move::apply(
+            doc,
+            from_block_id,
+            to_block_id,
+            dest_anchor_id,
+            dest_position,
+            expect,
+            semantic_hash,
+            ctx,
+        );
     }
     validate_move_expect(doc, from_block_id, expect, semantic_hash, ctx.step_index)?;
     check_destination_anchor_not_moved(doc, dest_anchor_id, ctx)?;
@@ -12126,6 +12484,11 @@ pub fn snapshot_paragraph_formatting(
         p.has_direct_numbering,
         effective_numbering.is_some(),
     );
+    assert!(
+        !p.direct_numbering_omits_ilvl || p.has_direct_numbering,
+        "cannot snapshot paragraph {}: a numPr without ilvl must be direct active numbering",
+        p.id
+    );
 
     let direct_numbering = if p.numbering_suppressed {
         DirectParagraphNumbering::Present(DirectParagraphNumPr {
@@ -12140,7 +12503,8 @@ pub fn snapshot_paragraph_formatting(
             .expect("validated direct numbering payload");
         DirectParagraphNumbering::Present(DirectParagraphNumPr {
             num_id: Some(numbering.num_id),
-            ilvl: Some(numbering.ilvl),
+            // The previous pPr keeps the numPr as the paragraph wrote it.
+            ilvl: (!p.direct_numbering_omits_ilvl).then_some(numbering.ilvl),
             extra_attrs: Vec::new(),
             preserved: Vec::new(),
         })
@@ -12347,6 +12711,7 @@ fn copy_paragraph_formatting_from_exemplar(target: &mut ParagraphNode, exemplar:
     target.tab_stops = exemplar.tab_stops.clone();
     target.numbering = exemplar.numbering.clone();
     target.has_direct_numbering = exemplar.has_direct_numbering;
+    target.direct_numbering_omits_ilvl = exemplar.direct_numbering_omits_ilvl;
     target.heading_level = exemplar.heading_level.clone();
     target.paragraph_mark_marks = exemplar.paragraph_mark_marks.clone();
     target.paragraph_mark_style_props = exemplar.paragraph_mark_style_props.clone();
@@ -12542,6 +12907,8 @@ pub fn apply_transaction_with_id_floor(
         std::collections::HashSet::new();
     let split_tracking_prefixes_before =
         crate::tracked_model::split_tracking_boundary_prefix_ids(transaction_base);
+    let cell_label_proposals_before =
+        crate::tracked_model::hoisted_label_cell_proposal_ids(transaction_base);
     let block_node_ids_before = collect_all_block_node_ids(transaction_base);
     let mut doc = doc.clone();
     // Fixed for the whole call: any revision_id >= this floor was minted by
@@ -12974,12 +13341,17 @@ pub fn apply_transaction_with_id_floor(
                                 step_index,
                             )?;
                         }
+                        let stacking_author = (transaction.materialization_mode
+                            == MaterializationMode::TrackedChange)
+                            .then_some(transaction.revision.author.as_deref())
+                            .flatten();
                         let (start, end) = validate_delete_step(
                             doc,
                             from_block_id,
                             to_block_id,
                             expect,
                             semantic_hash.as_deref(),
+                            stacking_author,
                             step_index,
                         )?;
                         if transaction.materialization_mode == MaterializationMode::TrackedChange {
@@ -13122,6 +13494,7 @@ pub fn apply_transaction_with_id_floor(
                         to_block_id,
                         expect,
                         semantic_hash.as_deref(),
+                        None,
                         step_index,
                     )?;
                     if transaction.materialization_mode == MaterializationMode::TrackedChange {
@@ -13236,7 +13609,10 @@ pub fn apply_transaction_with_id_floor(
                 expect_href,
                 expect_anchor,
             } => {
-                let revision = stamp_revision(&transaction.revision, &mut rev_counter);
+                // The deletion and the insertion are two revisions, each with
+                // its own id (revision ids are unique in a part, §17.13.1).
+                let deletion = stamp_revision(&transaction.revision, &mut rev_counter);
+                let insertion = stamp_revision(&transaction.revision, &mut rev_counter);
                 let direct = transaction.materialization_mode == MaterializationMode::Direct;
                 with_story_as_body(&mut doc, story, step_index, |doc| {
                     apply_replace_hyperlink_text(
@@ -13246,7 +13622,7 @@ pub fn apply_transaction_with_id_floor(
                         new_text,
                         expect_href.as_deref(),
                         expect_anchor.as_deref(),
-                        &revision,
+                        (&deletion, &insertion),
                         step_index,
                     )?;
                     if direct {
@@ -13327,6 +13703,22 @@ pub fn apply_transaction_with_id_floor(
                     &transaction.revision,
                     &mut rev_counter,
                     transaction.materialization_mode,
+                    step_index,
+                )?;
+            }
+            EditStep::ReplaceInlineObjectText {
+                block_id,
+                object_id,
+                edits,
+            } => {
+                verbs::object_text::apply(
+                    &mut doc,
+                    block_id,
+                    object_id,
+                    edits,
+                    &transaction.revision,
+                    &mut rev_counter,
+                    transaction.materialization_mode == MaterializationMode::TrackedChange,
                     step_index,
                 )?;
             }
@@ -14228,6 +14620,11 @@ pub fn apply_transaction_with_id_floor(
                 rationale: _,
             } => {
                 verbs::style_defs::apply_modify(style_id, def, step_index, &mut pending.style_ops)?;
+                // A new basedOn can change the level a list reference without
+                // one resolves to; keep every such item where it is.
+                if def.based_on.is_some() {
+                    verbs::numbering::write_resolved_list_levels(&mut doc);
+                }
             }
             EditStep::SetDocDefaults {
                 font_family,
@@ -14289,15 +14686,37 @@ pub fn apply_transaction_with_id_floor(
     // tracking boundary are canonicalized. A paragraph that already carried the
     // shape on input is the source document's own state, and rewriting it would
     // perturb the serialization of revisions that predate this transaction.
+    // A cell paragraph this transaction made a whole insertion or deletion
+    // carries its typed label inside that proposal (the same rule as
+    // `merge_diff`); it is not a retained label beside a tracked body.
+    let produced_cell_label_proposals =
+        crate::tracked_model::materialize_produced_cell_proposal_prefixes(
+            &mut doc,
+            &cell_label_proposals_before,
+        );
     let produced_split_tracking_prefixes: std::collections::HashSet<_> =
         crate::tracked_model::split_tracking_boundary_prefix_ids(&doc)
             .difference(&split_tracking_prefixes_before)
+            .filter(|id| !produced_cell_label_proposals.contains(*id))
             .cloned()
             .collect();
     crate::tracked_model::canonicalize_split_tracking_boundary_prefix_ids(
         &mut doc,
         &produced_split_tracking_prefixes,
     );
+
+    settle_block_insertions(&mut doc.blocks);
+    for story in doc
+        .headers
+        .iter_mut()
+        .map(|story| &mut story.blocks)
+        .chain(doc.footers.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.footnotes.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.endnotes.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.comments.iter_mut().map(|story| &mut story.blocks))
+    {
+        settle_block_insertions(story);
+    }
 
     // A block this transaction marked wholly inserted or deleted carries its
     // label inside the proposal, matching `merge_diff`. Left hoisted, the
@@ -14316,6 +14735,127 @@ pub fn apply_transaction_with_id_floor(
     // H2: one unified body-state validator after this producer's normalizers.
     crate::tracked_model::debug_assert_body_invariants(&doc, "apply_transaction");
     Ok((doc, pending))
+}
+
+/// Spell a whole-paragraph insertion by its parts: every untracked segment
+/// becomes inserted under the block's revision (except the decoration-only
+/// segments the serializer writes outside `w:ins`, which stay untracked) and
+/// the paragraph mark carries the insertion, as the saved document reads it.
+/// The paragraph mark the story's final paragraph adopted (`Some(Normal)`,
+/// the displaced insertion carried by the paragraph before it) stays as it
+/// is. A no-op for anything but a non-move inserted paragraph.
+pub(crate) fn lower_block_insertion(tracked_block: &mut TrackedBlock) {
+    let TrackingStatus::Inserted(revision) = &tracked_block.status else {
+        return;
+    };
+    if tracked_block.move_id.is_some() {
+        return;
+    }
+    let BlockNode::Paragraph(paragraph) = &mut tracked_block.block else {
+        return;
+    };
+    let revision = revision.clone();
+    for segment in &mut paragraph.segments {
+        if segment.status == TrackingStatus::Normal
+            && !crate::import::untracked_segment_subsumed_by_insertion(segment)
+        {
+            segment.status = TrackingStatus::Inserted(revision.clone());
+        }
+    }
+    if paragraph.para_mark_status.is_none() {
+        paragraph.para_mark_status = Some(TrackingStatus::Inserted(revision));
+    }
+    paragraph.block_text_hash = None;
+    paragraph.rendered_text = None;
+    tracked_block.status = TrackingStatus::Normal;
+}
+
+/// Whether a whole-paragraph insertion can be spelled by its parts. A story's
+/// final paragraph mark carries no revision: an inserted final paragraph is
+/// spelled by its parts only once its mark is the adopted untracked one
+/// (`Some(Normal)`, the displaced insertion on the paragraph before it), as a
+/// reopen reads it. An engine-authored final paragraph whose mark is still
+/// unplaced keeps the block spelling.
+pub(crate) fn block_insertion_lowerable(tracked_block: &TrackedBlock, story_final: bool) -> bool {
+    !story_final
+        || !matches!(&tracked_block.block, BlockNode::Paragraph(paragraph)
+            if paragraph.para_mark_status.is_none())
+}
+
+/// One state, one spelling, for a whole-paragraph insertion that an edit
+/// made partial. The block-level spelling (`TrackedBlock::Inserted` over
+/// untracked segments) is the one a reopen restores only while the insertion
+/// still covers the whole paragraph as one proposal
+/// (`import::lift_whole_paragraph_insertions`). Once another change sits
+/// inside it — another author's stacked deletion or insertion, a comment
+/// range — the saved document reopens spelled by its parts, so the edited
+/// paragraph takes that spelling now ([`lower_block_insertion`]).
+fn settle_block_insertions(blocks: &mut [TrackedBlock]) {
+    let story_len = blocks.len();
+    for (index, tracked_block) in blocks.iter_mut().enumerate() {
+        if !matches!(tracked_block.status, TrackingStatus::Inserted(_))
+            || tracked_block.move_id.is_some()
+            || !block_insertion_lowerable(tracked_block, index + 1 == story_len)
+        {
+            continue;
+        }
+        let BlockNode::Paragraph(paragraph) = &tracked_block.block else {
+            continue;
+        };
+        let whole = paragraph.segments.iter().all(|segment| {
+            segment.status == TrackingStatus::Normal
+                && segment.inlines.iter().all(|inline| {
+                    !matches!(
+                        inline,
+                        InlineNode::CommentRangeStart { .. } | InlineNode::CommentRangeEnd { .. }
+                    ) && !matches!(inline, InlineNode::Decoration(_)
+                    if !crate::import::untracked_segment_subsumed_by_insertion(
+                        &TrackedSegment {
+                            status: TrackingStatus::Normal,
+                            inlines: vec![inline.clone()],
+                        },
+                    ))
+                })
+        });
+        if !whole {
+            lower_block_insertion(tracked_block);
+        }
+    }
+}
+
+/// Track the deletion of a paragraph that is another author's pending
+/// insertion: the deletion stacks on the insertion (§17.13.5.14 inside
+/// §17.13.5.18), content and paragraph mark alike, so the paragraph is gone
+/// in both full resolutions, rejecting only the deletion restores the
+/// insertion, and accepting only the insertion leaves a pending deletion of
+/// base text. Spelled by its parts, as the saved document reads it.
+fn stack_deletion_on_block_insertion(
+    tracked_block: &mut TrackedBlock,
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) {
+    lower_block_insertion(tracked_block);
+    let BlockNode::Paragraph(paragraph) = &mut tracked_block.block else {
+        unreachable!("only an inserted paragraph is stacked on");
+    };
+    let stack = |status: &mut TrackingStatus, deleted: RevisionInfo| {
+        if let TrackingStatus::Inserted(inserted) = status {
+            *status = TrackingStatus::InsertedThenDeleted(Box::new(StackedRevision {
+                inserted: inserted.clone(),
+                deleted,
+            }));
+        }
+    };
+    let content_deletion = next_revision(revision, rev_counter);
+    for segment in &mut paragraph.segments {
+        stack(&mut segment.status, content_deletion.clone());
+    }
+    let mark_deletion = next_revision(revision, rev_counter);
+    if let Some(mark) = &mut paragraph.para_mark_status {
+        stack(mark, mark_deletion);
+    }
+    paragraph.block_text_hash = None;
+    paragraph.rendered_text = None;
 }
 
 /// Re-attribute a tracked mark that a paragraph-append/delete/move step placed on
@@ -14479,6 +15019,11 @@ fn apply_replace_table(
     // Resolve the spec. The freshly-resolved table gets a placeholder id;
     // we rename it to match the base so local edit compilation aligns on identity.
     let mut target_block = resolve_table_spec(doc, replacement, step_index)?;
+    // Its rows, cells and cell paragraphs carry the placeholder ids every
+    // resolved table shares; give them ids no block of the document holds, as
+    // an inserted table's are, so a replacement's cell paragraph never answers
+    // to another table's id.
+    assign_inserted_block_ids(&doc.blocks, &mut target_block);
     let target_table_owned = match &mut target_block {
         BlockNode::Table(t) => {
             t.id = base_table.id.clone();
@@ -14679,6 +15224,16 @@ pub(crate) fn validate_table_not_mid_redline(
                     step_index,
                 });
             }
+            // A pending merge change rewrites the merge geometry on Accept
+            // or Reject; a structural edit would be resolved against a grid
+            // that is not final.
+            if cell.cell_merge.is_some() {
+                return Err(EditError::TableMidRedline {
+                    table_id: base.id.clone(),
+                    location: format!("row[{row_index}].cell[{cell_index}] (cellMerge)"),
+                    step_index,
+                });
+            }
         }
     }
     Ok(())
@@ -14847,6 +15402,9 @@ fn merge_table_formatting_from_base(
     if target.default_cell_margins.is_none() {
         target.default_cell_margins = base.default_cell_margins.clone();
         target.has_direct_cell_margins = base.has_direct_cell_margins;
+    }
+    if target.cell_margins_pct.is_empty() {
+        target.cell_margins_pct = base.cell_margins_pct.clone();
     }
     if target.alignment.is_none() {
         target.alignment = base.alignment.clone();
@@ -15239,6 +15797,33 @@ fn stamp_revision(base: &RevisionInfo, rev_counter: &mut u32) -> RevisionInfo {
     }
 }
 
+/// Refuse an edit inside an inline object whose host paragraph is itself a
+/// pending block insertion or deletion, or sits in a tracked table row or cell.
+pub(crate) fn check_host_paragraph_editable(
+    doc: &CanonDoc,
+    path: &ParagraphPath,
+    step_index: usize,
+) -> Result<(), EditError> {
+    if path.is_top_level() {
+        let status = match &doc.blocks[path.top_block].status {
+            TrackingStatus::Normal => return Ok(()),
+            TrackingStatus::Inserted(_) => "inserted",
+            TrackingStatus::Deleted(_) => "deleted",
+            TrackingStatus::InsertedThenDeleted(_) => "inserted_then_deleted",
+        };
+        return Err(EditError::BlockHasTrackedStatus {
+            block_id: block_id_of(&doc.blocks[path.top_block].block).clone(),
+            status,
+            step_index,
+        });
+    }
+    let para_id = match block_at(doc, path) {
+        BlockNode::Paragraph(p) => p.id.clone(),
+        _ => unreachable!("a paragraph path resolves to a paragraph"),
+    };
+    check_ancestor_table_tracking(doc, path, &para_id, step_index)
+}
+
 /// Apply a `ReplaceHyperlinkText` step. Locates the hyperlink, validates
 /// preconditions, and rewrites the hyperlink's runs so that the matched
 /// substring is wrapped in a `Deleted` envelope followed by an `Inserted`
@@ -15252,7 +15837,7 @@ fn apply_replace_hyperlink_text(
     new_text: &str,
     expect_href: Option<&str>,
     expect_anchor: Option<&str>,
-    revision: &RevisionInfo,
+    revisions: (&RevisionInfo, &RevisionInfo),
     step_index: usize,
 ) -> Result<(), EditError> {
     // 1. Locate the enclosing paragraph.
@@ -15274,38 +15859,7 @@ fn apply_replace_hyperlink_text(
     })?;
 
     // 2. Validate the enclosing paragraph's block-level tracking status.
-    if path.is_top_level() {
-        match &doc.blocks[path.top_block].status {
-            TrackingStatus::Normal => {}
-            TrackingStatus::Inserted(_) => {
-                return Err(EditError::BlockHasTrackedStatus {
-                    block_id: block_id_of(&doc.blocks[path.top_block].block).clone(),
-                    status: "inserted",
-                    step_index,
-                });
-            }
-            TrackingStatus::Deleted(_) => {
-                return Err(EditError::BlockHasTrackedStatus {
-                    block_id: block_id_of(&doc.blocks[path.top_block].block).clone(),
-                    status: "deleted",
-                    step_index,
-                });
-            }
-            TrackingStatus::InsertedThenDeleted(_) => {
-                return Err(EditError::BlockHasTrackedStatus {
-                    block_id: block_id_of(&doc.blocks[path.top_block].block).clone(),
-                    status: "inserted_then_deleted",
-                    step_index,
-                });
-            }
-        }
-    } else {
-        let para_id = match block_at(doc, &path) {
-            BlockNode::Paragraph(p) => p.id.clone(),
-            _ => unreachable!("hyperlink path resolves to a paragraph"),
-        };
-        check_ancestor_table_tracking(doc, &path, &para_id, step_index)?;
-    }
+    check_host_paragraph_editable(doc, &path, step_index)?;
 
     // 3. Validate paragraph segments are all Normal — the MVP rule.
     let para_id = match block_at(doc, &path) {
@@ -15382,7 +15936,7 @@ fn apply_replace_hyperlink_text(
         }
     }
 
-    rewrite_hyperlink_runs(data, hyperlink_id, expect, new_text, revision, step_index)?;
+    rewrite_hyperlink_runs(data, hyperlink_id, expect, new_text, revisions, step_index)?;
 
     // Invalidate the cached raw_xml so the next serialize rebuilds from
     // the freshly edited `runs`.
@@ -15611,11 +16165,9 @@ fn rewrite_hyperlink_runs(
     hyperlink_id: &NodeId,
     expect: &str,
     new_text: &str,
-    revision: &RevisionInfo,
+    (deletion, insertion): (&RevisionInfo, &RevisionInfo),
     step_index: usize,
 ) -> Result<(), EditError> {
-    use crate::domain::HyperlinkRun;
-
     if data.runs.iter().any(|r| r.status != TrackingStatus::Normal) {
         return Err(EditError::HyperlinkContainsTrackedChanges {
             hyperlink_id: hyperlink_id.clone(),
@@ -15647,10 +16199,28 @@ fn rewrite_hyperlink_runs(
             step_index,
         })?;
 
-    // The words both ends share are kept text, not a change.
+    let (prefix, suffix, inserted) = shared_token_trim(expect, new_text);
+    let (del_start, del_end) = (match_start + prefix, match_start + expect.len() - suffix);
+    if del_start == del_end && inserted.is_empty() {
+        return Ok(());
+    }
+    splice_hyperlink_runs(
+        data,
+        hyperlink_id,
+        (del_start, del_end),
+        &inserted,
+        (deletion, insertion),
+        step_index,
+    )
+}
+
+/// What a rewrite of `old` to `new` changes: the words both ends share are kept
+/// text, not a change. Returns the byte lengths of the shared leading and
+/// trailing words of `old` and the new text between them.
+pub(crate) fn shared_token_trim(old: &str, new: &str) -> (usize, usize, String) {
     let (old_tokens, new_tokens) = (
-        crate::local_change::tokenize(expect),
-        crate::local_change::tokenize(new_text),
+        crate::local_change::tokenize(old),
+        crate::local_change::tokenize(new),
     );
     let prefix = old_tokens
         .iter()
@@ -15664,12 +16234,29 @@ fn rewrite_hyperlink_runs(
         .take_while(|(a, b)| a == b)
         .count();
     let byte_len = |tokens: &[&str]| tokens.iter().map(|t| t.len()).sum::<usize>();
-    let del_start = match_start + byte_len(&old_tokens[..prefix]);
-    let del_end = match_start + expect.len() - byte_len(&old_tokens[old_tokens.len() - suffix..]);
-    let inserted: String = new_tokens[prefix..new_tokens.len() - suffix].concat();
-    if del_start == del_end && inserted.is_empty() {
-        return Ok(());
-    }
+    (
+        byte_len(&old_tokens[..prefix]),
+        byte_len(&old_tokens[old_tokens.len() - suffix..]),
+        new_tokens[prefix..new_tokens.len() - suffix].concat(),
+    )
+}
+
+/// Replace the byte range `[del_start, del_end)` of a link's run text (all
+/// runs, deleted ones included) with `inserted`: the range's text becomes
+/// deleted runs and `inserted` one inserted run, formatted as the text it
+/// replaces. A pure insertion (empty range) lands at the range's position.
+/// Refuses a range reaching into a field inside the link.
+fn splice_hyperlink_runs(
+    data: &mut crate::domain::HyperlinkData,
+    hyperlink_id: &NodeId,
+    (del_start, del_end): (usize, usize),
+    inserted: &str,
+    (deletion, insertion): (&RevisionInfo, &RevisionInfo),
+    step_index: usize,
+) -> Result<(), EditError> {
+    use crate::domain::HyperlinkRun;
+    let full_text: String = data.runs.iter().map(|r| r.text.as_str()).collect();
+    let inserted = inserted.to_string();
 
     // A field inside the link (begin .. end, its result included) cannot lose
     // part of itself to a text deletion; a run with no text inside the deleted
@@ -15741,7 +16328,7 @@ fn rewrite_hyperlink_runs(
         additional_rpr_xml: run.additional_rpr_xml.clone(),
         source_xml: None,
         source_run_attrs: Vec::new(),
-        status: TrackingStatus::Inserted(revision.clone()),
+        status: TrackingStatus::Inserted(insertion.clone()),
     });
 
     let mut new_runs: Vec<HyperlinkRun> = Vec::new();
@@ -15782,7 +16369,7 @@ fn rewrite_hyperlink_runs(
             new_runs.push(piece(
                 run,
                 &run.text[lo..hi],
-                TrackingStatus::Deleted(revision.clone()),
+                TrackingStatus::Deleted(deletion.clone()),
             ));
         }
         if run_end >= del_end {
@@ -15872,6 +16459,7 @@ mod tests {
 
     fn field_inline(id: &str) -> InlineNode {
         InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(id),
             kind: OpaqueKind::Field(FieldData {
                 field_kind: FieldKind::Simple,
@@ -15928,6 +16516,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -15970,6 +16559,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 

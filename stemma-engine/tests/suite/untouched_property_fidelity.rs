@@ -350,10 +350,11 @@ fn a_universal_measure_size_is_read_in_half_points() {
 
 #[test]
 fn a_run_size_no_schema_form_admits_is_refused_with_its_element() {
+    // A non-numeric w:sz is not here: Word reads it as 0
+    // (`font_size_word_reading`); nor is a non-numeric w:spacing, which Word
+    // reads as no spacing (`twips_word_reading`).
     for (element, rpr) in [
-        ("sz", r#"<w:sz w:val="large"/>"#),
         ("szCs", r#"<w:szCs w:val="-4"/>"#),
-        ("spacing", r#"<w:spacing w:val="wide"/>"#),
         ("position", r#"<w:position w:val="up"/>"#),
     ] {
         let body = format!(r#"<w:p><w:r><w:rPr>{rpr}</w:rPr><w:t>Sized.</w:t></w:r></w:p>"#);

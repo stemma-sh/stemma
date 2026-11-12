@@ -16,7 +16,11 @@ and excerpt.
 Revision ids are the engine's content-derived identities: a revision whose
 own content is untouched keeps its id across save/reopen and across a
 `resolve` of *other* revisions, so ids read here remain valid against the
-resolved output. Never take ids from raw XML (`w:id` is not the same value;
+resolved output. Among changes that look exactly alike (same kind, author,
+date and text), that holds for Stemma's own save, reopen and resolutions;
+after another editor changes the file, lookalikes are numbered again by
+document order, so re-read ids after any edit made outside Stemma. Never take
+ids from raw XML (`w:id` is not the same value;
 the one exception is a change inside a textbox, kind `opaque_interior`, whose
 id is its own `w:id`), and re-extract if an operation may have altered a surviving revision's
 content; see [id durability](../reference/cli.md#extract).

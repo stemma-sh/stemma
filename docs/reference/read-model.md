@@ -101,7 +101,8 @@ Three honest caveats a builder should know:
 | Revision census and lean redline rendering | `stemma read` | `Document::read()` plus `Document::revisions()` | `GET /api/documents/{id}` plus `GET /api/documents/{id}/revisions` |
 | Resolve all, by author, by id, or with mixed outcomes | all, author, id, and one-call mixed plan | all and selective resolution; compose mixed outcomes in memory | selective ids; compose author groups client-side |
 | Complete value formatting and assets | not exposed | full render view | `GET /api/documents/{id}/rich` |
-| Headers, footers, comments, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, comments, and page geometry but omits footnote and endnote stories |
+| Comments (author, date, text, resolved, thread) | `stemma read` `comments` | full render view, or `stemma_diff::comment_readings` | `/rich` includes comments |
+| Headers, footers, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, and page geometry but omits footnote and endnote stories |
 | Stable installed local process boundary | yes | library API, not a process boundary | no; source-only demonstration transport |
 
 ## Units
@@ -520,11 +521,11 @@ The three text variants share these fields:
 | Field | Meaning |
 |---|---|
 | `segment_type` | "Equal", "Insert", or "Delete": the diff role of this anchor. |
-| `kind` | What the anchor is: "Drawing", "Omml", "Hyperlink", "Field", "Sdt", "Ruby", "SmartArt", "CommentReference", "FootnoteReference", "EndnoteReference", "SmartTag", "Sym", "Ptab", "CustomXml", or {"Unknown":name}. |
+| `kind` | What the anchor is: "Drawing", "Omml", "Hyperlink", "Field", "Sdt", "Ruby", "SmartArt", "CommentReference", "FootnoteReference", "EndnoteReference", "SmartTag", "Sym", "Ptab", "CustomXml", {"Unknown":name}, or the zero-width comment range markers "CommentRangeStart" and "CommentRangeEnd". |
 | `opaque_id` | The anchor's stable id. |
 | `inline_index` | Position of the anchor in the block's inline stream. |
 | `text` | Visible label when known (a link's text, a field's result; in a table cell paragraph, a content control's current value), else null. |
-| `reference_id` | The `w:id` for footnote, endnote, and comment references; else null. |
+| `reference_id` | The `w:id` for footnote, endnote, and comment references and comment range markers; else null. |
 | `field_kind` | For fields: "Begin", "Instruction", "Separate", "End", "Simple", or {"Unknown":name}. |
 | `field_instruction` | Field instruction text, for fields. |
 | `asset_ref` | Asset payload: an image data URI, or raw equation OMML XML; null for other kinds. |
@@ -693,7 +694,7 @@ blocks use:
 | Story | Shape |
 |---|---|
 | `footnotes`, `endnotes` | `{"id", "segments"}` per story. |
-| `comments` | `{"id", "author", "date", "segments", "resolved", "parent_para_id"}`; `resolved` comes from the comments-extended part, and `parent_para_id` links a reply to its thread parent. A commented span in the body carries a `CommentReference` opaque anchor whose `reference_id` equals the comment `id`. |
+| `comments` | `{"id", "author", "date", "segments", "resolved", "para_id", "parent_para_id"}`; `resolved` comes from the comments-extended part, `para_id` is the comment's own thread key, and a reply's `parent_para_id` equals its parent's `para_id`. A commented span in the body (or a table cell) is bracketed by a `CommentRangeStart` and a `CommentRangeEnd` opaque anchor whose `reference_id` equals the comment `id` (opaque ids `comment_<id>_start` / `comment_<id>_end`); the comment's reference is a separate `CommentReference` anchor with the same `reference_id`. |
 | `headers`, `footers` | One band per reference the body section binds: `{"kind": "default"/"first"/"even", "paragraphs": [...]}`, each paragraph carrying `align`, `tab_stops`, and `segments` so a centered footer renders centered. |
 
 ### Section properties
@@ -1166,7 +1167,7 @@ selective accept or reject. That loop is the same on every transport
 
 ### Revision kinds
 
-`insert`, `delete`, `format_run`, `format_paragraph`, `format_table`, `format_row`, `format_cell`, `format_section`, `opaque_interior`, `move`, `cell_merge`
+`insert`, `delete`, `format_run`, `format_paragraph`, `format_paragraph_mark`, `format_table`, `format_row`, `format_cell`, `format_section`, `opaque_interior`, `move`, `cell_merge`
 
 Transports serve projections of these records (HTTP `GET /revisions` rows
 carry `revision_id`, `author`, `kind`, `block_id`, `excerpt`, `date`, and

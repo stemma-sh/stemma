@@ -1,6 +1,6 @@
 {
   "name": "preexisting-moves",
   "spec_ref": "ECMA-376 \u00a717.13.5.21-28",
-  "description": "Pre-existing moveFrom/moveTo with range markers linked by name='move_0'",
-  "expected_behavior": "import_docx().canonical should preserve move_id on TrackedBlocks linking source and destination"
+  "description": "Pre-existing whole-paragraph move in Word's shape, ranges linked by name='move_0'",
+  "expected_behavior": "import_docx() reads one move: the two paragraphs share move_id 'move_0', one moved-from and one moved-to"
 }

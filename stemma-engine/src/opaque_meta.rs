@@ -573,6 +573,7 @@ mod tests {
     /// shape the read projection consumes.
     fn node(kind: OpaqueKind, raw_xml: Option<Vec<u8>>) -> OpaqueInlineNode {
         OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("o_test"),
             kind,
             opaque_ref: "ref".to_string(),
@@ -1004,6 +1005,7 @@ mod tests {
     fn project_hyperlink_surfaces_url_and_anchor() {
         let n = node(
             OpaqueKind::Hyperlink(HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: Some("https://example.com".into()),
                 anchor: Some("section2".into()),
                 text: "click".into(),

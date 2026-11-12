@@ -51,6 +51,32 @@ pub trait ChangePlanResolver {
         after: &TableNode,
         block_index: usize,
     ) -> Result<Option<crate::domain::NestedTableDiff>, String>;
+
+    /// How the blocks of a related cell pair up, in order, when the plan's
+    /// comparison reads that itself: which base block is the edited form of
+    /// which target block, and which blocks are deleted or inserted. `None`
+    /// leaves the pairing to [`reconcile_cell_blocks`], which pairs blocks of
+    /// identical content only (an edited block then reads as deleted and
+    /// inserted); that is the contract for a plan that does not compare
+    /// cells itself, such as an explicit edit.
+    fn cell_block_pairing(
+        &self,
+        _before: &[BlockNode],
+        _after: &[BlockNode],
+    ) -> Result<Option<Vec<CellBlockStep>>, String> {
+        Ok(None)
+    }
+}
+
+/// One step of a cell's block pairing ([`ChangePlanResolver::cell_block_pairing`]),
+/// in document order on both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum CellBlockStep {
+    /// Base block `0` is the edited form of target block `1`.
+    Paired(usize, usize),
+    Deleted(usize),
+    Inserted(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +262,32 @@ pub fn paragraph_text_to_inlines_with_formatting(
                 joins_following_text_run: false,
             }));
             inline_index += 1;
+        } else if ch == crate::local_change::TEXT_LINE_FEED {
+            // A line feed written in the run's text, not a hard break.
+            buf.push('\n');
+        } else if ch == crate::local_change::TEXT_NO_BREAK_HYPHEN {
+            // The `w:noBreakHyphen` element, its own node as import reads it.
+            flush_text(
+                &mut buf,
+                &mut out,
+                &mut inline_index,
+                &style_props,
+                &formatting_change,
+            );
+            out.push(InlineNode::from(crate::domain::TextNode {
+                id: NodeId::from(format!(
+                    "{}_seg{}_t{}",
+                    paragraph_id.0, segment_index, inline_index
+                )),
+                text_role: Some(crate::domain::TextRole::NoBreakHyphen),
+                text: "\u{2011}".to_string(),
+                marks: marks.to_vec(),
+                style_props: style_props.clone(),
+                rpr_authored,
+                source_run_attrs: Vec::new(),
+                formatting_change: formatting_change.clone(),
+            }));
+            inline_index += 1;
         } else {
             buf.push(ch);
         }
@@ -341,10 +393,13 @@ pub fn range_contains_auto_field_instruction(
 ///   4. Drops Deleted non-field content that was paired with a deleted Separate
 ///      (since we're keeping only the Inserted/Normal version of the field).
 ///
+/// A field whose structural opaques all carry one tracked status (deleted or
+/// inserted whole, cached result included) is not split and is left as it is.
+///
 /// This pass is shared by both materializers (Invariant M, domain-model §6). It is
 /// heavily guarded and returns its input unchanged unless an auto-updating field
 /// range (PAGE/NUMPAGES/SECTIONPAGES) has split structural opaques or tracked
-/// cached-result text. On ordinary edit-path output, where fields are preserved as
+/// cached-result text inside a kept field. On ordinary edit-path output, where fields are preserved as
 /// Normal, this is a no-op, so running it on both paths makes the pass set
 /// identical without changing well-formed output.
 #[doc(hidden)]
@@ -386,6 +441,13 @@ pub fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> Vec<Trac
 
     if field_ranges.is_empty() {
         return segments;
+    }
+
+    // Each inline inside a balanced Begin...End range: part of a complete
+    // field, never an orphan.
+    let mut in_complete_field = vec![false; flat.len()];
+    for &(start, end) in &field_ranges {
+        in_complete_field[start..=end].fill(true);
     }
 
     let candidate_ranges: Vec<(usize, usize)> = field_ranges
@@ -445,20 +507,16 @@ pub fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> Vec<Trac
         let structural_all_normal = structural_statuses
             .iter()
             .all(|(idx, _)| matches!(flat[*idx].1, TrackingStatus::Normal));
-        let structural_all_deleted = structural_statuses
-            .iter()
-            .all(|(idx, _)| matches!(flat[*idx].1, TrackingStatus::Deleted(_)));
         let tracked_non_field_content = flat[start..=end].iter().any(|(inline, status)| {
             inline_field_kind(inline).is_none() && !matches!(status, TrackingStatus::Normal)
         });
 
-        if structural_all_deleted {
-            for idx in start..=end {
-                to_remove.insert(idx);
-            }
-            continue;
-        }
-
+        // A field whose structural parts all carry one status is not split:
+        // deleted (or inserted) whole, it is a complete field inside `w:del`
+        // (`w:ins`), valid markup (§17.13.5.14, §17.13.5.18: their runs may
+        // hold fldChar and instrText). Rejecting the deletion restores it, so
+        // its cached result stays deleted with it: dropping the field would
+        // lose it from the Reject All reading.
         let should_repair_structure = !all_structural_same;
         let should_normalize_cached_result = structural_all_normal && tracked_non_field_content;
 
@@ -641,7 +699,9 @@ pub fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> Vec<Trac
     // Handle orphaned Deleted structural opaques immediately adjacent to an
     // auto-field candidate range. These arise when the diff leaves the "old"
     // field shell outside the matched Begin...End range but the surviving auto
-    // field lives in the adjacent candidate range.
+    // field lives in the adjacent candidate range. A structural opaque of a
+    // complete field (a field deleted whole beside the one inserted in its
+    // place) is not an orphan: removing it would tear that field.
     for &(start, end) in &candidate_ranges {
         let mut idx = start;
         while idx > 0 {
@@ -649,6 +709,9 @@ pub fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> Vec<Trac
             if to_remove.contains(&probe) {
                 idx = probe;
                 continue;
+            }
+            if in_complete_field[probe] {
+                break;
             }
             let Some(kind) = inline_field_kind(&flat[probe].0) else {
                 break;
@@ -669,6 +732,9 @@ pub fn coalesce_split_field_sequences(segments: Vec<TrackedSegment>) -> Vec<Trac
             if to_remove.contains(&idx) {
                 idx += 1;
                 continue;
+            }
+            if in_complete_field[idx] {
+                break;
             }
             let Some(kind) = inline_field_kind(&flat[idx].0) else {
                 break;
@@ -806,11 +872,39 @@ pub fn inline_changes_to_segments_with_opaques(
     base_opaques: &[crate::domain::OpaqueInlineNode],
     target_opaques: &[crate::domain::OpaqueInlineNode],
 ) -> Result<Vec<TrackedSegment>, MergeError> {
+    inline_changes_to_tracked_segments(
+        paragraph_id,
+        inline_changes,
+        revision,
+        rev_counter,
+        base_opaques,
+        target_opaques,
+    )
+    .map(|(segments, _)| segments)
+}
+
+/// [`inline_changes_to_segments_with_opaques`], also returning, per inline
+/// change, the revision ids of the insertion and deletion statuses it was
+/// given. Every such status gets a fresh revision id, so a caller can find the
+/// segments an inline change became after the segment normalization (which
+/// merges and reorders segments but never merges two revisions).
+#[doc(hidden)]
+pub fn inline_changes_to_tracked_segments(
+    paragraph_id: &NodeId,
+    inline_changes: &[InlineChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+    base_opaques: &[crate::domain::OpaqueInlineNode],
+    target_opaques: &[crate::domain::OpaqueInlineNode],
+) -> Result<(Vec<TrackedSegment>, Vec<Vec<u32>>), MergeError> {
     let mut segments = Vec::new();
     let mut base_opaque_idx = 0usize;
     let mut target_opaque_idx = 0usize;
+    // Where each inline change's segments start in `segments`.
+    let mut starts = Vec::with_capacity(inline_changes.len());
 
     for (segment_index, change) in inline_changes.iter().enumerate() {
+        starts.push(segments.len());
         let (status, text, marks, style_props, rpr_authored, formatting_change) = match change {
             InlineChange::Unchanged {
                 text,
@@ -874,15 +968,22 @@ pub fn inline_changes_to_segments_with_opaques(
                 None,
             ),
             InlineChange::Opaque {
-                segment_type, kind, ..
+                segment_type,
+                kind,
+                object_runs,
+                ..
             } => {
-                // The public diff projection represents both zero-width comment
-                // range starts and comment references as CommentReference
-                // opaque segments. They are not OpaqueInlineNodes and therefore
-                // must not consume either opaque cursor. The structural-marker
-                // reconciliation below re-injects the lossless start/end/ref
-                // nodes from the base and target paragraphs at their offsets.
-                if *kind == crate::domain::OpaqueSegmentKind::CommentReference {
+                // Comment range markers and comment references are projected
+                // as their own opaque segments. They must not consume either
+                // opaque cursor: the structural-marker reconciliation below
+                // re-injects the lossless start/end/ref nodes from the base and
+                // target paragraphs at their offsets.
+                if matches!(
+                    kind,
+                    crate::domain::OpaqueSegmentKind::CommentReference
+                        | crate::domain::OpaqueSegmentKind::CommentRangeStart
+                        | crate::domain::OpaqueSegmentKind::CommentRangeEnd
+                ) {
                     continue;
                 }
                 // Opaque changes (images, equations, fields) are handled directly
@@ -966,6 +1067,28 @@ pub fn inline_changes_to_segments_with_opaques(
                         base_opaque_idx += 1;
                         target_opaque_idx += 1;
 
+                        if let Some(object_runs) = object_runs {
+                            let link = redlined_object(
+                                base_opaque,
+                                target_opaque,
+                                object_runs,
+                                revision,
+                                rev_counter,
+                            )
+                            .map_err(|message| MergeError {
+                                kind: MergeErrorKind::InvalidPlan,
+                                message,
+                                context: format!(
+                                    "paragraph {}, InlineChange::Opaque Equal (object runs)",
+                                    paragraph_id.0
+                                ),
+                            })?;
+                            segments.push(TrackedSegment {
+                                status: TrackingStatus::Normal,
+                                inlines: vec![InlineNode::from(link)],
+                            });
+                            continue;
+                        }
                         let content_changed = opaque_payload_changed(base_opaque, target_opaque);
 
                         if content_changed {
@@ -1065,6 +1188,19 @@ pub fn inline_changes_to_segments_with_opaques(
             segments.push(TrackedSegment { status, inlines });
         }
     }
+    starts.push(segments.len());
+    let status_revisions: Vec<Vec<u32>> = starts
+        .windows(2)
+        .map(|w| {
+            segments[w[0]..w[1]]
+                .iter()
+                .filter_map(|segment| match &segment.status {
+                    TrackingStatus::Inserted(r) | TrackingStatus::Deleted(r) => Some(r.revision_id),
+                    TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => None,
+                })
+                .collect()
+        })
+        .collect();
     // Normalize only auto-updating field sequences (PAGE / NUMPAGES / SECTIONPAGES).
     // Word does not track cached result changes for these fields; keeping the
     // field structure/result as Normal avoids corrupt accepted output while
@@ -1077,7 +1213,7 @@ pub fn inline_changes_to_segments_with_opaques(
     // see the unmerged segment boundaries they depend on.
     let mut segments = segments;
     crate::edit::normalize_segments(&mut segments);
-    Ok(segments)
+    Ok((segments, status_revisions))
 }
 
 #[doc(hidden)]
@@ -1385,7 +1521,37 @@ pub fn reconstruct_opaques_with_change_detection(
                 // direct run properties around fldChar/instrText-like shells.
                 let opaque_node = match (target_opaque, base_opaque) {
                     (Some(target), Some(base)) => {
-                        Some(unchanged_opaque_in_base_package(&base, target))
+                        let mut kept = unchanged_opaque_in_base_package(&base, target);
+                        // A field part's run is compared like the text
+                        // around it. When the plan records a formatting
+                        // change for this character, the run is the
+                        // target's, recording the base's run (its own
+                        // revision, as each run's w:rPrChange is);
+                        // otherwise it keeps the base's spelling. Both
+                        // runs as written.
+                        if matches!(kept.kind, OpaqueKind::Field(_)) {
+                            match &formatting_change {
+                                Some(fc) => {
+                                    kept.formatting_change = Some(crate::domain::FormattingChange {
+                                        carrier: crate::domain::RunFormattingChangeCarrier::RunProperties,
+                                        previous_marks: base.wrapper_marks.clone(),
+                                        previous_style_props: base.wrapper_style_props.clone(),
+                                        previous_rpr_authored: base.wrapper_rpr_authored,
+                                        revision_id: next_revision(revision, rev_counter).revision_id,
+                                        identity: 0,
+                                        author: fc.author.clone(),
+                                        date: fc.date.clone(),
+                                    });
+                                }
+                                None => {
+                                    kept.wrapper_marks = base.wrapper_marks.clone();
+                                    kept.wrapper_style_props = base.wrapper_style_props.clone();
+                                    kept.wrapper_rpr_authored = base.wrapper_rpr_authored;
+                                    kept.source_run_attrs = base.source_run_attrs.clone();
+                                }
+                            }
+                        }
+                        Some(kept)
                     }
                     (target, base) => target.or(base),
                 };
@@ -1405,6 +1571,649 @@ pub fn reconstruct_opaques_with_change_detection(
     }
 
     segments
+}
+
+/// Check a paired object's runs from a comparison plan (`object_runs`)
+/// against the two objects' own runs: every run is text and run properties
+/// only and untracked, and the kept and deleted runs spell the base runs and
+/// the kept and inserted runs the target runs, character by character in the
+/// same run properties. Rejecting every revision then leaves the base object
+/// and accepting every one the target object.
+fn check_object_runs(
+    object_runs: &[crate::domain::ObjectRunChange],
+    base_runs: &[crate::domain::HyperlinkRun],
+    target_runs: &[crate::domain::HyperlinkRun],
+    what: &str,
+) -> Result<(), String> {
+    /// A character with its run's properties (`rpr_xml`, `additional_rpr_xml`).
+    type FormattedChar<'r> = (char, &'r Option<Vec<u8>>, &'r Vec<Vec<u8>>);
+    fn chars<'r>(
+        runs: impl Iterator<Item = &'r crate::domain::HyperlinkRun>,
+    ) -> Vec<FormattedChar<'r>> {
+        runs.flat_map(|run| {
+            run.text
+                .chars()
+                .map(move |c| (c, &run.rpr_xml, &run.additional_rpr_xml))
+        })
+        .collect()
+    }
+    let plain = |run: &crate::domain::HyperlinkRun| {
+        run.status == TrackingStatus::Normal && run.source_xml.is_none()
+    };
+    if !base_runs.iter().all(plain)
+        || !target_runs.iter().all(plain)
+        || !object_runs
+            .iter()
+            .all(|r| plain(&r.run) && r.target_spelling.iter().all(plain))
+    {
+        return Err(format!("{what}: runs are tracked or kept verbatim"));
+    }
+    let reading = |keep: InlineChangeSegmentType| {
+        chars(
+            object_runs
+                .iter()
+                .filter(move |r| r.change == InlineChangeSegmentType::Equal || r.change == keep)
+                .map(|r| &r.run),
+        )
+    };
+    if reading(InlineChangeSegmentType::Delete) != chars(base_runs.iter()) {
+        return Err(format!("{what}: the runs do not spell the base object's"));
+    }
+    // The target reading: a kept run equal to the target's only by
+    // effective value reads as the target's own spelling of it.
+    let target_reading = chars(
+        object_runs
+            .iter()
+            .filter(|r| {
+                r.change == InlineChangeSegmentType::Equal
+                    || r.change == InlineChangeSegmentType::Insert
+            })
+            .flat_map(|r| {
+                if r.target_spelling.is_empty() {
+                    std::slice::from_ref(&r.run).iter()
+                } else {
+                    r.target_spelling.iter()
+                }
+            }),
+    );
+    if target_reading != chars(target_runs.iter()) {
+        return Err(format!("{what}: the runs do not spell the target object's"));
+    }
+    Ok(())
+}
+
+/// A plan's object runs with their statuses: kept runs untracked, each run
+/// of adjacent deleted (inserted) runs in one deletion (insertion), as a
+/// deletion or insertion of text spanning several runs is.
+fn tracked_object_runs(
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Vec<crate::domain::HyperlinkRun> {
+    let mut runs: Vec<crate::domain::HyperlinkRun> = Vec::with_capacity(object_runs.len());
+    let mut previous: Option<&InlineChangeSegmentType> = None;
+    for change in object_runs {
+        let mut run = change.run.clone();
+        run.status = match change.change {
+            InlineChangeSegmentType::Equal => TrackingStatus::Normal,
+            InlineChangeSegmentType::Delete | InlineChangeSegmentType::Insert
+                if previous == Some(&change.change) =>
+            {
+                runs.last()
+                    .expect("a previous run of the same kind")
+                    .status
+                    .clone()
+            }
+            InlineChangeSegmentType::Delete => {
+                TrackingStatus::Deleted(next_revision(revision, rev_counter))
+            }
+            InlineChangeSegmentType::Insert => {
+                TrackingStatus::Inserted(next_revision(revision, rev_counter))
+            }
+        };
+        previous = Some(&change.change);
+        runs.push(run);
+    }
+    runs
+}
+
+/// A paired object kept as one object whose content changes inside it
+/// (`InlineChange::Opaque`'s `object_runs`): a hyperlink
+/// ([`redlined_hyperlink`]) or an inline content control
+/// ([`redlined_content_control`]). Any other object is refused.
+fn redlined_object(
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Result<crate::domain::OpaqueInlineNode, String> {
+    match (&base.kind, &target.kind) {
+        (OpaqueKind::Hyperlink(_), OpaqueKind::Hyperlink(_)) => {
+            redlined_hyperlink(base, target, object_runs, revision, rev_counter)
+        }
+        (OpaqueKind::Sdt, OpaqueKind::Sdt) => {
+            redlined_content_control(base, target, object_runs, revision, rev_counter)
+        }
+        (OpaqueKind::Drawing, OpaqueKind::Drawing) => {
+            redlined_text_box(base, target, object_runs, revision, rev_counter)
+        }
+        _ => Err(format!(
+            "object runs pair {} with {}, which are not two hyperlinks, content controls or text boxes",
+            base.id.0, target.id.0
+        )),
+    }
+}
+
+/// A paired hyperlink kept as one link whose display text changes inside it:
+/// the link in the base package (as an unchanged opaque,
+/// [`unchanged_opaque_in_base_package`]) with the plan's runs, each deleted
+/// or inserted run in a revision of its own (`HyperlinkRun::status`, written
+/// as `w:del` / `w:ins` inside the `w:hyperlink`, §17.13.5). The plan may
+/// change nothing else about the link.
+fn redlined_hyperlink(
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Result<crate::domain::OpaqueInlineNode, String> {
+    let (OpaqueKind::Hyperlink(base_link), OpaqueKind::Hyperlink(target_link)) =
+        (&base.kind, &target.kind)
+    else {
+        unreachable!("redlined_object dispatches hyperlink pairs only");
+    };
+    if base_link.url != target_link.url
+        || base_link.anchor != target_link.anchor
+        || base_link.extra_attrs != target_link.extra_attrs
+    {
+        return Err(format!(
+            "link runs pair hyperlinks {} and {} whose destinations or attributes differ",
+            base.id.0, target.id.0
+        ));
+    }
+    if base.raw_xml.is_some() || target.raw_xml.is_some() {
+        return Err(format!(
+            "link runs pair hyperlinks {} and {} written from verbatim XML",
+            base.id.0, target.id.0
+        ));
+    }
+    check_object_runs(
+        object_runs,
+        &base_link.runs,
+        &target_link.runs,
+        &format!("hyperlinks {} / {}", base.id.0, target.id.0),
+    )?;
+    let mut link = unchanged_opaque_in_base_package(base, target.clone());
+    let OpaqueKind::Hyperlink(data) = &mut link.kind else {
+        unreachable!("the target is a hyperlink");
+    };
+    let runs = tracked_object_runs(object_runs, revision, rev_counter);
+    data.text = runs
+        .iter()
+        .filter(|run| !matches!(run.status, TrackingStatus::Deleted(_)))
+        .map(|run| run.text.as_str())
+        .collect();
+    data.runs = runs;
+    Ok(link)
+}
+
+/// The runs of an inline content control's content (`w:sdtContent`,
+/// §17.5.2.34) when each is text and run properties only: a `w:r` holding at
+/// most one leading `w:rPr` and then only `w:t` and `w:tab` (read as a tab
+/// character). `None` for any other content (a field, a nested control, a
+/// hyperlink, a break, a bookmark): it cannot be rebuilt from text.
+#[doc(hidden)]
+pub fn content_control_text_runs(raw_xml: &[u8]) -> Option<Vec<crate::domain::HyperlinkRun>> {
+    let sdt = crate::word_xml::parse_raw_fragment(raw_xml).ok()?;
+    if !crate::word_xml::is_w_tag(&sdt, "sdt") {
+        return None;
+    }
+    let content = sdt.children.iter().find_map(|child| match child {
+        xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "sdtContent") => Some(e),
+        _ => None,
+    })?;
+    let mut runs = Vec::new();
+    for child in &content.children {
+        match child {
+            xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "r") => {
+                runs.push(plain_text_run(e)?);
+            }
+            // Insignificant white space between elements.
+            xmltree::XMLNode::Text(t) if t.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    Some(runs)
+}
+
+/// What makes two inline content controls the same control: Word's control
+/// id (`w:sdtPr/w:id`, §17.5.2.18) when it has one, else all of its
+/// properties (the canonical form of `w:sdtPr`). `None` when the XML is not
+/// a content control.
+#[doc(hidden)]
+pub fn content_control_key(raw_xml: &[u8]) -> Option<String> {
+    let sdt = crate::word_xml::parse_raw_fragment(raw_xml).ok()?;
+    if !crate::word_xml::is_w_tag(&sdt, "sdt") {
+        return None;
+    }
+    let properties = sdt.children.iter().find_map(|child| match child {
+        xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "sdtPr") => Some(e),
+        _ => None,
+    });
+    let Some(properties) = properties else {
+        return Some("properties:none".to_string());
+    };
+    let id = properties.children.iter().find_map(|child| match child {
+        xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "id") => {
+            crate::xml_attrs::attr_get(e, "w:val").cloned()
+        }
+        _ => None,
+    });
+    Some(match id {
+        Some(id) => format!("id:{id}"),
+        None => format!(
+            "properties:{}",
+            crate::import::canonical_raw_hash(&crate::word_xml::serialize_raw_fragment(properties))
+        ),
+    })
+}
+
+/// A run (`w:r`) as text and run properties, when that is all it is: at most
+/// one leading `w:rPr`, then only `w:t` and `w:tab` (read as a tab
+/// character). `None` for any other run (a field character, a break, a
+/// drawing): it cannot be rebuilt from text.
+fn plain_text_run(run: &xmltree::Element) -> Option<crate::domain::HyperlinkRun> {
+    let mut rpr_xml = None;
+    let mut text = String::new();
+    for (index, part) in run.children.iter().enumerate() {
+        match part {
+            xmltree::XMLNode::Element(e) if index == 0 && crate::word_xml::is_w_tag(e, "rPr") => {
+                rpr_xml = Some(crate::word_xml::serialize_raw_fragment(e));
+            }
+            xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "t") => {
+                for node in &e.children {
+                    match node {
+                        xmltree::XMLNode::Text(t) => text.push_str(t),
+                        _ => return None,
+                    }
+                }
+            }
+            xmltree::XMLNode::Element(e)
+                if crate::word_xml::is_w_tag(e, "tab") && e.children.is_empty() =>
+            {
+                text.push('\t');
+            }
+            xmltree::XMLNode::Text(t) if t.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    Some(crate::domain::HyperlinkRun {
+        text,
+        rpr_xml,
+        additional_rpr_xml: Vec::new(),
+        source_xml: None,
+        source_run_attrs: Vec::new(),
+        status: TrackingStatus::Normal,
+    })
+}
+
+/// One paragraph of a text box's content as a comparison reads it
+/// ([`text_box_paragraphs`]).
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextBoxParagraph {
+    /// The paragraph's children before its first run (its properties, a
+    /// bookmark), serialized: kept as they are.
+    pub frame: Vec<Vec<u8>>,
+    /// Its runs, each text and run properties only.
+    pub runs: Vec<crate::domain::HyperlinkRun>,
+}
+
+/// The one text box content (`w:txbxContent`, §17.17.1.1) under `root`, when
+/// there is exactly one: a text box written in two representations
+/// (`mc:AlternateContent`'s choice and fallback) has two, and a drawing with
+/// no text box none.
+fn single_text_box_content(root: &xmltree::Element) -> Option<&xmltree::Element> {
+    fn collect<'e>(element: &'e xmltree::Element, out: &mut Vec<&'e xmltree::Element>) {
+        for child in &element.children {
+            if let xmltree::XMLNode::Element(e) = child {
+                if crate::word_xml::is_w_tag(e, "txbxContent") {
+                    out.push(e);
+                } else {
+                    collect(e, out);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    collect(root, &mut found);
+    match found.as_slice() {
+        [one] => Some(one),
+        _ => None,
+    }
+}
+
+fn single_text_box_content_mut(root: &mut xmltree::Element) -> Option<&mut xmltree::Element> {
+    fn find(element: &mut xmltree::Element) -> Option<&mut xmltree::Element> {
+        for child in &mut element.children {
+            if let xmltree::XMLNode::Element(e) = child {
+                if crate::word_xml::is_w_tag(e, "txbxContent") {
+                    return Some(e);
+                }
+                if let Some(found) = find(e) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    single_text_box_content(root)?;
+    find(root)
+}
+
+/// The paragraphs of a drawing's text box when it has one text box content
+/// and every paragraph is its frame (children before its first run) then
+/// runs of text and run properties only ([`plain_text_run`]). `None` for any
+/// other drawing: no text box, two representations of one, a table or a
+/// field inside.
+#[doc(hidden)]
+pub fn text_box_paragraphs(raw_xml: &[u8]) -> Option<Vec<TextBoxParagraph>> {
+    let root = crate::word_xml::parse_raw_fragment(raw_xml).ok()?;
+    let content = single_text_box_content(&root)?;
+    let mut paragraphs = Vec::new();
+    for child in &content.children {
+        let paragraph = match child {
+            xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "p") => e,
+            xmltree::XMLNode::Text(t) if t.trim().is_empty() => continue,
+            _ => return None,
+        };
+        let mut frame = Vec::new();
+        let mut runs = Vec::new();
+        for part in &paragraph.children {
+            match part {
+                xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "r") => {
+                    runs.push(plain_text_run(e)?);
+                }
+                xmltree::XMLNode::Element(e) if runs.is_empty() => {
+                    frame.push(crate::word_xml::serialize_raw_fragment(e));
+                }
+                xmltree::XMLNode::Text(t) if t.trim().is_empty() => {}
+                _ => return None,
+            }
+        }
+        paragraphs.push(TextBoxParagraph { frame, runs });
+    }
+    Some(paragraphs)
+}
+
+/// What makes two text boxes the same text box: the drawing around its text
+/// (its canonical spelling with the text box content emptied and Word's
+/// drawing session ids left out), when the drawing has one text box content
+/// and no relationship reference (which would name a package-local part).
+/// `None` for any other drawing.
+#[doc(hidden)]
+pub fn text_box_frame_key(raw_xml: &[u8]) -> Option<String> {
+    let mut root = crate::word_xml::parse_raw_fragment(raw_xml).ok()?;
+    single_text_box_content_mut(&mut root)?.children.clear();
+    crate::package_ops::relationship_identity::remove_session_ids(&mut root);
+    if crate::package_ops::relationship_identity::has_relationship_attribute(&root) {
+        return None;
+    }
+    Some(crate::import::canonical_raw_hash(
+        &crate::word_xml::serialize_raw_fragment(&root),
+    ))
+}
+
+/// A paired text box kept as one drawing whose text changes inside it: the
+/// base drawing (both drawings are the same apart from their text,
+/// [`text_box_frame_key`]) whose text box paragraphs each hold the plan's
+/// runs for that paragraph, each deleted or inserted run in a `w:del` /
+/// `w:ins` of its own (§17.13.5; a text box's content holds block content,
+/// §17.17.1.1). Both text boxes must have the same paragraphs, frame by
+/// frame ([`text_box_paragraphs`]).
+fn redlined_text_box(
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Result<crate::domain::OpaqueInlineNode, String> {
+    let what = format!("text boxes {} / {}", base.id.0, target.id.0);
+    let raw = |node: &crate::domain::OpaqueInlineNode| {
+        node.raw_xml
+            .clone()
+            .ok_or_else(|| format!("{what}: drawing {} has no XML", node.id.0))
+    };
+    let (base_raw, target_raw) = (raw(base)?, raw(target)?);
+    let key = text_box_frame_key(&base_raw);
+    if key.is_none() || key != text_box_frame_key(&target_raw) {
+        return Err(format!("{what}: the drawings differ apart from their text"));
+    }
+    let not_text = |side: &str| format!("{what}: the {side} text box is not text paragraphs");
+    let base_paragraphs = text_box_paragraphs(&base_raw).ok_or_else(|| not_text("base"))?;
+    let target_paragraphs = text_box_paragraphs(&target_raw).ok_or_else(|| not_text("target"))?;
+    if base_paragraphs.len() != target_paragraphs.len()
+        || base_paragraphs
+            .iter()
+            .zip(&target_paragraphs)
+            .any(|(b, t)| b.frame != t.frame)
+    {
+        return Err(format!(
+            "{what}: the text boxes' paragraphs differ apart from their runs"
+        ));
+    }
+    if let Some(run) = object_runs
+        .iter()
+        .find(|r| r.paragraph >= base_paragraphs.len())
+    {
+        return Err(format!(
+            "{what}: a run names paragraph {} of {}",
+            run.paragraph,
+            base_paragraphs.len()
+        ));
+    }
+    let mut root = crate::word_xml::parse_raw_fragment(&base_raw)
+        .map_err(|e| format!("{what}: base drawing XML: {e}"))?;
+    let content = single_text_box_content_mut(&mut root)
+        .ok_or_else(|| format!("{what}: base drawing has no single text box content"))?;
+    let mut index = 0usize;
+    for child in &mut content.children {
+        let xmltree::XMLNode::Element(paragraph) = child else {
+            continue;
+        };
+        let runs: Vec<crate::domain::ObjectRunChange> = object_runs
+            .iter()
+            .filter(|r| r.paragraph == index)
+            .cloned()
+            .collect();
+        check_object_runs(
+            &runs,
+            &base_paragraphs[index].runs,
+            &target_paragraphs[index].runs,
+            &format!("{what}, paragraph {index}"),
+        )?;
+        paragraph
+            .children
+            .retain(|part| !matches!(part, xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "r")));
+        paragraph
+            .children
+            .extend(tracked_run_elements(&runs, revision, rev_counter));
+        index += 1;
+    }
+    let merged = crate::word_xml::serialize_raw_fragment(&root);
+    let mut drawing = unchanged_opaque_in_base_package(base, target.clone());
+    drawing.content_hash = Some(crate::import::canonical_raw_hash(&merged));
+    drawing.raw_xml = Some(merged);
+    Ok(drawing)
+}
+
+/// The run elements of a plan's object runs: kept runs as they are, each run
+/// of adjacent deleted (inserted) runs in one `w:del` (`w:ins`) with a
+/// revision of its own.
+fn tracked_run_elements(
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Vec<xmltree::XMLNode> {
+    let runs = tracked_object_runs(object_runs, revision, rev_counter);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < runs.len() {
+        let status = runs[i].status.clone();
+        let mut j = i + 1;
+        while j < runs.len() && runs[j].status == status {
+            j += 1;
+        }
+        let deleted = matches!(status, TrackingStatus::Deleted(_));
+        let built = runs[i..j].iter().map(|run| {
+            xmltree::XMLNode::Element(crate::serialize::build_hyperlink_run(run, deleted))
+        });
+        match &status {
+            TrackingStatus::Normal => out.extend(built),
+            TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => {
+                let author = rev.author.as_deref().unwrap_or("");
+                let date = rev.date.as_deref().unwrap_or("");
+                let mut container = if deleted {
+                    crate::word_xml::w_del(rev.revision_id, author, date)
+                } else {
+                    crate::word_xml::w_ins(rev.revision_id, author, date)
+                };
+                container.children.extend(built);
+                out.push(xmltree::XMLNode::Element(container));
+            }
+            TrackingStatus::InsertedThenDeleted(_) => {
+                unreachable!("tracked_object_runs gives runs one deletion or insertion")
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// A paired inline content control kept as one control whose content changes
+/// inside it: the target control (its properties: a control carries no
+/// revision, §17.5.2, so both readings show the target's, as for block
+/// controls) whose `w:sdtContent` holds the plan's runs, each deleted or
+/// inserted run in a `w:del` / `w:ins` of its own (§17.13.5.14, §17.13.5.18;
+/// `w:sdtContent` of a run-level control holds run content, §17.5.2.36).
+/// Both controls' content must be text and run properties only
+/// ([`content_control_text_runs`]).
+fn redlined_content_control(
+    base: &crate::domain::OpaqueInlineNode,
+    target: &crate::domain::OpaqueInlineNode,
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+) -> Result<crate::domain::OpaqueInlineNode, String> {
+    let what = format!("content controls {} / {}", base.id.0, target.id.0);
+    let no_xml = |node: &crate::domain::OpaqueInlineNode| {
+        format!("{what}: content control {} has no XML", node.id.0)
+    };
+    let base_raw = base.raw_xml.as_deref().ok_or_else(|| no_xml(base))?;
+    let target_raw = target.raw_xml.as_deref().ok_or_else(|| no_xml(target))?;
+    let sdt = redlined_control_element(
+        base_raw,
+        target_raw,
+        object_runs,
+        revision,
+        rev_counter,
+        &what,
+    )?;
+    let merged = crate::word_xml::serialize_raw_fragment(&sdt);
+    let mut control = unchanged_opaque_in_base_package(base, target.clone());
+    control.content_hash = Some(crate::import::canonical_raw_hash(&merged));
+    control.raw_xml = Some(merged);
+    Ok(control)
+}
+
+/// The pair of controls whose content a comparison compares: the controls
+/// themselves, or, when both controls' content is one nested control and
+/// those are the same control ([`content_control_key`]), that nested pair,
+/// recursively. (A date or list control nested in a rich-text control is a
+/// common Word shape.)
+#[doc(hidden)]
+pub fn compared_content_controls(base_raw: &[u8], target_raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (mut base, mut target) = (base_raw.to_vec(), target_raw.to_vec());
+    while let (Some(b), Some(t)) = (nested_control(&base), nested_control(&target)) {
+        if content_control_key(&b) != content_control_key(&t) || content_control_key(&b).is_none() {
+            break;
+        }
+        (base, target) = (b, t);
+    }
+    (base, target)
+}
+
+/// The nested control a control's content consists of, if that is all it
+/// holds (white space between elements aside).
+fn nested_control(raw_xml: &[u8]) -> Option<Vec<u8>> {
+    let sdt = crate::word_xml::parse_raw_fragment(raw_xml).ok()?;
+    let content = sdt.children.iter().find_map(|child| match child {
+        xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "sdtContent") => Some(e),
+        _ => None,
+    })?;
+    let mut elements = content.children.iter().filter_map(|child| match child {
+        xmltree::XMLNode::Element(e) => Some(Some(e)),
+        xmltree::XMLNode::Text(t) if t.trim().is_empty() => None,
+        _ => Some(None),
+    });
+    match (elements.next(), elements.next()) {
+        (Some(Some(inner)), None) if crate::word_xml::is_w_tag(inner, "sdt") => {
+            Some(crate::word_xml::serialize_raw_fragment(inner))
+        }
+        _ => None,
+    }
+}
+
+/// The merged control element: the target control with its content (or,
+/// for a nested pair, its nested control's content, recursively) holding
+/// the plan's runs.
+fn redlined_control_element(
+    base_raw: &[u8],
+    target_raw: &[u8],
+    object_runs: &[crate::domain::ObjectRunChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+    what: &str,
+) -> Result<xmltree::Element, String> {
+    let mut sdt = crate::word_xml::parse_raw_fragment(target_raw)
+        .map_err(|e| format!("{what}: target control XML: {e}"))?;
+    let inner = match (nested_control(base_raw), nested_control(target_raw)) {
+        (Some(b), Some(t))
+            if content_control_key(&b).is_some()
+                && content_control_key(&b) == content_control_key(&t) =>
+        {
+            Some(redlined_control_element(
+                &b,
+                &t,
+                object_runs,
+                revision,
+                rev_counter,
+                what,
+            )?)
+        }
+        _ => None,
+    };
+    let content = sdt
+        .children
+        .iter_mut()
+        .find_map(|child| match child {
+            xmltree::XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "sdtContent") => Some(e),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{what}: target control has no w:sdtContent"))?;
+    if let Some(inner) = inner {
+        content.children = vec![xmltree::XMLNode::Element(inner)];
+        return Ok(sdt);
+    }
+    let not_text = |side: &str| {
+        format!("{what}: the {side} control's content is not text and run properties only")
+    };
+    let base_runs = content_control_text_runs(base_raw).ok_or_else(|| not_text("base"))?;
+    let target_runs = content_control_text_runs(target_raw).ok_or_else(|| not_text("target"))?;
+    check_object_runs(object_runs, &base_runs, &target_runs, what)?;
+    content.children = tracked_run_elements(object_runs, revision, rev_counter);
+    Ok(sdt)
 }
 
 /// The unchanged form of an opaque whose base and target payloads are equal.
@@ -1460,6 +2269,49 @@ pub fn effective_text_prefix(p: &ParagraphNode) -> Option<&str> {
     p.literal_prefix.as_deref()
 }
 
+/// A paragraph's typed label as the reader sees it: the label with the
+/// whitespace written before it and between it and the body
+/// (`literal_prefix_leading_ws` / `_trailing_ws`). A typed label is text, so
+/// that whitespace is part of what the paragraph reads: "2. Body" and
+/// "\t2.\tBody" have different labels although the label itself is "2." in
+/// both. `None` when the paragraph has no typed label.
+#[doc(hidden)]
+pub fn literal_prefix_spelling(paragraph: &ParagraphNode) -> Option<String> {
+    paragraph
+        .literal_prefix
+        .as_deref()
+        .map(|prefix| materialized_prefix_text(prefix, paragraph))
+}
+
+/// Give `to` the typed label `from` has (every `literal_prefix*` field).
+#[doc(hidden)]
+pub fn copy_literal_prefix(from: &ParagraphNode, to: &mut ParagraphNode) {
+    to.literal_prefix = from.literal_prefix.clone();
+    to.literal_prefix_marks = from.literal_prefix_marks.clone();
+    to.literal_prefix_style_props = from.literal_prefix_style_props.clone();
+    to.literal_prefix_rpr_authored = from.literal_prefix_rpr_authored;
+    to.literal_prefix_leading_rpr = from.literal_prefix_leading_rpr.clone();
+    to.literal_prefix_trailing_rpr = from.literal_prefix_trailing_rpr.clone();
+    to.literal_prefix_leading_tab_twips = from.literal_prefix_leading_tab_twips;
+    to.literal_prefix_leading_tab_count = from.literal_prefix_leading_tab_count;
+    to.literal_prefix_leading_ws = from.literal_prefix_leading_ws.clone();
+    to.literal_prefix_trailing_ws = from.literal_prefix_trailing_ws.clone();
+    to.literal_prefix_has_trailing_tab = from.literal_prefix_has_trailing_tab;
+    to.literal_prefix_trailing_tab_stop_twips = from.literal_prefix_trailing_tab_stop_twips;
+}
+
+/// Return a paragraph's hoisted typed label to its text, as untracked
+/// characters ahead of the body, in the runs it was typed in (see
+/// `literal_prefix::inline_literal_prefix`).
+///
+/// # Panics
+///
+/// When the paragraph has no typed label.
+#[doc(hidden)]
+pub fn inline_literal_prefix(paragraph: &mut ParagraphNode) {
+    crate::literal_prefix::inline_literal_prefix(paragraph);
+}
+
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct PrefixMaterializationPlan {
@@ -1488,7 +2340,8 @@ pub fn plan_prefix_materialization(
 
     let old_prefix = effective_text_prefix(source).map(str::to_owned);
     let new_prefix = effective_text_prefix(target).map(str::to_owned);
-    let prefix_text_changed = old_prefix != new_prefix;
+    let prefix_text_changed = old_prefix != new_prefix
+        || literal_prefix_spelling(source) != literal_prefix_spelling(target);
 
     // Word accept/reject needs explicit inline prefix text when the visible
     // prefix is literal paragraph text on either terminal side. Structural
@@ -1756,21 +2609,101 @@ struct AnchoredMarker {
     pending_before: usize,
     inline: InlineNode,
     status: TrackingStatus,
+    move_edge: Option<MoveEdge>,
+}
+
+/// Which edge of a move's moved text a move decoration delimits. A move's
+/// container (`w:moveFrom`/`w:moveTo`, §17.13.5.22/24, imported as an open
+/// and a close decoration) and its range (`w:move*RangeStart`/`End`) wrap
+/// exactly the runs the move relocated; text a later edit types beside them
+/// is that editor's own revision and lies outside both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoveEdge {
+    Opens,
+    Closes,
+}
+
+/// The edge a proofing mark (`w:proofErr`, §17.13.8.1) is of: a
+/// `spellStart`/`gramStart` opens the bracket round the flagged word and a
+/// `spellEnd`/`gramEnd` closes it. Like a move's delimiters it hugs that
+/// word, so text an edit adds beside the bracket stays outside it. `None` for
+/// any other inline.
+fn proofing_edge(inline: &InlineNode) -> Option<MoveEdge> {
+    let InlineNode::Decoration(decoration) = inline else {
+        return None;
+    };
+    if decoration.kind != crate::domain::DecorationType::ProofError {
+        return None;
+    }
+    let element = crate::word_xml::parse_raw_fragment(decoration.raw_xml.as_deref()?).ok()?;
+    match crate::xml_attrs::attr_get(&element, "w:type").map(String::as_str) {
+        Some("spellStart" | "gramStart") => Some(MoveEdge::Opens),
+        Some("spellEnd" | "gramEnd") => Some(MoveEdge::Closes),
+        _ => None,
+    }
+}
+
+/// The move edge of each move decoration in `segments`, in document order;
+/// `None` for every other inline. Container open and close carry the same
+/// childless element, so they are told apart by pairing, as
+/// [`move_container_sides`] does.
+fn move_edges(segments: &[TrackedSegment]) -> Vec<Option<MoveEdge>> {
+    let mut open_container: Option<&[u8]> = None;
+    let mut edges = Vec::new();
+    for inline in segments.iter().flat_map(|segment| &segment.inlines) {
+        let InlineNode::Decoration(decoration) = inline else {
+            edges.push(None);
+            continue;
+        };
+        let raw = match (&decoration.kind, decoration.raw_xml.as_deref()) {
+            (crate::domain::DecorationType::MoveRange, Some(raw)) => raw,
+            _ => {
+                edges.push(None);
+                continue;
+            }
+        };
+        let element = crate::word_xml::parse_raw_fragment(raw)
+            .expect("an imported move decoration holds the element it was parsed from");
+        let edge = match element.name.rsplit(':').next() {
+            Some("moveFromRangeStart" | "moveToRangeStart") => MoveEdge::Opens,
+            Some("moveFromRangeEnd" | "moveToRangeEnd") => MoveEdge::Closes,
+            Some("moveFrom" | "moveTo") => match open_container {
+                None => {
+                    open_container = Some(raw);
+                    MoveEdge::Opens
+                }
+                Some(open_raw) => {
+                    assert_eq!(
+                        open_raw, raw,
+                        "a move container closes with its own element; containers do not nest"
+                    );
+                    open_container = None;
+                    MoveEdge::Closes
+                }
+            },
+            other => panic!("a move decoration holds a move element, found {other:?}"),
+        };
+        edges.push(Some(edge));
+    }
+    edges
 }
 
 fn collect_base_anchored_markers(segments: &[TrackedSegment]) -> Vec<AnchoredMarker> {
     let mut markers = Vec::new();
     let mut base_offset = 0usize;
     let mut pending_before = 0usize;
+    let mut edges = move_edges(segments).into_iter();
     for segment in segments {
         let in_base = visible_in(&segment.status, Reading::Base);
         for inline in &segment.inlines {
+            let move_edge = edges.next().expect("one move edge entry per inline");
             if is_structural_marker(inline) {
                 markers.push(AnchoredMarker {
                     base_offset,
                     pending_before,
                     inline: inline.clone(),
                     status: segment.status.clone(),
+                    move_edge,
                 });
                 continue;
             }
@@ -1917,15 +2850,21 @@ pub(crate) fn inject_structural_markers_at_offsets(
                     TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_)
                 )
             };
-            // At the edge of removed text the marker stays with the kept
-            // neighbour: after the edit's replacement when the text before it
-            // goes, before the deletion when the text after it goes.
-            let offset = if before.is_some_and(|status| removed(&status))
-                && !after.is_some_and(|status| removed(&status))
-            {
-                gap_end
-            } else {
-                offset
+            // A move's delimiters hug the moved text: text the edit added
+            // beside a move is never part of it. So does a proofing bracket
+            // the word Word flagged (`proofing_edge`). Any other marker at the edge
+            // of removed text stays with the kept neighbour: after the edit's
+            // replacement when the text before it goes, before the deletion
+            // when the text after it goes.
+            let offset = match marker.move_edge.or_else(|| proofing_edge(&marker.inline)) {
+                Some(MoveEdge::Opens) => gap_end,
+                Some(MoveEdge::Closes) => offset,
+                None if before.is_some_and(|status| removed(&status))
+                    && !after.is_some_and(|status| removed(&status)) =>
+                {
+                    gap_end
+                }
+                None => offset,
             };
             let keeps_revision = marker.status != TrackingStatus::Normal
                 && [before, after]
@@ -3264,6 +4203,8 @@ fn normalize_deleted_final_mark(
             final_paragraph.numbering = accepted_final_properties.numbering.clone();
             final_paragraph.has_direct_numbering = accepted_final_properties.has_direct_numbering;
             final_paragraph.numbering_suppressed = accepted_final_properties.numbering_suppressed;
+            final_paragraph.direct_numbering_omits_ilvl =
+                accepted_final_properties.direct_numbering_omits_ilvl;
             final_paragraph.materialized_numbering =
                 accepted_final_properties.materialized_numbering.clone();
 
@@ -3333,10 +4274,19 @@ pub fn mark_final_paragraph_runs_deleted(
 ///    pairing (`move_id`, `moveToRange` markers, its runs' `w:moveTo` wrapping)
 ///    entirely untouched — only the terminating marker is suppressed.
 ///
-///  * **Anchor stranded as final.** Every trailing inserted/deleted paragraph
-///    was resolved away, leaving a SURVIVING (`Normal`-block) paragraph whose
-///    own `para_mark_status` is still a pending `Inserted`/`Deleted` mark — the
-///    break that once introduced the now-gone followers. A tracked break on the
+///  * **Anchor stranded as final, mark deleted.** A pending deleted mark on
+///    the final paragraph joins nothing: Word treats it as a no-op on Accept
+///    and on Reject (no join, no empty paragraph after it). It settles to the
+///    untracked final mark both readings show.
+///
+///  * **Anchor stranded as final, mark inserted.** Settles the same way (Word
+///    treats an inserted final mark as a no-op too), unless the mark is a
+///    pending move's moveTo pilcrow:
+///
+///  * **Move destination stranded as final.** Every trailing inserted/
+///    deleted paragraph was resolved away, leaving a SURVIVING (`Normal`-block)
+///    move destination whose own `para_mark_status` is still the move's pending
+///    `Inserted` mark. A tracked break on the
 ///    final paragraph means "there is one more (now empty) paragraph after this
 ///    one": materialize exactly that. Append an empty, untracked-mark paragraph
 ///    that becomes the new document-final mark (adopting the surviving
@@ -3347,10 +4297,14 @@ pub fn mark_final_paragraph_runs_deleted(
 ///    revision resolvable — accepting it keeps the empty trailing paragraph,
 ///    rejecting it merges the empty tail back and restores the original final
 ///    paragraph — with no id invented and no other projection changed.
-fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
-    let Some(last) = document_final_paragraph_index(blocks) else {
-        return;
-    };
+///
+/// Returns the identity of the pending mark revision the stranded-anchor
+/// settle removed (the two "anchor stranded as final" cases), so the
+/// resolution can report it: the caller may not have selected it
+/// (`cascaded_resolution_ids`).
+#[must_use]
+fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) -> Option<u32> {
+    let last = document_final_paragraph_index(blocks)?;
     let BlockNode::Paragraph(final_para) = &blocks[last].block else {
         unreachable!("document_final_paragraph_index only returns paragraphs");
     };
@@ -3366,7 +4320,7 @@ fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
         TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_)
     );
     if !mark_is_pending {
-        return;
+        return None;
     }
 
     let block_level_tracked = matches!(
@@ -3380,12 +4334,33 @@ fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
         if let BlockNode::Paragraph(p) = &mut blocks[last].block {
             p.para_mark_status = Some(TrackingStatus::Normal);
         }
-        return;
+        return None;
     }
 
-    // Anchor stranded as final: the surviving final paragraph carries a pending
-    // break with no follower. Materialize the empty tail paragraph that break
-    // introduces, and make it the untracked document-final mark.
+    // Anchor stranded as final with a pending DELETED mark: Word treats a
+    // deleted final mark as a no-op on Accept and on Reject (no join, no
+    // empty paragraph; checked in Word), so it settles here to the untracked
+    // final mark it reads as either way.
+    // The same holds for a pending INSERTED mark (Word, checked): no split,
+    // no empty paragraph. A final mark that carries a pending MOVE (the
+    // destination copy's moveTo pilcrow) is part of that move, not a lone
+    // tracked break, and keeps the tail below (no Word check covers it).
+    let carries_move = blocks[last].move_id.is_some();
+    let settles = match &effective {
+        TrackingStatus::Deleted(revision) => Some(revision.identity),
+        TrackingStatus::Inserted(revision) if !carries_move => Some(revision.identity),
+        _ => None,
+    };
+    if let Some(settled) = settles {
+        if let BlockNode::Paragraph(p) = &mut blocks[last].block {
+            p.para_mark_status = None;
+        }
+        return Some(settled);
+    }
+
+    // A move destination stranded as final: its pending moveTo pilcrow still
+    // introduces the move's copy. Materialize the empty tail paragraph that
+    // break introduces, and make it the untracked document-final mark.
     let tail = empty_tail_after_stranded_break(final_para, blocks);
     // Keep any zero-width range-marker halves after the final paragraph in
     // their original body order: the materialized tail belongs immediately
@@ -3399,6 +4374,7 @@ fn renormalize_final_mark_after_selective(blocks: &mut Vec<TrackedBlock>) {
             block_sdt_wrap: None,
         },
     );
+    None
 }
 
 /// Build the empty untracked-mark paragraph that a stranded pending break on
@@ -3692,11 +4668,36 @@ pub fn apply_paragraph_diff_in_cell(
     context: &str,
     resolver: &dyn ChangePlanResolver,
 ) -> Result<(), MergeError> {
-    refuse_unstable_cnf_style_change(paragraph, new_para, context)?;
-
     let old_inlines = paragraph.all_inlines_owned();
     let new_inlines = new_para.all_inlines_owned();
     let inline_changes = resolver.paragraph_changes(&old_inlines, &new_inlines);
+    apply_paragraph_changes_in_cell(
+        paragraph,
+        new_para,
+        old_block,
+        new_block,
+        &inline_changes,
+        revision,
+        rev_counter,
+        context,
+    )
+}
+
+/// [`apply_paragraph_diff_in_cell`] with the inline changes given: a
+/// comparison plan's own changes for the cell paragraph pair.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn apply_paragraph_changes_in_cell(
+    paragraph: &mut ParagraphNode,
+    new_para: &ParagraphNode,
+    old_block: &BlockNode,
+    new_block: &BlockNode,
+    inline_changes: &[InlineChange],
+    revision: &RevisionInfo,
+    rev_counter: &mut u32,
+    context: &str,
+) -> Result<(), MergeError> {
+    refuse_unstable_cnf_style_change(paragraph, new_para, context)?;
 
     let base_opaques = collect_opaques(old_block);
     let target_opaques = collect_opaques(new_block);
@@ -3704,7 +4705,7 @@ pub fn apply_paragraph_diff_in_cell(
 
     let new_segments = inline_changes_to_segments_with_opaques(
         &paragraph.id,
-        &inline_changes,
+        inline_changes,
         revision,
         rev_counter,
         &base_opaques,
@@ -3793,6 +4794,7 @@ pub fn apply_paragraph_diff_in_cell(
             paragraph.numbering = None;
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
+            paragraph.direct_numbering_omits_ilvl = false;
             prefix_was_materialized = true;
         }
     }
@@ -3814,6 +4816,7 @@ pub fn apply_paragraph_diff_in_cell(
             // Carry the target's numbering provenance (see apply_block_modified).
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
+            paragraph.direct_numbering_omits_ilvl = new_para.direct_numbering_omits_ilvl;
             if new_para.has_resolved_numbering() {
                 paragraph.literal_prefix = None;
             }
@@ -4042,6 +5045,58 @@ pub fn mark_table_inserted(table: &mut TableNode, revision: &RevisionInfo, rev_c
     }
 }
 
+/// A cell's block pairing as diff operations: a pair is an `Equal` of one
+/// block (diffed in place, its content compared), a deleted or inserted
+/// block a `Delete` or `Insert`. The steps must cover every block of both
+/// cells once, in order.
+fn cell_block_ops(
+    steps: &[CellBlockStep],
+    old_len: usize,
+    new_len: usize,
+) -> Result<Vec<DiffOp>, String> {
+    let (mut old_next, mut new_next) = (0usize, 0usize);
+    let mut ops = Vec::with_capacity(steps.len());
+    for step in steps {
+        let op = match *step {
+            CellBlockStep::Paired(old_index, new_index) => DiffOp::Equal {
+                old_index,
+                new_index,
+                len: 1,
+            },
+            CellBlockStep::Deleted(old_index) => DiffOp::Delete {
+                old_index,
+                old_len: 1,
+                new_index: new_next,
+            },
+            CellBlockStep::Inserted(new_index) => DiffOp::Insert {
+                old_index: old_next,
+                new_index,
+                new_len: 1,
+            },
+        };
+        let (old_step, new_step) = match *step {
+            CellBlockStep::Paired(o, n) => (Some(o), Some(n)),
+            CellBlockStep::Deleted(o) => (Some(o), None),
+            CellBlockStep::Inserted(n) => (None, Some(n)),
+        };
+        if old_step.is_some_and(|o| o != old_next) || new_step.is_some_and(|n| n != new_next) {
+            return Err(format!(
+                "cell block pairing step {step:?} is out of order (next base {old_next}, \
+                 next target {new_next})"
+            ));
+        }
+        old_next += usize::from(old_step.is_some());
+        new_next += usize::from(new_step.is_some());
+        ops.push(op);
+    }
+    if old_next != old_len || new_next != new_len {
+        return Err(format!(
+            "cell block pairing covers {old_next}/{new_next} of {old_len}/{new_len} blocks"
+        ));
+    }
+    Ok(ops)
+}
+
 /// Reconcile cell blocks by aligning old and new blocks at the block level,
 /// then applying per-paragraph tracked changes. This preserves paragraph
 /// boundaries and opaque blocks that the flat text_diff approach loses.
@@ -4069,7 +5124,26 @@ pub fn reconcile_cell_blocks(
 
     let ops = match content_relation {
         CellContentRelation::Related => {
-            similar::capture_diff_slices_deadline(Algorithm::Patience, &old_fps, &new_fps, None)
+            match resolver
+                .cell_block_pairing(&cell.blocks, &new_cell.blocks)
+                .map_err(|message| MergeError {
+                    kind: MergeErrorKind::InvalidPlan,
+                    message: format!("cell block pairing failed: {message}"),
+                    context: format!("{context}:cell:{}", cell.id.0),
+                })? {
+                Some(steps) => cell_block_ops(&steps, cell.blocks.len(), new_cell.blocks.len())
+                    .map_err(|message| MergeError {
+                        kind: MergeErrorKind::InvalidPlan,
+                        message,
+                        context: format!("{context}:cell:{}", cell.id.0),
+                    })?,
+                None => similar::capture_diff_slices_deadline(
+                    Algorithm::Patience,
+                    &old_fps,
+                    &new_fps,
+                    None,
+                ),
+            }
         }
         CellContentRelation::UnrelatedReplacement => vec![DiffOp::Replace {
             old_index: 0,
@@ -4267,7 +5341,9 @@ pub fn reconcile_cell_blocks(
                         }
                         _ => {
                             // Same fingerprint but different block types shouldn't
-                            // happen; keep old block unchanged.
+                            // happen; keep old block unchanged. (A plan's own
+                            // pairing, `cell_block_pairing`, pairs blocks of one
+                            // kind only.)
                             merged_blocks.push(old_block.clone());
                         }
                     }
@@ -4383,7 +5459,40 @@ pub fn reconcile_cell_blocks(
     }
 
     cell.blocks = merged_blocks;
+    if let Some(first) = cell_append_start(cell) {
+        normalize_cell_append_mark(cell, first, revision, rev_counter);
+    }
     Ok(())
+}
+
+/// Where a reconciled cell's trailing run of wholly inserted paragraphs
+/// starts, when that run follows a paragraph whose mark is kept: an append
+/// at the end of the cell. The cell's final mark ends the cell and Word
+/// cannot remove it (Reject All would leave an empty paragraph), so the
+/// append is carried the way Word's own append, and the explicit cell
+/// append verb, carry it: [`normalize_cell_append_mark`] tracks the break
+/// after the kept paragraph and leaves the final mark untracked.
+fn cell_append_start(cell: &TableCellNode) -> Option<usize> {
+    let inserted = |block: &BlockNode| {
+        matches!(block, BlockNode::Paragraph(p)
+            if matches!(p.para_mark_status, Some(TrackingStatus::Inserted(_)))
+                && p.segments.iter().all(|s| matches!(s.status, TrackingStatus::Inserted(_))))
+    };
+    let mut first = cell.blocks.len();
+    while first > 0 && inserted(&cell.blocks[first - 1]) {
+        first -= 1;
+    }
+    if first == cell.blocks.len() || first == 0 {
+        return None;
+    }
+    match &cell.blocks[first - 1] {
+        BlockNode::Paragraph(anchor)
+            if matches!(anchor.para_mark_status, None | Some(TrackingStatus::Normal)) =>
+        {
+            Some(first)
+        }
+        _ => None,
+    }
 }
 
 /// Mark all content within a cell as deleted tracked segments.
@@ -4478,12 +5587,26 @@ pub fn reconcile_target_comment_ids(
     base: &CanonDoc,
     target: &mut CanonDoc,
 ) -> Result<(), MergeError> {
-    reconcile_target_comment_ids_with_map(base, target).map(|_| ())
+    reconcile_target_comment_ids_with_map(base, target, &HashMap::new()).map(|_| ())
+}
+
+/// [`reconcile_target_comment_ids`] with pairs a comparison has proved on
+/// other evidence (target comment id → base comment id), taken before the
+/// paragraph-id and content evidence. A pair naming a base comment that is
+/// not there, or that another target comment already took, is refused.
+#[doc(hidden)]
+pub fn reconcile_target_comment_ids_with_proven_pairs(
+    base: &CanonDoc,
+    target: &mut CanonDoc,
+    proven: &HashMap<String, String>,
+) -> Result<(), MergeError> {
+    reconcile_target_comment_ids_with_map(base, target, proven).map(|_| ())
 }
 
 pub(crate) fn reconcile_target_comment_ids_with_map(
     base: &CanonDoc,
     target: &mut CanonDoc,
+    proven: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, MergeError> {
     fn unique_comment_ids(
         stories: &[CommentStory],
@@ -4655,6 +5778,25 @@ pub(crate) fn reconcile_target_comment_ids_with_map(
     let mut remap = HashMap::new();
 
     for target_story in &target.comments {
+        if let Some(base_id) = proven.get(&target_story.id) {
+            let base_index = available_base
+                .iter()
+                .copied()
+                .find(|index| &base.comments[*index].id == base_id)
+                .ok_or_else(|| MergeError {
+                    kind: MergeErrorKind::InvalidPlan,
+                    message: "a proven comment pair names a base comment that is not available"
+                        .to_string(),
+                    context: format!(
+                        "target_comment_id={} base_comment_id={base_id}",
+                        target_story.id
+                    ),
+                })?;
+            available_base.remove(&base_index);
+            reserved.insert(base_id.clone());
+            remap.insert(target_story.id.clone(), base_id.clone());
+            continue;
+        }
         // A comment body's last paraId is the modern comment-sidecar identity.
         // When it is unavailable, byte-independent body content plus matching
         // author/date metadata is the only safe cross-package evidence. A bare
@@ -6019,9 +7161,17 @@ fn block_survives_retain(status: &TrackingStatus, keep_inserted: bool) -> bool {
 /// table" decision cannot drift from projection's "drop the rowless shell"
 /// decision — if they disagreed, the merge could join across a table that then
 /// survived, silently deleting its rows.
-fn row_survives_accept_reject(status: &Option<TrackingStatus>, keep_inserted: bool) -> bool {
-    let (has_ins, has_del) = status.as_ref().map_or((false, false), tracked_status_marks);
-    crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted)
+/// A row whose every cell the resolution removes goes with them
+/// (`resolution_rules::row_survives_resolution`).
+fn row_survives_accept_reject(row: &crate::domain::TableRowNode, keep_inserted: bool) -> bool {
+    let marks = |status: &Option<TrackingStatus>| {
+        status.as_ref().map_or((false, false), tracked_status_marks)
+    };
+    crate::resolution_rules::row_survives_resolution(
+        marks(&row.tracking_status),
+        row.cells.iter().map(|cell| marks(&cell.tracking_status)),
+        keep_inserted,
+    )
 }
 
 /// A table the accept/reject resolution empties COMPLETELY: it had rows and the
@@ -6042,12 +7192,11 @@ fn row_survives_accept_reject(status: &Option<TrackingStatus>, keep_inserted: bo
 /// byte path's `table_emptied_by_resolution` (normalize.rs) consults; extraction
 /// stays model-local (each row's marks from its `tracking_status`).
 fn table_emptied_by_accept_reject(t: &TableNode, keep_inserted: bool) -> bool {
-    let rows = t.rows.iter().map(|row| {
-        row.tracking_status
-            .as_ref()
-            .map_or((false, false), tracked_status_marks)
-    });
-    crate::resolution_rules::table_emptied_by_resolution(rows, keep_inserted)
+    crate::resolution_rules::table_emptied_by_resolution(
+        t.rows
+            .iter()
+            .map(|row| row_survives_accept_reject(row, keep_inserted)),
+    )
 }
 
 /// Whether a top-level block is removed ENTIRELY by the accept/reject
@@ -6159,9 +7308,9 @@ pub fn materialize_block_tracked_prefixes(blocks: &mut [TrackedBlock]) {
 /// inside the proposal before a paragraph-mark merge moves or resolves it,
 /// or the label outlives the text it labels.
 fn materialize_whole_paragraph_tracked_prefix(paragraph: &mut ParagraphNode) {
-    let Some(label) = paragraph.literal_prefix.as_deref() else {
+    if paragraph.literal_prefix.is_none() {
         return;
-    };
+    }
     let source_runs = paragraph
         .literal_prefix_leading_rpr
         .as_deref()
@@ -6210,7 +7359,24 @@ fn materialize_whole_paragraph_tracked_prefix(paragraph: &mut ParagraphNode) {
         );
         return;
     }
-    let prefix_inlines = if source_runs.is_empty() {
+    let prefix_inlines = tracked_prefix_inlines(paragraph);
+    paragraph.segments[segment_index]
+        .inlines
+        .splice(0..0, prefix_inlines);
+    paragraph.literal_prefix = None;
+}
+
+/// The hoisted label of `paragraph` as body inlines: one per source run it
+/// was read from, or one run in the label's own formatting. Statusless:
+/// the caller places them inside the proposal that owns the label.
+fn tracked_prefix_inlines(paragraph: &ParagraphNode) -> Vec<InlineNode> {
+    let label = paragraph.literal_prefix.as_deref().unwrap_or_default();
+    let source_runs = paragraph
+        .literal_prefix_leading_rpr
+        .as_deref()
+        .map(|provenance| provenance.source_runs.as_slice())
+        .unwrap_or_default();
+    if source_runs.is_empty() {
         vec![InlineNode::from(TextNode {
             id: NodeId::from(format!("{}_premerge_tracked_prefix", paragraph.id.0)),
             text_role: None,
@@ -6241,11 +7407,305 @@ fn materialize_whole_paragraph_tracked_prefix(paragraph: &mut ParagraphNode) {
                 })
             })
             .collect()
+    }
+}
+
+/// Whether `paragraph` is a cell paragraph proposal still carrying a
+/// hoisted typed label: its mark is inserted or deleted, every run of its
+/// text carries that same proposal, and its label is hoisted beside them.
+fn is_hoisted_label_proposal(paragraph: &ParagraphNode) -> bool {
+    let Some(mark) = &paragraph.para_mark_status else {
+        return false;
     };
-    paragraph.segments[segment_index]
-        .inlines
-        .splice(0..0, prefix_inlines);
-    paragraph.literal_prefix = None;
+    if matches!(mark, TrackingStatus::Normal)
+        || paragraph.has_resolved_numbering()
+        || paragraph
+            .literal_prefix
+            .as_deref()
+            .is_none_or(|label| label.trim().is_empty())
+    {
+        return false;
+    }
+    paragraph
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment
+                .inlines
+                .iter()
+                .any(|inline| matches!(inline, InlineNode::Text(_)))
+        })
+        .all(|segment| std::mem::discriminant(&segment.status) == std::mem::discriminant(mark))
+}
+
+/// The table-cell paragraphs of `blocks` (at any depth) that are whole
+/// inserted or deleted paragraphs with a hoisted typed label
+/// ([`materialize_cell_proposal_prefixes`]).
+fn collect_hoisted_label_cell_proposal_ids(blocks: &[TrackedBlock], ids: &mut HashSet<NodeId>) {
+    fn visit_table(table: &TableNode, ids: &mut HashSet<NodeId>) {
+        for row in &table.rows {
+            for cell in &row.cells {
+                for block in &cell.blocks {
+                    match block {
+                        BlockNode::Paragraph(paragraph) => {
+                            if is_hoisted_label_proposal(paragraph) {
+                                ids.insert(paragraph.id.clone());
+                            }
+                        }
+                        BlockNode::Table(nested) => visit_table(nested, ids),
+                        BlockNode::OpaqueBlock(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    for tracked in blocks {
+        if let BlockNode::Table(table) = &tracked.block {
+            visit_table(table, ids);
+        }
+    }
+}
+
+/// Put the typed label of each listed cell paragraph inside the proposal
+/// that inserts or deletes the paragraph.
+///
+/// A cell paragraph has no block-level status: a whole-paragraph insertion
+/// or deletion is its tracked mark plus its tracked text. `literal_prefix`
+/// is a view over untracked leading text, so a label left hoisted on such a
+/// paragraph is serialized as untracked text: it survives both readings
+/// and, once the paragraph's mark is resolved away, joins the neighbouring
+/// paragraph. The producer that made the paragraph a proposal moves the
+/// label into the first tracked text segment (or a new one, when the label
+/// is the whole text), the cell counterpart of
+/// [`materialize_block_tracked_prefixes`].
+///
+/// Only paragraphs the producer put into that shape are listed: an imported
+/// paragraph with an untracked label before a deleted body is the source
+/// document's own state and keeps it.
+fn materialize_cell_proposal_prefixes(blocks: &mut [TrackedBlock], ids: &HashSet<NodeId>) {
+    fn materialize(paragraph: &mut ParagraphNode) {
+        let text_segment = paragraph.segments.iter().position(|segment| {
+            segment
+                .inlines
+                .iter()
+                .any(|inline| matches!(inline, InlineNode::Text(_)))
+        });
+        let status = match text_segment {
+            Some(index) => paragraph.segments[index].status.clone(),
+            None => paragraph
+                .para_mark_status
+                .clone()
+                .expect("a proposal has a tracked mark"),
+        };
+        if crate::literal_prefix::has_positioned_prefix(paragraph) {
+            assert!(
+                crate::literal_prefix::expand_positioned_prefix_with_status(paragraph, status)
+                    .is_some(),
+                "cell paragraph {}: positioned label did not expand",
+                paragraph.id.0
+            );
+            return;
+        }
+        let inlines = tracked_prefix_inlines(paragraph);
+        match text_segment {
+            Some(index) => {
+                paragraph.segments[index].inlines.splice(0..0, inlines);
+            }
+            None => paragraph
+                .segments
+                .insert(0, TrackedSegment { status, inlines }),
+        }
+        paragraph.literal_prefix = None;
+    }
+    fn visit_table(table: &mut TableNode, ids: &HashSet<NodeId>) {
+        for row in &mut table.rows {
+            for cell in &mut row.cells {
+                for block in &mut cell.blocks {
+                    match block {
+                        BlockNode::Paragraph(paragraph) => {
+                            // Cell paragraph ids are not unique across a
+                            // merge (a target paragraph may share a base
+                            // id), so a listed id selects only paragraphs
+                            // in the proposal shape.
+                            if ids.contains(&paragraph.id) && is_hoisted_label_proposal(paragraph) {
+                                materialize(paragraph);
+                            }
+                        }
+                        BlockNode::Table(nested) => visit_table(nested, ids),
+                        BlockNode::OpaqueBlock(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    for tracked in blocks {
+        if let BlockNode::Table(table) = &mut tracked.block {
+            visit_table(table, ids);
+        }
+    }
+}
+
+/// [`collect_hoisted_label_cell_proposal_ids`] over the body and every story.
+#[doc(hidden)]
+pub fn hoisted_label_cell_proposal_ids(doc: &CanonDoc) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    collect_hoisted_label_cell_proposal_ids(&doc.blocks, &mut ids);
+    for story in &doc.headers {
+        collect_hoisted_label_cell_proposal_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.footers {
+        collect_hoisted_label_cell_proposal_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.footnotes {
+        collect_hoisted_label_cell_proposal_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.endnotes {
+        collect_hoisted_label_cell_proposal_ids(&story.blocks, &mut ids);
+    }
+    for story in &doc.comments {
+        collect_hoisted_label_cell_proposal_ids(&story.blocks, &mut ids);
+    }
+    ids
+}
+
+/// The producer rule for cell paragraphs a producer made whole insertions
+/// or deletions ([`materialize_cell_proposal_prefixes`]), over the body and
+/// every story: the paragraphs in that shape now and not in `before` (the
+/// producer's input) carry their label inside the proposal. Returns them, so
+/// the caller keeps them out of the split-boundary rule, which would make
+/// their label a retained, untracked one again. Run it before that rule.
+#[doc(hidden)]
+pub fn materialize_produced_cell_proposal_prefixes(
+    doc: &mut CanonDoc,
+    before: &HashSet<NodeId>,
+) -> HashSet<NodeId> {
+    let produced: HashSet<NodeId> = hoisted_label_cell_proposal_ids(doc)
+        .difference(before)
+        .cloned()
+        .collect();
+    materialize_cell_proposal_prefixes(&mut doc.blocks, &produced);
+    for story in &mut doc.headers {
+        materialize_cell_proposal_prefixes(&mut story.blocks, &produced);
+    }
+    for story in &mut doc.footers {
+        materialize_cell_proposal_prefixes(&mut story.blocks, &produced);
+    }
+    for story in &mut doc.footnotes {
+        materialize_cell_proposal_prefixes(&mut story.blocks, &produced);
+    }
+    for story in &mut doc.endnotes {
+        materialize_cell_proposal_prefixes(&mut story.blocks, &produced);
+    }
+    for story in &mut doc.comments {
+        materialize_cell_proposal_prefixes(&mut story.blocks, &produced);
+    }
+    produced
+}
+
+/// Give every complex field that a producer inserted or deleted whole one
+/// revision.
+///
+/// A field is one object (`fldChar begin` … `fldChar end`, ECMA-376
+/// §17.16.18), and Word records a whole field's insertion or deletion as one
+/// revision. A producer that builds a tracked field from several segments
+/// (its codes, its result and its end each a change of their own) would
+/// otherwise mint a revision per segment, and resolving one of them alone
+/// tears the field. Within one paragraph, every segment from a field's
+/// `begin` through its `end`, when all of them are insertions, or all
+/// deletions, by the same author at the same time, takes the `begin`
+/// segment's revision. A field with untracked or differently tracked parts
+/// is left as it is; so is one that spans paragraphs.
+///
+/// Only for a producer whose revisions are all its own (a comparison):
+/// it never merges revisions a document already carried.
+#[doc(hidden)]
+pub fn unify_whole_field_revisions(doc: &mut CanonDoc) {
+    fn same_proposal(a: &TrackingStatus, b: &TrackingStatus) -> bool {
+        match (a, b) {
+            (TrackingStatus::Inserted(x), TrackingStatus::Inserted(y))
+            | (TrackingStatus::Deleted(x), TrackingStatus::Deleted(y)) => {
+                x.author == y.author && x.date == y.date
+            }
+            _ => false,
+        }
+    }
+    fn paragraph(p: &mut ParagraphNode) {
+        // Open fields: (segment of the begin, still one proposal).
+        let mut open: Vec<(usize, bool)> = Vec::new();
+        let mut whole: Vec<(usize, usize)> = Vec::new();
+        for (index, segment) in p.segments.iter().enumerate() {
+            for (begin, ok) in &mut open {
+                if !same_proposal(&p.segments[*begin].status, &segment.status) {
+                    *ok = false;
+                }
+            }
+            for inline in &segment.inlines {
+                let InlineNode::OpaqueInline(o) = inline else {
+                    continue;
+                };
+                let OpaqueKind::Field(field) = &o.kind else {
+                    continue;
+                };
+                match field.field_kind {
+                    FieldKind::Begin => open.push((
+                        index,
+                        matches!(
+                            segment.status,
+                            TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_)
+                        ),
+                    )),
+                    FieldKind::End => {
+                        if let Some((begin, true)) = open.pop() {
+                            whole.push((begin, index));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (begin, end) in whole {
+            let status = p.segments[begin].status.clone();
+            for segment in &mut p.segments[begin..=end] {
+                segment.status = status.clone();
+            }
+        }
+    }
+    fn block(node: &mut BlockNode) {
+        match node {
+            BlockNode::Paragraph(p) => paragraph(p),
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for nested in &mut cell.blocks {
+                            block(nested);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    fn blocks(tracked: &mut [TrackedBlock]) {
+        for tracked in tracked {
+            block(&mut tracked.block);
+        }
+    }
+    blocks(&mut doc.blocks);
+    for story in &mut doc.headers {
+        blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        blocks(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        blocks(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        blocks(&mut story.blocks);
+    }
+    for story in &mut doc.comments {
+        blocks(&mut story.blocks);
+    }
 }
 
 /// Move the donor paragraph's content to the FRONT of the join target,
@@ -6671,6 +8131,23 @@ fn merge_marked_paragraphs_tracked(
             }
             continue;
         };
+        // A donor the resolution empties is removed whole, not joined: its
+        // zero-width anchors are re-anchored as Word does
+        // ([`relocate_anchors_of_removed_paragraph`]).
+        if matches!(&blocks[i].block,
+            BlockNode::Paragraph(p) if paragraph_emptied_by_accept_reject(p, keep_inserted))
+        {
+            let BlockNode::Paragraph(donor) = blocks.remove(i).block else {
+                unreachable!("an emptied donor is a paragraph");
+            };
+            let anchors = anchors_outlasting_paragraph(*donor, |segment| {
+                block_survives_retain(&segment.status, keep_inserted)
+            });
+            i += relocate_anchors_of_removed_paragraph(blocks, i, j - 1, anchors, |tb| {
+                block_survives_retain(&tb.status, keep_inserted)
+            });
+            continue;
+        }
         // Move paragraph i's content (and label) to the front of paragraph j.
         let (left, right) = blocks.split_at_mut(j);
         match (&mut left[i].block, &mut right[0].block) {
@@ -6683,6 +8160,66 @@ fn merge_marked_paragraphs_tracked(
         blocks.remove(i);
         // Don't increment i — the next element shifted into position i.
     }
+}
+
+/// Re-anchor the zero-width anchors of a paragraph a resolution removed
+/// whole from just before `blocks[at]`, `next` being the paragraph it would
+/// have joined (Word 16, verified on the oracle): a range lying wholly inside
+/// it goes with it; a range END goes right after the paragraph before it, as
+/// a body-level marker, when that is a surviving paragraph; every other
+/// anchor goes to the start of `next`. Returns the number of marker blocks
+/// inserted at `at`.
+fn relocate_anchors_of_removed_paragraph(
+    blocks: &mut Vec<TrackedBlock>,
+    at: usize,
+    next: usize,
+    anchors: Vec<InlineNode>,
+    survives: impl Fn(&TrackedBlock) -> bool,
+) -> usize {
+    let anchors = without_pairs_inside(anchors);
+    let previous_survives = at > 0
+        && matches!(blocks[at - 1].block, BlockNode::Paragraph(_))
+        && survives(&blocks[at - 1]);
+    let (held, ends) = if previous_survives {
+        split_off_range_ends(blocks, at, anchors)
+    } else {
+        (anchors, Vec::new())
+    };
+    let BlockNode::Paragraph(target) = &mut blocks[next].block else {
+        unreachable!("the join target is a paragraph");
+    };
+    hold_markers(target, RangeRole::Start, held);
+    let inserted = ends.len();
+    for (offset, end) in ends.into_iter().enumerate() {
+        blocks.insert(at + offset, end);
+    }
+    inserted
+}
+
+/// `anchors` without the range pairs lying wholly within them.
+fn without_pairs_inside(anchors: Vec<InlineNode>) -> Vec<InlineNode> {
+    let mut started = HashSet::new();
+    let mut whole = HashSet::new();
+    for anchor in &anchors {
+        if let Some((family, id, role)) = classify_range_pair_marker(anchor) {
+            match role {
+                RangeRole::Start => {
+                    started.insert((family, id));
+                }
+                RangeRole::End if started.contains(&(family, id.clone())) => {
+                    whole.insert((family, id));
+                }
+                RangeRole::End => {}
+            }
+        }
+    }
+    anchors
+        .into_iter()
+        .filter(|anchor| {
+            classify_range_pair_marker(anchor)
+                .is_none_or(|(family, id, _)| !whole.contains(&(family, id)))
+        })
+        .collect()
 }
 
 /// Keep the anchors of an emptied paragraph a blocked merge dropped from just
@@ -6733,7 +8270,7 @@ fn hold_anchors_beside_dropped_cell_paragraph(
 /// in sync with `runs` (see `HyperlinkData.text` docstring). The caller
 /// preserves the hyperlink envelope when any run survives, and removes the
 /// envelope when this projection empties a previously non-empty run set.
-fn project_hyperlink_runs(data: &mut crate::domain::HyperlinkData, keep_inserted: bool) {
+pub(crate) fn project_hyperlink_runs(data: &mut crate::domain::HyperlinkData, keep_inserted: bool) {
     let had_runs = !data.runs.is_empty();
     data.runs.retain(|run| match &run.status {
         TrackingStatus::Normal => true,
@@ -6984,6 +8521,9 @@ fn project_block_inner(
             p.paragraph_mark_style_props
                 .preserved
                 .retain(|property| property.name != "w:moveFrom" && property.name != "w:moveTo");
+            // The same holds for a table-cell move half's group (the cell
+            // twin of clearing `TrackedBlock::move_id` above).
+            p.cell_move_id = None;
 
             // The Word-qualified inline-SDT deletion is one logical carrier
             // split across two typed representations by import: range-marker
@@ -7030,6 +8570,13 @@ fn project_block_inner(
                             }
                         }
                         InlineNode::OpaqueInline(opaque) => {
+                            // The wrapper run's own formatting change, as for
+                            // a break's run.
+                            if !keep_inserted {
+                                reject_opaque_formatting(opaque);
+                            } else if !preserve_formatting_change {
+                                opaque.formatting_change = None;
+                            }
                             match &mut opaque.kind {
                                 crate::domain::OpaqueKind::Hyperlink(data) => {
                                     let had_runs = !data.runs.is_empty();
@@ -7106,6 +8653,15 @@ fn project_block_inner(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // A note mark's wrapper run's own formatting change, as for a
+                        // break's run.
+                        InlineNode::Decoration(deco) => {
+                            if !keep_inserted {
+                                reject_decoration_formatting(deco);
+                            } else if !preserve_formatting_change {
+                                deco.formatting_change = None;
                             }
                         }
                         _ => {}
@@ -7235,7 +8791,7 @@ fn project_block_inner(
             // the two never disagree.
             let prior_rows: Vec<_> = t.rows.iter().map(|row| row.id.clone()).collect();
             t.rows
-                .retain(|row| row_survives_accept_reject(&row.tracking_status, keep_inserted));
+                .retain(|row| row_survives_accept_reject(row, keep_inserted));
             reanchor_table_ranges_after_row_removal(t, &prior_rows);
 
             // tblGrid reconciliation for tracked COLUMN ops: capture (before the
@@ -7263,6 +8819,8 @@ fn project_block_inner(
                                 matches!(
                                     row.cells[index].tracking_status,
                                     Some(TrackingStatus::Deleted(_))
+                                ) && crate::resolution_rules::deleted_cell_gives_width(
+                                    cell_keeps_a_paragraph_mark(&row.cells[index]),
                                 )
                             })
                     })
@@ -7277,7 +8835,8 @@ fn project_block_inner(
                 )
             };
 
-            for row in &mut t.rows {
+            let mut resolved_merges: Vec<(usize, usize)> = Vec::new();
+            for (row_index, row) in t.rows.iter_mut().enumerate() {
                 row.tracking_status = None;
 
                 // Handle row formatting change (trPrChange, §17.13.5.36).
@@ -7310,7 +8869,7 @@ fn project_block_inner(
                     Some(TrackingStatus::Deleted(_)) => !keep_inserted,
                     Some(TrackingStatus::InsertedThenDeleted(_)) => false,
                 });
-                for cell in &mut row.cells {
+                for (cell_index, cell) in row.cells.iter_mut().enumerate() {
                     cell.tracking_status = None;
 
                     // Handle cell formatting change (tcPrChange, §17.13.5.37).
@@ -7318,6 +8877,11 @@ fn project_block_inner(
                         reject_cell_formatting(cell);
                     } else if !preserve_formatting_change {
                         cell.formatting_change = None;
+                    }
+                    // After the tcPrChange: the merge change decides the
+                    // cell's final merge (Word, Compare output).
+                    if resolve_cell_merge(cell, keep_inserted) {
+                        resolved_merges.push((row_index, cell_index));
                     }
 
                     // Merge paragraphs with marked para marks before
@@ -7350,6 +8914,7 @@ fn project_block_inner(
                 }
             }
 
+            settle_resolved_cell_merges(t, &resolved_merges);
             // Settle the current physical frame, including native deletion
             // width transfer, before restoring any previous grid on Reject.
             if let Some(slots) = column_slots {
@@ -7529,6 +9094,13 @@ fn project_blocks_for_accept_reject_keeping_controls(
     // sees only the inner status: Reject-All would incorrectly restore a
     // destination-only deletion as a stray paragraph, while Accept-All would
     // keep both clones of an inserted-then-moved paragraph.
+    if keep_inserted {
+        let all_moves: HashSet<String> = blocks
+            .iter()
+            .filter_map(|block| block.move_id.clone())
+            .collect();
+        drop_bookmarks_of_accepted_move_sources(blocks, &all_moves);
+    }
     let inserted_move_origins = inserted_move_origin_plans(blocks);
     let move_destination_deletions = move_destination_deletion_plans(blocks);
     let mut all_move_mixture_ids = HashSet::new();
@@ -7538,22 +9110,36 @@ fn project_blocks_for_accept_reject_keeping_controls(
     }
     for plan in &move_destination_deletions {
         all_move_mixture_ids.insert(plan.move_revision.identity);
-        all_move_mixture_ids.extend(plan.deletions.iter().map(|(revision, _)| revision.identity));
+        all_move_mixture_ids.extend(
+            plan.deletions
+                .iter()
+                .map(|(revision, _, _)| revision.identity),
+        );
     }
     let action = if keep_inserted {
         ResolveSelectionAction::Accept
     } else {
         ResolveSelectionAction::Reject
     };
+    // Either full resolution settles every origin into its move (Word's
+    // one-shot Reject All restores the content at its source). Origins
+    // settle first: a destination deletion then strikes settled moved text.
+    let dissolved = apply_inserted_move_origin_cascade(
+        blocks,
+        &all_move_mixture_ids,
+        &inserted_move_origins,
+        action,
+    );
+    assert!(
+        dissolved.is_empty(),
+        "a full resolution selects every move with its origins, so none dissolves"
+    );
     apply_move_destination_deletion_cascade(
         blocks,
         action,
         &all_move_mixture_ids,
         &move_destination_deletions,
     );
-    // Either full resolution settles every origin into its move (Word's
-    // one-shot Reject All restores the content at its source).
-    apply_inserted_move_origin_cascade(blocks, &all_move_mixture_ids, &inserted_move_origins);
 
     // Snapshot the story's inline range-pair markers BEFORE resolution, so a
     // pair torn by the drop below (one half removed with a resolved revision,
@@ -7838,7 +9424,8 @@ fn retain_blocks_keeping_range_markers(
         outlasting.push((kept.len(), markers_outlasting_removed_stretch(stretch)));
     }
     *blocks = kept;
-    for (at, markers) in outlasting {
+    // Back to front: re-anchoring an end inserts a marker block.
+    for (at, markers) in outlasting.into_iter().rev() {
         place_markers_at_removal_point(blocks, at, markers);
     }
 }
@@ -7865,17 +9452,81 @@ fn collect_block_range_markers(block: &BlockNode, out: &mut Vec<InlineNode>) {
     }
 }
 
-/// Put the range markers of removed blocks where the removal leaves the
-/// reading position: the start of the block now at `at` when it is a
-/// paragraph, otherwise (a table follows, or nothing does) the end of the
-/// paragraph before it; failing both, the nearest paragraph after, then
-/// before. With no paragraph left in the story there is nowhere to hold them
-/// and they go with the removed blocks.
+/// Put the range markers of removed blocks where Word puts them (Word 16,
+/// verified on the oracle): a range END goes right after the paragraph
+/// before the removal, as a body-level marker, so the range still covers
+/// that paragraph's mark ([`split_off_range_ends`]); everything else goes
+/// where the removal leaves the reading position: the start of the block
+/// now at `at` when it is a paragraph, otherwise (a table follows, or
+/// nothing does) the end of the paragraph before it; failing both, the
+/// nearest paragraph after, then before. With no paragraph left in the story
+/// there is nowhere to hold them and they go with the removed blocks.
 fn place_markers_at_removal_point(
-    blocks: &mut [TrackedBlock],
+    blocks: &mut Vec<TrackedBlock>,
     at: usize,
     markers: Vec<InlineNode>,
 ) {
+    let (markers, ends) = split_off_range_ends(blocks, at, markers);
+    hold_at_removal_point(blocks, at, markers);
+    for (offset, end) in ends.into_iter().enumerate() {
+        blocks.insert(at + offset, end);
+    }
+}
+
+/// The range ends among the markers outlasting a removal just before
+/// `blocks[at]`, as body-level marker blocks to sit at `at`, when the block
+/// before the removal is a paragraph; the remaining markers are returned to be
+/// held in a paragraph. (With no paragraph before, an end is held like any
+/// other marker.)
+fn split_off_range_ends(
+    blocks: &[TrackedBlock],
+    at: usize,
+    markers: Vec<InlineNode>,
+) -> (Vec<InlineNode>, Vec<TrackedBlock>) {
+    let previous_is_paragraph = at > 0 && matches!(blocks[at - 1].block, BlockNode::Paragraph(_));
+    if !previous_is_paragraph {
+        return (markers, Vec::new());
+    }
+    let mut held = Vec::new();
+    let mut ends = Vec::new();
+    for marker in markers {
+        match range_end_block(&marker) {
+            Some(block) => ends.push(block),
+            None => held.push(marker),
+        }
+    }
+    (held, ends)
+}
+
+/// A range end marker as a body-level marker block; `None` for anything else.
+fn range_end_block(marker: &InlineNode) -> Option<TrackedBlock> {
+    let (family, id, RangeRole::End) = classify_range_pair_marker(marker)? else {
+        return None;
+    };
+    let element = match marker {
+        InlineNode::CommentRangeEnd { id } => {
+            let mut element = crate::word_xml::w_el("commentRangeEnd");
+            crate::xml_attrs::attr_set(&mut element, "w:id", id);
+            element
+        }
+        InlineNode::Decoration(decoration) => crate::word_xml::parse_raw_fragment(
+            decoration
+                .raw_xml
+                .as_deref()
+                .expect("a paired range marker decoration holds its element"),
+        )
+        .expect("an imported range marker decoration holds valid XML"),
+        _ => unreachable!("a range end is a comment range end or a decoration"),
+    };
+    let block_id = NodeId::from(format!("range_end_{family:?}_{id}"));
+    Some(
+        crate::import::relocated_range_marker_block(&element, block_id)
+            .expect("a range end element is a range marker"),
+    )
+}
+
+/// [`place_markers_at_removal_point`] for the markers held in a paragraph.
+fn hold_at_removal_point(blocks: &mut [TrackedBlock], at: usize, markers: Vec<InlineNode>) {
     let target = removal_point_holder(blocks.len(), at, |index| {
         matches!(blocks[index].block, BlockNode::Paragraph(_))
     });
@@ -8118,6 +9769,7 @@ fn table_range_inline(marker: &crate::domain::RangeMarkerMeta, owner: &NodeId) -
     crate::xml_attrs::attr_set(&mut element, "w:id", &marker.id);
     let id = NodeId::from(format!("{}_range_{}_{:?}", owner.0, marker.id, marker.role));
     InlineNode::from(DecorationNode {
+        formatting_change: None,
         source_run_attrs: Vec::new(),
         id: id.clone(),
         kind,
@@ -8860,10 +10512,25 @@ fn table_emptied_by_selected(
     selected_revision_ids: &HashSet<u32>,
 ) -> bool {
     !t.rows.is_empty()
-        && t.rows.iter().all(|row| {
-            selected_optional_tracking_outcome(&row.tracking_status, action, selected_revision_ids)
-                == SelectedTrackingOutcome::Drop
-        })
+        && t.rows
+            .iter()
+            .all(|row| !row_survives_selected(row, action, selected_revision_ids))
+}
+
+/// Selective-path counterpart of `row_survives_accept_reject`: the row's own
+/// tracking is not dropped by this selection, and at least one of its cells
+/// survives it. A row whose last surviving cells this selection removes goes
+/// with them (CT_Row holds at least one cell).
+fn row_survives_selected(
+    row: &crate::domain::TableRowNode,
+    action: ResolveSelectionAction,
+    selected_revision_ids: &HashSet<u32>,
+) -> bool {
+    let drops = |status: &Option<TrackingStatus>| {
+        selected_optional_tracking_outcome(status, action, selected_revision_ids)
+            == SelectedTrackingOutcome::Drop
+    };
+    !drops(&row.tracking_status) && row.cells.iter().any(|cell| !drops(&cell.tracking_status))
 }
 
 /// Whether a top-level block is removed ENTIRELY by this selection — dropped at
@@ -8911,6 +10578,7 @@ fn merge_marked_paragraphs_tracked_selected(
     action: ResolveSelectionAction,
     selected_revision_ids: &HashSet<u32>,
     controls: &crate::block_controls::ControlMembership,
+    vanishing: &HashSet<NodeId>,
 ) {
     let mut i = 0;
     while i < blocks.len() {
@@ -8936,7 +10604,9 @@ fn merge_marked_paragraphs_tracked_selected(
         // any other surviving block (real content blocks the join).
         let mut next_para_idx = None;
         for (offset, b) in blocks[(i + 1)..].iter().enumerate() {
-            if tracked_block_removed_by_selected(b, action, selected_revision_ids) {
+            if tracked_block_removed_by_selected(b, action, selected_revision_ids)
+                || vanishing.contains(block_id(&b.block))
+            {
                 continue;
             }
             if !same_controls(controls, &blocks[i], b) {
@@ -8973,6 +10643,23 @@ fn merge_marked_paragraphs_tracked_selected(
             }
             continue;
         };
+        // A donor the selection empties is removed whole, not joined
+        // ([`relocate_anchors_of_removed_paragraph`]).
+        if matches!(&blocks[i].block,
+            BlockNode::Paragraph(p) if paragraph_emptied_by_selected(p, action, selected_revision_ids))
+        {
+            let BlockNode::Paragraph(donor) = blocks.remove(i).block else {
+                unreachable!("an emptied donor is a paragraph");
+            };
+            let anchors = anchors_outlasting_paragraph(*donor, |segment| {
+                selected_tracking_outcome(&segment.status, action, selected_revision_ids)
+                    != SelectedTrackingOutcome::Drop
+            });
+            i += relocate_anchors_of_removed_paragraph(blocks, i, j - 1, anchors, |tb| {
+                tracked_block_survives_selected(&tb.status, action, selected_revision_ids)
+            });
+            continue;
+        }
         // The join target may still be another revision's whole-paragraph
         // proposal, which this selection leaves pending. Its block status
         // covers its untracked-looking content; joined runs must keep their
@@ -9079,15 +10766,35 @@ pub enum RevisionKind {
     /// where accepting a move is one action).
     Move,
     /// `w:cellMerge` carrying `w:vMerge` or `w:vMergeOrig` — a tracked change
-    /// of a cell's vertical merge state (§17.13.5.3). Not modeled: resolving
-    /// it rewrites the vertical merge geometry across rows. The record is
-    /// census-only (`revision_id == 0`) so the change is never hidden, and
-    /// every resolution refuses while one is pending. A `w:cellMerge` with
-    /// neither attribute "can be ignored" (§17.13.5.3) and is not reported.
+    /// of a cell's vertical merge state (§17.13.5.3), modeled as
+    /// [`crate::domain::CellMergeChange`]. One record covers a vertically
+    /// contiguous run of such cells in one grid column, as Word resolves them
+    /// together. A `w:cellMerge` with neither attribute "can be ignored"
+    /// (§17.13.5.3) and is not reported.
     CellMerge,
 }
 
 impl RevisionKind {
+    /// Every kind, in declaration order. A surface that lists the revision
+    /// vocabulary (a reference page, a type stub, an error message) derives
+    /// it from, or is tested against, this list. The wildcard-free match in
+    /// the `revision_kind_vocabulary` test stops compilation when a variant
+    /// is added, at the place that says to add it here too.
+    pub const ALL: [RevisionKind; 12] = [
+        RevisionKind::Insert,
+        RevisionKind::Delete,
+        RevisionKind::FormatRun,
+        RevisionKind::FormatParagraph,
+        RevisionKind::FormatParagraphMark,
+        RevisionKind::FormatTable,
+        RevisionKind::FormatRow,
+        RevisionKind::FormatCell,
+        RevisionKind::FormatSection,
+        RevisionKind::OpaqueInterior,
+        RevisionKind::Move,
+        RevisionKind::CellMerge,
+    ];
+
     /// The wire name, as emitted by `list_revisions` rows and audit reports.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -9149,7 +10856,7 @@ impl RevisionKind {
     /// well-formed `OpaqueInterior` revision is now individually resolvable too.
     /// The enumerate↔resolvable agreement is keyed on `revision_id != 0`.
     pub fn is_modeled(self) -> bool {
-        !matches!(self, RevisionKind::OpaqueInterior | RevisionKind::CellMerge)
+        !matches!(self, RevisionKind::OpaqueInterior)
     }
 }
 
@@ -9389,6 +11096,7 @@ pub fn enumerate_revisions(doc: &CanonDoc) -> Vec<RevisionRecord> {
         }
     });
     collapse_move_records(&mut out, doc);
+    collapse_table_cell_format_records(&mut out);
     out
 }
 
@@ -9426,11 +11134,40 @@ fn move_group_identities(doc: &CanonDoc) -> HashSet<u32> {
             }
         }
     }
+    fn collect_move_paragraph(p: &ParagraphNode, out: &mut HashMap<u32, u8>) {
+        for seg in &p.segments {
+            collect_status(&seg.status, out);
+        }
+        if let Some(status) = &p.para_mark_status {
+            collect_status(status, out);
+        }
+    }
+    /// A table cell's move halves carry their group on the paragraph
+    /// (`ParagraphNode::cell_move_id`).
+    fn walk_cells(block: &BlockNode, out: &mut HashMap<u32, u8>) {
+        let BlockNode::Table(table) = block else {
+            return;
+        };
+        for nested in table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.blocks)
+        {
+            match nested {
+                BlockNode::Paragraph(p) if p.cell_move_id.is_some() => {
+                    collect_move_paragraph(p, out)
+                }
+                _ => walk_cells(nested, out),
+            }
+        }
+    }
     fn walk(blocks: &[TrackedBlock], out: &mut HashMap<u32, u8>) {
         for tb in blocks {
             if tb.move_id.is_some() {
                 collect_move_block(tb, out);
             }
+            walk_cells(&tb.block, out);
         }
     }
     let mut polarities = HashMap::new();
@@ -9450,10 +11187,58 @@ fn move_group_identities(doc: &CanonDoc) -> HashSet<u32> {
     for story in &doc.comments {
         walk(&story.blocks, &mut polarities);
     }
-    polarities
+    let mut identities: HashSet<u32> = polarities
         .into_iter()
         .filter_map(|(identity, flags)| (flags == 3).then_some(identity))
-        .collect()
+        .collect();
+    // A move whose source holds only text inserted before it has no deletion
+    // carrier of its own there (the source runs are the earlier insertion),
+    // but it is a move all the same: Word lists it as one.
+    for blocks in std::iter::once(&doc.blocks)
+        .chain(doc.headers.iter().map(|story| &story.blocks))
+        .chain(doc.footers.iter().map(|story| &story.blocks))
+        .chain(doc.footnotes.iter().map(|story| &story.blocks))
+        .chain(doc.endnotes.iter().map(|story| &story.blocks))
+        .chain(doc.comments.iter().map(|story| &story.blocks))
+    {
+        identities.extend(
+            inserted_move_origin_plans(blocks)
+                .into_iter()
+                .map(|plan| plan.move_revision.identity),
+        );
+    }
+    identities
+}
+
+/// One record for the cell property changes of one table that share one
+/// identity: Word lists a table's tracked cell property changes as one
+/// revision, and a comparison records them as one (every cell of a changed
+/// table records a change, the unchanged ones a change that changes
+/// nothing). The first cell's record represents them.
+fn collapse_table_cell_format_records(out: &mut Vec<RevisionRecord>) {
+    let key = |record: &RevisionRecord| {
+        (record.kind == RevisionKind::FormatCell && record.revision_id != 0)
+            .then(|| (record.revision_id, record.block_id.clone()))
+    };
+    let mut counts: HashMap<(u32, NodeId), usize> = HashMap::new();
+    for record in out.iter() {
+        if let Some(key) = key(record) {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+    let mut seen: HashSet<(u32, NodeId)> = HashSet::new();
+    out.retain_mut(|record| {
+        let Some(key) = key(record) else {
+            return true;
+        };
+        if !seen.insert(key.clone()) {
+            return false;
+        }
+        if counts[&key] > 1 {
+            record.excerpt = "table cell formatting".to_string();
+        }
+        true
+    });
 }
 
 /// Collapse the several per-carrier records of a move (source content, source
@@ -9561,6 +11346,7 @@ fn enumerate_table_revisions(
             excerpt: "table formatting".to_string(),
         });
     }
+    enumerate_cell_merge_revisions(out, t, block_id, location);
     for (ri, row) in t.rows.iter().enumerate() {
         let row_label = row
             .para_id
@@ -9615,25 +11401,6 @@ fn enumerate_table_revisions(
                     excerpt: format!("cell[{ri},{ci}] formatting"),
                 });
             }
-            for merge in cell.preserved.iter().filter_map(merge_changing_cell_merge) {
-                let attr = |name| crate::xml_attrs::attr_get(&merge, name).cloned();
-                out.push(RevisionRecord {
-                    // Census-only: the change is reported, never selectable.
-                    revision_id: 0,
-                    wire_id: attr("w:id").and_then(|id| id.parse().ok()).unwrap_or(0),
-                    author: attr("w:author").filter(|author| !author.is_empty()),
-                    date: attr("w:date"),
-                    kind: RevisionKind::CellMerge,
-                    block_id: block_id.clone(),
-                    location: location.clone(),
-                    excerpt: format!(
-                        "cell[{ri},{ci}] (cell {}) vertical merge change: vMerge={}, vMergeOrig={}",
-                        cell.id.0,
-                        attr("w:vMerge").as_deref().unwrap_or("(none)"),
-                        attr("w:vMergeOrig").as_deref().unwrap_or("(none)"),
-                    ),
-                });
-            }
             for nested in &cell.blocks {
                 match nested {
                     BlockNode::Paragraph(np) => {
@@ -9651,28 +11418,87 @@ fn enumerate_table_revisions(
     }
 }
 
-/// The parsed `w:cellMerge` a cell carries in its preserved `tcPr` remainder,
-/// when it changes the merge state (`w:vMerge` or `w:vMergeOrig`,
-/// §17.13.5.3). One with neither attribute "can be ignored" and is `None`.
-fn merge_changing_cell_merge(prop: &crate::domain::PreservedProp) -> Option<xmltree::Element> {
-    if prop.name.rsplit(':').next() != Some("cellMerge") {
-        return None;
+/// The pending cell merges (`w:cellMerge`, §17.13.5.3) of one table grouped
+/// into revisions, each as its `(row, cell)` positions in row order.
+///
+/// A group is a maximal run of cells carrying a [`TableCellNode::cell_merge`]
+/// that start at the same grid column in consecutive rows. Word resolves such
+/// a run as one action: accepting or rejecting any of its revisions resolves
+/// the whole run, while merges in another column, or separated by a row
+/// without one, resolve on their own (Word 16 probes, two merges in one
+/// column and two merged columns side by side).
+pub(crate) fn cell_merge_groups(table: &TableNode) -> Vec<Vec<(usize, usize)>> {
+    let mut groups: Vec<Vec<(usize, usize)>> = Vec::new();
+    // Grid column -> group index, for the previous row's merge cells.
+    let mut open: HashMap<u32, usize> = HashMap::new();
+    for (ri, row) in table.rows.iter().enumerate() {
+        let mut next_open = HashMap::new();
+        let mut column = row.grid_before;
+        for (ci, cell) in row.cells.iter().enumerate() {
+            if cell.cell_merge.is_some() {
+                let group = match open.get(&column) {
+                    Some(&group) => group,
+                    None => {
+                        groups.push(Vec::new());
+                        groups.len() - 1
+                    }
+                };
+                groups[group].push((ri, ci));
+                next_open.insert(column, group);
+            }
+            column += cell.grid_span.max(1);
+        }
+        open = next_open;
     }
-    let element = crate::word_xml::parse_raw_fragment(prop.raw_xml.as_bytes())
-        .expect("a preserved tcPr child holds the element it was parsed from");
-    let changes_merge = crate::xml_attrs::attr_get(&element, "w:vMerge").is_some()
-        || crate::xml_attrs::attr_get(&element, "w:vMergeOrig").is_some();
-    changes_merge.then_some(element)
+    groups
 }
 
-/// The first pending tracked vertical cell merge (`RevisionKind::CellMerge`)
-/// in the census. Every resolution refuses while one exists: the engine
-/// cannot apply it, and resolving the rest would report a resolved document
-/// that still carries it.
-pub(crate) fn first_pending_cell_merge(doc: &CanonDoc) -> Option<RevisionRecord> {
-    enumerate_revisions(doc)
-        .into_iter()
-        .find(|record| record.kind == RevisionKind::CellMerge)
+fn vertical_merge_label(merge: &crate::domain::VerticalMerge) -> &'static str {
+    match merge {
+        crate::domain::VerticalMerge::Restart => "rest",
+        crate::domain::VerticalMerge::Continue => "cont",
+        crate::domain::VerticalMerge::None => "(none)",
+    }
+}
+
+/// One census record per cell-merge group of `t` (see [`cell_merge_groups`]).
+fn enumerate_cell_merge_revisions(
+    out: &mut Vec<RevisionRecord>,
+    t: &TableNode,
+    block_id: &NodeId,
+    location: &StoryScope,
+) {
+    for group in cell_merge_groups(t) {
+        let (first_row, first_cell) = group[0];
+        let first = t.rows[first_row].cells[first_cell]
+            .cell_merge
+            .as_ref()
+            .expect("a cell-merge group holds only cells with a cell merge");
+        let cells: Vec<String> = group
+            .iter()
+            .map(|&(ri, ci)| {
+                let merge = t.rows[ri].cells[ci]
+                    .cell_merge
+                    .as_ref()
+                    .expect("a cell-merge group holds only cells with a cell merge");
+                format!(
+                    "cell[{ri},{ci}] vMerge={} vMergeOrig={}",
+                    vertical_merge_label(&merge.after),
+                    vertical_merge_label(&merge.before)
+                )
+            })
+            .collect();
+        out.push(RevisionRecord {
+            revision_id: first.revision.identity,
+            wire_id: first.revision.revision_id,
+            author: first.revision.author.clone(),
+            date: first.revision.date.clone(),
+            kind: RevisionKind::CellMerge,
+            block_id: block_id.clone(),
+            location: location.clone(),
+            excerpt: format!("vertical merge change: {}", cells.join("; ")),
+        });
+    }
 }
 
 fn enumerate_paragraph_revisions(
@@ -9756,6 +11582,20 @@ fn enumerate_paragraph_revisions(
                 // surface them too. Label the excerpt "hyperlink: <run
                 // text>" so the review card names the carrier.
                 InlineNode::OpaqueInline(o) => {
+                    if let Some(fc) = &o.formatting_change
+                        && fc.is_physical_revision()
+                    {
+                        out.push(RevisionRecord {
+                            revision_id: fc.identity,
+                            wire_id: fc.revision_id,
+                            author: some_author(&fc.author),
+                            date: fc.date.clone(),
+                            kind: RevisionKind::FormatRun,
+                            block_id: block_id.clone(),
+                            location: location.clone(),
+                            excerpt: format!("{} run formatting", opaque_run_label(o)),
+                        });
+                    }
                     if let crate::domain::OpaqueKind::Hyperlink(data) = &o.kind {
                         for run in &data.runs {
                             push_status_records(
@@ -9775,15 +11615,31 @@ fn enumerate_paragraph_revisions(
                     // this census and text-target discovery share, so they can
                     // never disagree on which opaques carry an interior.
                 }
+                InlineNode::Decoration(deco) => {
+                    if let Some(fc) = &deco.formatting_change
+                        && fc.is_physical_revision()
+                    {
+                        out.push(RevisionRecord {
+                            revision_id: fc.identity,
+                            wire_id: fc.revision_id,
+                            author: some_author(&fc.author),
+                            date: fc.date.clone(),
+                            kind: RevisionKind::FormatRun,
+                            block_id: block_id.clone(),
+                            location: location.clone(),
+                            excerpt: format!("{} run formatting", decoration_run_label(deco)),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
     }
     if let Some(status) = &p.para_mark_status {
         let excerpt = if paragraph_text.is_empty() {
-            "\u{00b6} paragraph mark".to_string()
+            PARAGRAPH_MARK_EXCERPT.to_string()
         } else {
-            format!("\u{00b6} paragraph mark: {paragraph_text}")
+            format!("{PARAGRAPH_MARK_EXCERPT}: {paragraph_text}")
         };
         push_status_records(out, status, block_id, location, &excerpt);
     }
@@ -9828,6 +11684,22 @@ fn enumerate_paragraph_revisions(
             excerpt: "section formatting".to_string(),
         });
     }
+}
+
+/// The excerpt label of a paragraph-mark revision. Its record's excerpt is
+/// this label, followed by `": "` and the paragraph's text when it has any:
+/// the text tells a reader which paragraph ends there; the revision itself is
+/// the paragraph break (§17.13.5.15/16) and holds none of that text.
+pub(crate) const PARAGRAPH_MARK_EXCERPT: &str = "\u{00b6} paragraph mark";
+
+/// Whether `record` is carried by a paragraph mark (its excerpt was built
+/// with [`PARAGRAPH_MARK_EXCERPT`]).
+pub(crate) fn is_paragraph_mark_record(record: &RevisionRecord) -> bool {
+    matches!(record.kind, RevisionKind::Insert | RevisionKind::Delete)
+        && record
+            .excerpt
+            .strip_prefix(PARAGRAPH_MARK_EXCERPT)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(": "))
 }
 
 fn push_status_records(
@@ -9939,9 +11811,15 @@ pub(crate) fn visit_fragment_carriers(
     f: &mut impl FnMut(FragmentCarrier),
 ) {
     let mut child_has_ancestor = has_rev_ancestor;
+    // A `w:cellMerge` with neither `w:vMerge` nor `w:vMergeOrig` "can be
+    // ignored" (§17.13.5.3): it is no revision.
+    let ignorable_cell_merge = crate::word_xml::is_w_tag(element, "cellMerge")
+        && crate::xml_attrs::attr_get(element, "w:vMerge").is_none()
+        && crate::xml_attrs::attr_get(element, "w:vMergeOrig").is_none();
     if let Some(name) = crate::normalize::REVISION_ELEMENT_LOCAL_NAMES
         .iter()
         .find(|name| crate::word_xml::is_w_tag(element, name))
+        .filter(|_| !ignorable_cell_merge)
     {
         let id = crate::xml_attrs::attr_get(element, "w:id").and_then(|v| v.parse::<u32>().ok());
         // Resolvable = a top-level `w:ins`/`w:del` with a NON-ZERO id. Id 0 is the
@@ -10368,8 +12246,10 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
             p.numbering_suppressed = false;
         }
         crate::domain::DirectParagraphNumbering::Present(direct) => {
+            // A previous list without a level is restored at the level Word
+            // resolved for it, written out: Word's Reject All writes the
+            // resolved ilvl into the live numPr (Word 16 probe).
             let simple_active = direct.num_id.is_some_and(|num_id| num_id > 0)
-                && direct.ilvl.is_some()
                 && direct.extra_attrs.is_empty()
                 && direct.preserved.is_empty();
             let simple_suppression = direct.num_id == Some(0)
@@ -10388,7 +12268,9 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
                     "pPrChange previous direct active numbering must have an effective projection",
                 );
                 assert_eq!(Some(effective.num_id), direct.num_id);
-                assert_eq!(Some(effective.ilvl), direct.ilvl);
+                if let Some(ilvl) = direct.ilvl {
+                    assert_eq!(effective.ilvl, ilvl);
+                }
                 p.has_direct_numbering = true;
                 p.numbering_suppressed = false;
             } else {
@@ -10407,6 +12289,8 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
             }
         }
     }
+    // Every restored direct numbering is written with its level (see above).
+    p.direct_numbering_omits_ilvl = false;
     p.numbering = numbering;
     // A restored effective numbering value supersedes the transient hoisted
     // representation; keeping both violates ParagraphNode's numbering invariant.
@@ -11022,6 +12906,88 @@ pub(crate) fn reject_hard_break_formatting(hard_break: &mut crate::domain::HardB
     hard_break.wrapper_rpr_authored = previous_rpr_authored;
 }
 
+/// What a run carrying an opaque inline holds, for a revision's excerpt.
+fn opaque_run_label(opaque: &crate::domain::OpaqueInlineNode) -> &'static str {
+    use crate::domain::{FieldKind, OpaqueKind};
+    match &opaque.kind {
+        OpaqueKind::Field(field) => match field.field_kind {
+            FieldKind::Begin => "field begin",
+            FieldKind::Separate => "field separator",
+            FieldKind::End => "field end",
+            FieldKind::Instruction => "field code",
+            FieldKind::Simple | FieldKind::Unknown(_) => "field",
+        },
+        OpaqueKind::FootnoteReference(_) => "footnote reference",
+        OpaqueKind::EndnoteReference(_) => "endnote reference",
+        OpaqueKind::CommentReference(_) => "comment reference",
+        OpaqueKind::Drawing => "drawing",
+        OpaqueKind::Sym(_) => "symbol",
+        _ => "object",
+    }
+}
+
+/// What a run carrying a run-level mark holds, for a revision's excerpt.
+fn decoration_run_label(deco: &crate::domain::DecorationNode) -> &'static str {
+    let raw = deco.raw_xml.as_deref().unwrap_or_default();
+    let raw = String::from_utf8_lossy(raw);
+    let local = raw
+        .trim_start()
+        .trim_start_matches('<')
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .next()
+        .unwrap_or_default();
+    match local.rsplit(':').next().unwrap_or_default() {
+        "footnoteRef" => "footnote mark",
+        "endnoteRef" => "endnote mark",
+        "annotationRef" => "comment mark",
+        "separator" | "continuationSeparator" => "note separator",
+        "lastRenderedPageBreak" => "page break mark",
+        "softHyphen" => "soft hyphen",
+        _ => "mark",
+    }
+}
+
+/// Restore a note mark's wrapper run to the formatting its tracked change
+/// records (Reject of the run's `w:rPrChange`).
+pub(crate) fn reject_decoration_formatting(deco: &mut crate::domain::DecorationNode) {
+    let Some(fc) = deco.formatting_change.take() else {
+        return;
+    };
+    let crate::domain::FormattingChange {
+        previous_marks,
+        previous_style_props,
+        previous_rpr_authored: _,
+        carrier: _,
+        revision_id: _,
+        identity: _,
+        author: _,
+        date: _,
+    } = fc;
+    deco.wrapper_marks = previous_marks;
+    deco.wrapper_style_props = previous_style_props;
+}
+
+/// Restore an opaque inline's wrapper run to the formatting its tracked
+/// change records (Reject of the run's `w:rPrChange`).
+pub(crate) fn reject_opaque_formatting(opaque: &mut crate::domain::OpaqueInlineNode) {
+    let Some(fc) = opaque.formatting_change.take() else {
+        return;
+    };
+    let crate::domain::FormattingChange {
+        previous_marks,
+        previous_style_props,
+        previous_rpr_authored,
+        carrier: _,
+        revision_id: _,
+        identity: _,
+        author: _,
+        date: _,
+    } = fc;
+    opaque.wrapper_marks = previous_marks;
+    opaque.wrapper_style_props = previous_style_props;
+    opaque.wrapper_rpr_authored = previous_rpr_authored;
+}
+
 #[doc(hidden)]
 pub(crate) fn reject_table_formatting(t: &mut crate::domain::TableNode) {
     let Some(fc) = t.formatting_change.take() else {
@@ -11157,6 +13123,172 @@ pub(crate) fn reject_cell_formatting(cell: &mut crate::domain::TableCellNode) {
     cell.formatting.text_direction = previous_text_direction;
     cell.formatting.tc_fit_text = previous_tc_fit_text;
     cell.cnf_style = previous_cnf_style;
+    // A `w:cellMerge` inside the prior tcPr (Word's Compare writes one there)
+    // marks the change, it is no property to restore: the cell's own pending
+    // merge change is `cell.cell_merge`, and Word rewrites the prior tcPr
+    // without it once the merge resolves.
+    cell.preserved.retain(|prop| !is_cell_merge_prop(prop));
+}
+
+fn is_cell_merge_prop(prop: &crate::domain::PreservedProp) -> bool {
+    prop.name.rsplit(':').next() == Some("cellMerge")
+}
+
+/// Resolve a cell's pending tracked vertical merge change (`w:cellMerge`,
+/// §17.13.5.3): Accept (`accept == true`) gives the cell the merge recorded
+/// in `w:vMerge`, Reject the one in `w:vMergeOrig`, a missing attribute
+/// meaning not merged; the cell's own `w:vMerge` element does not count. A
+/// cell the resolution leaves as a continuation loses its content, pending
+/// changes inside it included: Word keeps its first paragraph, emptied.
+///
+/// Word 16 evidence (probe files with invented text, each resolved by Accept
+/// All, Reject All and per revision):
+/// - `<w:vMerge/>` + cellMerge `vMerge="cont"`: Accept merges and empties the
+///   cell, Reject unmerges it with its text; `vMergeOrig` alone (a split)
+///   does the reverse; a `vMerge="cont"` attribute wins over a
+///   `w:vMerge w:val="restart"` element.
+/// - Text inside a pending `w:ins` in a cell that Accept turns into a
+///   continuation is gone with no pending change left; Reject of the merge
+///   alone keeps the insertion pending.
+/// - With a pending `w:tcPrChange` (Word's Compare writes one beside every
+///   cellMerge), resolving the merge alone rewrites the change's prior tcPr
+///   to the resolved merge, so the remaining change is a no-op for it.
+///
+/// Returns whether the cell had a merge change to resolve; the caller then
+/// settles the merges around it ([`settle_resolved_cell_merges`]).
+fn resolve_cell_merge(cell: &mut crate::domain::TableCellNode, accept: bool) -> bool {
+    let Some(change) = cell.cell_merge.take() else {
+        return false;
+    };
+    cell.v_merge = change.resolved(accept);
+    if let Some(fc) = &mut cell.formatting_change {
+        fc.previous_v_merge = cell.v_merge.clone();
+        fc.previous_preserved
+            .retain(|prop| !is_cell_merge_prop(prop));
+    }
+    if cell.v_merge == crate::domain::VerticalMerge::Continue {
+        empty_continuation_cell(cell, accept);
+    }
+    true
+}
+
+/// The index of the cell of `row` that starts at grid column `column`.
+fn cell_starting_at(row: &crate::domain::TableRowNode, column: u32) -> Option<usize> {
+    let mut start = row.grid_before;
+    for (index, cell) in row.cells.iter().enumerate() {
+        if start == column {
+            return Some(index);
+        }
+        start += cell.grid_span.max(1);
+    }
+    None
+}
+
+/// The grid column cell `cell_index` of `row` starts at.
+fn cell_start_column(row: &crate::domain::TableRowNode, cell_index: usize) -> u32 {
+    row.grid_before
+        + row.cells[..cell_index]
+            .iter()
+            .map(|cell| cell.grid_span.max(1))
+            .sum::<u32>()
+}
+
+/// Settle the vertical merges around cells whose merge change was just
+/// resolved (`resolved` = their `(row, cell)` positions), as Word 16 saves
+/// them: in each resolved cell's grid column, from the row above it to the
+/// row below it, a continuation with no merge above it is not merged, and
+/// then neither is a restart with no continuation below it. (A rejected
+/// `vMerge="cont"` leaves the restart above it unmerged; a rejected split
+/// whose restart has no `vMergeOrig` leaves the cell unmerged and empty; a
+/// rejected `vMergeOrig="rest"` under a restart leaves both unmerged.)
+/// Merges elsewhere in the table stay as authored.
+fn settle_resolved_cell_merges(t: &mut TableNode, resolved: &[(usize, usize)]) {
+    use crate::domain::VerticalMerge;
+    let mut affected = std::collections::BTreeSet::new();
+    for &(row, cell) in resolved {
+        let column = cell_start_column(&t.rows[row], cell);
+        for neighbour in row.saturating_sub(1)..=(row + 1).min(t.rows.len() - 1) {
+            affected.insert((neighbour, column));
+        }
+    }
+    let merge_at = |t: &TableNode, row: usize, column: u32| {
+        cell_starting_at(&t.rows[row], column).map(|cell| t.rows[row].cells[cell].v_merge.clone())
+    };
+    for &(row, column) in &affected {
+        let Some(cell) = cell_starting_at(&t.rows[row], column) else {
+            continue;
+        };
+        if t.rows[row].cells[cell].v_merge == VerticalMerge::Continue {
+            let above = row
+                .checked_sub(1)
+                .and_then(|above| merge_at(t, above, column));
+            if !matches!(
+                above,
+                Some(VerticalMerge::Restart | VerticalMerge::Continue)
+            ) {
+                t.rows[row].cells[cell].v_merge = VerticalMerge::None;
+            }
+        }
+    }
+    for &(row, column) in &affected {
+        let Some(cell) = cell_starting_at(&t.rows[row], column) else {
+            continue;
+        };
+        if t.rows[row].cells[cell].v_merge == VerticalMerge::Restart {
+            let below = (row + 1 < t.rows.len())
+                .then(|| merge_at(t, row + 1, column))
+                .flatten();
+            if below != Some(VerticalMerge::Continue) {
+                t.rows[row].cells[cell].v_merge = VerticalMerge::None;
+            }
+        }
+    }
+}
+
+/// Empty a cell that became a vertical-merge continuation, as Word does: its
+/// first paragraph stays, with no content and no pending change; every other
+/// block goes. A cell with no paragraph is left with no blocks, which a
+/// continuation may have (§17.4.85: its content is not displayed).
+fn empty_continuation_cell(cell: &mut crate::domain::TableCellNode, accept: bool) {
+    let first_paragraph = cell.blocks.iter().find_map(|block| match block {
+        BlockNode::Paragraph(p) => Some(p.clone()),
+        _ => None,
+    });
+    cell.content_sdt_wraps.clear();
+    cell.blocks = match first_paragraph {
+        Some(mut paragraph) => {
+            paragraph.segments = Vec::new();
+            paragraph.para_mark_status = None;
+            if accept {
+                paragraph.formatting_change = None;
+            } else {
+                reject_paragraph_formatting(&mut paragraph);
+            }
+            paragraph.block_text_hash = None;
+            paragraph.rendered_text = None;
+            vec![BlockNode::Paragraph(paragraph)]
+        }
+        None => Vec::new(),
+    };
+}
+
+/// Every revision identity pending inside a cell's content.
+fn cell_content_revision_ids(cell: &crate::domain::TableCellNode) -> Vec<u32> {
+    let mut records = Vec::new();
+    let location = StoryScope::Body;
+    for block in &cell.blocks {
+        match block {
+            BlockNode::Paragraph(p) => {
+                enumerate_paragraph_revisions(&mut records, p, &p.id, &location)
+            }
+            BlockNode::Table(t) => enumerate_table_revisions(&mut records, t, &t.id, &location),
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    records
+        .into_iter()
+        .map(|record| record.revision_id)
+        .collect()
 }
 
 fn project_block_for_selected_resolution(
@@ -11222,6 +13354,11 @@ fn project_block_for_selected_resolution(
                     SelectedTrackingOutcome::KeepTracked | SelectedTrackingOutcome::Drop => {}
                 }
             }
+            // Removing a resolved carrier leaves its neighbours adjacent: two
+            // runs of one pending revision are one carrier again, as the
+            // same paragraph reads after save and reopen (the identity walk
+            // counts carriers).
+            crate::edit::normalize_segments(&mut p.segments);
 
             let rejects_mark_deletion = action == ResolveSelectionAction::Reject
                 && match &p.para_mark_status {
@@ -11375,6 +13512,24 @@ fn project_block_for_selected_resolution(
                             }
                         }
                         InlineNode::OpaqueInline(opaque) => {
+                            // The wrapper run's own formatting change: only a
+                            // physical w:rPrChange is imported on an opaque's
+                            // run, so it resolves by its own id.
+                            let resolves = opaque.formatting_change.as_ref().is_some_and(|change| {
+                                change.is_physical_revision()
+                                    && change.revision_id != 0
+                                    && selected_revision_ids.contains(&change.identity)
+                            });
+                            if resolves {
+                                match action {
+                                    ResolveSelectionAction::Accept => {
+                                        opaque.formatting_change = None;
+                                    }
+                                    ResolveSelectionAction::Reject => {
+                                        reject_opaque_formatting(opaque);
+                                    }
+                                }
+                            }
                             if let crate::domain::OpaqueKind::Hyperlink(data) = &mut opaque.kind
                                 && data.runs.iter().any(|run| {
                                     status_carries_selected_id(&run.status, selected_revision_ids)
@@ -11438,6 +13593,19 @@ fn project_block_for_selected_resolution(
                                             "selected interior id reached an unparseable fragment"
                                         );
                                     }
+                                }
+                            }
+                        }
+                        InlineNode::Decoration(deco) => {
+                            let resolves = deco.formatting_change.as_ref().is_some_and(|change| {
+                                change.is_physical_revision()
+                                    && change.revision_id != 0
+                                    && selected_revision_ids.contains(&change.identity)
+                            });
+                            if resolves {
+                                match action {
+                                    ResolveSelectionAction::Accept => deco.formatting_change = None,
+                                    ResolveSelectionAction::Reject => reject_decoration_formatting(deco),
                                 }
                             }
                         }
@@ -11505,13 +13673,8 @@ fn project_block_for_selected_resolution(
                 }
             }
             let prior_rows: Vec<_> = t.rows.iter().map(|row| row.id.clone()).collect();
-            t.rows.retain(|row| {
-                selected_optional_tracking_outcome(
-                    &row.tracking_status,
-                    action,
-                    selected_revision_ids,
-                ) != SelectedTrackingOutcome::Drop
-            });
+            t.rows
+                .retain(|row| row_survives_selected(row, action, selected_revision_ids));
             reanchor_table_ranges_after_row_removal(t, &prior_rows);
             let accept = action == ResolveSelectionAction::Accept;
             let removed_columns: Vec<_> =
@@ -11540,6 +13703,8 @@ fn project_block_for_selected_resolution(
                                 matches!(
                                     row.cells[index].tracking_status,
                                     Some(TrackingStatus::Deleted(_))
+                                ) && crate::resolution_rules::deleted_cell_gives_width(
+                                    cell_keeps_a_paragraph_mark(&row.cells[index]),
                                 )
                             })
                     })
@@ -11553,7 +13718,8 @@ fn project_block_for_selected_resolution(
                     .expect("validated selected column geometry"),
                 )
             };
-            for row in &mut t.rows {
+            let mut resolved_merges: Vec<(usize, usize)> = Vec::new();
+            for (row_index, row) in t.rows.iter_mut().enumerate() {
                 match selected_optional_tracking_outcome(
                     &row.tracking_status,
                     action,
@@ -11608,7 +13774,7 @@ fn project_block_for_selected_resolution(
                         selected_revision_ids,
                     ) != SelectedTrackingOutcome::Drop
                 });
-                for cell in &mut row.cells {
+                for (cell_index, cell) in row.cells.iter_mut().enumerate() {
                     match selected_optional_tracking_outcome(
                         &cell.tracking_status,
                         action,
@@ -11631,6 +13797,14 @@ fn project_block_for_selected_resolution(
                             ResolveSelectionAction::Accept => cell.formatting_change = None,
                             ResolveSelectionAction::Reject => reject_cell_formatting(cell),
                         }
+                    }
+                    if cell.cell_merge.as_ref().is_some_and(|merge| {
+                        selected_revision_ids.contains(&merge.revision.identity)
+                    }) && resolve_cell_merge(
+                        cell,
+                        matches!(action, ResolveSelectionAction::Accept),
+                    ) {
+                        resolved_merges.push((row_index, cell_index));
                     }
 
                     merge_marked_paragraphs_bare_selected(
@@ -11660,6 +13834,7 @@ fn project_block_for_selected_resolution(
                     drop_emptied_nested_tables(&mut cell.blocks, &nested_had_rows);
                 }
             }
+            settle_resolved_cell_merges(t, &resolved_merges);
             // Selective row/cell resolution changes the physical grid just as
             // full resolution does. Its cached digest must describe the current
             // rows, not the pending pre-selection carrier layout.
@@ -11705,27 +13880,57 @@ fn project_blocks_for_selected_resolution_keeping_controls(
     controls: &crate::block_controls::ControlMembership,
 ) {
     let mut resolved_move_names = selected_move_names(blocks, selected_revision_ids);
+    if action == ResolveSelectionAction::Accept {
+        drop_bookmarks_of_accepted_move_sources(blocks, &resolved_move_names);
+    }
     let move_plans = selected_move_plans(blocks, selected_revision_ids);
     let inserted_move_origins = inserted_move_origin_plans(blocks);
     let move_destination_deletions = move_destination_deletion_plans(blocks);
     neutralize_selected_move_paragraph_marks(blocks, &move_plans, action, selected_revision_ids);
+    // Origins settle into their moves before a destination deletion maps
+    // onto the source, so it strikes the settled moved text.
+    resolved_move_names.extend(apply_inserted_move_origin_cascade(
+        blocks,
+        selected_revision_ids,
+        &inserted_move_origins,
+        action,
+    ));
     apply_move_destination_deletion_cascade(
         blocks,
         action,
         selected_revision_ids,
         &move_destination_deletions,
     );
-    apply_inserted_move_origin_cascade(blocks, selected_revision_ids, &inserted_move_origins);
     // A settled origin turns the source's runs into the move's own deletion,
     // which can make a selected move recognizable only now.
     resolved_move_names.extend(selected_move_names(blocks, selected_revision_ids));
+    // The resolved moves' containers and range markers go before any join:
+    // a source paragraph whose mark the resolution removes joins the next
+    // paragraph, and its move markup must not travel into it.
+    strip_move_decorations(blocks, &resolved_move_names);
     // Snapshot inline range-pair markers BEFORE resolution so a pair this
     // selection tears (one half dropped with a resolved revision, the other
     // surviving) can be collapsed back to a point — identical to the full
     // accept/reject path (see `collapse_resolution_torn_range_markers`).
     let range_pair_inventory = capture_range_pair_inventory(blocks);
 
-    merge_marked_paragraphs_tracked_selected(blocks, action, selected_revision_ids, controls);
+    // A rejected moved paragraph's destination copy vanishes with the move:
+    // a paragraph break removed before it joins past it (Word, checked).
+    let vanishing: HashSet<NodeId> = if action == ResolveSelectionAction::Reject {
+        move_plans
+            .iter()
+            .map(|plan| plan.destination_id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    merge_marked_paragraphs_tracked_selected(
+        blocks,
+        action,
+        selected_revision_ids,
+        controls,
+        &vanishing,
+    );
     retain_blocks_keeping_range_markers(blocks, |tb| {
         tracked_block_survives_selected(&tb.status, action, selected_revision_ids)
     });
@@ -11802,8 +14007,48 @@ struct MoveDestinationDeletionPlan {
     source_id: NodeId,
     destination_id: NodeId,
     move_revision: RevisionInfo,
-    deletions: Vec<(RevisionInfo, String)>,
+    /// Each nested deletion: its revision, where it starts in the move
+    /// clone's text, and its text.
+    deletions: Vec<(RevisionInfo, usize, String)>,
     scope: MoveCloneScope,
+}
+
+/// Where the text of one move clone sits: the whole paragraph, or the runs
+/// inside the move's container on `side`.
+fn segment_in_clone(scope: MoveCloneScope, side: Option<MoveSide>, wanted: MoveSide) -> bool {
+    scope == MoveCloneScope::WholeParagraph || side == Some(wanted)
+}
+
+/// The deletions nested in a move destination, positioned in the clone's
+/// text. The clone's text is the moved text: the move's own insertions and
+/// the moved text other authors deleted since; an insertion another author
+/// made at the destination later is not part of it.
+fn destination_clone_deletions(
+    paragraph: &ParagraphNode,
+    move_identity: u32,
+    scope: MoveCloneScope,
+) -> Vec<(RevisionInfo, usize, String)> {
+    let mut offset = 0usize;
+    let mut deletions = Vec::new();
+    for (segment, side) in paragraph
+        .segments
+        .iter()
+        .zip(move_container_sides(paragraph))
+    {
+        if !segment_in_clone(scope, side, MoveSide::To) {
+            continue;
+        }
+        let text = extract_inlines_text(&segment.inlines);
+        match &segment.status {
+            TrackingStatus::Inserted(revision) if revision.identity == move_identity => {}
+            TrackingStatus::Deleted(revision) if revision.identity != move_identity => {
+                deletions.push((revision.clone(), offset, text.clone()));
+            }
+            _ => continue,
+        }
+        offset += text.chars().count();
+    }
+    deletions
 }
 
 /// What a move clone is: a whole paragraph (its mark is the move half), or the
@@ -11817,7 +14062,7 @@ enum MoveCloneScope {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MoveSide {
+pub(crate) enum MoveSide {
     From,
     To,
 }
@@ -11828,7 +14073,7 @@ enum MoveSide {
 /// childless element (`word_ir::AtomKind::TrackedMove*`); the content segments
 /// between them are the container's runs. Range markers
 /// (`w:moveFromRangeStart` …) are not containers and are skipped.
-fn move_container_sides(paragraph: &ParagraphNode) -> Vec<Option<MoveSide>> {
+pub(crate) fn move_container_sides(paragraph: &ParagraphNode) -> Vec<Option<MoveSide>> {
     let mut open: Option<(MoveSide, &[u8])> = None;
     paragraph
         .segments
@@ -11973,18 +14218,11 @@ fn move_destination_deletion_plans(blocks: &[TrackedBlock]) -> Vec<MoveDestinati
         let Some(TrackingStatus::Inserted(move_revision)) = &paragraph.para_mark_status else {
             continue;
         };
-        let deletions: Vec<(RevisionInfo, String)> = paragraph
-            .segments
-            .iter()
-            .filter_map(|segment| match &segment.status {
-                TrackingStatus::Deleted(revision)
-                    if revision.identity != move_revision.identity =>
-                {
-                    Some((revision.clone(), extract_inlines_text(&segment.inlines)))
-                }
-                _ => None,
-            })
-            .collect();
+        let deletions = destination_clone_deletions(
+            paragraph,
+            move_revision.identity,
+            MoveCloneScope::WholeParagraph,
+        );
         let source_id = blocks.iter().find_map(|candidate| {
             if candidate.move_id != tracked.move_id {
                 return None;
@@ -12041,22 +14279,8 @@ fn move_destination_deletion_plans(blocks: &[TrackedBlock]) -> Vec<MoveDestinati
             let BlockNode::Paragraph(paragraph) = &blocks[destination_index].block else {
                 unreachable!("moved runs sit in paragraphs")
             };
-            let deletions = moved
-                .segments
-                .iter()
-                .filter(|(block_index, ..)| *block_index == destination_index)
-                .filter_map(|(_, segment_index, side, status)| match (side, status) {
-                    (MoveSide::To, TrackingStatus::Deleted(revision))
-                        if revision.identity != identity =>
-                    {
-                        Some((
-                            revision.clone(),
-                            extract_inlines_text(&paragraph.segments[*segment_index].inlines),
-                        ))
-                    }
-                    _ => None,
-                })
-                .collect();
+            let deletions =
+                destination_clone_deletions(paragraph, identity, MoveCloneScope::MovedRuns);
             plans.push(MoveDestinationDeletionPlan {
                 source_id: block_id(&blocks[*source_index].block).clone(),
                 destination_id: block_id(&blocks[destination_index].block).clone(),
@@ -12079,7 +14303,7 @@ fn apply_move_destination_deletion_cascade(
         let deletion_identities: HashSet<u32> = plan
             .deletions
             .iter()
-            .map(|(revision, _)| revision.identity)
+            .map(|(revision, _, _)| revision.identity)
             .collect();
         let rejecting_move = action == ResolveSelectionAction::Reject
             && selected_revision_ids.contains(&plan.move_revision.identity);
@@ -12100,18 +14324,17 @@ fn apply_move_destination_deletion_cascade(
             let BlockNode::Paragraph(source_paragraph) = &mut source.block else {
                 continue;
             };
-            for (revision, text) in &plan.deletions {
+            for (revision, start, text) in &plan.deletions {
                 if accepting_inner_deletion && !selected_revision_ids.contains(&revision.identity) {
                     continue;
                 }
-                assert!(
-                    overlay_unique_text_status(
-                        source_paragraph,
-                        plan.move_revision.identity,
-                        text,
-                        TrackingStatus::Deleted(revision.clone()),
-                    ),
-                    "move-destination deletion must map uniquely onto its source clone"
+                overlay_clone_deletion(
+                    source_paragraph,
+                    plan.move_revision.identity,
+                    plan.scope,
+                    *start,
+                    text,
+                    revision,
                 );
             }
         }
@@ -12133,6 +14356,25 @@ fn apply_move_destination_deletion_cascade(
             continue;
         };
         let sides = move_container_sides(paragraph);
+        // The restored text is moved text again: it joins the move's own
+        // destination run carrier (a whole paragraph's pilcrow is a separate
+        // carrier with its own wire id), so the destination reads as one
+        // moveTo, as it does after save and reopen.
+        let destination_carrier = paragraph
+            .segments
+            .iter()
+            .zip(&sides)
+            .find_map(|(segment, side)| match &segment.status {
+                TrackingStatus::Inserted(revision)
+                    if revision.identity == plan.move_revision.identity
+                        && (plan.scope == MoveCloneScope::WholeParagraph
+                            || *side == Some(MoveSide::To)) =>
+                {
+                    Some(revision.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| plan.move_revision.clone());
         for (segment, side) in paragraph.segments.iter_mut().zip(sides) {
             let in_clone =
                 plan.scope == MoveCloneScope::WholeParagraph || side == Some(MoveSide::To);
@@ -12141,43 +14383,65 @@ fn apply_move_destination_deletion_cascade(
                     TrackingStatus::Deleted(revision)
                         if deletion_identities.contains(&revision.identity))
             {
-                segment.status = TrackingStatus::Inserted(plan.move_revision.clone());
+                segment.status = TrackingStatus::Inserted(destination_carrier.clone());
             }
         }
     }
 }
 
-/// Apply `status` to the one occurrence of `needle` in a move source clone's
-/// text — the paragraph's runs the move `move_identity` deletes — preserving
-/// run formatting and every non-text inline. Returns false when the move clone
-/// does not provide an unambiguous content-identity mapping.
-fn overlay_unique_text_status(
+/// Strike `text`, which starts `start` characters into a move's destination
+/// clone, at the same characters of the source clone with `deletion`. The
+/// two clones of one move hold the same text: the source's moved text
+/// (the move's own deletion) and any text inserted there before the move
+/// (an origin, which the deletion then stacks on). Run formatting and every
+/// non-text inline are kept.
+fn overlay_clone_deletion(
     paragraph: &mut ParagraphNode,
     move_identity: u32,
-    needle: &str,
-    status: TrackingStatus,
-) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let in_clone = |segment_status: &TrackingStatus| matches!(segment_status, TrackingStatus::Deleted(r) if r.identity == move_identity);
-    let haystack: String = paragraph
+    scope: MoveCloneScope,
+    start: usize,
+    text: &str,
+    deletion: &RevisionInfo,
+) {
+    let in_clone = |segment_status: &TrackingStatus| match segment_status {
+        TrackingStatus::Deleted(revision) => revision.identity == move_identity,
+        TrackingStatus::Inserted(revision) => revision.identity != move_identity,
+        TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => false,
+    };
+    let sides = move_container_sides(paragraph);
+    let searched: Vec<bool> = paragraph
         .segments
         .iter()
-        .filter(|segment| in_clone(&segment.status))
-        .map(|segment| extract_inlines_text(&segment.inlines))
+        .zip(&sides)
+        .map(|(segment, side)| {
+            segment_in_clone(scope, *side, MoveSide::From) && in_clone(&segment.status)
+        })
         .collect();
-    let matches: Vec<usize> = haystack
-        .match_indices(needle)
-        .map(|(offset, _)| offset)
+    let clone_text: String = paragraph
+        .segments
+        .iter()
+        .zip(&searched)
+        .filter(|(_, searched)| **searched)
+        .map(|(segment, _)| extract_inlines_text(&segment.inlines))
         .collect();
-    if matches.len() != 1 {
-        return false;
-    }
-    let start = haystack[..matches[0]].chars().count();
-    let end = start + needle.chars().count();
-    let mut cursor = 0usize;
-    let mut rebuilt: Vec<TrackedSegment> = Vec::new();
+    let end = start + text.chars().count();
+    let struck: String = clone_text.chars().skip(start).take(end - start).collect();
+    assert_eq!(
+        struck, text,
+        "the two clones of move {move_identity} in paragraph {:?} hold the same text: the \
+         destination deletion at {start} must strike the same characters of the source \
+         (source clone text {clone_text:?})",
+        paragraph.id
+    );
+    let struck_status = |status: &TrackingStatus| match status {
+        TrackingStatus::Inserted(origin) => {
+            TrackingStatus::InsertedThenDeleted(Box::new(crate::domain::StackedRevision {
+                inserted: origin.clone(),
+                deleted: deletion.clone(),
+            }))
+        }
+        _ => TrackingStatus::Deleted(deletion.clone()),
+    };
 
     let push =
         |rebuilt: &mut Vec<TrackedSegment>, inline: InlineNode, inline_status: TrackingStatus| {
@@ -12193,8 +14457,12 @@ fn overlay_unique_text_status(
             }
         };
 
-    for segment in std::mem::take(&mut paragraph.segments) {
-        let searched = in_clone(&segment.status);
+    let mut cursor = 0usize;
+    let mut rebuilt: Vec<TrackedSegment> = Vec::new();
+    for (segment, searched) in std::mem::take(&mut paragraph.segments)
+        .into_iter()
+        .zip(searched)
+    {
         for inline in segment.inlines {
             let InlineNode::Text(text) = inline else {
                 push(&mut rebuilt, inline, segment.status.clone());
@@ -12215,7 +14483,10 @@ fn overlay_unique_text_status(
             let chars: Vec<char> = text.text.chars().collect();
             for (part_index, (part, part_status)) in [
                 (&chars[..overlap_start], segment.status.clone()),
-                (&chars[overlap_start..overlap_end], status.clone()),
+                (
+                    &chars[overlap_start..overlap_end],
+                    struck_status(&segment.status),
+                ),
                 (&chars[overlap_end..], segment.status.clone()),
             ]
             .into_iter()
@@ -12233,7 +14504,6 @@ fn overlay_unique_text_status(
         }
     }
     paragraph.segments = rebuilt;
-    true
 }
 
 fn inserted_move_origin_plans(blocks: &[TrackedBlock]) -> Vec<InsertedMoveOriginPlan> {
@@ -12245,23 +14515,45 @@ fn inserted_move_origin_plans(blocks: &[TrackedBlock]) -> Vec<InsertedMoveOrigin
         let BlockNode::Paragraph(source_paragraph) = &source.block else {
             continue;
         };
-        let Some(TrackingStatus::InsertedThenDeleted(stacked)) = &source_paragraph.para_mark_status
-        else {
-            continue;
-        };
-        // The deletion layer is the moveFrom pilcrow; the insertion layer is
-        // the paragraph's origin. Require material source content to carry the
-        // same origin so a coincidental stacked pilcrow cannot activate this
-        // transition.
+        // The source pilcrow carries the move: as the deletion layer of a
+        // stacked pilcrow when the whole paragraph was inserted and then
+        // moved, or alone when only some of its text was inserted first.
+        let (move_revision, origins): (&RevisionInfo, Vec<&RevisionInfo>) =
+            match &source_paragraph.para_mark_status {
+                Some(TrackingStatus::InsertedThenDeleted(stacked)) => {
+                    (&stacked.deleted, vec![&stacked.inserted])
+                }
+                Some(TrackingStatus::Deleted(mark_revision)) => {
+                    // Settled origin text joins the move's own content
+                    // carrier (the pilcrow is a separate carrier with its
+                    // own wire id), so the source reads as one moveFrom.
+                    let move_revision = source_paragraph
+                        .segments
+                        .iter()
+                        .find_map(|segment| match &segment.status {
+                            TrackingStatus::Deleted(revision)
+                                if revision.identity == mark_revision.identity =>
+                            {
+                                Some(revision)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(mark_revision);
+                    let mut origins: Vec<&RevisionInfo> = Vec::new();
+                    for segment in &source_paragraph.segments {
+                        if let TrackingStatus::Inserted(origin) = &segment.status
+                            && origin.identity != move_revision.identity
+                            && !origins.iter().any(|seen| seen.identity == origin.identity)
+                        {
+                            origins.push(origin);
+                        }
+                    }
+                    (move_revision, origins)
+                }
+                _ => continue,
+            };
         let source_text = extract_inlines_text(&source_paragraph.all_inlines_owned());
-        if source_text.is_empty()
-            || !source_paragraph.segments.iter().any(|segment| {
-                matches!(&segment.status,
-                    TrackingStatus::Inserted(revision)
-                        if revision.identity == stacked.inserted.identity)
-                    && !extract_inlines_text(&segment.inlines).is_empty()
-            })
-        {
+        if source_text.is_empty() {
             continue;
         }
         let destination = blocks.iter().find(|candidate| {
@@ -12274,18 +14566,30 @@ fn inserted_move_origin_plans(blocks: &[TrackedBlock]) -> Vec<InsertedMoveOrigin
             let destination_is_move = matches!(
                 &paragraph.para_mark_status,
                 Some(TrackingStatus::Inserted(revision))
-                    if revision.identity == stacked.deleted.identity
+                    if revision.identity == move_revision.identity
             );
             destination_is_move
                 && extract_inlines_text(&paragraph.all_inlines_owned()) == source_text
         });
-        if destination.is_some() {
-            plans.push(InsertedMoveOriginPlan {
-                source_id: block_id(&source.block).clone(),
-                move_revision: stacked.deleted.clone(),
-                origin: stacked.inserted.clone(),
-                scope: MoveCloneScope::WholeParagraph,
+        if destination.is_none() {
+            continue;
+        }
+        for origin in origins {
+            // Require material source content to carry the origin so a
+            // coincidental stacked pilcrow cannot activate this transition.
+            let carries_origin = source_paragraph.segments.iter().any(|segment| {
+                matches!(&segment.status,
+                    TrackingStatus::Inserted(revision) if revision.identity == origin.identity)
+                    && !extract_inlines_text(&segment.inlines).is_empty()
             });
+            if carries_origin {
+                plans.push(InsertedMoveOriginPlan {
+                    source_id: block_id(&source.block).clone(),
+                    move_revision: move_revision.clone(),
+                    origin: origin.clone(),
+                    scope: MoveCloneScope::WholeParagraph,
+                });
+            }
         }
     }
     // The same mixture inside paragraphs that stay: an insertion nested in
@@ -12344,22 +14648,44 @@ fn settle_move_origin_at_source(blocks: &mut [TrackedBlock], plan: &InsertedMove
             segment.status = TrackingStatus::Deleted(plan.move_revision.clone());
         }
     }
-    if plan.scope == MoveCloneScope::WholeParagraph {
-        paragraph.para_mark_status = Some(TrackingStatus::Deleted(plan.move_revision.clone()));
-    }
+    // The pilcrow is not settled: an inserted-then-moved pilcrow stays the
+    // stacked pair, so rejecting the move leaves the origin's insertion of
+    // the paragraph break pending, and rejecting both joins the paragraph to
+    // the next (Word's reading of an inserted paragraph moved away).
 }
 
 fn apply_inserted_move_origin_cascade(
     blocks: &mut [TrackedBlock],
     selected_revision_ids: &HashSet<u32>,
     plans: &[InsertedMoveOriginPlan],
-) {
+    action: ResolveSelectionAction,
+) -> HashSet<String> {
+    let mut dissolved = HashSet::new();
     for plan in plans {
         let origin_selected = selected_revision_ids.contains(&plan.origin.identity);
         let move_selected = selected_revision_ids.contains(&plan.move_revision.identity);
+        // Rejecting the insertion alone, when it is all the move took from
+        // its source: Word takes the text from the source, and what is left
+        // at the destination is the mover's plain insertion, no longer a
+        // move (checked in Word). The rejected origin drops with its source
+        // runs in the ordinary projection; the move's markup goes after it.
+        if action == ResolveSelectionAction::Reject
+            && origin_selected
+            && !move_selected
+            && source_clone_holds_only_origin(blocks, plan)
+        {
+            let name = blocks
+                .iter()
+                .find(|block| block_id(&block.block) == &plan.source_id)
+                .and_then(|block| block.move_id.clone())
+                .expect("an origin plan's source is one half of a named move");
+            dissolved.insert(name);
+            continue;
+        }
         if origin_selected || move_selected {
             // Once the inserted content is a pending move, resolving its
-            // origin in either direction settles that origin INTO the move;
+            // origin settles that origin INTO the move (accepting it; or
+            // rejecting it while the move took other text from the source);
             // it does not decide whether the logical content exists. Word's
             // later move decision alone chooses source vs destination.
             // Resolving the move settles the source-only origin with it:
@@ -12370,6 +14696,36 @@ fn apply_inserted_move_origin_cascade(
             settle_move_origin_at_source(blocks, plan);
         }
     }
+    dissolved
+}
+
+/// Whether every character the move took from its source is text the
+/// plan's origin inserted (the source clone holds nothing of the move's own).
+fn source_clone_holds_only_origin(blocks: &[TrackedBlock], plan: &InsertedMoveOriginPlan) -> bool {
+    let Some(source) = blocks
+        .iter()
+        .find(|block| block_id(&block.block) == &plan.source_id)
+    else {
+        return false;
+    };
+    let BlockNode::Paragraph(paragraph) = &source.block else {
+        return false;
+    };
+    paragraph
+        .segments
+        .iter()
+        .zip(move_container_sides(paragraph))
+        // Untracked text is never moved text (a container's closing marker
+        // can share a segment with the untracked text after it).
+        .filter(|(segment, side)| {
+            segment_in_clone(plan.scope, *side, MoveSide::From)
+                && segment.status != TrackingStatus::Normal
+                && !extract_inlines_text(&segment.inlines).is_empty()
+        })
+        .all(|(segment, _)| {
+            matches!(&segment.status,
+                TrackingStatus::Inserted(revision) if revision.identity == plan.origin.identity)
+        })
 }
 
 fn neutralize_selected_move_paragraph_marks(
@@ -12402,6 +14758,20 @@ fn neutralize_selected_move_paragraph_marks(
                             .any(|inline| matches!(inline, InlineNode::Text(_)))
                 })
             {
+                continue;
+            }
+            // An inserted-then-moved pilcrow keeps its origin's insertion:
+            // rejecting the move alone leaves that insertion pending; every
+            // other selection leaves the pair to the ordinary mark rules
+            // (accepting the move or rejecting both drops it and joins).
+            if let Some(TrackingStatus::InsertedThenDeleted(stacked)) = &paragraph.para_mark_status
+            {
+                if action == ResolveSelectionAction::Reject
+                    && !selected_revision_ids.contains(&stacked.inserted.identity)
+                {
+                    paragraph.para_mark_status =
+                        Some(TrackingStatus::Inserted(stacked.inserted.clone()));
+                }
                 continue;
             }
             if paragraph
@@ -12496,6 +14866,27 @@ fn selected_move_plans(
                         && moves_paragraph(block, identity, true)
                 })
                 .map(|block| block_id(&block.block));
+            // A destination paragraph that also holds untracked text of its
+            // own is a paragraph the move split, not a moved paragraph (a move
+            // of text across a paragraph break: Word puts the moved break in
+            // the middle of the destination). Its marks resolve like any
+            // other tracked mark, as in Accept/Reject All.
+            let destination_split = destination.is_some_and(|destination_id| {
+                blocks.iter().any(|block| {
+                    block_id(&block.block) == destination_id
+                        && matches!(&block.block, BlockNode::Paragraph(paragraph)
+                        if paragraph.segments.iter().any(|segment| {
+                            segment.status == TrackingStatus::Normal
+                                && segment
+                                    .inlines
+                                    .iter()
+                                    .any(|inline| matches!(inline, InlineNode::Text(_)))
+                        }))
+                })
+            });
+            if destination_split {
+                break;
+            }
             if let (Some(source_id), Some(destination_id)) = (source, destination) {
                 plans.push(SelectedMovePlan {
                     source_id: source_id.clone(),
@@ -12541,6 +14932,19 @@ fn resolve_selected_move_layout(
         let destination_index = blocks
             .iter()
             .position(|block| block_id(&block.block) == &plan.destination_id);
+        // A source whose pilcrow this resolution removed (an inserted-then-
+        // moved paragraph rejected with its origin) has joined the paragraph
+        // after it; the rejected destination copy then has nothing to carry
+        // back and goes when emptied.
+        if source_index.is_none()
+            && action == ResolveSelectionAction::Reject
+            && let Some(destination_index) = destination_index
+            && matches!(&blocks[destination_index].block,
+                BlockNode::Paragraph(paragraph) if !paragraph_has_content(paragraph))
+        {
+            blocks.remove(destination_index);
+            continue;
+        }
         let (Some(source_index), Some(destination_index)) = (source_index, destination_index)
         else {
             continue;
@@ -12568,14 +14972,219 @@ fn resolve_selected_move_layout(
                 if let BlockNode::Paragraph(destination) = &mut blocks[destination_index].block {
                     remove_move_decorations(destination);
                 }
+                // A source left with nothing but zero-width anchors (a
+                // bookmark half that spans text that stays) is removed, and
+                // its anchors are re-anchored as when Accept All removes a
+                // paragraph (Word 16, observed).
                 let source_empty = matches!(
                     &blocks[source_index].block,
-                    BlockNode::Paragraph(paragraph) if !paragraph_has_content(paragraph)
+                    BlockNode::Paragraph(paragraph)
+                        if !paragraph.all_inlines().any(is_comment_range_content)
                 );
                 if source_empty {
-                    blocks.remove(source_index);
+                    let BlockNode::Paragraph(source) = blocks.remove(source_index).block else {
+                        unreachable!("source_empty matched a paragraph");
+                    };
+                    let anchors: Vec<InlineNode> = source
+                        .segments
+                        .into_iter()
+                        .flat_map(|segment| segment.inlines)
+                        .filter(is_zero_width_anchor)
+                        .collect();
+                    let next = blocks[source_index..]
+                        .iter()
+                        .position(|block| !is_zero_width_marker_block(&block.block))
+                        .map(|offset| source_index + offset)
+                        .filter(|&index| matches!(blocks[index].block, BlockNode::Paragraph(_)));
+                    match next {
+                        Some(next) => {
+                            relocate_anchors_of_removed_paragraph(
+                                blocks,
+                                source_index,
+                                next,
+                                anchors,
+                                |_| true,
+                            );
+                        }
+                        None => {
+                            hold_anchors_beside_dropped_paragraph(
+                                blocks,
+                                source_index,
+                                anchors,
+                                |_| true,
+                            );
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Word's rule for accepting a move and the bookmarks of its source (Word 16,
+/// observed): a bookmark goes, both halves, when it has a half in the moved
+/// text — or spans moved text — and nothing it spans stays. It is neither
+/// collapsed to a point at the source nor carried to the destination. A
+/// bookmark that also spans content that stays (it starts in the moved text
+/// and ends after it, or starts before it and ends inside) is kept; its half
+/// in the moved text is left where that text is removed. `accepted` names the
+/// moves being accepted.
+///
+/// The moved text is what lies between the move's `w:moveFromRangeStart` and
+/// `w:moveFromRangeEnd` in a moved-from carrier, and a whole moved-from
+/// paragraph (its mark included). Everything else a bookmark spans stays:
+/// other text and objects, other paragraphs' marks, tables. Bookmark halves
+/// are read from paragraphs and from body-level marker blocks; a table is
+/// content that stays, so a bookmark with a half in one is always kept.
+/// Comment ranges are not bookmarks and are left to their own rule. The byte
+/// path applies the same rule (`normalize::drop_bookmarks_of_move_sources`).
+fn drop_bookmarks_of_accepted_move_sources(
+    blocks: &mut Vec<TrackedBlock>,
+    accepted: &HashSet<String>,
+) {
+    /// What one open bookmark has spanned so far.
+    #[derive(Default)]
+    struct Span {
+        touches_source: bool,
+        holds_moved: bool,
+        holds_staying: bool,
+    }
+    fn spanned(open: &mut HashMap<String, Span>, moved: bool) {
+        for span in open.values_mut() {
+            if moved {
+                span.holds_moved = true;
+            } else {
+                span.holds_staying = true;
+            }
+        }
+    }
+    fn bookmark_half(
+        id: String,
+        role: RangeRole,
+        in_source: bool,
+        open: &mut HashMap<String, Span>,
+        doomed: &mut HashSet<String>,
+    ) {
+        match role {
+            RangeRole::Start => {
+                open.insert(
+                    id,
+                    Span {
+                        touches_source: in_source,
+                        ..Span::default()
+                    },
+                );
+            }
+            RangeRole::End => {
+                if let Some(span) = open.remove(&id)
+                    && (span.touches_source || in_source || span.holds_moved)
+                    && !span.holds_staying
+                {
+                    doomed.insert(id);
+                }
+            }
+        }
+    }
+    if accepted.is_empty() {
+        return;
+    }
+    let move_range_edge = |inline: &InlineNode| -> Option<bool> {
+        let InlineNode::Decoration(decoration) = inline else {
+            return None;
+        };
+        if decoration.kind != crate::domain::DecorationType::MoveRange {
+            return None;
+        }
+        let element = crate::word_xml::parse_raw_fragment(decoration.raw_xml.as_deref()?)
+            .expect("an imported move decoration holds the element it was parsed from");
+        match crate::import::local_element_name(&element) {
+            "moveFromRangeStart" => Some(true),
+            "moveFromRangeEnd" => Some(false),
+            _ => None,
+        }
+    };
+    let mut open: HashMap<String, Span> = HashMap::new();
+    let mut doomed: HashSet<String> = HashSet::new();
+    let mut inside = false;
+    for block in blocks.iter() {
+        let paragraph = match &block.block {
+            BlockNode::Paragraph(paragraph) => paragraph,
+            BlockNode::OpaqueBlock(opaque) => {
+                match opaque_range_marker(opaque) {
+                    Some((RangePairFamily::Bookmark, id, role)) => {
+                        bookmark_half(id, role, inside, &mut open, &mut doomed);
+                    }
+                    Some(_) => {}
+                    None => spanned(&mut open, false),
+                }
+                continue;
+            }
+            BlockNode::Table(_) => {
+                spanned(&mut open, false);
+                continue;
+            }
+        };
+        let of_accepted_move = block
+            .move_id
+            .as_ref()
+            .is_some_and(|name| accepted.contains(name));
+        // A whole moved-from paragraph: the block is the move's deletion, or
+        // its mark is and no untracked text stays behind in it.
+        let mark_moves = matches!(
+            paragraph.para_mark_status,
+            Some(TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_))
+        );
+        let only_moved_text = paragraph.segments.iter().all(|segment| {
+            !matches!(segment.status, TrackingStatus::Normal)
+                || segment
+                    .inlines
+                    .iter()
+                    .all(|inline| matches!(inline, InlineNode::Decoration(_)))
+        });
+        let whole_source = of_accepted_move
+            && (matches!(block.status, TrackingStatus::Deleted(_))
+                || (mark_moves && only_moved_text));
+        for segment in &paragraph.segments {
+            let removed_with_source = matches!(
+                segment.status,
+                TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_)
+            );
+            for inline in &segment.inlines {
+                if of_accepted_move && let Some(opens) = move_range_edge(inline) {
+                    inside = opens;
+                    continue;
+                }
+                let in_source = whole_source || (of_accepted_move && inside);
+                if let Some((RangePairFamily::Bookmark, id, role)) =
+                    classify_range_pair_marker(inline)
+                {
+                    bookmark_half(id, role, in_source, &mut open, &mut doomed);
+                } else if is_comment_range_content(inline) {
+                    spanned(&mut open, in_source && removed_with_source);
+                }
+            }
+        }
+        // The paragraph's mark: moved with a whole moved-from paragraph,
+        // otherwise content that stays.
+        spanned(&mut open, whole_source);
+    }
+    if doomed.is_empty() {
+        return;
+    }
+    blocks.retain(|block| {
+        !matches!(&block.block, BlockNode::OpaqueBlock(opaque)
+            if matches!(opaque_range_marker(opaque),
+                Some((RangePairFamily::Bookmark, id, _)) if doomed.contains(&id)))
+    });
+    for block in blocks.iter_mut() {
+        let BlockNode::Paragraph(paragraph) = &mut block.block else {
+            continue;
+        };
+        for segment in &mut paragraph.segments {
+            segment.inlines.retain(|inline| {
+                !matches!(classify_range_pair_marker(inline),
+                    Some((RangePairFamily::Bookmark, id, _)) if doomed.contains(&id))
+            });
         }
     }
 }
@@ -12601,6 +15210,19 @@ fn selected_move_names(
     }
 
     let mut by_name: HashMap<String, HashMap<u32, u8>> = HashMap::new();
+    for paragraph in cell_move_paragraphs(blocks) {
+        let move_name = paragraph
+            .cell_move_id
+            .as_ref()
+            .expect("cell_move_paragraphs yields move halves");
+        let polarities = by_name.entry(move_name.clone()).or_default();
+        for segment in &paragraph.segments {
+            record(&segment.status, polarities);
+        }
+        if let Some(status) = &paragraph.para_mark_status {
+            record(status, polarities);
+        }
+    }
     for block in blocks {
         let Some(move_name) = &block.move_id else {
             continue;
@@ -12628,9 +15250,124 @@ fn selected_move_names(
         .collect()
 }
 
+/// The paragraphs inside `blocks`' tables (at any depth) that are move
+/// halves: a cell paragraph carries its move group itself
+/// (`ParagraphNode::cell_move_id`).
+fn cell_move_paragraphs(blocks: &[TrackedBlock]) -> Vec<&ParagraphNode> {
+    fn walk<'a>(block: &'a BlockNode, out: &mut Vec<&'a ParagraphNode>) {
+        let BlockNode::Table(table) = block else {
+            return;
+        };
+        for nested in table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.blocks)
+        {
+            match nested {
+                BlockNode::Paragraph(p) if p.cell_move_id.is_some() => out.push(p),
+                _ => walk(nested, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for block in blocks {
+        walk(&block.block, &mut out);
+    }
+    out
+}
+
+/// [`cell_move_paragraphs`], mutably.
+fn cell_move_paragraphs_mut(blocks: &mut [TrackedBlock]) -> Vec<&mut ParagraphNode> {
+    fn walk<'a>(block: &'a mut BlockNode, out: &mut Vec<&'a mut ParagraphNode>) {
+        let BlockNode::Table(table) = block else {
+            return;
+        };
+        for nested in table
+            .rows
+            .iter_mut()
+            .flat_map(|row| &mut row.cells)
+            .flat_map(|cell| &mut cell.blocks)
+        {
+            match nested {
+                BlockNode::Paragraph(p) => {
+                    if p.cell_move_id.is_some() {
+                        out.push(p);
+                    }
+                }
+                other => walk(other, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for block in blocks {
+        walk(&mut block.block, &mut out);
+    }
+    out
+}
+
+/// Remove the move containers and range markers of the moves named in
+/// `names` from their paragraphs.
+fn strip_move_decorations(blocks: &mut [TrackedBlock], names: &HashSet<String>) {
+    for paragraph in cell_move_paragraphs_mut(blocks) {
+        if paragraph
+            .cell_move_id
+            .as_ref()
+            .is_some_and(|name| names.contains(name))
+        {
+            for segment in &mut paragraph.segments {
+                segment.inlines.retain(|inline| {
+                    !matches!(inline, InlineNode::Decoration(decoration)
+                        if decoration.kind == crate::domain::DecorationType::MoveRange)
+                });
+            }
+        }
+    }
+    for block in blocks.iter_mut() {
+        if !block
+            .move_id
+            .as_ref()
+            .is_some_and(|name| names.contains(name))
+        {
+            continue;
+        }
+        if let BlockNode::Paragraph(paragraph) = &mut block.block {
+            for segment in &mut paragraph.segments {
+                segment.inlines.retain(|inline| {
+                    !matches!(inline, InlineNode::Decoration(decoration)
+                        if decoration.kind == crate::domain::DecorationType::MoveRange)
+                });
+            }
+        }
+    }
+}
+
 fn clear_resolved_move_markup(blocks: &mut [TrackedBlock], resolved_move_names: &HashSet<String>) {
     if resolved_move_names.is_empty() {
         return;
+    }
+    for paragraph in cell_move_paragraphs_mut(blocks) {
+        if !paragraph
+            .cell_move_id
+            .as_ref()
+            .is_some_and(|name| resolved_move_names.contains(name))
+        {
+            continue;
+        }
+        paragraph.cell_move_id = None;
+        for segment in &mut paragraph.segments {
+            segment.inlines.retain(|inline| {
+                !matches!(
+                    inline,
+                    InlineNode::Decoration(decoration)
+                        if decoration.kind == crate::domain::DecorationType::MoveRange
+                )
+            });
+        }
+        paragraph
+            .paragraph_mark_style_props
+            .preserved
+            .retain(|property| property.name != "w:moveFrom" && property.name != "w:moveTo");
     }
     for block in blocks {
         if !block
@@ -12662,7 +15399,10 @@ fn clear_resolved_move_markup(blocks: &mut [TrackedBlock], resolved_move_names: 
 /// The revision ids resolved AS A CASCADE by applying `action` to
 /// `selected_revision_ids` (cascades are enumerated, never
 /// silent): for every stacked segment whose drop is entailed by resolving
-/// only ONE member of its pair, the OTHER member's id. An id named here may
+/// only ONE member of its pair, the OTHER member's id; for a selected
+/// move, each insertion made before the move that it settles; and the
+/// pending mark of a paragraph the selection strands as document-final,
+/// which the final-mark settle removes. An id named here may
 /// still have pending segments elsewhere (revisions span segments) — it names
 /// a revision AFFECTED by the cascade, not necessarily fully resolved.
 pub fn cascaded_resolution_ids(
@@ -12716,6 +15456,14 @@ pub fn cascaded_resolution_ids(
         for tb in blocks {
             visit_block(&tb.block, ids, action, out);
         }
+        // Resolving a move settles the insertions made before it into it
+        // (`apply_inserted_move_origin_cascade`): they leave with the move
+        // in either direction without being selected.
+        for plan in inserted_move_origin_plans(blocks) {
+            if ids.contains(&plan.move_revision.identity) && !ids.contains(&plan.origin.identity) {
+                out.insert(plan.origin.identity);
+            }
+        }
     }
     fn visit_block(
         block: &BlockNode,
@@ -12734,6 +15482,19 @@ pub fn cascaded_resolution_ids(
                         if let Some(status) = &cell.tracking_status {
                             visit_status(status, ids, action, out);
                         }
+                        // A cell its merge change leaves as a continuation
+                        // loses its content, pending changes included.
+                        if let Some(merge) = &cell.cell_merge
+                            && ids.contains(&merge.revision.identity)
+                            && merge.resolved(matches!(action, ResolveSelectionAction::Accept))
+                                == crate::domain::VerticalMerge::Continue
+                        {
+                            out.extend(
+                                cell_content_revision_ids(cell)
+                                    .into_iter()
+                                    .filter(|id| *id != 0 && !ids.contains(id)),
+                            );
+                        }
                         for nested in &cell.blocks {
                             visit_block(nested, ids, action, out);
                         }
@@ -12745,6 +15506,11 @@ pub fn cascaded_resolution_ids(
     }
     let mut out = HashSet::new();
     visit_blocks(&doc.blocks, selected_revision_ids, action, &mut out);
+    if let Some(settled) = final_mark_settled_by_selection(doc, selected_revision_ids, action)
+        && !selected_revision_ids.contains(&settled)
+    {
+        out.insert(settled);
+    }
     for story in &doc.headers {
         visit_blocks(&story.blocks, selected_revision_ids, action, &mut out);
     }
@@ -12761,6 +15527,59 @@ pub fn cascaded_resolution_ids(
         visit_blocks(&story.blocks, selected_revision_ids, action, &mut out);
     }
     out
+}
+
+/// The pending paragraph-mark revision the body's final-mark settle
+/// (`renormalize_final_mark_after_selective`) removes when `action` is applied
+/// to `selected`: the selection resolves away every paragraph after it, so
+/// the paragraph becomes document-final and its pending mark settles to the
+/// untracked final mark. Computed by running the same projection and settle
+/// on a copy of the body, so the prediction cannot drift from the resolver;
+/// the copy is only made when the body's last untracked-status paragraph
+/// (the only one that can become final — paragraphs with a `Normal` block
+/// status are never removed whole) carries a pending mark. The copy is
+/// thrown away, so the resolution definitions (which only re-derive inherited
+/// formatting, never which blocks survive) are not needed.
+fn final_mark_settled_by_selection(
+    doc: &CanonDoc,
+    selected: &HashSet<u32>,
+    action: ResolveSelectionAction,
+) -> Option<u32> {
+    let mut candidate = None;
+    for tracked in doc.blocks.iter().rev() {
+        match &tracked.block {
+            BlockNode::OpaqueBlock(opaque) if opaque.range_marker.is_some() => continue,
+            BlockNode::Paragraph(_) if !matches!(tracked.status, TrackingStatus::Normal) => {
+                continue;
+            }
+            BlockNode::Paragraph(paragraph) => candidate = Some(paragraph),
+            BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => {}
+        }
+        break;
+    }
+    let candidate_mark_is_pending = candidate.is_some_and(|paragraph| {
+        matches!(
+            paragraph.para_mark_status,
+            Some(TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_))
+        )
+    });
+    if !candidate_mark_is_pending {
+        return None;
+    }
+    let interior_selected: HashSet<u32> = classify_interior_ids(doc)
+        .selectable
+        .intersection(selected)
+        .copied()
+        .collect();
+    let mut blocks = doc.blocks.clone();
+    project_blocks_for_selected_resolution(
+        &mut blocks,
+        action,
+        selected,
+        &interior_selected,
+        ResolutionDefinitions::NONE,
+    );
+    renormalize_final_mark_after_selective(&mut blocks)
 }
 
 /// Every revision id `resolve_selected_revisions` is able to act on: the
@@ -12853,10 +15672,22 @@ fn body_resolvable_revision_ids(doc: &CanonDoc) -> HashSet<u32> {
                         // (`resolvable_revision_ids`) from
                         // `classify_interior_ids` — not here, so this walk
                         // stays the exact mirror of the import mint walk.
+                        if let Some(fc) = &opaque.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_formatting_change_id(fc.identity, out);
+                        }
                         if let crate::domain::OpaqueKind::Hyperlink(data) = &opaque.kind {
                             for run in &data.runs {
                                 visit_status(&run.status, out);
                             }
+                        }
+                    }
+                    InlineNode::Decoration(deco) => {
+                        if let Some(fc) = &deco.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_formatting_change_id(fc.identity, out);
                         }
                     }
                     _ => {}
@@ -12893,6 +15724,9 @@ fn body_resolvable_revision_ids(doc: &CanonDoc) -> HashSet<u32> {
                         visit_optional_status(&cell.tracking_status, out);
                         if let Some(fc) = &cell.formatting_change {
                             visit_formatting_change_id(fc.identity, out);
+                        }
+                        if let Some(merge) = &cell.cell_merge {
+                            visit_formatting_change_id(merge.revision.identity, out);
                         }
                         for nested in &cell.blocks {
                             visit_block(nested, out);
@@ -12944,10 +15778,19 @@ pub enum SelectionError {
     /// its insertion), but the join into the following paragraph is blocked
     /// only by blocks another, unselected revision would remove in the same
     /// direction. The join's outcome depends on that revision, so the subset
-    /// has no order-independent result; resolve them together.
+    /// has no order-independent result; resolve them together, or the
+    /// blocker first. Holds for body paragraphs across a table and for cell
+    /// paragraphs across a nested table. Word (16, oracle) resolves such a
+    /// mark alone by pulling the paragraph into the pending table's first
+    /// cell, after which accepting the table loses the paragraph's text (or,
+    /// in a nested table, leaves a revision Word cannot reach): no outcome
+    /// to reproduce.
     BlockedJoin {
         paragraph_id: NodeId,
         required_ids: Vec<u32>,
+        /// The revisions of the blocking table(s): resolving them first is
+        /// the order Word resolves cleanly.
+        blocker_ids: Vec<u32>,
     },
 }
 
@@ -12970,6 +15813,40 @@ fn blocked_join_selection(
             TrackingStatus::InsertedThenDeleted(stacked) => {
                 out.extend([stacked.inserted.identity, stacked.deleted.identity])
             }
+        }
+    }
+    /// The refusal for `paragraph`, naming its mark's revisions and those of
+    /// every blocker (its own status, when it is a body block, and each
+    /// row's).
+    fn refusal(
+        paragraph: &ParagraphNode,
+        blockers: &[(Option<&TrackingStatus>, &BlockNode)],
+    ) -> SelectionError {
+        let mut blocker_ids = Vec::new();
+        for (status, block) in blockers {
+            if let Some(status) = status {
+                collect_ids(status, &mut blocker_ids);
+            }
+            if let BlockNode::Table(table) = block {
+                for row in &table.rows {
+                    if let Some(status) = &row.tracking_status {
+                        collect_ids(status, &mut blocker_ids);
+                    }
+                }
+            }
+        }
+        blocker_ids.sort_unstable();
+        blocker_ids.dedup();
+        let mut required = blocker_ids.clone();
+        if let Some(mark) = &paragraph.para_mark_status {
+            collect_ids(mark, &mut required);
+        }
+        required.sort_unstable();
+        required.dedup();
+        SelectionError::BlockedJoin {
+            paragraph_id: paragraph.id.clone(),
+            required_ids: required,
+            blocker_ids,
         }
     }
     fn visit(
@@ -13008,7 +15885,7 @@ fn blocked_join_selection(
                     break;
                 }
                 if tracked_block_removed_by_accept_reject(follower, keep_inserted) {
-                    blockers.push(follower);
+                    blockers.push((Some(&follower.status), &follower.block));
                     continue;
                 }
                 if is_zero_width_marker_block(&follower.block) {
@@ -13016,31 +15893,76 @@ fn blocked_join_selection(
                 }
                 break;
             }
-            if !joins || blockers.is_empty() {
+            if joins && !blockers.is_empty() {
+                return Some(refusal(paragraph, &blockers));
+            }
+        }
+        blocks
+            .iter()
+            .find_map(|tracked| visit_tables_in(&tracked.block, selected, action))
+    }
+    /// A table cell's paragraphs join the same way (§17.13.5.15), stepping
+    /// over a nested table the resolution empties, so the selective cell
+    /// merge (`merge_marked_paragraphs_bare_selected`) has the same order
+    /// dependence when the only blocker is a nested table another revision
+    /// removes. A cell paragraph has no block status of its own.
+    fn visit_cell(
+        blocks: &[BlockNode],
+        selected: &HashSet<u32>,
+        action: ResolveSelectionAction,
+    ) -> Option<SelectionError> {
+        let keep_inserted = action == ResolveSelectionAction::Accept;
+        for (index, block) in blocks.iter().enumerate() {
+            let BlockNode::Paragraph(paragraph) = block else {
+                continue;
+            };
+            if paragraph.para_split
+                || !para_mark_needs_selected_merge(&paragraph.para_mark_status, action, selected)
+            {
                 continue;
             }
-            let mut required = Vec::new();
-            if let Some(mark) = &paragraph.para_mark_status {
-                collect_ids(mark, &mut required);
-            }
-            for blocker in blockers {
-                collect_ids(&blocker.status, &mut required);
-                if let BlockNode::Table(table) = &blocker.block {
-                    for row in &table.rows {
-                        if let Some(status) = &row.tracking_status {
-                            collect_ids(status, &mut required);
-                        }
-                    }
+            let mut blockers = Vec::new();
+            let mut joins = false;
+            for follower in &blocks[index + 1..] {
+                if matches!(follower, BlockNode::Table(t) if table_emptied_by_selected(t, action, selected))
+                {
+                    continue;
                 }
+                if matches!(follower, BlockNode::Paragraph(_)) {
+                    joins = true;
+                    break;
+                }
+                if matches!(follower, BlockNode::Table(t) if table_emptied_by_accept_reject(t, keep_inserted))
+                {
+                    blockers.push((None, follower));
+                    continue;
+                }
+                if is_zero_width_marker_block(follower) {
+                    continue;
+                }
+                break;
             }
-            required.sort_unstable();
-            required.dedup();
-            return Some(SelectionError::BlockedJoin {
-                paragraph_id: paragraph.id.clone(),
-                required_ids: required,
-            });
+            if joins && !blockers.is_empty() {
+                return Some(refusal(paragraph, &blockers));
+            }
         }
-        None
+        blocks
+            .iter()
+            .find_map(|block| visit_tables_in(block, selected, action))
+    }
+    fn visit_tables_in(
+        block: &BlockNode,
+        selected: &HashSet<u32>,
+        action: ResolveSelectionAction,
+    ) -> Option<SelectionError> {
+        let BlockNode::Table(table) = block else {
+            return None;
+        };
+        table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .find_map(|cell| visit_cell(&cell.blocks, selected, action))
     }
     std::iter::once(doc.blocks.as_slice())
         .chain(doc.headers.iter().map(|story| story.blocks.as_slice()))
@@ -13193,6 +16115,7 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
 ) -> Result<Option<bool>, SelectionError> {
     let referenced_stories_before = section_referenced_part_paths(doc);
     let referenced_comments_before = comment_reference_ids(doc);
+    let comment_anchors_before = comment_anchors(doc);
     let referenced_notes_before = note_reference_ids(doc);
     let resolvable = resolvable_revision_ids(doc);
     let mut unresolved: Vec<u32> = selected_revision_ids
@@ -13230,8 +16153,9 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
     // Re-establish the document-final-mark invariant the projection can break
     // (suppression stripped off a tracked tail, or an anchor stranded as final
     // once its followers were resolved away). Body only — a header/footer/cell
-    // final mark is not the document-final mark.
-    renormalize_final_mark_after_selective(&mut doc.blocks);
+    // final mark is not the document-final mark. A mark the settle removes is
+    // reported by `cascaded_resolution_ids`, which runs the same settle.
+    let _settled_mark = renormalize_final_mark_after_selective(&mut doc.blocks);
     for story in &mut doc.headers {
         project_blocks_for_selected_resolution(
             &mut story.blocks,
@@ -13314,6 +16238,7 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
         );
         story_outcome != SelectedTrackingOutcome::Drop && !story.blocks.is_empty()
     });
+    remove_comments_that_lost_their_anchor(doc, &comment_anchors_before);
     prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     prune_newly_unreferenced_notes(doc, &referenced_notes_before);
     // Same orphan cleanup as accept_all/reject_all: a selective resolution
@@ -13527,10 +16452,22 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
                                     }
                                 }
                                 InlineNode::OpaqueInline(o) => {
+                                    if let Some(fc) = &o.formatting_change
+                                        && fc.is_physical_revision()
+                                    {
+                                        self.formatting_record(&fc.author);
+                                    }
                                     if let crate::domain::OpaqueKind::Hyperlink(data) = &o.kind {
                                         for run in &data.runs {
                                             self.status(&run.status);
                                         }
+                                    }
+                                }
+                                InlineNode::Decoration(deco) => {
+                                    if let Some(fc) = &deco.formatting_change
+                                        && fc.is_physical_revision()
+                                    {
+                                        self.formatting_record(&fc.author);
                                     }
                                 }
                                 _ => {}
@@ -13558,6 +16495,11 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
                             }
                             if let Some(fc) = &cell.formatting_change {
                                 self.formatting_record(&fc.author);
+                            }
+                            if let Some(merge) = &cell.cell_merge {
+                                self.formatting_record(
+                                    merge.revision.author.as_deref().unwrap_or(""),
+                                );
                             }
                             for nested in &cell.blocks {
                                 self.block(nested);
@@ -13614,6 +16556,7 @@ pub fn accept_all(doc: &mut CanonDoc) {
 pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
     let referenced_stories_before = section_referenced_part_paths(doc);
     let referenced_comments_before = comment_reference_ids(doc);
+    let comment_anchors_before = comment_anchors(doc);
     let referenced_notes_before = note_reference_ids(doc);
     // Accept keeps each paragraph's current style, but resolving inserted text
     // can restore a materialized literal prefix. That changes derived indent
@@ -13678,6 +16621,7 @@ pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     doc.comments.retain(|s| {
         !s.blocks.is_empty() && !matches!(s.tracking_status, Some(TrackingStatus::Deleted(_)))
     });
+    remove_comments_that_lost_their_anchor(doc, &comment_anchors_before);
     prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     prune_newly_unreferenced_notes(doc, &referenced_notes_before);
     // Same cleanup for footnote/endnote stories: a tracked `DeleteNote`
@@ -13980,9 +16924,242 @@ fn prune_newly_unreferenced_comment_stories(
     referenced_before: &HashSet<String>,
 ) {
     let referenced_after = comment_reference_ids(doc);
-    doc.comments.retain(|story| {
-        !referenced_before.contains(&story.id) || referenced_after.contains(&story.id)
-    });
+    let removed: HashSet<String> = doc
+        .comments
+        .iter()
+        .filter(|story| {
+            referenced_before.contains(&story.id) && !referenced_after.contains(&story.id)
+        })
+        .map(|story| story.id.clone())
+        .collect();
+    remove_comments(doc, &removed);
+}
+
+/// What anchors each comment before a resolution: which comments have a
+/// reference run, and which ranges hold content.
+struct CommentAnchors {
+    references: HashSet<String>,
+    holding_content: HashSet<String>,
+}
+
+fn comment_anchors(doc: &CanonDoc) -> CommentAnchors {
+    CommentAnchors {
+        references: comment_reference_run_ids(doc),
+        holding_content: comment_ranges_holding_content(doc),
+    }
+}
+
+/// Remove the comments this resolution took the anchor of (Word 16, verified
+/// on the oracle).
+///
+/// A comment is anchored by its reference (`w:commentReference`, ECMA-376
+/// §17.13.4.5) and is about the text between its range start and end
+/// (§17.13.4.3/4). Accepting the deletion of the reference or rejecting its
+/// insertion removes the comment; so does a resolution that removes all the
+/// text its range held (rejecting the insertion that holds the commented
+/// text), even when the reference survives as another, still pending,
+/// insertion: Word drops that reference with the comment. The comment goes
+/// whole: its reference, its range markers wherever the resolution left them,
+/// its definition and its `commentsExtended` record. Text the range keeps
+/// stays as plain text; a comment whose anchor survives, or that had none
+/// before the resolution, is untouched. Anything left in the range keeps the
+/// comment, not only plain text: text inside a hyperlink or an inline content
+/// control, or an object such as a picture or a tab (Word 16, observed). The
+/// byte path applies the same rule (`normalize::comment_anchor_ids`).
+fn remove_comments_that_lost_their_anchor(doc: &mut CanonDoc, before: &CommentAnchors) {
+    let references_after = comment_reference_run_ids(doc);
+    let holding_content_after = comment_ranges_holding_content(doc);
+    let lost: HashSet<String> = before
+        .references
+        .difference(&references_after)
+        .chain(before.holding_content.difference(&holding_content_after))
+        .cloned()
+        .collect();
+    remove_comments(doc, &lost);
+}
+
+/// Whether `inline` is content a comment's range can hold: anything but a
+/// zero-width marker (range markers, bookmarks and other decorations, a
+/// comment reference) and empty text. A hyperlink or an inline content
+/// control counts whole, as do pictures, tabs, breaks, symbols and fields.
+fn is_comment_range_content(inline: &InlineNode) -> bool {
+    match inline {
+        // A materialized numbering prefix is not in the file, so it is not
+        // content of the range (the byte path never sees it).
+        InlineNode::Text(text) => {
+            !text.text.is_empty() && !crate::domain::is_materialized_prefix_text(text)
+        }
+        InlineNode::HardBreak(_) => true,
+        InlineNode::OpaqueInline(opaque) => !matches!(opaque.kind, OpaqueKind::CommentReference(_)),
+        InlineNode::Decoration(_)
+        | InlineNode::CommentRangeStart { .. }
+        | InlineNode::CommentRangeEnd { .. } => false,
+    }
+}
+
+/// The ids of the comments whose range holds content
+/// (`is_comment_range_content`), in any story.
+fn comment_ranges_holding_content(doc: &CanonDoc) -> HashSet<String> {
+    fn walk_block(block: &BlockNode, open: &mut HashSet<String>, out: &mut HashSet<String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for inline in paragraph.all_inlines() {
+                    match inline {
+                        InlineNode::CommentRangeStart { id } => {
+                            open.insert(id.clone());
+                        }
+                        InlineNode::CommentRangeEnd { id } => {
+                            open.remove(id);
+                        }
+                        inline if is_comment_range_content(inline) => {
+                            out.extend(open.iter().cloned());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for block in &cell.blocks {
+                            walk_block(block, open, out);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(opaque) => match opaque_range_marker(opaque) {
+                Some((RangePairFamily::CommentRange, id, RangeRole::Start)) => {
+                    open.insert(id);
+                }
+                Some((RangePairFamily::CommentRange, id, RangeRole::End)) => {
+                    open.remove(&id);
+                }
+                _ => {}
+            },
+        }
+    }
+    let mut out = HashSet::new();
+    let stories = std::iter::once(&doc.blocks)
+        .chain(doc.headers.iter().map(|s| &s.blocks))
+        .chain(doc.footers.iter().map(|s| &s.blocks))
+        .chain(doc.footnotes.iter().map(|s| &s.blocks))
+        .chain(doc.endnotes.iter().map(|s| &s.blocks));
+    for blocks in stories {
+        let mut open = HashSet::new();
+        for tracked in blocks {
+            walk_block(&tracked.block, &mut open, &mut out);
+        }
+    }
+    out
+}
+
+/// Remove comments `ids` whole: their range markers and reference runs in
+/// every story, their definitions, and their `commentsExtended` records.
+fn remove_comments(doc: &mut CanonDoc, ids: &HashSet<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    fn strip_block(block: &mut BlockNode, ids: &HashSet<String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    segment.inlines.retain(|inline| {
+                        !matches!(
+                            classify_range_pair_marker(inline),
+                            Some((RangePairFamily::CommentRange, id, _)) if ids.contains(&id)
+                        ) && !matches!(inline, InlineNode::OpaqueInline(opaque)
+                            if matches!(&opaque.kind, OpaqueKind::CommentReference(reference)
+                                if ids.contains(&reference.reference_id)))
+                    });
+                }
+                paragraph
+                    .segments
+                    .retain(|segment| !segment.inlines.is_empty());
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for block in &mut cell.blocks {
+                            strip_block(block, ids);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    let strip = |blocks: &mut Vec<TrackedBlock>| {
+        blocks.retain(|tracked| {
+            !matches!(&tracked.block, BlockNode::OpaqueBlock(opaque)
+                if matches!(opaque_range_marker(opaque),
+                    Some((RangePairFamily::CommentRange, id, _)) if ids.contains(&id)))
+        });
+        for tracked in blocks.iter_mut() {
+            strip_block(&mut tracked.block, ids);
+        }
+    };
+    strip(&mut doc.blocks);
+    for story in &mut doc.headers {
+        strip(&mut story.blocks);
+    }
+    for story in &mut doc.footers {
+        strip(&mut story.blocks);
+    }
+    for story in &mut doc.footnotes {
+        strip(&mut story.blocks);
+    }
+    for story in &mut doc.endnotes {
+        strip(&mut story.blocks);
+    }
+    let removed_para_ids: HashSet<String> = doc
+        .comments
+        .iter()
+        .filter(|story| ids.contains(&story.id))
+        .filter_map(|story| story.last_para_id().map(str::to_string))
+        .collect();
+    doc.comments.retain(|story| !ids.contains(&story.id));
+    doc.comments_extended
+        .retain(|record| !removed_para_ids.contains(&record.para_id));
+}
+
+/// The ids of every comment reference run (`w:commentReference`) in the
+/// document's stories.
+fn comment_reference_run_ids(doc: &CanonDoc) -> HashSet<String> {
+    fn collect_block(block: &BlockNode, ids: &mut HashSet<String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for inline in paragraph.all_inlines() {
+                    if let InlineNode::OpaqueInline(opaque) = inline
+                        && let OpaqueKind::CommentReference(reference) = &opaque.kind
+                    {
+                        ids.insert(reference.reference_id.clone());
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for block in &cell.blocks {
+                            collect_block(block, ids);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    let mut ids = HashSet::new();
+    let stories = std::iter::once(&doc.blocks)
+        .chain(doc.headers.iter().map(|s| &s.blocks))
+        .chain(doc.footers.iter().map(|s| &s.blocks))
+        .chain(doc.footnotes.iter().map(|s| &s.blocks))
+        .chain(doc.endnotes.iter().map(|s| &s.blocks));
+    for blocks in stories {
+        for tracked in blocks {
+            collect_block(&tracked.block, &mut ids);
+        }
+    }
+    ids
 }
 
 /// Every header/footer part path referenced by the body section or by any
@@ -14230,6 +17407,7 @@ fn assert_virtual_running_head_has_no_revisions(blocks: &[TrackedBlock], part: &
 pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDefinitions<'_>) {
     let referenced_stories_before = section_referenced_part_paths(doc);
     let referenced_comments_before = comment_reference_ids(doc);
+    let comment_anchors_before = comment_anchors(doc);
     let referenced_notes_before = note_reference_ids(doc);
     project_blocks_for_accept_reject(&mut doc.blocks, false, defs, DerivedGeometryPolicy::Resolve);
     for story in &mut doc.headers {
@@ -14297,6 +17475,7 @@ pub(crate) fn reject_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     }
     // Remove comment stories whose blocks were all projected away.
     doc.comments.retain(|s| !s.blocks.is_empty());
+    remove_comments_that_lost_their_anchor(doc, &comment_anchors_before);
     prune_newly_unreferenced_comment_stories(doc, &referenced_comments_before);
     prune_newly_unreferenced_notes(doc, &referenced_notes_before);
     // Same cleanup for footnote/endnote stories (see accept_all's identical
@@ -14860,6 +18039,18 @@ fn check_stacked_state(blocks: &[TrackedBlock], out: &mut Vec<InvariantViolation
     }
 }
 
+/// Whether a cell keeps a paragraph whose mark is not tracked as deleted
+/// ([`crate::resolution_rules::deleted_cell_gives_width`]).
+fn cell_keeps_a_paragraph_mark(cell: &TableCellNode) -> bool {
+    cell.blocks.iter().any(|block| match block {
+        BlockNode::Paragraph(paragraph) => !matches!(
+            paragraph.para_mark_status,
+            Some(TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_))
+        ),
+        BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -14884,6 +18075,7 @@ mod tests {
             CellFormatting, CellFormattingChange, TableCellNode, TextDirection, VerticalMerge,
         };
         let mut cell = TableCellNode {
+            cell_merge: None,
             id: NodeId::from("c1"),
             blocks: vec![],
             grid_span: 1,
@@ -15032,6 +18224,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -15074,6 +18267,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         })
     }
 
@@ -15134,6 +18328,7 @@ mod tests {
         instruction_text: Option<&str>,
     ) -> InlineNode {
         InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(id.to_string()),
             kind: OpaqueKind::Field(FieldData {
                 field_kind: field_kind.clone(),
@@ -15178,8 +18373,10 @@ mod tests {
     fn make_hyperlink_inline(id: &str, url: &str, runs: Vec<HyperlinkRun>) -> InlineNode {
         let text = runs.iter().map(|r| r.text.as_str()).collect();
         InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(id.to_string()),
             kind: OpaqueKind::Hyperlink(HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: Some(url.to_string()),
                 anchor: None,
                 text,
@@ -15298,6 +18495,7 @@ mod tests {
 
     fn make_simple_field_inline(id: &str, instruction_text: &str, result_text: &str) -> InlineNode {
         InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(id.to_string()),
             kind: OpaqueKind::Field(FieldData {
                 field_kind: FieldKind::Simple,
@@ -15323,6 +18521,7 @@ mod tests {
 
     fn drawing_opaque(id: &str, content_hash: &str) -> OpaqueInlineNode {
         OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(id),
             kind: OpaqueKind::Drawing,
             opaque_ref: format!("{id}:drawing"),
@@ -15388,6 +18587,7 @@ mod tests {
             alt_text: None,
             url: None,
             content_hash: None,
+            object_runs: None,
         }]);
     }
 
@@ -15774,8 +18974,65 @@ mod tests {
         );
     }
 
+    /// A page number field deleted whole right before the page number field
+    /// inserted in its place: each is a complete field, so neither is
+    /// repaired; the deleted one's end is part of it, not an orphan beside
+    /// the inserted one, and removing it would tear the deleted field.
     #[test]
-    fn coalesce_auto_page_field_drops_uniform_deleted_field_range() {
+    fn coalesce_auto_page_field_keeps_a_deleted_field_beside_its_replacement() {
+        let revision = |id: u32| RevisionInfo {
+            revision_id: id,
+            identity: id,
+            author: Some("tester".to_string()),
+            date: None,
+            apply_op_id: None,
+        };
+        let (deleted, inserted) = (
+            TrackingStatus::Deleted(revision(1)),
+            TrackingStatus::Inserted(revision(2)),
+        );
+        let field = |prefix: &str, result: Option<&str>| {
+            let mut inlines = vec![
+                make_field_inline(&format!("{prefix}-begin"), FieldKind::Begin, None),
+                make_field_inline(
+                    &format!("{prefix}-instr"),
+                    FieldKind::Instruction,
+                    Some(" PAGE "),
+                ),
+                make_field_inline(&format!("{prefix}-sep"), FieldKind::Separate, None),
+            ];
+            if let Some(result) = result {
+                inlines.push(make_text_inline(&format!("{prefix}-result"), result));
+            }
+            inlines.push(make_field_inline(
+                &format!("{prefix}-end"),
+                FieldKind::End,
+                None,
+            ));
+            inlines
+        };
+        let segments = vec![
+            TrackedSegment {
+                status: deleted.clone(),
+                inlines: field("old", Some("2")),
+            },
+            TrackedSegment {
+                status: inserted.clone(),
+                inlines: field("new", None),
+            },
+        ];
+        let repaired = coalesce_split_field_sequences(segments.clone());
+        assert_eq!(repaired, segments, "both complete fields stay as they are");
+    }
+
+    /// A page number field deleted whole is a complete field inside `w:del`
+    /// (§17.13.5.14 runs may hold fldChar and instrText), not a split one: it
+    /// stays deleted, cached result included, so rejecting the deletion
+    /// restores it (Reject All reads as the base). The earlier expectation —
+    /// the field dropped from the redline — lost it from both readings and
+    /// cited no Word evidence.
+    #[test]
+    fn coalesce_auto_page_field_keeps_a_wholly_deleted_field() {
         let deleted = TrackingStatus::Deleted(RevisionInfo {
             revision_id: 1,
             identity: 1,
@@ -15821,8 +19078,15 @@ mod tests {
 
         assert_eq!(
             flat,
-            vec![("-".to_string(), &TrackingStatus::Normal)],
-            "uniformly deleted auto-updating field shell/result should be dropped entirely"
+            vec![
+                ("field:Begin".to_string(), &deleted),
+                ("field:Instruction".to_string(), &deleted),
+                ("field:Separate".to_string(), &deleted),
+                ("2".to_string(), &deleted),
+                ("field:End".to_string(), &deleted),
+                ("-".to_string(), &TrackingStatus::Normal),
+            ],
+            "a wholly deleted auto-updating field stays deleted, cached result included"
         );
     }
 
@@ -15967,6 +19231,7 @@ mod tests {
         tracking: Option<TrackingStatus>,
     ) -> crate::domain::TableCellNode {
         crate::domain::TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id),
             blocks,
             grid_span: 1,
@@ -16660,8 +19925,9 @@ mod tests {
         assert_eq!(
             segments,
             vec![
-                ("new".to_string(), "normal"),
-                (" / ".to_string(), "normal"),
+                // The settled text and its unchanged neighbour are one
+                // Normal carrier (adjacent equal statuses merge).
+                ("new / ".to_string(), "normal"),
                 ("left".to_string(), "deleted"),
                 ("right".to_string(), "inserted"),
             ]
@@ -16891,8 +20157,9 @@ mod tests {
         assert_eq!(
             segments,
             vec![
-                ("old".to_string(), "normal"),
-                (" / ".to_string(), "normal"),
+                // The settled text and its unchanged neighbour are one
+                // Normal carrier (adjacent equal statuses merge).
+                ("old / ".to_string(), "normal"),
                 ("left".to_string(), "deleted"),
                 ("right".to_string(), "inserted"),
             ]
@@ -17301,6 +20568,7 @@ mod tests {
 
         fn make_simple_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
             TableCellNode {
+                cell_merge: None,
                 id: NodeId::from(id.to_string()),
                 blocks,
                 grid_span: 1,
@@ -17458,6 +20726,7 @@ mod tests {
         // assertion below pins. ---
         {
             let textbox = InlineNode::OpaqueInline(Box::new(crate::domain::OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("p1_textbox"),
                 kind: OpaqueKind::Drawing,
                 opaque_ref: "p1:widget:0".to_string(),
@@ -17567,6 +20836,7 @@ mod tests {
             id: "1".to_string(),
             author: Some("AI".to_string()),
             date: None,
+            initials: None,
             blocks: vec![story_para(
                 "cm_p1",
                 "comment interior ins",
@@ -17704,6 +20974,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let textbox = InlineNode::OpaqueInline(Box::new(crate::domain::OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("p1_textbox"),
                 kind: OpaqueKind::Drawing,
                 opaque_ref: "p1:widget:0".to_string(),
@@ -17837,6 +21108,7 @@ mod tests {
     /// normalized at import, so collision fixtures write raw `w:id`s directly.
     fn textbox_inline(node_id: &str, txbx_paragraph_children: &str) -> InlineNode {
         InlineNode::OpaqueInline(Box::new(crate::domain::OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from(node_id),
             kind: OpaqueKind::Drawing,
             opaque_ref: format!("{node_id}:widget:0"),
@@ -19519,6 +22791,7 @@ mod tests {
             source_row_attrs: Vec::new(),
             id: NodeId::from(id.to_string()),
             cells: vec![TableCellNode {
+                cell_merge: None,
                 id: NodeId::from(cell_id.to_string()),
                 blocks: vec![make_paragraph(para_id, text)],
                 grid_span: 1,
@@ -19960,6 +23233,47 @@ mod tests {
             after, expected,
             "the enumerate id SET is stable: exactly the resolved id vanished, no id \
              re-valued or split/coalesced (before={before:?} after={after:?})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod revision_kind_vocabulary {
+    use super::RevisionKind;
+
+    /// Position of each kind in `RevisionKind::ALL`. Wildcard-free: a new
+    /// variant fails compilation here. Give it the next position AND append
+    /// it to `RevisionKind::ALL` (growing the array length); the test below
+    /// checks the two agree.
+    fn position(kind: RevisionKind) -> usize {
+        match kind {
+            RevisionKind::Insert => 0,
+            RevisionKind::Delete => 1,
+            RevisionKind::FormatRun => 2,
+            RevisionKind::FormatParagraph => 3,
+            RevisionKind::FormatParagraphMark => 4,
+            RevisionKind::FormatTable => 5,
+            RevisionKind::FormatRow => 6,
+            RevisionKind::FormatCell => 7,
+            RevisionKind::FormatSection => 8,
+            RevisionKind::OpaqueInterior => 9,
+            RevisionKind::Move => 10,
+            RevisionKind::CellMerge => 11,
+        }
+    }
+
+    #[test]
+    fn all_is_exhaustive() {
+        for (index, kind) in RevisionKind::ALL.iter().enumerate() {
+            assert_eq!(position(*kind), index, "{kind:?} is out of place in ALL");
+            assert_eq!(RevisionKind::parse(kind.as_str()), Some(*kind));
+        }
+        let wire_names: std::collections::HashSet<&str> =
+            RevisionKind::ALL.iter().map(|kind| kind.as_str()).collect();
+        assert_eq!(
+            wire_names.len(),
+            RevisionKind::ALL.len(),
+            "wire names are distinct"
         );
     }
 }

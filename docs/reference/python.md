@@ -12,7 +12,11 @@ and audit. It is a thin binding over the Rust
 transactions go in as v4 JSON, results come back as plain Python values (dicts,
 lists, `str`, `bytes`). There are no per-operation helper classes; the
 [v4 operation reference](operations.md) is the write vocabulary, exactly as
-for every other transport.
+for every other transport. The shapes of those values (`Revision`,
+`ValidationReport`, `SaveReceipt`, `Transaction`, …) are `TypedDict`s and
+aliases importable from `stemma` for annotations. Byte inputs
+(`Document.from_bytes`, `audit`, `validate`) take `bytes`, `bytearray`, or
+`memoryview`.
 
 ## Install
 
@@ -79,7 +83,8 @@ the opened document, raising `AuthorLabelCollision`, unless you pass
 
 `save(path)` never overwrites: an existing path raises `FileExistsError` and is
 left untouched, the same create-new rule as the CLI. Pass `overwrite=True` to
-replace a file atomically. `serialize()` returns the bytes instead. Both run
+replace a file atomically; the replaced file keeps its permissions, and a new
+one gets the usual mode for a new file (0666 less the umask on Unix). `serialize()` returns the bytes instead. Both run
 the engine's save validation, so bytes Word would reject are refused, never
 written.
 
@@ -145,7 +150,10 @@ tracked_only = (
     report["validator"]["ok"]
     and report["direct_changes"] == []
     and report["untouched"]["violations"] == []
-    and all(r["disposition"] == "untouched" for r in report["preexisting_revisions"])
+    and all(
+        r["disposition"] in ("untouched", "edited_inside")
+        for r in report["preexisting_revisions"]
+    )
 )
 assert tracked_only
 
@@ -155,7 +163,7 @@ assert stemma.validate(after) == {"ok": True, "issues": []}
 | Key | What it holds |
 |---|---|
 | `new_revisions` | Revisions present after and not before, shaped like `revisions()` rows. |
-| `preexisting_revisions` | Revisions pending before, each with `disposition` (`untouched`, `modified`, `resolved`) and `after_excerpt`. |
+| `preexisting_revisions` | Revisions pending before, each with `disposition` and `after_excerpt`. `untouched`: same content. `edited_inside`: changed only by the new tracked revisions (rejecting them restores it), such as an edit stacked inside another author's pending insertion; it is still pending and still theirs. `modified`: changed in a way the new revisions do not explain. `resolved`: no longer pending. |
 | `direct_changes` | Committed-content changes no tracked change covers. Empty for a tracked delivery. |
 | `untouched` | `verified_blocks`, the story `parts` walked, and `violations` of the proof that nothing else changed. |
 | `validator` | The package verdict on the after bytes: `ok` and `issues`. |

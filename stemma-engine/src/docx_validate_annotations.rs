@@ -1343,6 +1343,60 @@ pub fn check_perm_id_validity(stories: &[(String, &Element)]) -> Vec<ValidationF
 }
 
 // ---------------------------------------------------------------------------
+// I-TC-004: moved-from text is plain text
+// ---------------------------------------------------------------------------
+
+/// `w:moveFrom` content is runs of plain text (ECMA-376 §17.13.5.22); deleted
+/// text (`w:delText`, `w:delInstrText`) belongs only inside `w:del`. Word
+/// repairs a file whose moveFrom runs carry deleted text (checked in Word: it
+/// wraps each such run in a new `w:del` by "Unknown" and the revisions are
+/// lost). The same holds for a field instruction: Word 16 writes a moved
+/// field's instruction as `w:instrText` and reports `w:delInstrText` inside
+/// `w:moveFrom` as corrupted (observed). A `w:del` nested in the moveFrom is
+/// its own scope and is not reported here.
+pub fn check_move_from_text_form(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if !(is_w_tag(el, "delText") || is_w_tag(el, "delInstrText")) {
+                return;
+            }
+            let scope = path.iter().rev().find(|ancestor| {
+                matches!(
+                    ancestor.as_str(),
+                    "del" | "ins" | "moveFrom" | "moveTo" | "txbxContent"
+                )
+            });
+            if scope.map(String::as_str) == Some("moveFrom") {
+                let text: String = el
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        XMLNode::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .chars()
+                    .take(40)
+                    .collect();
+                findings.push(ValidationFinding {
+                    rule_id: "I-TC-004",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-TC-004: {part_path}: a run inside w:moveFrom spells its text as \
+                         w:{} ({text:?}); moved-from text is written as w:t (ECMA-376 \
+                         §17.13.5.22). Word reports the file as corrupted and repairs it",
+                        local_name(&el.name)
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
 // I-RANGE-001: colFirst/colLast are a both-or-neither pair
 // ---------------------------------------------------------------------------
 

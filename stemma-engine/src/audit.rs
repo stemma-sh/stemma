@@ -7,7 +7,8 @@
 //! stateless form (`crate::api::audit` — any two byte packages) share the
 //! same checks. Session snapshots additionally supply a shared block-ID
 //! namespace; independently parsed packages use explicit insertion carriers
-//! and conservative baseline positions, never content-based lineage.
+//! and an exact-text alignment of the baseline blocks, never similarity-based
+//! lineage.
 //!
 //! THE CONTRACT (the reason this module exists): "declared success without
 //! read-back" is the universal agent failure mode. The audit is the
@@ -25,7 +26,9 @@
 //!   no obligation to allocate above the baseline's max id.
 //! - **Disposition by content, never by marker absence.** A pre-existing
 //!   revision still present with identical content is `Untouched`; present
-//!   with different content is `Modified`; absent is `Resolved`. Whether a
+//!   with different content is `EditedInside` when rejecting exactly the
+//!   revisions new in `after` restores it (a tracked edit stacked on it),
+//!   otherwise `Modified`; absent is `Resolved`. Whether a
 //!   `Resolved` revision was accepted or rejected is deliberately NOT
 //!   claimed in v1 — that distinction requires the committed-content
 //!   comparison the resolution gates use, and a wrong claim here would be
@@ -68,8 +71,8 @@ use crate::runtime::{
 };
 use crate::styles::StyleTable;
 use crate::tracked_model::{
-    RevisionKind, RevisionRecord, block_node_id, enumerate_revisions, extract_block_text_for_hash,
-    reject_all_with_styles,
+    ResolveSelectionAction, RevisionKind, RevisionRecord, block_node_id, enumerate_revisions,
+    extract_block_text_for_hash, reject_all_with_styles, resolve_selected_revisions_with_styles,
 };
 
 /// The audit report: five engine-derived sections (RFC 0001).
@@ -108,8 +111,21 @@ pub struct PreexistingRevision {
 pub enum RevisionDisposition {
     /// The same revision is present in `after` with identical content.
     Untouched,
+    /// A revision with the same identity is present in `after` with different
+    /// content, and the revisions new in `after` explain all of the
+    /// difference: rejecting exactly those restores this revision's content.
+    /// Another author's tracked edit stacked inside it (Bob deleting a word
+    /// inside Alice's pending insertion) is this case. The revision itself
+    /// is neither resolved nor rewritten.
+    EditedInside {
+        /// The record's content in `after`.
+        after_excerpt: String,
+    },
     /// A revision with the same identity is present in `after` but its
-    /// affected content differs — someone edited inside it.
+    /// content differs in a way the new revisions do not explain: rejecting
+    /// them does not restore it. An untracked edit inside a pending
+    /// revision lands here (the reject-all committed delta cannot see it,
+    /// because rejecting the revision discards the edited text with it).
     Modified {
         /// The record's content in `after`.
         after_excerpt: String,
@@ -309,8 +325,17 @@ pub(crate) fn audit_documents_with_identity(
     let mut before_records = enumerate_revisions(before);
     before_records.extend(sealed.before);
     let mut after_records = enumerate_revisions(after);
-    after_records.extend(sealed.after);
-    let (new_revisions, preexisting_revisions) = match_census(before_records, after_records);
+    after_records.extend(sealed.after.iter().cloned());
+    let (new_revisions, mut preexisting_revisions) =
+        match_census(before_records.clone(), after_records);
+    classify_edited_inside(
+        before_records,
+        after,
+        after_styles,
+        sealed.after,
+        &new_revisions,
+        &mut preexisting_revisions,
+    );
 
     // Section 2: the committed (untracked) delta. Reject with each document's
     // own style table so a rejected paragraph-style change re-resolves its
@@ -412,6 +437,18 @@ fn census_key(r: &RevisionRecord) -> CensusKey {
     )
 }
 
+/// Whether two records with one identity hold the same content. A
+/// paragraph-mark revision's content is the paragraph break itself; its
+/// excerpt also names the paragraph's text for the reader, which an edit of
+/// that text changes without touching the break.
+fn same_revision_content(after: &RevisionRecord, before: &RevisionRecord) -> bool {
+    use crate::tracked_model::is_paragraph_mark_record;
+    if is_paragraph_mark_record(before) || is_paragraph_mark_record(after) {
+        return is_paragraph_mark_record(before) && is_paragraph_mark_record(after);
+    }
+    after.excerpt == before.excerpt
+}
+
 /// Match `before`'s records against `after`'s by semantic identity, in document
 /// order. One user intention can have several census rows under the same
 /// identity (for example content and paragraph-mark carriers), so rows pair as
@@ -436,7 +473,7 @@ fn match_census(
         let untouched_match = candidates.and_then(|idxs| {
             idxs.iter()
                 .copied()
-                .find(|&i| !consumed[i] && after[i].excerpt == record.excerpt)
+                .find(|&i| !consumed[i] && same_revision_content(&after[i], &record))
         });
         if let Some(i) = untouched_match {
             consumed[i] = true;
@@ -499,6 +536,85 @@ fn match_census(
         .map(|(_, r)| r)
         .collect();
     (new_revisions, preexisting)
+}
+
+/// Turn each `Modified` pre-existing revision that the new revisions fully
+/// explain into `EditedInside`. The proof is a projection, not a heuristic:
+/// reject exactly the selectable revisions new in `after`, re-run the census
+/// against `before`, and a row whose content comes back identical was changed
+/// only by those revisions. Identical content may come back in several pieces
+/// (the stacked edit split one wrapper into two, and rejecting it leaves both
+/// halves): the pieces, read in document order, are compared as one.
+///
+/// Fail closed: a row is promoted only on that proof. When there is nothing
+/// selectable to reject, or the selective resolver refuses the selection
+/// (a shared table grid, a blocked join), every row keeps `Modified`, which
+/// every delivery policy treats as a finding. Sealed-block revisions are not
+/// in the `CanonDoc`, so they are not rejected; their records ride along
+/// unchanged on both sides of the proof census.
+fn classify_edited_inside(
+    before_records: Vec<RevisionRecord>,
+    after: &CanonDoc,
+    after_styles: Option<&StyleTable>,
+    sealed_after: Vec<RevisionRecord>,
+    new_revisions: &[RevisionRecord],
+    preexisting: &mut [PreexistingRevision],
+) {
+    if !preexisting
+        .iter()
+        .any(|p| matches!(p.disposition, RevisionDisposition::Modified { .. }))
+    {
+        return;
+    }
+    let selectable: HashSet<u32> = enumerate_revisions(after)
+        .iter()
+        .map(|r| r.revision_id)
+        .filter(|&id| id != 0)
+        .collect();
+    let new_ids: HashSet<u32> = new_revisions
+        .iter()
+        .map(|r| r.revision_id)
+        .filter(|id| selectable.contains(id))
+        .collect();
+    if new_ids.is_empty() {
+        return;
+    }
+    let mut restored = after.clone();
+    if resolve_selected_revisions_with_styles(
+        &mut restored,
+        &new_ids,
+        ResolveSelectionAction::Reject,
+        after_styles,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let mut restored_records = enumerate_revisions(&restored);
+    restored_records.extend(sealed_after);
+    let (_, proof) = match_census(before_records, restored_records);
+    assert_eq!(
+        proof.len(),
+        preexisting.len(),
+        "the proof census runs over the same before records"
+    );
+    for (row, proof_row) in preexisting.iter_mut().zip(proof) {
+        debug_assert_eq!(row.record, proof_row.record);
+        let restored = match &proof_row.disposition {
+            RevisionDisposition::Untouched => true,
+            RevisionDisposition::Modified { after_excerpt } => {
+                *after_excerpt == proof_row.record.excerpt
+            }
+            RevisionDisposition::EditedInside { .. } | RevisionDisposition::Resolved => false,
+        };
+        if let RevisionDisposition::Modified { after_excerpt } = &row.disposition
+            && restored
+        {
+            row.disposition = RevisionDisposition::EditedInside {
+                after_excerpt: after_excerpt.clone(),
+            };
+        }
+    }
 }
 
 /// Flatten a committed-projection diff into direct-change rows. Story
@@ -909,14 +1025,20 @@ fn untouched_proof(
     for r in new_revisions {
         note_implication(&mut implicated_after, &mut implicated_stories, r);
         note_move_carrier_implications(after, r, &mut implicated_after);
+        note_text_frame_host_implications(after, r, &mut implicated_after);
     }
     let mut implicated_before: Implicated = HashSet::new();
     for p in preexisting {
         if !matches!(p.disposition, RevisionDisposition::Untouched) {
             note_implication(&mut implicated_before, &mut implicated_stories, &p.record);
             note_move_carrier_implications(before, &p.record, &mut implicated_before);
-            if matches!(p.disposition, RevisionDisposition::Modified { .. }) {
+            note_text_frame_host_implications(before, &p.record, &mut implicated_before);
+            if matches!(
+                p.disposition,
+                RevisionDisposition::Modified { .. } | RevisionDisposition::EditedInside { .. }
+            ) {
                 note_move_carrier_implications(after, &p.record, &mut implicated_after);
+                note_text_frame_host_implications(after, &p.record, &mut implicated_after);
             }
         }
     }
@@ -1301,6 +1423,42 @@ fn note_implication(
     }
 }
 
+/// A textbox revision's census row is attributed to the text frame's own
+/// story (`StoryScope::TextFrame`), but the frame lives inside a drawing in a
+/// paragraph of the hosting story, and the untouched proof pairs that host
+/// paragraph. Implicate the host so a change inside the textbox (a resolution
+/// or an edit there) accounts for its host paragraph instead of reading as an
+/// unexplained difference.
+///
+/// The row names the host paragraph by id but not the host story, so every
+/// story with a drawing in a paragraph of that id is implicated. A positional
+/// id can repeat across stories (`p_1` in the body and in a header); when both
+/// host a drawing, both are exempted, which only narrows the proof to fewer
+/// verified pairs and never hides a block the census does not account for in
+/// some story.
+///
+/// Named limit: a textbox's interior is outside the committed (reject-all)
+/// delta, so once its host is implicated, an untracked edit elsewhere in the
+/// same textbox is not reported by this proof either. Before, every change
+/// inside a textbox failed the proof, supported ones included.
+fn note_text_frame_host_implications(
+    doc: &CanonDoc,
+    record: &RevisionRecord,
+    blocks: &mut Implicated,
+) {
+    if !matches!(record.location, StoryScope::TextFrame { .. }) {
+        return;
+    }
+    crate::opaque_targets::visit_opaque_interiors(doc, &mut |host, location, interior| {
+        if let crate::opaque_targets::OpaqueInteriorRef::Inline(opaque) = interior
+            && matches!(opaque.kind, OpaqueKind::Drawing)
+            && *host == record.block_id
+        {
+            blocks.insert((location.clone(), host.clone()));
+        }
+    });
+}
+
 /// A move census row represents every source and destination carrier sharing
 /// one engine identity. The representative row names only the first carrier
 /// in document order, so the untouched proof must recover and implicate the
@@ -1430,6 +1588,24 @@ fn raw_removed_block_ids(changes: &[AuditDelta]) -> (HashSet<NodeId>, HashSet<No
     (before_removed, after_removed)
 }
 
+/// The ids of every block nested in a table's cells, at any depth (none for
+/// a paragraph or an opaque block).
+fn nested_block_ids(block: &BlockNode) -> impl Iterator<Item = NodeId> {
+    fn collect(block: &BlockNode, out: &mut Vec<NodeId>) {
+        if let BlockNode::Table(table) = block {
+            for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                for nested in &cell.blocks {
+                    out.push(block_node_id(nested));
+                    collect(nested, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(block, &mut out);
+    out.into_iter()
+}
+
 /// The core of the proof: remove diff-mentioned blocks from each side, pair
 /// the remainder 1:1 in order, exempt census-implicated pairs, and require
 /// full `TrackedBlock` equality of every remaining pair.
@@ -1477,8 +1653,13 @@ fn verify_block_sequences(
     for (b, a) in before_rest.iter().zip(after_rest.iter()) {
         let b_id = block_node_id(&b.block);
         let a_id = block_node_id(&a.block);
+        // A census row in a table cell names the cell paragraph, while the
+        // pair is the top-level table: a row inside implicates the table.
         let exempt = implicated_before.contains(&(story.clone(), b_id.clone()))
-            || implicated_after.contains(&(story.clone(), a_id.clone()));
+            || implicated_after.contains(&(story.clone(), a_id.clone()))
+            || nested_block_ids(&b.block)
+                .any(|id| implicated_before.contains(&(story.clone(), id)))
+            || nested_block_ids(&a.block).any(|id| implicated_after.contains(&(story.clone(), id)));
         if exempt {
             // Accounted for by a census row (section 1); neither verified
             // nor a violation.

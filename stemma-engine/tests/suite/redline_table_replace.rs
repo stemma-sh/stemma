@@ -59,6 +59,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -101,12 +102,14 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
 fn make_cell(id: &str, paragraph_text: &str) -> TableCellNode {
     let para = make_para(&format!("{id}_p"), paragraph_text);
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks: vec![BlockNode::from(para)],
         grid_span: 1,

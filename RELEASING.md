@@ -2,8 +2,9 @@
 
 A release is one manually started candidate run. CI builds and exposes the
 exact artifacts, a protected environment pauses promotion for Word
-qualification, and the same run binds the version tag, publishes npm and
-PyPI, then publishes a verified GitHub release only after approval. This file is the
+qualification, and the same run binds the version tag, publishes npm,
+crates.io and PyPI, then publishes a verified GitHub release only after
+approval. This file is the
 maintainer checklist; contributors never need it.
 
 ## One-time setup (before the first release)
@@ -60,24 +61,27 @@ maintainer checklist; contributors never need it.
    not prevent a contents writer from replacing or deleting release assets.
 7. **crates.io.** The release surface has six versioned package names: `stemma` (engine),
    `stemma-diff` (opinionated comparison), `stemma-artifacts` (host artifact
-   boundary), `stemma-cli`, `stemma-mcp`, and `stemma-api`. As of 2026-07-12,
-   the project's `stemma` and `stemma-cli` 0.1.0 releases exist in the
-   registry; `stemma-artifacts` 0.5.0 is also published. `stemma-diff` has not
-   been published yet and must be claimed before publishing a CLI version that
-   depends on it. `stemma-mcp` and `stemma-api` are intentionally absent from
-   crates.io. Log in with GitHub, `cargo login` with an API token (scoped to
-   publish, short expiry), then see "crates.io" under Per release below.
-   A first publish stays deliberately manual and local: a long-lived registry
-   token must never live in CI secrets (any compromised workflow step can
-   read it), and trusted publishing cannot be configured on a crate that does
-   not exist yet.
-8. **After the first release: switch crates.io to trusted publishing.** Same
-   endgame as npm: on crates.io, for each published crate, Settings →
-   Trusted Publishing → add the GitHub repo (`stemma-sh/stemma`) and
-   workflow (`release.yml`). Then a `crates-publish` job can be added to
-   release.yml using OIDC (`id-token: write`, no stored token), and the
-   local API token is revoked. Until that job exists, crates publishes stay
-   manual per release. The workspace also contains the unversioned,
+   boundary), `stemma-cli`, `stemma-mcp`, and `stemma-api`. The first four
+   publish to crates.io and all four exist there (0.7.0). `stemma-mcp` and
+   `stemma-api` are intentionally absent from crates.io. A crate's first
+   version must be published manually (`just publish-crates`, with a
+   short-lived, publish-scoped API token from `cargo login`), because
+   trusted publishing cannot be configured on a crate that does not exist
+   yet. A long-lived registry token must never live in CI secrets: any
+   compromised workflow step can read it.
+8. **crates.io trusted publishing.** On crates.io, for EACH of `stemma`,
+   `stemma-diff`, `stemma-artifacts` and `stemma-cli`: Settings → Trusted
+   Publishing → add a GitHub publisher with owner `stemma-sh`, repository
+   `stemma`, workflow filename `release.yml`, environment left empty (the
+   `crates-publish` job declares none; promotion is already gated by the
+   `release` environment). The `crates-publish` job has `id-token: write`
+   and exchanges the workflow's OIDC identity for a short-lived token per
+   crate through `rust-lang/crates-io-auth-action`; no crates.io token is
+   stored in Actions or anywhere else. Once the publisher is configured,
+   revoke any remaining crates.io API token and delete it from local
+   environment files. A missing or mistyped publisher surfaces as an
+   authentication error in the first crate's step, before anything is
+   published. The workspace also contains the unversioned,
    `publish = false` `stemma-doc-tests` compile guard; it is not a release
    package.
 9. **PyPI trusted publishing for `stemma-py`.** The Python package
@@ -159,9 +163,15 @@ maintainer checklist; contributors never need it.
      architecture, build stamp, platform, timestamps, the explicit conformance
      tool profile, and the stable 21-case result set, then uploads one
      content-minimized create-new manifest;
+   - **qualification-checklist** runs before the gate and prints
+     `.github/release-qualification-checklist.md` (with the candidate commit
+     and run URL) to the log and the run page summary, so the reviewer sees
+     what approval asserts while the deployment is pending. A gated job only
+     starts after approval, which is why the checklist is not printed by the
+     gated job alone (0.7.0's gate was approved before qualification ran);
    - **release-approval** waits at the protected `release` environment (after
-     both the native candidate manifest and the Python distribution set). While
-     it is pending, download the candidate manifest and exact artifacts, run
+     the native candidate manifest, the Python distribution set, and the
+     printed checklist). While it is pending, download the candidate manifest and exact artifacts, run
      the required Word/client qualification, and record the report. The
      qualification must include the exact natural-language workflow in
      `demo/README.md` through the promoted path-based MCP setup: confirm the
@@ -182,19 +192,39 @@ maintainer checklist; contributors never need it.
      binary/report against the approved manifest. A retry skips an immutable
      version only when its registry `dist.integrity` exactly matches the local
      prepacked tarball. Lifecycle scripts are refused and disabled; the exact
-     independently hashed tarball is published, then registry
-     visibility/integrity is verified before continuing. The active
+     independently hashed tarball is published. The five platform packages
+     go out back to back, then one wait verifies registry
+     visibility/integrity for all of them before the wrapper is published
+     and waited for in turn. Each wait allows up to
+     `STEMMA_NPM_PUBLISH_POLL_ATTEMPTS` x `STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS`
+     (set in the workflow to 60 x 15 s, about 15 minutes; npm took 3 to 12
+     minutes per new package at 0.7.0). A wait that runs out fails the job
+     and names the invisible versions; rerun the job once npm serves them,
+     and the preflight skips each identical version and resumes. The active
      update/deletion ruleset is checked immediately before this irreversible
      step; if a retry tag already exists, its SHA must also match. The qualified
      native bytes embed the source SHA, so another source cannot reuse an
      already-published platform package at the same version and integrity;
+   - **crates-publish** runs after npm completes. On the toolchain pinned in
+     `.mise.toml` and after re-verifying the tag against the approved SHA, it
+     publishes `stemma` → `stemma-diff` → `stemma-artifacts` → `stemma-cli`
+     with `scripts/publish-crate.sh`: each crate is dry-run-verified, then
+     published with its own trusted-publishing token, then waited for until
+     the crates.io index lists it with the local `.crate` checksum (up to
+     `STEMMA_CRATES_PUBLISH_POLL_ATTEMPTS` x
+     `STEMMA_CRATES_PUBLISH_POLL_INTERVAL_SECONDS`, set in the workflow to
+     60 x 10 s) before the next crate starts. A version the index already
+     lists with the identical checksum is skipped, so a rerun resumes; one
+     with any other checksum, or yanked, fails the job. Package bytes are
+     reproducible for one commit and one cargo version, which is why the
+     toolchain is pinned;
    - **pypi-publish** runs after npm completes. It re-verifies the
      `python_dist` files against their recorded sums and the tag against the
      approved SHA, publishes through trusted publishing, then refuses unless
      PyPI serves exactly the approved file set with identical SHA-256 digests.
      A retried job skips files it already uploaded; that final check still
      fails on any byte difference;
-   - **github-release** runs only after npm and PyPI complete, re-verifies the candidate
+   - **github-release** runs only after npm, crates.io and PyPI complete, re-verifies the candidate
      again, and attaches deterministic tarballs/zip containing each binary and
      conformance JSON, the aggregate manifest, and `sha256sums.txt`. It stages
      the release as a draft, refuses a differently named or byte-different
@@ -209,26 +239,20 @@ maintainer checklist; contributors never need it.
    still fails closed if any already-published npm package or GitHub asset
    differs from its newly approved bytes. A fresh run from another SHA cannot
    reuse the SHA-stamped platform tarballs.
-7. **crates.io** (manual and deliberate — the workflow does not touch cargo).
-   Publishing is per-crate opt-in through each `Cargo.toml`'s `publish` field.
-   Intended split: `stemma` (the engine library), `stemma-diff` (the
-   downstream comparison compiler), `stemma-artifacts` (the shared host-side
-   artifact boundary required by transports), and `stemma-cli` (`cargo install
-   stemma-cli`) publish; `stemma-mcp` stays off crates.io because npm/prebuilt
-   binaries are its distribution channel; `stemma-api` stays unpublished
-   because it is demo infrastructure, not a deployable. Then, with a registry
-   token in the environment:
-
-   ```bash
-   just publish-crates
-   ```
-
-   The recipe enforces `stemma` → `stemma-diff` → `stemma-artifacts` →
-   `stemma-cli`. Each real `cargo publish` waits for registry visibility before
-   the next package; the CLI's three internal dependencies carry both `path`
-   and `version`. The recipe uses the committed lockfile, dry-runs each crate
-   immediately before its
-   real publish, refuses a dirty working tree, and asks for confirmation.
+7. **crates.io** is published by the `crates-publish` job above; nothing is
+   run by hand. Publishing is per-crate opt-in through each `Cargo.toml`'s
+   `publish` field. Intended split: `stemma` (the engine library),
+   `stemma-diff` (the downstream comparison compiler), `stemma-artifacts`
+   (the shared host-side artifact boundary required by transports), and
+   `stemma-cli` (`cargo install stemma-cli`) publish; `stemma-mcp` stays off
+   crates.io because npm/prebuilt binaries are its distribution channel;
+   `stemma-api` stays unpublished because it is demo infrastructure, not a
+   deployable. The CLI's three internal dependencies carry both `path` and
+   `version`. If a release adds a new publishable crate, publish its first
+   version manually before the release run (`just publish-crates` uses the
+   same script and order, and skips crates already published with identical
+   bytes), configure its trusted publisher (setup step 8), and add it to the
+   `crates-publish` job in dependency order.
 8. Verify exact packages from a clean machine:
    `npx -y @stemma-sh/mcp@<version> --version` must print
    `<version>+g<first-12-characters-of-tag-commit>`, and (if

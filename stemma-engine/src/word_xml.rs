@@ -1855,6 +1855,37 @@ pub fn w_cell_del(revision_id: u32, author: &str, date: &str) -> Element {
     cell_del
 }
 
+/// Creates a `<w:cellMerge>` element (tracked vertical merge change,
+/// §17.13.5.3): `w:vMerge` is the merge after the change and `w:vMergeOrig`
+/// the merge before it, each `rest`/`cont` (ST_AnnotationVMerge) and absent
+/// when the cell is not merged on that side.
+pub fn w_cell_merge(
+    revision_id: u32,
+    author: &str,
+    date: &str,
+    after: &crate::domain::VerticalMerge,
+    before: &crate::domain::VerticalMerge,
+) -> Element {
+    fn annotation(merge: &crate::domain::VerticalMerge) -> Option<&'static str> {
+        match merge {
+            crate::domain::VerticalMerge::Restart => Some("rest"),
+            crate::domain::VerticalMerge::Continue => Some("cont"),
+            crate::domain::VerticalMerge::None => None,
+        }
+    }
+    let mut cell_merge = w_el("cellMerge");
+    attr_set(&mut cell_merge, "w:id", revision_id.to_string());
+    attr_set(&mut cell_merge, "w:author", author);
+    set_revision_date(&mut cell_merge, date, true);
+    if let Some(value) = annotation(after) {
+        attr_set(&mut cell_merge, "w:vMerge", value);
+    }
+    if let Some(value) = annotation(before) {
+        attr_set(&mut cell_merge, "w:vMergeOrig", value);
+    }
+    cell_merge
+}
+
 /// Creates a `<w:delText>` element (used inside deleted runs)
 pub fn w_del_text(text: &str) -> Element {
     let mut del_text = w_el("delText");

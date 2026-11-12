@@ -27,17 +27,22 @@ semantics:
   gets wrong most often.
 - **Structural changes** include inserted or deleted table rows and whole
   tracked blocks.
+- **Cell merges** (`w:cellMerge`, §17.13.5.3) record a change to a cell's
+  vertical merge: `w:vMerge` is the merge after the change and `w:vMergeOrig`
+  the merge before it, a missing attribute meaning not merged. Accept gives
+  the cell the first, Reject the second, as Word does. A cell either one
+  leaves as a continuation of the cell above loses its content, pending
+  changes in it included, and a merge left with one cell is saved unmerged.
+  The cell merges of one run of cells in one column are one revision, kind
+  `cell_merge`. Word writes them only when it compares two documents;
+  merging cells with Track Changes on is not tracked, in Word or in Stemma
+  (`merge_cells`).
 
 All of these are enumerable (`Document::revisions()` in Rust,
 `list_revisions` over MCP, `extract` in the CLI) and resolvable across
 every story, including the body, footnotes, tables, and section properties.
 
-One kind is enumerated but not resolvable: a tracked vertical cell merge
-(`w:cellMerge` carrying `w:vMerge` or `w:vMergeOrig`, §17.13.5.3), reported
-as kind `cell_merge` with `revision_id` 0. While one is pending, every
-resolution (Accept All, Reject All, and any selection) refuses with an error
-naming the cell, rather than return a "resolved" document that still carries
-it. A `w:cellMerge` with neither attribute changes nothing, as the standard
+A `w:cellMerge` with neither attribute changes nothing, as the standard
 allows, and is ignored.
 
 ## Word author labels
@@ -84,7 +89,11 @@ disambiguating ordinal among identical duplicates. Two consequences:
 - **Durability.** A revision whose own content is untouched keeps its id
   across serialize/reopen and across resolution of *other* revisions. Ids
   enumerated before a selective resolve remain valid against its output, and
-  against the saved file reopened tomorrow.
+  against the saved file reopened tomorrow. One limit: among changes that
+  look exactly alike (same kind, author, date and text), ids are kept by
+  Stemma's own save, reopen and resolutions, but after another editor
+  changes the file, lookalikes are numbered again by document order, so two
+  of them can trade ids. Re-read ids after any edit made outside Stemma.
 - **The re-key edge.** If an operation alters a surviving revision's content
   (or removes an identical-signature duplicate ahead of it), that survivor's
   signature, and so its id, changes. This is the honest edge of a

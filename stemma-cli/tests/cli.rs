@@ -137,6 +137,29 @@ fn write_worklist_for(path: &Path, input: &Path, author: &str, changes: serde_js
     std::fs::write(path, bytes).expect("write worklist");
 }
 
+/// A one-part package whose body is `body` (inner XML of `w:body`).
+fn minimal_docx(body: &str) -> Vec<u8> {
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+    );
+    DocxArchive::from_parts(vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: document.into_bytes(),
+        },
+    ])
+    .write()
+    .unwrap()
+}
+
 fn receipt_for(output: &Path) -> PathBuf {
     PathBuf::from(format!("{}.receipt.json", output.display()))
 }
@@ -1230,6 +1253,54 @@ fn apply_edits_inside_another_authors_pending_insertion() {
         rejected.contains("within  of delivery."),
         "rejecting everything also rejects Alice's insertion: {rejected}"
     );
+
+    // One delivery policy: `verify` on the same pair agrees with the
+    // successful apply receipt.
+    let verify = run(&["verify", input.to_str().unwrap(), out.to_str().unwrap()]);
+    assert!(
+        verify.status.success(),
+        "verify must agree with the deliverable apply receipt: {verify:?}"
+    );
+    let verification: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verification["status"], "pass");
+    assert_eq!(
+        verification["summary"]["preexisting_revisions_edited_inside"],
+        1
+    );
+    assert_eq!(
+        verification["summary"]["modified_or_resolved_preexisting"],
+        0
+    );
+}
+
+#[test]
+fn verify_fails_an_untracked_rewrite_inside_another_authors_insertion() {
+    // Another producer rewrote Alice's pending "45 days" as "60 days", still
+    // marked as hers, with no tracked change of its own: not a tracked
+    // delivery.
+    let dir = tempfile::tempdir().unwrap();
+    let body = |days: &str| {
+        format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Notice must be given within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">{days}</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of delivery.</w:t></w:r></w:p>"#
+        )
+    };
+    let before = dir.path().join("before.docx");
+    let after = dir.path().join("after.docx");
+    std::fs::write(&before, minimal_docx(&body("45 days"))).unwrap();
+    std::fs::write(&after, minimal_docx(&body("60 days"))).unwrap();
+
+    let verify = run(&["verify", before.to_str().unwrap(), after.to_str().unwrap()]);
+    assert_eq!(verify.status.code(), Some(3), "{verify:?}");
+    let verification: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verification["status"], "fail");
+    assert_eq!(
+        verification["summary"]["preexisting_revisions_edited_inside"],
+        0
+    );
+    assert_eq!(
+        verification["summary"]["modified_or_resolved_preexisting"],
+        1
+    );
 }
 
 /// Run a worklist over "The Customer shall pay the Price." / "The Supplier
@@ -1346,16 +1417,14 @@ fn apply_lets_a_later_item_revise_or_undo_an_earlier_items_change() {
     );
 }
 
-#[test]
-fn apply_refuses_an_item_whose_text_also_stands_in_a_link_or_control() {
-    // A worklist edits a paragraph's own runs; a hyperlink's display text and
-    // a content control's value are edited through their objects. Replacing
-    // the other occurrence and calling the item complete would leave text the
-    // item asked to replace, so it refuses and names each object.
-    let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("objects.docx");
-    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Acme Corp signs; see </w:t></w:r><w:hyperlink w:anchor="terms"><w:r><w:t>the Acme Corp terms</w:t></w:r></w:hyperlink><w:r><w:t>.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Party: </w:t></w:r><w:sdt><w:sdtPr><w:id w:val="7"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p><w:sectPr/></w:body></w:document>"#;
-    let archive = DocxArchive::from_parts(vec![
+/// A package whose body holds "Acme Corp" in a paragraph's own text, in a
+/// hyperlink's text and in a plain-text content control with `control_pr`
+/// (extra `w:sdtPr` children).
+fn objects_docx(control_pr: &str) -> Vec<u8> {
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Acme Corp signs; see </w:t></w:r><w:hyperlink w:anchor="terms"><w:r><w:t>the Acme Corp terms</w:t></w:r></w:hyperlink><w:r><w:t>.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Party: </w:t></w:r><w:sdt><w:sdtPr><w:id w:val="7"/>{control_pr}<w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p><w:sectPr/></w:body></w:document>"#
+    );
+    DocxArchive::from_parts(vec![
         DocxFile {
             name: "[Content_Types].xml".to_string(),
             data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
@@ -1366,17 +1435,95 @@ fn apply_refuses_an_item_whose_text_also_stands_in_a_link_or_control() {
         },
         DocxFile {
             name: "word/document.xml".to_string(),
-            data: document.as_bytes().to_vec(),
+            data: document.into_bytes(),
         },
-    ]);
-    std::fs::write(&input, archive.write().unwrap()).unwrap();
+    ])
+    .write()
+    .unwrap()
+}
+
+/// The `w:t` text of the document part of `doc`, in order.
+fn body_wire_text(doc: &Document) -> String {
+    let bytes = doc.serialize(&ExportOptions::default()).expect("serialize");
+    let archive = DocxArchive::read(&bytes).unwrap();
+    let xml = String::from_utf8(archive.get("word/document.xml").unwrap().to_vec()).unwrap();
+    let mut out = String::new();
+    for piece in xml.split("<w:t").skip(1) {
+        let Some(open) = piece.find('>') else {
+            continue;
+        };
+        if piece[..open].ends_with('/') || !(piece.starts_with('>') || piece.starts_with(' ')) {
+            continue;
+        }
+        if let Some(close) = piece.find("</w:t>") {
+            out.push_str(&piece[open + 1..close]);
+        }
+    }
+    out
+}
+
+#[test]
+fn apply_replaces_an_item_inside_a_link_and_a_control() {
+    // A worklist item's text stands in a paragraph's own runs, a hyperlink's
+    // display text and a content control's value: every occurrence is the
+    // reader's text, so the item replaces all three as tracked changes.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("objects.docx");
+    std::fs::write(&input, objects_docx("")).unwrap();
     let worklist = dir.path().join("worklist.json");
     let out = dir.path().join("objects-redline.docx");
     write_worklist_for(
         &worklist,
         &input,
         "Bob",
-        serde_json::json!([{"id": "rename", "old": "Acme Corp", "new": "Acme Inc"}]),
+        serde_json::json!([{"id": "rename", "old": "Acme Corp", "new": "Acme Inc",
+            "expected_matches": 3}]),
+    );
+
+    let output = run(&[
+        "apply",
+        input.to_str().unwrap(),
+        "--worklist",
+        worklist.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["items"][0]["status"], "applied", "{receipt}");
+    assert_eq!(
+        receipt["items"][0]["matches"].as_array().unwrap().len(),
+        3,
+        "{receipt}"
+    );
+    let redline = Document::parse(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(
+        body_wire_text(&redline.read_accepted().unwrap()),
+        "Acme Inc signs; see the Acme Inc terms.Party: Acme Inc"
+    );
+    assert_eq!(
+        body_wire_text(&redline.read_rejected().unwrap()),
+        "Acme Corp signs; see the Acme Corp terms.Party: Acme Corp"
+    );
+}
+
+#[test]
+fn apply_refuses_an_item_whose_text_stands_in_a_locked_control() {
+    // A control whose content is locked (w:lock contentLocked, §17.5.2.23)
+    // cannot be edited; replacing the other occurrences and calling the item
+    // complete would leave text it asked to replace, so it refuses, naming the
+    // control and its lock.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("objects.docx");
+    std::fs::write(&input, objects_docx(r#"<w:lock w:val="contentLocked"/>"#)).unwrap();
+    let worklist = dir.path().join("worklist.json");
+    let out = dir.path().join("objects-redline.docx");
+    write_worklist_for(
+        &worklist,
+        &input,
+        "Bob",
+        serde_json::json!([{"id": "rename", "old": "Acme Corp", "new": "Acme Inc",
+            "expected_matches": 3}]),
     );
 
     let output = run(&[
@@ -1390,15 +1537,14 @@ fn apply_refuses_an_item_whose_text_also_stands_in_a_link_or_control() {
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(!out.exists(), "a refused worklist creates no redline");
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["status"], "partial", "{receipt}");
     let item = &receipt["items"][0];
     assert_eq!(item["status"], "refused", "{receipt}");
     assert_eq!(item["code"], "matches_inside_inline_objects", "{receipt}");
     let diagnosis = item["diagnosis"].as_array().expect("diagnosis");
-    assert_eq!(diagnosis.len(), 2, "the link and the control: {receipt}");
+    assert_eq!(diagnosis.len(), 1, "the control alone: {receipt}");
+    let named = diagnosis[0].as_str().unwrap();
     assert!(
-        diagnosis[0].as_str().unwrap().contains("hyperlink")
-            && diagnosis[1].as_str().unwrap().contains("content control"),
+        named.contains("content control") && named.contains("w:lock=\"contentLocked\""),
         "{receipt}"
     );
 }
@@ -1896,10 +2042,10 @@ fn resolve_accept_author_empty_string_errors_when_no_anonymous_changes() {
 }
 
 /// A tracked vertical cell merge (`w:cellMerge` with `w:vMerge`, §17.13.5.3)
-/// is a pending change the engine cannot resolve yet: Accept All must refuse
-/// and name it, never report "no pending tracked changes" or write a file.
+/// resolves as Word resolves it: Accept All merges the cell into the one
+/// above and deletes its text, and leaves no cell merge behind.
 #[test]
-fn resolve_accept_all_refuses_a_pending_tracked_cell_merge() {
+fn resolve_accept_all_applies_a_pending_tracked_cell_merge() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("cell-merge.docx");
     let resolved = dir.path().join("resolved.docx");
@@ -1910,7 +2056,7 @@ fn resolve_accept_all_refuses_a_pending_tracked_cell_merge() {
     };
     let body = format!(
         r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr>{}</w:tr><w:tr>{}</w:tr></w:tbl><w:p/><w:sectPr/>"#,
-        cell("Above", ""),
+        cell("Above", r#"<w:vMerge w:val="restart"/>"#),
         cell(
             "Below",
             r#"<w:cellMerge w:id="3" w:author="Alice" w:date="2026-01-01T00:00:00Z" w:vMerge="cont"/>"#
@@ -1943,14 +2089,23 @@ fn resolve_accept_all_refuses_a_pending_tracked_cell_merge() {
         "--accept-all",
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "accept-all must refuse: {stderr}");
+    assert!(output.status.success(), "accept-all resolves it: {stderr}");
+    let resolved_xml = String::from_utf8(
+        DocxArchive::read(&std::fs::read(&resolved).unwrap())
+            .unwrap()
+            .get("word/document.xml")
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     assert!(
-        !resolved.exists(),
-        "a refused resolution writes no output file"
+        !resolved_xml.contains("cellMerge") && !resolved_xml.contains("Below"),
+        "no cell merge is left and the continuation's text is gone: {resolved_xml}"
     );
     assert!(
-        stderr.contains("cellMerge") && !stderr.contains("no pending tracked changes"),
-        "the refusal names the pending cell merge: {stderr}"
+        resolved_xml.contains("Above")
+            && (resolved_xml.contains("<w:vMerge/>") || resolved_xml.contains("<w:vMerge />")),
+        "the cells are merged: {resolved_xml}"
     );
 }
 
@@ -3575,4 +3730,65 @@ fn validate_format_json_reports_invalid_with_structured_issues() {
     let issues = payload["issues"].as_array().unwrap();
     assert!(!issues.is_empty(), "the issues are enumerated");
     assert!(issues[0]["code"].is_string() && issues[0]["message"].is_string());
+}
+
+/// A package with a comment thread (comment 1, replied to by comment 2) and a
+/// separate resolved comment 3, anchored in one paragraph. Thread links and
+/// the resolved flag live in the comments-extended part (§17.13.4,
+/// `w15:paraIdParent`, `w15:done`).
+fn read_commented_parts() -> Vec<(&'static str, String)> {
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:commentRangeStart w:id="1"/><w:commentRangeStart w:id="2"/><w:r><w:t xml:space="preserve">The fee is payable monthly</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r><w:r><w:t xml:space="preserve"> and </w:t></w:r><w:commentRangeStart w:id="3"/><w:r><w:t>in advance</w:t></w:r><w:commentRangeEnd w:id="3"/><w:r><w:commentReference w:id="3"/></w:r><w:r><w:t>.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+    let comments = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:comment w:id="1" w:author="Priya" w:date="2026-10-01T09:00:00Z"><w:p w14:paraId="1A2B3C01"><w:r><w:t>Should this be quarterly?</w:t></w:r></w:p></w:comment><w:comment w:id="2" w:author="Tomas" w:date="2026-10-02T10:30:00Z"><w:p w14:paraId="1A2B3C02"><w:r><w:t>Monthly was agreed.</w:t></w:r></w:p></w:comment><w:comment w:id="3" w:author="Priya" w:date="2026-10-03T11:00:00Z"><w:p w14:paraId="1A2B3C03"><w:r><w:t>Confirm the advance wording.</w:t></w:r></w:p></w:comment></w:comments>"#;
+    let extended = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="1A2B3C01" w15:done="0"/><w15:commentEx w15:paraId="1A2B3C02" w15:paraIdParent="1A2B3C01" w15:done="0"/><w15:commentEx w15:paraId="1A2B3C03" w15:done="1"/></w15:commentsEx>"#;
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/><Override PartName="/word/commentsExtended.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/><Relationship Id="rId3" Type="http://schemas.microsoft.com/office/2011/relationships/commentsExtended" Target="commentsExtended.xml"/></Relationships>"#;
+    vec![
+        ("[Content_Types].xml", content_types.to_string()),
+        ("_rels/.rels", rels.to_string()),
+        ("word/_rels/document.xml.rels", doc_rels.to_string()),
+        ("word/document.xml", document.to_string()),
+        ("word/comments.xml", comments.to_string()),
+        ("word/commentsExtended.xml", extended.to_string()),
+    ]
+}
+
+fn read_commented_docx() -> Vec<u8> {
+    use stemma::docx::{DocxArchive, DocxFile};
+    DocxArchive::from_parts(
+        read_commented_parts()
+            .into_iter()
+            .map(|(name, data)| DocxFile {
+                name: name.to_string(),
+                data: data.into_bytes(),
+            })
+            .collect(),
+    )
+    .write()
+    .expect("write commented package")
+}
+
+#[test]
+fn read_reports_comments_with_their_thread_and_resolved_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("commented.docx");
+    std::fs::write(&input, read_commented_docx()).unwrap();
+    let output = run(&["read", input.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let read: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(read["schema"], "stemma.read.v0");
+    assert_eq!(
+        read["comments"],
+        serde_json::json!([
+            {"id": "1", "author": "Priya", "date": "2026-10-01T09:00:00Z",
+             "text": "Should this be quarterly?", "resolved": false,
+             "parent_id": null, "parent_para_id": null},
+            {"id": "2", "author": "Tomas", "date": "2026-10-02T10:30:00Z",
+             "text": "Monthly was agreed.", "resolved": false,
+             "parent_id": "1", "parent_para_id": "1A2B3C01"},
+            {"id": "3", "author": "Priya", "date": "2026-10-03T11:00:00Z",
+             "text": "Confirm the advance wording.", "resolved": true,
+             "parent_id": null, "parent_para_id": null}
+        ])
+    );
 }

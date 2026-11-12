@@ -23,7 +23,7 @@ use pyo3::exceptions::{
     PyPermissionError, PyRuntimeError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyList, PyMemoryView, PyString};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stemma::api::{
@@ -511,6 +511,9 @@ fn audit_json(report: &AuditReport) -> Result<Value, serde_json::Error> {
                 let mut row = revision_json(record)?;
                 let (label, after_excerpt) = match disposition {
                     RevisionDisposition::Untouched => ("untouched", None),
+                    RevisionDisposition::EditedInside { after_excerpt } => {
+                        ("edited_inside", Some(after_excerpt.as_str()))
+                    }
                     RevisionDisposition::Modified { after_excerpt } => {
                         ("modified", Some(after_excerpt.as_str()))
                     }
@@ -635,8 +638,9 @@ impl Document {
     /// DOCX the engine can edit safely. Check `diagnostics()` afterwards: any
     /// normalization applied at import is reported there, never silently.
     #[staticmethod]
-    fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Document> {
-        py.detach(|| stemma::api::Document::parse(data))
+    fn from_bytes(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Document> {
+        let data = docx_bytes("data", data)?;
+        py.detach(|| stemma::api::Document::parse(&data))
             .map(Document::wrap)
             .map_err(|e| runtime_error(py, e))
     }
@@ -874,6 +878,10 @@ fn revision_ids(ids: &Bound<'_, PyAny>) -> PyResult<HashSet<u32>> {
 
 /// `save(..., overwrite=True)`: stage beside the destination, flush, then
 /// rename over it, so a reader sees the old file or the complete new one.
+///
+/// The result keeps the replaced file's permissions; a file that did not
+/// exist is created like any new file (mode 0666 less the process umask on
+/// Unix), not with the 0600 a private temporary file would carry.
 fn replace_file(path: &Path, bytes: &[u8]) -> PyResult<Value> {
     let context = |what: &str, error: std::io::Error| {
         io_error_class(
@@ -885,10 +893,27 @@ fn replace_file(path: &Path, bytes: &[u8]) -> PyResult<Value> {
     let parent = absolute.parent().ok_or_else(|| {
         PyValueError::new_err(format!("{} has no parent directory", absolute.display()))
     })?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".stemma-save-")
+    let existing_permissions = match std::fs::metadata(&absolute) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(context("inspect", error)),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".stemma-save-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut staged = builder
         .tempfile_in(parent)
         .map_err(|e| context("stage a file next to", e))?;
+    if let Some(permissions) = existing_permissions {
+        staged
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|e| context("carry the permissions of", e))?;
+    }
     staged
         .write_all(bytes)
         .and_then(|()| staged.as_file().sync_all())
@@ -1010,9 +1035,15 @@ fn compare(
 /// edits need not have been made by Stemma. Same report shape as
 /// `Document.review()`, with the package verdict computed on `after`.
 #[pyfunction]
-fn audit(py: Python<'_>, before: &[u8], after: &[u8]) -> PyResult<Py<PyAny>> {
+fn audit(
+    py: Python<'_>,
+    before: &Bound<'_, PyAny>,
+    after: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let before = docx_bytes("before", before)?;
+    let after = docx_bytes("after", after)?;
     let report = py
-        .detach(|| stemma::api::audit(before, after))
+        .detach(|| stemma::api::audit(&before, &after))
         .map_err(|e| runtime_error(py, e))?;
     let value = audit_json(&report).map_err(|e| encode_error("the audit report", e))?;
     to_py_object(py, &value)
@@ -1022,9 +1053,32 @@ fn audit(py: Python<'_>, before: &[u8], after: &[u8]) -> PyResult<Py<PyAny>> {
 /// (`stemma::api::validate`): `{"ok": bool, "issues": [{"code", "message",
 /// "context"}]}`. Invalid bytes are a result, not an exception.
 #[pyfunction]
-fn validate(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
-    let report = py.detach(|| stemma::api::validate(data));
+fn validate(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let data = docx_bytes("data", data)?;
+    let report = py.detach(|| stemma::api::validate(&data));
     to_py_object(py, &validation_json(&report))
+}
+
+/// DOCX bytes from any bytes-like object a caller holds: `bytes`,
+/// `bytearray`, or a contiguous `memoryview`. The buffer protocol is outside
+/// the abi3-py39 limited API, so each type is read explicitly; anything else
+/// is a `TypeError` naming the parameter.
+fn docx_bytes(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(bytes) = value.cast::<PyBytes>() {
+        return Ok(bytes.as_bytes().to_vec());
+    }
+    if let Ok(array) = value.cast::<PyByteArray>() {
+        return Ok(array.to_vec());
+    }
+    if value.is_instance_of::<PyMemoryView>() {
+        let copied = value.call_method0("tobytes")?;
+        let copied = copied.cast::<PyBytes>().map_err(PyErr::from)?;
+        return Ok(copied.as_bytes().to_vec());
+    }
+    Err(PyTypeError::new_err(format!(
+        "{name} must be bytes, bytearray or memoryview, not {}",
+        value.get_type().name()?
+    )))
 }
 
 #[pymodule]

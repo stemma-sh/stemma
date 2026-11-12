@@ -13,7 +13,9 @@
 //!   - **Walls**: opaques/hard-breaks in range are carried by reference
 //!     (covered by `spec_span_addressing.rs`'s `OpaqueDestroyed` tests).
 //!   - **Brackets**: the splice boundary must not split a paired range marker
-//!     (bookmarkStart/End etc.); refusals name the bracket kind.
+//!     whose position the splice cannot keep (move and custom-XML ranges,
+//!     wrappers); refusals name the bracket kind. Bookmark, permission and
+//!     comment range boundaries keep their text offsets instead.
 //!   - **Text identity**: when the op carries `expect`, the resolved range's
 //!     visible text must equal it (`SpanTextMismatch` → stale_edit).
 //!   - The block guard is **mandatory** on the wire (`SpanRequiresGuard`).
@@ -552,16 +554,16 @@ fn bookmark_pair_body() -> &'static str {
 }
 
 #[test]
-fn splice_refuses_to_split_a_bookmark_pair() {
+fn splice_over_one_bookmark_boundary_keeps_it_with_the_text_it_covers() {
     // s_0 ("alpha ") contains the bookmarkStart; its bookmarkEnd lies outside
-    // the range. Replacing s_0 would detach the start marker from the text the
-    // bookmark covers — a REF field pointing at it would silently change
-    // meaning. Refuse, naming the bracket kind.
+    // the range. The splice keeps the start at its text offset, with the kept
+    // "beta" it precedes, so the bookmark (a REF field's target) still covers
+    // "beta gamma" in both readings and Reject restores the source.
     let doc = Document::parse(&make_docx_with_body(bookmark_pair_body())).expect("parse");
     let (block_id, guard) = first_block_id_and_guard(&doc);
     let lead_handle = handle_of_span(&doc, "alpha ");
 
-    let err = apply_step(
+    let edited = apply_step(
         &doc,
         EditStep::ReplaceSpanText {
             block_id,
@@ -571,16 +573,22 @@ fn splice_refuses_to_split_a_bookmark_pair() {
             content: text_content("ALPHA "),
             rationale: None,
         },
+    )
+    .expect("a bookmark boundary in the range keeps its offset");
+    let stream = |doc: &Document| {
+        let bytes = doc.serialize(&stemma::ExportOptions::default()).unwrap();
+        crate::common::marker_stream(
+            &crate::common::read_zip_entry(&bytes, "word/document.xml").unwrap(),
+        )
+    };
+    assert_eq!(stream(&edited), "<-alpha-><+ALPHA+> {bs3}beta gamma{be3}|");
+    assert_eq!(
+        stream(&edited.project(stemma::Resolution::AcceptAll).unwrap()),
+        "ALPHA {bs3}beta gamma{be3}|"
     );
-    let err = expect_refusal(
-        err,
-        "a range containing one member of a bookmark pair must refuse",
-    );
-    assert_eq!(err.code, stemma::ErrorCode::UnsupportedEdit, "{err:?}");
-    assert!(
-        err.message.contains("bookmark"),
-        "the refusal must name the bracket kind that blocked it: {}",
-        err.message
+    assert_eq!(
+        stream(&edited.project(stemma::Resolution::RejectAll).unwrap()),
+        stream(&doc)
     );
 }
 

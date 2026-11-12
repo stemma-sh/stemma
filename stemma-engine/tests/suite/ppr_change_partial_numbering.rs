@@ -1,16 +1,12 @@
-//! A tracked paragraph-property change whose previous numbering names a list
-//! but no level is refused at import, as the same direct numbering is.
+//! Numbering that names a list but no level, live and as a tracked
+//! paragraph-property change's previous numbering, in a document without a
+//! styles part.
 //!
-//! Domain rule: CT_NumPr's numId and ilvl are each schema-optional (§17.3.1.19),
-//! and the engine does not invent the missing level for a direct `w:numPr`
-//! (import refuses "numId without ilvl" rather than defaulting ilvl to zero).
-//! The previous `w:pPr` of a `w:pPrChange` (§17.13.5.29) is the paragraph's
-//! direct properties before the change; rejecting the change makes it the
-//! paragraph's direct `w:numPr` again. Accepting it in the snapshot while
-//! refusing it live gave reject nowhere honest to go: the model invented
-//! level 0 in memory and wrote no numbering, and the byte path wrote the
-//! partial numPr back, which the engine then refused to open. One rule holds
-//! on every path: the partial pair is refused wherever it is read.
+//! Domain rule: CT_NumPr's numId and ilvl are each schema-optional
+//! (§17.3.1.19). Word 16 puts such a paragraph at its style's level, and with
+//! no style level at level 0; Reject All writes the resolved level into the
+//! restored live `w:numPr`. The style cases are in
+//! `spec_numbering_list_without_level`.
 
 use stemma::api::Document;
 
@@ -50,28 +46,45 @@ fn docx(paragraph_properties: &str) -> Vec<u8> {
     buf
 }
 
-fn refusal(paragraph_properties: &str) -> String {
-    match Document::parse(&docx(paragraph_properties)) {
-        Ok(_) => panic!("numbering without a level must be refused: {paragraph_properties}"),
-        Err(err) => err.to_string(),
-    }
+fn saved_document_xml(doc: &Document) -> String {
+    let saved = doc
+        .serialize(&stemma::ExportOptions::default())
+        .expect("save");
+    String::from_utf8(
+        stemma::docx::DocxArchive::read(&saved)
+            .unwrap()
+            .get("word/document.xml")
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+    .replace(" />", "/>")
 }
 
 #[test]
-fn previous_numbering_with_a_list_but_no_level_is_refused_as_the_direct_form_is() {
-    let direct = refusal(r#"<w:numPr><w:numId w:val="1"/></w:numPr>"#);
-    let previous = refusal(
-        r#"<w:ind w:left="720"/><w:pPrChange w:id="1" w:author="Reviewer" w:date="2026-01-01T00:00:00Z"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:pPrChange>"#,
-    );
-    for message in [&direct, &previous] {
-        assert!(
-            message.contains("numId") && message.contains("ilvl"),
-            "the refusal names the incomplete pair: {message}"
-        );
-    }
+fn numbering_with_a_list_but_no_level_opens_at_level_zero_without_styles() {
+    let direct = Document::parse(&docx(r#"<w:numPr><w:numId w:val="1"/></w:numPr>"#))
+        .expect("a list without a level opens");
+    let list = direct.read().blocks[0].list.clone().expect("numbered");
+    assert_eq!((list.num_id, list.ilvl), (1, 0));
     assert!(
-        previous.contains("pPrChange"),
-        "the refusal says the pair is the change's previous state: {previous}"
+        saved_document_xml(&direct).contains(r#"<w:numPr><w:numId w:val="1"/></w:numPr>"#),
+        "an untouched paragraph keeps the numPr as written"
+    );
+
+    let tracked = Document::parse(&docx(
+        r#"<w:ind w:left="720"/><w:pPrChange w:id="1" w:author="Reviewer" w:date="2026-01-01T00:00:00Z"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:pPrChange>"#,
+    ))
+    .expect("a previous list without a level opens");
+    let rejected = tracked
+        .project(stemma::Resolution::RejectAll)
+        .expect("reject all");
+    let list = rejected.read().blocks[0].list.clone().expect("numbered");
+    assert_eq!((list.num_id, list.ilvl), (1, 0));
+    assert!(
+        saved_document_xml(&rejected)
+            .contains(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>"#),
+        "Word's Reject All writes the resolved level"
     );
 }
 

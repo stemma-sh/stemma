@@ -1,6 +1,6 @@
 [package]
 name = "stemma-diff"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Opinionated document comparison for the Stemma Word engine."
@@ -15,7 +15,7 @@ default = []
 test-support = []
 
 [dependencies]
-stemma = { path = "../stemma-engine", version = "0.7.0" }
+stemma = { path = "../stemma-engine", version = "0.8.0" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10.8"

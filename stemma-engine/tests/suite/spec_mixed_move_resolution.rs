@@ -322,8 +322,11 @@ fn accepting_move_settles_source_only_origin_at_destination() {
     assert!(stemma::enumerate_revisions(&moved.snapshot().canonical).is_empty());
 }
 
+/// Word (checked: an inserted paragraph moved away, rejecting only the
+/// insertion): the paragraph leaves its source, and what remains at the
+/// destination is the mover's plain inserted paragraph, no longer a move.
 #[test]
-fn rejecting_inserted_paragraph_origin_settles_into_pending_move() {
+fn rejecting_inserted_paragraph_origin_leaves_the_movers_insertion() {
     let document = Document::parse(&make_docx_with_body(INSERT_THEN_MOVE)).unwrap();
     let rejected = resolve_author(
         document,
@@ -331,19 +334,23 @@ fn rejecting_inserted_paragraph_origin_settles_into_pending_move() {
         RevisionKind::Insert,
         ResolveSelectionAction::Reject,
     );
+    assert_eq!(visible_paragraphs(&rejected), vec!["Middle.", "Inserted."]);
     let revisions = stemma::enumerate_revisions(&rejected.snapshot().canonical);
     assert!(
-        revisions
-            .iter()
-            .all(|revision| revision.kind == RevisionKind::Move)
+        !revisions.is_empty()
+            && revisions
+                .iter()
+                .all(|revision| revision.kind == RevisionKind::Insert
+                    && revision.author.as_deref() == Some("Mover")),
+        "{revisions:?}"
     );
-    let moved = resolve_author(
+    let gone = resolve_author(
         rejected,
         "Mover",
-        RevisionKind::Move,
-        ResolveSelectionAction::Accept,
+        RevisionKind::Insert,
+        ResolveSelectionAction::Reject,
     );
-    assert_eq!(visible_paragraphs(&moved), vec!["Middle.", "Inserted."]);
+    assert_eq!(visible_paragraphs(&gone), vec!["Middle."]);
 }
 
 #[test]
@@ -368,11 +375,15 @@ fn accepting_origin_then_rejecting_move_restores_it_at_source() {
     assert!(stemma::enumerate_revisions(&rejected_move.snapshot().canonical).is_empty());
 }
 
+/// Word's Reject All (checked): the moved text returns to the source, and
+/// the origin's inserted paragraph break is rejected with everything else,
+/// joining the text onto the next paragraph. Not the base: Word is the
+/// definition of Reject for this shape, which no Stemma writer produces.
 #[test]
-fn reject_all_restores_inserted_then_moved_paragraph_at_source() {
+fn reject_all_restores_inserted_then_moved_text_and_rejects_its_break() {
     let document = Document::parse(&make_docx_with_body(INSERT_THEN_MOVE)).unwrap();
     let rejected = document.project(Resolution::RejectAll).unwrap();
-    assert_eq!(visible_paragraphs(&rejected), vec!["Inserted.", "Middle."]);
+    assert_eq!(visible_paragraphs(&rejected), vec!["Inserted.Middle."]);
     assert!(stemma::enumerate_revisions(&rejected.snapshot().canonical).is_empty());
 }
 

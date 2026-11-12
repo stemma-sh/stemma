@@ -256,6 +256,7 @@ fn edit_inline_sdt(
     tracked: bool,
     step_index: usize,
 ) -> Result<(), EditError> {
+    super::content_controls::refuse_content_lock(element, opaque_id, step_index)?;
     // An inline content control's text region is its single `w:sdtContent`.
     if container_index != 0 || paragraph_index != 0 {
         return Err(EditError::OpaqueTextRegionNotFound {

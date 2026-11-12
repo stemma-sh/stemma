@@ -369,6 +369,17 @@ pub(crate) fn apply(
         );
     }
 
+    // Word's Merge Cells records no revision with Track Changes on: the cells
+    // merge and the absorbed text moves into the top-left cell, untracked.
+    // OOXML's only tracked merge is `w:cellMerge`, which Word does not write
+    // for it, so the merge and its text relocation are one direct change even
+    // in a tracked transaction. Tracking only the relocation would let Reject
+    // put text back into a continuation cell, which Word does not display.
+    let mode = if matches!(op, TableOp::MergeCells { .. }) {
+        MaterializationMode::Direct
+    } else {
+        mode
+    };
     lower_table_target(
         doc,
         idx,
@@ -1286,6 +1297,7 @@ fn fresh_cell_like(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(TableCellNode {
+        cell_merge: None,
         id: cell_id,
         blocks,
         grid_span: template.grid_span.max(1),
@@ -1387,6 +1399,7 @@ fn minimal_paragraph(id: NodeId, segments: Vec<TrackedSegment>, text: &str) -> P
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -1429,6 +1442,7 @@ fn minimal_paragraph(id: NodeId, segments: Vec<TrackedSegment>, text: &str) -> P
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -1473,6 +1487,7 @@ mod tests {
                     &format!("r{r}c{c}"),
                 );
                 cells.push(TableCellNode {
+                    cell_merge: None,
                     id: cell_id,
                     blocks: vec![BlockNode::from(para)],
                     grid_span: 1,
@@ -1548,6 +1563,7 @@ mod tests {
             }
         }
         let field = InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("move_field"),
             kind: OpaqueKind::Field(FieldData {
                 field_kind: FieldKind::Simple,

@@ -3,8 +3,9 @@ name: release
 # A maintainer starts one release-candidate run from the exact release commit.
 # It builds and uploads the native matrix first, then waits at the protected
 # `release` environment. Only after exact-artifact/Word qualification is
-# approved does the same run bind the tag, publish exact npm tarballs, and
-# attach the verified GitHub assets.
+# approved does the same run bind the tag, publish exact npm tarballs, the
+# crates.io crates and the PyPI distributions, and attach the verified GitHub
+# assets.
 # See RELEASING.md for the required environment protection and full checklist.
 
 on:
@@ -451,21 +452,52 @@ jobs:
           path: candidate-manifest.json
           if-no-files-found: error
 
+  qualification-checklist:
+    # A job behind an environment gate starts only after approval, so the
+    # checklist must be shown by a job that finishes BEFORE the gate: its
+    # step summary is on the run page while the deployment waits. 0.7.0's
+    # gate was approved before Word qualification ran; the checklist is the
+    # reviewer's reminder of what approval asserts.
+    name: show the qualification checklist before approval
+    needs: [candidate-manifest, python-candidate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print the qualification checklist for this candidate
+        run: |
+          set -euo pipefail
+          checklist=.github/release-qualification-checklist.md
+          test -s "$checklist"
+          {
+            echo "# Qualify v$REQUESTED_VERSION before approving"
+            echo
+            echo "- Candidate commit: \`$GITHUB_SHA\`"
+            echo "- Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            cat "$checklist"
+          } > "$RUNNER_TEMP/qualification-checklist.md"
+          cat "$RUNNER_TEMP/qualification-checklist.md"
+          cat "$RUNNER_TEMP/qualification-checklist.md" >> "$GITHUB_STEP_SUMMARY"
+
   release-approval:
     # Configure this environment with required reviewers and prevent
     # self-review. Reviewers approve only after downloading this run's build
-    # artifacts and recording the exact-artifact Word qualification result.
+    # artifacts and completing the qualification checklist that the
+    # qualification-checklist job prints on the run page.
     name: approve exact candidate after Word qualification
-    needs: [candidate-manifest, python-candidate]
+    needs: [candidate-manifest, python-candidate, qualification-checklist]
     runs-on: ubuntu-latest
     environment: release
     steps:
+      - uses: actions/checkout@v4
       - name: Record promotion boundary
         run: |
           echo "Approved exact candidate from commit $GITHUB_SHA"
           echo "Pinned request commit: $REQUESTED_COMMIT_SHA"
           echo "Requested release version: $REQUESTED_VERSION"
           echo "Approved candidate identity: candidate-manifest workflow artifact"
+          echo "Approval asserts every item of this qualification checklist:"
+          cat .github/release-qualification-checklist.md
 
   release-package:
     # Every fallible preparation step runs BEFORE anything irreversible. If
@@ -633,8 +665,87 @@ jobs:
             verify "$RUNNER_TEMP/release-tag-ruleset.json" "$ruleset_id"
       - name: Publish platform packages, then the wrapper
         # The wrapper goes last: from the moment @stemma-sh/mcp resolves at a
-        # version, every binary it pins must already exist.
+        # version, every binary it pins must already exist. The five platform
+        # packages are published back to back with one visibility wait for
+        # all of them, then the wrapper with its own wait. npm took 3 to 12
+        # minutes to serve new versions at 0.7.0, so each wait allows up to
+        # 60 x 15 s (~15 minutes). A wait that runs out fails the job; rerun
+        # it, and the script skips every version npm already serves with the
+        # exact local integrity.
+        env:
+          STEMMA_NPM_PUBLISH_POLL_ATTEMPTS: "60"
+          STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS: "15"
         run: bash stemma-mcp/npm/publish-npm-packages.sh out
+
+  crates-publish:
+    # Publishes stemma -> stemma-diff -> stemma-artifacts -> stemma-cli from
+    # the approved, tagged source, each dry-run-verified immediately before
+    # its real publish and waited for in the crates.io index before the next
+    # (scripts/publish-crate.sh). Authentication is crates.io trusted
+    # publishing (OIDC): no crates.io token is stored anywhere. Each crate
+    # gets its own token from rust-lang/crates-io-auth-action; a token is
+    # valid for 30 minutes and the action revokes it when the job ends.
+    # crates.io must list this repository and release.yml as a trusted
+    # publisher of all four crates (RELEASING.md, setup step 8).
+    name: publish crates to crates.io
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    env:
+      STEMMA_CRATES_PUBLISH_POLL_ATTEMPTS: "60"
+      STEMMA_CRATES_PUBLISH_POLL_INTERVAL_SECONDS: "10"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned toolchain from .mise.toml
+        # A rerun recognises its own earlier upload by the .crate checksum,
+        # which is reproducible for one commit and one cargo version, so the
+        # publish toolchain is pinned rather than floating stable.
+        id: toolchain
+        run: |
+          version="$(sed -n 's/^rust = "\([^"]*\)".*/\1/p' .mise.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse the pinned rust version from .mise.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - name: Re-verify the release tag before irreversible publication
+        run: |
+          set -euo pipefail
+          tag="v$REQUESTED_VERSION"
+          tag_sha="$(git ls-remote --tags origin "refs/tags/$tag" | awk 'NR == 1 { print $1 }')"
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $tag no longer identifies approved source $GITHUB_SHA."
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth-stemma
+      - name: Publish stemma
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-stemma.outputs.token }}
+        run: bash scripts/publish-crate.sh stemma
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth-stemma-diff
+      - name: Publish stemma-diff
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-stemma-diff.outputs.token }}
+        run: bash scripts/publish-crate.sh stemma-diff
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth-stemma-artifacts
+      - name: Publish stemma-artifacts
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-stemma-artifacts.outputs.token }}
+        run: bash scripts/publish-crate.sh stemma-artifacts
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth-stemma-cli
+      - name: Publish stemma-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth-stemma-cli.outputs.token }}
+        run: bash scripts/publish-crate.sh stemma-cli
 
   pypi-publish:
     # Deliberately minimal, like npm-publish: downloads the frozen python_dist
@@ -722,7 +833,7 @@ jobs:
 
   github-release:
     name: attach binaries to the GitHub release
-    needs: [npm-publish, pypi-publish]
+    needs: [npm-publish, pypi-publish, crates-publish]
     runs-on: ubuntu-latest
     permissions:
       actions: read

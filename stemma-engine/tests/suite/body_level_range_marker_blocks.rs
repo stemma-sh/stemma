@@ -1,15 +1,18 @@
 //! A range marker standing between paragraphs is zero-width.
 //!
-//! Word writes the end of its `_GoBack` bookmark as a `w:bookmarkEnd` directly
-//! under `w:body`, between the paragraph holding the start and the next one
-//! (ECMA-376 §17.13.6.1: a bookmark's start and end may sit at block level).
-//! Such a marker is not content: it closes the range around the paragraph
-//! before it. So, by the editing contract (docs/guide/editing.md):
+//! Word writes the end of a bookmark as a `w:bookmarkEnd` directly under
+//! `w:body`, after the last paragraph it covers (ECMA-376 §17.13.6.1: a
+//! bookmark's start and end may sit at block level). Such a marker is not
+//! content. By the editing contract (docs/guide/editing.md):
 //!
 //! - an insert `after` a paragraph without a role takes the formatting of the
-//!   following PARAGRAPH, which is the one after the marker, and lands after
-//!   the marker: content added after the bookmarked paragraph is not inside
-//!   its bookmark;
+//!   following PARAGRAPH, the one after the marker;
+//! - a paragraph inserted after the last paragraph a bookmark covers, or
+//!   before the first, joins the bookmark. Word evidence: in Word 16, Enter
+//!   at the end of the bookmarked paragraph then typing, or typing then
+//!   Enter at its start, leaves the new paragraph inside the bookmark
+//!   (Bookmarks(..).Range.Text "Marked line¶New line¶" / "New line¶Marked
+//!   line¶"), with Track Changes on or off, in the body and in table cells;
 //! - deleting the paragraph that holds the start keeps the bookmark a pair in
 //!   every reading: the redline, Accept All and Reject All all save (an
 //!   orphaned `bookmarkEnd` is invalid, §17.13.6.2).
@@ -102,8 +105,8 @@ fn text_marks(paragraph: &ParagraphNode, text: &str) -> Vec<Mark> {
 }
 
 #[test]
-fn an_insert_after_a_bookmarked_paragraph_takes_the_next_paragraphs_formatting_outside_the_bookmark()
- {
+fn an_insert_after_a_bookmarked_paragraph_takes_the_next_paragraphs_formatting_inside_the_bookmark()
+{
     let doc = Document::parse(&docx()).expect("parse");
     let first = doc.read().blocks[0].id.to_string();
     for mode in ["tracked_change", "direct"] {
@@ -132,9 +135,44 @@ fn an_insert_after_a_bookmarked_paragraph_takes_the_next_paragraphs_formatting_o
             .find("Inserted paragraph")
             .expect("the new paragraph is saved");
         assert!(
-            end < new_text,
-            "{mode}: the new paragraph lands after the bookmark's end, outside the bookmark: {xml}"
+            new_text < end,
+            "{mode}: the new paragraph lands before the bookmark's end, inside the bookmark \
+             (Word): {xml}"
         );
+    }
+}
+
+#[test]
+fn an_insert_before_a_bookmarked_paragraph_joins_the_bookmark() {
+    let doc = Document::parse(&docx()).expect("parse");
+    let first = doc.read().blocks[0].id.to_string();
+    for mode in ["tracked_change", "direct"] {
+        let edited = apply(
+            &doc,
+            serde_json::json!({"op":"insert","target":{"anchor":first,"position":"before"},
+                "content":[{"type":"paragraph","content":[{"type":"text","text":"Inserted paragraph"}]}]}),
+            mode,
+        );
+        let xml = document_xml(&edited);
+        let start = xml
+            .find("<w:bookmarkStart")
+            .expect("the bookmark start is kept");
+        let new_text = xml
+            .find("Inserted paragraph")
+            .expect("the new paragraph is saved");
+        let title = xml.find("Title paragraph").expect("the title is kept");
+        assert!(
+            start < new_text && new_text < title,
+            "{mode}: the bookmark now starts at the new first paragraph (Word): {xml}"
+        );
+        for resolution in [Resolution::AcceptAll, Resolution::RejectAll] {
+            let resolved = document_xml(&edited.project(resolution).expect("resolve"));
+            assert_eq!(
+                resolved.matches("<w:bookmarkStart").count(),
+                resolved.matches("<w:bookmarkEnd").count(),
+                "{mode}: every bookmark is a pair: {resolved}"
+            );
+        }
     }
 }
 

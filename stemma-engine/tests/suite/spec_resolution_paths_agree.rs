@@ -146,11 +146,18 @@ fn block_reading(block: &BlockNode) -> String {
                         .cells
                         .iter()
                         .map(|cell| {
-                            cell.blocks
+                            let merge = match cell.v_merge {
+                                stemma::domain::VerticalMerge::None => "",
+                                stemma::domain::VerticalMerge::Restart => "(rest)",
+                                stemma::domain::VerticalMerge::Continue => "(cont)",
+                            };
+                            let content = cell
+                                .blocks
                                 .iter()
                                 .map(block_reading)
                                 .collect::<Vec<_>>()
-                                .join(" / ")
+                                .join(" / ");
+                            format!("{merge}{content}")
                         })
                         .collect();
                     format!("[{}]", cells.join(" | "))
@@ -411,6 +418,49 @@ fn text_moved_between_paragraphs_keeps_both_paragraphs() {
     );
 }
 
+/// §17.13.5.22: a deletion beside a move's runs is its own revision, not part
+/// of the move, even when one author made both at one time (Word lists them
+/// separately; a comparison writes every change with one author and date).
+/// Each resolves on its own: rejecting the deletion while accepting the move
+/// keeps the deleted words and relocates the moved ones.
+#[test]
+fn a_deletion_beside_moved_text_is_its_own_revision() {
+    let body = para(&format!(
+        "{}<w:del {}>{}</w:del>{}{}",
+        run("First "),
+        rev(20, "Mover"),
+        del_run("gone "),
+        inline_move("moveFrom", 10, 11, "moved"),
+        run(" end.")
+    )) + &para(&format!(
+        "{}{}{}",
+        run("Second "),
+        inline_move("moveTo", 12, 13, "moved"),
+        run(" end.")
+    ));
+    let original = Document::parse(&docx(&body)).expect("parse fixture");
+    let records = stemma::enumerate_revisions(&original.snapshot().canonical);
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds.len(), 2, "a move and a deletion: {kinds:?}");
+    assert_every_path(
+        &body,
+        &["First  end.", "Second moved end."],
+        &["First gone moved end.", "Second  end."],
+    );
+    let deletion = records
+        .iter()
+        .find(|record| record.kind == stemma::RevisionKind::Delete)
+        .expect("the deletion")
+        .revision_id;
+    let kept = select(&original, &[deletion], ResolveSelectionAction::Reject)
+        .project(Resolution::AcceptAll)
+        .expect("accept the move");
+    assert_eq!(
+        persisted_reading(&kept, "reject the deletion, accept the move"),
+        ["First gone  end.", "Second moved end."]
+    );
+}
+
 #[test]
 fn a_whole_paragraph_move_still_resolves_as_one_unit() {
     let source = format!(
@@ -630,11 +680,108 @@ fn text_inserted_then_moved_away_resolves_without_duplicating() {
         inline_move("moveTo", 12, 13, "fresh"),
         run(" D.")
     ));
-    assert_every_path(&body, &["A  B.", "C fresh D."], &["A fresh B.", "C  D."]);
+    // Word's ruling (W10): here the order of rejections matters. Rejecting
+    // the move (alone or with everything) returns it with the inserted text
+    // ("A fresh B."); rejecting the insertion first takes the text from the
+    // source and leaves the mover's plain insertion at the destination, whose
+    // rejection then gives the base.
+    assert_paths_with_word_order(
+        &body,
+        &["A  B.", "C fresh D."],
+        &["A fresh B.", "C  D."],
+        "Bob",
+        &["A  B.", "C  D."],
+    );
+}
+
+/// [`assert_every_path`] for a shape whose one-at-a-time Reject depends on
+/// the order in Word: every Accept path and every Reject path that does not
+/// reject `origin_author`'s revision before the others reaches the totals;
+/// rejecting that revision first reaches `rejected_origin_first`.
+fn assert_paths_with_word_order(
+    body: &str,
+    accepted: &[&str],
+    rejected: &[&str],
+    origin_author: &str,
+    rejected_origin_first: &[&str],
+) {
+    let bytes = docx(body);
+    let original = Document::parse(&bytes).expect("parse fixture");
+    let ids = revision_ids(&original);
+    let mut origin: Vec<u32> = stemma::enumerate_revisions(&original.snapshot().canonical)
+        .into_iter()
+        .filter(|r| r.author.as_deref() == Some(origin_author))
+        .map(|r| r.revision_id)
+        .collect();
+    origin.dedup();
+    assert_eq!(origin.len(), 1, "one revision by {origin_author}");
+    for (action, expected) in [
+        (ResolveSelectionAction::Accept, accepted),
+        (ResolveSelectionAction::Reject, rejected),
+    ] {
+        let accept = action == ResolveSelectionAction::Accept;
+        let total = original
+            .project(if accept {
+                Resolution::AcceptAll
+            } else {
+                Resolution::RejectAll
+            })
+            .expect("total resolution");
+        assert_eq!(
+            persisted_reading(&total, "total"),
+            expected,
+            "{action:?} All"
+        );
+        assert_eq!(
+            byte_reading(&bytes, accept),
+            expected,
+            "{action:?} All bytes"
+        );
+        assert_eq!(
+            persisted_reading(&select(&original, &ids, action), "batch"),
+            expected,
+            "{action:?} batch"
+        );
+        for order in permutations(&ids) {
+            for reopen_between in [false, true] {
+                let mut document = Document::parse(&bytes).expect("parse fixture");
+                for (step, id) in order.iter().enumerate() {
+                    if !revision_ids(&document).contains(id) {
+                        // What is left of the move after its origin was
+                        // rejected re-keys: resolve whatever is pending.
+                        let left = revision_ids(&document);
+                        if left.is_empty() || step + 1 < order.len() {
+                            continue;
+                        }
+                        document = select(&document, &left, action);
+                        continue;
+                    }
+                    document = select(&document, &[*id], action);
+                    if reopen_between {
+                        document = reopen(&document, "step");
+                    }
+                }
+                let left = revision_ids(&document);
+                if !left.is_empty() {
+                    document = select(&document, &left, action);
+                }
+                let want = if !accept && order[0] == origin[0] {
+                    rejected_origin_first
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    persisted_reading(&document, "order"),
+                    want,
+                    "{action:?} in the order {order:?} (reopened between steps: {reopen_between})"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn a_paragraph_inserted_then_moved_resolves_the_same_in_any_order() {
+fn a_paragraph_inserted_then_moved_resolves_in_words_orders() {
     let source = format!(
         r#"<w:p><w:pPr><w:rPr><w:ins {}/><w:moveFrom {}/></w:rPr></w:pPr><w:moveFromRangeStart {} w:name="m1"/><w:moveFrom {}><w:ins {}>{}</w:ins></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p>"#,
         rev(0, "Origin"),
@@ -652,10 +799,17 @@ fn a_paragraph_inserted_then_moved_resolves_the_same_in_any_order() {
         run("Inserted.")
     );
     let body = source + &para(&run("Middle.")) + &destination + &para(&run("Tail."));
-    assert_every_path(
+    // Word's ruling (W10, whole paragraph): rejecting the move returns the
+    // text and leaves the origin's inserted break pending, so Reject All and
+    // move-then-origin join the text onto "Middle."; rejecting the origin
+    // first leaves the mover's plain insertion, whose rejection gives the
+    // base.
+    assert_paths_with_word_order(
         &body,
         &["Middle.", "Inserted.", "Tail."],
-        &["Inserted.", "Middle.", "Tail."],
+        &["Inserted.Middle.", "Tail."],
+        "Origin",
+        &["Middle.", "Tail."],
     );
 }
 
@@ -735,6 +889,12 @@ fn a_join_blocked_only_by_a_table_another_change_deletes_is_refused_alone() {
         context.contains(&bob.to_string()) && context.contains(&carol.to_string()),
         "the refusal names the revisions to resolve together: {refused} / {context}"
     );
+    assert!(
+        refused
+            .message
+            .contains(&format!("resolve the table's revision [{carol}] first")),
+        "the refusal names the table's revision to resolve first: {refused}"
+    );
 
     // Accepting both, at once or the table first, is Accept All.
     let accepted = ["Left right"];
@@ -792,16 +952,148 @@ fn a_join_blocked_only_by_a_table_another_change_deletes_is_refused_alone() {
     }
 }
 
+// The same join inside a table cell, blocked by a nested table another change
+// deletes. Word (16, oracle) resolves the mark alone by pulling the paragraph
+// into the first cell of the still-pending nested table, and that order then
+// either loses the paragraph's text (accepting the table deletes it with the
+// row) or leaves a revision Word can no longer reach. Accept All, and the
+// table first then the mark, join the two paragraphs. So the mark alone is
+// refused in a cell exactly as in the body.
+
+fn mark_deletion_before_deleted_nested_table() -> String {
+    let nested = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:trPr><w:del {}/></w:trPr><w:tc><w:p><w:pPr><w:rPr><w:del {}/></w:rPr></w:pPr><w:del {}>{}</w:del></w:p></w:tc></w:tr></w:tbl>"#,
+        rev(2, "Carol"),
+        rev(2, "Carol"),
+        rev(2, "Carol"),
+        del_run("x")
+    );
+    let cell = para_marked(&format!("del {}", rev(1, "Bob")), &run("Left"))
+        + &nested
+        + &para(&run(" right"));
+    format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl>{}"#,
+        para(&run("After"))
+    )
+}
+
+#[test]
+fn a_cell_join_blocked_only_by_a_nested_table_another_change_deletes_is_refused_alone() {
+    let body = mark_deletion_before_deleted_nested_table();
+    let bytes = docx(&body);
+    let original = Document::parse(&bytes).expect("parse");
+    let bob = revision_by(&original, "Bob");
+    let carol = revision_by(&original, "Carol");
+
+    let Err(refused) = original.project(Resolution::Selective {
+        ids: HashSet::from([bob]),
+        action: ResolveSelectionAction::Accept,
+    }) else {
+        panic!("accepting the cell join alone has no order-independent result");
+    };
+    assert_eq!(
+        refused.code,
+        stemma::ErrorCode::UnsupportedEdit,
+        "{refused}"
+    );
+    let context = refused.details.context.clone().unwrap_or_default();
+    assert!(
+        context.contains(&bob.to_string()) && context.contains(&carol.to_string()),
+        "the refusal names the revisions to resolve together: {refused} / {context}"
+    );
+    assert!(
+        refused
+            .message
+            .contains(&format!("resolve the table's revision [{carol}] first")),
+        "the refusal names the table's revision to resolve first: {refused}"
+    );
+
+    let accepted = ["[Left right]", "After"];
+    assert_eq!(
+        persisted_reading(
+            &original.project(Resolution::AcceptAll).unwrap(),
+            "accept all"
+        ),
+        accepted
+    );
+    assert_eq!(
+        persisted_reading(
+            &select(&original, &[bob, carol], ResolveSelectionAction::Accept),
+            "accept both"
+        ),
+        accepted
+    );
+    let table_first = select(&original, &[carol], ResolveSelectionAction::Accept);
+    assert_eq!(
+        persisted_reading(
+            &select(&table_first, &[bob], ResolveSelectionAction::Accept),
+            "accept the table, then the join"
+        ),
+        accepted
+    );
+}
+
+#[test]
+fn a_cell_join_blocked_only_by_a_nested_table_another_change_inserts_is_refused_alone() {
+    let nested = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:trPr><w:ins {}/></w:trPr><w:tc><w:p><w:pPr><w:rPr><w:ins {}/></w:rPr></w:pPr><w:ins {}>{}</w:ins></w:p></w:tc></w:tr></w:tbl>"#,
+        rev(2, "Carol"),
+        rev(2, "Carol"),
+        rev(2, "Carol"),
+        run("x")
+    );
+    let cell = para_marked(&format!("ins {}", rev(1, "Bob")), &run("Left"))
+        + &nested
+        + &para(&run(" right"));
+    let body = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc>{cell}</w:tc></w:tr></w:tbl>{}"#,
+        para(&run("After"))
+    );
+    let original = Document::parse(&docx(&body)).expect("parse");
+    let bob = revision_by(&original, "Bob");
+    let carol = revision_by(&original, "Carol");
+    let Err(refused) = original.project(Resolution::Selective {
+        ids: HashSet::from([bob]),
+        action: ResolveSelectionAction::Reject,
+    }) else {
+        panic!("rejecting the cell join alone has no order-independent result");
+    };
+    let context = refused.details.context.clone().unwrap_or_default();
+    assert!(
+        context.contains(&bob.to_string()) && context.contains(&carol.to_string()),
+        "the refusal names the revisions to resolve together: {refused} / {context}"
+    );
+    assert!(
+        refused
+            .message
+            .contains(&format!("resolve the table's revision [{carol}] first")),
+        "the refusal names the table's revision to resolve first: {refused}"
+    );
+    let table_first = select(&original, &[carol], ResolveSelectionAction::Reject);
+    assert_eq!(
+        persisted_reading(
+            &select(&table_first, &[bob], ResolveSelectionAction::Reject),
+            "reject the table, then the join"
+        ),
+        persisted_reading(
+            &original.project(Resolution::RejectAll).unwrap(),
+            "reject all"
+        )
+    );
+}
+
 // ─── A tracked vertical cell merge (`w:cellMerge`, §17.13.5.3) ─────────────
 //
-// `w:cellMerge` records that a cell's vertical merge state was changed with
-// tracking on; its `w:vMerge` / `w:vMergeOrig` attributes give the revised and
-// the original state, and Accept / Reject apply one of them. The engine does
-// not model that resolution (it rewrites the vertical merge geometry across
-// rows), so such a document still opens and reads, the census reports the
-// change (never "no pending changes"), and every resolution refuses, naming
-// the change and its cell, rather than leave it behind and report success.
-// A cellMerge with neither attribute "can be ignored" (§17.13.5.3) and is.
+// `w:cellMerge` records that a cell's vertical merge was changed with tracking
+// on: `w:vMerge` is the merge after the change and `w:vMergeOrig` the merge
+// before it, a missing attribute meaning not merged. The expected readings are
+// Word 16's, from probe files resolved in Word by Accept All and Reject All:
+// the attribute decides, not the cell's own `w:vMerge` element; a cell the
+// resolution leaves as a continuation is emptied, pending changes inside it
+// included; and around a resolved cell a continuation with no merge above and
+// a restart with no continuation below are saved unmerged. The cell merges of
+// one vertically contiguous run in one grid column are one revision. A
+// cellMerge with neither attribute "can be ignored" (§17.13.5.3) and is.
 
 fn cell_merge_body(cell_merge: &str) -> String {
     let cell = |text: &str, tc_pr: &str| {
@@ -829,10 +1121,408 @@ fn merge_changing_cell_merge() -> String {
     format!(r#"<w:cellMerge {} w:vMerge="cont"/>"#, rev(5, "Alice"))
 }
 
+/// A `w:cellMerge` by Alice with the given merge attributes.
+fn cell_merge(id: u32, attributes: &str) -> String {
+    format!(r#"<w:cellMerge {} {attributes}/>"#, rev(id, "Alice"))
+}
+
+const RESTART: &str = r#"<w:vMerge w:val="restart"/>"#;
+const CONTINUE: &str = "<w:vMerge/>";
+
+/// A cell holding one paragraph of `content` (runs), with `tc_pr` after its
+/// width.
+fn merge_cell(tc_pr: &str, content: &str) -> String {
+    format!(
+        r#"<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/>{tc_pr}</w:tcPr>{}</w:tc>"#,
+        para(content)
+    )
+}
+
+/// A two-column table; each row is its two cells.
+fn merge_table(rows: &[[String; 2]]) -> String {
+    let rows: String = rows
+        .iter()
+        .map(|[first, second]| format!("<w:tr>{first}{second}</w:tr>"))
+        .collect();
+    format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>{rows}</w:tbl>"#
+    )
+}
+
+/// Three rows: column one holds `first`, `second` and `third` with the given
+/// tcPr children; column two holds untracked filler text.
+fn three_rows(first: (&str, &str), second: (&str, &str), third: (&str, &str)) -> String {
+    merge_table(&[
+        [
+            merge_cell(first.0, &run(first.1)),
+            merge_cell("", &run("One")),
+        ],
+        [
+            merge_cell(second.0, &run(second.1)),
+            merge_cell("", &run("Two")),
+        ],
+        [
+            merge_cell(third.0, &run(third.1)),
+            merge_cell("", &run("Three")),
+        ],
+    ])
+}
+
+const UNMERGED: &str = "[Alpha | One] [Bravo | Two] [Charlie | Three]";
+
+#[test]
+fn accepting_a_cell_merge_merges_and_empties_the_continuation() {
+    // Word: Accept merges Bravo's cell into Alpha's and deletes "Bravo";
+    // Reject leaves the cells unmerged, and the restart alone is unmerged.
+    let body = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+            "Bravo",
+        ),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+        &[UNMERGED],
+    );
+}
+
+#[test]
+fn the_cell_merge_attribute_decides_not_the_cells_own_merge_element() {
+    // No `w:vMerge` element at all, as Word's Compare writes it.
+    let body = three_rows(
+        (&cell_merge(4, r#"w:vMerge="rest""#), "Alpha"),
+        (&cell_merge(5, r#"w:vMerge="cont""#), "Bravo"),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+        &[UNMERGED],
+    );
+    // A restart element under a `cont` attribute.
+    let body = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!("{RESTART}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+            "Bravo",
+        ),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+        &[UNMERGED],
+    );
+    // A continuation element with only `vMergeOrig`: the change split it.
+    let body = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMergeOrig="cont""#)),
+            "Bravo",
+        ),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &[UNMERGED],
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+    );
+}
+
+#[test]
+fn rejecting_a_split_merges_back_and_empties_the_continuation() {
+    let body = three_rows(
+        (&cell_merge(4, r#"w:vMergeOrig="rest""#), "Alpha"),
+        (&cell_merge(5, r#"w:vMergeOrig="cont""#), "Bravo"),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &[UNMERGED],
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+    );
+    // With no restart recorded above it, Word deletes the text and saves the
+    // cell unmerged.
+    let body = three_rows(
+        ("", "Alpha"),
+        (&cell_merge(5, r#"w:vMergeOrig="cont""#), "Bravo"),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &[UNMERGED],
+        &["[Alpha | One] [ | Two] [Charlie | Three]"],
+    );
+}
+
+#[test]
+fn a_rejected_restart_merge_under_a_restart_leaves_both_unmerged() {
+    let body = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!(
+                "{CONTINUE}{}",
+                cell_merge(5, r#"w:vMerge="cont" w:vMergeOrig="rest""#)
+            ),
+            "Bravo",
+        ),
+        ("", "Charlie"),
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+        &[UNMERGED],
+    );
+}
+
+#[test]
+fn a_run_of_cell_merges_in_one_column_is_one_revision() {
+    let body = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+            "Bravo",
+        ),
+        (
+            &format!("{CONTINUE}{}", cell_merge(6, r#"w:vMerge="cont""#)),
+            "Charlie",
+        ),
+    );
+    let document = Document::parse(&docx(&body)).expect("parse");
+    assert_eq!(revision_ids(&document).len(), 1, "Word lists one revision");
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [(cont) | Three]"],
+        &[UNMERGED],
+    );
+}
+
+/// `cell` wrapped in a cell-level content control (CT_SdtCell, §17.5.2.32):
+/// still one cell of its row, in its grid column.
+fn sdt_cell(cell: &str) -> String {
+    format!(
+        r#"<w:sdt><w:sdtPr><w:id w:val="77"/></w:sdtPr><w:sdtContent>{cell}</w:sdtContent></w:sdt>"#
+    )
+}
+
+#[test]
+fn a_content_control_around_an_earlier_cell_keeps_the_merge_column() {
+    // The control wraps the first cell of the first row only; the merge is
+    // in the second grid column of every row.
+    let body = merge_table(&[
+        [
+            sdt_cell(&merge_cell("", &run("One"))),
+            merge_cell(RESTART, &run("Alpha")),
+        ],
+        [
+            merge_cell("", &run("Two")),
+            merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+                &run("Bravo"),
+            ),
+        ],
+        [
+            merge_cell("", &run("Three")),
+            merge_cell("", &run("Charlie")),
+        ],
+    ]);
+    assert_every_path(
+        &body,
+        &["[One | (rest)Alpha] [Two | (cont)] [Three | Charlie]"],
+        &["[One | Alpha] [Two | Bravo] [Three | Charlie]"],
+    );
+}
+
+#[test]
+fn a_cell_merge_on_a_cell_inside_a_content_control_resolves() {
+    let body = merge_table(&[
+        [
+            merge_cell("", &run("One")),
+            merge_cell(RESTART, &run("Alpha")),
+        ],
+        [
+            merge_cell("", &run("Two")),
+            sdt_cell(&merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+                &run("Bravo"),
+            )),
+        ],
+        [
+            merge_cell("", &run("Three")),
+            merge_cell("", &run("Charlie")),
+        ],
+    ]);
+    assert_every_path(
+        &body,
+        &["[One | (rest)Alpha] [Two | (cont)] [Three | Charlie]"],
+        &["[One | Alpha] [Two | Bravo] [Three | Charlie]"],
+    );
+    // The byte path's working mark on a resolved cell is never written.
+    for archive in [
+        normalize_docx(&DocxArchive::read(&docx(&body)).unwrap())
+            .unwrap()
+            .0,
+        reject_all_docx(&DocxArchive::read(&docx(&body)).unwrap())
+            .unwrap()
+            .0,
+    ] {
+        let xml = String::from_utf8(archive.get("word/document.xml").unwrap().to_vec()).unwrap();
+        assert!(!xml.contains("stemma-"), "{xml}");
+    }
+}
+
+#[test]
+fn cell_merges_in_two_columns_or_two_runs_are_separate_revisions() {
+    let body = merge_table(&[
+        [
+            merge_cell(RESTART, &run("Alpha")),
+            merge_cell(RESTART, &run("One")),
+        ],
+        [
+            merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+                &run("Bravo"),
+            ),
+            merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(6, r#"w:vMerge="cont""#)),
+                &run("Two"),
+            ),
+        ],
+    ]);
+    let document = Document::parse(&docx(&body)).expect("parse");
+    assert_eq!(
+        revision_ids(&document).len(),
+        2,
+        "Word lists one per column"
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | (rest)One] [(cont) | (cont)]"],
+        &["[Alpha | One] [Bravo | Two]"],
+    );
+
+    let body = merge_table(&[
+        [
+            merge_cell(RESTART, &run("Alpha")),
+            merge_cell("", &run("One")),
+        ],
+        [
+            merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+                &run("Bravo"),
+            ),
+            merge_cell("", &run("Two")),
+        ],
+        [
+            merge_cell("", &run("Charlie")),
+            merge_cell("", &run("Three")),
+        ],
+        [
+            merge_cell(RESTART, &run("Delta")),
+            merge_cell("", &run("Four")),
+        ],
+        [
+            merge_cell(
+                &format!("{CONTINUE}{}", cell_merge(7, r#"w:vMerge="cont""#)),
+                &run("Echo"),
+            ),
+            merge_cell("", &run("Five")),
+        ],
+    ]);
+    let document = Document::parse(&docx(&body)).expect("parse");
+    assert_eq!(revision_ids(&document).len(), 2, "Word lists one per run");
+    assert_every_path(
+        &body,
+        &[
+            "[(rest)Alpha | One] [(cont) | Two] [Charlie | Three] [(rest)Delta | Four] [(cont) | Five]",
+        ],
+        &["[Alpha | One] [Bravo | Two] [Charlie | Three] [Delta | Four] [Echo | Five]"],
+    );
+}
+
+#[test]
+fn a_continuation_takes_the_pending_changes_inside_it() {
+    // Word: Accept All, or accepting the merge alone, deletes the inserted
+    // "Bravo" with no pending change left; rejecting the merge alone keeps
+    // the insertion pending, and Reject All removes it, leaving the cell
+    // empty.
+    let body = three_rows((RESTART, "Alpha"), ("", "Charlie"), ("", "Delta")).replacen(
+        &merge_cell("", &run("Charlie")),
+        &merge_cell(
+            &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+            &format!("<w:ins {}>{}</w:ins>", rev(8, "Bob"), run("Bravo")),
+        ),
+        1,
+    );
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Delta | Three]"],
+        &["[Alpha | One] [ | Two] [Delta | Three]"],
+    );
+    let document = Document::parse(&docx(&body)).expect("parse");
+    let merge = stemma::enumerate_revisions(&document.snapshot().canonical)
+        .into_iter()
+        .find(|record| record.kind == stemma::RevisionKind::CellMerge)
+        .expect("the cell merge is listed")
+        .revision_id;
+    let accepted = select(&document, &[merge], ResolveSelectionAction::Accept);
+    assert!(
+        revision_ids(&accepted).is_empty(),
+        "accepting the merge alone leaves no pending change"
+    );
+    let rejected = select(&document, &[merge], ResolveSelectionAction::Reject);
+    assert_eq!(
+        reading(&rejected)[0],
+        "[Alpha | One] [{+Bravo+} | Two] [Delta | Three]",
+        "rejecting the merge alone keeps the insertion pending"
+    );
+}
+
+#[test]
+fn a_compare_style_cell_merge_with_a_cell_property_change_resolves_as_word() {
+    // Word's Compare writes each cellMerge with no `w:vMerge` element, a
+    // `w:tcPrChange` on every cell whose prior tcPr repeats the cellMerge,
+    // and the absorbed text as a deletion.
+    let compare = |tc_pr: &str| {
+        format!(
+            r#"{tc_pr}<w:tcPrChange {}><w:tcPr><w:tcW w:w="2000" w:type="dxa"/>{tc_pr}</w:tcPr></w:tcPrChange>"#,
+            rev(20, "Alice")
+        )
+    };
+    let body = merge_table(&[
+        [
+            merge_cell(
+                &compare(&cell_merge(4, r#"w:vMerge="rest""#)),
+                &run("Alpha"),
+            ),
+            merge_cell(&compare(""), &run("One")),
+        ],
+        [
+            merge_cell(
+                &compare(&cell_merge(5, r#"w:vMerge="cont""#)),
+                &format!("<w:del {}>{}</w:del>", rev(6, "Alice"), del_run("Bravo")),
+            ),
+            merge_cell(&compare(""), &run("Two")),
+        ],
+        [
+            merge_cell(&compare(""), &run("Charlie")),
+            merge_cell(&compare(""), &run("Three")),
+        ],
+    ]);
+    assert_every_path(
+        &body,
+        &["[(rest)Alpha | One] [(cont) | Two] [Charlie | Three]"],
+        &[UNMERGED],
+    );
+}
+
 #[test]
 fn a_tracked_cell_merge_is_reported_by_the_census() {
     let document = Document::parse(&docx(&cell_merge_body(&merge_changing_cell_merge())))
-        .expect("a document with a tracked cell merge still opens");
+        .expect("a document with a tracked cell merge opens");
     let records = stemma::enumerate_revisions(&document.snapshot().canonical);
     let merges: Vec<_> = records
         .iter()
@@ -846,13 +1536,13 @@ fn a_tracked_cell_merge_is_reported_by_the_census() {
     let merge = merges[0];
     assert_eq!(merge.author.as_deref(), Some("Alice"));
     assert_eq!(merge.location, stemma::StoryScope::Body);
-    assert_eq!(
+    assert_ne!(
         merge.revision_id, 0,
-        "reported, but not individually selectable while unmodeled"
+        "a cell merge is individually selectable"
     );
     assert!(
-        merge.excerpt.contains("cell[1,0]"),
-        "the record names its cell: {merge:?}"
+        merge.excerpt.contains("cell[1,0]") && merge.excerpt.contains("vMerge=cont"),
+        "the record names its cell and its merge: {merge:?}"
     );
 
     // A cellMerge with neither attribute can be ignored, and is.
@@ -869,51 +1559,33 @@ fn a_tracked_cell_merge_is_reported_by_the_census() {
 }
 
 #[test]
-fn every_resolution_refuses_while_a_tracked_cell_merge_is_pending() {
-    let document =
-        Document::parse(&docx(&cell_merge_body(&merge_changing_cell_merge()))).expect("parse");
-    let bob = revision_by(&document, "Bob");
-    for (label, resolution) in [
-        ("accept all", Resolution::AcceptAll),
-        ("reject all", Resolution::RejectAll),
-        (
-            "accept one other change",
-            Resolution::Selective {
-                ids: HashSet::from([bob]),
-                action: ResolveSelectionAction::Accept,
-            },
-        ),
-    ] {
-        let Err(error) = document.project(resolution) else {
-            panic!("{label} must not succeed past a pending cell merge");
-        };
-        assert_eq!(
-            error.code,
-            stemma::ErrorCode::UnsupportedEdit,
-            "{label}: {error}"
-        );
-        assert!(
-            error.message.contains("cellMerge")
-                && error.message.contains("§17.13.5.3")
-                && error.message.contains("cell[1,0]"),
-            "{label}: the refusal names the change and its cell: {error}"
-        );
-        assert!(error.details.block_id.is_some(), "{label}: {error:?}");
-    }
+fn a_cell_merge_resolves_beside_another_change() {
+    assert_every_path(
+        &cell_merge_body(&merge_changing_cell_merge()),
+        &["[(rest)a | b] [(cont) | d]", "After more."],
+        &["[a | b] [ | d]", "After"],
+    );
+}
 
-    let archive = DocxArchive::read(&docx(&cell_merge_body(&merge_changing_cell_merge())))
-        .expect("read package");
+#[test]
+fn a_malformed_cell_merge_is_refused_at_open_and_by_the_byte_path() {
+    let body = cell_merge_body(&cell_merge(5, r#"w:vMerge="continue""#));
+    let Err(error) = Document::parse(&docx(&body)) else {
+        panic!("a malformed cellMerge is refused at open");
+    };
+    assert!(
+        error.message.contains("ST_AnnotationVMerge"),
+        "the refusal names the value's type: {error}"
+    );
+    let archive = DocxArchive::read(&docx(&body)).expect("read package");
     for (direction, result) in [
         ("accept", normalize_docx(&archive).map(|_| ())),
         ("reject", reject_all_docx(&archive).map(|_| ())),
     ] {
-        let Err(error) = result else {
-            panic!("byte-level {direction} all must not resolve past a pending cell merge");
-        };
-        let rendered = format!("{error:?}");
+        let rendered = format!("{:?}", result.expect_err(direction));
         assert!(
             rendered.contains("cellMerge") && rendered.contains("word/document.xml"),
-            "{direction}: the refusal names the change and its part: {rendered}"
+            "{direction}: the refusal names the element and its part: {rendered}"
         );
     }
 }
@@ -930,4 +1602,149 @@ fn an_ignorable_cell_merge_does_not_block_resolution() {
     let archive = DocxArchive::read(&docx(&body)).expect("read package");
     normalize_docx(&archive).expect("byte accept all");
     reject_all_docx(&archive).expect("byte reject all");
+}
+
+// ─── A row whose every cell is a tracked cell deletion ─────────────────────
+//
+// §17.13.5.1: accepting a w:cellDel removes the cell. A row holds at least one
+// cell (CT_Row, §17.4.79), so a row whose every cell is deleted goes with its
+// cells on Accept, and a table left with no row goes too (§17.4.37). Reject
+// keeps every cell. No row marker (w:trPr/w:del) is involved.
+
+fn deleted_cell(id: u32, text: &str) -> String {
+    format!(
+        r#"<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:cellDel {}/></w:tcPr>{}</w:tc>"#,
+        rev(id, "Carol"),
+        para(&run(text))
+    )
+}
+
+fn kept_cell(text: &str) -> String {
+    format!(
+        r#"<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr>{}</w:tc>"#,
+        para(&run(text))
+    )
+}
+
+fn two_column_table(rows: &[String]) -> String {
+    format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>{}</w:tbl>"#,
+        rows.iter()
+            .map(|cells| format!("<w:tr>{cells}</w:tr>"))
+            .collect::<String>()
+    )
+}
+
+#[test]
+fn a_row_of_deleted_cells_goes_with_its_cells_on_accept() {
+    let body = para(&run("Before"))
+        + &two_column_table(&[
+            kept_cell("Apple") + &kept_cell("Pear"),
+            deleted_cell(1, "Oak") + &deleted_cell(2, "Elm"),
+            kept_cell("Lime") + &kept_cell("Fig"),
+        ])
+        + &para(&run("After"));
+    assert_every_path(
+        &body,
+        &["Before", "[Apple | Pear] [Lime | Fig]", "After"],
+        &["Before", "[Apple | Pear] [Oak | Elm] [Lime | Fig]", "After"],
+    );
+}
+
+#[test]
+fn a_table_of_deleted_cells_goes_with_its_cells_on_accept() {
+    let body = para(&run("Before"))
+        + &two_column_table(&[deleted_cell(1, "Oak") + &deleted_cell(2, "Elm")])
+        + &para(&run("After"));
+    assert_every_path(
+        &body,
+        &["Before", "After"],
+        &["Before", "[Oak | Elm]", "After"],
+    );
+}
+
+// ─── A tracked cell merge inside a textbox ─────────────────────────────────
+//
+// A textbox's content stays raw XML in the model, and its tracked changes are
+// reported as `opaque_interior` records and resolved by both full
+// resolutions. A cell merge there is one of them.
+
+fn textbox_with(table: &str) -> String {
+    format!(
+        r#"<w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent>{table}<w:p/></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#
+    )
+}
+
+fn document_xml(bytes: &[u8]) -> String {
+    let archive = DocxArchive::read(bytes).expect("read package");
+    String::from_utf8(
+        archive
+            .get("word/document.xml")
+            .expect("document part")
+            .to_vec(),
+    )
+    .expect("utf-8")
+}
+
+#[test]
+fn a_cell_merge_inside_a_textbox_is_reported_and_resolved() {
+    let table = three_rows(
+        (RESTART, "Alpha"),
+        (
+            &format!("{CONTINUE}{}", cell_merge(5, r#"w:vMerge="cont""#)),
+            "Bravo",
+        ),
+        ("", "Charlie"),
+    );
+    let bytes = docx(&textbox_with(&table));
+    let document = Document::parse(&bytes).expect("parse");
+    let records = stemma::enumerate_revisions(&document.snapshot().canonical);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == stemma::RevisionKind::OpaqueInterior)
+            .count(),
+        1,
+        "the census reports the cell merge inside the textbox: {records:?}"
+    );
+    // An attribute-less one changes nothing and is not reported.
+    let ignorable = Document::parse(&docx(&textbox_with(&three_rows(
+        (RESTART, "Alpha"),
+        (&format!("{CONTINUE}{}", cell_merge(5, "")), "Bravo"),
+        ("", "Charlie"),
+    ))))
+    .expect("parse");
+    assert!(stemma::enumerate_revisions(&ignorable.snapshot().canonical).is_empty());
+
+    let accepted = |xml: &str| {
+        assert!(
+            !xml.contains("cellMerge") && !xml.contains("Bravo"),
+            "{xml}"
+        );
+        assert!(xml.contains("Alpha") && xml.contains("<w:vMerge"), "{xml}");
+    };
+    let rejected = |xml: &str| {
+        assert!(!xml.contains("cellMerge") && xml.contains("Bravo"), "{xml}");
+        assert!(
+            !xml.contains("<w:vMerge"),
+            "a lone restart is unmerged: {xml}"
+        );
+    };
+    let model = |resolution| {
+        document_xml(
+            &document
+                .project(resolution)
+                .expect("resolve")
+                .serialize(&ExportOptions::default())
+                .expect("serialize"),
+        )
+    };
+    accepted(&model(Resolution::AcceptAll));
+    rejected(&model(Resolution::RejectAll));
+    let archive = DocxArchive::read(&bytes).expect("read package");
+    let bytes_of = |result: Result<(DocxArchive, _), _>| {
+        document_xml(&result.expect("byte path").0.write().expect("write"))
+    };
+    accepted(&bytes_of(normalize_docx(&archive)));
+    rejected(&bytes_of(reject_all_docx(&archive)));
 }

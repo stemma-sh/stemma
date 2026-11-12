@@ -295,6 +295,7 @@ fn synthesize_new_field_inline(id: &NodeId, spec: &RefFieldSpec) -> InlineNode {
     let content_hash =
         crate::serialize::authored_simple_field_hash(&data, &[], &StyleProps::default());
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind: OpaqueKind::Field(data),
         opaque_ref: format!("fieldref_{}", id.0),

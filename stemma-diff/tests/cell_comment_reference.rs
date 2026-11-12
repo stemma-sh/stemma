@@ -104,14 +104,19 @@ fn a_cell_paragraph_gaining_a_comment_reference_keeps_its_field_whole() {
         field(FieldKind::Separate),
         field(FieldKind::End),
     ];
+    // The redline inserts the reference and keeps the field whole.
     let mut expected = vec![("comment reference".to_string(), "inserted")];
     expected.extend(fields.iter().cloned());
-    assert_eq!(cell_objects(&reopened), expected);
+    assert_eq!(cell_objects(&redline), expected);
 
-    let accepted = reopened.project(Resolution::AcceptAll).expect("accept");
-    let mut accepted_expected = vec![("comment reference".to_string(), "normal")];
-    accepted_expected.extend(fields.iter().cloned());
-    assert_eq!(cell_objects(&accepted), accepted_expected);
-    let rejected = reopened.project(Resolution::RejectAll).expect("reject");
-    assert_eq!(cell_objects(&rejected), fields.to_vec());
+    // Saved, a `w:ins` holding only the reference of a comment whose range
+    // holds no inserted text is no revision to Word (Word 16, verified): it
+    // reopens untracked, and every resolution keeps it and the field whole.
+    let mut kept = vec![("comment reference".to_string(), "normal")];
+    kept.extend(fields.iter().cloned());
+    assert_eq!(cell_objects(&reopened), kept);
+    for resolution in [Resolution::AcceptAll, Resolution::RejectAll] {
+        let resolved = reopened.project(resolution).expect("resolve");
+        assert_eq!(cell_objects(&resolved), kept);
+    }
 }

@@ -313,22 +313,19 @@ const WILD_TORN_BOOKMARK: &str = r#"<w:p>
 </w:p>
 <w:p><w:r><w:t>Following paragraph</w:t></w:r></w:p>"#;
 
+/// The bookmark lies wholly inside the paragraph the reject removes, so it
+/// goes with it, as Word drops a range wholly inside a removed paragraph
+/// (`removed_paragraph_range_markers`); the selective path agrees with the
+/// full one and the result is well-formed.
 #[test]
-fn bug_b_selective_reject_all_collapses_wild_torn_bookmark() {
+fn bug_b_selective_reject_all_drops_wild_bookmark_inside_the_removed_paragraph() {
     // Reproduces the wild witness through the same SELECTIVE path the harness
     // uses; before the fix this failed with "serialization introduced unpaired
     // bookmarks" (id 211).
     let bytes = selective_resolve_all(WILD_TORN_BOOKMARK, stemma::ResolveSelectionAction::Reject);
     let xml = document_xml_of(&bytes);
-    let starts = xml.matches("<w:bookmarkStart").count();
-    let ends = xml.matches("<w:bookmarkEnd").count();
-    assert_eq!(starts, 1, "one surviving bookmarkStart: {xml}");
-    assert_eq!(ends, 1, "the torn bookmarkEnd is re-paired: {xml}");
-    assert_eq!(
-        xml.matches(r#"w:id="211""#).count(),
-        2,
-        "both halves keep id 211: {xml}"
-    );
+    assert_eq!(xml.matches("<w:bookmarkStart").count(), 0, "{xml}");
+    assert_eq!(xml.matches("<w:bookmarkEnd").count(), 0, "{xml}");
     assert!(
         !xml.contains("Uncommenced provisions table"),
         "rejected insertion gone: {xml}"

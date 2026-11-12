@@ -123,6 +123,7 @@ fn build_paragraph(
         numbering,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -165,6 +166,7 @@ fn build_paragraph(
         formatting_change: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -183,8 +185,10 @@ fn make_text(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
 
 fn make_hyperlink(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Hyperlink(HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some("https://example.com".to_string()),
             anchor: None,
             text: "example".to_string(),

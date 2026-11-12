@@ -444,3 +444,91 @@ fn tcmar_out_of_schema_order_opens_clean_verbatim() {
         "out-of-order per-cell tcMar children are well-formed; an unedited doc round-trips verbatim and real Word opens it without repair (oracle /validate: repaired=false) (ISO 29500-1 §17.4.68, §A.1)",
     );
 }
+
+/// pct_cell_margins_round_trip_as_written
+/// ST_TblWidth §17.18.90 on CT_TcMar / CT_TblCellMar. Word does not read a
+/// pct-typed margin as a percentage: it renders the edge as not specified
+/// (Word oracle: 500 pct renders like no margin, not like a 450-twip one) and
+/// keeps tcMar pct as written on save. A pct edge is therefore written back
+/// exactly as authored, at table and cell level, and never as a dxa value,
+/// which would turn "no margin" into a visible one. A dxa edge beside it keeps
+/// its own value.
+#[test]
+fn pct_cell_margins_round_trip_as_written() {
+    let body = r#"<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/><w:tblCellMar><w:top w:w="100" w:type="pct"/><w:left w:w="250" w:type="pct"/><w:bottom w:w="60" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="2500"/><w:gridCol w:w="2500"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/><w:tcMar><w:start w:w="500" w:type="pct"/><w:right w:w="80" w:type="dxa"/></w:tcMar></w:tcPr><w:p><w:r><w:t>Heron</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Plover</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/><w:sectPr/>"#;
+    // Untouched content is copied verbatim, so edit the table first: its
+    // properties are then written from the model.
+    let doc = Document::parse(&make_docx(body, &[])).expect("parse");
+    let table_id = match &doc.snapshot().canonical.blocks[0].block {
+        stemma::BlockNode::Table(t) => t.id.to_string(),
+        other => panic!("expected a table, got {other:?}"),
+    };
+    let json = format!(
+        r#"{{"ops":[{{"op":"table_op","target":"{table_id}","table_op":{{"kind":"set_cell_text","row_index":0,"col_index":1,"text":"Sandpiper"}}}}],"materialization_mode":"direct","revision":{{"author":"Editor"}}}}"#
+    );
+    let txn = stemma::edit_v4::parse_transaction(&json)
+        .expect("schema")
+        .into_edit_transaction()
+        .expect("adapter");
+    let edited = doc.apply(&txn).expect("edit the table");
+    let xml = document_xml_of(
+        &edited
+            .serialize(&stemma::ExportOptions::default())
+            .expect("serialize"),
+    );
+    assert!(xml.contains("Sandpiper"), "the edit is written: {xml}");
+    for kept in [
+        r#"<w:top w:w="100" w:type="pct""#,
+        r#"<w:left w:w="250" w:type="pct""#,
+        r#"<w:bottom w:w="60" w:type="dxa""#,
+        r#"<w:start w:w="500" w:type="pct""#,
+        r#"<w:right w:w="80" w:type="dxa""#,
+    ] {
+        assert!(xml.contains(kept), "{kept} is written as authored: {xml}");
+    }
+    for converted in [
+        r#"w:w="100" w:type="dxa""#,
+        r#"w:w="250" w:type="dxa""#,
+        r#"w:w="500" w:type="dxa""#,
+    ] {
+        assert!(
+            !xml.contains(converted),
+            "a pct margin became {converted}: {xml}"
+        );
+    }
+}
+
+/// pct_cell_margin_is_not_specified_in_the_model
+/// A pct edge is not specified (Word renders no margin from it), so the
+/// effective margins carry no value for it: a document whose only margin is
+/// a pct edge has the same effective margins as one with none.
+#[test]
+fn pct_cell_margin_is_not_specified_in_the_model() {
+    let with_pct = r#"<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/><w:tblCellMar><w:left w:w="250" w:type="pct"/></w:tblCellMar></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="5000" w:type="dxa"/><w:tcMar><w:left w:w="500" w:type="pct"/></w:tcMar></w:tcPr><w:p><w:r><w:t>Heron</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/><w:sectPr/>"#;
+    let without = r#"<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="5000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Heron</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/><w:sectPr/>"#;
+    let table = |body: &str| {
+        let doc = Document::parse(&make_docx(body, &[])).expect("parse");
+        let canonical = doc.snapshot().canonical.clone();
+        match &canonical.blocks[0].block {
+            stemma::BlockNode::Table(t) => (*t).clone(),
+            other => panic!("expected a table, got {other:?}"),
+        }
+    };
+    let (a, b) = (table(with_pct), table(without));
+    assert_eq!(
+        a.formatting.default_cell_margins,
+        b.formatting.default_cell_margins
+    );
+    assert_eq!(
+        a.rows[0].cells[0].formatting.margins,
+        b.rows[0].cells[0].formatting.margins
+    );
+    assert_eq!(
+        a.formatting, b.formatting,
+        "table formatting compares equal"
+    );
+    assert_eq!(
+        a.rows[0].cells[0].formatting, b.rows[0].cells[0].formatting,
+        "cell formatting compares equal"
+    );
+}

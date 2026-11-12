@@ -192,6 +192,62 @@ const MAX_ILVL: u32 = 8;
 /// a `num_id` this high is refused loudly at save time rather than captured.
 const SPLIT_PLACEHOLDER_NUM_ID_BASE: u32 = 0xF000_0000;
 
+/// Write out the level of every list reference that omits one, in every
+/// story: the live numPr and a pPrChange's previous numPr alike.
+///
+/// A numPr that names a list but no level takes its level from the paragraph
+/// style chain when read (`styles::resolve_omitted_direct_level`). A step that
+/// can change that chain (a style's `basedOn`) would move such items on the
+/// next open. Word holds the resolved level once a document is open, so the
+/// items keep the level they had: it becomes the written one.
+pub(crate) fn write_resolved_list_levels(doc: &mut CanonDoc) {
+    fn paragraph(p: &mut ParagraphNode) {
+        p.direct_numbering_omits_ilvl = false;
+        if let Some(change) = &mut p.formatting_change
+            && let crate::domain::DirectParagraphNumbering::Present(previous) =
+                &mut change.previous.direct.numbering
+            && previous.num_id.is_some_and(|num_id| num_id > 0)
+            && previous.ilvl.is_none()
+        {
+            let effective = change.previous.effective.numbering.as_ref().expect(
+                "a previous list without a level has an effective level from import or snapshot",
+            );
+            previous.ilvl = Some(effective.ilvl);
+        }
+    }
+    fn blocks<'a>(nodes: impl Iterator<Item = &'a mut BlockNode>) {
+        for node in nodes {
+            match node {
+                BlockNode::Paragraph(p) => paragraph(p),
+                BlockNode::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            blocks(cell.blocks.iter_mut());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    blocks(doc.blocks.iter_mut().map(|tracked| &mut tracked.block));
+    for story in doc.headers.iter_mut().map(|s| &mut s.blocks) {
+        blocks(story.iter_mut().map(|tracked| &mut tracked.block));
+    }
+    for story in doc.footers.iter_mut().map(|s| &mut s.blocks) {
+        blocks(story.iter_mut().map(|tracked| &mut tracked.block));
+    }
+    for story in doc.footnotes.iter_mut().map(|s| &mut s.blocks) {
+        blocks(story.iter_mut().map(|tracked| &mut tracked.block));
+    }
+    for story in doc.endnotes.iter_mut().map(|s| &mut s.blocks) {
+        blocks(story.iter_mut().map(|tracked| &mut tracked.block));
+    }
+    for story in doc.comments.iter_mut().map(|s| &mut s.blocks) {
+        blocks(story.iter_mut().map(|tracked| &mut tracked.block));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     doc: &mut CanonDoc,
@@ -402,12 +458,16 @@ fn apply_to_paragraph(
             // so inherited numbering cannot reappear on save.
             para.has_direct_numbering = new_numbering.is_some();
             para.numbering_suppressed = target_numbering_suppressed;
+            // The verb writes the level it sets (or removes the list).
+            para.direct_numbering_omits_ilvl = false;
             para.numbering = new_numbering;
         }
         // Direct mutation: set the new numbering, no tracked change.
         MaterializationMode::Direct => {
             para.has_direct_numbering = new_numbering.is_some();
             para.numbering_suppressed = target_numbering_suppressed;
+            // The verb writes the level it sets (or removes the list).
+            para.direct_numbering_omits_ilvl = false;
             para.numbering = new_numbering;
             para.formatting_change = None;
         }
@@ -748,6 +808,7 @@ mod tests {
             numbering,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -790,6 +851,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 

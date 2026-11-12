@@ -95,6 +95,7 @@ fn tracked_paragraph(id: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -137,6 +138,7 @@ fn tracked_paragraph(id: &str) -> ParagraphNode {
         formatting_change: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -181,6 +183,7 @@ fn doc_with_tracked_stories() -> CanonDoc {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -223,6 +226,7 @@ fn doc_with_tracked_stories() -> CanonDoc {
             formatting_change: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }))],
         meta: stemma::DocMeta {
             schema_version: stemma::SCHEMA_VERSION_V0.to_string(),
@@ -249,6 +253,7 @@ fn doc_with_tracked_stories() -> CanonDoc {
             id: "1".to_string(),
             author: Some("reviewer".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
+            initials: None,
             blocks: vec![tracked_block("cm_p1")],
             content_hash: String::new(),
             tracking_status: None,

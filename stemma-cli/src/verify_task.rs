@@ -262,6 +262,14 @@ fn verify_output_audit(
         .iter()
         .filter(|prior| !matches!(prior.disposition, RevisionDisposition::Untouched))
         .count() as u64;
+    // A revision edited inside by the new tracked changes is an expected
+    // change (the MCP save audit counts it the same way); a stateless
+    // recheck has no session evidence for any other kind.
+    let expected_changed_prior_revisions = report
+        .preexisting_revisions
+        .iter()
+        .filter(|prior| matches!(prior.disposition, RevisionDisposition::EditedInside { .. }))
+        .count() as u64;
     let unexplained_direct_changes = report
         .direct_changes
         .iter()
@@ -277,8 +285,9 @@ fn verify_output_audit(
         unexplained_direct_changes,
         preexisting_revisions: report.preexisting_revisions.len() as u64,
         changed_prior_revisions,
-        expected_changed_prior_revisions: 0,
-        unexpected_changed_prior_revisions: changed_prior_revisions,
+        expected_changed_prior_revisions,
+        unexpected_changed_prior_revisions: changed_prior_revisions
+            - expected_changed_prior_revisions,
         untouched_violations: report.untouched.violations.len() as u64,
         validator_issues: report.validator.issues.len() as u64,
         new_validator_issues,

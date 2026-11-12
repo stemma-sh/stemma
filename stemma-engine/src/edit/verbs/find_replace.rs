@@ -40,6 +40,17 @@
 //!
 //! Never half-edit across a barrier.
 //!
+//! # Text inside links and content controls
+//!
+//! A hyperlink's display text and an inline content control's value are text
+//! of the paragraph, but no paragraph rewrite reaches them. Both planners
+//! replace an occurrence there with `EditStep::ReplaceInlineObjectText`,
+//! emitted after the paragraph's own step (see `verbs::object_text`). A match
+//! across a link's or control's edge is a barrier straddle (which part of the
+//! replacement belongs inside the object is not known); an occurrence in an
+//! object that cannot be edited refuses the whole plan
+//! (`ReplaceTextInsideInlineObjects`), naming it and why.
+//!
 //! # Already-tracked segments (no silent history fold)
 //!
 //! `apply_transaction`'s `ReplaceParagraphText` path calls
@@ -70,6 +81,9 @@
 
 use super::super::{
     ContentFragment, EditError, EditStep, ParagraphContent, block_at, find_paragraph_path,
+};
+use super::object_text::{
+    ObjectTextBlock, ObjectTextEdit, ObjectTextView, object_text_view, rewritten,
 };
 use crate::domain::{
     BlockNode, CanonDoc, InlineNode, NodeId, ParagraphNode, TrackedBlock, TrackingStatus,
@@ -140,44 +154,81 @@ pub fn plan_find_replace_all(
         return Ok(Vec::new());
     }
 
-    // An occurrence inside a link or content control is beyond the
-    // paragraph rewrite; replacing the rest would leave it standing.
-    let mut searched: Vec<&[TrackedBlock]> = vec![&doc.blocks];
+    let find = |text: &str| find_all_matches(text, opts);
+
+    // Objects in notes and comments are not edited by replacement; replacing
+    // the rest would leave their occurrences standing.
     if opts.scope == FindReplaceScope::BodyAndStories {
-        searched.extend(doc.footnotes.iter().map(|story| story.blocks.as_slice()));
-        searched.extend(doc.endnotes.iter().map(|story| story.blocks.as_slice()));
-        searched.extend(doc.comments.iter().map(|story| story.blocks.as_slice()));
-    }
-    let inside_objects: Vec<InlineObjectMatch> = searched
-        .into_iter()
-        .flatten()
-        .filter_map(|tracked| match &tracked.block {
-            BlockNode::Paragraph(para) => Some(para.as_ref()),
-            _ => None,
-        })
-        .flat_map(inline_object_texts)
-        .filter(|(_, text)| find_match(text, opts).is_some())
-        .map(|(occurrence, _)| occurrence)
-        .collect();
-    if !inside_objects.is_empty() {
-        return Err(EditError::ReplaceTextInsideInlineObjects {
-            needle: opts.needle.clone(),
-            occurrences: inside_objects,
-            step_index: 0,
-        });
+        let refused: Vec<InlineObjectMatch> = doc
+            .footnotes
+            .iter()
+            .map(|story| story.blocks.as_slice())
+            .chain(doc.endnotes.iter().map(|story| story.blocks.as_slice()))
+            .chain(doc.comments.iter().map(|story| story.blocks.as_slice()))
+            .flatten()
+            .filter_map(|tracked| match &tracked.block {
+                BlockNode::Paragraph(para) => Some(para.as_ref()),
+                _ => None,
+            })
+            .flat_map(|para| {
+                object_occurrences(para, &find)
+                    .into_iter()
+                    .map(|found| InlineObjectMatch {
+                        block_id: para.id.clone(),
+                        object_id: found.object_id,
+                        object: found.view.object,
+                        reason: ObjectTextBlock::OutsideBody,
+                    })
+            })
+            .collect();
+        if !refused.is_empty() {
+            return Err(EditError::ReplaceTextInsideInlineObjects {
+                needle: opts.needle.clone(),
+                occurrences: refused,
+                step_index: 0,
+            });
+        }
     }
 
     let mut steps = Vec::new();
+    let mut refused: Vec<InlineObjectMatch> = Vec::new();
 
     // Body paragraphs. `step_index` mirrors the position in the emitted plan so
     // error context lines up with the transaction that will carry these steps.
+    // Each paragraph's own rewrite comes first, then the edits inside its links
+    // and controls.
     for tracked in &doc.blocks {
         if let BlockNode::Paragraph(para) = &tracked.block {
+            let crossed = crossed_object_edges(para, &find);
+            if !crossed.is_empty() && opts.on_barrier_match == BarrierPolicy::Fail {
+                return Err(EditError::FindReplaceBarrierStraddle {
+                    block_id: para.id.clone(),
+                    needle: opts.needle.clone(),
+                    walls: crossed.iter().map(object_edge_wall).collect(),
+                    step_index: steps.len(),
+                });
+            }
             let step_index = steps.len();
-            if let Some(step) = plan_paragraph(para, &tracked.status, opts, step_index)? {
-                steps.push(step);
+            let rewrite = plan_paragraph(para, &tracked.status, opts, step_index)?;
+            let objects = object_occurrences(para, &find);
+            if rewrite.is_some() || !objects.is_empty() {
+                refuse_locked_block_control(doc, &para.id)?;
+            }
+            steps.extend(rewrite);
+            for found in objects {
+                match plan_object(para, found, &opts.replacement) {
+                    Ok((step, _)) => steps.push(step),
+                    Err(object) => refused.push(object),
+                }
             }
         }
+    }
+    if !refused.is_empty() {
+        return Err(EditError::ReplaceTextInsideInlineObjects {
+            needle: opts.needle.clone(),
+            occurrences: refused,
+            step_index: 0,
+        });
     }
 
     if opts.scope == FindReplaceScope::BodyAndStories {
@@ -244,13 +295,13 @@ fn plan_paragraph(
         // No section-local match. But does it straddle a barrier? A needle
         // present in the full visible text yet absent from every section is a
         // straddle — surface it, never silently skip without a policy decision.
-        let visible = para_visible_text(&elements);
-        let straddles = find_match(&visible, opts).is_some();
-        if straddles {
+        let walls = section_straddled_walls(para, opts);
+        if !walls.is_empty() {
             match opts.on_barrier_match {
                 BarrierPolicy::Skip => return Ok(None),
                 BarrierPolicy::Fail => {
                     return Err(EditError::FindReplaceBarrierStraddle {
+                        walls,
                         block_id,
                         needle: opts.needle.clone(),
                         step_index,
@@ -335,6 +386,64 @@ fn plan_paragraph(
     }))
 }
 
+/// The anchors the first straddling occurrence of the needle runs across in a
+/// paragraph, named by id; empty when no occurrence straddles one.
+///
+/// The occurrence is sought in the paragraph's text as read: its text with
+/// each link's or control's text in place. An occurrence touching such an
+/// object's text is not an anchor straddle (inside it, it is the object's own
+/// match; across its edge, `crossed_object_edges` names it), and leaving the
+/// object's text out would join the text on its two sides into occurrences
+/// the reader never sees. Other anchors (breaks, drawings, fields) read as
+/// no text here, as the sections see them.
+fn section_straddled_walls(para: &ParagraphNode, opts: &FindReplaceOptions) -> Vec<String> {
+    let mut text = String::new();
+    let mut chars = 0usize;
+    // Zero-width anchors by position, and character spans of object text.
+    let mut anchors: Vec<(usize, &NodeId)> = Vec::new();
+    let mut objects: Vec<(usize, usize)> = Vec::new();
+    for segment in &para.segments {
+        for inline in &segment.inlines {
+            match inline {
+                InlineNode::Text(t) => {
+                    text.push_str(&t.text);
+                    chars += t.text.chars().count();
+                }
+                InlineNode::OpaqueInline(o) => match object_text_view(o, &segment.status) {
+                    Some(view) => {
+                        let len = view.shown.chars().count();
+                        objects.push((chars, chars + len));
+                        text.push_str(&view.shown);
+                        chars += len;
+                    }
+                    None => anchors.push((chars, &o.id)),
+                },
+                InlineNode::HardBreak(hb) => anchors.push((chars, &hb.id)),
+                // Zero-width: decorations and comment markers do not split sections.
+                _ => {}
+            }
+        }
+    }
+    let Some((start, end)) = find_all_matches(&text, opts)
+        .into_iter()
+        .find(|(start, end)| !objects.iter().any(|(from, to)| from < end && start < to))
+    else {
+        return Vec::new();
+    };
+    let walls: Vec<String> = anchors
+        .iter()
+        .filter(|(position, _)| *position > start && *position < end)
+        .map(|(_, id)| format!("anchor '{id}'"))
+        .collect();
+    assert!(
+        !walls.is_empty(),
+        "a straddling occurrence of {:?} in paragraph '{}' crosses no anchor",
+        opts.needle,
+        para.id
+    );
+    walls
+}
+
 /// Flatten a paragraph into ordered `Section`/`Anchor` elements, mirroring the
 /// section model of `extract_text_sections` + `collect_anchor_inventory`. Text
 /// runs between anchors are concatenated into one section; each opaque inline
@@ -364,18 +473,6 @@ fn flatten_paragraph(para: &ParagraphNode) -> Vec<Element> {
     elements
 }
 
-/// The paragraph's full visible text (anchors contribute nothing), used only to
-/// detect barrier straddles.
-fn para_visible_text(elements: &[Element]) -> String {
-    let mut out = String::new();
-    for e in elements {
-        if let Element::Section(s) = e {
-            out.push_str(s);
-        }
-    }
-    out
-}
-
 /// Replace every (non-overlapping, left-to-right) match of the needle in one
 /// section with the literal replacement. Honors case-sensitivity and
 /// whole-word boundaries. The literal `replacement` casing is always written.
@@ -394,6 +491,27 @@ fn replace_in_section(section: &str, opts: &FindReplaceOptions) -> String {
             i += needle.len();
         } else {
             out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Every match of the needle in `haystack` under the options, left to right
+/// and not overlapping, as character spans.
+fn find_all_matches(haystack: &str, opts: &FindReplaceOptions) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = haystack.chars().collect();
+    let needle: Vec<char> = opts.needle.chars().collect();
+    let mut out = Vec::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let mut i = 0usize;
+    while i + needle.len() <= chars.len() {
+        if matches_at(&chars, i, &needle, opts) {
+            out.push((i, i + needle.len()));
+            i += needle.len();
+        } else {
             i += 1;
         }
     }
@@ -540,7 +658,10 @@ pub enum ReplaceTextScope {
     WholeDoc,
     /// Every body paragraph, including paragraphs nested in table cells.
     BodyAndTables,
-    /// The inclusive top-level body slice `[from..=to]` in document order.
+    /// The inclusive slice `[from..=to]` in document order, table cells
+    /// included: a table in it contributes its cell paragraphs, and either
+    /// endpoint may be a table (all of it), a body paragraph or a cell
+    /// paragraph.
     Range { from: NodeId, to: NodeId },
     /// One paragraph, either top-level or nested in a table cell.
     SingleBlock(NodeId),
@@ -634,7 +755,9 @@ pub fn unreached_cell_matches(
     out
 }
 
-/// Inline objects holding text that a replace-text splice does not reach.
+/// Inline objects holding text of their own, which a paragraph splice does not
+/// reach: their occurrences are replaced through the object
+/// (`EditStep::ReplaceInlineObjectText`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineObjectText {
     /// A hyperlink's display text (`w:hyperlink` runs).
@@ -643,92 +766,204 @@ pub enum InlineObjectText {
     ContentControlValue,
 }
 
-/// One inline object in a searched paragraph whose text holds the needle.
+/// An inline object whose text holds the needle but cannot be edited by
+/// replacement, and why.
 #[derive(Clone, Debug)]
 pub struct InlineObjectMatch {
     /// The paragraph holding the object.
     pub block_id: NodeId,
-    /// The object's id, the handle the op that edits it targets.
+    /// The object's id.
     pub object_id: NodeId,
     pub object: InlineObjectText,
+    /// Why its text cannot be replaced.
+    pub reason: ObjectTextBlock,
 }
 
 impl InlineObjectMatch {
-    /// Where the occurrence is, and the op that edits it.
+    /// Where the occurrence is, and why it stays.
     pub fn describe(&self) -> String {
-        match self.object {
-            InlineObjectText::HyperlinkText => format!(
-                "the text of hyperlink '{}' in paragraph '{}' (replace targeting the hyperlink \
-                 id with content.type=hyperlink)",
-                self.object_id, self.block_id
-            ),
-            InlineObjectText::ContentControlValue => format!(
-                "the value of content control '{}' in paragraph '{}' \
-                 (set_content_control_value, or opaque_text_edit on the control)",
-                self.object_id, self.block_id
-            ),
-        }
+        let what = match self.object {
+            InlineObjectText::HyperlinkText => "the text of hyperlink",
+            InlineObjectText::ContentControlValue => "the value of content control",
+        };
+        format!(
+            "{what} '{}' in paragraph '{}': {}",
+            self.object_id, self.block_id, self.reason
+        )
     }
 }
 
-/// The live inline objects of `para` that hold text of their own, with that
-/// text. Text replacement edits a paragraph's own runs; a hyperlink's display
-/// text and a content control's value are edited through their objects.
-fn inline_object_texts(para: &ParagraphNode) -> Vec<(InlineObjectMatch, String)> {
+/// The occurrences of a needle in one inline object's text.
+struct ObjectOccurrences {
+    object_id: NodeId,
+    view: ObjectTextView,
+    /// Character spans in `view.shown`, in order and disjoint.
+    spans: Vec<(usize, usize)>,
+}
+
+/// The live inline objects of `para` with text of their own in which `find`
+/// (character spans of a text, in order and disjoint) matches.
+fn object_occurrences(
+    para: &ParagraphNode,
+    find: &dyn Fn(&str) -> Vec<(usize, usize)>,
+) -> Vec<ObjectOccurrences> {
     let mut out = Vec::new();
     for segment in &para.segments {
-        // Deleted text is not live content; there is nothing to replace there.
-        if !matches!(
-            segment.status,
-            TrackingStatus::Normal | TrackingStatus::Inserted(_)
-        ) {
-            continue;
-        }
         for inline in &segment.inlines {
             let InlineNode::OpaqueInline(opaque) = inline else {
                 continue;
             };
-            let (text, object) = match &opaque.kind {
-                crate::domain::OpaqueKind::Hyperlink(link) => {
-                    (link.text.clone(), InlineObjectText::HyperlinkText)
-                }
-                crate::domain::OpaqueKind::Sdt => match crate::opaque_meta::project(opaque) {
-                    Some(crate::view::OpaqueMetadata::ContentControl {
-                        display_text: Some(value),
-                        ..
-                    }) => (value, InlineObjectText::ContentControlValue),
-                    _ => continue,
-                },
-                _ => continue,
+            let Some(view) = object_text_view(opaque, &segment.status) else {
+                continue;
             };
-            out.push((
-                InlineObjectMatch {
-                    block_id: para.id.clone(),
+            let spans = find(&view.shown);
+            if !spans.is_empty() {
+                out.push(ObjectOccurrences {
                     object_id: opaque.id.clone(),
-                    object,
-                },
-                text,
-            ));
+                    view,
+                    spans,
+                });
+            }
         }
     }
     out
 }
 
-/// The inline objects of `para` whose text holds `opts.old` under its match
-/// mode.
-fn inline_object_matches(
+/// What the planner does with an object's occurrences: replace them (the step
+/// and one excerpt per occurrence), or refuse them.
+fn plan_object(
     para: &ParagraphNode,
-    opts: &ReplaceTextOptions,
-) -> Vec<InlineObjectMatch> {
-    inline_object_texts(para)
-        .into_iter()
-        .filter(|(_, text)| {
-            !region_matches(text, &opts.old, opts.match_mode)
-                .0
-                .is_empty()
+    found: ObjectOccurrences,
+    new: &str,
+) -> Result<(EditStep, Vec<String>), InlineObjectMatch> {
+    let chars: Vec<char> = found.view.shown.chars().collect();
+    let edits: Vec<ObjectTextEdit> = found
+        .spans
+        .iter()
+        .map(|&(start, end)| ObjectTextEdit {
+            start,
+            old: chars[start..end].iter().collect(),
+            new: new.to_string(),
         })
-        .map(|(occurrence, _)| occurrence)
-        .collect()
+        .collect();
+    let blocked = found.view.blocked.clone().or_else(|| {
+        rewritten(&found.view.shown, &edits)
+            .is_empty()
+            .then_some(ObjectTextBlock::WouldBeEmpty)
+    });
+    if let Some(reason) = blocked {
+        return Err(InlineObjectMatch {
+            block_id: para.id.clone(),
+            object_id: found.object_id,
+            object: found.view.object,
+            reason,
+        });
+    }
+    let excerpts = found
+        .spans
+        .iter()
+        .map(|&span| build_excerpt(&found.view.shown, span))
+        .collect();
+    Ok((
+        EditStep::ReplaceInlineObjectText {
+            block_id: para.id.clone(),
+            object_id: found.object_id,
+            edits,
+        },
+        excerpts,
+    ))
+}
+
+/// Refuse an edit of paragraph `block_id` when it lies in an open block
+/// content control whose lock (§17.5.2.23) forbids editing its contents.
+fn refuse_locked_block_control(doc: &CanonDoc, block_id: &NodeId) -> Result<(), EditError> {
+    let Some(path) = find_paragraph_path(doc, block_id) else {
+        return Ok(());
+    };
+    match super::content_controls::content_locked_block_controls(doc)
+        .into_iter()
+        .find(|(range, _, _)| range.contains(&path.top_block))
+    {
+        None => Ok(()),
+        Some((_, control, lock)) => Err(EditError::ContentControlLocked {
+            sdt_id: control,
+            lock,
+            step_index: 0,
+        }),
+    }
+}
+
+/// The objects whose edge an occurrence of `find` crosses: a match that takes
+/// in part of a link's or control's text and text outside it. There is no
+/// faithful carrier for it (which part of the replacement belongs inside the
+/// object is not known), so the planners treat the edge as a wall. Objects are
+/// named in reading order, each once.
+fn crossed_object_edges(
+    para: &ParagraphNode,
+    find: &dyn Fn(&str) -> Vec<(usize, usize)>,
+) -> Vec<(NodeId, InlineObjectText)> {
+    // Streams of text with no wall inside, each a list of pieces: paragraph
+    // text (None) or an object's text.
+    type Piece = (String, Option<(NodeId, InlineObjectText)>);
+    let mut streams: Vec<Vec<Piece>> = vec![Vec::new()];
+    for segment in &para.segments {
+        let live = matches!(
+            segment.status,
+            TrackingStatus::Normal | TrackingStatus::Inserted(_)
+        );
+        for inline in &segment.inlines {
+            let piece = match inline {
+                InlineNode::Text(text) if live => Some((text.text.clone(), None)),
+                InlineNode::OpaqueInline(opaque) => object_text_view(opaque, &segment.status)
+                    .map(|view| (view.shown, Some((opaque.id.clone(), view.object)))),
+                InlineNode::Text(_) | InlineNode::HardBreak(_) => None,
+                // Zero-width: markers and decorations do not split text.
+                _ => continue,
+            };
+            match piece {
+                Some(piece) => streams.last_mut().expect("never empty").push(piece),
+                None => streams.push(Vec::new()),
+            }
+        }
+    }
+    let mut crossed: Vec<(NodeId, InlineObjectText)> = Vec::new();
+    for pieces in &streams {
+        let text: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+        let mut bounds = Vec::with_capacity(pieces.len());
+        let mut at = 0usize;
+        for (piece, _) in pieces {
+            let len = piece.chars().count();
+            bounds.push((at, at + len));
+            at += len;
+        }
+        for (start, end) in find(&text) {
+            let touched: Vec<usize> = bounds
+                .iter()
+                .enumerate()
+                .filter(|(_, (from, to))| from < &end && &start < to)
+                .map(|(index, _)| index)
+                .collect();
+            if touched.len() < 2 {
+                continue;
+            }
+            for index in touched {
+                if let Some(object) = &pieces[index].1
+                    && !crossed.contains(object)
+                {
+                    crossed.push(object.clone());
+                }
+            }
+        }
+    }
+    crossed
+}
+
+/// How a crossed object edge is named in a straddle refusal.
+fn object_edge_wall((id, object): &(NodeId, InlineObjectText)) -> String {
+    match object {
+        InlineObjectText::HyperlinkText => format!("the edge of hyperlink '{id}'"),
+        InlineObjectText::ContentControlValue => format!("the edge of content control '{id}'"),
+    }
 }
 
 /// A match that could not be replaced because it crossed a wall, surfaced under
@@ -762,7 +997,7 @@ pub enum ReplaceTextError {
         sites: Vec<MatchSite>,
         /// Teaching diagnostics, populated on a ZERO-match mismatch (when
         /// `actual > 0` the per-site `sites` excerpts already serve; an
-        /// occurrence inside a link or content control refuses before the
+        /// occurrence inside a link or control that cannot be edited refuses before the
         /// count gate, `EditError::ReplaceTextInsideInlineObjects`). Each entry
         /// explains WHY the literal needle matched nothing and what to change — so
         /// the agent fixes the call in one follow-up instead of falling back to
@@ -810,7 +1045,7 @@ const EXCERPT_RADIUS: usize = 32;
 /// whole inline. Because `partition_regions` derives them from
 /// `flat_inlines_with_status` (the same flattening, paired with segment status),
 /// a region's `[flat_start, flat_end)` selects EXACTLY the inlines whose text it
-/// holds, plus any proofing marks between them — true by construction, not by two iterations that happen to agree
+/// holds, plus any crossable markers between them — true by construction, not by two iterations that happen to agree
 /// (`region_flat_range_indexes_the_same_inlines_it_collected` pins this).
 struct Region {
     text: String,
@@ -822,8 +1057,8 @@ struct Region {
 /// Coalesce the paragraph's flat inlines into maximal runs of text with the
 /// same editable status ("regions"), separated by walls. Normal and Inserted
 /// segments are editable; Deleted and InsertedThenDeleted remain walls. Opaque
-/// anchors, hard breaks, and zero-width decorations other than proofing marks
-/// ([`is_proofing_mark`]) are walls too. A region
+/// anchors, hard breaks, and zero-width markers other than the crossable ones
+/// ([`is_crossable_marker`]) are walls too. A region
 /// never spans a status boundary, keeping attribution explicit.
 ///
 /// The flat index space is the SHARED `flat_inlines_with_status(para)`, which is
@@ -849,7 +1084,7 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
             let region_status = flat[i].1;
             let mut text = String::new();
             // One past the last text inline taken: a region ends on text, so
-            // proofing marks after its last text stay outside it.
+            // markers after its last text stay outside it.
             let mut flat_end = i;
             while i < flat.len() {
                 match flat[i].0 {
@@ -858,7 +1093,7 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
                         i += 1;
                         flat_end = i;
                     }
-                    inline if is_proofing_mark(inline) => i += 1,
+                    inline if is_crossable_marker(inline) => i += 1,
                     _ => break,
                 }
             }
@@ -877,12 +1112,173 @@ fn partition_regions(para: &ParagraphNode) -> Vec<Region> {
     regions
 }
 
-/// Word's spelling/grammar marks (`w:proofErr`) bracket a word Word's
-/// proofing flagged and are recomputed on open. They are not content, so a
-/// search region runs through them (Word's own Find does); the splice carries
-/// them with the surrounding text. Every other non-text inline stays a wall.
-fn is_proofing_mark(inline: &InlineNode) -> bool {
-    matches!(inline, InlineNode::Decoration(d) if d.kind == crate::domain::DecorationType::ProofError)
+/// What the first straddling occurrence of `needle` in the paragraph runs
+/// across, in reading order: the walls `partition_regions` stops at that lie
+/// inside the occurrence, named for the caller. Empty when the needle has no
+/// such occurrence (no straddle).
+///
+/// The occurrence is sought in the paragraph's text as read: its editable
+/// text with each link's or control's text in place. An occurrence touching
+/// such an object's text is not a straddle of these walls (inside it, it is
+/// the object's own match; across its edge, `crossed_object_edges` names it),
+/// and leaving the object's text out would join the text on its two sides
+/// into occurrences the reader never sees.
+fn straddled_walls(para: &ParagraphNode, needle: &str, mode: MatchMode) -> Vec<String> {
+    // The searchable text (exactly the regions' text, joined) and, per wall,
+    // the number of searchable characters before it.
+    let mut text = String::new();
+    let mut chars = 0usize;
+    let mut walls: Vec<(usize, String)> = Vec::new();
+    // Character spans of link and control text within `text`.
+    let mut objects: Vec<(usize, usize)> = Vec::new();
+    let mut previous_text_status: Option<&TrackingStatus> = None;
+    for (inline, status) in crate::edit::flat_inlines_with_status(para) {
+        let editable = matches!(status, TrackingStatus::Normal | TrackingStatus::Inserted(_));
+        match inline {
+            InlineNode::OpaqueInline(opaque) => {
+                if let Some(view) = object_text_view(opaque, status) {
+                    let len = view.shown.chars().count();
+                    objects.push((chars, chars + len));
+                    text.push_str(&view.shown);
+                    chars += len;
+                    previous_text_status = None;
+                    continue;
+                }
+            }
+            InlineNode::Text(t) if editable => {
+                if let Some(previous) = previous_text_status
+                    && previous != status
+                {
+                    walls.push((chars, status_edge_label(previous, status)));
+                }
+                previous_text_status = Some(status);
+                text.push_str(&t.text);
+                chars += t.text.chars().count();
+                continue;
+            }
+            marker if editable && is_crossable_marker(marker) => continue,
+            _ => {}
+        }
+        let label = if editable {
+            wall_label(inline)
+        } else {
+            pending_removal_label(status)
+        };
+        if walls.last() != Some(&(chars, label.clone())) {
+            walls.push((chars, label));
+        }
+        previous_text_status = None;
+    }
+    let (spans, _) = region_matches(&text, needle, mode);
+    let Some(&(start, end)) = spans
+        .iter()
+        .find(|(start, end)| !objects.iter().any(|(from, to)| from < end && start < to))
+    else {
+        return Vec::new();
+    };
+    let mut named: Vec<String> = Vec::new();
+    for (position, label) in walls {
+        if position > start && position < end && !named.contains(&label) {
+            named.push(label);
+        }
+    }
+    assert!(
+        !named.is_empty(),
+        "a straddling occurrence of {needle:?} in paragraph '{}' crosses no wall",
+        para.id
+    );
+    named
+}
+
+/// A wall inline as a straddle refusal names it.
+fn wall_label(inline: &InlineNode) -> String {
+    use crate::domain::DecorationType;
+    match inline {
+        InlineNode::OpaqueInline(opaque) => format!(
+            "{} '{}'",
+            crate::edit::opaque_kind_label(&opaque.kind),
+            opaque.id
+        ),
+        InlineNode::HardBreak(hard_break) => format!("break '{}'", hard_break.id),
+        InlineNode::Decoration(decoration) => match decoration.kind {
+            DecorationType::MoveRange => "a move range marker".to_string(),
+            DecorationType::CustomXmlRange => "a custom XML range marker".to_string(),
+            DecorationType::BidiWrapper => "a bidi wrapper boundary".to_string(),
+            DecorationType::CustomXmlWrapper | DecorationType::CustomXmlWrapperEnd => {
+                "a custom XML or smart tag boundary".to_string()
+            }
+            DecorationType::ForeignElement => "a foreign-namespace marker".to_string(),
+            DecorationType::EmptyRun => "an empty run".to_string(),
+            DecorationType::Bookmark
+            | DecorationType::CommentRange
+            | DecorationType::PermissionRange
+            | DecorationType::ProofError => {
+                unreachable!("crossable markers are not walls")
+            }
+        },
+        InlineNode::Text(_)
+        | InlineNode::CommentRangeStart { .. }
+        | InlineNode::CommentRangeEnd { .. } => {
+            unreachable!("editable text and comment range markers are not walls")
+        }
+    }
+}
+
+/// Struck text (and anything inside it) as a straddle refusal names it.
+fn pending_removal_label(status: &TrackingStatus) -> String {
+    match status {
+        TrackingStatus::Deleted(revision) => {
+            format!("a pending deletion{}", by_author(revision))
+        }
+        TrackingStatus::InsertedThenDeleted(stacked) => format!(
+            "a pending insertion{} deleted{}",
+            by_author(&stacked.inserted),
+            by_author(&stacked.deleted)
+        ),
+        TrackingStatus::Normal | TrackingStatus::Inserted(_) => {
+            unreachable!("visible text is not struck")
+        }
+    }
+}
+
+/// The edge between visible text of two statuses (untracked text and a
+/// pending insertion, or two authors' insertions): a region keeps one status.
+fn status_edge_label(before: &TrackingStatus, after: &TrackingStatus) -> String {
+    let inserted = match (before, after) {
+        (_, TrackingStatus::Inserted(revision)) | (TrackingStatus::Inserted(revision), _) => {
+            revision
+        }
+        _ => unreachable!("visible text of two statuses includes an insertion"),
+    };
+    format!("the edge of a pending insertion{}", by_author(inserted))
+}
+
+fn by_author(revision: &crate::domain::RevisionInfo) -> String {
+    revision
+        .author
+        .as_deref()
+        .map(|author| format!(" by {author}"))
+        .unwrap_or_default()
+}
+
+/// A zero-width marker a search region runs through: a proofing mark
+/// (`w:proofErr`, recomputed by Word on open), a bookmark boundary, a comment
+/// range boundary or a permission range boundary. None of them is content or
+/// splits the text (Word's own Find matches across them), and the splice keeps
+/// each at its text offset (`apply_span_splice`). Every other non-text inline
+/// stays a wall: an inline object or break, a move range marker (it belongs to
+/// a revision), and a custom-XML, smart-tag or bidi wrapper boundary (it
+/// re-nests the runs between its two markers).
+fn is_crossable_marker(inline: &InlineNode) -> bool {
+    use crate::domain::DecorationType;
+    match inline {
+        InlineNode::Decoration(decoration) => matches!(
+            decoration.kind,
+            DecorationType::ProofError | DecorationType::Bookmark | DecorationType::PermissionRange
+        ),
+        InlineNode::CommentRangeStart { .. } | InlineNode::CommentRangeEnd { .. } => true,
+        _ => false,
+    }
 }
 
 /// Fold one char to its normalization-class representative, returning the class
@@ -1007,6 +1403,44 @@ fn build_excerpt(region_text: &str, (start, end): (usize, usize)) -> String {
     s
 }
 
+/// One block in document order, table cells included: its id, the index of
+/// its last descendant in the order (its own index unless it is a table), and
+/// the paragraph it is, if it is one.
+struct OrderedBlock<'a> {
+    id: &'a NodeId,
+    last: usize,
+    paragraph: Option<&'a ParagraphNode>,
+}
+
+fn block_order(blocks: &[TrackedBlock]) -> Vec<OrderedBlock<'_>> {
+    fn push<'a>(block: &'a BlockNode, out: &mut Vec<OrderedBlock<'a>>) {
+        let at = out.len();
+        let (id, paragraph) = match block {
+            BlockNode::Paragraph(p) => (&p.id, Some(p.as_ref())),
+            BlockNode::Table(t) => (&t.id, None),
+            BlockNode::OpaqueBlock(o) => (&o.id, None),
+        };
+        out.push(OrderedBlock {
+            id,
+            last: at,
+            paragraph,
+        });
+        if let BlockNode::Table(table) = block {
+            for cell in table.rows.iter().flat_map(|row| &row.cells) {
+                for inner in &cell.blocks {
+                    push(inner, out);
+                }
+            }
+        }
+        out[at].last = out.len() - 1;
+    }
+    let mut out = Vec::new();
+    for tracked in blocks {
+        push(&tracked.block, &mut out);
+    }
+    out
+}
+
 /// Resolve the scope to the ordered list of (block_id, paragraph) pairs to
 /// search. Fails loud on an unknown/mis-ordered block id.
 fn scoped_paragraphs<'a>(
@@ -1077,20 +1511,23 @@ fn scoped_paragraphs<'a>(
             Ok(vec![p])
         }
         ReplaceTextScope::Range { from, to } => {
-            let start = body_paras
-                .iter()
-                .position(|p| &p.id == from)
-                .ok_or_else(|| EditError::BlockNotFound {
-                    block_id: from.clone(),
-                    step_index: 0,
-                })?;
-            let end = body_paras.iter().position(|p| &p.id == to).ok_or_else(|| {
-                EditError::BlockNotFound {
-                    block_id: to.clone(),
-                    step_index: 0,
-                }
+            // The range is every block between its endpoints in document
+            // order, table cells included: a table inside it contributes its
+            // cell paragraphs, any block id a read reports (a table's, a cell
+            // paragraph's) is an endpoint, and a table as the end includes
+            // everything inside it.
+            let order = block_order(&doc.blocks);
+            let position = |id: &NodeId| order.iter().position(|entry| entry.id == id);
+            let start = position(from).ok_or_else(|| EditError::BlockNotFound {
+                block_id: from.clone(),
+                step_index: 0,
             })?;
-            if start > end {
+            let end = position(to).ok_or_else(|| EditError::BlockNotFound {
+                block_id: to.clone(),
+                step_index: 0,
+            })?;
+            let last = order[end].last;
+            if start > last {
                 return Err(EditError::BlockRangeInvalid {
                     start_block_id: from.clone(),
                     end_block_id: to.clone(),
@@ -1098,7 +1535,10 @@ fn scoped_paragraphs<'a>(
                     step_index: 0,
                 });
             }
-            Ok(body_paras[start..=end].to_vec())
+            Ok(order[start..=last]
+                .iter()
+                .filter_map(|entry| entry.paragraph)
+                .collect())
         }
     }
 }
@@ -1127,9 +1567,13 @@ pub fn plan_replace_text(
     let mut skipped: Vec<SkippedStraddle> = Vec::new();
     let mut classes: Vec<NormalizationClass> = Vec::new();
     let mut inside_objects: Vec<InlineObjectMatch> = Vec::new();
+    // Per paragraph, the object edits that follow its splice.
+    let mut object_steps: std::collections::HashMap<NodeId, Vec<EditStep>> =
+        std::collections::HashMap::new();
+    let find = |text: &str| region_matches(text, &opts.old, opts.match_mode).0;
 
     for para in &paras {
-        inside_objects.extend(inline_object_matches(para, opts));
+        let objects = object_occurrences(para, &find);
 
         // A tracked BLOCK status can't be carried by a splice — refuse up front.
         let top_level_status =
@@ -1139,7 +1583,7 @@ pub fn plan_replace_text(
         {
             // Only refuse if this paragraph actually contains a match; otherwise
             // a tracked block elsewhere shouldn't block an unrelated replace.
-            if paragraph_has_match(para, opts) {
+            if paragraph_has_match(para, opts) || !objects.is_empty() {
                 return Err(ReplaceTextError::Engine(EditError::BlockHasTrackedStatus {
                     block_id: para.id.clone(),
                     status: tracked_status_label(status),
@@ -1147,6 +1591,12 @@ pub fn plan_replace_text(
                 }));
             }
             continue;
+        }
+
+        // A block content control whose contents are locked keeps them, as the
+        // control fill verbs keep them.
+        if paragraph_has_match(para, opts) || !objects.is_empty() {
+            refuse_locked_block_control(doc, &para.id).map_err(ReplaceTextError::Engine)?;
         }
 
         let regions = partition_regions(para);
@@ -1167,12 +1617,55 @@ pub fn plan_replace_text(
             }
         }
 
+        // Occurrences inside links and controls are replaced through the
+        // object, after the paragraph's own splice.
+        for found in objects {
+            match plan_object(para, found, &opts.new) {
+                Ok((step, excerpts)) => {
+                    sites.extend(excerpts.into_iter().map(|excerpt| MatchSite {
+                        block_id: para.id.clone(),
+                        excerpt,
+                    }));
+                    object_steps.entry(para.id.clone()).or_default().push(step);
+                }
+                Err(refused) => inside_objects.push(refused),
+            }
+        }
+
+        // An occurrence across a link's or control's edge has no faithful
+        // carrier: the edge is a wall.
+        let crossed = crossed_object_edges(para, &find);
+        if !crossed.is_empty() {
+            match opts.on_barrier_match {
+                BarrierPolicy::Skip => {
+                    for (_, object) in &crossed {
+                        skipped.push(SkippedStraddle {
+                            block_id: para.id.clone(),
+                            wall: match object {
+                                InlineObjectText::HyperlinkText => "hyperlink_edge",
+                                InlineObjectText::ContentControlValue => "content_control_edge",
+                            },
+                        });
+                    }
+                }
+                BarrierPolicy::Fail => {
+                    return Err(ReplaceTextError::Engine(
+                        EditError::FindReplaceBarrierStraddle {
+                            block_id: para.id.clone(),
+                            needle: opts.old.clone(),
+                            walls: crossed.iter().map(object_edge_wall).collect(),
+                            step_index: 0,
+                        },
+                    ));
+                }
+            }
+        }
+
         // Straddle detection: a needle present across the paragraph's editable text
         // but absent from every region crossed a wall.
         if !had_region_match {
-            let joined: String = regions.iter().map(|r| r.text.as_str()).collect();
-            let (whole_spans, _) = region_matches(&joined, &opts.old, opts.match_mode);
-            if !whole_spans.is_empty() {
+            let walls = straddled_walls(para, &opts.old, opts.match_mode);
+            if !walls.is_empty() {
                 match opts.on_barrier_match {
                     BarrierPolicy::Skip => skipped.push(SkippedStraddle {
                         block_id: para.id.clone(),
@@ -1183,6 +1676,7 @@ pub fn plan_replace_text(
                             EditError::FindReplaceBarrierStraddle {
                                 block_id: para.id.clone(),
                                 needle: opts.old.clone(),
+                                walls,
                                 step_index: 0,
                             },
                         ));
@@ -1192,9 +1686,9 @@ pub fn plan_replace_text(
         }
     }
 
-    // ── Occurrences the splice cannot reach ────────────────────────────────
-    // Replacing the reachable occurrences while one sits in a link or a
-    // content control would report success with the text still there.
+    // ── Occurrences that cannot be replaced ────────────────────────────────
+    // Replacing the others while one sits in a locked or otherwise uneditable
+    // link or control would report success with the text still there.
     if !inside_objects.is_empty() {
         return Err(ReplaceTextError::Engine(
             EditError::ReplaceTextInsideInlineObjects {
@@ -1214,7 +1708,7 @@ pub fn plan_replace_text(
             // On a ZERO-match mismatch, diagnose WHY (the benchmark's measured
             // residual: bare zero-match errors forced fallback ceremony). The
             // probes fire only when they'd change the outcome; empty otherwise.
-            // (Occurrences inside links and content controls refused above.)
+            // (Occurrences inside links and controls count; uneditable ones refused above.)
             let diagnosis = if actual == 0 {
                 zero_match_diagnosis(doc, &paras, opts)
             } else {
@@ -1235,6 +1729,7 @@ pub fn plan_replace_text(
         if let Some(step) = plan_paragraph_splice(para, opts)? {
             steps.push(step);
         }
+        steps.extend(object_steps.remove(&para.id).unwrap_or_default());
     }
 
     Ok(ReplaceTextPlan {
@@ -1400,7 +1895,7 @@ fn bound_matched_region(
         .take(region.flat_end)
         .skip(region.flat_start)
     {
-        if is_proofing_mark(inline) {
+        if is_crossable_marker(inline) {
             continue;
         }
         let InlineNode::Text(text) = inline else {
@@ -1729,15 +2224,13 @@ fn classify_tracked_wall_straddle(
         if region_local {
             continue; // matched in a region — not a straddle
         }
-        let joined: String = regions.iter().map(|r| r.text.as_str()).collect();
-        if !region_matches(&joined, &opts.old, opts.match_mode)
-            .0
-            .is_empty()
-        {
+        let walls = straddled_walls(para, &opts.old, opts.match_mode);
+        if !walls.is_empty() {
             return Some(format!(
-                "the needle spans a wall (an opaque anchor or a tracked-change boundary) in \
-                 block '{}' — replace_text only edits within one unbroken run of body text, \
-                 so split the edit around the wall or target the surrounding text",
+                "the needle runs across {} in block '{}' — replace_text only edits within one \
+                 unbroken run of body text, so split the edit around that wall or target the \
+                 surrounding text",
+                walls.join(", "),
                 para.id.0
             ));
         }
@@ -1766,16 +2259,31 @@ fn classify_already_applied(paras: &[&ParagraphNode], opts: &ReplaceTextOptions)
     ))
 }
 
-/// Classification 5: matches for the needle exist OUTSIDE the given scope. Fires
-/// ONLY when the scope is restricted (Range/SingleBlock — WholeDoc has no
-/// "outside") AND a bounded whole-body scan finds ≥1 match in a body paragraph not
-/// in the scoped set. Names the count and the scope they fell outside, so the
-/// agent widens the scope rather than concluding the phrase is absent.
+/// Classification 5: matches for the needle exist where this search did not
+/// look. Two kinds of place, each named so the agent goes there rather than
+/// concluding the phrase is absent or mistyped:
+///   - body paragraphs, table cells included, outside a restricted scope
+///     (Range/SingleBlock), or the table cells WholeDoc's top-level scan skips;
+///   - the stories `replace_text` never searches under any scope: headers,
+///     footers, footnotes, endnotes and comments.
+///
+/// One bounded scan of the document's paragraphs.
 fn classify_out_of_scope(doc: &CanonDoc, opts: &ReplaceTextOptions) -> Option<String> {
+    let mut findings = Vec::new();
+    if let Some(body) = out_of_scope_body_matches(doc, opts) {
+        findings.push(body);
+    }
+    if let Some(stories) = unsearched_story_matches(doc, opts) {
+        findings.push(stories);
+    }
+    (!findings.is_empty()).then(|| findings.join("; "))
+}
+
+fn out_of_scope_body_matches(doc: &CanonDoc, opts: &ReplaceTextOptions) -> Option<String> {
     let scope_label = match &opts.scope {
-        // Both broad scopes cover every region they promise. BodyAndTables is
-        // the MCP scope; WholeDoc is the frozen CLI's top-level body scope.
-        ReplaceTextScope::WholeDoc | ReplaceTextScope::BodyAndTables => return None,
+        // BodyAndTables searches every body paragraph there is.
+        ReplaceTextScope::BodyAndTables => return None,
+        ReplaceTextScope::WholeDoc => "the top-level body paragraphs".to_string(),
         ReplaceTextScope::SingleBlock(id) => format!("block '{}'", id.0),
         ReplaceTextScope::Range { from, to } => {
             format!("block range '{}'..'{}'", from.0, to.0)
@@ -1789,27 +2297,68 @@ fn classify_out_of_scope(doc: &CanonDoc, opts: &ReplaceTextOptions) -> Option<St
         Err(_) => return None,
     };
 
-    // One bounded whole-body scan over the paragraphs NOT in scope.
-    let mut outside_hits = 0usize;
-    let mut first_outside: Option<&NodeId> = None;
-    for tb in &doc.blocks {
-        if let BlockNode::Paragraph(p) = &tb.block
-            && !scoped.contains(&p.id)
-            && paragraph_has_match(p, opts)
-        {
-            outside_hits += 1;
-            if first_outside.is_none() {
-                first_outside = Some(&p.id);
-            }
+    let outside: Vec<&NodeId> = block_order(&doc.blocks)
+        .into_iter()
+        .filter_map(|entry| entry.paragraph)
+        .filter(|p| !scoped.contains(&p.id) && paragraph_has_match(p, opts))
+        .map(|p| &p.id)
+        .collect();
+    let first = outside.first()?;
+    Some(format!(
+        "the needle matches nothing inside {scope_label} but {} time(s) OUTSIDE it \
+         (first at block '{}') — widen the scope to reach those matches",
+        outside.len(),
+        first.0
+    ))
+}
+
+fn unsearched_story_matches(doc: &CanonDoc, opts: &ReplaceTextOptions) -> Option<String> {
+    let stories = doc
+        .headers
+        .iter()
+        .map(|h| ("header", h.part_name.as_str(), &h.blocks, "edit_header"))
+        .chain(
+            doc.footers
+                .iter()
+                .map(|f| ("footer", f.part_name.as_str(), &f.blocks, "edit_footer")),
+        )
+        .chain(
+            doc.footnotes
+                .iter()
+                .map(|n| ("footnote", n.id.as_str(), &n.blocks, "edit_note")),
+        )
+        .chain(
+            doc.endnotes
+                .iter()
+                .map(|n| ("endnote", n.id.as_str(), &n.blocks, "edit_note")),
+        )
+        .chain(
+            doc.comments
+                .iter()
+                .map(|c| ("comment", c.id.as_str(), &c.blocks, "")),
+        );
+    let mut hits = Vec::new();
+    for (kind, id, blocks, op) in stories {
+        let count = block_order(blocks)
+            .into_iter()
+            .filter_map(|entry| entry.paragraph)
+            .filter(|p| paragraph_has_match(p, opts))
+            .count();
+        if count > 0 {
+            let how = if op.is_empty() {
+                String::new()
+            } else {
+                format!(", edited with {op}")
+            };
+            hits.push(format!("{count} in {kind} '{id}'{how}"));
         }
     }
-    if outside_hits == 0 {
+    if hits.is_empty() {
         return None;
     }
-    let where_: &str = first_outside.map(|id| &*id.0).unwrap_or("the body");
     Some(format!(
-        "the needle matches nothing inside {scope_label} but {outside_hits} time(s) \
-         OUTSIDE it (first at block '{where_}') — widen the scope to reach those matches"
+        "the needle matches outside the body, where replace_text does not search: {}",
+        hits.join(", ")
     ))
 }
 

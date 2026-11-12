@@ -144,6 +144,32 @@ pub(in crate::edit) fn apply(
         cell_mut(doc, path).blocks.insert(index, block);
         last_id = Some(id);
     }
+    // Word moves a bookmark's or permission range's start onto a paragraph
+    // inserted before the first paragraph it covers, and a permission end
+    // inside the anchor to the end of a paragraph inserted after it (checked
+    // in cells and in the body).
+    if let Some(count) = last_id.as_ref().map(|_| specs.len()) {
+        let blocks = &mut cell_mut(doc, path).blocks;
+        match position {
+            InsertPosition::Before => {
+                let (before, after) = blocks.split_at_mut(index + count);
+                if let (BlockNode::Paragraph(first_new), Some(BlockNode::Paragraph(anchor))) =
+                    (&mut before[index], after.first_mut())
+                {
+                    super::super::hand_leading_bookmark_starts(anchor, first_new);
+                }
+            }
+            InsertPosition::After if index > 0 => {
+                let (before, after) = blocks.split_at_mut(index);
+                if let (Some(BlockNode::Paragraph(anchor)), BlockNode::Paragraph(last_new)) =
+                    (before.last_mut(), &mut after[count - 1])
+                {
+                    super::super::hand_trailing_permission_ends(anchor, last_new);
+                }
+            }
+            InsertPosition::After => {}
+        }
+    }
     if is_tail_append && let Some((revision, counter)) = &mut tracking {
         crate::tracked_model::normalize_cell_append_mark(
             cell_mut(doc, path),

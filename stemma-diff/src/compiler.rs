@@ -39,10 +39,11 @@ use crate::domain::{
 };
 // Shared with the engine: one implementation of the change pipeline.
 use stemma::local_change::{
-    CharFormatting, DiffHeuristics, build_full_replace, cleanup_inline_changes_with_config,
-    content_similarity, detect_formatting_change, extract_inline_text, formatting_for_token_range,
-    normalize_for_similarity, opaque_identity_hash, opaque_placeholder, parse_drawing_metadata,
-    should_bail_out_with_config, text_similarity,
+    CharFormatting, DiffHeuristics, RunFormatting, build_full_replace,
+    cleanup_inline_changes_with_config, content_similarity, detect_formatting_change,
+    extract_inline_text, formatting_for_token_range, normalize_for_similarity,
+    opaque_identity_hash, opaque_placeholder, parse_drawing_metadata, should_bail_out_with_config,
+    text_similarity,
 };
 pub(crate) use stemma::local_change::{
     diff_block_content_resolving_opaques, find_blip_rid, inlines_to_segments,
@@ -127,6 +128,7 @@ fn story_blocks_to_segments(blocks: &[TrackedBlock]) -> Vec<InlineChange> {
                         alt_text: None,
                         url: opaque_url(&opaque.kind),
                         content_hash: opaque.content_hash.clone(),
+                        object_runs: None,
                     });
                 }
                 _ => {}
@@ -785,19 +787,24 @@ fn detect_moves_in_changes(changes: &mut [DiffChange]) {
 
 /// Post-pass: detect paragraph splits in the DiffChange list.
 ///
-/// A paragraph split occurs when one base paragraph becomes two target paragraphs.
-/// The diff may align the base paragraph with either half of the split, producing
-/// two possible adjacency patterns:
+/// A paragraph split occurs when one base paragraph becomes two target
+/// paragraphs, and Word records it as one inserted paragraph mark: the mark
+/// that ends the first part. The diff may align the base paragraph with
+/// either half of the split:
 ///
-/// **Pattern A:** `(BlockModified, BlockInserted)` — diff matched the base to the first
-/// target paragraph. The inserted paragraph's text is a suffix of old_text.
+/// **Pattern A:** `(BlockModified, BlockInserted)`: the diff matched the base
+/// to the first target paragraph, and the inserted paragraph's text is a
+/// suffix of old_text. The modified paragraph's mark is the split's mark,
+/// and the inserted paragraph (the second part) carries the base
+/// paragraph's own mark. `para_split = true` on the BlockModified says so:
+/// materialization tracks the modified paragraph's mark as inserted and
+/// keeps the inserted paragraph's mark, its content alone tracked.
 ///
-/// **Pattern B:** `(BlockInserted, BlockModified)` — diff matched the base to the second
-/// target paragraph. The inserted paragraph's text is a prefix of old_text.
-///
-/// When detected, `para_split = true` is set on the BlockModified. This causes
-/// `apply_changes_to_blocks` to set `para_mark_status = Inserted` on the modified
-/// paragraph and guards the merge logic so reject doesn't create franken-paragraphs.
+/// **Pattern B:** `(BlockInserted, BlockModified)`: the diff matched the base
+/// to the second target paragraph. The inserted paragraph (the first part)
+/// is inserted whole, its mark included, which is the split's mark, and the
+/// modified paragraph keeps the base paragraph's mark. That is the ordinary
+/// reading of the pair, so it needs no flag.
 fn reconcile_paragraph_splits(changes: &mut [DiffChange]) {
     fn is_plausible_split_affix(removed_text: &str, inserted_text: &str) -> bool {
         let removed = normalize_for_similarity(removed_text);
@@ -846,45 +853,8 @@ fn reconcile_paragraph_splits(changes: &mut [DiffChange]) {
             _ => false,
         };
 
-        // Pattern B: (BlockInserted, BlockModified) — the modified paragraph's new_text
-        // is a proper suffix of its old_text. The "lost" prefix was split off and the
-        // inserted paragraph takes its place (possibly with new content).
-        let pattern_b = !pattern_a
-            && match (&changes[i], &changes[i + 1]) {
-                (
-                    DiffChange::BlockInserted {
-                        block: BlockNode::Paragraph(ins_para),
-                        move_id: None,
-                        ..
-                    },
-                    DiffChange::BlockModified {
-                        old_text, new_text, ..
-                    },
-                ) => {
-                    let old_norm = normalize_for_similarity(old_text);
-                    let new_norm = normalize_for_similarity(new_text);
-                    let ins_text = extract_inline_text(&ins_para.all_inlines_owned());
-
-                    // The modified paragraph kept its suffix (new is a suffix of old),
-                    // and something meaningful was removed from the front.
-                    new_norm.len() >= 10
-                        && old_norm.len() > new_norm.len() + 5
-                        && old_norm.ends_with(&new_norm)
-                        && is_plausible_split_affix(
-                            &old_norm[..old_norm.len() - new_norm.len()],
-                            &ins_text,
-                        )
-                }
-                _ => false,
-            };
-
         if pattern_a {
             if let DiffChange::BlockModified { para_split, .. } = &mut changes[i] {
-                *para_split = true;
-            }
-            i += 2;
-        } else if pattern_b {
-            if let DiffChange::BlockModified { para_split, .. } = &mut changes[i + 1] {
                 *para_split = true;
             }
             i += 2;
@@ -2460,13 +2430,16 @@ fn compute_changes(
                         let para_props_differ =
                             paragraph_properties_differ(&base_block.block, &target_block.block);
 
+                        // Equal text can still hold a changed object: a field
+                        // replaced whole reads as deleted and inserted.
                         let has_formatting_diff = inline_changes.iter().any(|c| {
                             matches!(
                                 c,
                                 InlineChange::Unchanged {
                                     formatting_change: Some(_),
                                     ..
-                                }
+                                } | InlineChange::Inserted { .. }
+                                    | InlineChange::Deleted { .. }
                             )
                         }) || para_props_differ;
 
@@ -3039,12 +3012,28 @@ fn diff_matched_tables(
                         let base_text = extract_inline_text(&base_inlines);
                         let target_text = extract_inline_text(&target_inlines);
 
-                        if base_text != target_text {
-                            let inline_changes = diff_block_content_resolving_opaques(
-                                &base_inlines,
-                                &target_inlines,
-                                &HashMap::new(),
-                            );
+                        // A field whose code alone changed reads as equal text
+                        // and is still a change: its plan replaces it.
+                        let has_field = crate::fields::has_complex_field_part(&base_inlines)
+                            || crate::fields::has_complex_field_part(&target_inlines);
+                        let inline_changes = (base_text != target_text || has_field)
+                            .then(|| cell_paragraph_changes(&base_inlines, &target_inlines))
+                            .filter(|plan| {
+                                base_text != target_text
+                                    || plan.iter().any(|change| {
+                                        matches!(
+                                            change,
+                                            InlineChange::Inserted { .. }
+                                                | InlineChange::Deleted { .. }
+                                                | InlineChange::Opaque {
+                                                    segment_type: InlineChangeSegmentType::Insert
+                                                        | InlineChangeSegmentType::Delete,
+                                                    ..
+                                                }
+                                        )
+                                    })
+                            });
+                        if let Some(inline_changes) = inline_changes {
                             paragraph_changes.push(CellParagraphChange {
                                 block_index: block_idx,
                                 inline_changes,
@@ -3202,34 +3191,124 @@ pub fn diff_nested_tables(
     }
 }
 
-/// Extract text from inlines along with a per-character formatting mapping.
-/// Returns (text, char_fmt) where char_fmt[i] contains the formatting for character i.
-fn extract_text_with_marks(inlines: &[InlineNode]) -> (String, Vec<CharFormatting>) {
+/// The plan of a table cell paragraph pair, compared with its objects
+/// resolved. A plan that keeps part of a complex field and changes the rest
+/// is replaced by the text comparison, which keeps or replaces every field
+/// whole (`crate::fields`).
+pub(crate) fn cell_paragraph_changes(
+    base_inlines: &[InlineNode],
+    target_inlines: &[InlineNode],
+) -> Vec<InlineChange> {
+    let plan = diff_block_content_resolving_opaques(base_inlines, target_inlines, &HashMap::new());
+    if crate::fields::plan_tears_a_field(&plan) {
+        diff_block_content_with_marks(base_inlines, target_inlines)
+    } else {
+        plan
+    }
+}
+
+/// The comparison text of an inline sequence, with what each of its
+/// characters is made of.
+///
+/// `text` is what the comparison matches on: a `w:caps` run contributes its
+/// rendered capitals, so "Definitions" under caps equals "DEFINITIONS" (caps-
+/// aware comparison, a deliberate contract). `char_fmt[i]` is the formatting
+/// of `text`'s character `i`, and `source[i]` the stored characters it came
+/// from, which the redline writes: rendering is not content. One stored
+/// character can render as several (`ß` as `SS`); its source rides on the
+/// first and the rest carry "".
+pub(crate) struct ComparisonText {
+    pub(crate) text: String,
+    pub(crate) char_fmt: Vec<CharFormatting>,
+    pub(crate) source: Vec<String>,
+}
+
+impl ComparisonText {
+    /// The stored characters behind comparison characters `offset..offset+len`.
+    pub(crate) fn source(&self, offset: usize, len: usize) -> String {
+        self.source[offset..offset + len].concat()
+    }
+
+    fn caps_at(&self, offset: usize) -> bool {
+        self.char_fmt[offset].style_props.caps == MarkValue::On
+    }
+}
+
+/// The stored characters the redline writes for `len` comparison characters
+/// both sides keep (at `old_at` in `old`, `new_at` in `new`): equal as
+/// rendered, so under caps the two sides may store different letters.
+///
+/// The kept span is one run carrying the target's formatting and, when that
+/// differs, the base's as a tracked formatting change, so Reject All draws
+/// these letters with the base's caps setting and Accept All with the
+/// target's. Caps draws any letters in capitals; no caps draws the stored
+/// letters as they are. So:
+/// - caps on the base only: the target's letters, the only ones that render
+///   right without caps once the change is accepted;
+/// - otherwise (caps on the target only, on both, on neither): the base's
+///   letters, so Reject All stores the base exactly and Accept All renders
+///   as the target.
+///
+/// Decided per stretch of one caps setting on each side.
+pub(crate) fn kept_spelling(
+    old: &ComparisonText,
+    old_at: usize,
+    new: &ComparisonText,
+    new_at: usize,
+    len: usize,
+) -> String {
+    let setting = |i: usize| (old.caps_at(old_at + i), new.caps_at(new_at + i));
+    let mut spelled = String::new();
+    let mut i = 0usize;
+    while i < len {
+        let here = setting(i);
+        let mut j = i + 1;
+        while j < len && setting(j) == here {
+            j += 1;
+        }
+        spelled.push_str(&match here {
+            (true, false) => new.source(new_at + i, j - i),
+            _ => old.source(old_at + i, j - i),
+        });
+        i = j;
+    }
+    spelled
+}
+
+fn extract_text_with_marks(inlines: &[InlineNode]) -> ComparisonText {
+    let mut source: Vec<String> = Vec::new();
     let mut text = String::new();
     let mut char_fmt: Vec<CharFormatting> = Vec::new();
 
     for inline in inlines {
         match inline {
             InlineNode::Text(t) => {
-                // Apply caps mark to normalize text for comparison
-                let node_text = if t.style_props.caps == MarkValue::On {
-                    t.text.to_uppercase()
-                } else {
-                    t.text.clone()
-                };
+                let caps = t.style_props.caps == MarkValue::On;
                 let fmt = CharFormatting {
                     marks: t.marks.clone(),
                     style_props: t.style_props.clone(),
                     rpr_authored: t.rpr_authored,
                 };
-                // Add formatting for each character in this text node
-                for _ in node_text.chars() {
-                    char_fmt.push(fmt.clone());
+                for stored in t.text.chars() {
+                    let rendered: String = if caps {
+                        stored.to_uppercase().collect()
+                    } else {
+                        stored.to_string()
+                    };
+                    for (index, compared) in rendered.chars().enumerate() {
+                        text.push(compared);
+                        char_fmt.push(fmt.clone());
+                        source.push(if index == 0 {
+                            stored.to_string()
+                        } else {
+                            String::new()
+                        });
+                    }
                 }
-                text.push_str(&node_text);
             }
             InlineNode::HardBreak(hard_break) => {
                 text.push('\n');
+                source.push("\n".to_string());
                 char_fmt.push(CharFormatting {
                     marks: hard_break.wrapper_marks.clone(),
                     style_props: hard_break.wrapper_style_props.clone(),
@@ -3238,8 +3317,9 @@ fn extract_text_with_marks(inlines: &[InlineNode]) -> (String, Vec<CharFormattin
             }
             InlineNode::OpaqueInline(o) => {
                 let placeholder = opaque_placeholder(o);
-                for _ in placeholder.chars() {
+                for character in placeholder.chars() {
                     char_fmt.push(CharFormatting::default());
+                    source.push(character.to_string());
                 }
                 text.push_str(&placeholder);
             }
@@ -3251,7 +3331,13 @@ fn extract_text_with_marks(inlines: &[InlineNode]) -> (String, Vec<CharFormattin
         }
     }
 
-    (text, char_fmt)
+    debug_assert_eq!(text.chars().count(), char_fmt.len());
+    debug_assert_eq!(char_fmt.len(), source.len());
+    ComparisonText {
+        text,
+        char_fmt,
+        source,
+    }
 }
 
 /// Diff inline content with marks preservation.
@@ -3270,17 +3356,19 @@ fn diff_block_content_with_marks_and_notes(
 ) -> Vec<InlineChange> {
     let heuristics = DiffHeuristics::from_env();
     // Extract text and build char->formatting mapping
-    let (old_text, old_char_fmt) = extract_text_with_marks(old_inlines);
-    let (new_text, new_char_fmt) = extract_text_with_marks(new_inlines);
+    let old = extract_text_with_marks(old_inlines);
+    let new = extract_text_with_marks(new_inlines);
+    let (old_text, old_char_fmt) = (&old.text, &old.char_fmt);
+    let (new_text, new_char_fmt) = (&new.text, &new.char_fmt);
 
     // Layer 3: Early bail-out for heavily rewritten text
-    if should_bail_out_with_config(&old_text, &new_text, &heuristics) {
+    if should_bail_out_with_config(old_text, new_text, &heuristics) {
         return build_full_replace(old_inlines, new_inlines, note_markers);
     }
 
     // Tokenize and diff
-    let old_tokens = tokenize(&old_text);
-    let new_tokens = tokenize(&new_text);
+    let old_tokens = tokenize(old_text);
+    let new_tokens = tokenize(new_text);
     let diff = TextDiff::configure()
         .algorithm(Algorithm::Patience)
         .diff_slices(&old_tokens, &new_tokens);
@@ -3294,12 +3382,17 @@ fn diff_block_content_with_marks_and_notes(
         let text = change.to_string_lossy().into_owned();
         let len = text.chars().count();
 
+        // The plan is built and cleaned up in comparison characters, the
+        // one text both sides share, and spelled from stored characters
+        // after the cleanup (`spell_plan`): the cleanup may merge kept text
+        // into a deletion and an insertion, and each must then be spelled
+        // as its own side wrote it.
         match change.tag() {
             ChangeTag::Equal => {
-                let old_fmt = formatting_for_token_range(&old_char_fmt, old_offset, len);
-                let new_fmt = formatting_for_token_range(&new_char_fmt, new_offset, len);
+                let old_fmt = formatting_for_token_range(old_char_fmt, old_offset, len);
+                let new_fmt = formatting_for_token_range(new_char_fmt, new_offset, len);
                 let (marks, style_props, rpr_authored, formatting_change) =
-                    detect_formatting_change(&old_fmt, &new_fmt);
+                    detect_formatting_change(&old_fmt, &new_fmt, RunFormatting::AsWritten, None);
                 result.push(InlineChange::Unchanged {
                     text,
                     marks,
@@ -3313,13 +3406,13 @@ fn diff_block_content_with_marks_and_notes(
             ChangeTag::Delete => {
                 result.extend(stemma::local_change::deleted_token_changes(
                     &text,
-                    &old_char_fmt,
+                    old_char_fmt,
                     old_offset,
                 ));
                 old_offset += len;
             }
             ChangeTag::Insert => {
-                let fmt = formatting_for_token_range(&new_char_fmt, new_offset, len);
+                let fmt = formatting_for_token_range(new_char_fmt, new_offset, len);
                 result.push(InlineChange::Inserted {
                     text,
                     marks: fmt.marks,
@@ -3334,7 +3427,94 @@ fn diff_block_content_with_marks_and_notes(
     }
 
     // Layer 2: Post-processing cleanup (zipper collapse)
-    cleanup_inline_changes_with_config(result, &heuristics)
+    let plan = spell_plan(
+        cleanup_inline_changes_with_config(result, &heuristics),
+        &old,
+        &new,
+    );
+    // A complex field is kept or replaced whole (see `crate::fields`).
+    crate::fields::keep_or_replace_fields_whole(
+        old_inlines,
+        new_inlines,
+        &old,
+        &new,
+        &|inline| {
+            extract_text_with_marks(std::slice::from_ref(inline))
+                .text
+                .chars()
+                .count()
+        },
+        plan,
+    )
+}
+
+/// Spells a token-diff plan written in comparison characters with the stored
+/// characters the redline writes: a deletion as the base wrote it, an
+/// insertion as the target did, kept text by `kept_spelling`. Kept text the
+/// cleanup merged into a deletion and an insertion is spelled on each arm by
+/// its own side, so Reject All stores the base's letters there and Accept
+/// All the target's.
+///
+/// # Panics
+///
+/// When the plan does not spell the comparison texts, in order, on each side
+/// (old: kept and deleted; new: kept and inserted), or a change starts inside
+/// a stored character that renders as several: a bug in the token diff or
+/// its cleanup.
+fn spell_plan(
+    plan: Vec<InlineChange>,
+    old: &ComparisonText,
+    new: &ComparisonText,
+) -> Vec<InlineChange> {
+    let old_chars: Vec<char> = old.text.chars().collect();
+    let new_chars: Vec<char> = new.text.chars().collect();
+    let take = |chars: &[char], source: &[String], at: usize, text: &str, side: &str| {
+        let len = text.chars().count();
+        assert!(
+            chars
+                .get(at..at + len)
+                .is_some_and(|span| span.iter().copied().eq(text.chars()))
+                && source.get(at).is_none_or(|s| !s.is_empty()),
+            "a token-diff plan change is not the {side} comparison text at {at}: {text:?}"
+        );
+        len
+    };
+    let (mut old_at, mut new_at) = (0usize, 0usize);
+    let spelled = plan
+        .into_iter()
+        .map(|mut change| {
+            match &mut change {
+                InlineChange::Unchanged { text, .. } => {
+                    let len = take(&old_chars, &old.source, old_at, text, "base");
+                    take(&new_chars, &new.source, new_at, text, "target");
+                    *text = kept_spelling(old, old_at, new, new_at, len);
+                    old_at += len;
+                    new_at += len;
+                }
+                InlineChange::Deleted { text, .. } => {
+                    let len = take(&old_chars, &old.source, old_at, text, "base");
+                    *text = old.source(old_at, len);
+                    old_at += len;
+                }
+                InlineChange::Inserted { text, .. } => {
+                    let len = take(&new_chars, &new.source, new_at, text, "target");
+                    *text = new.source(new_at, len);
+                    new_at += len;
+                }
+                InlineChange::Opaque { .. } => {
+                    unreachable!("a token-diff plan holds no opaque items")
+                }
+            }
+            change
+        })
+        .collect();
+    assert!(
+        old_at == old_chars.len() && new_at == new_chars.len(),
+        "a token-diff plan covers {old_at} of {} base and {new_at} of {} target comparison characters",
+        old_chars.len(),
+        new_chars.len()
+    );
+    spelled
 }
 
 // =============================================================================
@@ -4513,6 +4693,29 @@ pub fn project_tracked_document(
     blocks
 }
 
+/// The comment stories as the full view carries them (§17.13.4): body
+/// flattened to segments, the thread-derived resolved flag, and the thread
+/// links from the comments-extended part. The one projection both the full
+/// view and the comment read surfaces use.
+pub(crate) fn project_comments(doc: &CanonDoc) -> Vec<CommentPayload> {
+    doc.comments
+        .iter()
+        .map(|c| {
+            let (resolved, parent_para_id) =
+                crate::domain::comment_extended_state(c, &doc.comments_extended);
+            CommentPayload {
+                id: c.id.clone(),
+                author: c.author.clone(),
+                date: c.date.clone(),
+                segments: story_blocks_to_segments(&c.blocks),
+                resolved,
+                para_id: c.last_para_id().map(str::to_string),
+                parent_para_id,
+            }
+        })
+        .collect()
+}
+
 /// Build the comparison-aware tracked-document view, including bound stories.
 pub fn build_tracked_document_view(
     doc: &CanonDoc,
@@ -4540,22 +4743,7 @@ pub fn build_tracked_document_view(
         })
         .collect();
 
-    let comments: Vec<CommentPayload> = doc
-        .comments
-        .iter()
-        .map(|c| {
-            let (resolved, parent_para_id) =
-                crate::domain::comment_extended_state(c, &doc.comments_extended);
-            CommentPayload {
-                id: c.id.clone(),
-                author: c.author.clone(),
-                date: c.date.clone(),
-                segments: story_blocks_to_segments(&c.blocks),
-                resolved,
-                parent_para_id,
-            }
-        })
-        .collect();
+    let comments = project_comments(doc);
 
     FullDocViewResult {
         blocks,
@@ -4743,6 +4931,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -4785,6 +4974,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         })
     }
 
@@ -5047,6 +5237,7 @@ mod tests {
         CommentStory {
             id: id.to_string(),
             author: Some("Reviewer".to_string()),
+            initials: None,
             date: Some("2026-08-31T00:00:00Z".to_string()),
             blocks: blocks.into_iter().map(normal_tracked_block).collect(),
             content_hash: sha256_hex(text.as_bytes()),
@@ -5074,6 +5265,7 @@ mod tests {
 
     fn make_field_opaque(id: &str, kind: FieldKind) -> InlineNode {
         InlineNode::from(OpaqueInlineNode {
+formatting_change: None,
             id: NodeId::from(id.to_string()),
             kind: OpaqueKind::Field(FieldData {
                 field_kind: kind.clone(),
@@ -5131,6 +5323,7 @@ mod tests {
             joins_following_text_run: false,
             raw_xml: None,
             content_hash: content_hash.map(str::to_string),
+            formatting_change: None,
         })
     }
 
@@ -5140,6 +5333,7 @@ mod tests {
         raw_xml: impl Into<Vec<u8>>,
     ) -> InlineNode {
         InlineNode::Decoration(Box::new(DecorationNode {
+            formatting_change: None,
             source_run_attrs: Vec::new(),
             id: NodeId::from(id.to_string()),
             kind,
@@ -5228,6 +5422,7 @@ mod tests {
             make_test_opaque(
                 "base-link",
                 OpaqueKind::Hyperlink(HyperlinkData {
+                    flattened_wrappers: Vec::new(),
                     url: None,
                     anchor: Some("bookmark".to_string()),
                     text: "link".to_string(),
@@ -7669,6 +7864,7 @@ mod tests {
     fn test_opaque_placeholder_returns_barrier() {
         use crate::domain::{DocPart, ProofRef};
         let opaque = OpaqueInlineNode {
+formatting_change: None,
             id: NodeId::from("eq1"),
             kind: OpaqueKind::OmmlInline,
             opaque_ref: String::new(),
@@ -7823,6 +8019,7 @@ mod tests {
                 source_row_attrs: Vec::new(),
                 id: NodeId::from(format!("{id}_r0")),
                 cells: vec![TableCellNode {
+                    cell_merge: None,
                     id: NodeId::from(format!("{id}_r0_c0")),
                     blocks: vec![BlockNode::Paragraph(cell_para)],
                     grid_span: 1,
@@ -7981,8 +8178,10 @@ mod tests {
                     StyleProps::default(),
                 ),
                 InlineNode::from(OpaqueInlineNode {
+formatting_change: None,
                     id: NodeId::from("hyperlink"),
                     kind: OpaqueKind::Hyperlink(HyperlinkData {
+                        flattened_wrappers: Vec::new(),
                         url: Some("https://example.test/target".to_string()),
                         anchor: None,
                         text: "old".to_string(),
@@ -8099,6 +8298,7 @@ mod tests {
                 source_row_attrs: Vec::new(),
                 id: NodeId::from(format!("{id}_r0")),
                 cells: vec![TableCellNode {
+                    cell_merge: None,
                     id: NodeId::from(format!("{id}_r0_c0")),
                     blocks,
                     grid_span: 1,
@@ -8160,6 +8360,7 @@ mod tests {
                 source_row_attrs: Vec::new(),
                 id: NodeId::from(format!("{id}_r0")),
                 cells: vec![TableCellNode {
+                    cell_merge: None,
                     id: NodeId::from(format!("{id}_r0_c0")),
                     blocks: vec![opaque],
                     grid_span: 1,
@@ -8323,8 +8524,11 @@ mod tests {
         );
     }
 
+    /// A prefix split (pattern B) is the inserted first part, its mark the
+    /// split's, before the modified second part, which keeps its mark: the
+    /// ordinary reading of the pair, with no flag.
     #[test]
-    fn reconcile_paragraph_splits_marks_real_prefix_split_only() {
+    fn reconcile_paragraph_splits_leaves_a_prefix_split_unflagged() {
         let mut changes = vec![
             DiffChange::BlockInserted {
                 after_block_id: None,
@@ -8349,8 +8553,8 @@ mod tests {
 
         match &changes[1] {
             DiffChange::BlockModified { para_split, .. } => assert!(
-                *para_split,
-                "true paragraph split should preserve para_split=true"
+                !*para_split,
+                "the modified second part of a prefix split keeps its own mark"
             ),
             other => panic!("expected BlockModified, got {other:?}"),
         }
@@ -8605,8 +8809,10 @@ mod tests {
             unreachable!("make_paragraph must return a paragraph")
         };
         target_paragraph.segments = normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("target-link"),
             kind: OpaqueKind::Hyperlink(HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: None,
                 anchor: Some("bookmark".to_string()),
                 text: "link".to_string(),
@@ -8657,8 +8863,10 @@ mod tests {
             unreachable!("make_paragraph must return a paragraph")
         };
         target_paragraph.segments = normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("target-link"),
             kind: OpaqueKind::Hyperlink(HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: None,
                 anchor: Some("bookmark".to_string()),
                 text: "link".to_string(),
@@ -8969,6 +9177,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -9011,6 +9220,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         })
     }
 
@@ -9357,6 +9567,7 @@ mod tests {
         kind: OpaqueSegmentKind,
     ) -> InlineChange {
         InlineChange::Opaque {
+            object_runs: None,
             segment_type,
             kind,
             opaque_id: format!("op_{idx}"),

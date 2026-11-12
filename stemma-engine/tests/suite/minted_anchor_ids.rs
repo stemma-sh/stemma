@@ -337,3 +337,57 @@ fn paragraphs_inserted_with_links_give_each_link_its_own_id() {
     assert_eq!(ids.len(), 2, "{ids:?}");
     assert_unique(&ids);
 }
+
+/// Each table's id, in document order.
+fn table_ids(doc: &Document) -> Vec<String> {
+    doc.snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .filter_map(|tb| match &tb.block {
+            BlockNode::Table(t) => Some(t.id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn two_cell_table(first: &str, second: &str) -> serde_json::Value {
+    serde_json::json!({"type":"table","content":[{"content":[
+        {"content":[{"type":"paragraph","content":[{"type":"text","text":first}]}]},
+        {"content":[{"type":"paragraph","content":[{"type":"text","text":second}]}]}]}]})
+}
+
+#[test]
+fn the_cell_paragraphs_of_a_whole_table_replacement_get_their_own_ids() {
+    let doc = paragraphs(&["Alpha", "Beta"]);
+    let insert_after = |doc: &Document, anchor: &str, table: serde_json::Value| {
+        apply(
+            doc,
+            serde_json::json!({"op":"insert","target":{"anchor":anchor,"position":"after"},
+            "content":[table]}),
+        )
+    };
+    let doc = insert_after(&doc, "p_1", one_cell_table("A1"));
+    let doc = insert_after(&doc, "p_2", one_cell_table("B1"));
+    let second = table_ids(&doc)[1].clone();
+    let replaced = apply(
+        &doc,
+        serde_json::json!({"op":"replace","target":second,
+        "content":two_cell_table("C1","C2")}),
+    );
+    let cells = cell_paragraph_ids(&replaced);
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[1].len(), 2);
+    assert_unique(&cells.concat());
+
+    // Each id read in the replacement edits its own cell.
+    let edited = apply(
+        &replaced,
+        serde_json::json!({"op":"replace","target":cells[1][1],"expect":"C2",
+        "content":{"type":"paragraph","content":[{"type":"text","text":"C3"}]}}),
+    );
+    assert_eq!(
+        edited.read_accepted().unwrap().to_text(),
+        "Alpha\n\nA1\n\nBeta\n\nC1 C3"
+    );
+}

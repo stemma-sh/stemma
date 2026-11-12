@@ -136,6 +136,7 @@ fn fill_inline(
         reason: e.to_string(),
         step_index,
     })?;
+    super::content_controls::refuse_content_lock(&element, sdt_id, step_index)?;
     let value_rpr =
         leave_placeholder(&mut element).map_err(|reason| EditError::OpaqueTextRawXmlParse {
             opaque_id: sdt_id.clone(),
@@ -188,7 +189,9 @@ fn stage_block(
     step_index: usize,
 ) -> Result<(), EditError> {
     // A block control's bytes live in the serialize scaffold, unreachable from
-    // this pure core, and block discovery surfaces no hash — a supplied
+    // this pure core — so its `w:lock` is checked by the caller holding the
+    // scaffold (`EditSnapshot::apply`, `ContentControlLocked`) before this
+    // stages — and block discovery surfaces no hash — a supplied
     // `semantic_hash` precondition CANNOT be honored here. Refuse rather than
     // silently ignore a stale-edit guard the caller is counting on.
     if semantic_hash.is_some() {
@@ -355,6 +358,17 @@ pub(crate) fn lower_open_block_fill(
             .iter()
             .position(|other| block_id_of(&other.block) == &paragraph.id)
             .expect("the value paragraph is in the control");
+    // The control, or a control inside it holding the value, may lock it.
+    if let Some((_, control, lock)) = super::content_controls::content_locked_block_controls(doc)
+        .into_iter()
+        .find(|(range, _, _)| range.contains(&value_index))
+    {
+        return Err(EditError::ContentControlLocked {
+            sdt_id: control,
+            lock,
+            step_index,
+        });
+    }
     let more_content = doc.blocks[value_index + 1..start + wrap.span]
         .iter()
         .any(|other| match &other.block {

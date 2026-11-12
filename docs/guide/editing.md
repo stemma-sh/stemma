@@ -29,7 +29,8 @@ for them:
 - `set_block_form_text` and `set_textbox_text`, which update the field result
   or the textbox's paragraphs in place;
 - `merge_cells`, which is applied untracked even inside a tracked
-  transaction, as Word's Merge Cells is with Track Changes on.
+  transaction, as Word's Merge Cells is with Track Changes on: neither the
+  merge nor the text it moves into the top-left cell is a revision.
 
 Accepting or rejecting revisions does not undo these changes. The audit
 reports them as direct changes.
@@ -43,6 +44,12 @@ formatting for `before`, or the following paragraph's formatting for `after`
 (the anchor's when there is no following paragraph in the same container).
 An explicit role selects its vocabulary exemplar, which need not have the
 same formatting as the nearest paragraph.
+
+A paragraph inserted after the last paragraph a bookmark or a permission
+range covers, or before the first, joins that range, in the body and in table
+cells, as it does in Word when you press Enter at either edge of the covered
+paragraph. A comment range does not grow, also as in Word: the new paragraph
+lands outside it and the comment keeps covering the text it covered.
 
 Cell insertion currently accepts paragraph blocks only. It refuses pending
 tracked table/row/cell ancestors, cell content-control ranges, and literal

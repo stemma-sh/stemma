@@ -238,6 +238,7 @@ fn xml_escape_attr(s: &str) -> String {
 fn make_bookmark_decoration(para_id: &NodeId, suffix: &str, raw_xml: Vec<u8>) -> InlineNode {
     let id = NodeId::from(format!("{}_{suffix}", para_id.0));
     InlineNode::from(DecorationNode {
+        formatting_change: None,
         source_run_attrs: Vec::new(),
         id: id.clone(),
         kind: DecorationType::Bookmark,
@@ -702,6 +703,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -744,6 +746,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 

@@ -48,7 +48,7 @@ pub(crate) struct ComparisonPlanResolver;
 
 impl ChangePlanResolver for ComparisonPlanResolver {
     fn paragraph_changes(&self, before: &[InlineNode], after: &[InlineNode]) -> Vec<InlineChange> {
-        crate::compiler::diff_block_content_resolving_opaques(before, after, &HashMap::new())
+        crate::compiler::cell_paragraph_changes(before, after)
     }
 
     fn nested_table_change(
@@ -59,6 +59,63 @@ impl ChangePlanResolver for ComparisonPlanResolver {
     ) -> Result<Option<crate::domain::NestedTableDiff>, String> {
         crate::compiler::diff_nested_tables(before, after, block_index)
     }
+}
+
+/// Make the inserted paragraph `merged_id`, the second part of a paragraph
+/// split, keep its mark: the base paragraph's mark, which the split leaves
+/// in place. Its content stays inserted, under the revision it was inserted
+/// with.
+fn keep_split_second_part_mark(
+    blocks: &mut [TrackedBlock],
+    merged_id: &NodeId,
+    context: &str,
+) -> Result<(), MergeError> {
+    let invalid = |message: String| MergeError {
+        kind: MergeErrorKind::InvalidPlan,
+        message,
+        context: context.to_string(),
+    };
+    let tracked = blocks
+        .iter_mut()
+        .find(|tb| block_id(&tb.block) == merged_id)
+        .ok_or_else(|| {
+            invalid(format!(
+                "the second part of a paragraph split, {}, is not in the merge",
+                merged_id.0
+            ))
+        })?;
+    let TrackingStatus::Inserted(inserted) = tracked.status.clone() else {
+        return Err(invalid(format!(
+            "the second part of a paragraph split, {}, is not an inserted block",
+            merged_id.0
+        )));
+    };
+    if !matches!(tracked.block, BlockNode::Paragraph(_)) {
+        return Err(invalid(format!(
+            "the second part of a paragraph split, {}, is not a paragraph",
+            merged_id.0
+        )));
+    }
+    // A typed label is a view over untracked text: it becomes part of the
+    // inserted content, as on a block-tracked paragraph.
+    if matches!(&tracked.block, BlockNode::Paragraph(p) if p.literal_prefix.is_some()) {
+        stemma::tracked_model::materialize_numbering_prefix_in_place(&mut tracked.block);
+    }
+    let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+        unreachable!("checked above: the second part is a paragraph");
+    };
+    for segment in &mut paragraph.segments {
+        if segment.status != TrackingStatus::Normal {
+            return Err(invalid(format!(
+                "the second part of a paragraph split, {}, holds a {:?} segment",
+                merged_id.0, segment.status
+            )));
+        }
+        segment.status = TrackingStatus::Inserted(inserted.clone());
+    }
+    paragraph.para_mark_status = None;
+    tracked.status = TrackingStatus::Normal;
+    Ok(())
 }
 
 /// Result of compiling a comparison into tracked engine state.
@@ -369,6 +426,7 @@ fn apply_block_modified(
                 paragraph.numbering = None;
                 paragraph.has_direct_numbering = new_para.has_direct_numbering;
                 paragraph.numbering_suppressed = new_para.numbering_suppressed;
+                paragraph.direct_numbering_omits_ilvl = false;
                 prefix_was_materialized = true;
             }
         }
@@ -408,6 +466,7 @@ fn apply_block_modified(
             // numPr emits one; inherited numbering does not).
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
+            paragraph.direct_numbering_omits_ilvl = new_para.direct_numbering_omits_ilvl;
             // Clear literal_prefix when gaining structural numbering to
             // prevent the serializer from writing both a text run for the
             // literal prefix AND a numPr in pPr.
@@ -804,7 +863,28 @@ fn apply_changes_to_blocks(
 
     let mut insert_order = InsertOrderState::default();
     let mut target_tables_by_id = target_tables_by_id;
+    // The first part of a paragraph split (`para_split`) was just applied:
+    // the next change is its second part, which keeps the paragraph's mark.
+    let mut split_second_part_pending = false;
     for change in changes {
+        if split_second_part_pending
+            && !matches!(
+                change,
+                DiffChange::BlockInserted {
+                    block: BlockNode::Paragraph(_),
+                    move_id: None,
+                    ..
+                }
+            )
+        {
+            return Err(MergeError {
+                kind: MergeErrorKind::InvalidPlan,
+                message:
+                    "a paragraph split's first part is not followed by its inserted second part"
+                        .to_string(),
+                context: context.to_string(),
+            });
+        }
         match change {
             DiffChange::BlockDeleted {
                 block_id, move_id, ..
@@ -843,6 +923,10 @@ fn apply_changes_to_blocks(
                     })
                     .map(|tb| block_id(&tb.block).clone())
                     .unwrap_or_else(|| original_target_id.clone());
+                if split_second_part_pending {
+                    split_second_part_pending = false;
+                    keep_split_second_part_mark(blocks, &merged_id, context)?;
+                }
                 provenance.insert_inserted(merged_id, original_target_id);
                 if let Some(mid) = move_id {
                     for tb in blocks.iter_mut().rev() {
@@ -878,15 +962,36 @@ fn apply_changes_to_blocks(
                     context,
                 )?;
                 provenance.insert_modified(block_id.clone(), block_id.clone(), target_id);
-                if *para_split
-                    && let Some(idx) = find_block_index(blocks, block_id)
-                    && let BlockNode::Paragraph(p) = &mut blocks[idx].block
-                {
-                    p.para_split = true;
+                // The first part of a split: its mark is the inserted one.
+                // Rejecting it joins the paragraph to its second part, whose
+                // content is rejected while its mark (the base paragraph's)
+                // stays, so the paragraph reads whole again.
+                if *para_split {
+                    let Some(idx) = find_block_index(blocks, block_id) else {
+                        return Err(MergeError {
+                            kind: MergeErrorKind::InvalidPlan,
+                            message: format!(
+                                "the first part of a paragraph split, {}, is not in the merge",
+                                block_id.0
+                            ),
+                            context: context.to_string(),
+                        });
+                    };
+                    let BlockNode::Paragraph(p) = &mut blocks[idx].block else {
+                        return Err(MergeError {
+                            kind: MergeErrorKind::InvalidPlan,
+                            message: format!(
+                                "the first part of a paragraph split, {}, is not a paragraph",
+                                block_id.0
+                            ),
+                            context: context.to_string(),
+                        });
+                    };
                     p.para_mark_status = Some(TrackingStatus::Inserted(next_revision(
                         revision,
                         rev_counter,
                     )));
+                    split_second_part_pending = true;
                 }
             }
             DiffChange::TableStructureChanged {
@@ -2022,6 +2127,24 @@ pub fn materialize_change_plan(
         }
     }
 
+    // A reference copied into deleted and inserted content names one note
+    // twice: each inserted copy gets a note of its own (`noterefs`).
+    crate::noterefs::split_shared_note_references(
+        &mut merged,
+        base,
+        target,
+        revision,
+        &mut rev_counter,
+    )?;
+    // A comment added on kept text is an annotation, carried untracked
+    // (`comments`).
+    crate::comments::carry_added_comments_on_kept_text(&mut merged, target, &diff.changes)
+        .map_err(|message| MergeError {
+            kind: MergeErrorKind::InvalidPlan,
+            message,
+            context: "comments".to_string(),
+        })?;
+
     // Post-processing: fix numbering drift for Normal paragraphs whose auto-
     // numbering prefix shifted due to insertions/deletions between base and
     // target. Uses the diff changes to find each merged block's target
@@ -2037,6 +2160,16 @@ pub fn materialize_change_plan(
     // endnotes) so w:numPr never survives into serialized redline XML.
     materialize_numbering_in_story_blocks(&mut merged);
 
+    // A cell paragraph this merge made a whole insertion or deletion (its
+    // mark and all its text tracked; a cell paragraph has no block status)
+    // carries its typed label inside that proposal, like a block-tracked
+    // paragraph below. It is not a retained label beside a tracked body, so
+    // the split-boundary rule that follows must not keep its label normal.
+    let produced_cell_proposals =
+        stemma::tracked_model::materialize_produced_cell_proposal_prefixes(
+            &mut merged,
+            &stemma::tracked_model::hoisted_label_cell_proposal_ids(base),
+        );
     // A merge can combine a retained manual label with a deletion whose first
     // source run begins at the label/body separator. `literal_prefix` cannot
     // represent that mixed tracking boundary by itself: serialization rejoins
@@ -2055,6 +2188,7 @@ pub fn materialize_change_plan(
     collect_split_tracking_boundary_prefix_ids(&merged.blocks, &mut merged_split_ids);
     let produced_split_ids: HashSet<NodeId> = merged_split_ids
         .difference(&base_split_ids)
+        .filter(|id| !produced_cell_proposals.contains(*id))
         .cloned()
         .collect();
     materialize_split_tracking_boundary_prefixes(&mut merged.blocks, &produced_split_ids);
@@ -2943,6 +3077,7 @@ mod table_structure_carrier_tests {
 
     fn cell(id: &str) -> TableCellNode {
         TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id.to_string()),
             blocks: Vec::new(),
             grid_span: 1,
@@ -2999,6 +3134,7 @@ mod table_structure_carrier_tests {
         paragraph.segments = vec![TrackedSegment {
             status: TrackingStatus::Normal,
             inlines: vec![InlineNode::from(crate::domain::OpaqueInlineNode {
+formatting_change: None,
                 id: NodeId::from(format!("{id}-math")),
                 kind: OpaqueKind::OmmlBlock,
                 opaque_ref: format!("{id}-math-ref"),
@@ -3027,6 +3163,7 @@ mod table_structure_carrier_tests {
         paragraph.segments = vec![TrackedSegment {
             status: TrackingStatus::Normal,
             inlines: vec![InlineNode::from(crate::domain::OpaqueInlineNode {
+formatting_change: None,
                 id: NodeId::from(format!("{id}-sdt")),
                 kind: OpaqueKind::Sdt,
                 opaque_ref: format!("{id}-sdt-ref"),

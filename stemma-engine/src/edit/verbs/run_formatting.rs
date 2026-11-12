@@ -108,7 +108,7 @@ pub(crate) fn apply(
     };
     if !own_insertion {
         if path.is_top_level() {
-            validate_top_level_block_status(&doc.blocks[path.top_block], step_index)?;
+            validate_top_level_block_status(&doc.blocks[path.top_block], mode, step_index)?;
         } else {
             check_ancestor_table_tracking(doc, &path, block_id, step_index)?;
         }
@@ -164,10 +164,20 @@ pub(crate) fn apply(
 
 fn validate_top_level_block_status(
     block: &crate::domain::TrackedBlock,
+    mode: MaterializationMode,
     step_index: usize,
 ) -> Result<(), EditError> {
     let (status, block_id) = match &block.status {
         TrackingStatus::Normal => return Ok(()),
+        // Another author's inserted paragraph (not a move destination): a
+        // tracked format records a formatting revision on its text, which
+        // Word keeps as an independently attributed proposal inside the
+        // insertion, as it does in an inserted run.
+        TrackingStatus::Inserted(_)
+            if mode == MaterializationMode::TrackedChange && block.move_id.is_none() =>
+        {
+            return Ok(());
+        }
         TrackingStatus::Inserted(_) => ("inserted", block_id_of(&block.block).clone()),
         TrackingStatus::Deleted(_) => ("deleted", block_id_of(&block.block).clone()),
         TrackingStatus::InsertedThenDeleted(_) => {

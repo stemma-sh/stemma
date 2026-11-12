@@ -9,6 +9,17 @@
 # build-npm-packages.sh. Every local package and every remote version is
 # reconciled before the first publish. Only a structured registry E404 means
 # that a version is missing; every other command or JSON failure stops the run.
+#
+# Publication runs in two phases with one registry-visibility wait each:
+#   1. every missing platform package is published back to back, then the run
+#      waits until all of them are visible with their exact local integrity;
+#   2. the @stemma-sh/mcp wrapper is published, then the run waits for it.
+# npm can take several minutes to serve a new version, so the default window
+# is 60 attempts x 15 s (~15 minutes) per wait. Both settings are environment
+# variables; release.yml sets them explicitly so the window is visible there.
+# A wait that runs out fails loudly and names the versions still invisible.
+# Rerunning the script resumes: the preflight skips every version whose remote
+# integrity exactly matches the local tarball and refuses any that differ.
 set -euo pipefail
 
 die() {
@@ -21,8 +32,8 @@ assembled_root="$1"
 [[ -d "$assembled_root" ]] || die "assembled package directory does not exist: $assembled_root"
 assembled_root="$(cd "$assembled_root" && pwd)"
 
-poll_attempts="${STEMMA_NPM_PUBLISH_POLL_ATTEMPTS:-30}"
-poll_interval="${STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS:-2}"
+poll_attempts="${STEMMA_NPM_PUBLISH_POLL_ATTEMPTS:-60}"
+poll_interval="${STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS:-15}"
 [[ "$poll_attempts" =~ ^[1-9][0-9]*$ ]] || die "STEMMA_NPM_PUBLISH_POLL_ATTEMPTS must be a positive integer"
 [[ "$poll_interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS must be a non-negative number"
 
@@ -356,44 +367,84 @@ for index in "${!package_dirs[@]}"; do
   esac
 done
 
-for index in "${!package_dirs[@]}"; do
-  spec="${package_names[$index]}@${versions[$index]}"
-  if [[ "${remote_states[$index]}" == "identical" ]]; then
-    echo "skip: $spec already published with identical integrity"
-    continue
-  fi
-
-  echo "publish: $spec"
-  if ! npm publish "${tarballs[$index]}" --access public --provenance --ignore-scripts; then
-    die "npm publish failed for $spec"
-  fi
-
-  verified=0
-  for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
-    if ! remote="$(query_remote "$spec")"; then
-      die "registry verification failed for newly published $spec"
+# Publish the given package indices back to back, skipping versions the
+# preflight found already published with identical integrity. The indices
+# actually published are recorded in `published_indices`.
+publish_indices() {
+  local index spec
+  published_indices=()
+  for index in "$@"; do
+    spec="${package_names[$index]}@${versions[$index]}"
+    if [[ "${remote_states[$index]}" == "identical" ]]; then
+      echo "skip: $spec already published with identical integrity"
+      continue
     fi
-    case "$remote" in
-      missing)
-        if (( attempt < poll_attempts )); then
-          sleep "$poll_interval"
-        fi
-        ;;
-      present$'\t'*)
-        remote_integrity="${remote#*$'\t'}"
-        if [[ "$remote_integrity" != "${local_integrities[$index]}" ]]; then
-          die "published $spec has remote integrity $remote_integrity; expected ${local_integrities[$index]}"
-        fi
-        verified=1
-        echo "verified: $spec integrity ${local_integrities[$index]}"
-        break
-        ;;
-      *)
-        die "unexpected registry classification while verifying $spec"
-        ;;
-    esac
+    echo "publish: $spec"
+    if ! npm publish "${tarballs[$index]}" --access public --provenance --ignore-scripts; then
+      die "npm publish failed for $spec"
+    fi
+    published_indices+=("$index")
   done
-  [[ "$verified" -eq 1 ]] || die "published $spec did not become visible with the expected integrity after $poll_attempts attempts"
-done
+}
+
+# Wait until every given package index is visible on the registry with its
+# exact local integrity. Each attempt queries every still-invisible version;
+# a visible version with any other integrity stops the run immediately.
+wait_until_visible() {
+  local label="$1"
+  shift
+  local pending=("$@")
+  local still_pending index spec remote remote_integrity attempt
+  if [[ "${#pending[@]}" -eq 0 ]]; then
+    echo "wait ($label): nothing newly published"
+    return 0
+  fi
+  echo "wait ($label): up to $poll_attempts attempts x ${poll_interval}s for ${#pending[@]} package(s)"
+  for ((attempt = 1; attempt <= poll_attempts; attempt++)); do
+    still_pending=()
+    for index in "${pending[@]}"; do
+      spec="${package_names[$index]}@${versions[$index]}"
+      if ! remote="$(query_remote "$spec")"; then
+        die "registry verification failed for newly published $spec"
+      fi
+      case "$remote" in
+        missing)
+          still_pending+=("$index")
+          ;;
+        present$'\t'*)
+          remote_integrity="${remote#*$'\t'}"
+          if [[ "$remote_integrity" != "${local_integrities[$index]}" ]]; then
+            die "published $spec has remote integrity $remote_integrity; expected ${local_integrities[$index]}"
+          fi
+          echo "verified: $spec integrity ${local_integrities[$index]}"
+          ;;
+        *)
+          die "unexpected registry classification while verifying $spec"
+          ;;
+      esac
+    done
+    if [[ "${#still_pending[@]}" -eq 0 ]]; then
+      return 0
+    fi
+    pending=("${still_pending[@]}")
+    if (( attempt < poll_attempts )); then
+      echo "waiting ($label): ${#pending[@]} package(s) not yet visible (attempt $attempt/$poll_attempts)"
+      sleep "$poll_interval"
+    fi
+  done
+  local invisible=()
+  for index in "${pending[@]}"; do
+    invisible+=("${package_names[$index]}@${versions[$index]}")
+  done
+  die "published but not visible with the expected integrity after $poll_attempts attempts x ${poll_interval}s ($label): ${invisible[*]}. Nothing later was published. Rerun this script once npm serves them: the preflight verifies their integrity and resumes."
+}
+
+# Phase 1: all five platform packages back to back, then one wait for all.
+publish_indices 0 1 2 3 4
+wait_until_visible "platform packages" ${published_indices[@]+"${published_indices[@]}"}
+
+# Phase 2: the wrapper last, so every binary it pins already resolves.
+publish_indices 5
+wait_until_visible "wrapper" ${published_indices[@]+"${published_indices[@]}"}
 
 echo "npm package publication complete: $common_version"

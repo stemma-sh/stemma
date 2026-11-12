@@ -86,6 +86,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -128,11 +129,13 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
 fn make_cell(id: &str, text: &str) -> TableCellNode {
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks: vec![BlockNode::from(make_para(&format!("{id}_p"), text))],
         grid_span: 1,
@@ -876,6 +879,74 @@ fn merge_horizontal_accept_sets_gridspan() {
     assert_eq!(live_cells[0].grid_span, 2, "merged cell spans 2 columns");
 }
 
+/// OOXML can carry a tracked merge only as `w:cellMerge`, which Word does not
+/// write for Merge Cells with Track Changes on: Word merges the cells and moves
+/// the text untracked. A merge inside a tracked transaction is therefore one
+/// direct change, text relocation included. It records no revision, and
+/// neither Accept All nor Reject All undoes any part of it, so no text is ever
+/// left in a continuation cell Word does not display.
+#[test]
+fn tracked_vertical_merge_is_direct_and_reject_all_keeps_the_text_visible() {
+    let doc = grid_2x2();
+    let txn = translate(&table_op_json(
+        "t1",
+        r#"{ "kind": "merge_cells", "start_row": 0, "start_col": 0, "end_row": 1, "end_col": 0 }"#,
+    ));
+    let edited = apply_transaction(&doc, &txn).expect("apply").0;
+    assert!(
+        stemma::enumerate_revisions(&edited).is_empty(),
+        "an untracked merge records no revision"
+    );
+    let mut accepted = edited.clone();
+    accept_all(&mut accepted);
+    let mut rejected = edited.clone();
+    reject_all_with_styles(&mut rejected, None);
+    for (label, resolved) in [("accept", &accepted), ("reject", &rejected)] {
+        let t = find_table(resolved, "t1");
+        assert_eq!(
+            t.rows[0].cells[0].v_merge,
+            VerticalMerge::Restart,
+            "{label}"
+        );
+        assert_eq!(
+            t.rows[1].cells[0].v_merge,
+            VerticalMerge::Continue,
+            "{label}"
+        );
+        assert_eq!(
+            cell_texts(resolved, "t1"),
+            vec![vec!["r0c0r1c0", "r0c1"], vec!["", "r1c1"]],
+            "{label}: the lower text sits in the displayed top cell"
+        );
+    }
+}
+
+/// The horizontal case: after Reject All the merged row still has one cell
+/// spanning both grid columns, so every row covers the same grid.
+#[test]
+fn tracked_horizontal_merge_is_direct_and_reject_all_keeps_the_grid() {
+    let doc = grid_2x2();
+    let txn = translate(&table_op_json(
+        "t1",
+        r#"{ "kind": "merge_cells", "start_row": 0, "start_col": 0, "end_row": 0, "end_col": 1 }"#,
+    ));
+    let edited = apply_transaction(&doc, &txn).expect("apply").0;
+    assert!(stemma::enumerate_revisions(&edited).is_empty());
+    let mut rejected = edited.clone();
+    reject_all_with_styles(&mut rejected, None);
+    let t = find_table(&rejected, "t1");
+    let spans: Vec<Vec<u32>> = t
+        .rows
+        .iter()
+        .map(|row| row.cells.iter().map(|cell| cell.grid_span.max(1)).collect())
+        .collect();
+    assert_eq!(spans, vec![vec![2], vec![1, 1]]);
+    assert_eq!(
+        cell_texts(&rejected, "t1"),
+        vec![vec!["r0c0r0c1"], vec!["r1c0", "r1c1"]]
+    );
+}
+
 #[test]
 fn merge_single_cell_refused() {
     let doc = grid_2x2();
@@ -1241,6 +1312,49 @@ fn a_move_that_separates_a_merge_group_is_refused() {
             matches!(
                 apply_transaction(&doc, &translate(&table_op_json("m", op))),
                 Err(stemma::edit::EditError::UnsupportedTableRowMove { .. })
+            ),
+            "{op}"
+        );
+    }
+}
+
+/// A pending tracked cell merge (`w:cellMerge`, §17.13.5.3) sets the merge
+/// geometry only when it is accepted or rejected, so a structural table edit
+/// waits for it, as for any other pending table-structure change.
+#[test]
+fn a_pending_cell_merge_refuses_structural_table_edits() {
+    let mut doc = grid_2x2();
+    let table = doc
+        .blocks
+        .iter_mut()
+        .find_map(|tracked| match &mut tracked.block {
+            BlockNode::Table(table) => Some(table),
+            _ => None,
+        })
+        .expect("the fixture holds a table");
+    table.rows[0].cells[0].v_merge = VerticalMerge::Restart;
+    table.rows[1].cells[0].v_merge = VerticalMerge::Continue;
+    table.rows[1].cells[0].cell_merge = Some(CellMergeChange {
+        revision: RevisionInfo {
+            revision_id: 7,
+            identity: 7,
+            author: Some("Reviewer".to_string()),
+            date: None,
+            apply_op_id: None,
+        },
+        after: VerticalMerge::Continue,
+        before: VerticalMerge::None,
+    });
+    for op in [
+        r#"{ "kind": "merge_cells", "start_row": 0, "start_col": 1, "end_row": 1, "end_col": 1 }"#,
+        r#"{ "kind": "insert_row", "ref_row": 0, "position": "after" }"#,
+    ] {
+        let txn = translate(&table_op_json("t1", op));
+        assert!(
+            matches!(
+                apply_transaction(&doc, &txn),
+                Err(stemma::edit::EditError::TableMidRedline { ref location, .. })
+                    if location.contains("cellMerge")
             ),
             "{op}"
         );

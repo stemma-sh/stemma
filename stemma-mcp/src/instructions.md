@@ -54,10 +54,13 @@ hatches over the same kernels.
    occurrence. `match_mode` is exactly `exact` or
    `normalize_ws`. Omitted scope includes top-level and table-cell paragraphs;
    pass a matching cell paragraph `block_id` as `scope:{block_id}` only when
-   disambiguation is needed. Do not flatten the cell. An item whose `old` also
-   stands in a hyperlink's display text or a content control's value refuses
-   (`ReplaceTextInsideInlineObjects`), its `unreached_matches` naming each
-   object and the op that edits it; edit those first, then re-run the item.
+   disambiguation is needed. Do not flatten the cell. An occurrence inside a
+   hyperlink's display text or a content control's value is replaced inside
+   that object. An item whose `old` stands in a link or control that cannot be
+   edited (a content-locked control, a drop-down or date, one showing its
+   placeholder) refuses (`ReplaceTextInsideInlineObjects`), its
+   `unreached_matches` naming each object and why. A match running across a
+   link's or control's edge is a wall, like an inline object.
 
 When replacing a paragraph that contains an opaque span, preserve that anchor
 inside `content.content` as
@@ -308,7 +311,7 @@ Batch these style edits into ONE `apply_edit` transaction — each `apply_edit` 
 Three ops, all via `apply_edit`, all default to tracked (`w:ins`/`w:del`):
 
 - **`insert_note`** — splice a reference run after `expect` in `target`, plus a new story: `{"op":"insert_note","target":"<block_id>","expect":"<substring in the block>","note_kind":"footnote","body":"<note text>"}`. Tracked: BOTH the reference run and the whole story body show as inserted; reject-all removes the note entirely, accept-all keeps it.
-- **`edit_note`** — replace an existing note's body by its `note_id` (from `read_index`'s `notes` or from `list_revisions`): `{"op":"edit_note","note_id":"<note_id>","note_kind":"footnote","body":"<new body text>"}`. Tracked mode is a SURGICAL word-diff (like a whole-paragraph `replace`) — only the changed words become `w:ins`/`w:del`, not the whole body. For a note of several paragraphs, give one line per paragraph, separated by `\n`, in order (repeat a line unchanged to keep it): each paragraph is edited in place and keeps its formatting and list numbering. A line count other than the note's paragraph count is refused (`NoteBodyLineCountMismatch`).
+- **`edit_note`** — replace an existing note's body by its `note_id` (from `read_index`'s `notes` or from `list_revisions`): `{"op":"edit_note","note_id":"<note_id>","note_kind":"footnote","body":"<new body text>"}`. Tracked mode is a SURGICAL word-diff (like a whole-paragraph `replace`) — only the changed words become `w:ins`/`w:del`, not the whole body. For a note of several paragraphs, give one line per paragraph, separated by `\n`, in order (repeat a line unchanged to keep it): each paragraph is edited in place and keeps its formatting and list numbering. A line count other than the note's paragraph count is refused (`NoteBodyLineCountMismatch`). A link, field or other inline object (or a line break) in a note paragraph reads as one U+FFFC in the `notes` text: keep each U+FFFC in place in your line and the object is carried untouched (`NoteBodyObjectCountMismatch` when a line has a different count). A note with pending tracked changes reads as its accepted text: a tracked `edit_note` on it is refused (`ParagraphContainsTrackedSegments`); a direct one accepts those changes and applies your edit.
 - **`delete_note`** — remove a note and its reference run by `note_id`: `{"op":"delete_note","note_id":"<note_id>","note_kind":"footnote"}`. Tracked mode marks both the reference and the story `Deleted` (not physically removed) — accept-all removes the note, reject-all restores it fully.
 
 **No stacking.** `edit_note`/`delete_note` in tracked mode refuse (`BlockHasTrackedStatus`) if the target note's story already carries a pending tracked change (e.g. you just `insert_note`d it and haven't accepted/rejected yet, or a prior `delete_note` on it is still pending) — resolve the existing change first, same rule as editing an already-tracked body paragraph. This is why a note you just inserted in the SAME session can't be `edit_note`d again until it's committed (`accept_changes`/`reject_changes`) or the document is reopened with it already resolved.

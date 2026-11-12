@@ -159,10 +159,12 @@ pub enum WordIrError {
         attribute: &'static str,
         value: String,
     },
-    /// `w:numPr` is schema-valid with either coordinate omitted, but the
-    /// standard does not define an effective numbering pair for that partial
-    /// direct state. Preserve/refuse it at this parse boundary rather than
-    /// inventing a coordinate from style state or a positional default.
+    /// `w:numPr` is schema-valid with either coordinate omitted. A list
+    /// without a level is modeled (`DirectNumPr::ListWithoutLevel`); this
+    /// refusal covers a level without a list (or an empty container), and a
+    /// list without a level in a second sibling `w:pPr` that would have to
+    /// merge with an earlier pair. No Word evidence fixes those yet, so refuse
+    /// rather than invent the missing coordinate.
     IncompleteDirectNumbering {
         num_id: Option<u32>,
         ilvl: Option<u32>,
@@ -294,9 +296,9 @@ impl fmt::Display for WordIrError {
             WordIrError::IncompleteDirectNumbering { num_id, ilvl } => write!(
                 f,
                 "w:numPr has an incomplete direct numbering pair (numId={num_id:?}, \
-                 ilvl={ilvl:?}); this shape is schema-valid, but no frozen rule proves an \
-                 effective pair, so refusing rather than inheriting a missing coordinate \
-                 or defaulting ilvl to zero"
+                 ilvl={ilvl:?}); this shape is schema-valid, but no Word evidence fixes \
+                 its effective pair here, so refusing rather than inventing the missing \
+                 coordinate"
             ),
             WordIrError::DuplicateParagraphPropertyElement {
                 parent,
@@ -869,6 +871,10 @@ pub enum DirectNumPr {
     Suppressed,
     /// Active numbering: numId > 0 with an ilvl.
     Active(NumProps),
+    /// A list (numId > 0) with no `w:ilvl`. CT_NumPr makes both children
+    /// optional; the level Word applies is resolved, not read
+    /// (`StyleDefinitions::resolve_effective_num_props`).
+    ListWithoutLevel { num_id: u32 },
 }
 
 /// Raw required `w:val` payload retained at the package edge so a present but
@@ -1200,6 +1206,16 @@ impl ParagraphView {
                 // to match that load behavior instead of replacing the entire
                 // accumulated set on every pPr.
                 let direct_numbering = extract_num_props(element)?;
+                if let DirectNumPr::ListWithoutLevel { num_id } = direct_numbering
+                    && num_props != DirectNumPr::Absent
+                {
+                    // Whether Word merges this list into an earlier pPr's
+                    // level is unobserved; refuse rather than pick one.
+                    return Err(WordIrError::IncompleteDirectNumbering {
+                        num_id: Some(num_id),
+                        ilvl: None,
+                    });
+                }
                 if direct_numbering != DirectNumPr::Absent {
                     num_props = direct_numbering;
                 }
@@ -1244,7 +1260,7 @@ impl ParagraphView {
                 adjust_right_ind =
                     extract_optional_bool(element, "adjustRightInd").or(adjust_right_ind);
                 word_wrap = extract_optional_bool(element, "wordWrap").or(word_wrap);
-                frame_pr = extract_frame_pr(element).or(frame_pr);
+                frame_pr = extract_frame_pr(element)?.or(frame_pr);
                 cnf_style = extract_cnf_style(element)?.or(cnf_style);
 
                 // --- Preserved remainder: unmodeled pPr child ---
@@ -2606,6 +2622,7 @@ fn lowered_tracked_hyperlink_atom(
         .collect();
     let display_runs = extract_runs_from_hyperlink(&display);
     let data = HyperlinkData {
+        flattened_wrappers: Vec::new(),
         url,
         anchor,
         text: display_runs.iter().map(|run| run.text.as_str()).collect(),
@@ -3431,11 +3448,10 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
             // --- Font sizes ---
             "sz" => {
                 // w:sz w:val="24" — half-points (24 = 12pt)
-                marks.font_size = rpr_unsigned(el, "sz", "val", rpr_half_points(el, "sz", false)?)?;
+                marks.font_size = font_size_half_points(el, "sz")?;
             }
             "szCs" => {
-                marks.font_size_cs =
-                    rpr_unsigned(el, "szCs", "val", rpr_half_points(el, "szCs", false)?)?;
+                marks.font_size_cs = font_size_half_points(el, "szCs")?;
             }
 
             // --- Color & highlight ---
@@ -3467,13 +3483,7 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
 
             // --- Spacing / positioning / scaling ---
             "spacing" => {
-                // ST_SignedTwipsMeasure (§17.3.2.35).
-                marks.char_spacing = rpr_twips(el, "spacing", "val", true)?
-                    .map(|twips| {
-                        i32::try_from(twips)
-                            .map_err(|_| invalid_rpr_attribute(el, "spacing", "val"))
-                    })
-                    .transpose()?;
+                marks.char_spacing = char_spacing_twips(el)?;
             }
             "position" => {
                 // w:position w:val="6" — vertical displacement in half-points (ISO 29500-1 §17.3.2.19)
@@ -4232,11 +4242,13 @@ fn attr_value<'a>(element: &'a Element, local: &str) -> Option<&'a String> {
 ///
 /// Returns `DirectNumPr::Absent` when no w:numPr is present,
 /// `DirectNumPr::Suppressed` when numId=0 (§17.9.18: remove inherited numbering),
-/// or `DirectNumPr::Active(NumProps)` for a complete active numbering reference.
+/// `DirectNumPr::Active(NumProps)` for a complete active numbering reference,
+/// or `DirectNumPr::ListWithoutLevel` for a list reference that writes no level.
 ///
-/// Both children are schema-optional. A partial direct pair therefore is not
-/// malformed OOXML, but its effective meaning is not defined by our frozen
-/// model. It is a typed refusal rather than a guessed style merge or `ilvl=0`.
+/// Both children are schema-optional. A list without a level is carried as
+/// written; its effective level is resolved later, with the style in hand. A
+/// level without a list (or an empty container) is still a typed refusal: no
+/// Word evidence fixes its meaning yet.
 fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
     let num_prs = w_children_named(p_pr, "numPr");
     let Some(num_pr) = num_prs.first().copied() else {
@@ -4289,6 +4301,7 @@ fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
 
     match (num_id, ilvl) {
         (Some(num_id), Some(ilvl)) => Ok(DirectNumPr::Active(NumProps { num_id, ilvl })),
+        (Some(num_id), None) => Ok(DirectNumPr::ListWithoutLevel { num_id }),
         (num_id, ilvl) => Err(WordIrError::IncompleteDirectNumbering { num_id, ilvl }),
     }
 }
@@ -4422,9 +4435,9 @@ fn extract_indentation(p_pr: &Element) -> Result<Option<IndentProps>, WordIrErro
     // §17.3.1.12: "The firstLine and hanging attributes are mutually
     // exclusive, if both are specified, then the firstLine value is ignored."
     // hanging wins when both are present.
-    let first_line = if attr_value(ind, "hanging").is_some() {
-        let hanging = parse_paragraph_twip_measure(ind, "ind", "hanging", false)?
-            .expect("the authored hanging attribute was already observed");
+    let first_line = if let Some(hanging) =
+        parse_paragraph_twip_measure(ind, "ind", "hanging", false)?
+    {
         Some(
             i32::try_from(hanging.checked_neg().ok_or_else(|| {
                 WordIrError::ParagraphPropertyAttributeOutOfRange {
@@ -4516,12 +4529,41 @@ fn extract_optional_bool(p_pr: &Element, tag: &str) -> Option<bool> {
     }
 }
 
+/// A tab stop position (`w:tab/@w:pos`, ST_SignedTwipsMeasure §17.3.1.37)
+/// in twips, the one reading shared by paragraphs, styles and numbering:
+/// [`crate::import::read_twips`]. `None` when the value has no position in
+/// the i32 model: empty, not a number (Word refuses to open such a file) or
+/// out of range. Callers refuse it.
+pub(crate) fn tab_position_twips(value: &str) -> Option<i32> {
+    crate::import::read_twips(value)
+        .ok()
+        .flatten()
+        .and_then(|twips| i32::try_from(twips).ok())
+}
+
+/// A twips attribute of `w:framePr` (§17.3.1.11), read by
+/// [`crate::import::read_twips`]. Word refuses to open a frame measure that
+/// is not a number, so it is refused here too: the frame is rebuilt from the
+/// model on save, and a dropped value would silently move or resize it.
+fn frame_twips(element: &Element, attribute: &'static str) -> Result<Option<i64>, WordIrError> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Ok(None);
+    };
+    crate::import::read_twips(value).map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
+        element: "framePr",
+        attribute,
+        value: value.clone(),
+    })
+}
+
 /// Extract w:framePr from w:pPr (§17.3.1.11).
-fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
-    let el = find_w_child(p_pr, "framePr")?;
-    Some(FrameProperties {
-        width: attr_value(el, "w").and_then(|v| v.parse().ok()),
-        height: attr_value(el, "h").and_then(|v| v.parse().ok()),
+fn extract_frame_pr(p_pr: &Element) -> Result<Option<FrameProperties>, WordIrError> {
+    let Some(el) = find_w_child(p_pr, "framePr") else {
+        return Ok(None);
+    };
+    Ok(Some(FrameProperties {
+        width: frame_twips(el, "w")?,
+        height: frame_twips(el, "h")?,
         h_rule: attr_value(el, "hRule").and_then(|v| match HeightRule::from_xml_str(v) {
             Ok(hr) => Some(hr),
             Err(e) => {
@@ -4529,7 +4571,7 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
                 None
             }
         }),
-        h_space: attr_value(el, "hSpace").and_then(|v| v.parse().ok()),
+        h_space: frame_twips(el, "hSpace")?,
         wrap: attr_value(el, "wrap").and_then(|v| match FrameWrap::from_xml_str(v) {
             Ok(fw) => Some(fw),
             Err(e) => {
@@ -4551,7 +4593,7 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
                 None
             }
         }),
-        x: attr_value(el, "x").and_then(|v| v.parse().ok()),
+        x: frame_twips(el, "x")?,
         x_align: attr_value(el, "xAlign").and_then(|v| match XAlign::from_xml_str(v) {
             Ok(xa) => Some(xa),
             Err(e) => {
@@ -4559,7 +4601,7 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
                 None
             }
         }),
-        y: attr_value(el, "y").and_then(|v| v.parse().ok()),
+        y: frame_twips(el, "y")?,
         y_align: attr_value(el, "yAlign").and_then(|v| match YAlign::from_xml_str(v) {
             Ok(ya) => Some(ya),
             Err(e) => {
@@ -4567,7 +4609,7 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
                 None
             }
         }),
-        v_space: attr_value(el, "vSpace").and_then(|v| v.parse().ok()),
+        v_space: frame_twips(el, "vSpace")?,
         // Everything not modeled above (dropCap, lines, anchorLock, unknowns)
         // is preserved verbatim (§17.3.1.11 CT_FramePr remainder).
         extra_attrs: capture_extra_attrs(
@@ -4577,7 +4619,7 @@ fn extract_frame_pr(p_pr: &Element) -> Option<FrameProperties> {
                 "y", "yAlign",
             ],
         ),
-    })
+    }))
 }
 
 /// Parse one exact `w:cnfStyle` attribute set (§17.3.1.8 / §17.4.7 / §17.4.8).
@@ -4791,9 +4833,12 @@ fn extract_spacing(p_pr: &Element) -> Result<Option<SpacingProps>, WordIrError> 
 /// Parse a paragraph-property twip-measure union into normalized twips.
 ///
 /// Both paragraph spacing and indentation use `ST_TwipsMeasure` or
-/// `ST_SignedTwipsMeasure`. Each admits universal measures such as `12pt` in
-/// addition to decimal twips; percentages are not members of either union.
-fn parse_paragraph_twip_measure(
+/// `ST_SignedTwipsMeasure`, read by [`crate::import::read_twips`] (a decimal
+/// truncates toward zero, a universal measure converts, an empty value is
+/// none). The one reading of a paragraph measure wherever it is written: a
+/// paragraph, a style or a numbering level. A value that is not a number is
+/// refused, as Word refuses to open it.
+pub(crate) fn parse_paragraph_twip_measure(
     element: &Element,
     element_name: &'static str,
     attribute: &'static str,
@@ -4802,25 +4847,17 @@ fn parse_paragraph_twip_measure(
     let Some(value) = attr_value(element, attribute) else {
         return Ok(None);
     };
-    let parsed = crate::import::parse_measurement_or_percent(
-        value,
-        &format!("w:{element_name}/@w:{attribute}"),
-    )
-    .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
-        element: element_name,
-        attribute,
-        value: value.clone(),
-    })?;
-    let twips = match parsed {
-        crate::import::MeasurementOrPercent::Number(twips)
-        | crate::import::MeasurementOrPercent::UniversalTwips(twips) => twips,
-        crate::import::MeasurementOrPercent::Percent { .. } => {
-            return Err(WordIrError::InvalidParagraphPropertyAttribute {
-                element: element_name,
-                attribute,
-                value: value.clone(),
-            });
+    // Word refuses to open a paragraph measure that is not a number, so the
+    // import refuses it too; an empty value is no value (`read_twips`).
+    let Some(twips) = crate::import::read_twips(value).map_err(|_| {
+        WordIrError::InvalidParagraphPropertyAttribute {
+            element: element_name,
+            attribute,
+            value: value.clone(),
         }
+    })?
+    else {
+        return Ok(None);
     };
     if twips < 0 && !schema_allows_negative {
         return Err(WordIrError::InvalidParagraphPropertyAttribute {
@@ -5181,7 +5218,7 @@ fn extract_ppr_change(p_pr: &Element) -> Result<Option<PprChange>, WordIrError> 
         previous_overflow_punct: extract_optional_bool(inner_ppr, "overflowPunct"),
         previous_adjust_right_ind: extract_optional_bool(inner_ppr, "adjustRightInd"),
         previous_word_wrap: extract_optional_bool(inner_ppr, "wordWrap"),
-        previous_frame_pr: extract_frame_pr(inner_ppr),
+        previous_frame_pr: extract_frame_pr(inner_ppr)?,
         previous_outline_lvl: find_w_child(inner_ppr, "outlineLvl").map(|element| {
             RawRequiredValue {
                 value: attr_value(element, "val").cloned(),
@@ -5276,8 +5313,45 @@ fn rpr_half_points(
     Ok(Some(half_points))
 }
 
+/// A font size (`w:sz` / `w:szCs`, ST_HpsMeasure §17.3.2.38) in half-points,
+/// the one reading shared by runs and styles. A decimal truncates toward zero
+/// and a universal measure converts ([`rpr_half_points`]).
+///
+/// CONTRACT DEFAULT (Word 16, verified): a value that is neither a number
+/// nor a universal measure ("abc") reads as 0 half-points. Word opens such a
+/// document without repair, renders its minimum size and saves `0`; it does
+/// not treat the size as absent, so neither do we. A negative number is not
+/// covered by that ruling and stays refused.
+pub(crate) fn font_size_half_points(
+    element: &Element,
+    element_name: &'static str,
+) -> Result<Option<u32>, WordIrError> {
+    let Some(value) = attr_value(element, "val") else {
+        return Ok(None);
+    };
+    let numeric = crate::import::is_schema_decimal(value)
+        || (value.len() > 2
+            && value.is_char_boundary(value.len() - 2)
+            && crate::import::is_schema_decimal(&value[..value.len() - 2])
+            && crate::import::universal_measure_unit_to_twips(&value[value.len() - 2..]).is_some());
+    if !numeric {
+        return Ok(Some(WORD_NON_NUMERIC_FONT_SIZE));
+    }
+    rpr_unsigned(
+        element,
+        element_name,
+        "val",
+        rpr_half_points(element, element_name, false)?,
+    )
+}
+
+/// What Word reads a non-numeric `w:sz` / `w:szCs` as (see
+/// [`font_size_half_points`]).
+pub(crate) const WORD_NON_NUMERIC_FONT_SIZE: u32 = 0;
+
 /// A twips run property attribute: ST_TwipsMeasure or, when `signed`,
-/// ST_SignedTwipsMeasure, read as import reads every twips measure.
+/// ST_SignedTwipsMeasure, read by [`crate::import::read_twips`]; a value that
+/// is not a number is refused.
 fn rpr_twips(
     element: &Element,
     element_name: &'static str,
@@ -5287,15 +5361,33 @@ fn rpr_twips(
     let Some(value) = attr_value(element, attribute) else {
         return Ok(None);
     };
-    match crate::import::parse_measurement_or_percent(
-        value,
-        &format!("w:{element_name}/@w:{attribute}"),
-    ) {
-        Ok(
-            crate::import::MeasurementOrPercent::Number(twips)
-            | crate::import::MeasurementOrPercent::UniversalTwips(twips),
-        ) if signed || twips >= 0 => Ok(Some(twips)),
+    match crate::import::read_twips(value) {
+        Ok(twips) if signed || twips.is_none_or(|twips| twips >= 0) => Ok(twips),
         _ => Err(invalid_rpr_attribute(element, element_name, attribute)),
+    }
+}
+
+/// A run's character spacing (`w:spacing/@w:val`, ST_SignedTwipsMeasure
+/// §17.3.2.35) in twips, the one reading shared by runs and styles. A
+/// decimal truncates toward zero ([`crate::import::read_twips`]).
+///
+/// CONTRACT DEFAULT (Word 16, verified): a value that is not a number
+/// ("abc") is no spacing. Word opens such a document and saves the run
+/// without `w:spacing`; an untouched run keeps the bytes the document wrote.
+pub(crate) fn char_spacing_twips(element: &Element) -> Result<Option<i32>, WordIrError> {
+    let Some(value) = attr_value(element, "val") else {
+        return Ok(None);
+    };
+    match crate::import::read_twips(value) {
+        Ok(twips) => twips
+            .map(|twips| {
+                i32::try_from(twips).map_err(|_| invalid_rpr_attribute(element, "spacing", "val"))
+            })
+            .transpose(),
+        Err(crate::import::TwipsError::NotANumber) => Ok(None),
+        Err(crate::import::TwipsError::OutOfRange) => {
+            Err(invalid_rpr_attribute(element, "spacing", "val"))
+        }
     }
 }
 
@@ -5424,12 +5516,12 @@ pub(crate) fn parse_header_footer_kind(type_attr: Option<&str>) -> crate::domain
 }
 
 /// A twips attribute of a section property (`w:pgSz`, `w:pgMar`, `w:cols`,
-/// `w:col`, `w:lnNumType`): ST_TwipsMeasure or ST_SignedTwipsMeasure, decimal
-/// twips or a universal measure. Read as import reads every twips measure: a
-/// decimal truncates, as Word reads it (`w:header="566.93"` saves as 566), and
-/// a universal measure rounds. A value neither form admits is refused, not
-/// dropped: the section is rebuilt from the model on save, so a dropped value
-/// would silently become Word's default.
+/// `w:col`, `w:lnNumType`): ST_TwipsMeasure or ST_SignedTwipsMeasure, read
+/// by [`crate::import::read_twips`]: a decimal truncates toward zero, as Word
+/// reads it (`w:header="566.93"` saves as 566). A value that is not a number
+/// is refused, as Word refuses it, not dropped: the section is rebuilt from
+/// the model on save, so a dropped value would silently become Word's
+/// default.
 fn section_twips(
     element: &Element,
     element_name: &'static str,
@@ -5438,16 +5530,9 @@ fn section_twips(
     let Some(value) = attr_value(element, attribute) else {
         return Ok(None);
     };
-    match crate::import::parse_measurement_or_percent(
-        value,
-        &format!("w:{element_name}/@w:{attribute}"),
-    ) {
-        Ok(
-            crate::import::MeasurementOrPercent::Number(twips)
-            | crate::import::MeasurementOrPercent::UniversalTwips(twips),
-        ) => Ok(Some(twips)),
-        _ => Err(invalid_section_attribute(element, element_name, attribute)),
-    }
+    // Word refuses to open a section measure that is not a number.
+    crate::import::read_twips(value)
+        .map_err(|_| invalid_section_attribute(element, element_name, attribute))
 }
 
 /// [`section_twips`] for an ST_TwipsMeasure (unsigned) attribute.
@@ -5891,7 +5976,7 @@ fn extract_tab_stops(p_pr: &Element) -> Result<Option<Vec<TabStopDef>>, WordIrEr
         // MS-OI29500 2.1.95 §17.3.1.37 describes Word's LOAD-time clamp to
         // ±31680 — a consumption rule, NOT a save rewrite. Keep the authored
         // value; a consumer that needs Word's effective behavior clamps at read.
-        let position = raw_position.parse::<i32>().map_err(|_| {
+        let position = tab_position_twips(raw_position).ok_or_else(|| {
             WordIrError::InvalidParagraphPropertyAttribute {
                 element: "tab",
                 attribute: "pos",
@@ -6040,7 +6125,32 @@ fn extract_hyperlink_data(element: &Element) -> HyperlinkData {
         r_id,
         runs,
         extra_attrs,
+        flattened_wrappers: flattened_hyperlink_wrappers(element),
     }
+}
+
+/// The run-wrapping elements inside a `w:hyperlink` that the run collector
+/// (`collect_hyperlink_runs_with_status`) descends into and flattens, by
+/// local name in document order. The tracked-change envelopes it also
+/// descends into are not wrappers: their status rides on each run.
+fn flattened_hyperlink_wrappers(element: &Element) -> Vec<String> {
+    fn walk(el: &Element, out: &mut Vec<String>) {
+        for child in &el.children {
+            let XMLNode::Element(c) = child else { continue };
+            let local = local_element_name(c);
+            match local.as_str() {
+                "smartTag" | "sdt" | "customXml" | "dir" | "bdo" | "fldSimple" | "hyperlink" => {
+                    out.push(local.to_string());
+                    walk(c, out);
+                }
+                "ins" | "del" | "moveFrom" | "moveTo" => walk(c, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(element, &mut out);
+    out
 }
 
 /// A hoisted range marker: (element name, raw bytes).
@@ -7233,10 +7343,9 @@ mod tests {
     }
 
     #[test]
-    fn partial_direct_numbering_is_a_typed_refusal() {
+    fn a_level_without_a_list_is_a_typed_refusal() {
         let witnesses = [
             ("<w:numPr/>", None, None),
-            ("<w:numPr><w:numId w:val=\"7\"/></w:numPr>", Some(7), None),
             ("<w:numPr><w:ilvl w:val=\"2\"/></w:numPr>", None, Some(2)),
         ];
 
@@ -7249,7 +7358,7 @@ mod tests {
             );
             let element = parse_with_whitespace(&xml);
             let error = ParagraphView::from_paragraph(&element, &Default::default())
-                .expect_err("a partial direct numbering pair has no frozen effective rule");
+                .expect_err("a level without a list has no frozen effective rule");
             assert!(matches!(
                 error,
                 WordIrError::IncompleteDirectNumbering { num_id, ilvl }
@@ -7276,6 +7385,17 @@ mod tests {
             ParagraphView::from_paragraph(&element, &Default::default())
                 .expect_err("malformed direct numbering must fail at the package edge");
         }
+    }
+
+    #[test]
+    fn a_list_without_a_level_is_carried_without_inventing_one() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&element, &Default::default()).unwrap();
+        assert_eq!(view.num_props, DirectNumPr::ListWithoutLevel { num_id: 7 });
     }
 
     #[test]

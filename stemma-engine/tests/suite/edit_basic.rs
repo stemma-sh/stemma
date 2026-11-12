@@ -43,6 +43,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: false,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -85,6 +86,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -119,6 +121,7 @@ fn make_text_with_marks(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
 /// Create an opaque inline node.
 fn make_opaque(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Drawing,
         opaque_ref: format!("opaque_{id}"),
@@ -156,8 +159,10 @@ fn make_hard_break(id: &str) -> InlineNode {
 /// Create a hyperlink opaque inline node.
 fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Hyperlink(HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some(url.to_string()),
             anchor: None,
             text: text.to_string(),
@@ -193,6 +198,7 @@ fn make_hyperlink(id: &str, url: &str, text: &str) -> InlineNode {
 /// Create a field opaque inline node.
 fn make_field(id: &str, kind: FieldKind) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Field(FieldData {
             field_kind: kind,
@@ -219,6 +225,7 @@ fn make_field(id: &str, kind: FieldKind) -> InlineNode {
 /// Create an SDT opaque inline node.
 fn make_sdt(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Sdt,
         opaque_ref: format!("sdt_{id}"),
@@ -243,6 +250,7 @@ fn make_sdt(id: &str) -> InlineNode {
 #[allow(dead_code)]
 fn make_decoration(id: &str) -> InlineNode {
     InlineNode::from(DecorationNode {
+        formatting_change: None,
         source_run_attrs: Vec::new(),
         id: NodeId::from(id),
         kind: DecorationType::Bookmark,
@@ -829,8 +837,15 @@ fn replace_inserted_block_keeps_it_pending_in_tracked_mode() {
     }]);
     let tx = replace_transaction("p1", "hello", text_content("new"));
     let result = apply_transaction(&doc, &tx).unwrap().0;
+    // The paragraph is still a pending insertion: the block, or (spelled by
+    // its parts, as the save reopens once the edit's own insertion sits
+    // inside it) the paragraph mark.
+    let BlockNode::Paragraph(edited) = &result.blocks[0].block else {
+        panic!("a paragraph");
+    };
     assert!(
-        matches!(result.blocks[0].status, TrackingStatus::Inserted(_)),
+        matches!(result.blocks[0].status, TrackingStatus::Inserted(_))
+            || matches!(edited.para_mark_status, Some(TrackingStatus::Inserted(_))),
         "the pending block insertion is preserved, not auto-accepted"
     );
     assert_eq!(
@@ -4010,6 +4025,7 @@ fn replace_expect_mismatch_still_fires_on_genuinely_different_text() {
 
 fn make_table_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks,
         grid_span: 1,
@@ -4379,23 +4395,25 @@ fn resolve_selected_revisions_accepts_hyperlink_edit_by_id() {
         .expect("hyperlink edit applies")
         .0;
     // H7: the resolver addresses revisions by their minted identity, not the
-    // wire revision_id.
-    let revision_id = get_hyperlink(&result, "h1")
+    // wire revision_id. The edit is a deletion and an insertion, two
+    // revisions (each with its own id, §17.13.1): select both.
+    let revision_ids: std::collections::HashSet<u32> = get_hyperlink(&result, "h1")
         .runs
         .iter()
-        .find_map(|r| match &r.status {
-            TrackingStatus::Inserted(rev) => Some(rev.identity),
+        .filter_map(|r| match &r.status {
+            TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => Some(rev.identity),
             _ => None,
         })
-        .expect("edit records an Inserted run");
+        .collect();
+    assert_eq!(revision_ids.len(), 2, "a deletion and an insertion");
 
     stemma::resolve_selected_revisions_with_styles(
         &mut result,
-        &std::collections::HashSet::from([revision_id]),
+        &revision_ids,
         stemma::ResolveSelectionAction::Accept,
         None,
     )
-    .expect("the edit's own revision id must resolve");
+    .expect("the edit's own revision ids must resolve");
 
     let data = get_hyperlink(&result, "h1");
     assert_eq!(data.text, "new link");
@@ -4418,23 +4436,25 @@ fn resolve_selected_revisions_rejects_hyperlink_edit_by_id() {
         .expect("hyperlink edit applies")
         .0;
     // H7: the resolver addresses revisions by their minted identity, not the
-    // wire revision_id.
-    let revision_id = get_hyperlink(&result, "h1")
+    // wire revision_id. The edit is a deletion and an insertion, two
+    // revisions (each with its own id, §17.13.1): select both.
+    let revision_ids: std::collections::HashSet<u32> = get_hyperlink(&result, "h1")
         .runs
         .iter()
-        .find_map(|r| match &r.status {
-            TrackingStatus::Deleted(rev) => Some(rev.identity),
+        .filter_map(|r| match &r.status {
+            TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => Some(rev.identity),
             _ => None,
         })
-        .expect("edit records a Deleted run");
+        .collect();
+    assert_eq!(revision_ids.len(), 2, "a deletion and an insertion");
 
     stemma::resolve_selected_revisions_with_styles(
         &mut result,
-        &std::collections::HashSet::from([revision_id]),
+        &revision_ids,
         stemma::ResolveSelectionAction::Reject,
         None,
     )
-    .expect("the edit's own revision id must resolve");
+    .expect("the edit's own revision ids must resolve");
 
     let data = get_hyperlink(&result, "h1");
     assert_eq!(data.text, "old link");
@@ -4482,8 +4502,10 @@ fn replace_hyperlink_text_preserves_url_and_anchor() {
     let para = make_para(
         "p1",
         normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("h1"),
             kind: OpaqueKind::Hyperlink(HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: None,
                 anchor: Some("Section_5".to_string()),
                 text: "See Section 5".to_string(),
@@ -4621,6 +4643,7 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
     // A hyperlink that already has tracked changes in its runs is off-
     // limits for the MVP. The caller must accept/reject first.
     let mut existing = HyperlinkData {
+        flattened_wrappers: Vec::new(),
         url: Some("https://example.com".to_string()),
         anchor: None,
         text: "click here".to_string(),
@@ -4651,6 +4674,7 @@ fn replace_hyperlink_with_existing_tracked_change_is_rejected() {
     let para = make_para(
         "p1",
         normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("h1"),
             kind: OpaqueKind::Hyperlink(existing),
             opaque_ref: "hyperlink_h1".to_string(),
@@ -4736,6 +4760,7 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
     // formatting from the nearest kept/deleted neighbor.
     let bold_rpr = b"<w:rPr><w:b/></w:rPr>".to_vec();
     let mut data = HyperlinkData {
+        flattened_wrappers: Vec::new(),
         url: Some("https://example.com".to_string()),
         anchor: None,
         text: String::new(),
@@ -4765,6 +4790,7 @@ fn replace_hyperlink_preserves_run_formatting_on_kept_text() {
     let para = make_para(
         "p1",
         normal_segment(vec![InlineNode::from(OpaqueInlineNode {
+            formatting_change: None,
             id: NodeId::from("h1"),
             kind: OpaqueKind::Hyperlink(data),
             opaque_ref: "hyperlink_h1".to_string(),

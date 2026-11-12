@@ -63,6 +63,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -105,6 +106,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -123,6 +125,7 @@ fn make_text(id: &str, text: &str) -> InlineNode {
 
 fn make_opaque(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Drawing,
         opaque_ref: format!("opaque_{id}"),
@@ -408,6 +411,7 @@ fn make_simple_table(id: &str, cell_text: &str) -> BlockNode {
             source_row_attrs: Vec::new(),
             id: NodeId::from(format!("{id}_r0")),
             cells: vec![TableCellNode {
+                cell_merge: None,
                 id: NodeId::from(format!("{id}_c0")),
                 blocks: vec![BlockNode::from(make_para(
                     &format!("{id}_c0_p"),
@@ -642,8 +646,10 @@ fn invariant_6_move_range_rejects_destination_inside_source() {
 
 fn doc_with_hyperlink(para_id: &str, hyperlink_id: &str, url: &str, text: &str) -> CanonDoc {
     let hyp = InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(hyperlink_id),
         kind: OpaqueKind::Hyperlink(HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some(url.to_string()),
             anchor: None,
             text: text.to_string(),
@@ -927,8 +933,10 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
     // earlier in the same review). Editing its hyperlink is refused, just
     // like editing its text would be.
     let hyp = InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from("h1"),
         kind: OpaqueKind::Hyperlink(HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some("https://example.com".to_string()),
             anchor: None,
             text: "click".to_string(),
@@ -995,6 +1003,7 @@ fn set_attr_hyperlink_target_not_a_hyperlink() {
     // ref). The engine reports NotAHyperlink with the actual kind so the
     // caller can route correctly.
     let footnote_ref = InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from("fn_3"),
         kind: OpaqueKind::FootnoteReference(NoteReferenceData {
             reference_id: "7".to_string(),

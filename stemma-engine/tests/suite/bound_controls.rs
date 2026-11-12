@@ -162,3 +162,26 @@ fn an_edit_elsewhere_leaves_the_store_untouched() {
     let accepted = edited.project(Resolution::AcceptAll).expect("accept");
     assert_eq!(part(&accepted, "docProps/core.xml"), CORE);
 }
+
+/// Word refills a bound control from its store on open, so a resolved
+/// document reads as resolved in Word only when its store holds what the
+/// control now shows: the rejected edit's old text, the accepted edit's new
+/// text.
+#[test]
+fn resolving_a_tracked_edit_of_a_bound_control_carries_the_store() {
+    let doc = Document::parse(&docx()).expect("parse");
+    let edited = apply(
+        &doc,
+        serde_json::json!({"op":"edit_header","header_part":"header1.xml",
+            "target":header_title_paragraph(&doc),"expect":"Civil Appeal No. 82/12",
+            "content":[{"type":"text","text":"Criminal Appeal No. 82/12"}]}),
+    )
+    .expect("the header edit applies");
+    let rejected = edited.project(Resolution::RejectAll).expect("reject");
+    assert_eq!(part(&rejected, "docProps/core.xml"), CORE);
+    let accepted = edited.project(Resolution::AcceptAll).expect("accept");
+    assert_eq!(
+        part(&accepted, "docProps/core.xml"),
+        CORE.replace("Civil Appeal No. 82/12", "Criminal Appeal No. 82/12")
+    );
+}
