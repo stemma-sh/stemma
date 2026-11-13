@@ -223,20 +223,28 @@ struct SummaryReceipt {
 
 #[derive(Serialize)]
 struct CoverageReceipt {
-    supported: [&'static str; 2],
+    /// Where an item's text is searched and replaced.
+    supported: [&'static str; 4],
     default_scope: &'static str,
     /// Text in covered paragraphs that is matched but not edited: an
-    /// occurrence there refuses its item.
-    searched_not_edited: [&'static str; 2],
+    /// occurrence there refuses its item. Nothing is, since link text and
+    /// content control values became editable; the field stays so a
+    /// consumer reading it finds the answer.
+    searched_not_edited: [&'static str; 0],
     unsearched: [&'static str; 6],
 }
 
 impl Default for CoverageReceipt {
     fn default() -> Self {
         Self {
-            supported: ["body_paragraphs", "table_cell_paragraphs"],
+            supported: [
+                "body_paragraphs",
+                "table_cell_paragraphs",
+                "hyperlink_text",
+                "content_control_values",
+            ],
             default_scope: "all_body_and_table_paragraphs",
-            searched_not_edited: ["hyperlink_text", "content_control_values"],
+            searched_not_edited: [],
             unsearched: [
                 "headers",
                 "footers",

@@ -50,7 +50,9 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
   replace, `set_format`, `delete` and `comment_create` were refused in a
   paragraph that is wholly another author's pending insertion, though the
   same edits inside an inserted run already stacked. They now stack as
-  they do in a run.
+  they do in a run. This is the edit operations; a worklist item (`stemma
+  apply`, MCP `replacement_worklist`) whose text is in such a paragraph is
+  still refused.
 - **The worklist and `replace_text` match across bookmark, comment and
   permission boundaries**, as Word's Find does, keeping each marker at its
   text offset. A refusal for an occurrence that straddles something now
@@ -215,6 +217,17 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
   `EditError::FindReplaceBarrierStraddle` gains `walls`.
 - **CLI, MCP and Python consumers of audit dispositions** may see
   `edited_inside` where 0.7.0 reported `modified`.
+- **Rust callers matching on `NormalizeError`:** `UnmodeledRevision` is
+  gone and `InvalidCellMerge` takes its place.
+- **MCP consumers of `unreached_matches`:** each entry carries `reason`
+  where 0.7.0 carried `route`.
+- **Consumers of the CLI apply receipt's `coverage`:** `hyperlink_text`
+  and `content_control_values` move from `searched_not_edited` (now empty)
+  to `supported`.
+- **Consumers that parse the blocked-join refusal of a selective
+  resolve:** `details.context` now reads
+  `required_revision_ids=[…] blocking_table_revision_ids=[…]`; 0.7.0 ended
+  after the first list.
 - **A file with `w:delText` or `w:delInstrText` inside `w:moveFrom` no
   longer saves untouched** (I-TC-004); resolve or rewrite the move first.
   Nor does one whose footnote or endnote id is referenced twice

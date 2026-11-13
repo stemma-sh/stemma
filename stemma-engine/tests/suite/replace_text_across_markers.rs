@@ -236,3 +236,27 @@ fn text_added_before_a_proofing_bracket_stays_outside_it() {
     let end = position(r#"w:type="spellEnd""#);
     assert!(added < start && start < word && word < end, "{xml}");
 }
+
+/// A foreign-namespace element is foreign markup whatever its name. One whose
+/// name starts with "move" is no WordprocessingML move marker (§17.13.5): the
+/// paragraph holds no move, a whole-paragraph replace is an ordinary edit, and
+/// the element is still in the file afterwards.
+#[test]
+fn a_foreign_element_named_like_a_move_marker_is_not_a_move() {
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">The Seller shall </w:t></w:r><acme:moveMarker xmlns:acme="urn:example:acme"/><w:r><w:t>deliver the goods.</w:t></w:r></w:p>"#;
+    let source = Document::parse(&docx_with_body_and_comments(body, &[])).unwrap();
+    let edited = whole_paragraph_replace(&source, "The Buyer shall collect the goods.");
+    assert_eq!(
+        edited.project(Resolution::AcceptAll).unwrap().read().blocks[0].text,
+        "The Buyer shall collect the goods."
+    );
+    assert_eq!(
+        edited.project(Resolution::RejectAll).unwrap().read().blocks[0].text,
+        "The Seller shall deliver the goods."
+    );
+    let bytes = edited
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let xml = read_zip_entry(&bytes, "word/document.xml").unwrap();
+    assert!(xml.contains("acme:moveMarker"), "{xml}");
+}

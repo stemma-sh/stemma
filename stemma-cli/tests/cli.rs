@@ -445,7 +445,17 @@ fn apply_turns_an_approved_worklist_into_a_verified_redline() {
     );
     assert_eq!(
         receipt["coverage"]["supported"],
-        serde_json::json!(["body_paragraphs", "table_cell_paragraphs"])
+        serde_json::json!([
+            "body_paragraphs",
+            "table_cell_paragraphs",
+            "hyperlink_text",
+            "content_control_values"
+        ])
+    );
+    // Link text and control values are edited, so nothing is searched only.
+    assert_eq!(
+        receipt["coverage"]["searched_not_edited"],
+        serde_json::json!([])
     );
     assert_eq!(
         receipt["coverage"]["unsearched"].as_array().unwrap().len(),

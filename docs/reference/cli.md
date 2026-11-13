@@ -308,10 +308,10 @@ status, deliverability, or exit code.
   explicit stable refusal code and diagnosis; the items' created less
   withdrawn revisions equal the audited new revision count;
 - `coverage`: the `supported` regions (`body_paragraphs`,
-  `table_cell_paragraphs`), the `default_scope`
+  `table_cell_paragraphs`, and in those paragraphs `hyperlink_text` and
+  `content_control_values`), the `default_scope`
   (`all_body_and_table_paragraphs`), the regions searched but not edited
-  (`searched_not_edited`: `hyperlink_text`, `content_control_values`), and
-  the `unsearched` stories;
+  (`searched_not_edited`, empty since 0.8.0), and the `unsearched` stories;
 - under `verification`: the validator result (`validator_ok`), the
   direct-change count (`direct_changes`), untouched-scope violations
   (`untouched_violations`), pre-existing revisions preserved and edited inside

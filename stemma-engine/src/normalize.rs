@@ -193,10 +193,14 @@ fn row_merge_cells(row: &Element) -> Vec<(u32, crate::domain::VerticalMerge, boo
         };
         let resolved = crate::xml_attrs::attr_get(tc, RESOLVED_CELL_MERGE_MARK).is_some();
         cells.push((column, merge, resolved));
-        column += tc_pr
-            .and_then(|tc_pr| w_val_u32(tc_pr, "gridSpan"))
-            .unwrap_or(1)
-            .max(1);
+        // A span past the last representable column ends there: no cell can
+        // follow it in the grid, so nothing below can line up with one.
+        column = column.saturating_add(
+            tc_pr
+                .and_then(|tc_pr| w_val_u32(tc_pr, "gridSpan"))
+                .unwrap_or(1)
+                .max(1),
+        );
     }
     cells
 }

@@ -111,7 +111,9 @@ pub(crate) fn splice_region_text(
 /// `(start, end, replacement)` is a byte range of [`region_text`] as it reads
 /// BEFORE any of them is applied. The ranges must be in order and must not
 /// overlap. Each becomes its own change (its own `w:del`/`w:ins` ids in tracked
-/// mode). Refuses a region that already carries tracked changes, as
+/// mode). An empty range with a replacement is an insertion at that offset; it
+/// takes the formatting of the text before it (of the text after it at offset
+/// 0), as typing there does. Refuses a region that already carries tracked changes, as
 /// [`splice_region_text`] does; any refusal leaves `region` untouched.
 pub(crate) fn splice_region_spans(
     region: &mut Element,
@@ -128,10 +130,9 @@ pub(crate) fn splice_region_spans(
         return Err(SpliceError::RegionHasTrackedChanges);
     }
     let text = region_text(region);
-    if spans
-        .iter()
-        .any(|(start, end, _)| start >= end || text.get(*start..*end).is_none())
-    {
+    if spans.iter().any(|(start, end, replacement)| {
+        start > end || (start == end && replacement.is_empty()) || text.get(*start..*end).is_none()
+    }) {
         return Err(SpliceError::TextNotFound);
     }
     // Last span first: a splice changes only the text at and after its own
@@ -230,8 +231,15 @@ fn splice_located(
     let mut seg_start = 0usize;
     for (seg, len) in &segments {
         let seg_end = seg_start + len;
-        // Skip zero-length and non-overlapping segments.
-        if *len > 0 && start < seg_end && end > seg_start {
+        // Skip zero-length and non-overlapping segments. An insertion point
+        // (`start == end`) belongs to the container whose text ends at it, or
+        // to the first container when it is at offset 0.
+        let holds = if start == end {
+            start <= seg_end && (start > seg_start || start == 0)
+        } else {
+            start < seg_end && end > seg_start
+        };
+        if *len > 0 && holds {
             if start < seg_start || end > seg_end {
                 // Straddles this container's boundary — not present in any
                 // single container's text: genuinely ambiguous, refuse.
@@ -386,7 +394,17 @@ fn splice_direct_at(
                 }
                 // The run that contains the END of the span is where the change
                 // block lands — after this run's pre, before its post.
-                if !change_emitted && run_start < end && end <= run_end && end > start {
+                // An insertion point sits after the text before it: in the run
+                // that ends at or spans it, or in the first run at offset 0.
+                let lands_here = if end > start {
+                    run_start < end && end <= run_end
+                } else {
+                    start <= run_end && (start > run_start || start == 0)
+                };
+                if !change_emitted && lands_here {
+                    if insert_rpr.is_none() {
+                        insert_rpr = Some(rpr.cloned().unwrap_or_else(|| w_el("rPr")));
+                    }
                     seams.push(new_children.len());
                     emit_change(
                         &mut new_children,

@@ -473,6 +473,54 @@ fn a_match_inside_a_plain_text_control_is_replaced_inside_it() {
     );
 }
 
+/// A replacement that only adds words keeps the words around them in place,
+/// so what changes is an insertion with nothing deleted. Typing in a control's
+/// value is an ordinary edit in Word; the insertion stands inside the control,
+/// formatted as the text before it (as the text after it at the very start).
+#[test]
+fn a_replacement_that_only_adds_words_inserts_them_inside_the_control() {
+    for (old, new, after) in [
+        (
+            "twelve months",
+            "twelve (12) months",
+            "Term: twelve (12) months",
+        ),
+        (
+            "twelve months",
+            "about twelve months",
+            "Term: about twelve months",
+        ),
+        (
+            "twelve months",
+            "twelve months or more",
+            "Term: twelve months or more",
+        ),
+    ] {
+        let body = para(&format!(
+            "{}{}",
+            run("Term: "),
+            control(
+                "",
+                &format!(
+                    "{}{}",
+                    r#"<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">twelve </w:t></w:r>"#,
+                    run("months")
+                )
+            )
+        ));
+        let doc = Document::parse(&docx(&body)).unwrap();
+        let plan = plan(&doc, &options(old, new, ExpectedMatches::Count(1)));
+        let tracked = assert_laws(&doc, &plan.steps, "Term: twelve months", after);
+        let xml = part(&tracked, "word/document.xml");
+        let content =
+            &xml[xml.find("<w:sdtContent>").unwrap()..xml.find("</w:sdtContent>").unwrap()];
+        assert!(
+            content.contains("<w:ins ") && !content.contains("<w:del "),
+            "{new}: an insertion and no deletion, inside the control: {xml}"
+        );
+    }
+}
+
 #[test]
 fn a_match_inside_a_rich_text_control_keeps_each_runs_formatting() {
     let body = para(&control(

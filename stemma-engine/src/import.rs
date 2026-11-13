@@ -15164,7 +15164,12 @@ fn decoration_type_from_name(name: &str) -> DecorationType {
         s if s.starts_with("perm") => DecorationType::PermissionRange,
         "proofErr" => DecorationType::ProofError,
         s if s.starts_with("customXml") => DecorationType::CustomXmlRange,
-        s if s.starts_with("move") => DecorationType::MoveRange,
+        // The WordprocessingML move markers by their exact names: a foreign
+        // element whose name merely starts with "move" is foreign markup,
+        // and the move logic reads a MoveRange decoration as one of these.
+        // (`name` is the local name; the parser drops the prefix.)
+        "moveFromRangeStart" | "moveFromRangeEnd" | "moveToRangeStart" | "moveToRangeEnd"
+        | "moveFrom" | "moveTo" => DecorationType::MoveRange,
         // Anything else reaching here is a FOREIGN-namespace element that
         // word_ir preserved verbatim as a zero-width decoration (e.g. a
         // PowerTools/Templafy <Insert> placeholder). Label it honestly rather
