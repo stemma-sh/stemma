@@ -240,111 +240,51 @@ def make_preexisting_deletions() -> None:
 # =========================================================================
 
 def make_preexisting_moves() -> None:
-    """A DOCX with pre-existing move tracking markup.
+    """A Word-valid DOCX with a pre-existing move of a whole paragraph.
 
     Paragraph layout:
-      P1: "Paragraph Alpha stays in place."  (normal)
-      P2: moveTo[name="move_0"]: "Paragraph Charlie was moved here."  (inserted)
-      P3: "Paragraph Bravo stays in place."  (normal)
-      P4: moveFrom[name="move_0"]: "Paragraph Charlie was moved here."  (deleted)
+      P1: "Paragraph Alpha stays in place."
+      P2: moved-to "Paragraph Charlie was moved here."   (range name "move_0")
+      P3: "Paragraph Bravo stays in place."
+      P4: moved-from "Paragraph Charlie was moved here." (range name "move_0")
+      P5: "Paragraph Delta closes the document."
 
-    The moveFrom and moveTo are linked by w:name="move_0", and wrapped in
-    moveFromRangeStart/End and moveToRangeStart/End markers respectively.
+    Written in Word's own shape: each moved paragraph's mark carries
+    w:moveTo/w:moveFrom, its runs sit in a w:moveTo/w:moveFrom container
+    holding plain w:t, the range start sits inside the paragraph and the range
+    end follows it at body level, and w:sectPr stays the body's last child.
     """
     from lxml import etree
 
     doc = Document()
     body = doc.element.body
-
-    # Remove default empty paragraph
     for p in body.findall(qn("w:p")):
         body.remove(p)
+    sect_pr = body.find(qn("w:sectPr"))
 
-    ns = {"w": W}
-
-    # P1: normal paragraph
-    p1 = OxmlElement("w:p")
-    r1 = OxmlElement("w:r")
-    t1 = make_element("w:t")
-    t1.text = "Paragraph Alpha stays in place."
-    r1.append(t1)
-    p1.append(r1)
-    body.append(p1)
-
-    # moveToRangeStart
-    mtr_start = make_element("w:moveToRangeStart", {
-        "w:id": "10",
-        "w:name": "move_0",
-        "w:author": "Move Author",
-        "w:date": "2025-06-01T12:00:00Z",
-    })
-    body.append(mtr_start)
-
-    # P2: moveTo container with paragraph
-    move_to = make_element("w:moveTo", {
-        "w:id": "200",
-        "w:author": "Move Author",
-        "w:date": "2025-06-01T12:00:00Z",
-    })
-    p2 = OxmlElement("w:p")
-    r2 = OxmlElement("w:r")
-    t2 = make_element("w:t")
-    t2.text = "Paragraph Charlie was moved here."
-    r2.append(t2)
-    p2.append(r2)
-    move_to.append(p2)
-    body.append(move_to)
-
-    # moveToRangeEnd
-    mtr_end = make_element("w:moveToRangeEnd", {
-        "w:id": "10",
-    })
-    body.append(mtr_end)
-
-    # P3: normal paragraph
-    p3 = OxmlElement("w:p")
-    r3 = OxmlElement("w:r")
-    t3 = make_element("w:t")
-    t3.text = "Paragraph Bravo stays in place."
-    r3.append(t3)
-    p3.append(r3)
-    body.append(p3)
-
-    # moveFromRangeStart
-    mfr_start = make_element("w:moveFromRangeStart", {
-        "w:id": "11",
-        "w:name": "move_0",
-        "w:author": "Move Author",
-        "w:date": "2025-06-01T12:00:00Z",
-    })
-    body.append(mfr_start)
-
-    # P4: moveFrom container with paragraph
-    move_from = make_element("w:moveFrom", {
-        "w:id": "201",
-        "w:author": "Move Author",
-        "w:date": "2025-06-01T12:00:00Z",
-    })
-    p4 = OxmlElement("w:p")
-    r4 = OxmlElement("w:r")
-    t4 = make_element("w:delText")
-    t4.text = "Paragraph Charlie was moved here."
-    r4.append(t4)
-    p4.append(r4)
-    move_from.append(p4)
-    body.append(move_from)
-
-    # moveFromRangeEnd
-    mfr_end = make_element("w:moveFromRangeEnd", {
-        "w:id": "11",
-    })
-    body.append(mfr_end)
+    m = 'w:author="Move Author" w:date="2025-06-01T12:00:00Z"'
+    xml = (
+        '<w:p><w:r><w:t>Paragraph Alpha stays in place.</w:t></w:r></w:p>'
+        f'<w:p><w:pPr><w:rPr><w:moveTo w:id="20" {m}/></w:rPr></w:pPr>'
+        f'<w:moveToRangeStart w:id="10" w:name="move_0" {m}/>'
+        f'<w:moveTo w:id="200" {m}><w:r><w:t>Paragraph Charlie was moved here.</w:t></w:r></w:moveTo></w:p>'
+        '<w:moveToRangeEnd w:id="10"/>'
+        '<w:p><w:r><w:t>Paragraph Bravo stays in place.</w:t></w:r></w:p>'
+        f'<w:p><w:pPr><w:rPr><w:moveFrom w:id="21" {m}/></w:rPr></w:pPr>'
+        f'<w:moveFromRangeStart w:id="11" w:name="move_0" {m}/>'
+        f'<w:moveFrom w:id="201" {m}><w:r><w:t>Paragraph Charlie was moved here.</w:t></w:r></w:moveFrom></w:p>'
+        '<w:moveFromRangeEnd w:id="11"/>'
+        '<w:p><w:r><w:t>Paragraph Delta closes the document.</w:t></w:r></w:p>'
+    )
+    fragment = etree.fromstring(f'<w:root xmlns:w="{W}">{xml}</w:root>')
+    for element in list(fragment):
+        sect_pr.addprevious(element)
 
     save_fixture("preexisting-moves", doc, {
         "name": "preexisting-moves",
-        "spec_ref": "ECMA-376 §17.13.5.21-28",
-        "description": "Pre-existing moveFrom/moveTo with range markers linked by name='move_0'",
-        "expected_behavior": "import_docx().canonical should preserve move_id on TrackedBlocks linking source and destination",
+        "spec_ref": "ECMA-376 \u00a717.13.5.21-28",
+        "description": "Pre-existing whole-paragraph move in Word's shape, ranges linked by name='move_0'",
+        "expected_behavior": "import_docx() reads one move: the two paragraphs share move_id 'move_0', one moved-from and one moved-to",
     })
 
 

@@ -115,6 +115,9 @@ enum InspectQuery {
     Rejected,
     /// Footnote/endnote inventory with note ids, kinds, and editable body text.
     Notes,
+    /// Every comment: id, author, date, text, resolved flag, and the comment
+    /// it replies to (`parent_id`), in document-part order.
+    Comments,
     /// Paged authored header/footer blocks, including part names and field anchors.
     /// Synthesized blank stories have no editable package part and are excluded.
     HeadersFooters,
@@ -950,7 +953,8 @@ struct ReplaceTextArgs {
     /// Author stamped on the resulting tracked change.
     author: String,
     /// Where to search. Omit for top-level and table-cell body paragraphs. To
-    /// restrict: an inclusive top-level block range
+    /// restrict: an inclusive block range in document order, table cells
+    /// included (either end may be a table id, standing for the whole table)
     /// `{ "from_block_id": "p_3", "to_block_id": "p_9" }` or a single block
     /// `{ "block_id": "p_7" }` (including a table-cell paragraph id).
     #[serde(default)]
@@ -2112,12 +2116,12 @@ struct RevisionRow {
     author: Option<String>,
     /// Which OOXML change element carries the revision; serialized as the
     /// wire name (`"insert"`, `"delete"`, `"format_run"`, `"format_paragraph"`,
-    /// `"format_table"`, `"format_row"`, `"format_cell"`, `"format_section"`,
+    /// `"format_paragraph_mark"`, `"format_table"`, `"format_row"`,
+    /// `"format_cell"`, `"format_section"`,
     /// `"opaque_interior"` — a tracked change inside embedded content
     /// (textbox/object), reported with `revision_id` 0 and NOT individually
-    /// resolvable — `"move"`, or `"cell_merge"` — a tracked vertical cell
-    /// merge, reported with `revision_id` 0; every resolution refuses while
-    /// one is pending).
+    /// resolvable — `"move"`, or `"cell_merge"` — a tracked change to the
+    /// vertical merge of a run of cells in one column).
     kind: RevisionKind,
     block_id: String,
     /// ≤ 80 chars of the affected text, truncated on a char boundary.
@@ -3308,6 +3312,58 @@ fn move_receipts(before: &CanonDoc, after: &CanonDoc) -> Vec<Value> {
                 "prev": neighbor(first.checked_sub(1)),
                 "next": neighbor(Some(last + 1)),
             })
+        })
+        .collect()
+}
+
+/// The receipt's `cell_paragraph_moves` entry for each `move` step of this
+/// transaction whose source lies inside a table cell. Word (16) records no
+/// move for a cut taken from inside a cell: the engine writes such a step as
+/// a tracked deletion at the source plus a tracked insertion at the
+/// destination, two revisions that resolve independently, and the receipt
+/// says so instead of letting the caller look for a move. A step that moves
+/// body paragraphs into a cell is a real move and reports under `moves`'
+/// changed blocks as usual.
+fn cell_paragraph_moves(before: &CanonDoc, txn: &stemma::edit::EditTransaction) -> Vec<Value> {
+    fn in_cells(blocks: &[BlockNode], id: &str) -> bool {
+        blocks.iter().any(|block| match block {
+            BlockNode::Paragraph(p) => p.id.0.as_ref() == id,
+            BlockNode::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| in_cells(&cell.blocks, id)),
+            BlockNode::OpaqueBlock(_) => false,
+        })
+    }
+    let in_a_cell = |id: &str| {
+        before.blocks.iter().any(|tracked| match &tracked.block {
+            BlockNode::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| in_cells(&cell.blocks, id)),
+            _ => false,
+        })
+    };
+    txn.steps
+        .iter()
+        .enumerate()
+        .filter_map(|(step_index, step)| match step {
+            stemma::edit::EditStep::MoveBlockRange {
+                from_block_id,
+                to_block_id,
+                ..
+            } if in_a_cell(from_block_id.0.as_ref()) => Some(json!({
+                "step_index": step_index,
+                "from": from_block_id.0.as_ref(),
+                "to": to_block_id.0.as_ref(),
+                "recorded_as": "deletion_and_insertion",
+                "why": "Word records no move whose source is inside a table cell; the \
+                        source is a tracked deletion and the destination a tracked \
+                        insertion, two revisions",
+            })),
+            _ => None,
         })
         .collect()
 }
@@ -4592,6 +4648,7 @@ impl StemmaServer {
                         Err(r) => return (r, result.applied),
                     };
                 let moves = move_receipts(&before, &result.canonical);
+                let cell_moves = cell_paragraph_moves(&before, txn);
                 let table_rows_changed = table_receipts(&before, &result.canonical);
                 (
                     ok(Self::bounded_transaction_receipt(json!({
@@ -4605,6 +4662,10 @@ impl StemmaServer {
                         // Neighborhood receipt for any move(s) this transaction
                         // performed — empty when none did. See `move_receipts`.
                         "moves": moves,
+                        // `move` steps out of a table cell, which Word records
+                        // as a deletion plus an insertion. See
+                        // `cell_paragraph_moves`.
+                        "cell_paragraph_moves": cell_moves,
                         // Fresh row inserts/deletes any table_op made this
                         // transaction — empty when none did. See `table_receipts`.
                         "table_receipts": table_rows_changed,
@@ -5530,7 +5591,7 @@ fn inline_object_matches_json(occurrences: &[stemma::edit::InlineObjectMatch]) -
                 },
                 "block_id": m.block_id.to_string(),
                 "object_id": m.object_id.to_string(),
-                "route": m.describe(),
+                "reason": m.describe(),
             }))
             .collect::<Vec<_>>()
     )
@@ -5725,15 +5786,17 @@ impl KindFilter {
         }
         match RevisionKind::parse(raw) {
             Some(kind) => Ok(Self::Exact(kind)),
-            None => Err(format!(
-                "by_kind must be \"insert\", \"delete\", \"format\" (any formatting \
-                 change), \"format_run\", \"format_paragraph\", \"format_table\", \
-                 \"format_row\", \"format_cell\", \"format_section\", or \
-                 \"opaque_interior\" (tracked changes inside embedded content — \
-                 visible but not individually resolvable), \"move\", or \
-                 \"cell_merge\" (a tracked vertical cell merge — visible, not \
-                 resolvable); got {raw:?}"
-            )),
+            None => {
+                let kinds: Vec<String> = RevisionKind::ALL
+                    .iter()
+                    .map(|kind| format!("{:?}", kind.as_str()))
+                    .collect();
+                Err(format!(
+                    "by_kind must be \"format\" (any formatting change) or one revision \
+                     kind: {}; got {raw:?}",
+                    kinds.join(", ")
+                ))
+            }
         }
     }
 }
@@ -6075,10 +6138,10 @@ fn outline_entry_json(entry: &stemma::api::OutlineEntry) -> Value {
 /// `delete_note`: before this, no read tool exposed a note's id or body text
 /// at all — an agent had to unzip the docx to see footnote text, and a note
 /// id was only visible via list_revisions once it already carried a
-/// revision. `text` is the note body's full visible text (both stories are
-/// single-paragraph in v1, so this is the whole body — no truncation, unlike
-/// an outline entry's 120-char preview, since note bodies are typically
-/// short).
+/// revision. `text` is the note body exactly as `edit_note` takes it back
+/// (`stemma::edit::note_body_text`): one line per paragraph, joined by `\n`,
+/// with one U+FFFC per inline object or break — the whole body, no
+/// truncation, unlike an outline entry's 120-char preview.
 fn notes_json(canonical: &CanonDoc) -> Vec<Value> {
     let footnotes = canonical
         .footnotes
@@ -6094,10 +6157,9 @@ fn notes_json(canonical: &CanonDoc) -> Vec<Value> {
 }
 
 fn note_row_json(kind: &str, note_id: &str, blocks: &[TrackedBlock]) -> Value {
-    let text: String = blocks
-        .iter()
-        .map(|tb| stemma::import::extract_block_text(&tb.block))
-        .collect();
+    // The text edit_note takes back: one line per paragraph, one U+FFFC per
+    // inline object or break.
+    let text = stemma::edit::note_body_text(blocks);
     json!({
         "note_id": note_id,
         "kind": kind,
@@ -7002,7 +7064,9 @@ impl StemmaServer {
                        selection, pass the same axes to execute_plan's resolution \
                        selector (by='by_filter') instead of enumerating ids. \
                        query='styles' returns authored styles and document defaults; query='notes' \
-                       returns footnote/endnote ids, kinds, and editable body text. query='headers_footers' \
+                       returns footnote/endnote ids, kinds, and editable body text; query='comments' \
+                       returns every comment's id, author, date, text, resolved flag, and the \
+                       comment it replies to (parent_id). query='headers_footers' \
                        pages authored story blocks (offset/limit), with part_name, kind, and exact block/field identities; \
                        synthesized blank stories are excluded. Use pattern='<part_name>' to select a story, \
                        then optionally block_id and detail='formatting'; block ids are story-local. \
@@ -7653,6 +7717,26 @@ impl StemmaServer {
                     ),
                 }
             }
+            InspectQuery::Comments => {
+                if has_query_args {
+                    return fail("invalid_argument", "query 'comments' accepts only doc_id");
+                }
+                let handle = DocHandle(args.doc_id.clone());
+                match self.runtime.with(&handle, |snapshot| {
+                    stemma_diff::comment_readings(snapshot.canonical.as_ref())
+                }) {
+                    Ok(comments) => ok(json!({
+                        "doc_id": args.doc_id,
+                        "comment_count": comments.len(),
+                        "comments": comments,
+                        "server_version": SERVER_VERSION,
+                    })),
+                    Err(error) => fail(
+                        &format!("{:?}", error.code),
+                        format!("doc not open: {}", error.message),
+                    ),
+                }
+            }
             InspectQuery::Operations => {
                 if args.block_id.is_some()
                     || args.detail.is_some()
@@ -7720,7 +7804,7 @@ impl StemmaServer {
                        author:'Reviewer'}; reply to that comment with \
                        {op:'comment_reply',parent_comment_id:'1',body:'reply',author:'Reviewer'}. \
                        Notes are first-class: inspect_docx query='notes' returns note_id/kind/body; \
-                       then use insert_note/edit_note/delete_note. parent_comment_id is the string comment id returned by inspection, never \
+                       then use insert_note/edit_note/delete_note. parent_comment_id is the string comment id that query='comments' returns, never \
                        a block id or opaque-anchor id. When replacing a paragraph that contains an opaque \
                        anchor, preserve it in content.content as \
                        {type:'opaque_ref',attrs:{id:'<opaque id from inspect block anchors>'}}. \
@@ -8845,11 +8929,13 @@ fn audit_report_json(
     let expected_changed_prior_revisions = report
         .preexisting_revisions
         .iter()
-        .filter(|prior| {
-            matches!(&prior.disposition, RevisionDisposition::Resolved)
-                && resolution_evidence.is_some_and(|evidence| {
-                    evidence.revision_ids.contains(&prior.record.revision_id)
-                })
+        .filter(|prior| match &prior.disposition {
+            // Edited inside by this delivery's tracked changes only: the
+            // engine proved rejecting them restores it.
+            RevisionDisposition::EditedInside { .. } => true,
+            RevisionDisposition::Resolved => resolution_evidence
+                .is_some_and(|evidence| evidence.revision_ids.contains(&prior.record.revision_id)),
+            RevisionDisposition::Untouched | RevisionDisposition::Modified { .. } => false,
         })
         .count();
     let unexpected_changed_prior_revisions =
@@ -8872,6 +8958,9 @@ fn audit_report_json(
             let mut row = audit_census_row_json(&p.record);
             let (disposition, after_excerpt) = match &p.disposition {
                 RevisionDisposition::Untouched => ("untouched", None),
+                RevisionDisposition::EditedInside { after_excerpt } => {
+                    ("edited_inside", Some(cap_excerpt(after_excerpt)))
+                }
                 RevisionDisposition::Modified { after_excerpt } => {
                     ("modified", Some(cap_excerpt(after_excerpt)))
                 }
@@ -10209,6 +10298,23 @@ mod tests {
         );
     }
 
+    /// The refusal for an unknown `by_kind` teaches the whole vocabulary:
+    /// every kind the engine can emit is selectable and named.
+    #[test]
+    fn by_kind_refusal_names_every_revision_kind() {
+        let Err(error) = KindFilter::parse("formatting") else {
+            panic!("\"formatting\" is not a kind");
+        };
+        for kind in RevisionKind::ALL {
+            assert!(
+                error.contains(&format!("\"{}\"", kind.as_str())),
+                "{} missing from: {error}",
+                kind.as_str()
+            );
+            assert!(KindFilter::parse(kind.as_str()).is_ok());
+        }
+    }
+
     /// An all-empty filter is `all` in disguise — it must fail loudly, never
     /// resolve everything by accident.
     #[tokio::test]
@@ -11225,6 +11331,76 @@ mod tests {
         );
     }
 
+    /// A package with a comment thread (comment 1, replied to by comment 2) and a
+    /// separate resolved comment 3, anchored in one paragraph. Thread links and
+    /// the resolved flag live in the comments-extended part (§17.13.4,
+    /// `w15:paraIdParent`, `w15:done`).
+    fn inspect_commented_parts() -> Vec<(&'static str, String)> {
+        let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:commentRangeStart w:id="1"/><w:commentRangeStart w:id="2"/><w:r><w:t xml:space="preserve">The fee is payable monthly</w:t></w:r><w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r><w:commentRangeEnd w:id="2"/><w:r><w:commentReference w:id="2"/></w:r><w:r><w:t xml:space="preserve"> and </w:t></w:r><w:commentRangeStart w:id="3"/><w:r><w:t>in advance</w:t></w:r><w:commentRangeEnd w:id="3"/><w:r><w:commentReference w:id="3"/></w:r><w:r><w:t>.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let comments = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:comment w:id="1" w:author="Priya" w:date="2026-10-01T09:00:00Z"><w:p w14:paraId="1A2B3C01"><w:r><w:t>Should this be quarterly?</w:t></w:r></w:p></w:comment><w:comment w:id="2" w:author="Tomas" w:date="2026-10-02T10:30:00Z"><w:p w14:paraId="1A2B3C02"><w:r><w:t>Monthly was agreed.</w:t></w:r></w:p></w:comment><w:comment w:id="3" w:author="Priya" w:date="2026-10-03T11:00:00Z"><w:p w14:paraId="1A2B3C03"><w:r><w:t>Confirm the advance wording.</w:t></w:r></w:p></w:comment></w:comments>"#;
+        let extended = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="1A2B3C01" w15:done="0"/><w15:commentEx w15:paraId="1A2B3C02" w15:paraIdParent="1A2B3C01" w15:done="0"/><w15:commentEx w15:paraId="1A2B3C03" w15:done="1"/></w15:commentsEx>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/><Override PartName="/word/commentsExtended.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml"/></Types>"#;
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/><Relationship Id="rId3" Type="http://schemas.microsoft.com/office/2011/relationships/commentsExtended" Target="commentsExtended.xml"/></Relationships>"#;
+        vec![
+            ("[Content_Types].xml", content_types.to_string()),
+            ("_rels/.rels", rels.to_string()),
+            ("word/_rels/document.xml.rels", doc_rels.to_string()),
+            ("word/document.xml", document.to_string()),
+            ("word/comments.xml", comments.to_string()),
+            ("word/commentsExtended.xml", extended.to_string()),
+        ]
+    }
+
+    fn inspect_commented_docx() -> Vec<u8> {
+        use stemma::docx::{DocxArchive, DocxFile};
+        DocxArchive::from_parts(
+            inspect_commented_parts()
+                .into_iter()
+                .map(|(name, data)| DocxFile {
+                    name: name.to_string(),
+                    data: data.into_bytes(),
+                })
+                .collect(),
+        )
+        .write()
+        .expect("write commented package")
+    }
+
+    #[tokio::test]
+    async fn compact_comments_query_reports_threads_and_resolved_state() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &inspect_commented_docx()).await;
+        let args: InspectDocxArgs =
+            serde_json::from_value(json!({"doc_id": doc_id, "query": "comments"}))
+                .expect("inspect args");
+        let result = server.inspect_docx(Parameters(args)).await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        assert_eq!(payload["comment_count"], 3);
+        assert_eq!(
+            payload["comments"],
+            json!([
+                {"id": "1", "author": "Priya", "date": "2026-10-01T09:00:00Z",
+                 "text": "Should this be quarterly?", "resolved": false,
+                 "parent_id": null, "parent_para_id": null},
+                {"id": "2", "author": "Tomas", "date": "2026-10-02T10:30:00Z",
+                 "text": "Monthly was agreed.", "resolved": false,
+                 "parent_id": "1", "parent_para_id": "1A2B3C01"},
+                {"id": "3", "author": "Priya", "date": "2026-10-03T11:00:00Z",
+                 "text": "Confirm the advance wording.", "resolved": true,
+                 "parent_id": null, "parent_para_id": null}
+            ])
+        );
+
+        let refused: InspectDocxArgs = serde_json::from_value(
+            json!({"doc_id": doc_id, "query": "comments", "block_id": "p_1"}),
+        )
+        .expect("inspect args");
+        let refused = server.inspect_docx(Parameters(refused)).await;
+        assert_eq!(refused.is_error, Some(true));
+    }
+
     #[test]
     fn replacement_catalog_teaches_existing_hyperlink_display_edit() {
         let catalog = operation_catalog(Some("replace")).unwrap();
@@ -11898,6 +12074,46 @@ mod tests {
         assert!(
             entry["next"].is_null(),
             "nothing follows the run at the end of the document: {entry}"
+        );
+    }
+
+    /// A `move` out of a table cell is written as Word records that cut and
+    /// paste, a tracked deletion plus a tracked insertion, and the receipt
+    /// says so (`cell_paragraph_moves`) rather than leave the caller to look
+    /// for a move; `moves` stays empty.
+    #[tokio::test]
+    async fn a_move_out_of_a_cell_is_reported_as_a_deletion_and_an_insertion() {
+        let server = StemmaServer::new();
+        let body = r#"<w:p><w:r><w:t>Harbor echo</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="0"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Pine alpha</w:t></w:r></w:p><w:p><w:r><w:t>Pine bravo</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Harbor golf</w:t></w:r></w:p>"#;
+        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let result = server
+            .apply_edit(Parameters(ApplyEditArgs {
+                doc_id,
+                transaction: TransactionArg(json!({
+                    "ops": [{
+                        "op": "move",
+                        "target": "p_2",
+                        "destination": { "anchor": "p_4", "position": "before" },
+                    }],
+                    "revision": { "author": "Receipts Test" },
+                })),
+                mode: None,
+                allow_existing_author: false,
+            }))
+            .await;
+        let payload = structured(&result);
+        assert_eq!(payload["applied"], true, "edit applied: {payload}");
+        assert_eq!(payload["moves"], json!([]), "no move: {payload}");
+        let notes = payload["cell_paragraph_moves"]
+            .as_array()
+            .expect("cell_paragraph_moves array");
+        assert_eq!(notes.len(), 1, "{payload}");
+        assert_eq!(notes[0]["from"], "p_2");
+        assert_eq!(notes[0]["recorded_as"], "deletion_and_insertion");
+        assert_eq!(
+            payload["revision_ids"].as_array().map(Vec::len),
+            Some(2),
+            "two revisions, a deletion and an insertion: {payload}"
         );
     }
 
@@ -13887,20 +14103,14 @@ mod tests {
         assert_eq!(detail["text"], exact);
     }
 
-    /// Domain rule: a replacement worklist edits a paragraph's own runs; a
-    /// content control's value and a hyperlink's display text are edited
-    /// through their objects. A replace_all item whose needle also stands in
-    /// one must not report would_apply/applied with that text left behind: it
-    /// refuses and names the object.
-    #[tokio::test]
-    async fn worklist_replace_all_refuses_text_left_in_a_content_control() {
-        let body = concat!(
-            r#"<w:p><w:r><w:t xml:space="preserve">Acme Corp signs as </w:t></w:r>"#,
-            r#"<w:sdt><w:sdtPr><w:id w:val="7"/><w:text/></w:sdtPr><w:sdtContent>"#,
-            r#"<w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p>"#,
+    /// A worklist item in preview over a paragraph whose text and inline
+    /// control both hold "Acme Corp"; `control_pr` goes in the control's sdtPr.
+    async fn preview_control_worklist(control_pr: &str) -> Value {
+        let body = format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Acme Corp signs as </w:t></w:r><w:sdt><w:sdtPr><w:id w:val="7"/>{control_pr}<w:text/></w:sdtPr><w:sdtContent><w:r><w:t>Acme Corp</w:t></w:r></w:sdtContent></w:sdt></w:p>"#
         );
         let server = StemmaServer::new();
-        let doc_id = open_and_id(&server, &make_docx(body, false)).await;
+        let doc_id = open_and_id(&server, &make_docx(&body, false)).await;
         let preview = server
             .execute_plan(Parameters(ExecutePlanArgs {
                 doc_id: Some(doc_id.clone()),
@@ -13925,7 +14135,26 @@ mod tests {
                 allow_existing_author: false,
             }))
             .await;
-        let payload = structured(&preview);
+        structured(&preview)
+    }
+
+    /// Domain rule: a content control's value is text of the paragraph, so a
+    /// replace_all worklist item reaches it as it reaches the paragraph's own
+    /// runs.
+    #[tokio::test]
+    async fn worklist_replace_all_reaches_a_content_control_value() {
+        let payload = preview_control_worklist("").await;
+        assert_eq!(payload["would_apply"], 1, "{payload}");
+        assert_eq!(payload["items"][0]["match_count"], 2, "{payload}");
+    }
+
+    /// Domain rule: a control whose content is locked (§17.5.2.23) cannot be
+    /// edited. A replace_all item whose needle stands in one must not report
+    /// would_apply/applied with that text left behind: it refuses and names the
+    /// control and its lock.
+    #[tokio::test]
+    async fn worklist_replace_all_refuses_text_left_in_a_locked_control() {
+        let payload = preview_control_worklist(r#"<w:lock w:val="contentLocked"/>"#).await;
         assert_eq!(payload["would_apply"], 0, "{payload}");
         assert_ne!(payload["apply_ready"], true, "{payload}");
         let item = &payload["items"][0];
@@ -13936,6 +14165,13 @@ mod tests {
             "{payload}"
         );
         assert_eq!(item["unreached_matches"][0]["block_id"], "p_1", "{payload}");
+        assert!(
+            item["unreached_matches"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("w:lock=\"contentLocked\""),
+            "{payload}"
+        );
     }
 
     #[tokio::test]
@@ -17045,6 +17281,184 @@ mod tests {
             }))
             .await;
         assert_eq!(structured(&bad_verify)["code"], "invalid_argument");
+    }
+
+    // ── The session audit judges supported edits as deliverable ────────────
+
+    /// A package whose body is `body`, with the drawing and relationship
+    /// namespaces declared and one external hyperlink relationship (`rId5`).
+    fn audit_judgement_docx(body: &str) -> Vec<u8> {
+        use stemma::docx::{DocxArchive, DocxFile};
+        let document = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body>{body}<w:sectPr/></w:body></w:document>"#
+        );
+        let part = |name: &str, data: &str| DocxFile {
+            name: name.to_string(),
+            data: data.as_bytes().to_vec(),
+        };
+        DocxArchive::from_parts(vec![
+            part(
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            part(
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            part(
+                "word/_rels/document.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/terms" TargetMode="External"/></Relationships>"#,
+            ),
+            part("word/document.xml", &document),
+        ])
+        .write()
+        .expect("write test package")
+    }
+
+    /// A paragraph hosting one textbox whose interior is `interior`.
+    fn textbox_body(interior: &str) -> String {
+        format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">See the box. </w:t></w:r><w:r><w:drawing><wp:inline><wp:extent cx="100" cy="100"/><wp:docPr id="1" name="TextBox 1"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:txbx><w:txbxContent><w:p>{interior}</w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+        )
+    }
+
+    async fn plan(server: &StemmaServer, args: Value) -> Value {
+        let args: ExecutePlanArgs = serde_json::from_value(args).expect("plan args");
+        let result = server.execute_plan(Parameters(args)).await;
+        let payload = structured(&result);
+        assert_eq!(result.is_error, Some(false), "{payload}");
+        payload
+    }
+
+    async fn session_verdict(server: &StemmaServer, doc_id: &str) -> Value {
+        let args: VerifyDocxArgs =
+            serde_json::from_value(json!({ "doc_id": doc_id })).expect("verify args");
+        structured(&server.verify_docx(Parameters(args)).await)
+    }
+
+    fn assert_deliverable(review: &Value) {
+        assert_eq!(review["verdict"]["deliverable"], true, "{review}");
+        assert_eq!(review["counts"]["untouched_violations"], 0, "{review}");
+        assert_eq!(
+            review["counts"]["unexplained_direct_changes"], 0,
+            "{review}"
+        );
+        assert_eq!(
+            review["counts"]["unexpected_changed_prior_revisions"], 0,
+            "{review}"
+        );
+    }
+
+    /// An edit inside another author's pending insertion stacks on it: her
+    /// revision is edited inside, still pending, and the delivery is clean.
+    #[tokio::test]
+    async fn verify_passes_an_edit_stacked_inside_another_authors_insertion() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(
+            &server,
+            &audit_judgement_docx(
+                r#"<w:p><w:r><w:t xml:space="preserve">Notice must be given within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">45 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of delivery.</w:t></w:r></w:p>"#,
+            ),
+        )
+        .await;
+        plan(
+            &server,
+            json!({"doc_id": doc_id, "preview": false, "replacement_worklist": {
+                "author": "Bob",
+                "replacements": [{"old": "45 days", "new": "60 days"}]
+            }}),
+        )
+        .await;
+        let review = session_verdict(&server, &doc_id).await;
+        assert_deliverable(&review);
+        assert_eq!(
+            review["preexisting"]["rows"][0]["disposition"],
+            "edited_inside"
+        );
+        assert_eq!(review["counts"]["expected_changed_prior_revisions"], 1);
+    }
+
+    /// Accepting or rejecting a textbox revision changes the textbox, which
+    /// lives in its host paragraph: that resolution accounts for the host.
+    #[tokio::test]
+    async fn verify_passes_a_requested_textbox_resolution() {
+        for action in ["accept", "reject"] {
+            let server = StemmaServer::new();
+            let doc_id = open_and_id(
+                &server,
+                &audit_judgement_docx(&textbox_body(
+                    r#"<w:r><w:t xml:space="preserve">Fees are due </w:t></w:r><w:ins w:id="21" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t>monthly</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> in advance.</w:t></w:r>"#,
+                )),
+            )
+            .await;
+            plan(
+                &server,
+                json!({"doc_id": doc_id, "preview": false, "resolution": {
+                    "action": action,
+                    "selector": {"by": "by_ids", "revision_ids": [21]}
+                }}),
+            )
+            .await;
+            let review = session_verdict(&server, &doc_id).await;
+            assert_deliverable(&review);
+            assert_eq!(review["preexisting"]["rows"][0]["disposition"], "resolved");
+        }
+    }
+
+    /// A tracked edit inside a textbox accounts for its host paragraph.
+    #[tokio::test]
+    async fn verify_passes_a_tracked_textbox_edit() {
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(
+            &server,
+            &audit_judgement_docx(&textbox_body(
+                r#"<w:r><w:t xml:space="preserve">Fees are due monthly in advance.</w:t></w:r>"#,
+            )),
+        )
+        .await;
+        plan(
+            &server,
+            json!({"doc_id": doc_id, "preview": false, "transaction": {
+                "ops": [{"op": "opaque_text_edit", "target": "p_1", "opaque_id": "p_1_widget_2",
+                         "find": "monthly", "replacement": "quarterly"}],
+                "revision": {"author": "Bob"}
+            }}),
+        )
+        .await;
+        let review = session_verdict(&server, &doc_id).await;
+        assert_deliverable(&review);
+        assert_eq!(review["counts"]["new_revisions"], 2, "{review}");
+    }
+
+    /// A tracked link-text edit in a table cell is as deliverable as the same
+    /// edit in a body paragraph; an untracked one is still a finding.
+    #[tokio::test]
+    async fn verify_judges_cell_link_edits_like_body_link_edits() {
+        let cell_link = audit_judgement_docx(
+            r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4000"/><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Terms</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t xml:space="preserve">Read the </w:t></w:r><w:hyperlink r:id="rId5"><w:r><w:t>standard terms</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> first.</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#,
+        );
+        let link_edit = |doc_id: &str, mode: &str| {
+            json!({"doc_id": doc_id, "preview": false, "mode": mode, "transaction": {
+                "ops": [{"op": "replace", "target": "p_2_hyperlink_2", "expect": "standard terms",
+                         "content": {"type": "hyperlink",
+                                     "attrs": {"href": "https://example.com/terms"},
+                                     "content": [{"type": "text", "text": "current terms"}]}}],
+                "revision": {"author": "Bob"}
+            }})
+        };
+
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &cell_link).await;
+        plan(&server, link_edit(&doc_id, "tracked")).await;
+        let review = session_verdict(&server, &doc_id).await;
+        assert_deliverable(&review);
+        assert_eq!(review["counts"]["new_revisions"], 2, "{review}");
+
+        let server = StemmaServer::new();
+        let doc_id = open_and_id(&server, &cell_link).await;
+        plan(&server, link_edit(&doc_id, "direct")).await;
+        let review = session_verdict(&server, &doc_id).await;
+        assert_eq!(review["verdict"]["deliverable"], false, "{review}");
     }
 }
 

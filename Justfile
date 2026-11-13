@@ -55,45 +55,24 @@ check-toolchain:
     @want="$(sed -n 's/^rust = "\([^"]*\)".*/\1/p' .mise.toml)"; have="$(rustc --version | cut -d' ' -f2)"; if [ "$want" != "$have" ]; then echo "error: toolchain drift — rustc $have active but .mise.toml pins $want. Run: mise install (or rustup default $want)"; exit 1; fi
 
 # Publish the crates.io surface in dependency order: engine, comparison,
-# host artifact boundary, then CLI. The CLI's three workspace dependencies
-# must already be visible in the registry before its package can resolve there. Manual and
-# deliberate; see RELEASING.md for where this sits in a release. Fails loud
-# unless a registry token is present (`cargo login` or
-# CARGO_REGISTRY_TOKEN), every selected crate permits publishing, the lockfile
-# is current, and the working tree is clean. Each crate is dry-run-verified
-# immediately before its real publish. stemma-mcp (npm is its channel) and
-# stemma-api (demo infrastructure) are deliberately not published.
-[doc("Publish stemma -> stemma-diff -> stemma-artifacts -> stemma-cli (guarded; see RELEASING.md)")]
+# host artifact boundary, then CLI. Release CI runs the same script per crate
+# through crates.io trusted publishing (release.yml `crates-publish`); this
+# recipe is the manual path, needed only for a crate that does not exist on
+# crates.io yet (trusted publishing cannot be configured before a crate's
+# first version). It needs a registry token (`cargo login` or
+# CARGO_REGISTRY_TOKEN). scripts/publish-crate.sh refuses a dirty tree,
+# dry-run-verifies each crate immediately before its real publish, skips a
+# version crates.io already lists with the identical .crate checksum, refuses
+# one with any other checksum, and waits for index visibility before the
+# next crate. stemma-mcp (npm is its channel) and stemma-api (demo
+# infrastructure) are deliberately not published.
+[doc("Publish stemma -> stemma-diff -> stemma-artifacts -> stemma-cli (manual path; release CI does this; see RELEASING.md)")]
 [confirm("Publish stemma, stemma-diff, stemma-artifacts, and stemma-cli to crates.io? Published versions are permanent. (y/N)")]
 publish-crates: check-toolchain package-check
-    @test -z "$(git status --porcelain)" || { echo "error: working tree not clean — publish only from the release commit"; exit 1; }
-    cargo publish --locked -p stemma --dry-run
-    cargo publish --locked -p stemma
-    just _wait-crate-visible stemma stemma-engine/Cargo.toml
-    cargo publish --locked -p stemma-diff --dry-run
-    cargo publish --locked -p stemma-diff
-    just _wait-crate-visible stemma-diff stemma-diff/Cargo.toml
-    cargo publish --locked -p stemma-artifacts --dry-run
-    cargo publish --locked -p stemma-artifacts
-    just _wait-crate-visible stemma-artifacts stemma-artifacts/Cargo.toml
-    cargo publish --locked -p stemma-cli --dry-run
-    cargo publish --locked -p stemma-cli
-
-# crates.io accepts a publish before every index/API mirror can resolve it.
-# Bound the wait so a partial release stops explicitly instead of letting the
-# dependent package fail with a misleading missing-dependency error.
-_wait-crate-visible crate manifest:
-    @version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' {{manifest}} | head -1)"; \
-      for attempt in $(seq 1 30); do \
-        if cargo info "{{crate}}@$version" --registry crates-io >/dev/null 2>&1; then \
-          echo "visible on crates.io: {{crate}}@$version"; \
-          exit 0; \
-        fi; \
-        echo "waiting for crates.io: {{crate}}@$version ($attempt/30)"; \
-        sleep 10; \
-      done; \
-      echo "error: {{crate}}@$version was not visible on crates.io after 5 minutes"; \
-      exit 1
+    bash scripts/publish-crate.sh stemma
+    bash scripts/publish-crate.sh stemma-diff
+    bash scripts/publish-crate.sh stemma-artifacts
+    bash scripts/publish-crate.sh stemma-cli
 
 test:
     cargo test --workspace

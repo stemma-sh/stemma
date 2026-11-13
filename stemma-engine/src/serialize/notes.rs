@@ -74,6 +74,11 @@ pub(crate) fn serialize_footnotes_part(
     } else {
         load_story_template_root(base_pkg, target_archive, &part_path)?
     };
+    // A link in these notes resolves through the part's own relationships
+    // (`word/_rels/<part>.xml.rels`), never the document's: unchanged links
+    // keep their relationship, a link new to the part gets one there.
+    let rels_path = crate::runtime::story_part_rels_path(&part_path);
+    let mut part_rels = base_pkg.story_rels.remove(&rels_path);
     sync_note_like_part(
         &mut root,
         "footnote",
@@ -110,7 +115,19 @@ pub(crate) fn serialize_footnotes_part(
         },
         next_id,
         bookmark_policy,
+        &mut |target: &str, rel_type: &str| {
+            crate::runtime::story_hyperlink_rid(
+                &mut part_rels,
+                &rels_path,
+                &part_path,
+                target,
+                rel_type,
+            )
+        },
     )?;
+    if let Some(rels) = part_rels {
+        base_pkg.story_rels.insert(rels_path, rels);
+    }
     word_xml::ensure_all_used_namespaces(&mut root);
     let xml = word_xml::write_document_xml(&root).map_err(map_word_xml_error)?;
     base_pkg.set_part(&part_path, xml);
@@ -174,6 +191,11 @@ pub(crate) fn serialize_endnotes_part(
     } else {
         load_story_template_root(base_pkg, target_archive, &part_path)?
     };
+    // A link in these notes resolves through the part's own relationships
+    // (`word/_rels/<part>.xml.rels`), never the document's: unchanged links
+    // keep their relationship, a link new to the part gets one there.
+    let rels_path = crate::runtime::story_part_rels_path(&part_path);
+    let mut part_rels = base_pkg.story_rels.remove(&rels_path);
     sync_note_like_part(
         &mut root,
         "endnote",
@@ -210,7 +232,19 @@ pub(crate) fn serialize_endnotes_part(
         },
         next_id,
         bookmark_policy,
+        &mut |target: &str, rel_type: &str| {
+            crate::runtime::story_hyperlink_rid(
+                &mut part_rels,
+                &rels_path,
+                &part_path,
+                target,
+                rel_type,
+            )
+        },
     )?;
+    if let Some(rels) = part_rels {
+        base_pkg.story_rels.insert(rels_path, rels);
+    }
     word_xml::ensure_all_used_namespaces(&mut root);
     let xml = word_xml::write_document_xml(&root).map_err(map_word_xml_error)?;
     base_pkg.set_part(&part_path, xml);
@@ -279,6 +313,11 @@ pub(crate) fn serialize_comments_part(
     } else {
         load_story_template_root(base_pkg, target_archive, &part_path)?
     };
+    // A link in these notes resolves through the part's own relationships
+    // (`word/_rels/<part>.xml.rels`), never the document's: unchanged links
+    // keep their relationship, a link new to the part gets one there.
+    let rels_path = crate::runtime::story_part_rels_path(&part_path);
+    let mut part_rels = base_pkg.story_rels.remove(&rels_path);
     sync_note_like_part(
         &mut root,
         "comment",
@@ -303,12 +342,55 @@ pub(crate) fn serialize_comments_part(
                 if let Some(date) = &story.date {
                     attr_set(note, "w:date", date.clone());
                 }
+                if let Some(initials) = &story.initials {
+                    attr_set(note, "w:initials", initials.clone());
+                }
             }
             Ok(())
         },
         next_id,
         bookmark_policy,
+        &mut |target: &str, rel_type: &str| {
+            crate::runtime::story_hyperlink_rid(
+                &mut part_rels,
+                &rels_path,
+                &part_path,
+                target,
+                rel_type,
+            )
+        },
     )?;
+    if let Some(rels) = part_rels {
+        base_pkg.story_rels.insert(rels_path, rels);
+    }
+    // A comment's author, date and initials are its own attributes
+    // (§17.13.4.2) and the model holds them: a comment the template already
+    // wrote takes the model's values (a comparison carries the target's
+    // metadata on a kept comment), absent ones removed.
+    for child in &mut root.children {
+        let XMLNode::Element(note) = child else {
+            continue;
+        };
+        if local_element_name(note) != "comment" {
+            continue;
+        }
+        let Some(id) = crate::xml_attrs::attr_get(note, "w:id").cloned() else {
+            continue;
+        };
+        let Some(story) = comments.iter().find(|c| c.id == id) else {
+            continue;
+        };
+        for (name, value) in [
+            ("author", &story.author),
+            ("date", &story.date),
+            ("initials", &story.initials),
+        ] {
+            match value {
+                Some(value) => attr_set(note, &format!("w:{name}"), value.clone()),
+                None => note.attributes.retain(|key, _| key.local_name != name),
+            }
+        }
+    }
     word_xml::ensure_all_used_namespaces(&mut root);
     let xml = word_xml::write_document_xml(&root).map_err(map_word_xml_error)?;
     base_pkg.set_part(&part_path, xml);
@@ -590,6 +672,7 @@ fn is_reserved_note(note: &Element) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_note_like_part(
     root: &mut Element,
     note_tag: &str,
@@ -598,6 +681,7 @@ pub(crate) fn sync_note_like_part(
     configure_note_attrs: impl Fn(&str, &mut Element) -> Result<(), RuntimeError>,
     next_id: &mut u32,
     bookmark_policy: &BookmarkIdPolicy,
+    resolve_rel_rid: &mut dyn FnMut(&str, &str) -> String,
 ) -> Result<(), RuntimeError> {
     let ordered_id_set: HashSet<&str> = ordered_ids.iter().map(|s| s.as_str()).collect();
     let mut seen = HashSet::new();
@@ -642,7 +726,8 @@ pub(crate) fn sync_note_like_part(
             continue;
         }
         let blocks = blocks_for_id(&id)?;
-        note.children = serialize_tracked_blocks(&blocks, next_id, bookmark_policy, None)?;
+        note.children =
+            serialize_tracked_blocks(&blocks, next_id, bookmark_policy, Some(resolve_rel_rid))?;
         seen.insert(id);
         retained.push(XMLNode::Element(note));
     }
@@ -655,7 +740,8 @@ pub(crate) fn sync_note_like_part(
         let mut note = w_el(note_tag);
         configure_note_attrs(&id, &mut note)?;
         let blocks = blocks_for_id(&id)?;
-        note.children = serialize_tracked_blocks(&blocks, next_id, bookmark_policy, None)?;
+        note.children =
+            serialize_tracked_blocks(&blocks, next_id, bookmark_policy, Some(resolve_rel_rid))?;
         root.children.push(XMLNode::Element(note));
     }
 
@@ -688,6 +774,7 @@ mod tests {
                 |_, _| panic!("no authored notes to configure"),
                 &mut 0,
                 &BookmarkIdPolicy::default(),
+                &mut |_, _| panic!("no links to resolve"),
             )
             .unwrap();
             let remaining: Vec<_> = root

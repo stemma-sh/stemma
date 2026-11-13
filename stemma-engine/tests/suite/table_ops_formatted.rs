@@ -69,6 +69,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -111,6 +112,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -146,6 +148,7 @@ fn single_borders() -> BorderSet {
 /// A cell carrying NON-DEFAULT formatting (shading + explicit width + vAlign).
 fn formatted_cell(id: &str, text: &str) -> TableCellNode {
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks: vec![BlockNode::from(text_para(&format!("{id}_p"), text))],
         grid_span: 1,

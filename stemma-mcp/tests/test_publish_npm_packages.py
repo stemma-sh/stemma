@@ -162,7 +162,14 @@ if command == "publish":
     if spec in state.get("publish_fail", []):
         print("synthetic publish failure", file=sys.stderr)
         raise SystemExit(8)
-    integrity = state["local_integrities"][spec]
+    if spec in state.get("remote", {}) or spec in state.get("pending", {}):
+        print("EPUBLISHCONFLICT cannot publish over " + spec, file=sys.stderr)
+        raise SystemExit(1)
+    # served_integrities models a registry that serves other bytes than the
+    # ones uploaded; normally it serves exactly what was published.
+    integrity = state.get("served_integrities", {}).get(
+        spec, state["local_integrities"][spec]
+    )
     delay = state.get("publish_delays", {}).get(spec, 0)
     if delay:
         state.setdefault("pending", {})[spec] = {
@@ -224,6 +231,9 @@ class PublishNpmPackagesTests(unittest.TestCase):
     def ordered_specs(self):
         return [self.spec(name) for _directory, name in PACKAGES]
 
+    def read_state(self):
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
     def write_state(self, **overrides):
         state = {
             "local_integrities": self.local_integrities,
@@ -238,14 +248,20 @@ class PublishNpmPackagesTests(unittest.TestCase):
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
         self.log_path.unlink(missing_ok=True)
 
-    def run_script(self):
+    def run_script(self, poll_attempts="4", poll_interval="0"):
         environment = os.environ.copy()
         environment["PATH"] = str(self.fake_bin) + os.pathsep + environment["PATH"]
         environment["HOME"] = str(self.home)
         environment["FAKE_NPM_STATE"] = str(self.state_path)
         environment["FAKE_NPM_LOG"] = str(self.log_path)
-        environment["STEMMA_NPM_PUBLISH_POLL_ATTEMPTS"] = "4"
-        environment["STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS"] = "0"
+        for key, value in (
+            ("STEMMA_NPM_PUBLISH_POLL_ATTEMPTS", poll_attempts),
+            ("STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS", poll_interval),
+        ):
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = value
         environment.pop("NODE_AUTH_TOKEN", None)
         environment.pop("NPM_TOKEN", None)
         return subprocess.run(
@@ -293,7 +309,7 @@ class PublishNpmPackagesTests(unittest.TestCase):
                 }
             manifest.write_text(json.dumps(package), encoding="utf-8")
 
-    def test_fresh_publish_is_platform_first_and_verifies_before_continuing(self):
+    def test_fresh_publish_is_platforms_then_one_wait_then_wrapper(self):
         first_spec = self.ordered_specs[0]
         self.write_state(publish_delays={first_spec: 1})
 
@@ -302,33 +318,133 @@ class PublishNpmPackagesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.published_specs(), self.ordered_specs)
         events = self.events()
-        first_publish = next(index for index, event in enumerate(events) if event[0] == "publish")
+        publish_indices = [
+            index for index, event in enumerate(events) if event[0] == "publish"
+        ]
+        first_publish = publish_indices[0]
         self.assertEqual(
             [event[1] for event in events[:first_publish] if event[0] == "view"],
             self.ordered_specs,
             "every remote version must be reconciled before the first publish",
         )
-        publish_indices = [
-            index for index, event in enumerate(events) if event[0] == "publish"
-        ]
-        for position, publish_index in enumerate(publish_indices):
-            next_publish = (
-                publish_indices[position + 1]
-                if position + 1 < len(publish_indices)
-                else len(events)
-            )
-            spec = self.ordered_specs[position]
-            self.assertTrue(
-                any(
-                    event[0] == "view" and event[1] == spec
-                    for event in events[publish_index + 1 : next_publish]
-                ),
-                "a publish must be remotely verified before the next publish",
-            )
+        platform_publishes = publish_indices[:5]
+        wrapper_publish = publish_indices[5]
+        self.assertEqual(
+            platform_publishes,
+            list(range(first_publish, first_publish + 5)),
+            "the five platform packages are published back to back",
+        )
+        between = events[platform_publishes[-1] + 1 : wrapper_publish]
+        self.assertTrue(all(event[0] == "view" for event in between), between)
+        self.assertEqual(
+            {event[1] for event in between},
+            set(self.ordered_specs[:5]),
+            "every platform package is verified before the wrapper is published",
+        )
+        self.assertEqual(
+            [event[1] for event in between if event[1] == first_spec],
+            [first_spec, first_spec],
+            "a still-invisible platform is polled again in the same wait",
+        )
+        self.assertEqual(
+            [event[1] for event in events[wrapper_publish + 1 :]],
+            [self.ordered_specs[-1]],
+            "the wrapper is verified after its own publish",
+        )
+        for index in publish_indices:
             self.assertEqual(
-                events[publish_index][2:],
+                events[index][2:],
                 ["--access", "public", "--provenance", "--ignore-scripts"],
             )
+        self.assertEqual(result.stdout.count("wait ("), 2, result.stdout)
+
+    def test_slow_registry_is_absorbed_by_two_waits(self):
+        # npm took 3 to 12 minutes per new package on 2026-11-07. Model that
+        # as versions that stay invisible for several polls after publish.
+        delays = dict(zip(self.ordered_specs, (3, 1, 5, 0, 2, 4)))
+        self.write_state(publish_delays=delays)
+
+        result = self.run_script(poll_attempts="6", poll_interval="0.01")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.published_specs(), self.ordered_specs)
+        self.assertEqual(result.stdout.count("wait ("), 2, result.stdout)
+        self.assertEqual(result.stdout.count("verified:"), len(PACKAGES))
+        events = self.events()
+        wrapper_publish = [
+            index for index, event in enumerate(events) if event[0] == "publish"
+        ][-1]
+        slowest = self.ordered_specs[2]
+        self.assertEqual(
+            sum(1 for event in events[:wrapper_publish] if event[1] == slowest),
+            1 + 6,
+            "one preflight view, then polls until visible on the sixth attempt",
+        )
+
+    def test_visibility_timeout_fails_loudly_and_rerun_resumes(self):
+        slow_platform = self.ordered_specs[2]
+        wrapper_spec = self.ordered_specs[-1]
+        self.write_state(publish_delays={slow_platform: 10})
+
+        timed_out = self.run_script(poll_attempts="3", poll_interval="0")
+
+        self.assertNotEqual(timed_out.returncode, 0)
+        self.assertEqual(self.published_specs(), self.ordered_specs[:5])
+        self.assertIn(slow_platform, timed_out.stderr)
+        self.assertIn("after 3 attempts", timed_out.stderr)
+        self.assertIn("Rerun", timed_out.stderr)
+        self.assertNotIn("publication complete", timed_out.stdout)
+
+        # Rerunning while npm still hides the version cannot succeed quietly:
+        # the version looks missing, and npm refuses to publish it again.
+        state = self.read_state()
+        self.write_state(**state)
+        too_early = self.run_script(poll_attempts="3", poll_interval="0")
+        self.assertNotEqual(too_early.returncode, 0)
+        self.assertIn("npm publish failed for " + slow_platform, too_early.stderr)
+        self.assertNotIn(wrapper_spec, self.published_specs())
+
+        # Once npm serves it, a rerun verifies every platform integrity,
+        # skips them, and finishes with the wrapper.
+        state = self.read_state()
+        state["remote"][slow_platform] = state["pending"].pop(slow_platform)["integrity"]
+        self.write_state(**state)
+        resumed = self.run_script(poll_attempts="3", poll_interval="0")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.published_specs(), [wrapper_spec])
+        self.assertEqual(resumed.stdout.count("skip:"), 5)
+        self.assertIn("publication complete", resumed.stdout)
+
+    def test_visible_version_with_wrong_integrity_fails_during_wait(self):
+        target = self.ordered_specs[1]
+        # The registry serves different bytes than the ones just published.
+        self.write_state(served_integrities={target: sri("tampered")})
+
+        result = self.run_script()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(target, result.stderr)
+        self.assertIn(sri("tampered"), result.stderr)
+        self.assertNotIn(self.ordered_specs[-1], self.published_specs())
+
+    def test_default_window_is_about_fifteen_minutes(self):
+        self.write_state()
+
+        result = self.run_script(poll_attempts=None, poll_interval=None)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("up to 60 attempts x 15s", result.stdout)
+
+    def test_release_workflow_sets_the_window_explicitly(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.index("run: bash stemma-mcp/npm/publish-npm-packages.sh out")
+        step_start = workflow.rindex("      - name:", 0, step)
+        step_text = workflow[step_start:step]
+        self.assertIn('STEMMA_NPM_PUBLISH_POLL_ATTEMPTS: "60"', step_text)
+        self.assertIn('STEMMA_NPM_PUBLISH_POLL_INTERVAL_SECONDS: "15"', step_text)
 
     def test_identical_retry_skips_every_publish(self):
         self.write_state(remote=dict(self.local_integrities))

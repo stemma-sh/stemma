@@ -68,7 +68,7 @@ durability promise.
 | `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial] [--allow-existing-author]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. `--allow-existing-author` confirms that the worklist intentionally continues an existing Word reviewer group. |
 | `stemma compare <base> <target> -o <out> [--author NAME] [--format text\|json]` | Diff two files' accepted readings into a redline (`reject-all == accepted base`, `accept-all == accepted target`); `--author` attributes the revisions; `--format json` emits a `stemma.compare_receipt.v0`. |
 | `stemma extract <file> [--format text\|json]` | Read the body as plain text (default) or structured JSON. |
-| `stemma read <file>` | Emit the complete structured lean view (`stemma.read.v0`): typed blocks with per-segment tracked status, plus the complete revision census. |
+| `stemma read <file>` | Emit the complete structured lean view (`stemma.read.v0`): typed blocks with per-segment tracked status, the complete revision census, and every comment. |
 | `stemma resolve <file> -o <out> <disposition> [--dry-run] [--format text\|json]` | Accept/reject tracked changes; write the result; `--format json` emits a `stemma.resolve_receipt.v0`. |
 | `stemma validate <file> [--format text\|json]` | Parse + validate; print block/revision counts, or a structured `stemma.validate.v0` result. |
 
@@ -133,9 +133,13 @@ boundary. The execution audit is rerun over the exact serialized candidate
 before its receipt or DOCX is committed.
 
 `verify` audits any before/after pair under `tracked-delivery-v0`. It passes
-only when the result validates, contains no untracked committed delta, leaves
-every pre-existing revision untouched, and has no unexplained untouched-scope
-violation. Its `stemma.verify.v0` JSON includes exact input identities and
+only when the result validates, contains no untracked committed delta, has no
+unexplained untouched-scope violation, and leaves every pre-existing revision
+pending and unchanged except by tracked edits inside it: a revision the new
+tracked changes are stacked inside (rejecting exactly the new revisions
+restores it) counts in `summary.preexisting_revisions_edited_inside` and
+passes; a resolved revision, or one changed without a covering tracked
+change, counts in `summary.modified_or_resolved_preexisting` and fails. Its `stemma.verify.v0` JSON includes exact input identities and
 accepted/rejected projection hashes. A policy failure is a structured result
 on stdout with exit `3`, not an operational error. Use it when the output came
 from another producer or when an independent recheck is useful; a successful
@@ -244,7 +248,9 @@ paragraph or a paragraph in a cell:
 { "block_id": "p_41" }
 ```
 
-or an inclusive body-block range:
+or an inclusive range of blocks in document order, which searches the cells of
+any table inside it; either end may also be a table's id, standing for the
+whole table:
 
 ```json
 { "from_block_id": "p_35", "to_block_id": "p_48" }
@@ -254,13 +260,18 @@ Use `stemma read <input>` to inspect current block IDs, including the
 `block_id` of each table cell's paragraphs (`stemma extract --format json`
 lists top-level blocks only). A
 match-count mismatch refuses that item and returns actual matches with excerpts
-instead of guessing. A match crossing an opaque anchor or existing tracked
-segment also refuses the item. An occurrence inside a hyperlink's display text
-or an inline content control's value refuses the item with code
-`matches_inside_inline_objects`: the worklist does not edit inside those
-objects, so the refusal names each one, its paragraph, and the op that edits
-it (`replace` on the hyperlink, `set_content_control_value` or
-`opaque_text_edit` on the control) rather than replacing the rest. A match inside another author's pending
+instead of guessing. A match may run across bookmark, comment-range,
+permission and proofing marks (each keeps its place in the text); a match
+crossing an inline object, a break or an existing tracked segment refuses the
+item, and the refusal names what it crosses. An occurrence inside a hyperlink's display text
+or an inline content control's value is replaced inside that object, as a
+tracked change there; a control bound to a data store gets the new value in
+its store too. A match running across a link's or control's edge refuses as a
+straddle. An occurrence in a control that cannot be edited (content-locked, a
+drop-down, date or other non-text control, one showing its placeholder) or in
+an object holding pending changes refuses the item with code
+`matches_inside_inline_objects`, naming each such object, its paragraph and
+the reason, rather than replacing the rest. A match inside another author's pending
 insertion is applied as a tracked change stacked on that insertion: the
 insertion stays the other author's, edited inside, and is never accepted or
 rejected.
@@ -297,10 +308,10 @@ status, deliverability, or exit code.
   explicit stable refusal code and diagnosis; the items' created less
   withdrawn revisions equal the audited new revision count;
 - `coverage`: the `supported` regions (`body_paragraphs`,
-  `table_cell_paragraphs`), the `default_scope`
+  `table_cell_paragraphs`, and in those paragraphs `hyperlink_text` and
+  `content_control_values`), the `default_scope`
   (`all_body_and_table_paragraphs`), the regions searched but not edited
-  (`searched_not_edited`: `hyperlink_text`, `content_control_values`), and
-  the `unsearched` stories;
+  (`searched_not_edited`, empty since 0.8.0), and the `unsearched` stories;
 - under `verification`: the validator result (`validator_ok`), the
   direct-change count (`direct_changes`), untouched-scope violations
   (`untouched_violations`), pre-existing revisions preserved and edited inside
@@ -317,10 +328,11 @@ Revision numbers are intentionally absent. Word revision IDs are session-local
 handles and can change when the exact output is reopened; publishing them as
 artifact identities would be misleading.
 
-Before output, Stemma serializes the candidate and audits those exact bytes.
+Before output, Stemma serializes the candidate and audits those exact bytes
+under the same `tracked-delivery-v0` policy `verify` checks.
 It blocks any untracked direct change, unexplained untouched-scope violation,
-resolved pre-existing revision, pre-existing revision changed outside the
-blocks the worklist edited, invalid package, disagreement between
+resolved pre-existing revision, pre-existing revision changed other than by
+the worklist's tracked edits inside it, invalid package, disagreement between
 the execution-time item revision census and the serialized package audit
 census, or disagreement between the verification output hash and candidate
 bytes.
@@ -361,6 +373,13 @@ flattening occurs, the human diagnostic reports the number consumed from each
 input; the JSON receipt records their full censuses under
 `flattened_input_revisions.base` and `.target` (both arrays are empty for clean
 inputs).
+
+One deliberate exception: comments are annotations, as in Word. A comment the
+target adds on text both inputs keep is written untracked, so both readings
+show it (Word's own compare does the same, and Word does not honour a tracked
+insertion of such a comment: its reject-all would leave the comment anchored and
+empty). A comment added on inserted text, and a removed comment, are tracked and
+resolve with the rest.
 
 ```
 $ stemma compare memo.docx memo-v2.docx -o redline.docx
@@ -444,20 +463,19 @@ $ stemma extract redline.docx --format json
 `kind` is the engine's full revision vocabulary (the same closed set the
 [read model reference](read-model.md) documents), not just insert/delete:
 `insert`, `delete`, `move` (a source/destination pair enumerates as ONE
-atomic record), `format_run`, `format_paragraph`, `format_table`,
+atomic record), `format_run`, `format_paragraph`, `format_paragraph_mark`
+(a paragraph mark's own run formatting), `format_table`,
 `format_row`, `format_cell`, `format_section`, `opaque_interior` (a
 change inside opaque content such as a textbox; individually resolvable only
 when it carries a nonzero `revision_id`; a census-only interior reports
 `revision_id: 0` and is never selectable), and `cell_merge` (a tracked
-vertical cell merge, `w:cellMerge` with `w:vMerge` or `w:vMergeOrig`; it
-reports `revision_id: 0`, and every resolution, `--accept-all` and
-`--reject-all` included, refuses while one is pending, because resolving it
-is not supported). Unlike every other kind, an `opaque_interior` id is the
+vertical cell merge, `w:cellMerge` with `w:vMerge` or `w:vMergeOrig`; one
+record covers a run of such cells in one column). Unlike every other kind, an `opaque_interior` id is the
 change's own `w:id` inside the textbox, so it is selectable only when no
 other revision in the document carries the same `w:id`; two textboxes sharing
 one both report `0` and are resolved only by accepting or rejecting
 everything. A consumer switching on `kind`
-must handle, or explicitly refuse, all eleven: a real multi-party redline
+must handle, or explicitly refuse, all twelve: a real multi-party redline
 routinely carries moves and formatting changes alongside inserts and
 deletes.
 
@@ -495,7 +513,11 @@ omit `date`.
 > alters a *surviving* revision's content (or removes an identical-signature
 > duplicate ahead of it), that survivor is re-keyed; a mixed `resolve --plan`
 > detects this at its internal phase boundary and refuses rather than
-> resolving the wrong revision. Apart from `opaque_interior` changes (see
+> resolving the wrong revision. Among changes that look exactly alike (same
+> kind, author, date and text), ids are kept by Stemma's own save, reopen and
+> resolutions; after another editor changes the file, lookalikes are numbered
+> again by document order, so two of them can trade ids. Re-read ids after
+> any edit made outside Stemma. Apart from `opaque_interior` changes (see
 > `kind` above), ids never come from raw XML; always read them from
 > `extract`, `read`, or a receipt.
 
@@ -510,7 +532,8 @@ $ stemma read redline.docx
   "schema": "stemma.read.v0",
   "input": { "role": "input_docx", "supplied_path": "…", "digest": { … }, "bytes": … },
   "blocks": [ … ],
-  "revisions": [ … ]
+  "revisions": [ … ],
+  "comments": [ … ]
 }
 ```
 
@@ -522,13 +545,24 @@ literal prefix, and (for tables) the cell grid. This is enough to render a
 redline view from one invocation. `revisions` is the same complete census as
 `extract --format json` (the segment view alone omits formatting-change
 records), so the ids that `resolve` selects on arrive in the same call.
+`comments` lists every comment in document-part order, one object each:
+
+| Field | Meaning |
+|---|---|
+| `id` | The comment id: the `reference_id` of the commented span's `CommentReference` anchor, and the id `comment_reply`, `comment_resolve` and `comment_delete` take. |
+| `author`, `date` | As written; `null` when the comment carries none. |
+| `text` | The body as it currently reads: paragraphs joined by a newline, a link's display text and a field's result inline, one U+FFFC for any other inline object. |
+| `resolved` | Thread-derived: a reply reads its thread root's resolved flag (`w15:done`). |
+| `parent_id` | The id of the comment this one replies to; `null` for a thread root, and also when the thread link names no comment in the document. |
+| `parent_para_id` | The raw thread link (`w15:paraIdParent`), so a link to a missing comment stays visible rather than reading as a root. |
+
 `extract` remains the compact body reading; `read` is the complete structured
 lean machine surface. The CLI does not expose the separately defined
 [full render view](read-model.md#the-full-render-view), which adds resolved
 value formatting, assets, stories, and page geometry.
 
 Stability, same statement as the read-model reference: the envelope
-(`schema`, `input`, the presence of `blocks`/`revisions`) is the v0 contract,
+(`schema`, `input`, the presence of `blocks`/`revisions`/`comments`) is the v0 contract,
 but the block shapes inside are the engine-version-bound read model. Fields
 are added between releases; render from it live, tolerate unknown fields, and
 never persist it (durability is DOCX bytes).
@@ -597,9 +631,7 @@ output, one receipt:
 - Plans address the selectable census (`revision_id != 0`). Census-only
   records (id `0`, e.g. some opaque-interior changes) are outside plan scope
   and stay pending; only the total `--accept-all`/`--reject-all` resolve
-  those. The exception is a pending `cell_merge` record: it is resolved by
-  nothing, and while one is pending every resolution, the total ones
-  included, refuses.
+  those.
 - A mixed plan executes accepts before rejects internally. Revision ids are
   content-derived and survive the internal phase (see **Id durability**
   above); in the rare case an accepted change re-keys a survivor selected

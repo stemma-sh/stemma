@@ -63,5 +63,7 @@ fn opaque_kind_name(kind: &OpaqueSegmentKind) -> String {
         OpaqueSegmentKind::Ptab => "ptab".to_string(),
         OpaqueSegmentKind::CustomXml => "custom_xml".to_string(),
         OpaqueSegmentKind::Unknown(name) => format!("unknown:{name}"),
+        OpaqueSegmentKind::CommentRangeStart => "comment_range_start".to_string(),
+        OpaqueSegmentKind::CommentRangeEnd => "comment_range_end".to_string(),
     }
 }

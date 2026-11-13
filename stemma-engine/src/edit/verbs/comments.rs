@@ -108,6 +108,7 @@ use crate::semantic_hash::check_block_guard;
 fn comment_reference_inline(comment_id: &str) -> InlineNode {
     let id = NodeId::from(format!("comment_ref_{comment_id}"));
     InlineNode::from(crate::domain::OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind: OpaqueKind::CommentReference(crate::domain::NoteReferenceData {
             reference_id: comment_id.to_string(),
@@ -215,7 +216,23 @@ pub(crate) fn apply_create(
     // anchors on a redlined clause. The refusal names the escape hatch. For a
     // cell paragraph the contested levels are the enclosing table, rows and
     // cells.
-    let block_status = if path.is_top_level() {
+    // A paragraph that is wholly a pending insertion (not a move destination)
+    // is commented as an inserted run is: spelled by its parts (below), the
+    // range widens over the insertion like any tracked container's.
+    let inserted_paragraph = path.is_top_level()
+        && matches!(
+            doc.blocks[path.top_block].status,
+            TrackingStatus::Inserted(_)
+        )
+        && doc.blocks[path.top_block].move_id.is_none()
+        && matches!(doc.blocks[path.top_block].block, BlockNode::Paragraph(_))
+        && super::super::block_insertion_lowerable(
+            &doc.blocks[path.top_block],
+            path.top_block + 1 == doc.blocks.len(),
+        );
+    let block_status = if inserted_paragraph {
+        None
+    } else if path.is_top_level() {
         match &doc.blocks[path.top_block].status {
             TrackingStatus::Normal => None,
             TrackingStatus::Inserted(_) => Some("inserted"),
@@ -266,6 +283,10 @@ pub(crate) fn apply_create(
         });
     }
 
+    if inserted_paragraph {
+        super::super::lower_block_insertion(&mut doc.blocks[path.top_block]);
+    }
+
     // Allocate identity before borrowing the paragraph mutably.
     let comment_id = fresh_comment_id(doc);
     let para_id = fresh_para_id(doc, &comment_id);
@@ -307,6 +328,7 @@ pub(crate) fn apply_create(
         id: comment_id,
         author,
         date: revision.date.clone(),
+        initials: None,
         blocks,
         content_hash,
         tracking_status: None,
@@ -452,6 +474,7 @@ pub(crate) fn apply_reply(
         id: reply_id,
         author,
         date: revision.date.clone(),
+        initials: None,
         blocks,
         content_hash,
         tracking_status: None,
@@ -1394,6 +1417,7 @@ mod tests {
             id: "4".to_string(),
             author: None,
             date: None,
+            initials: None,
             blocks: vec![],
             content_hash: String::new(),
             tracking_status: None,

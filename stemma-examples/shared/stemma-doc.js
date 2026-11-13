@@ -413,7 +413,7 @@ export const schema = new Schema({
     },
     // A commented span (§17.13.4). Display-only, dropped on commit (not in
     // V4_MARK) — it highlights the text the engine bracketed with
-    // CommentRangeStart…CommentReference markers (matched by `id` = the
+    // CommentRangeStart…CommentRangeEnd markers (matched by `id` = the
     // CommentPayload.id), so a sidebar card links to its span. `id` is the
     // comment's w:id; `cid` lets clicks/scroll target the span by data attr.
     comment: {
@@ -568,6 +568,21 @@ export function buildDoc(blocks) {
   return schema.nodes.doc.create(null, nodes);
 }
 
+// A comment range marker opens or closes its comment in `openComments` and
+// renders nothing; a comment reference renders nothing either. Returns whether
+// `seg` was one of those zero-width comment anchors.
+function trackCommentRange(seg, openComments) {
+  const o = seg.Opaque;
+  if (!o) return false;
+  if (o.kind === "CommentRangeStart" && o.reference_id != null) openComments.add(o.reference_id);
+  else if (o.kind === "CommentRangeEnd" && o.reference_id != null) openComments.delete(o.reference_id);
+  return isCommentAnchor(o.kind);
+}
+
+function isCommentAnchor(kind) {
+  return kind === "CommentRangeStart" || kind === "CommentRangeEnd" || kind === "CommentReference";
+}
+
 // Build the ProseMirror node for one /rich block. Exported so the editor can
 // patch a single block in place (reconcile).
 // Cell paragraphs are editable (real PM content), like body paragraphs.
@@ -579,11 +594,7 @@ const CELLS_READONLY = false;
 function buildCellParagraph(par, readonly) {
   const openComments = new Set();
   const inline = (par.segments || []).flatMap((seg) => {
-    if (seg.Opaque && seg.Opaque.kind === "CommentReference") {
-      const cid = seg.Opaque.reference_id;
-      if (cid != null) { if (openComments.has(cid)) openComments.delete(cid); else openComments.add(cid); }
-      return [];
-    }
+    if (trackCommentRange(seg, openComments)) return [];
     return segToInline(seg, "[]", openComments, par.block_id);
   });
   return schema.nodes.paragraph.create(
@@ -622,18 +633,14 @@ export function buildBlock(b) {
   const ind = b.indent || {};
   const bodyLeft = (ind.left || 0) + (ind.effective_first_line_twips || 0);
   const stopsAttr = JSON.stringify((b.tab_stops || []).map((t) => ({ p: bodyLeft + t.position, a: t.alignment || "Left", l: t.leader || null })));
-  // Comment anchors arrive as zero-width `CommentReference` opaque segments that
-  // BRACKET the commented text (start + end, same `reference_id`). We toggle an
-  // "open comment ids" set as we walk the segments and attach the `comment` mark
-  // to the text in between — so the span highlights and links to its sidebar card
-  // — then drop the marker segments themselves (they carry no text).
+  // Comment ranges arrive as zero-width `CommentRangeStart` / `CommentRangeEnd`
+  // opaque segments that BRACKET the commented text (same `reference_id`). We
+  // track an "open comment ids" set as we walk the segments and attach the
+  // `comment` mark to the text in between — so the span highlights and links to
+  // its sidebar card — then drop the marker segments (they carry no text).
   const openComments = new Set();
   const inline = (b.segments || []).flatMap((seg) => {
-    if (seg.Opaque && seg.Opaque.kind === "CommentReference") {
-      const cid = seg.Opaque.reference_id;
-      if (cid != null) { if (openComments.has(cid)) openComments.delete(cid); else openComments.add(cid); }
-      return [];
-    }
+    if (trackCommentRange(seg, openComments)) return [];
     return segToInline(seg, stopsAttr, openComments, b.block_id);
   });
   // Numbering marker: a non-editable inline atom + a REAL tab node, so the
@@ -715,9 +722,9 @@ function segToInline(seg, stopsAttr = "", openComments = null, blockId = null) {
   }
   if (seg.Opaque) {
     const o = seg.Opaque;
-    // Comment anchor markers are zero-width and consumed by buildBlock (which
-    // toggles the open-comment set); they render nothing on their own.
-    if (o.kind === "CommentReference") return [];
+    // Comment anchors are zero-width and consumed by buildBlock (which tracks
+    // the open-comment set); they render nothing on their own.
+    if (isCommentAnchor(o.kind)) return [];
     if (o.kind === "Drawing" && o.asset_ref && o.asset_ref.startsWith("data:")) {
       // Thread the drawing's engine identity (opaque_id → drawingId, the hosting
       // block → blockId, the drawing's own content_hash → drawingGuard) so the
@@ -776,7 +783,7 @@ export function isCommittable(b) {
   if (b.block_type !== "Paragraph" && b.block_type !== "Heading") return false;
   if (b.numbering_text) return false;
   const segs = b.segments || [];
-  if (segs.some((s) => s.Opaque && s.Opaque.kind !== "Hyperlink" && s.Opaque.kind !== "CommentReference")) return false;
+  if (segs.some((s) => s.Opaque && s.Opaque.kind !== "Hyperlink" && !isCommentAnchor(s.Opaque.kind))) return false;
   // Blocks that already carry a tracked change (Inserted/Deleted) ARE committable
   // again: the engine re-edits them via flatten-then-diff (accepts the prior
   // change into the base, then tracks the new edit), so a reviewer can refine a

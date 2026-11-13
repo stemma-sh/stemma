@@ -14,7 +14,9 @@
 //! catching up to byte-path parity. The collapse itself is unchanged.
 //!
 //! The collapse touches range MARKERS only — never the `commentReference` run nor
-//! `word/comments.xml` — so the comment is preserved, only re-anchored.
+//! `word/comments.xml` — so the comment is preserved, only re-anchored, while
+//! its range still holds text. (A resolution that removes all of a comment's
+//! text removes the comment, as Word does: `comment_anchor_resolution`.)
 //!
 //! Daily tier: synthetic in-memory DOCX carrying a real comments part.
 
@@ -206,6 +208,7 @@ fn torn_comment_survivor_start_collapses_on_reject() {
     let body = r#"<w:p>
       <w:r><w:t xml:space="preserve">Before </w:t></w:r>
       <w:commentRangeStart w:id="1"/>
+      <w:r><w:t xml:space="preserve">kept </w:t></w:r>
       <w:ins w:id="7" w:author="A" w:date="2024-01-01T00:00:00Z">
         <w:r><w:t>inserted</w:t></w:r>
         <w:commentRangeEnd w:id="1"/>
@@ -317,6 +320,7 @@ fn comment_and_bookmark_tears_collapse_independently() {
       <w:r><w:t xml:space="preserve">Before </w:t></w:r>
       <w:bookmarkStart w:id="3" w:name="_BM"/>
       <w:commentRangeStart w:id="3"/>
+      <w:r><w:t xml:space="preserve">kept </w:t></w:r>
       <w:ins w:id="7" w:author="A" w:date="2024-01-01T00:00:00Z">
         <w:r><w:t>inserted</w:t></w:r>
         <w:commentRangeEnd w:id="3"/>
@@ -376,7 +380,7 @@ fn wire_model_parity_on_comment_tears() {
     let cases = [
         Case {
             name: "start-survivor/reject",
-            body: r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r><w:commentRangeStart w:id="1"/><w:ins w:id="7" w:author="A" w:date="2024-01-01T00:00:00Z"><w:r><w:t>inserted</w:t></w:r><w:commentRangeEnd w:id="1"/></w:ins><w:r><w:commentReference w:id="1"/></w:r><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#,
+            body: r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r><w:commentRangeStart w:id="1"/><w:r><w:t xml:space="preserve">kept </w:t></w:r><w:ins w:id="7" w:author="A" w:date="2024-01-01T00:00:00Z"><w:r><w:t>inserted</w:t></w:r><w:commentRangeEnd w:id="1"/></w:ins><w:r><w:commentReference w:id="1"/></w:r><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#,
             ids: &["1"],
             accept: false,
         },

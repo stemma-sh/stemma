@@ -47,10 +47,32 @@ pub(crate) fn tracked_class_survives(
     }
 }
 
+/// Whether accepting a deleted cell gives its width to a neighbour.
+///
+/// Accepting a deleted column gives its width to a neighbour only where the
+/// neighbour grew: Word merges a deleted cell that keeps a paragraph mark
+/// (its marks not tracked as deleted) into the preceding cell, which takes
+/// its width (the following cell when the leading column is deleted); a cell
+/// deleted whole, its paragraph marks tracked as deleted too, leaves with its
+/// width. Observed in Word 16 (2026-11-09) on simple 4-column grids, auto or
+/// fixed layout, auto or `dxa` preferred width: text deleted but mark kept,
+/// or content untracked, Accept widens the preceding cell by the deleted
+/// width; text and mark deleted, Accept removes the column and its width.
+/// The table's preferred width plays no part: Word's save rescales a grid to
+/// a `dxa` preferred width with or without a deletion.
+///
+/// The tracked `delete_column` verb deletes a partition of the neighbour's
+/// slot, its text deleted and its mark kept, so Accept gives the slot back.
+pub(crate) fn deleted_cell_gives_width(keeps_paragraph_mark: bool) -> bool {
+    keeps_paragraph_mark
+}
+
 /// Resolve physical slots of a simple tracked column grid. Accepting a
-/// deletion transfers its slot to the preceding surviving column, or to the
-/// following survivor when deleting the leading column. Rejecting an insertion
-/// removes its slot without transfer. Stacked origins never transfer a slot.
+/// deletion marked in `absorb` ([`deleted_cell_gives_width`] in every row)
+/// transfers its slot to the preceding surviving column, or to the
+/// following survivor when deleting the leading column; any other removed
+/// slot leaves with its width. Rejecting an insertion removes its slot
+/// without transfer. Stacked origins never transfer a slot.
 /// Returned indices refer to the original frame, so both XML and model callers
 /// can update cell widths before removing their physical carriers.
 pub(crate) fn resolved_column_slots(
@@ -157,24 +179,38 @@ pub(crate) fn is_zero_width_body_marker_name(local: &str) -> bool {
 /// rowless is untouched by the resolution and does NOT vanish, so it does not
 /// satisfy this rule.
 ///
-/// `rows` yields each row's `(has_ins_mark, has_del_mark)`; per-row survival
-/// goes through [`tracked_class_survives`], so this composition cannot drift
-/// from the block/row retain filter that actually drops the rows. Consumers:
-/// byte `table_emptied_by_resolution` (normalize.rs, rows from
-/// `w:trPr/w:ins`/`w:del`); model `table_emptied_by_accept_reject`
-/// (tracked_model.rs, rows from each row's `tracking_status`).
-pub(crate) fn table_emptied_by_resolution(
-    rows: impl Iterator<Item = (bool, bool)>,
-    keep_inserted: bool,
-) -> bool {
+/// `rows` yields whether each row survives ([`row_survives_resolution`]), so
+/// this composition cannot drift from the row retain filter that actually
+/// drops the rows. Consumers: byte `table_emptied_by_resolution`
+/// (normalize.rs); model `table_emptied_by_accept_reject` (tracked_model.rs).
+pub(crate) fn table_emptied_by_resolution(rows: impl Iterator<Item = bool>) -> bool {
     let mut saw_row = false;
-    for (has_ins_mark, has_del_mark) in rows {
+    for survives in rows {
         saw_row = true;
-        if tracked_class_survives(has_ins_mark, has_del_mark, keep_inserted) {
+        if survives {
             return false;
         }
     }
     saw_row
+}
+
+/// Whether a table row survives a full resolution: its own marks survive
+/// (`w:trPr/w:ins`, `w:trPr/w:del`) and so does at least one of its cells
+/// (`w:tcPr/w:cellIns`, `w:tcPr/w:cellDel`), each through
+/// [`tracked_class_survives`]. A row whose every cell is a tracked cell
+/// deletion loses all of them on Accept, and a row holds at least one cell
+/// (CT_Row, §17.4.79: `tc` one or more), so the row goes with its cells.
+/// Consumers: byte accept/reject passes and `table_emptied_by_resolution`
+/// (normalize.rs); model `row_survives_accept_reject` (tracked_model.rs).
+pub(crate) fn row_survives_resolution(
+    row: (bool, bool),
+    cells: impl IntoIterator<Item = (bool, bool)>,
+    keep_inserted: bool,
+) -> bool {
+    tracked_class_survives(row.0, row.1, keep_inserted)
+        && cells
+            .into_iter()
+            .any(|(has_ins, has_del)| tracked_class_survives(has_ins, has_del, keep_inserted))
 }
 
 #[cfg(test)]
@@ -272,20 +308,35 @@ mod tests {
     // the revision pass removes), not from either path's fold.
     #[test]
     fn table_emptied_composition() {
+        // No rows: never "emptied by resolution" (nothing to drop).
+        assert!(!table_emptied_by_resolution(std::iter::empty()));
+        // A surviving row keeps the table.
+        assert!(!table_emptied_by_resolution([true].into_iter()));
+        // Every row drops → emptied.
+        assert!(table_emptied_by_resolution([false, false].into_iter()));
+        // A mix with one survivor keeps the table.
+        assert!(!table_emptied_by_resolution([false, true].into_iter()));
+    }
+
+    // Post-condition: a row survives iff its own marks survive and at least
+    // one cell survives (CT_Row needs a cell; a deleted cell goes on Accept).
+    #[test]
+    fn row_survival_needs_a_surviving_cell() {
+        let normal = (false, false);
+        let deleted = (false, true);
+        let inserted = (true, false);
         for &keep in &[false, true] {
-            // No rows: never "emptied by resolution" (nothing to drop).
-            assert!(!table_emptied_by_resolution(std::iter::empty(), keep));
-            // A surviving normal row keeps the table.
-            assert!(!table_emptied_by_resolution(
-                [(false, false)].into_iter(),
-                keep
-            ));
-            // Every row drops in this direction → emptied.
-            let all_drop = [(!keep, keep)]; // insertion-class survives only on accept
-            assert!(table_emptied_by_resolution(all_drop.into_iter(), keep));
-            // A mix with one survivor keeps the table.
-            let mixed = [(!keep, keep), (false, false)];
-            assert!(!table_emptied_by_resolution(mixed.into_iter(), keep));
+            assert!(row_survives_resolution(normal, [normal], keep));
+            assert!(row_survives_resolution(normal, [deleted, normal], keep));
+            // A deleted row drops on Accept, an inserted one on Reject.
+            assert_eq!(row_survives_resolution(deleted, [normal], keep), !keep);
+            assert_eq!(row_survives_resolution(inserted, [normal], keep), keep);
         }
+        // Every cell deleted: the row goes on Accept, stays on Reject.
+        assert!(!row_survives_resolution(normal, [deleted, deleted], true));
+        assert!(row_survives_resolution(normal, [deleted, deleted], false));
+        // Every cell inserted: the row goes on Reject, stays on Accept.
+        assert!(row_survives_resolution(normal, [inserted], true));
+        assert!(!row_survives_resolution(normal, [inserted], false));
     }
 }

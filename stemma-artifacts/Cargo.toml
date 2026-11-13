@@ -1,6 +1,6 @@
 [package]
 name = "stemma-artifacts"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Host-side artifact identity and safe create-new filesystem boundary for Stemma transports."

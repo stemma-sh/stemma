@@ -210,7 +210,8 @@ fn survivor_inside_nested_table_cell_is_repaired() {
 /// (c) A bookmark, a comment range and a permission range that share the SAME
 /// numeric pairing id (600), all with their ends in the same rejected
 /// insertion. Each end stays at the removal point within its own family; a
-/// repair keyed on id alone would cross-pair them (or drop one).
+/// repair keyed on id alone would cross-pair them (or drop one). The ranges
+/// keep text, so the comment keeps its anchor.
 #[test]
 fn mixed_families_shared_id_do_not_cross_pair() {
     let body = r#"<w:p>
@@ -218,6 +219,7 @@ fn mixed_families_shared_id_do_not_cross_pair() {
       <w:bookmarkStart w:id="600" w:name="_BM"/>
       <w:commentRangeStart w:id="600"/>
       <w:permStart w:id="600" w:edGrp="everyone"/>
+      <w:r><w:t xml:space="preserve">kept </w:t></w:r>
       <w:ins w:id="7" w:author="A" w:date="2024-01-01T00:00:00Z">
         <w:r><w:t>gone</w:t></w:r>
         <w:bookmarkEnd w:id="600"/>

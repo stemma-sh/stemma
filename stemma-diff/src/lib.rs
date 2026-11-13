@@ -15,10 +15,13 @@ pub(crate) mod domain {
     pub(crate) use stemma::domain::*;
 }
 
+mod comments;
 mod compiler;
 mod controls;
+mod fields;
 mod materialize;
 mod model;
+mod noterefs;
 mod semantic_hash;
 mod table_diff;
 
@@ -110,6 +113,66 @@ fn diff_detailed_with_author(
     })
 }
 
+/// One comment as the read surfaces (`stemma read`, MCP `inspect_docx
+/// query='comments'`) report it, derived from the full view's comment
+/// projection.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct CommentReading {
+    /// The comment id: the `reference_id` of the commented span's
+    /// `CommentReference` anchor, and the id comment ops take.
+    pub id: String,
+    pub author: Option<String>,
+    pub date: Option<String>,
+    /// The body as it currently reads: paragraphs joined by "\n", a link's
+    /// display text and a field's result inline, one U+FFFC for any other
+    /// inline object.
+    pub text: String,
+    /// Thread-derived: a reply reads its thread root's `w15:done` flag.
+    pub resolved: bool,
+    /// The comment this one replies to; `None` for a thread root, and also
+    /// when `parent_para_id` names no comment in the document.
+    pub parent_id: Option<String>,
+    /// The raw thread link (`w15:paraIdParent`), so a link that resolves to
+    /// no comment stays visible rather than reading as a root.
+    pub parent_para_id: Option<String>,
+}
+
+/// Every comment in document-part order, with its thread position resolved.
+pub fn comment_readings(document: &stemma::CanonDoc) -> Vec<CommentReading> {
+    let comments = compiler::project_comments(document);
+    comments
+        .iter()
+        .map(|comment| CommentReading {
+            id: comment.id.clone(),
+            author: comment.author.clone(),
+            date: comment.date.clone(),
+            text: comment_text(&comment.segments),
+            resolved: comment.resolved,
+            parent_id: comment.parent_para_id.as_ref().and_then(|parent| {
+                comments
+                    .iter()
+                    .find(|candidate| candidate.para_id.as_ref() == Some(parent))
+                    .map(|candidate| candidate.id.clone())
+            }),
+            parent_para_id: comment.parent_para_id.clone(),
+        })
+        .collect()
+}
+
+fn comment_text(segments: &[stemma::InlineChange]) -> String {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            stemma::InlineChange::Unchanged { text, .. }
+            | stemma::InlineChange::Inserted { text, .. }
+            | stemma::InlineChange::Deleted { text, .. } => text.clone(),
+            stemma::InlineChange::Opaque { text, .. } => {
+                text.clone().unwrap_or_else(|| "\u{FFFC}".to_string())
+            }
+        })
+        .collect()
+}
+
 /// Build the rich tracked-document read projection used by comparison-aware
 /// clients. Media lookup failures are surfaced; a missing asset is not silently
 /// converted into an empty projection.
@@ -199,6 +262,19 @@ fn diff_snapshots(
     })?;
     let mut merged = merge.doc;
     stemma::runtime::restore_opaque_transport_hashes(&mut merged)?;
+    // A field the comparison inserted or deleted whole is one revision, as
+    // in Word, so resolving any revision alone cannot tear it.
+    stemma::tracked_model::unify_whole_field_revisions(&mut merged);
+    // The redline holds both inputs' drawings: an inserted drawing whose id
+    // another already uses gets an unused one (ids are unique, §20.4.2.5).
+    stemma::drawing_ids::make_drawing_ids_unique(&mut merged).map_err(|error| RuntimeError {
+        code: ErrorCode::InvalidDocx,
+        message: "the redline's drawing ids cannot be made unique".to_string(),
+        details: ErrorDetails {
+            context: Some(error),
+            ..ErrorDetails::default()
+        },
+    })?;
     stemma::import::mint_identities(&mut merged);
 
     let snapshot = stemma::runtime::materialize_compiled_document(source, &target, merged)?;

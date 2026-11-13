@@ -642,9 +642,9 @@ async function insertImageFile(file) {
 
 // ─── comments (redline review) ──────────────────────────────────────────────
 // Author a comment on the selected text → comment_create {target, expect, body,
-// author}. The engine brackets the span with CommentRangeStart…CommentReference
-// markers (surfaced as zero-width CommentReference opaque segments carrying the
-// comment's reference_id); buildBlock turns the text between them into a `comment`
+// author}. The engine brackets the span with CommentRangeStart…CommentRangeEnd
+// markers (zero-width opaque segments of those kinds carrying the comment's
+// reference_id); buildBlock turns the text between them into a `comment`
 // mark, so the span highlights and links to its sidebar card. After the op we
 // re-read /rich fully so the sidebar + highlights stay read-consistent.
 

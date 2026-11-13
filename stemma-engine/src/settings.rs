@@ -209,26 +209,18 @@ pub fn parse_default_tab_stop_bytes(xml_bytes: Option<&[u8]>) -> Result<Option<i
         if crate::word_xml::is_w_tag(el, "defaultTabStop") {
             let val = crate::xml_attrs::attr_get(el, "val")
                 .ok_or_else(|| "word/settings.xml defaultTabStop missing w:val".to_string())?;
-            let parsed = match crate::import::parse_measurement_or_percent(
-                val,
-                "word/settings.xml defaultTabStop",
-            )
-            .map_err(|err| err.message)?
-            {
-                crate::import::MeasurementOrPercent::Number(value)
-                | crate::import::MeasurementOrPercent::UniversalTwips(value) => {
-                    i32::try_from(value).map_err(|_| {
-                        format!(
-                            "word/settings.xml defaultTabStop value '{val}' is outside the i32 twips range"
-                        )
-                    })?
-                }
-                crate::import::MeasurementOrPercent::Percent { .. } => {
-                    return Err(format!(
-                        "word/settings.xml defaultTabStop has invalid percentage w:val '{val}'"
-                    ));
-                }
-            };
+            // One twips reading for every twips attribute
+            // (`import::read_twips`); a value with no number is refused.
+            let twips = crate::import::read_twips(val)
+                .map_err(|err| {
+                    format!("word/settings.xml defaultTabStop w:val '{val}' is not a twips measure ({err:?})")
+                })?
+                .ok_or_else(|| "word/settings.xml defaultTabStop has an empty w:val".to_string())?;
+            let parsed = i32::try_from(twips).map_err(|_| {
+                format!(
+                    "word/settings.xml defaultTabStop value '{val}' is outside the i32 twips range"
+                )
+            })?;
             return Ok(Some(parsed));
         }
     }
@@ -542,7 +534,7 @@ mod tests {
 </w:settings>"#;
         let archive = archive_with_settings(xml);
         let err = parse_default_tab_stop(&archive).expect_err("percentage is not a twips measure");
-        assert!(err.contains("percentage"), "unexpected error: {err}");
+        assert!(err.contains("50%"), "unexpected error: {err}");
     }
 
     // ── evenAndOddHeaders tests ─────────────────────────────────────────

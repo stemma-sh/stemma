@@ -8,8 +8,10 @@
 //! be serialized (Annex A child ordering) and consumed (accept-all / reject-all
 //! text). A FAILING assertion here means stemma DIVERGES from Word — i.e. a real
 //! Word-compliance gap — NOT something to be made green by weakening the test.
-//! A cellMerge that changes the merge state is refused by Accept/Reject All
-//! (§17.13.5.3 resolution is not modeled): a deliberate refusal, not a weakening.
+//! A cellMerge that changes the merge state (§17.13.5.3) resolves as Word 16
+//! resolves it: Accept gives the cell the `w:vMerge` merge, Reject the
+//! `w:vMergeOrig` one (absent = not merged), and a cell left as a continuation
+//! loses its content.
 //!
 //! Methodology note (consumption vs. save):
 //! - `xmlContains`/`xmlOmits`/ordering checks run against `reserialize()`. stemma
@@ -154,31 +156,17 @@ fn current_text(bytes: &[u8]) -> String {
 }
 
 /// A cellMerge that changes the merge state (§17.13.5.3) is reported by the
-/// revision census, and Accept All / Reject All refuse with a typed error naming
-/// it while it is pending: resolving it is not supported yet, and resolving
-/// around it would report a resolved document that still carries it.
-fn assert_cell_merge_resolution_refused(bytes: &[u8]) {
+/// revision census as one `cell_merge` record.
+fn assert_cell_merge_reported(bytes: &[u8]) {
     let doc = Document::parse(bytes).expect("a document with a tracked cell merge opens");
-    assert!(
+    assert_eq!(
         doc.revisions()
             .iter()
-            .any(|record| record.kind == stemma::RevisionKind::CellMerge),
-        "the census reports the pending cell merge"
+            .filter(|record| record.kind == stemma::RevisionKind::CellMerge)
+            .count(),
+        1,
+        "the census reports the pending cell merge once"
     );
-    for (label, result) in [
-        ("accept all", doc.read_accepted()),
-        ("reject all", doc.read_rejected()),
-    ] {
-        let Err(error) = result else {
-            panic!("{label} must refuse while a tracked cell merge is pending");
-        };
-        assert_eq!(
-            error.code,
-            stemma::ErrorCode::UnsupportedEdit,
-            "{label}: {error}"
-        );
-        assert!(error.message.contains("cellMerge"), "{label}: {error}");
-    }
 }
 
 /// Remove ASCII/Unicode whitespace so a cell-survival assertion is independent
@@ -230,16 +218,26 @@ fn assert_ordered_adjacent(xml: &str, first_open: &str, second_open: &str, msg: 
 fn cellmerge_cont_is_merge_state_not_content_delete() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4788"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Above</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/><w:cellMerge w:id="3" w:vMerge="cont"/></w:tcPr><w:p><w:r><w:t>Below</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    // Resolution is refused until cell-merge revisions are modeled; the cell
-    // text must survive on read, and Accept/Reject All must refuse loudly.
+    // The pending reading shows both cells; Accept makes 'Below' a
+    // continuation, which Word empties; Reject leaves it unmerged.
     assert_eq!(
         current_text(&b),
         "AboveBelow",
-        "§17.13.5.3 / §17.18.1 (ST_AnnotationVMerge cont): cellMerge changes only \
-         vertical-merge STATE, never content, so 'Below' is NOT dropped. \
+        "§17.13.5.3 / §17.18.1 (ST_AnnotationVMerge cont): a pending cellMerge changes \
+         vertical-merge STATE, not content, so 'Below' still reads. \
          refs: ECMA-376 §17.13.5.3, MS-OI29500 §2.1.319, ECMA-376 §17.18.1"
     );
-    assert_cell_merge_resolution_refused(&b);
+    assert_cell_merge_reported(&b);
+    assert_eq!(
+        accept_text(&b),
+        "Above",
+        "Word 16: accepting cellMerge vMerge=cont makes the cell a continuation and deletes its text"
+    );
+    assert_eq!(
+        reject_text(&b),
+        "AboveBelow",
+        "Word 16: rejecting a cellMerge with no vMergeOrig leaves the cell unmerged, text kept"
+    );
     assert_eq!(
         validation_issues(&b),
         "",
@@ -317,19 +315,28 @@ fn cellmerge_serializes_after_vmerge_before_tcprchange() {
 }
 
 #[test]
-fn cellmerge_text_survives_both_resolutions_and_independent_of_sibling_celldel() {
+fn cellmerge_resolves_independently_of_sibling_celldel() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4788"/><w:gridCol w:w="4788"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Keep</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/><w:cellDel w:id="5" w:author="A" w:date="2006-06-01T10:00:00Z"/></w:tcPr><w:p><w:r><w:t>Gone</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Three</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/><w:cellMerge w:id="6" w:author="A" w:date="2006-06-01T10:00:00Z" w:vMerge="cont"/></w:tcPr><w:p><w:r><w:t>Four</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    // Resolution is refused until cell-merge revisions are modeled; the cell
-    // text must survive on read, and Accept/Reject All must refuse loudly.
     assert_eq!(
         current_text(&b),
         "KeepGoneThreeFour",
         "The cellDel sibling 'Gone' is still pending and the cellMerge cell 'Four' is \
-         merge-state only (§17.13.5.3), so all four cells' text reads. \
+         merge-state only while pending (§17.13.5.3), so all four cells' text reads. \
          refs: ECMA-376 §17.13.5.3, §17.13.5.1, MS-OI29500 §2.1.319, §2.1.317"
     );
-    assert_cell_merge_resolution_refused(&b);
+    assert_cell_merge_reported(&b);
+    assert_eq!(
+        accept_text(&b),
+        "KeepThree",
+        "Accept drops the deleted cell 'Gone' (§17.13.5.1) and empties the cell its merge \
+         change makes a continuation, 'Four' (Word 16)"
+    );
+    assert_eq!(
+        reject_text(&b),
+        "KeepGoneThreeFour",
+        "Reject restores 'Gone' and leaves 'Four' unmerged with its text (Word 16)"
+    );
     assert_eq!(
         validation_issues(&b),
         "",
@@ -396,16 +403,25 @@ fn tblgridchange_prior_grid_serializes_after_live_gridcols() {
 fn cellmerge_with_inline_run_edit_resolves_independently_in_same_cell() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4788"/><w:gridCol w:w="4788"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>One</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Two</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Three</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="4788" w:type="dxa"/><w:cellMerge w:id="7" w:author="A" w:date="2006-06-01T10:00:00Z" w:vMerge="cont"/></w:tcPr><w:p><w:r><w:t>Base</w:t></w:r><w:ins w:id="8" w:author="A" w:date="2006-06-01T10:00:00Z"><w:r><w:t>Add</w:t></w:r></w:ins></w:p></w:tc></w:tr></w:tbl><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-    // Resolution is refused until cell-merge revisions are modeled; the cell
-    // text must survive on read, and Accept/Reject All must refuse loudly.
     assert_eq!(
         current_text(&b),
         "OneTwoThreeBaseAdd",
-        "The inline-inserted 'Add' reads as pending beside 'Base'; cellMerge contributes no \
-         text change, so all cells survive. \
+        "The inline-inserted 'Add' reads as pending beside 'Base'; a pending cellMerge \
+         contributes no text change, so all cells read. \
          refs: ECMA-376 §17.13.5.3, §17.13.5.14, §17.13.5.18, MS-OI29500 §2.1.319"
     );
-    assert_cell_merge_resolution_refused(&b);
+    assert_cell_merge_reported(&b);
+    assert_eq!(
+        accept_text(&b),
+        "OneTwoThree",
+        "Word 16: accepting the merge empties the continuation cell, the accepted \
+         insertion 'Add' with it"
+    );
+    assert_eq!(
+        reject_text(&b),
+        "OneTwoThreeBase",
+        "Word 16: rejecting the merge keeps the cell; rejecting the insertion drops 'Add'"
+    );
     assert_eq!(
         validation_issues(&b),
         "",
@@ -425,15 +441,23 @@ fn cellmerge_cont_without_vmergeorig_opens_clean_text_survives() {
          'rest', so the document is conformant and must validate without repair. \
          refs: ECMA-376 §17.13.5.3, ISO 29500-1 §17.18.1, MS-OI29500 §2.1.319"
     );
-    // Resolution is refused until cell-merge revisions are modeled; the cell
-    // text must survive on read, and Accept/Reject All must refuse loudly.
     assert_eq!(
         current_text(&b),
         "UpperLower",
-        "cellMerge is a merge-state revision (§17.13.5.3), not a content deletion, so both \
-         cells' text reads. refs: ECMA-376 §17.13.5.3, §17.18.1"
+        "a pending cellMerge is a merge-state revision (§17.13.5.3), not a content deletion, \
+         so both cells' text reads. refs: ECMA-376 §17.13.5.3, §17.18.1"
     );
-    assert_cell_merge_resolution_refused(&b);
+    assert_cell_merge_reported(&b);
+    assert_eq!(
+        accept_text(&b),
+        "Upper",
+        "Word 16: accepting vMerge=cont empties the continuation cell"
+    );
+    assert_eq!(
+        reject_text(&b),
+        "UpperLower",
+        "Word 16: a missing vMergeOrig means the cell was not merged; reject keeps 'Lower'"
+    );
 }
 
 #[test]
@@ -470,15 +494,19 @@ fn cellmerge_vmerge_rest_split_revision_opens_clean_text_survives() {
         "§17.18.1 lists 'rest' as a valid ST_AnnotationVMerge value, so a cellMerge vMerge=rest is \
          schema-conformant and must validate without repair. refs: ECMA-376 §17.13.5.3, ISO 29500-1 §17.18.1"
     );
-    // Resolution is refused until cell-merge revisions are modeled; the cell
-    // text must survive on read, and Accept/Reject All must refuse loudly.
     assert_eq!(
         current_text(&b),
         "Split",
-        "A 'rest' cellMerge is a merge-state (split) revision, not a deletion (§17.13.5.3), so \
+        "A 'rest' cellMerge is a merge-state revision, not a deletion (§17.13.5.3), so \
          the cell text reads. refs: ECMA-376 §17.13.5.3, §17.18.1"
     );
-    assert_cell_merge_resolution_refused(&b);
+    assert_cell_merge_reported(&b);
+    for (label, text) in [("accept", accept_text(&b)), ("reject", reject_text(&b))] {
+        assert_eq!(
+            text, "Split",
+            "{label}: a restart cell (accept) or an unmerged one (reject) keeps its text"
+        );
+    }
 }
 
 #[test]

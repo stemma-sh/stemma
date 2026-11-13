@@ -12,9 +12,9 @@ use crate::domain::{
     Alignment, BlockNode, Border, BorderSet, CanonDoc, CellMargins, CellSdtWrap, CnfStyle,
     FieldData, FieldKind, FormattingChange, FrameProperties, HyperlinkData, HyperlinkRun,
     InlineNode, LineSpacingRule, Mark, MarkValue, NodeId, OpaqueInlineNode, OpaqueKind,
-    ParagraphNode, Shading, StyleProps, TableCellNode, TableFormatting, TableMeasurement,
-    TableNode, TableRowNode, TextNode, TrackedBlock, TrackedSegment, TrackingStatus,
-    VerticalAlignment, VerticalMerge,
+    ParagraphNode, PctMarginsAsWritten, Shading, StyleProps, TableCellNode, TableFormatting,
+    TableMeasurement, TableNode, TableRowNode, TextNode, TrackedBlock, TrackedSegment,
+    TrackingStatus, VerticalAlignment, VerticalMerge,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, HYPERLINK_REL_TYPE, RuntimeError, build_sdt_wrapper,
@@ -524,34 +524,7 @@ fn build_text_run_with_leading_tabs(
         let mut rpr = build_rpr_with_underline_off(&marks, &direct_props, directness.underline_off);
         append_authored_off_toggles(&mut rpr, resolved_marks, directness);
         if let Some(fc) = formatting_change {
-            let mut rpr_change = w_el("rPrChange");
-            attr_set(
-                &mut rpr_change,
-                "w:id",
-                if fc.revision_id != 0 {
-                    fc.revision_id.to_string()
-                } else {
-                    next_annotation_id(next_id).to_string()
-                },
-            );
-            attr_set(&mut rpr_change, "w:author", fc.author.clone());
-            if let Some(ref date) = fc.date {
-                attr_set(&mut rpr_change, "w:date", date.clone());
-            }
-            // The previous-props snapshot has its OWN direct-formatting
-            // provenance. Filtering it through the live run's provenance
-            // destroys history whenever the change removed a property (for
-            // example, current plain text with a previously-authored <w:b/>).
-            // Project and synthesize OFF toggles from the previous state only.
-            let previous_directness = fc.previous_rpr_authored;
-            let mut prev_rpr = build_rpr_with_underline_off(
-                &direct_marks(&fc.previous_marks, previous_directness),
-                &direct_run_style_props(&fc.previous_style_props, previous_directness),
-                previous_directness.underline_off,
-            );
-            append_authored_off_toggles(&mut prev_rpr, &fc.previous_marks, previous_directness);
-            rpr_change.children.push(XMLNode::Element(prev_rpr));
-            rpr.children.push(XMLNode::Element(rpr_change));
+            append_rpr_change(&mut rpr, fc, next_id);
         }
         run.children.push(XMLNode::Element(rpr));
     }
@@ -565,6 +538,62 @@ fn build_text_run_with_leading_tabs(
         run.children.push(rpr);
     }
     run
+}
+
+/// An opaque inline written without a run wrapper of its own (or rebuilt
+/// from its typed data) has no `w:rPr` to carry a tracked formatting change:
+/// refuse rather than drop it.
+fn refuse_unwritable_formatting_change(opaque: &OpaqueInlineNode) -> Result<(), RuntimeError> {
+    match &opaque.formatting_change {
+        Some(fc) if fc.is_physical_revision() => Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!(
+                "tracked formatting change {} on an opaque inline written without its own run \
+                 cannot be serialized",
+                fc.revision_id
+            ),
+            details: ErrorDetails {
+                block_id: Some(opaque.id.clone()),
+                context: Some(format!("opaque_ref={}", opaque.opaque_ref)),
+                ..ErrorDetails::default()
+            },
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Append `fc` to a run's `rpr` as its `w:rPrChange` (§17.13.5.31): the
+/// change's identity, attribution and the previous run properties, with
+/// their own direct-formatting provenance.
+fn append_rpr_change(rpr: &mut Element, fc: &FormattingChange, next_id: &mut u32) {
+    let mut rpr_change = w_el("rPrChange");
+    attr_set(
+        &mut rpr_change,
+        "w:id",
+        if fc.revision_id != 0 {
+            fc.revision_id.to_string()
+        } else {
+            next_annotation_id(next_id).to_string()
+        },
+    );
+    attr_set(&mut rpr_change, "w:author", fc.author.clone());
+    if let Some(ref date) = fc.date {
+        attr_set(&mut rpr_change, "w:date", date.clone());
+    }
+    // The previous-props snapshot has its OWN direct-formatting
+    // provenance. Filtering it through the live run's provenance
+    // destroys history whenever the change removed a property (for
+    // example, current plain text with a previously-authored <w:b/>).
+    // Project and synthesize OFF toggles from the previous state only.
+    let previous_directness = fc.previous_rpr_authored;
+    let mut prev_rpr = build_rpr_with_underline_off(
+        &direct_marks(&fc.previous_marks, previous_directness),
+        &direct_run_style_props(&fc.previous_style_props, previous_directness),
+        previous_directness.underline_off,
+    );
+    append_authored_off_toggles(&mut prev_rpr, &fc.previous_marks, previous_directness);
+    rpr_change.children.push(XMLNode::Element(prev_rpr));
+    rpr.children.push(XMLNode::Element(rpr_change));
 }
 
 /// Build a run's DIRECT `<w:rPr>`: the run properties Word would serialize for
@@ -1102,11 +1131,18 @@ fn append_single_inline(
                 if opaque_raw_element_requires_run_wrapper(&element) {
                     let mut run = w_el("r");
                     apply_source_run_attrs(&mut run, &opaque.source_run_attrs);
-                    let rpr = build_run_direct_rpr(
+                    let mut rpr = build_run_direct_rpr(
                         &opaque.wrapper_marks,
                         &opaque.wrapper_style_props,
                         opaque.wrapper_rpr_authored,
                     );
+                    // The wrapper run's tracked formatting change, as on a
+                    // text run.
+                    if let Some(fc) = &opaque.formatting_change
+                        && fc.is_physical_revision()
+                    {
+                        append_rpr_change(&mut rpr, fc, next_id);
+                    }
                     let rpr_after_content = opaque.wrapper_rpr_authored.rpr_after_content;
                     if !rpr.children.is_empty() && !rpr_after_content {
                         run.children.push(XMLNode::Element(rpr.clone()));
@@ -1117,9 +1153,11 @@ fn append_single_inline(
                     }
                     parent.children.push(XMLNode::Element(run));
                 } else {
+                    refuse_unwritable_formatting_change(opaque)?;
                     parent.children.push(XMLNode::Element(element));
                 }
             } else if let OpaqueKind::Hyperlink(data) = &opaque.kind {
+                refuse_unwritable_formatting_change(opaque)?;
                 let mut resolved = data.clone();
                 if let (Some(url), Some(resolver)) = (&data.url, resolve_rel_rid) {
                     resolved.r_id = Some(resolver(url, HYPERLINK_REL_TYPE));
@@ -1145,6 +1183,7 @@ fn append_single_inline(
                         &opaque.source_run_attrs,
                     )));
             } else if let OpaqueKind::Field(data) = &opaque.kind {
+                refuse_unwritable_formatting_change(opaque)?;
                 if data.field_kind == FieldKind::Simple {
                     parent
                         .children
@@ -1181,6 +1220,7 @@ fn append_single_inline(
                     OpaqueKind::CommentReference(_) => "commentReference",
                     _ => unreachable!("matched a note or comment reference above"),
                 };
+                refuse_unwritable_formatting_change(opaque)?;
                 let mut reference = w_el(tag);
                 attr_set(&mut reference, "w:id", data.reference_id.clone());
                 let mut run = w_el("r");
@@ -1246,15 +1286,41 @@ fn append_single_inline(
                     // wrapper collapses to a bare `<w:r>` and the footnote/endnote
                     // auto-number reverts to the default style on every rebuild of
                     // the story — a silent, text-invisible fidelity loss.
-                    if !deco.wrapper_marks.is_empty() || !deco.wrapper_style_props.is_empty() {
-                        run.children.push(XMLNode::Element(build_rpr(
-                            &deco.wrapper_marks,
-                            &deco.wrapper_style_props,
-                        )));
+                    let physical_change = deco
+                        .formatting_change
+                        .as_ref()
+                        .filter(|change| change.is_physical_revision());
+                    if !deco.wrapper_marks.is_empty()
+                        || !deco.wrapper_style_props.is_empty()
+                        || physical_change.is_some()
+                    {
+                        let mut rpr = build_rpr(&deco.wrapper_marks, &deco.wrapper_style_props);
+                        // The wrapper run's tracked formatting change, as on
+                        // a text run.
+                        if let Some(change) = physical_change {
+                            append_rpr_change(&mut rpr, change, next_id);
+                        }
+                        run.children.push(XMLNode::Element(rpr));
                     }
                     run.children.push(XMLNode::Element(element));
                     parent.children.push(XMLNode::Element(run));
                 } else {
+                    if let Some(change) = &deco.formatting_change
+                        && change.is_physical_revision()
+                    {
+                        return Err(RuntimeError {
+                            code: ErrorCode::UnsupportedEdit,
+                            message: format!(
+                                "tracked formatting change {} on a decoration written without \
+                                 a run cannot be serialized",
+                                change.revision_id
+                            ),
+                            details: ErrorDetails {
+                                context: Some(format!("opaque_ref={}", deco.opaque_ref)),
+                                ..ErrorDetails::default()
+                            },
+                        });
+                    }
                     parent.children.push(XMLNode::Element(element));
                 }
             } else {
@@ -1552,6 +1618,20 @@ pub fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
                             insert_author_label(&formatting.author, out);
                         }
                     }
+                    InlineNode::OpaqueInline(opaque) => {
+                        if let Some(formatting) = &opaque.formatting_change
+                            && formatting.is_physical_revision()
+                        {
+                            insert_author_label(&formatting.author, out);
+                        }
+                    }
+                    InlineNode::Decoration(deco) => {
+                        if let Some(formatting) = &deco.formatting_change
+                            && formatting.is_physical_revision()
+                        {
+                            insert_author_label(&formatting.author, out);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1584,6 +1664,12 @@ pub fn collect_tracked_change_authors(doc: &CanonDoc) -> Vec<String> {
                         }
                         if let Some(formatting) = &cell.formatting_change {
                             insert_author_label(&formatting.author, out);
+                        }
+                        if let Some(merge) = &cell.cell_merge {
+                            insert_author_label(
+                                merge.revision.author.as_deref().unwrap_or(""),
+                                out,
+                            );
                         }
                         for b in &cell.blocks {
                             authors_from_block(b, out);
@@ -1708,6 +1794,68 @@ pub(crate) fn merge_people_xml(existing: &[u8], authors: &[String]) -> Result<Ve
     Ok(output)
 }
 
+/// Where a move range ends relative to its last moved paragraph.
+///
+/// A paragraph whose own mark is a move half (`w:pPr/w:rPr/w:moveFrom` or
+/// `w:moveTo`) must lie inside its named range, so the range ends AFTER the
+/// paragraph's `</w:p>`, where Word writes it: Word (16) reads a mark outside
+/// the range as a separate insertion or deletion, splitting one move into
+/// four revisions (and resolving the move alone then leaves those two and an
+/// empty paragraph). The model keeps such an end as the paragraph's last
+/// marker (import reads Word's after-paragraph end that way); this takes it
+/// back out of the written paragraph so the caller writes it right after.
+/// A range ending inside a paragraph whose mark is not moved (moved words at
+/// a paragraph's end) stays where it is.
+pub(crate) fn take_trailing_move_range_end(paragraph: &mut Element) -> Option<Element> {
+    if !word_xml::is_w_tag(paragraph, "p") {
+        return None;
+    }
+    let last = paragraph
+        .children
+        .iter()
+        .rposition(|child| matches!(child, XMLNode::Element(_)))?;
+    let XMLNode::Element(end) = &paragraph.children[last] else {
+        unreachable!("rposition found an element");
+    };
+    let mark = if word_xml::is_w_tag(end, "moveFromRangeEnd") {
+        "moveFrom"
+    } else if word_xml::is_w_tag(end, "moveToRangeEnd") {
+        "moveTo"
+    } else {
+        return None;
+    };
+    let mark_is_moved = paragraph
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(e) if word_xml::is_w_tag(e, "pPr") => Some(e),
+            _ => None,
+        })
+        .flat_map(|ppr| &ppr.children)
+        .filter_map(|child| match child {
+            XMLNode::Element(e) if word_xml::is_w_tag(e, "rPr") => Some(e),
+            _ => None,
+        })
+        .flat_map(|rpr| &rpr.children)
+        .any(|child| matches!(child, XMLNode::Element(e) if word_xml::is_w_tag(e, mark)));
+    if !mark_is_moved {
+        return None;
+    }
+    let XMLNode::Element(end) = paragraph.children.remove(last) else {
+        unreachable!("checked above");
+    };
+    Some(end)
+}
+
+/// A serialized block followed by the move range end it closes, if any (see
+/// [`take_trailing_move_range_end`]).
+pub(crate) fn with_trailing_move_range_end(mut block: Element) -> Vec<XMLNode> {
+    let end = take_trailing_move_range_end(&mut block);
+    std::iter::once(XMLNode::Element(block))
+        .chain(end.map(XMLNode::Element))
+        .collect()
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn serialize_tracked_blocks(
     blocks: &[crate::domain::TrackedBlock],
@@ -1720,7 +1868,7 @@ pub(crate) fn serialize_tracked_blocks(
         let resolver = resolve_rel_rid
             .as_mut()
             .map(|resolver| &mut **resolver as &mut dyn FnMut(&str, &str) -> String);
-        out.push(XMLNode::Element(serialize_tracked_block(
+        out.extend(with_trailing_move_range_end(serialize_tracked_block(
             tracked,
             next_id,
             bookmark_policy,
@@ -1778,6 +1926,123 @@ pub(crate) fn serialize_tracked_block(
     }
 }
 
+/// Whether a paragraph carries move markup of its own as `MoveRange`
+/// decorations: `(range markers, run-level containers)`. An imported Word move
+/// carries both inside its paragraphs; a move the engine authored carries
+/// neither, and its markup is written from the model.
+fn move_decoration_kinds(paragraph: &ParagraphNode) -> (bool, bool) {
+    let mut range = false;
+    let mut container = false;
+    for inline in paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+    {
+        let InlineNode::Decoration(decoration) = inline else {
+            continue;
+        };
+        if decoration.kind != crate::domain::DecorationType::MoveRange {
+            continue;
+        }
+        let raw = decoration
+            .raw_xml
+            .as_deref()
+            .expect("a move decoration holds the element it was parsed from");
+        let element = crate::word_xml::parse_raw_fragment(raw)
+            .expect("a move decoration holds the element it was parsed from");
+        match crate::import::local_element_name(&element) {
+            "moveFrom" | "moveTo" => container = true,
+            _ => range = true,
+        }
+    }
+    (range, container)
+}
+
+/// The side and revision of a table-cell move half whose markup the model
+/// writes (no run-level move containers of its own): the pending status of
+/// its paragraph mark, which the move set on the whole paragraph.
+fn authored_cell_move_status(paragraph: &ParagraphNode) -> Option<&TrackingStatus> {
+    paragraph.cell_move_id.as_ref()?;
+    if move_decoration_kinds(paragraph).1 {
+        return None;
+    }
+    paragraph.para_mark_status.as_ref().filter(|status| {
+        matches!(
+            status,
+            TrackingStatus::Inserted(_) | TrackingStatus::Deleted(_)
+        )
+    })
+}
+
+/// One move range the serializer writes around adjacent cell paragraphs of
+/// one move half (`first..=last`), §17.13.5.24–.27. Written only when none
+/// of those paragraphs carries a range marker of its own.
+struct CellMoveRange {
+    first: usize,
+    last: usize,
+    from: bool,
+    name: String,
+    author: String,
+    date: String,
+    id: std::cell::OnceCell<u32>,
+}
+
+impl CellMoveRange {
+    fn annotation_id(&self, next_id: &mut u32) -> u32 {
+        *self
+            .id
+            .get_or_init(|| crate::runtime::next_annotation_id(next_id))
+    }
+}
+
+fn cell_move_ranges(blocks: &[BlockNode]) -> Vec<CellMoveRange> {
+    fn side(block: &BlockNode) -> Option<(&str, bool)> {
+        let BlockNode::Paragraph(paragraph) = block else {
+            return None;
+        };
+        let name = paragraph.cell_move_id.as_deref()?;
+        let from = matches!(
+            paragraph.para_mark_status,
+            Some(TrackingStatus::Deleted(_) | TrackingStatus::InsertedThenDeleted(_))
+        );
+        Some((name, from))
+    }
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        let Some(key) = side(&blocks[index]) else {
+            index += 1;
+            continue;
+        };
+        let mut last = index;
+        while last + 1 < blocks.len() && side(&blocks[last + 1]) == Some(key) {
+            last += 1;
+        }
+        let carried_by_decorations = blocks[index..=last]
+            .iter()
+            .any(|block| matches!(block, BlockNode::Paragraph(p) if move_decoration_kinds(p).0));
+        let BlockNode::Paragraph(first) = &blocks[index] else {
+            unreachable!("side() only matches paragraphs");
+        };
+        if !carried_by_decorations
+            && let Some(TrackingStatus::Inserted(revision) | TrackingStatus::Deleted(revision)) =
+                authored_cell_move_status(first)
+        {
+            ranges.push(CellMoveRange {
+                first: index,
+                last,
+                from: key.1,
+                name: key.0.to_string(),
+                author: revision.author.clone().unwrap_or_default(),
+                date: revision.date.clone().unwrap_or_default(),
+                id: std::cell::OnceCell::new(),
+            });
+        }
+        index = last + 1;
+    }
+    ranges
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn serialize_untracked_block(
     block: &BlockNode,
@@ -1787,10 +2052,15 @@ pub(crate) fn serialize_untracked_block(
     resolve_rel_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
 ) -> Result<Element, RuntimeError> {
     match block {
+        // A cell paragraph that is a move half carries its move group itself
+        // (`ParagraphNode::cell_move_id`); its pilcrow is then part of the
+        // move exactly when its runs carry the move with the mark's identity.
         BlockNode::Paragraph(p) => serialize_paragraph_node(
             p,
-            None,
-            false,
+            // A move half the engine authored is written whole, exactly as a
+            // body block move is: its mark's status stands for the block's.
+            authored_cell_move_status(p),
+            p.cell_move_id.is_some(),
             next_id,
             bookmark_policy,
             origin,
@@ -1925,6 +2195,7 @@ pub fn serialize_paragraph_node(
         numbering: _,               // → pPr (numPr) — resolved effective, gated below
         has_direct_numbering: _,    // → pPr (numPr) — gate: emit only paragraph-authored numPr
         numbering_suppressed: _,    // → pPr (numPr w:numId=0, §17.9.18)
+        direct_numbering_omits_ilvl: _, // → pPr (numPr written without w:ilvl)
         materialized_numbering: _,  // internal — projection roundtrip, not serialized
         rendered_text: _,           // derived — diff comparison, not serialized
         literal_prefix: _,          // → here (prefix text run)
@@ -1969,6 +2240,7 @@ pub fn serialize_paragraph_node(
         source_paragraph_attrs: _,  // → here (source w:rsid* attributes)
         cnf_style: _,               // → pPr (cnfStyle)
         preserved_ppr: _,           // → pPr (post-pass: PPR_ORDER position, or end of pPr)
+        cell_move_id: _,            // → move markup, via `is_move` (serialize_untracked_block)
     } = paragraph;
 
     let mut p = w_el("p");
@@ -2030,8 +2302,40 @@ pub fn serialize_paragraph_node(
     // leaves its mark-deletion pending): that pilcrow mark is now an INDEPENDENT
     // change and must emit plain `w:ins`/`w:del`, matching the model's projection
     // (accept MERGES the paragraph with its neighbour, it does not move-remove it).
-    let block_move_to = is_move && matches!(block_status, Some(TrackingStatus::Inserted(_)));
-    let block_move_from = is_move && matches!(block_status, Some(TrackingStatus::Deleted(_)));
+    // A moved paragraph whose block-level status a projection lowered onto
+    // its runs is still that move half while its runs carry the move with the
+    // mark's identity (the move is pending in this very paragraph): Word
+    // writes its pilcrow as w:moveFrom/w:moveTo, never a separate w:del/w:ins.
+    let runs_carry_mark_move = |inserted: bool| {
+        paragraph.para_mark_status.as_ref().is_some_and(|mark| {
+            let mark_identity = match (mark, inserted) {
+                (TrackingStatus::Inserted(rev), true) | (TrackingStatus::Deleted(rev), false) => {
+                    rev.identity
+                }
+                _ => return false,
+            };
+            paragraph
+                .segments
+                .iter()
+                .any(|segment| match (&segment.status, inserted) {
+                    (TrackingStatus::Inserted(rev), true)
+                    | (TrackingStatus::Deleted(rev), false) => rev.identity == mark_identity,
+                    _ => false,
+                })
+                && paragraph.segments.iter().any(|segment| {
+                    segment.inlines.iter().any(|inline| {
+                        matches!(inline, InlineNode::Decoration(decoration)
+                        if decoration.kind == crate::domain::DecorationType::MoveRange)
+                    })
+                })
+        })
+    };
+    let block_move_to = is_move
+        && (matches!(block_status, Some(TrackingStatus::Inserted(_)))
+            || runs_carry_mark_move(true));
+    let block_move_from = is_move
+        && (matches!(block_status, Some(TrackingStatus::Deleted(_)))
+            || runs_carry_mark_move(false));
     if let Some(status) = para_mark_status {
         match status {
             // A genuine move half's pilcrow mark is part of the move: emit
@@ -3016,11 +3320,15 @@ pub(crate) fn build_paragraph_properties(
         && let Some(numbering) = &paragraph.numbering
     {
         let mut num_pr = w_el("numPr");
-        let mut ilvl = w_el("ilvl");
-        attr_set(&mut ilvl, "w:val", numbering.ilvl.to_string());
+        // A list reference that wrote no level keeps writing none: its
+        // `numbering.ilvl` is the level Word resolves, not an authored one.
+        if !paragraph.direct_numbering_omits_ilvl {
+            let mut ilvl = w_el("ilvl");
+            attr_set(&mut ilvl, "w:val", numbering.ilvl.to_string());
+            num_pr.children.push(XMLNode::Element(ilvl));
+        }
         let mut num_id = w_el("numId");
         attr_set(&mut num_id, "w:val", numbering.num_id.to_string());
-        num_pr.children.push(XMLNode::Element(ilvl));
         num_pr.children.push(XMLNode::Element(num_id));
         ppr.children.push(XMLNode::Element(num_pr));
         has_any = true;
@@ -4036,7 +4344,8 @@ pub(crate) fn fold_lowered_inserted_simple_field(parts: &[InlineNode]) -> Option
         if let Some((opaque, _)) = field_part(part)
             && (&opaque.wrapper_marks != marks
                 || &opaque.wrapper_style_props != props
-                || !opaque.source_run_attrs.is_empty())
+                || !opaque.source_run_attrs.is_empty()
+                || opaque.formatting_change.is_some())
         {
             return None;
         }
@@ -4099,6 +4408,7 @@ pub(crate) fn fold_lowered_inserted_simple_field(parts: &[InlineNode]) -> Option
         }
     }
     Some(InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: first.id.clone(),
         kind,
         opaque_ref: first.opaque_ref.clone(),
@@ -6164,11 +6474,12 @@ fn serialize_tbl_pr_ex(fmt: &TableFormatting) -> Element {
         el.children.push(XMLNode::Element(tbl_layout));
     }
     // tblCellMar
-    if let Some(ref margins) = fmt.default_cell_margins {
-        el.children.push(XMLNode::Element(serialize_cell_margins(
-            "tblCellMar",
-            margins,
-        )));
+    if let Some(margins) = serialize_cell_margins(
+        "tblCellMar",
+        fmt.default_cell_margins.as_ref(),
+        &fmt.cell_margins_pct,
+    ) {
+        el.children.push(XMLNode::Element(margins));
     }
     // tblLook
     if let Some(ref tbl_look) = fmt.tbl_look {
@@ -6312,34 +6623,42 @@ fn serialize_table_measurement(element_name: &str, measurement: &TableMeasuremen
     el
 }
 
-/// Serialize cell margins into a container element (e.g., w:tblCellMar or w:tcMar).
-fn serialize_cell_margins(container_name: &str, margins: &CellMargins) -> Element {
+/// Serialize cell margins into a container element (e.g., w:tblCellMar or
+/// w:tcMar), in schema order (top, left, bottom, right). Each edge is the
+/// effective dxa margin when there is one, or else the pct edge as authored
+/// (`PctMarginsAsWritten`: Word renders it as no margin, so it is never
+/// written as dxa). `None` when neither gives an edge.
+fn serialize_cell_margins(
+    container_name: &str,
+    margins: Option<&CellMargins>,
+    pct: &PctMarginsAsWritten,
+) -> Option<Element> {
+    let dxa = |edge: fn(&CellMargins) -> Option<u32>| margins.and_then(edge);
+    let edges = [
+        ("top", dxa(|m| m.top), &pct.top),
+        ("left", dxa(|m| m.left), &pct.left),
+        ("bottom", dxa(|m| m.bottom), &pct.bottom),
+        ("right", dxa(|m| m.right), &pct.right),
+    ];
     let mut el = w_el(container_name);
-    if let Some(top) = margins.top {
-        let mut m = w_el("top");
-        attr_set(&mut m, "w:w", top.to_string());
-        attr_set(&mut m, "w:type", "dxa");
-        el.children.push(XMLNode::Element(m));
+    for (name, twips, pct_edge) in edges {
+        if let Some(twips) = twips {
+            let mut m = w_el(name);
+            attr_set(&mut m, "w:w", twips.to_string());
+            attr_set(&mut m, "w:type", "dxa");
+            el.children.push(XMLNode::Element(m));
+        } else if let Some(edge) = pct_edge {
+            let mut m = w_el(&edge.element);
+            if let Some(w) = &edge.w {
+                attr_set(&mut m, "w:w", w.clone());
+            }
+            attr_set(&mut m, "w:type", "pct");
+            el.children.push(XMLNode::Element(m));
+        }
     }
-    if let Some(left) = margins.left {
-        let mut m = w_el("left");
-        attr_set(&mut m, "w:w", left.to_string());
-        attr_set(&mut m, "w:type", "dxa");
-        el.children.push(XMLNode::Element(m));
-    }
-    if let Some(bottom) = margins.bottom {
-        let mut m = w_el("bottom");
-        attr_set(&mut m, "w:w", bottom.to_string());
-        attr_set(&mut m, "w:type", "dxa");
-        el.children.push(XMLNode::Element(m));
-    }
-    if let Some(right) = margins.right {
-        let mut m = w_el("right");
-        attr_set(&mut m, "w:w", right.to_string());
-        attr_set(&mut m, "w:type", "dxa");
-        el.children.push(XMLNode::Element(m));
-    }
-    el
+    // Effective margins are written even with no edge, as before; without
+    // them, only a pct edge makes a container.
+    (margins.is_some() || !el.children.is_empty()).then_some(el)
 }
 
 /// Serialize the complete authored `CT_TblPr` projection used inside
@@ -6465,15 +6784,14 @@ fn serialize_previous_table_properties(fmt: &TableFormatting) -> Element {
         attr_set(&mut element, "w:type", layout.to_xml_str());
         tbl_pr.children.push(XMLNode::Element(element));
     }
-    if fmt.has_direct_cell_margins
-        && let Some(ref margins) = fmt.default_cell_margins
-    {
-        tbl_pr
-            .children
-            .push(XMLNode::Element(serialize_cell_margins(
-                "tblCellMar",
-                margins,
-            )));
+    if let Some(margins) = serialize_cell_margins(
+        "tblCellMar",
+        fmt.default_cell_margins
+            .as_ref()
+            .filter(|_| fmt.has_direct_cell_margins),
+        &fmt.cell_margins_pct,
+    ) {
+        tbl_pr.children.push(XMLNode::Element(margins));
     }
     if fmt.has_direct_tbl_look
         && let Some(ref look) = fmt.tbl_look
@@ -6717,15 +7035,14 @@ fn serialize_table_node(
             tbl_pr.children.push(XMLNode::Element(tbl_layout));
         }
         // --- Position 13: tblCellMar ---
-        if fmt.has_direct_cell_margins
-            && let Some(ref margins) = fmt.default_cell_margins
-        {
-            tbl_pr
-                .children
-                .push(XMLNode::Element(serialize_cell_margins(
-                    "tblCellMar",
-                    margins,
-                )));
+        if let Some(margins) = serialize_cell_margins(
+            "tblCellMar",
+            fmt.default_cell_margins
+                .as_ref()
+                .filter(|_| fmt.has_direct_cell_margins),
+            &fmt.cell_margins_pct,
+        ) {
+            tbl_pr.children.push(XMLNode::Element(margins));
         }
         // --- Position 14: tblLook ---
         if fmt.has_direct_tbl_look
@@ -7212,6 +7529,7 @@ fn serialize_table_node(
                 formatting: _,        // → tcPr (borders, shd, width, vAlign, margins)
                 formatting_change: _, // → tcPr (tcPrChange)
                 tracking_status: _,   // → tcPr (cellIns/cellDel)
+                cell_merge: _,        // → tcPr (cellMerge)
                 row_sdt_wrapper: _,   // → here (SDT re-wrapping)
                 content_sdt_wraps: _, // → here (per-range content SDT wrapping)
                 cnf_style: _,         // → tcPr (cnfStyle)
@@ -7291,10 +7609,12 @@ fn serialize_table_node(
                 tc_pr.children.push(XMLNode::Element(el));
                 has_tc_pr = true;
             }
-            if let Some(ref margins) = cell.formatting.margins {
-                tc_pr
-                    .children
-                    .push(XMLNode::Element(serialize_cell_margins("tcMar", margins)));
+            if let Some(margins) = serialize_cell_margins(
+                "tcMar",
+                cell.formatting.margins.as_ref(),
+                &cell.formatting.margins_pct,
+            ) {
+                tc_pr.children.push(XMLNode::Element(margins));
                 has_tc_pr = true;
             }
             // Position 9: textDirection
@@ -7362,6 +7682,18 @@ fn serialize_table_node(
                 }
                 Some(TrackingStatus::Normal) | None => {}
             }
+            // cellMerge — tracked vertical merge change (§17.13.5.3), in the
+            // CT_TcPr cellIns/cellDel/cellMerge choice before tcPrChange.
+            if let Some(merge) = &cell.cell_merge {
+                tc_pr.children.push(XMLNode::Element(word_xml::w_cell_merge(
+                    next_annotation_id(next_id),
+                    merge.revision.author.as_deref().unwrap_or(""),
+                    merge.revision.date.as_deref().unwrap_or(""),
+                    &merge.after,
+                    &merge.before,
+                )));
+                has_tc_pr = true;
+            }
             // tcPrChange — tracked cell formatting change (§17.13.5.36).
             if let Some(ref fc) = cell.formatting_change {
                 let mut tc_pr_change = w_el("tcPrChange");
@@ -7425,10 +7757,12 @@ fn serialize_table_node(
                     }
                     prev_tc_pr.children.push(XMLNode::Element(el));
                 }
-                if let Some(ref margins) = fc.previous_margins {
-                    prev_tc_pr
-                        .children
-                        .push(XMLNode::Element(serialize_cell_margins("tcMar", margins)));
+                if let Some(margins) = serialize_cell_margins(
+                    "tcMar",
+                    fc.previous_margins.as_ref(),
+                    &PctMarginsAsWritten::default(),
+                ) {
+                    prev_tc_pr.children.push(XMLNode::Element(margins));
                 }
                 if let Some(ref td) = fc.previous_text_direction {
                     let mut td_el = w_el("textDirection");
@@ -7496,19 +7830,61 @@ fn serialize_table_node(
                 tc.children.push(XMLNode::Element(w_el("p")));
             } else {
                 let mut block_nodes = Vec::with_capacity(cell.blocks.len());
-                for block in &cell.blocks {
+                let move_ranges = cell_move_ranges(&cell.blocks);
+                for (index, block) in cell.blocks.iter().enumerate() {
                     // Cell paragraphs need the relationship resolver too: a link
                     // authored in a cell has no rId until one is allocated here.
                     let resolver = resolve_rel_rid
                         .as_mut()
                         .map(|resolver| &mut **resolver as &mut dyn FnMut(&str, &str) -> String);
-                    block_nodes.push(serialize_untracked_block(
+                    let mut element = serialize_untracked_block(
                         block,
                         next_id,
                         bookmark_policy,
                         origin,
                         resolver,
-                    )?);
+                    )?;
+                    if let Some(range) = move_ranges.iter().find(|range| range.first == index) {
+                        let start = if range.from {
+                            word_xml::w_move_from_range_start(
+                                range.annotation_id(next_id),
+                                &range.name,
+                                &range.author,
+                                &range.date,
+                            )
+                        } else {
+                            word_xml::w_move_to_range_start(
+                                range.annotation_id(next_id),
+                                &range.name,
+                                &range.author,
+                                &range.date,
+                            )
+                        };
+                        // After the paragraph properties, where Word writes it.
+                        let at = element
+                            .children
+                            .iter()
+                            .position(|child| {
+                                !matches!(child, XMLNode::Element(e) if word_xml::is_w_tag(e, "pPr"))
+                            })
+                            .unwrap_or(element.children.len());
+                        element.children.insert(at, XMLNode::Element(start));
+                    }
+                    let mut nodes = with_trailing_move_range_end(element);
+                    // A range the model writes ends after its last
+                    // paragraph too (see `take_trailing_move_range_end`).
+                    if let Some(range) = move_ranges.iter().find(|range| range.last == index) {
+                        let id = *range
+                            .id
+                            .get()
+                            .expect("a move range's start precedes its end in the same cell");
+                        nodes.push(XMLNode::Element(if range.from {
+                            word_xml::w_move_from_range_end(id)
+                        } else {
+                            word_xml::w_move_to_range_end(id)
+                        }));
+                    }
+                    block_nodes.push(nodes);
                 }
                 let mut content = wrap_cell_blocks_in_content_sdts(
                     block_nodes,
@@ -7573,13 +7949,16 @@ fn serialize_table_node(
 /// the model invariant here (cheap, local, exact) rather than re-diff the
 /// serialized archive against the input — the invariant "an SDT that wrapped N
 /// blocks re-emits exactly N blocks" is enforced at the point of emission.
+/// `blocks` holds each cell block's written nodes: the block, then any move
+/// range end that closes right after it (see
+/// [`take_trailing_move_range_end`]); a block and its range end stay together.
 fn wrap_cell_blocks_in_content_sdts(
-    blocks: Vec<Element>,
+    blocks: Vec<Vec<XMLNode>>,
     wraps: &[CellSdtWrap],
     cell_id: &NodeId,
 ) -> Result<Vec<XMLNode>, RuntimeError> {
     if wraps.is_empty() {
-        return Ok(blocks.into_iter().map(XMLNode::Element).collect());
+        return Ok(blocks.into_iter().flatten().collect());
     }
     let n = blocks.len();
     // Validate the ranges: document order, in-bounds, span >= 1, no overlap.
@@ -7627,15 +8006,13 @@ fn wrap_cell_blocks_in_content_sdts(
         {
             let mut content = Vec::with_capacity(w.span);
             for _ in 0..w.span {
-                content.push(XMLNode::Element(
-                    drain.next().expect("wrap range validated in-bounds"),
-                ));
+                content.extend(drain.next().expect("wrap range validated in-bounds"));
             }
             out.push(XMLNode::Element(build_sdt_wrapper(&w.wrapper, content)?));
             idx += w.span;
             wrap_iter.next();
         } else {
-            out.push(XMLNode::Element(drain.next().expect("idx < blocks.len()")));
+            out.extend(drain.next().expect("idx < blocks.len()"));
             idx += 1;
         }
     }
@@ -7874,6 +8251,7 @@ mod tests {
         raw_xml: &[u8],
     ) -> InlineNode {
         InlineNode::from(crate::domain::DecorationNode {
+            formatting_change: None,
             source_run_attrs: Vec::new(),
             id: NodeId::from(id),
             kind,
@@ -8036,6 +8414,7 @@ mod tests {
 
     fn author_test_cell(id: &str, blocks: Vec<BlockNode>) -> TableCellNode {
         TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id),
             blocks,
             grid_span: 1,
@@ -8640,6 +9019,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -8682,6 +9062,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 
@@ -9687,6 +10068,7 @@ mod tests {
                     status: TrackingStatus::Normal,
                     inlines: vec![
                         InlineNode::from(DecorationNode {
+                            formatting_change: None,
                             source_run_attrs: Vec::new(),
                             id: NodeId::from("d1"),
                             kind: DecorationType::Bookmark,
@@ -9719,6 +10101,7 @@ mod tests {
                 numbering: None,
                 has_direct_numbering: true,
                 numbering_suppressed: false,
+                direct_numbering_omits_ilvl: false,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -9761,6 +10144,7 @@ mod tests {
                 cnf_style: None,
                 source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
+                cell_move_id: None,
             }),
             move_id: None,
             block_sdt_wrap: None,
@@ -9813,6 +10197,7 @@ mod tests {
                     }),
                     inlines: vec![
                         InlineNode::from(DecorationNode {
+                            formatting_change: None,
                             source_run_attrs: Vec::new(),
                             id: NodeId::from("d2"),
                             kind: DecorationType::Bookmark,
@@ -9846,6 +10231,7 @@ mod tests {
                 numbering: None,
                 has_direct_numbering: true,
                 numbering_suppressed: false,
+                direct_numbering_omits_ilvl: false,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -9888,6 +10274,7 @@ mod tests {
                 cnf_style: None,
                 source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
+                cell_move_id: None,
             }),
             move_id: None,
             block_sdt_wrap: None,
@@ -9985,6 +10372,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -10031,6 +10419,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         };
 
         let mut next_id = 1;
@@ -10116,6 +10505,7 @@ mod tests {
             // Mutually exclusive with numbering: Some(..). This paragraph
             // explicitly removes inherited numbering.
             numbering_suppressed: true,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -10158,6 +10548,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         };
 
         let mut next_id = 1;
@@ -10229,6 +10620,7 @@ mod tests {
             apply_op_id: None,
         };
         let data = HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some("https://example.com".to_string()),
             anchor: None,
             text: "before middle after".to_string(),
@@ -10375,8 +10767,10 @@ mod tests {
 
         fn link(id: &str) -> InlineNode {
             InlineNode::from(OpaqueInlineNode {
+                formatting_change: None,
                 id: crate::domain::NodeId::from(id),
                 kind: OpaqueKind::Hyperlink(HyperlinkData {
+                    flattened_wrappers: Vec::new(),
                     url: None,
                     anchor: Some("same-target".to_string()),
                     text: "[1]".to_string(),
@@ -10486,6 +10880,7 @@ mod tests {
     #[test]
     fn hyperlink_with_all_normal_runs_emits_bare_r_only() {
         let data = HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some("https://example.com".to_string()),
             anchor: None,
             text: "click here".to_string(),
@@ -10527,6 +10922,7 @@ mod tests {
         ] {
             for kind in [TrackedContainer::Ins, TrackedContainer::Del] {
                 let data = HyperlinkData {
+                    flattened_wrappers: Vec::new(),
                     url: Some("https://example.test/resource".into()),
                     anchor: None,
                     text: "Resource".into(),
@@ -10568,6 +10964,7 @@ mod tests {
             (vec![("vendor:history", "1")], "no qualified"),
         ] {
             let data = HyperlinkData {
+                flattened_wrappers: Vec::new(),
                 url: Some("https://example.test/resource".into()),
                 anchor: None,
                 text: "Resource".into(),
@@ -10599,6 +10996,7 @@ mod tests {
     #[test]
     fn hyperlink_run_restores_source_rsid_attrs() {
         let data = HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: None,
             anchor: Some("target".to_string()),
             text: "click".to_string(),
@@ -10699,7 +11097,10 @@ mod tests {
     fn cell_sdt_wrap_emits_exactly_span_blocks_and_keeps_siblings() {
         // blocks [glyph, label]; a span-1 wrap over block 0 must leave the label
         // a sibling of the w:sdt, not inside its sdtContent.
-        let blocks = vec![labeled_paragraph("Glyph"), labeled_paragraph("Label")];
+        let blocks = vec![
+            vec![XMLNode::Element(labeled_paragraph("Glyph"))],
+            vec![XMLNode::Element(labeled_paragraph("Label"))],
+        ];
         let id = crate::domain::NodeId::from("cell".to_string());
         let out = wrap_cell_blocks_in_content_sdts(blocks, &[wrap_at(0, 1)], &id)
             .expect("valid single-block wrap");
@@ -10713,7 +11114,7 @@ mod tests {
 
     #[test]
     fn cell_sdt_wrap_rejects_span_past_blocks() {
-        let blocks = vec![labeled_paragraph("only")];
+        let blocks = vec![vec![XMLNode::Element(labeled_paragraph("only"))]];
         let id = crate::domain::NodeId::from("cell".to_string());
         let err = wrap_cell_blocks_in_content_sdts(blocks, &[wrap_at(0, 2)], &id)
             .expect_err("span past the cell's blocks must fail loud");
@@ -10723,9 +11124,9 @@ mod tests {
     #[test]
     fn cell_sdt_wrap_rejects_overlapping_ranges() {
         let blocks = vec![
-            labeled_paragraph("a"),
-            labeled_paragraph("b"),
-            labeled_paragraph("c"),
+            vec![XMLNode::Element(labeled_paragraph("a"))],
+            vec![XMLNode::Element(labeled_paragraph("b"))],
+            vec![XMLNode::Element(labeled_paragraph("c"))],
         ];
         let id = crate::domain::NodeId::from("cell".to_string());
         // [0,2) then [1,3) overlap.
@@ -10736,7 +11137,7 @@ mod tests {
 
     #[test]
     fn cell_sdt_wrap_rejects_zero_span() {
-        let blocks = vec![labeled_paragraph("a")];
+        let blocks = vec![vec![XMLNode::Element(labeled_paragraph("a"))]];
         let id = crate::domain::NodeId::from("cell".to_string());
         let err = wrap_cell_blocks_in_content_sdts(blocks, &[wrap_at(0, 0)], &id)
             .expect_err("a zero-span wrap must fail loud");

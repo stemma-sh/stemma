@@ -103,3 +103,97 @@ fn a_later_identical_change_earlier_in_the_document_gets_its_own_identity() {
         "accepting clause 7's revisions resolves clause 7 only"
     );
 }
+
+/// CHARACTERIZATION TEST (pins today's behaviour, not the domain rule): two
+/// lookalike revisions (same kind, author, date and text) TRADE ids after
+/// another editor changes the file. Stemma records the ids it gave with the
+/// saved file and adopts them on reopen only while the file's revisions are
+/// the ones it recorded; once another editor resolves an unrelated revision,
+/// the ids are derived again and lookalikes are numbered by document order.
+/// The docs state this limit (docs/reference/cli.md, Id durability). When the
+/// discriminator for lookalike groups lands, this test changes on purpose:
+/// the two clauses should then keep their ids.
+#[test]
+fn characterization_lookalike_revisions_trade_ids_after_an_outside_edit() {
+    use std::io::{Read, Write};
+    let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Clause 3: payment within 30 days.</w:t></w:r></w:p><w:p><w:r><w:t>Clause 7: refund within 30 days.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Clause 9: </w:t></w:r><w:ins w:id="50" w:author="Third" w:date="2026-11-01T00:00:00Z"><w:r><w:t>notices</w:t></w:r></w:ins></w:p><w:sectPr/></w:body></w:document>"#;
+    let original = {
+        let source = docx();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(source)).unwrap();
+        let mut out = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for index in 0..archive.len() {
+                let mut file = archive.by_index(index).unwrap();
+                let name = file.name().to_string();
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).unwrap();
+                if name == "word/document.xml" {
+                    data = document_xml.as_bytes().to_vec();
+                }
+                zip.start_file(name, zip::write::FileOptions::default())
+                    .unwrap();
+                zip.write_all(&data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        out
+    };
+    let doc = Document::parse(&original).expect("parse");
+    let clause7 = change(&doc, "p_2", "Clause 7: refund within 45 days.");
+    let both = change(&clause7, "p_1", "Clause 3: payment within 45 days.");
+    let insertion_in = |doc: &Document, block: &str| -> u32 {
+        doc.revisions()
+            .iter()
+            .find(|r| r.block_id.to_string() == block && r.kind == stemma::RevisionKind::Insert)
+            .unwrap_or_else(|| panic!("an insertion in {block}"))
+            .revision_id
+    };
+    let (clause3, clause7_id) = (insertion_in(&both, "p_1"), insertion_in(&both, "p_2"));
+    assert_ne!(clause3, clause7_id);
+    let saved = both.serialize(&ExportOptions::default()).unwrap();
+
+    // Another editor accepts the unrelated insertion in clause 9.
+    let edited_elsewhere = {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(saved)).unwrap();
+        let mut out = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for index in 0..archive.len() {
+                let mut file = archive.by_index(index).unwrap();
+                let name = file.name().to_string();
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).unwrap();
+                if name == "word/document.xml" {
+                    let xml = String::from_utf8(data).unwrap();
+                    let notices = xml.find("notices").expect("clause 9's insertion");
+                    let start = xml[..notices].rfind("<w:ins ").unwrap();
+                    let open_end = start + xml[start..].find('>').unwrap() + 1;
+                    let close = notices + xml[notices..].find("</w:ins>").unwrap();
+                    data = format!(
+                        "{}{}{}",
+                        &xml[..start],
+                        &xml[open_end..close],
+                        &xml[close + "</w:ins>".len()..]
+                    )
+                    .into_bytes();
+                }
+                zip.start_file(name, zip::write::FileOptions::default())
+                    .unwrap();
+                zip.write_all(&data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        out
+    };
+    let reopened = Document::parse(&edited_elsewhere).expect("reopen");
+    assert_eq!(
+        (
+            insertion_in(&reopened, "p_1"),
+            insertion_in(&reopened, "p_2")
+        ),
+        (clause7_id, clause3),
+        "today the two lookalike insertions trade ids after the outside edit"
+    );
+}

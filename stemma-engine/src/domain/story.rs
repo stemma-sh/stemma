@@ -123,6 +123,9 @@ pub struct CommentStory {
     pub author: Option<String>,
     /// Date/time of the comment.
     pub date: Option<String>,
+    /// Initials of the comment's author (`w:initials`, §17.13.4.2).
+    #[serde(default)]
+    pub initials: Option<String>,
     /// Block content of the comment.
     pub blocks: Vec<TrackedBlock>,
     /// Content hash for cross-document alignment.

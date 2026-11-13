@@ -1,6 +1,7 @@
 //! Reject All removes an inserted (or moved-in) paragraph that stands before a
-//! table even when it carries a bookmark or a comment range, and keeps those
-//! markers in the paragraph before it.
+//! table even when it carries a bookmark or a comment range, and keeps a
+//! bookmark's markers in the paragraph before it (a comment whose commented
+//! text was all in the paragraph goes with it).
 //!
 //! Domain rules: rejecting a paragraph's inserted mark removes the paragraph
 //! break (ECMA-376 §17.13.5.20); with a table next there is no paragraph to
@@ -87,7 +88,9 @@ fn inserted_paragraph_with_a_comment_before_a_table_goes_on_reject() {
         r#"<w:p><w:r><w:t>Alpha.</w:t></w:r></w:p><w:p><w:pPr><w:rPr><w:ins w:id="11" w:author="Ann" {DATE}/></w:rPr></w:pPr><w:commentRangeStart w:id="0"/><w:ins w:id="10" w:author="Ann" {DATE}><w:r><w:t>Inserted para.</w:t></w:r></w:ins><w:commentRangeEnd w:id="0"/><w:r><w:commentReference w:id="0"/></w:r></w:p>{TABLE}<w:p><w:r><w:t>Tail.</w:t></w:r></w:p>"#
     );
     let bytes = docx_with_body_and_comments(&body, &["0"]);
-    assert_rejects_to(&bytes, "Alpha.{cs0}{ce0}{cr0}|[tblCell|tbl]Tail.|");
+    // The rejected insertion held all the commented text, so the comment goes
+    // whole, as in Word (`comment_anchor_resolution`).
+    assert_rejects_to(&bytes, "Alpha.|[tblCell|tbl]Tail.|");
 }
 
 #[test]

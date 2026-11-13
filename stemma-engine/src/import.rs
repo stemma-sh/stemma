@@ -20,13 +20,13 @@ use crate::domain::{
     INTERNAL_IDS_VERSION_V0, IStr, Indentation, InlineNode, LineSpacingRule, Mark, MarkValue,
     NodeId, NoteReferenceData, NoteType, OpaqueBlockNode, OpaqueKind, ParagraphBorders,
     ParagraphFormattingChange, ParagraphMarkProperties, ParagraphNode, ParagraphSpacing,
-    PreviousParagraphProperties, ProofRef, RangeMarkerMeta, RevisionInfo, RowFormattingChange,
-    RunRprAuthored, SCHEMA_VERSION_V0, SdtWrapper, SectionPropertyChange, Shading, ShadingPattern,
-    StoryScope, StyleProps, SymData, TableCellNode, TableFormatting, TableFormattingChange,
-    TableLayout, TableMeasurement, TableNode, TableOverlap, TablePositioning, TableRowNode,
-    TblLook, TextAlignment, TextDirection, TextEffect, TextNode, TrackedBlock, TrackedSegment,
-    TrackingStatus, UnderlineStyle, VAnchor, VerticalAlignment, VerticalMerge, WidthType, XAlign,
-    YAlign, normal_tracked_block,
+    PctMarginEdge, PctMarginsAsWritten, PreviousParagraphProperties, ProofRef, RangeMarkerMeta,
+    RevisionInfo, RowFormattingChange, RunRprAuthored, SCHEMA_VERSION_V0, SdtWrapper,
+    SectionPropertyChange, Shading, ShadingPattern, StoryScope, StyleProps, SymData, TableCellNode,
+    TableFormatting, TableFormattingChange, TableLayout, TableMeasurement, TableNode, TableOverlap,
+    TablePositioning, TableRowNode, TblLook, TextAlignment, TextDirection, TextEffect, TextNode,
+    TrackedBlock, TrackedSegment, TrackingStatus, UnderlineStyle, VAnchor, VerticalAlignment,
+    VerticalMerge, WidthType, XAlign, YAlign, normal_tracked_block,
 };
 use crate::runtime::{
     COMMENTS_EXTENDED_REL_TYPE, COMMENTS_REL_TYPE, CUSTOM_XML_REL_TYPE, Diagnostic,
@@ -62,13 +62,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Position remains provenance (`ProofRef::docx_anchor`), not identity. Since
 /// the engine cannot interpret an opaque element well enough to establish a
-/// semantic equivalence, byte identity is the only honest unchanged relation.
-/// In particular, two different content controls at the same body index must
-/// not collapse into one unchanged block.
+/// semantic equivalence, identity of its canonical spelling (see
+/// [`canonical_spelling`]) is the only honest unchanged relation. In
+/// particular, two different content controls at the same body index must not
+/// collapse into one unchanged block, while one element written by two
+/// producers in different attribute orders is one element.
 pub(crate) fn opaque_body_ref(element: &Element) -> String {
+    let mut element = element.clone();
+    canonical_spelling(&mut element);
     format!(
         "body_item_sha256:{}",
-        sha256_hex(&word_xml::serialize_raw_fragment(element))
+        sha256_hex(&word_xml::serialize_raw_fragment(&element))
     )
 }
 
@@ -447,6 +451,18 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
                         {
                             claim(&mut fc.revision_id);
                         }
+                        if let crate::domain::InlineNode::OpaqueInline(opaque) = inline
+                            && let Some(fc) = &mut opaque.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            claim(&mut fc.revision_id);
+                        }
+                        if let crate::domain::InlineNode::Decoration(deco) = inline
+                            && let Some(fc) = &mut deco.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            claim(&mut fc.revision_id);
+                        }
                     }
                 }
             }
@@ -464,6 +480,9 @@ fn ensure_unique_formatting_change_ids(doc: &mut CanonDoc) {
                     for cell in &mut row.cells {
                         if let Some(fc) = &mut cell.formatting_change {
                             claim(&mut fc.revision_id);
+                        }
+                        if let Some(merge) = &mut cell.cell_merge {
+                            claim(&mut merge.revision.revision_id);
                         }
                         for nested in &mut cell.blocks {
                             visit_block(nested, claim);
@@ -621,10 +640,22 @@ pub(crate) fn for_each_revision_id_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(&mu
                         }
                     }
                     InlineNode::OpaqueInline(opaque) => {
+                        if let Some(fc) = &mut opaque.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            f(&mut fc.revision_id);
+                        }
                         if let OpaqueKind::Hyperlink(data) = &mut opaque.kind {
                             for run in &mut data.runs {
                                 visit_status(&mut run.status, f);
                             }
+                        }
+                    }
+                    InlineNode::Decoration(deco) => {
+                        if let Some(fc) = &mut deco.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            f(&mut fc.revision_id);
                         }
                     }
                     _ => {}
@@ -655,6 +686,9 @@ pub(crate) fn for_each_revision_id_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(&mu
                         visit_optional_status(&mut cell.tracking_status, f);
                         if let Some(fc) = &mut cell.formatting_change {
                             f(&mut fc.revision_id);
+                        }
+                        if let Some(merge) = &mut cell.cell_merge {
+                            f(&mut merge.revision.revision_id);
                         }
                         for nested in &mut cell.blocks {
                             visit_block(nested, f);
@@ -715,8 +749,10 @@ pub(crate) struct RevCarrierMut<'a> {
     /// The enclosing move group (`TrackedBlock::move_id`) when this is one of a
     /// MOVE's status carriers (source content/pilcrow, destination clone). All
     /// carriers of one move share this key and therefore one identity, so the
-    /// move enumerates as one record and resolves atomically. `None` for
-    /// formatting changes (always their own revision) and non-move content.
+    /// move enumerates as one record and resolves atomically. The cell
+    /// property changes of one table (one author, one date) share a key the
+    /// same way: they are one revision. `None` for other formatting changes
+    /// (always their own revision) and non-move content.
     pub move_group: Option<String>,
     /// Physical formatting-change elements are independent OOXML annotations even when
     /// they happen to reuse the same wire id/author/date. The serializer must
@@ -822,6 +858,26 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
             content: format!("fmt\0{text}"),
         });
     }
+    /// Whether a tracked status carries a revision with the move's author
+    /// and date (any revision, when the move has no range-marker signature).
+    fn status_matches_signature(
+        status: &TrackingStatus,
+        move_signature: Option<(&str, Option<&str>)>,
+    ) -> bool {
+        let matches = |r: &RevisionInfo| match move_signature {
+            None => true,
+            Some((author, date)) => {
+                r.author.as_deref().unwrap_or_default() == author && r.date.as_deref() == date
+            }
+        };
+        match status {
+            TrackingStatus::Normal => false,
+            TrackingStatus::Inserted(r) | TrackingStatus::Deleted(r) => matches(r),
+            TrackingStatus::InsertedThenDeleted(sr) => {
+                matches(&sr.inserted) || matches(&sr.deleted)
+            }
+        }
+    }
     fn visit_paragraph(
         p: &mut ParagraphNode,
         move_group: Option<&str>,
@@ -839,7 +895,52 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                 f,
             );
         }
-        for seg in &mut p.segments {
+        // A paragraph holding run-level move containers (`w:moveFrom` /
+        // `w:moveTo` inside the paragraph) carries the move only in the runs
+        // inside them: a deletion or insertion beside the moved runs is its
+        // own revision even when it shares the move's author and date (Word
+        // lists it separately; a comparison writes every change with one
+        // author and date). The mark belongs to the move only when every
+        // tracked run is moved, as in a moved whole paragraph before its
+        // block-level lift. A paragraph without containers keeps the
+        // block-level grouping.
+        let sides = crate::tracked_model::move_container_sides(p);
+        let mut mark_group = move_group;
+        let mut segment_groups = vec![move_group; p.segments.len()];
+        if move_group.is_some() && sides.iter().any(Option::is_some) {
+            for (index, segment) in p.segments.iter().enumerate() {
+                // Inside a container only the container's own polarity is
+                // the move: a `w:ins` inside `w:moveFrom` (text inserted,
+                // then moved away) or a `w:del` inside `w:moveTo` (moved
+                // text deleted since) is a revision of its own even with the
+                // move's author and date (Word lists it separately).
+                let nested_edit = matches!(
+                    (sides[index], &segment.status),
+                    (
+                        Some(crate::tracked_model::MoveSide::From),
+                        TrackingStatus::Inserted(_)
+                    ) | (
+                        Some(crate::tracked_model::MoveSide::To),
+                        TrackingStatus::Deleted(_)
+                    )
+                );
+                if nested_edit {
+                    segment_groups[index] = None;
+                    continue;
+                }
+                if sides[index].is_none() {
+                    segment_groups[index] = None;
+                    // Only a run the move's author and date could have made
+                    // keeps the mark out of the move; a later edit by
+                    // someone else is never part of it either way.
+                    if status_matches_signature(&segment.status, move_signature) {
+                        mark_group = None;
+                    }
+                }
+            }
+        }
+        for (seg, segment_group) in p.segments.iter_mut().zip(segment_groups) {
+            let move_group = segment_group;
             if seg.status != TrackingStatus::Normal {
                 let text = segment_text(seg);
                 visit_status(&mut seg.status, &text, move_group, move_signature, f);
@@ -875,6 +976,18 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                         }
                     }
                     InlineNode::OpaqueInline(opaque) => {
+                        if let Some(fc) = &mut opaque.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_fmt(
+                                &mut fc.identity,
+                                fc.revision_id,
+                                &fc.author,
+                                &fc.date,
+                                "\u{fffc}",
+                                f,
+                            );
+                        }
                         if let OpaqueKind::Hyperlink(data) = &mut opaque.kind {
                             for run in &mut data.runs {
                                 visit_status(
@@ -887,6 +1000,20 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                             }
                         }
                     }
+                    InlineNode::Decoration(deco) => {
+                        if let Some(fc) = &mut deco.formatting_change
+                            && fc.is_physical_revision()
+                        {
+                            visit_fmt(
+                                &mut fc.identity,
+                                fc.revision_id,
+                                &fc.author,
+                                &fc.date,
+                                "\u{fffc}",
+                                f,
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -894,7 +1021,7 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
         visit_optional_status(
             &mut p.para_mark_status,
             "\u{b6}",
-            move_group,
+            mark_group,
             move_signature,
             f,
         );
@@ -929,7 +1056,20 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                         f,
                     );
                 }
-                for row in &mut t.rows {
+                // The cell merges of one contiguous run in one grid column are
+                // one revision (`tracked_model::cell_merge_groups`).
+                let merge_groups: HashMap<(usize, usize), String> =
+                    crate::tracked_model::cell_merge_groups(t)
+                        .into_iter()
+                        .flat_map(|group| {
+                            let (row, cell) = group[0];
+                            let key = format!("\0cell-merge\0{}\0{row}\0{cell}", t.id.0);
+                            group
+                                .into_iter()
+                                .map(move |position| (position, key.clone()))
+                        })
+                        .collect();
+                for (ri, row) in t.rows.iter_mut().enumerate() {
                     let row_text = if row.tracking_status.is_some()
                         || row.formatting_change.is_some()
                         || row.tbl_pr_ex_change.is_some()
@@ -959,26 +1099,66 @@ pub(crate) fn for_each_rev_carrier_mut(doc: &mut CanonDoc, f: &mut dyn FnMut(Rev
                             f,
                         );
                     }
-                    for cell in &mut row.cells {
-                        let cell_text =
-                            if cell.tracking_status.is_some() || cell.formatting_change.is_some() {
-                                blocks_text(&cell.blocks)
-                            } else {
-                                String::new()
-                            };
+                    for (ci, cell) in row.cells.iter_mut().enumerate() {
+                        let cell_text = if cell.tracking_status.is_some()
+                            || cell.formatting_change.is_some()
+                            || cell.cell_merge.is_some()
+                        {
+                            blocks_text(&cell.blocks)
+                        } else {
+                            String::new()
+                        };
+                        if let Some(merge) = &mut cell.cell_merge {
+                            let group = merge_groups
+                                .get(&(ri, ci))
+                                .expect("every cell with a cell merge is in a cell-merge group")
+                                .clone();
+                            f(RevCarrierMut {
+                                wire_id: merge.revision.revision_id,
+                                author: merge.revision.author.clone().unwrap_or_default(),
+                                date: merge.revision.date.clone(),
+                                move_group: Some(group),
+                                force_distinct: false,
+                                identity: &mut merge.revision.identity,
+                                content: format!("merge\0{cell_text}"),
+                            });
+                        }
                         visit_optional_status(&mut cell.tracking_status, &cell_text, None, None, f);
                         if let Some(fc) = &mut cell.formatting_change {
-                            visit_fmt(
-                                &mut fc.identity,
-                                fc.revision_id,
-                                &fc.author,
-                                &fc.date,
-                                &cell_text,
-                                f,
+                            // A table's cell property changes by one author
+                            // at one time are one revision, as Word lists
+                            // them (and Word honours a tracked cell property
+                            // change only when every cell of its table
+                            // records one, so a comparison records it on
+                            // every cell).
+                            let group = format!(
+                                "\0cell-properties\0{}\0{}\0{:?}",
+                                t.id.0, fc.author, fc.date
                             );
+                            f(RevCarrierMut {
+                                wire_id: fc.revision_id,
+                                author: fc.author.clone(),
+                                date: fc.date.clone(),
+                                move_group: Some(group),
+                                force_distinct: false,
+                                identity: &mut fc.identity,
+                                content: format!("fmt\0{cell_text}"),
+                            });
                         }
                         for nested in &mut cell.blocks {
-                            visit_block(nested, None, None, f);
+                            // A cell paragraph that is a move half carries its
+                            // group itself (`ParagraphNode::cell_move_id`).
+                            let move_group = match &*nested {
+                                BlockNode::Paragraph(p) => p.cell_move_id.clone(),
+                                _ => None,
+                            };
+                            let move_signature = move_group
+                                .as_ref()
+                                .and_then(|_| move_signature_from_block(nested));
+                            let signature_ref = move_signature
+                                .as_ref()
+                                .map(|(author, date)| (author.as_str(), date.as_deref()));
+                            visit_block(nested, move_group.as_deref(), signature_ref, f);
                         }
                     }
                 }
@@ -2067,6 +2247,17 @@ fn lift_lowered_inserted_simple_fields(doc: &mut CanonDoc) {
     }
 }
 
+/// Whether an untracked segment of a paragraph is subsumed by the paragraph's
+/// whole insertion: it holds only decorations the serializer writes outside
+/// `w:ins` that are paragraph content (a self-contained glyph run, or a
+/// decoration carrying its origin), not a range marker.
+pub(crate) fn untracked_segment_subsumed_by_insertion(segment: &TrackedSegment) -> bool {
+    segment.inlines.iter().all(|inline| {
+        matches!(inline, InlineNode::Decoration(decoration)
+            if decoration.origin.is_some() || decoration_is_self_contained_run(decoration))
+    })
+}
+
 /// Restore the public whole-block insertion shape after OOXML import.
 ///
 /// The serializer persists an inserted paragraph as inserted content plus an
@@ -2083,13 +2274,7 @@ fn lift_whole_paragraph_insertions(doc: &mut CanonDoc) {
             .iter()
             .all(|segment| match &segment.status {
                 TrackingStatus::Inserted(revision) if revision.identity == identity => true,
-                TrackingStatus::Normal
-                    if segment.inlines.iter().all(|inline| {
-                        matches!(inline, InlineNode::Decoration(decoration)
-                            if decoration.origin.is_some()
-                                || decoration_is_self_contained_run(decoration))
-                    }) =>
-                {
+                TrackingStatus::Normal if untracked_segment_subsumed_by_insertion(segment) => {
                     // The serializer hoists decoration runs out of `w:ins`,
                     // so an authored inserted paragraph legitimately reopens
                     // with an untracked decoration-only segment — a note
@@ -2387,6 +2572,18 @@ fn unify_decoration_split_content_identities(doc: &mut CanonDoc) {
         let mut marker_between = false;
 
         for segment in &mut paragraph.segments {
+            // A move's range marker or container bracket is not a marker that
+            // split one envelope: it is the edge of a move (`w:moveFrom` /
+            // `w:moveTo`), a different proposal from a deletion or insertion
+            // beside it even with the same author and date.
+            if segment.inlines.iter().any(|inline| {
+                matches!(inline, InlineNode::Decoration(decoration)
+                    if decoration.kind == DecorationType::MoveRange)
+            }) {
+                previous = None;
+                marker_between = false;
+                continue;
+            }
             let starts_with_marker = segment.inlines.first().is_some_and(is_direct_marker);
             let ends_with_marker = segment.inlines.last().is_some_and(is_direct_marker);
             match &mut segment.status {
@@ -3359,6 +3556,14 @@ fn build_canonical_from_archive(
     // (ECMA-376 Part 2 §9.3) — its name is not fixed at word/document.xml.
     let main_part =
         crate::docx_package::resolve_main_document_part(archive).map_err(map_package_error)?;
+    // A tracked cell merge both resolution paths can read, wherever it is
+    // (textbox interiors stay raw XML in the model).
+    crate::normalize::refuse_malformed_cell_merges(archive).map_err(|error| match error {
+        crate::normalize::NormalizeError::InvalidCellMerge { part, reason } => {
+            invalid_docx(&format!("{part}: {reason}"))
+        }
+        other => invalid_docx(&format!("cannot check tracked cell merges: {other:?}")),
+    })?;
     let main_dir = crate::docx_package::part_dir(&main_part);
     let document_xml = archive
         .get(&main_part)
@@ -3438,6 +3643,7 @@ fn build_canonical_from_archive(
         compat_settings: &compat_settings,
         rel_lookup: &rel_lookup,
         active_move_name: None,
+        open_paragraph_move_ranges: Vec::new(),
         active_move_status: None,
     };
     let mut body_section_properties = None;
@@ -3562,8 +3768,10 @@ fn build_canonical_from_archive(
 
     // Resolve external hyperlink URLs from document relationships
     resolve_hyperlink_urls(&mut doc, &rels.hyperlinks);
-    resolve_story_hyperlink_urls(&mut doc, archive, main_dir)?;
+    resolve_story_hyperlink_urls(&mut doc, archive, &rels, main_dir)?;
 
+    stack_edits_inside_unnamed_move_containers(&mut doc.blocks)?;
+    untrack_reference_only_insertions(&mut doc);
     mint_wire_zero_revision_ids(&mut doc);
     ensure_unique_formatting_change_ids(&mut doc);
     crate::tracked_model::canonicalize_imported_split_tracking_boundary_prefixes(&mut doc);
@@ -3575,6 +3783,7 @@ fn build_canonical_from_archive(
     lift_whole_paragraph_insertions(&mut doc);
     lift_whole_paragraph_deletions(&mut doc);
     lift_whole_paragraph_moves(&mut doc);
+    untrack_range_tagged_final_mark(&mut doc.blocks);
     // Adopt identities a previous save recorded — LAST, so the walk this
     // document presents is the same post-lift canonical walk the writer
     // digested. Before the lifts, a whole-paragraph insertion counts two
@@ -3639,6 +3848,7 @@ pub(crate) fn build_canonical_from_root_with_stories(
         compat_settings,
         rel_lookup,
         active_move_name: None,
+        open_paragraph_move_ranges: Vec::new(),
         active_move_status: None,
     };
 
@@ -3693,6 +3903,8 @@ pub(crate) fn build_canonical_from_root_with_stories(
         document_background,
     });
 
+    stack_edits_inside_unnamed_move_containers(&mut doc.blocks)?;
+    untrack_reference_only_insertions(&mut doc);
     mint_wire_zero_revision_ids(&mut doc);
     ensure_unique_formatting_change_ids(&mut doc);
     crate::tracked_model::canonicalize_imported_split_tracking_boundary_prefixes(&mut doc);
@@ -3704,6 +3916,7 @@ pub(crate) fn build_canonical_from_root_with_stories(
     lift_whole_paragraph_insertions(&mut doc);
     lift_whole_paragraph_deletions(&mut doc);
     lift_whole_paragraph_moves(&mut doc);
+    untrack_range_tagged_final_mark(&mut doc.blocks);
     // Adopt identities a previous save recorded — LAST, so the walk this
     // document presents is the same post-lift canonical walk the writer
     // digested (see the body-import pipeline for the full rationale).
@@ -3907,9 +4120,416 @@ fn consume_move_range_boundary(
     if is_w_tag(element, "moveFromRangeEnd") || is_w_tag(element, "moveToRangeEnd") {
         ctx.active_move_name = None;
         ctx.active_move_status = None;
+        // Word ends a range started inside a paragraph with a body-level end
+        // right after that paragraph (a moved whole paragraph): the range
+        // covers nothing after it.
+        if let Some(id) = attr_get(element, "w:id") {
+            ctx.open_paragraph_move_ranges
+                .retain(|(open_id, _)| open_id != id);
+        }
         return Ok(true);
     }
     Ok(false)
+}
+
+/// A run-level `w:moveFrom`/`w:moveTo` is one half of a move only when a move
+/// range names it (§17.13.5.23–28 pair the halves by the range's `w:name`);
+/// without one nothing pairs it and its runs read as what the container is,
+/// a deletion or an insertion. Another author's change nested inside such a
+/// container is then the stacked state (§17.13.5.14): a `w:del` inside an
+/// unnamed `w:moveTo` deletes inserted text, a `w:ins` inside an unnamed
+/// `w:moveFrom` is inserted text deleted since. Spell both as the stacked
+/// status, so the resolutions cascade (Reject All drops the deleted inserted
+/// text with its insertion) instead of resolving the nested change alone.
+/// Body paragraphs only: a cell paragraph carries no move pairing to test.
+/// A `w:ins` whose only content is comment reference runs, for comments
+/// whose range holds no inserted text, is not a revision to Word (Word 16,
+/// verified on the oracle): Word lists no revision for it, and Accept and
+/// Reject both keep the reference and its comment. Such a reference is read
+/// as untracked. A reference insertion beside a comment on inserted text is
+/// a revision (rejecting it removes the comment).
+fn untrack_reference_only_insertions(doc: &mut CanonDoc) {
+    fn walk_inserted_ranges(
+        block: &BlockNode,
+        open: &mut HashSet<String>,
+        out: &mut HashSet<String>,
+    ) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &paragraph.segments {
+                    let inserted = matches!(
+                        segment.status,
+                        TrackingStatus::Inserted(_) | TrackingStatus::InsertedThenDeleted(_)
+                    );
+                    for inline in &segment.inlines {
+                        match inline {
+                            InlineNode::CommentRangeStart { id } => {
+                                open.insert(id.clone());
+                            }
+                            InlineNode::CommentRangeEnd { id } => {
+                                open.remove(id);
+                            }
+                            InlineNode::Text(text) if inserted && !text.text.is_empty() => {
+                                out.extend(open.iter().cloned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for block in &cell.blocks {
+                            walk_inserted_ranges(block, open, out);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    fn untrack_block(block: &mut BlockNode, ranges_with_insertions: &HashSet<String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for segment in &mut paragraph.segments {
+                    let reference_only = matches!(segment.status, TrackingStatus::Inserted(_))
+                        && !segment.inlines.is_empty()
+                        && segment.inlines.iter().all(|inline| {
+                            matches!(inline, InlineNode::OpaqueInline(opaque)
+                                if matches!(&opaque.kind, OpaqueKind::CommentReference(reference)
+                                    if !ranges_with_insertions.contains(&reference.reference_id)))
+                        });
+                    if reference_only {
+                        segment.status = TrackingStatus::Normal;
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        for block in &mut cell.blocks {
+                            untrack_block(block, ranges_with_insertions);
+                        }
+                    }
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    let mut ranges_with_insertions = HashSet::new();
+    for blocks in std::iter::once(&doc.blocks)
+        .chain(doc.headers.iter().map(|story| &story.blocks))
+        .chain(doc.footers.iter().map(|story| &story.blocks))
+        .chain(doc.footnotes.iter().map(|story| &story.blocks))
+        .chain(doc.endnotes.iter().map(|story| &story.blocks))
+    {
+        let mut open = HashSet::new();
+        for tracked in blocks {
+            walk_inserted_ranges(&tracked.block, &mut open, &mut ranges_with_insertions);
+        }
+    }
+    let stories = std::iter::once(&mut doc.blocks)
+        .chain(doc.headers.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.footers.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.footnotes.iter_mut().map(|story| &mut story.blocks))
+        .chain(doc.endnotes.iter_mut().map(|story| &mut story.blocks));
+    for blocks in stories {
+        for tracked in blocks {
+            untrack_block(&mut tracked.block, &ranges_with_insertions);
+        }
+    }
+}
+
+fn stack_edits_inside_unnamed_move_containers(
+    blocks: &mut [TrackedBlock],
+) -> Result<(), RuntimeError> {
+    for tracked in blocks
+        .iter_mut()
+        .filter(|tracked| tracked.move_id.is_none())
+    {
+        let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+            continue;
+        };
+        let mut open: Option<(bool, RevisionInfo, Vec<u8>)> = None;
+        for segment in &mut paragraph.segments {
+            if let Some((is_destination, container, _)) = &open {
+                let same = |revision: &RevisionInfo| {
+                    revision.revision_id == container.revision_id
+                        && revision.author == container.author
+                        && revision.date == container.date
+                };
+                let stacked = match &segment.status {
+                    TrackingStatus::Deleted(deletion) if *is_destination && !same(deletion) => {
+                        Some((container.clone(), deletion.clone()))
+                    }
+                    TrackingStatus::Inserted(origin) if !*is_destination && !same(origin) => {
+                        Some((origin.clone(), container.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((inserted, deleted)) = stacked {
+                    segment.status = TrackingStatus::InsertedThenDeleted(Box::new(
+                        crate::domain::StackedRevision { inserted, deleted },
+                    ));
+                }
+            }
+            for inline in &segment.inlines {
+                let InlineNode::Decoration(decoration) = inline else {
+                    continue;
+                };
+                let (DecorationType::MoveRange, Some(raw)) =
+                    (&decoration.kind, decoration.raw_xml.as_deref())
+                else {
+                    continue;
+                };
+                let element = crate::word_xml::parse_raw_fragment(raw)
+                    .expect("an imported move decoration holds the element it was parsed from");
+                let is_destination = match element.name.rsplit(':').next() {
+                    Some("moveTo") => true,
+                    Some("moveFrom") => false,
+                    _ => continue,
+                };
+                open = match open {
+                    Some((_, _, open_raw)) if open_raw == raw => None,
+                    Some((_, _, open_raw)) => panic!(
+                        "a move container closes with its own element; containers do not \
+                         nest (paragraph {:?}, open {:?})",
+                        paragraph.id,
+                        String::from_utf8_lossy(&open_raw)
+                    ),
+                    None => Some((
+                        is_destination,
+                        RevisionInfo {
+                            revision_id: parse_revision_id(&element, &element.name)?,
+                            identity: 0,
+                            author: attr_get(&element, "w:author").cloned(),
+                            date: attr_get(&element, "w:date").cloned(),
+                            apply_op_id: None,
+                        },
+                        raw.to_vec(),
+                    )),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The document-final paragraph mark carries no revision (§17.13.5.15; the
+/// final-mark rule, `tracked_model::renormalize_final_mark_after_selective`).
+/// A move of the document's last paragraph writes its source's final mark
+/// untracked, and only the move range around it says the paragraph moved;
+/// [`tag_blocks_in_move_range`] gives that mark the range's status along with
+/// the block. Spell it as every producer does: a block-level move whose own
+/// final mark is explicitly untracked. A mark that carries the range's own
+/// revision came from the range, not from a marker on the mark.
+fn untrack_range_tagged_final_mark(blocks: &mut [TrackedBlock]) {
+    let Some(last) = crate::tracked_model::document_final_paragraph_index(blocks) else {
+        return;
+    };
+    let tracked = &mut blocks[last];
+    if tracked.move_id.is_none()
+        || !matches!(
+            tracked.status,
+            TrackingStatus::Deleted(_) | TrackingStatus::Inserted(_)
+        )
+    {
+        return;
+    }
+    let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+        unreachable!("document_final_paragraph_index only returns paragraphs");
+    };
+    if paragraph.para_mark_status.as_ref() == Some(&tracked.status) {
+        paragraph.para_mark_status = Some(TrackingStatus::Normal);
+    }
+}
+
+/// The table and run twips measures Word opens with no number in them, each
+/// read as Word reads it (Word 16, verified), and recorded here as an import
+/// diagnostic naming the reading so the default is observable:
+///
+/// - `w:tblW` / `w:tcW` / `w:wBefore` / `w:wAfter`: width 0
+///   (`parse_table_measurement`);
+/// - `w:tblInd`, `w:tblCellSpacing`, a `w:tblCellMar` / `w:tcMar` edge: no
+///   value (`parse_table_indent`, `parse_table_cell_spacing`,
+///   `parse_cell_margins`);
+/// - `w:trHeight`: no row height (`parse_row_height`);
+/// - a run's `w:spacing` (in `w:rPr`): no character spacing
+///   (`word_ir::char_spacing_twips`).
+///
+/// Every other twips measure with no number is refused where it is read.
+fn note_twips_read_without_a_number(element: &Element, part: &str, ctx: &mut ParseContext<'_>) {
+    fn reading(element: &Element, parent: Option<&str>) -> Option<(&'static str, String)> {
+        let local = element.name.rsplit(':').next().unwrap_or(&element.name);
+        let (attribute, reads_as) = match (parent, local) {
+            (_, "tblW" | "tcW" | "wBefore" | "wAfter") => ("w", "a width of 0"),
+            (_, "tblInd" | "tblCellSpacing") => ("w", "no value"),
+            (Some("tblCellMar" | "tcMar"), _) => ("w", "no margin"),
+            (_, "trHeight") => ("val", "no row height"),
+            (Some("rPr"), "spacing") => ("val", "no character spacing"),
+            _ => return None,
+        };
+        let value = attr_get(element, &format!("w:{attribute}"))?;
+        let no_number = match local {
+            "trHeight" | "spacing" => read_twips(value) == Err(TwipsError::NotANumber),
+            _ => {
+                matches!(
+                    parse_measurement_or_percent(value, local),
+                    Ok(MeasurementOrPercent::NotANumber)
+                ) && !value.is_empty()
+            }
+        };
+        no_number.then(|| (reads_as, format!("w:{local}/@w:{attribute} = {value:?}")))
+    }
+    fn walk(element: &Element, parent: Option<&str>, found: &mut Vec<(&'static str, String)>) {
+        if let Some(reading) = reading(element, parent) {
+            found.push(reading);
+        }
+        let local = element.name.rsplit(':').next().unwrap_or(&element.name);
+        for child in &element.children {
+            if let XMLNode::Element(child) = child {
+                walk(child, Some(local), found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(element, None, &mut found);
+    for (reads_as, attribute) in found {
+        ctx.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "{attribute} is not a number; read as {reads_as}, as Word reads it (Word \
+                 opens the file and saves it so). An untouched element keeps its bytes"
+            ),
+            context: Some(part.to_string()),
+        });
+    }
+}
+
+/// A run inside `w:moveFrom` that spells its text as `w:delText` or its field
+/// instruction as `w:delInstrText` (moved-from text is `w:t` / `w:instrText`,
+/// ECMA-376 §17.13.5.22; Word 16 writes those when it moves a field, observed).
+/// Word reports such a file as corrupted and repairs it (Word 16, observed,
+/// for both spellings). Import reads the run as the
+/// moved text it is, records a warning naming it, and the engine never
+/// writes the shape back: a re-written run is `w:t`, and an untouched save
+/// is refused by the validator (I-TC-004).
+fn note_deleted_text_in_move_from(element: &Element, ctx: &mut ParseContext<'_>) {
+    fn walk(element: &Element, scope: Option<&str>, found: &mut Vec<(String, String)>) {
+        let local = element.name.rsplit(':').next().unwrap_or(&element.name);
+        let scope = if matches!(local, "del" | "ins" | "moveFrom" | "moveTo" | "txbxContent") {
+            Some(local)
+        } else {
+            scope
+        };
+        if matches!(local, "delText" | "delInstrText") && scope == Some("moveFrom") {
+            found.push((
+                local.to_string(),
+                element
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        XMLNode::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .chars()
+                    .take(40)
+                    .collect(),
+            ));
+        }
+        for child in &element.children {
+            if let XMLNode::Element(child) = child {
+                walk(child, scope, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(element, None, &mut found);
+    for (element_name, text) in found {
+        let plain = if element_name == "delText" {
+            "w:t"
+        } else {
+            "w:instrText"
+        };
+        ctx.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "a run inside w:moveFrom spells its text as w:{element_name} ({text:?}); read \
+                 as moved text. Word reports such a file as corrupted and repairs it; saving \
+                 it unchanged is refused (I-TC-004), resolving the move writes {plain}"
+            ),
+            context: Some("word/document.xml".to_string()),
+        });
+    }
+}
+
+/// Word writes a moved whole paragraph's range START inside the paragraph
+/// and its END at body level, right after it. The end closes the range that
+/// paragraph opened; keep it as the paragraph's last inline marker (the same
+/// position: nothing lies between them), so the move range survives every
+/// later serialization instead of being dropped with the body-level marker
+/// state. Returns whether `element` was such an end.
+fn close_paragraph_move_range_at_body_level(
+    element: &Element,
+    blocks: &mut [TrackedBlock],
+    ctx: &mut ParseContext<'_>,
+) -> bool {
+    if !is_w_tag(element, "moveFromRangeEnd") && !is_w_tag(element, "moveToRangeEnd") {
+        return false;
+    }
+    let Some(id) = attr_get(element, "w:id") else {
+        return false;
+    };
+    let Some(position) = ctx
+        .open_paragraph_move_ranges
+        .iter()
+        .position(|(open_id, _)| open_id == id)
+    else {
+        return false;
+    };
+    let (_, name) = &ctx.open_paragraph_move_ranges[position];
+    let Some(TrackedBlock {
+        block: BlockNode::Paragraph(paragraph),
+        move_id: Some(paragraph_move),
+        ..
+    }) = blocks.last_mut()
+    else {
+        return false;
+    };
+    if paragraph_move != name {
+        return false;
+    }
+    ctx.open_paragraph_move_ranges.remove(position);
+    let marker_id = NodeId::from(format!("{}_deco_range_end_{id}", paragraph.id.0));
+    let decoration = InlineNode::from(DecorationNode {
+        formatting_change: None,
+        id: marker_id.clone(),
+        kind: DecorationType::MoveRange,
+        source_run_attrs: Vec::new(),
+        opaque_ref: format!("paragraph:{}:deco:range_end_{id}", paragraph.id.0),
+        proof_ref: ProofRef {
+            part: DocPart::DocumentXml,
+            block_id: marker_id,
+            docx_anchor: format!("paragraph:{}:range_end_{id}", paragraph.id.0),
+        },
+        wrapper_marks: Vec::new(),
+        wrapper_style_props: StyleProps::default(),
+        joins_following_text_run: false,
+        raw_xml: Some(crate::word_xml::serialize_raw_fragment(element)),
+        origin: None,
+    });
+    match paragraph.segments.last_mut() {
+        Some(segment) if segment.status == TrackingStatus::Normal => {
+            segment.inlines.push(decoration);
+        }
+        _ => paragraph.segments.push(TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: vec![decoration],
+        }),
+    }
+    true
 }
 
 /// Give `blocks`, just parsed, the active move range's identity and status.
@@ -4010,6 +4630,11 @@ fn consume_body_child(
         return Ok(());
     }
 
+    note_deleted_text_in_move_from(element, ctx);
+    note_twips_read_without_a_number(element, "word/document.xml", ctx);
+    if close_paragraph_move_range_at_body_level(element, blocks, ctx) {
+        return Ok(());
+    }
     if consume_move_range_boundary(element, ctx)? {
         return Ok(());
     }
@@ -4338,6 +4963,7 @@ pub(crate) fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockN
         numbering: None,
         has_direct_numbering: false,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -4380,6 +5006,7 @@ pub(crate) fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockN
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     })
 }
 
@@ -4553,6 +5180,12 @@ struct ParseContext<'a> {
     /// Deleted for moveFrom ranges, Inserted for moveTo ranges.
     /// Extracted from the range start marker's w:author/w:date attributes.
     active_move_status: Option<TrackingStatus>,
+    /// Paragraph-level move ranges still open after the paragraph that
+    /// started them: `(range w:id, w:name)`. Word writes a move of text that
+    /// crosses a paragraph break with its `move*RangeStart` in one paragraph
+    /// and the matching `move*RangeEnd` in a later one; every paragraph from
+    /// the start to the end holds that move's runs.
+    open_paragraph_move_ranges: Vec<(String, String)>,
 }
 /// What a nested-tracked-container scan found in a body item's subtree.
 enum NestedTracking {
@@ -4741,6 +5374,45 @@ fn append_body_sdt_blocks(
 /// metadata, which holds the whole element.
 pub(crate) const IN_CONTROL_RANGE_MARKER_ANCHOR: &str = "in_control";
 
+/// The `docx_anchor` of a range marker directly inside a body-level
+/// `w:ins`/`w:del`. Like [`IN_CONTROL_RANGE_MARKER_ANCHOR`] it is no body
+/// child of its own and is written from its `range_marker` metadata.
+pub(crate) const TRACKED_WRAPPER_RANGE_MARKER_ANCHOR: &str = "in_tracked_wrapper";
+
+/// The `docx_anchor` of a range END a resolution re-anchored after the
+/// paragraph before a removed one (Word writes it as a body-level marker
+/// there). Like [`IN_CONTROL_RANGE_MARKER_ANCHOR`] it is no body child of the
+/// source and is written from its `range_marker` metadata.
+pub(crate) const RELOCATED_RANGE_MARKER_ANCHOR: &str = "relocated_by_resolution";
+
+/// Whether a body range marker with this anchor is written from its
+/// metadata rather than copied from a body child.
+pub(crate) fn range_marker_written_from_metadata(docx_anchor: &str) -> bool {
+    docx_anchor == IN_CONTROL_RANGE_MARKER_ANCHOR
+        || docx_anchor == TRACKED_WRAPPER_RANGE_MARKER_ANCHOR
+        || docx_anchor == RELOCATED_RANGE_MARKER_ANCHOR
+}
+
+/// A body-level block holding the range marker `element` (a bookmark,
+/// comment-range or permission start or end), written from its metadata.
+/// `None` for any other element.
+pub(crate) fn relocated_range_marker_block(element: &Element, id: NodeId) -> Option<TrackedBlock> {
+    let marker = range_marker_meta_from_element(element)?;
+    Some(normal_tracked_block(BlockNode::from(OpaqueBlockNode {
+        id: id.clone(),
+        kind: OpaqueKind::Unknown(element.name.clone()),
+        note_references: Default::default(),
+        source_paragraph_ids: Vec::new(),
+        opaque_ref: opaque_body_ref(element),
+        proof_ref: ProofRef {
+            part: DocPart::DocumentXml,
+            block_id: id,
+            docx_anchor: RELOCATED_RANGE_MARKER_ANCHOR.to_string(),
+        },
+        range_marker: Some(marker),
+    })))
+}
+
 fn in_control_range_marker(
     element: &Element,
     marker: crate::domain::RangeMarkerMeta,
@@ -4883,7 +5555,7 @@ fn append_blocks_from_element(
         // group directly from the paragraph. Identity minting later uses the
         // range marker's author/date signature to group only the actual move
         // carriers; later edits inside the moved paragraph remain independent.
-        tracked.move_id = element.children.iter().find_map(|child| {
+        let started = element.children.iter().find_map(|child| {
             let XMLNode::Element(child) = child else {
                 return None;
             };
@@ -4910,6 +5582,54 @@ fn append_blocks_from_element(
             }
             None
         });
+        let range_ids = |tags: [&str; 2]| -> Vec<String> {
+            let mut ids = Vec::new();
+            for child in &element.children {
+                let XMLNode::Element(child) = child else {
+                    continue;
+                };
+                let nested: Vec<&Element> =
+                    if is_w_tag(child, "moveFrom") || is_w_tag(child, "moveTo") {
+                        child
+                            .children
+                            .iter()
+                            .filter_map(|inner| match inner {
+                                XMLNode::Element(inner) => Some(inner),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        vec![child]
+                    };
+                for candidate in nested {
+                    if tags.iter().any(|tag| is_w_tag(candidate, tag))
+                        && let Some(id) = attr_get(candidate, "w:id")
+                    {
+                        ids.push(id.clone());
+                    }
+                }
+            }
+            ids
+        };
+        let ended = range_ids(["moveFromRangeEnd", "moveToRangeEnd"]);
+        tracked.move_id = match started {
+            Some(name) => {
+                // A range this paragraph starts but does not end stays open
+                // into the paragraphs after it.
+                for id in range_ids(["moveFromRangeStart", "moveToRangeStart"]) {
+                    if !ended.contains(&id) {
+                        ctx.open_paragraph_move_ranges.push((id, name.clone()));
+                    }
+                }
+                Some(name)
+            }
+            None => {
+                let open = ctx.open_paragraph_move_ranges.last().cloned();
+                ctx.open_paragraph_move_ranges
+                    .retain(|(id, _)| !ended.contains(id));
+                open.map(|(_, name)| name)
+            }
+        };
         blocks.push(tracked);
         return Ok(());
     }
@@ -4919,17 +5639,29 @@ fn append_blocks_from_element(
     // into children and lose the tracking context.
     if is_w_tag(element, "ins") || is_w_tag(element, "del") {
         let tracking_status = extract_block_tracking_status(element)?;
-        let before_len = blocks.len();
         for child in &element.children {
-            if let XMLNode::Element(el) = child {
-                append_blocks_from_element(el, None, blocks, table_counter, ctx)?;
+            let XMLNode::Element(el) = child else {
+                continue;
+            };
+            // A range marker directly in a body-level `w:ins`/`w:del` is no
+            // revision: Word does not track bookmarks, lists no revision for
+            // the wrapper, and keeps the marker on Accept and Reject alike
+            // (Word-observed). It stays a body marker, untracked; it is not
+            // a body child itself, so it is written from its metadata.
+            if let Some(marker) = range_marker_meta_from_element(el) {
+                let mut opaque = in_control_range_marker(el, marker, ctx)?;
+                opaque.proof_ref.docx_anchor = TRACKED_WRAPPER_RANGE_MARKER_ANCHOR.to_string();
+                blocks.push(normal_tracked_block(BlockNode::from(opaque)));
+                continue;
             }
-        }
-        // Tag all newly added blocks with the container's tracking status
-        for tb in &mut blocks[before_len..] {
-            tb.status = tracking_status.clone();
-            if let BlockNode::Paragraph(p) = &mut tb.block {
-                p.para_mark_status = Some(tracking_status.clone());
+            let before_len = blocks.len();
+            append_blocks_from_element(el, None, blocks, table_counter, ctx)?;
+            // Tag the wrapper's blocks with its tracking status.
+            for tb in &mut blocks[before_len..] {
+                tb.status = tracking_status.clone();
+                if let BlockNode::Paragraph(p) = &mut tb.block {
+                    p.para_mark_status = Some(tracking_status.clone());
+                }
             }
         }
         return Ok(());
@@ -5171,6 +5903,7 @@ fn structural_range_decoration(
         docx_anchor: format!("{anchor_label}:deco:{local_index}"),
     };
     InlineNode::from(DecorationNode {
+        formatting_change: None,
         source_run_attrs: Vec::new(),
         id: id.clone(),
         kind,
@@ -5481,6 +6214,7 @@ fn table_from_element(
             let direct_borders = parse_border_set(el, "tblBorders")?;
             formatting.width = parse_table_measurement(el, "tblW")?;
             let direct_cell_margins = parse_cell_margins(el, "tblCellMar");
+            formatting.cell_margins_pct = parse_pct_margins(el, "tblCellMar");
 
             // Direct table alignment from w:jc (§17.4.28).
             let direct_alignment = parse_table_alignment(el);
@@ -5822,10 +6556,12 @@ fn table_row_from_element(
                             })?);
                     }
                     // Parse trHeight (row height)
-                    if is_w_tag(prop_el, "trHeight") {
-                        height = attr_get(prop_el, "w:val")
-                            .map(|v| parse_twips_measure(v, "trHeight element"))
-                            .transpose()?;
+                    // A trHeight whose value Word reads as no number is no
+                    // element at all (see `parse_row_height`).
+                    if is_w_tag(prop_el, "trHeight")
+                        && let Some(read) = row_height_element(prop_el, "trHeight element")?
+                    {
+                        height = read;
                         height_rule = attr_get(prop_el, "w:hRule")
                             .map(|s| HeightRule::from_xml_str(s))
                             .transpose()
@@ -6120,6 +6856,7 @@ fn table_cell_from_element(
     let mut tracking_status: Option<TrackingStatus> = None;
     let mut cell_ins: Option<RevisionInfo> = None;
     let mut cell_del: Option<RevisionInfo> = None;
+    let mut cell_merge: Option<crate::domain::CellMergeChange> = None;
     let mut content_sdt_wraps: Vec<CellSdtWrap> = Vec::new();
     let mut cnf_style: Option<crate::domain::CnfStyle> = None;
     let mut hide_mark = false;
@@ -6136,6 +6873,7 @@ fn table_cell_from_element(
         compat_settings: ctx.compat_settings,
         rel_lookup: ctx.rel_lookup,
         active_move_name: None,
+        open_paragraph_move_ranges: Vec::new(),
         active_move_status: None,
     };
 
@@ -6239,6 +6977,17 @@ fn table_cell_from_element(
                             apply_op_id: None,
                         });
                     }
+                    if is_w_tag(prop_el, "cellMerge")
+                        && let Some(change) =
+                            parse_cell_merge(prop_el, table_id, row_index, cell_index)?
+                    {
+                        if cell_merge.is_some() {
+                            return Err(invalid_docx(&format!(
+                                "table cell tbl_{table_id}_r{row_index}_c{cell_index} carries more than one w:cellMerge (§17.13.5.3 allows one)"
+                            )));
+                        }
+                        cell_merge = Some(change);
+                    }
                     if is_w_tag(prop_el, "cellDel") {
                         let revision_id = parse_revision_id(prop_el, "w:cellDel")?;
                         cell_del = Some(RevisionInfo {
@@ -6267,6 +7016,7 @@ fn table_cell_from_element(
             formatting.has_direct_shading = formatting.shading.is_some();
             formatting.width = parse_table_measurement(el, "tcW")?;
             formatting.margins = parse_cell_margins(el, "tcMar");
+            formatting.margins_pct = parse_pct_margins(el, "tcMar");
             tracking_status = match (cell_ins.take(), cell_del.take()) {
                 (Some(inserted), Some(deleted)) => Some(TrackingStatus::InsertedThenDeleted(
                     Box::new(crate::domain::StackedRevision { inserted, deleted }),
@@ -6279,6 +7029,11 @@ fn table_cell_from_element(
             // RFC-0003 "never silently drop": capture any tcPr child the typed
             // fields don't consume — legacy w:hMerge, vendor extensions.
             preserved = capture_unmodeled_children(el, TCPR_CONSUMED);
+            // A merge-changing cellMerge is modeled in `cell_merge`; only the
+            // ignorable attribute-less form stays in the verbatim remainder.
+            if cell_merge.is_some() {
+                preserved.retain(|prop| prop.name.rsplit(':').next() != Some("cellMerge"));
+            }
             if v_merge == VerticalMerge::Continue
                 && let Some(zero_grid_span) = word_zero_grid_span.take()
             {
@@ -6366,7 +7121,20 @@ fn table_cell_from_element(
             continue;
         }
 
+        // Move-range boundaries between the cell's paragraphs, read as in the
+        // body: Word ends a range that a cell paragraph starts with a
+        // cell-level end right after the range's last paragraph (a paragraph
+        // moved into a cell, §17.13.5.23–.28); a range started between
+        // paragraphs tags the paragraphs inside it.
+        if close_paragraph_move_range_at_body_level(el, &mut blocks, &mut cell_ctx) {
+            continue;
+        }
+        if consume_move_range_boundary(el, &mut cell_ctx)? {
+            continue;
+        }
+
         // Recurse into cell content using existing block parsing
+        let before = blocks.len();
         append_blocks_from_element(
             el,
             None,
@@ -6374,6 +7142,7 @@ fn table_cell_from_element(
             &mut nested_table_counter,
             &mut cell_ctx,
         )?;
+        tag_blocks_in_move_range(&mut blocks[before..], &cell_ctx);
     }
 
     // A cell's last block must be a paragraph (§17.4.65). A source cell that
@@ -6401,6 +7170,23 @@ fn table_cell_from_element(
     // ignore-rule at consumption. Only sectPr is still cleared: a
     // cell-paragraph sectPr is structurally unemittable here (§17.6.18c) and
     // carrying it would fabricate a section boundary.
+    if let Some(moved) = blocks
+        .iter()
+        .find(|tb| tb.move_id.is_some() && !matches!(tb.block, BlockNode::Paragraph(_)))
+    {
+        return Err(RuntimeError {
+            code: ErrorCode::UnsupportedEdit,
+            message: format!(
+                "a move range in table cell tbl_{table_id}_r{row_index}_c{cell_index} covers a \
+                 nested table ({}); only paragraphs can be move halves inside a cell",
+                crate::tracked_model::block_id(&moved.block).0
+            ),
+            details: ErrorDetails {
+                context: moved.move_id.clone(),
+                ..ErrorDetails::default()
+            },
+        });
+    }
     let mut blocks: Vec<BlockNode> = blocks
         .into_iter()
         .map(|tb| match tb.block {
@@ -6408,6 +7194,9 @@ fn table_cell_from_element(
                 // MS-OI29500 §17.6.18c: Word ignores sectPr in table cell paragraphs.
                 p.section_properties = None;
                 p.section_property_change = None;
+                // A cell block has no tracked-block wrapper: the paragraph
+                // itself carries its move group.
+                p.cell_move_id = tb.move_id;
                 BlockNode::Paragraph(p)
             }
             other => other,
@@ -6430,6 +7219,7 @@ fn table_cell_from_element(
     }
 
     Ok(TableCellNode {
+        cell_merge,
         id: NodeId::from(format!("tbl_{table_id}_r{row_index}_c{cell_index}")),
         blocks,
         grid_span,
@@ -6444,6 +7234,43 @@ fn table_cell_from_element(
         preserved,
     })
 }
+/// Parse a `w:cellMerge` (§17.13.5.3). `None` for one with neither `w:vMerge`
+/// nor `w:vMergeOrig`: it "can be ignored" and stays in the verbatim remainder.
+/// A value outside ST_AnnotationVMerge (`rest`/`cont`) is refused.
+fn parse_cell_merge(
+    element: &Element,
+    table_id: u32,
+    row_index: u32,
+    cell_index: u32,
+) -> Result<Option<crate::domain::CellMergeChange>, RuntimeError> {
+    let merge = |name: &str| -> Result<VerticalMerge, RuntimeError> {
+        match attr_get(element, name).map(String::as_str) {
+            None => Ok(VerticalMerge::None),
+            Some("rest") => Ok(VerticalMerge::Restart),
+            Some("cont") => Ok(VerticalMerge::Continue),
+            Some(other) => Err(invalid_docx(&format!(
+                "table cell tbl_{table_id}_r{row_index}_c{cell_index}: w:cellMerge {name}=\"{other}\" is not an ST_AnnotationVMerge value (rest, cont)"
+            ))),
+        }
+    };
+    let after = merge("w:vMerge")?;
+    let before = merge("w:vMergeOrig")?;
+    if after == VerticalMerge::None && before == VerticalMerge::None {
+        return Ok(None);
+    }
+    Ok(Some(crate::domain::CellMergeChange {
+        revision: RevisionInfo {
+            revision_id: parse_revision_id(element, "w:cellMerge")?,
+            identity: 0,
+            author: attr_get(element, "w:author").cloned(),
+            date: attr_get(element, "w:date").cloned(),
+            apply_op_id: None,
+        },
+        after,
+        before,
+    }))
+}
+
 // =============================================================================
 // SDT (Content Control) Parsing Helpers
 // =============================================================================
@@ -6543,6 +7370,11 @@ fn parse_table_indent(tbl_pr: &Element) -> Option<i32> {
                 let twips = match parse_measurement_or_percent(v, "tblInd element") {
                     Ok(MeasurementOrPercent::Number(n)) => n,
                     Ok(MeasurementOrPercent::UniversalTwips(t)) => t,
+                    // CONTRACT DEFAULT (Word 16, verified): Word opens a
+                    // tblInd whose w:w is no number ("abc") and saves the
+                    // table without it, so the table has no indent. An
+                    // untouched table keeps its bytes.
+                    Ok(MeasurementOrPercent::NotANumber) => return None,
                     Ok(MeasurementOrPercent::Percent { .. }) => {
                         tracing::warn!(
                             value = %v,
@@ -6611,11 +7443,11 @@ fn parse_table_cell_spacing(tbl_pr: &Element) -> Option<i64> {
                 match parse_measurement_or_percent(v, "tblCellSpacing element") {
                     Ok(MeasurementOrPercent::Number(n)) => Some(n),
                     Ok(MeasurementOrPercent::UniversalTwips(t)) => Some(t),
-                    Ok(MeasurementOrPercent::Percent { .. }) => {
+                    Ok(MeasurementOrPercent::Percent { .. } | MeasurementOrPercent::NotANumber) => {
                         tracing::warn!(
                             value = %v,
-                            "tblCellSpacing w:w is a percent form, which has no twips meaning \
-                             in the spacing model; dropping the cell spacing"
+                            "tblCellSpacing w:w is a percent form or no number, which has no \
+                             twips meaning in the spacing model; dropping the cell spacing"
                         );
                         None
                     }
@@ -6633,6 +7465,22 @@ fn parse_table_cell_spacing(tbl_pr: &Element) -> Option<i64> {
         }
     }
     None
+}
+
+/// A twips attribute of `w:tblpPr` (ST_SignedTwipsMeasure /
+/// ST_TwipsMeasure, §17.4.57), read by [`read_twips`]. A value that is not a
+/// number is refused, as Word refuses one on a frame's position (`w:framePr`,
+/// the paragraph counterpart): the table is rebuilt from the model on save,
+/// so a dropped value would silently move it.
+fn table_position_twips(element: &Element, attribute: &str) -> Result<Option<i64>, RuntimeError> {
+    let Some(value) = attr_get(element, &format!("w:{attribute}")) else {
+        return Ok(None);
+    };
+    read_twips(value).map_err(|error| {
+        invalid_docx(&format!(
+            "invalid w:tblpPr/@w:{attribute} value '{value}' ({error:?})"
+        ))
+    })
 }
 
 /// Parse floating table positioning from w:tblpPr child of a w:tblPr element (§17.4.57).
@@ -6660,14 +7508,12 @@ fn parse_table_positioning(tbl_pr: &Element) -> Result<Option<TablePositioning>,
             return Ok(Some(TablePositioning {
                 vert_anchor,
                 horz_anchor,
-                tblp_y: attr_get(el, "w:tblpY").and_then(|v| v.parse::<i64>().ok()),
-                tblp_x: attr_get(el, "w:tblpX").and_then(|v| v.parse::<i64>().ok()),
-                left_from_text: attr_get(el, "w:leftFromText").and_then(|v| v.parse::<i64>().ok()),
-                right_from_text: attr_get(el, "w:rightFromText")
-                    .and_then(|v| v.parse::<i64>().ok()),
-                top_from_text: attr_get(el, "w:topFromText").and_then(|v| v.parse::<i64>().ok()),
-                bottom_from_text: attr_get(el, "w:bottomFromText")
-                    .and_then(|v| v.parse::<i64>().ok()),
+                tblp_y: table_position_twips(el, "tblpY")?,
+                tblp_x: table_position_twips(el, "tblpX")?,
+                left_from_text: table_position_twips(el, "leftFromText")?,
+                right_from_text: table_position_twips(el, "rightFromText")?,
+                top_from_text: table_position_twips(el, "topFromText")?,
+                bottom_from_text: table_position_twips(el, "bottomFromText")?,
                 tblp_x_spec,
                 tblp_y_spec,
                 // Everything not modeled above is preserved verbatim
@@ -6779,10 +7625,10 @@ fn parse_border_edge(
             // fail fast, matching parse_table_measurement's w:tblW/w:tcW
             // pattern (reusing its tolerant int-or-float parse).
             let size = attr_get(el, "w:sz")
-                .map(|s| parse_twips(s, &format!("{edge_name} border w:sz")))
+                .map(|s| parse_border_measure(s, &format!("{edge_name} border w:sz")))
                 .transpose()?;
             let space = attr_get(el, "w:space")
-                .map(|s| parse_twips(s, &format!("{edge_name} border w:space")))
+                .map(|s| parse_border_measure(s, &format!("{edge_name} border w:space")))
                 .transpose()?;
             return Ok(Some(Border {
                 style,
@@ -6913,7 +7759,7 @@ fn parse_revision_id(el: &Element, element_name: &str) -> Result<u32, RuntimeErr
     })
 }
 /// Parse cell margins from a container element (e.g., w:tcMar for per-cell, w:tblCellMar for table-level).
-fn parse_cell_margins(parent: &Element, container_name: &str) -> Option<CellMargins> {
+pub(crate) fn parse_cell_margins(parent: &Element, container_name: &str) -> Option<CellMargins> {
     // Find the margin container child (e.g., tcMar or tblCellMar)
     let container = parent.children.iter().find_map(|child| {
         if let XMLNode::Element(el) = child
@@ -6930,7 +7776,12 @@ fn parse_cell_margins(parent: &Element, container_name: &str) -> Option<CellMarg
                 && is_w_tag(el, name)
             {
                 // MS-OI29500 §17.4.42: type="nil" means "not specified" — skip element.
-                if attr_get(el, "w:type").map(|v| v.as_str()) == Some("nil") {
+                // A pct edge is not specified either: Word renders it as no
+                // margin (`parse_pct_margins` keeps it as written).
+                if matches!(
+                    attr_get(el, "w:type").map(|v| v.as_str()),
+                    Some("nil" | "pct")
+                ) {
                     return None;
                 }
                 // The margin elements are CT_TblWidth, so w:w is
@@ -6946,7 +7797,10 @@ fn parse_cell_margins(parent: &Element, container_name: &str) -> Option<CellMarg
                     ) {
                         Ok(MeasurementOrPercent::Number(n)) => n,
                         Ok(MeasurementOrPercent::UniversalTwips(t)) => t,
-                        Ok(MeasurementOrPercent::Percent { .. }) | Err(_) => {
+                        Ok(
+                            MeasurementOrPercent::Percent { .. } | MeasurementOrPercent::NotANumber,
+                        )
+                        | Err(_) => {
                             tracing::warn!(
                                 value = %v,
                                 container = container_name,
@@ -6994,47 +7848,225 @@ fn parse_cell_margins(parent: &Element, container_name: &str) -> Option<CellMarg
     })
 }
 
-/// Parse a string as a twip (twentieths of a point) integer value.
-///
-/// Twips are integer units per the OOXML spec, but some real-world producers
-/// emit float values like "9634.0". We parse as f64 first and truncate to u32
-/// when the string isn't a valid integer. This is a deliberate "parse tolerantly,
-/// store precisely" decision at the import edge.
-fn parse_twips(s: &str, context: &str) -> Result<u32, RuntimeError> {
-    // Fast path: try integer parse first (the common case).
+/// The edges of a margin container (`w:tcMar`, `w:tblCellMar`) written with
+/// `w:type="pct"`, as authored. Word renders such an edge as not specified, so
+/// `parse_cell_margins` leaves it out of the effective margins; this keeps it
+/// to be written back unchanged (see `PctMarginsAsWritten`).
+fn parse_pct_margins(parent: &Element, container_name: &str) -> PctMarginsAsWritten {
+    let Some(container) = parent.children.iter().find_map(|child| match child {
+        XMLNode::Element(el) if is_w_tag(el, container_name) => Some(el),
+        _ => None,
+    }) else {
+        return PctMarginsAsWritten::default();
+    };
+    let edge = |names: &[&str]| {
+        names.iter().find_map(|name| {
+            container.children.iter().find_map(|child| match child {
+                XMLNode::Element(el)
+                    if is_w_tag(el, name)
+                        && attr_get(el, "w:type").map(|v| v.as_str()) == Some("pct") =>
+                {
+                    Some(PctMarginEdge {
+                        element: (*name).to_string(),
+                        w: attr_get(el, "w:w").cloned(),
+                    })
+                }
+                _ => None,
+            })
+        })
+    };
+    PctMarginsAsWritten {
+        top: edge(&["top"]),
+        left: edge(&["left", "start"]),
+        bottom: edge(&["bottom"]),
+        right: edge(&["right", "end"]),
+    }
+}
+
+/// Parse a border `w:sz` (ST_EighthPointMeasure) or `w:space`
+/// (ST_PointMeasure): an unsigned decimal number. Not a twips measure; a
+/// float spelling ("4.0") is read truncated.
+fn parse_border_measure(s: &str, context: &str) -> Result<u32, RuntimeError> {
     if let Ok(n) = s.parse::<u32>() {
         return Ok(n);
     }
-    // Slow path: try float parse for values like "9634.0".
     let f: f64 = s.parse().map_err(|_| RuntimeError {
         code: ErrorCode::InvalidDocx,
-        message: format!("invalid width value '{s}' in {context}"),
+        message: format!("invalid value '{s}' in {context}"),
         details: ErrorDetails::default(),
     })?;
     if f < 0.0 || f > u32::MAX as f64 {
         return Err(RuntimeError {
             code: ErrorCode::InvalidDocx,
-            message: format!("width value '{s}' out of range in {context}"),
+            message: format!("value '{s}' out of range in {context}"),
             details: ErrorDetails::default(),
         });
     }
     Ok(f as u32)
 }
 
-/// Parse an ST_TwipsMeasure value (§22.9.2.14): an unsigned decimal number
-/// of twips OR a positive universal measure ("1in", "0.5cm"), used by
-/// `w:gridCol/@w` and `w:trHeight/@val`. Universal measures convert to
-/// twips (rounded); everything else follows [`parse_twips`], including its
-/// fail-fast on non-numeric values.
-pub(crate) fn parse_twips_measure(s: &str, context: &str) -> Result<u32, RuntimeError> {
-    if let Ok(MeasurementOrPercent::UniversalTwips(t)) = parse_measurement_or_percent(s, context) {
-        return u32::try_from(t).map_err(|_| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: format!("width value '{s}' out of range in {context}"),
-            details: ErrorDetails::default(),
-        });
+/// A twips measure as written: a plain number of twips, or a universal
+/// measure converted to twips. CT_TblWidth needs the distinction (a plain
+/// number's unit is the sibling `w:type`; a universal measure carries its
+/// own); every other twips attribute reads both the same.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TwipsMeasure {
+    Number(i64),
+    Universal(i64),
+}
+
+impl TwipsMeasure {
+    pub(crate) fn twips(&self) -> i64 {
+        match self {
+            TwipsMeasure::Number(twips) | TwipsMeasure::Universal(twips) => *twips,
+        }
     }
-    parse_twips(s, context)
+}
+
+/// Why a written twips value has no twips reading.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TwipsError {
+    /// Not a number in any spelling Word reads ("abc", "12abc", "1e3"). What
+    /// that means depends on the attribute: see [`read_twips_measure`].
+    NotANumber,
+    /// A number outside the i64 twips range.
+    OutOfRange,
+}
+
+/// THE reading of a twips attribute (ST_TwipsMeasure §22.9.2.14,
+/// ST_SignedTwipsMeasure §22.9.2.13, and the number of a CT_TblWidth), shared
+/// by every twips attribute in every part: paragraph, run, frame, tab,
+/// table, section, settings, styles and numbering. It reads a value as Word
+/// 16 does (verified on the oracle):
+///
+/// - a number `[+-]?digits[.digits]` truncates toward zero: "720.6" is 720,
+///   "720.99" is 720, "-200.6" is -200, "+500" is 500;
+/// - a universal measure (`<number>mm|cm|in|pt|pc|pi`) converts to the
+///   nearest twip: ".5in" is 720;
+/// - CONTRACT DEFAULT: an empty value is no value (`Ok(None)`). Word opens
+///   `w:ind w:left=""` and saves the paragraph without the attribute;
+/// - anything else is [`TwipsError::NotANumber`]. Word does not treat that
+///   one way: it refuses to open the file over a paragraph, tab, frame or
+///   section measure, repairs a grid column, reads `w:tblW` / `w:tcW` as 0
+///   and drops `w:tblInd`, `w:trHeight` and a run's `w:spacing`. Each caller
+///   applies the reading of its own attribute.
+pub(crate) fn read_twips_measure(value: &str) -> Result<Option<TwipsMeasure>, TwipsError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let universal = (value.len() > 2 && value.is_char_boundary(value.len() - 2))
+        .then(|| value.split_at(value.len() - 2))
+        .and_then(|(number, unit)| {
+            universal_measure_unit_to_twips(unit).map(|per_unit| (number, per_unit))
+        });
+    if let Some((number, twips_per_unit)) = universal {
+        if !is_word_twips_number(number) {
+            return Err(TwipsError::NotANumber);
+        }
+        let n: f64 = number.parse().map_err(|_| TwipsError::NotANumber)?;
+        let twips = (n * twips_per_unit).round();
+        if !(i64::MIN as f64..=i64::MAX as f64).contains(&twips) {
+            return Err(TwipsError::OutOfRange);
+        }
+        return Ok(Some(TwipsMeasure::Universal(twips as i64)));
+    }
+    if !is_word_twips_number(value) {
+        return Err(TwipsError::NotANumber);
+    }
+    // Truncation toward zero is the integer part, read exactly from its
+    // digits (no float rounding of large values).
+    let (sign, digits) = match value.as_bytes()[0] {
+        b'-' => (-1, &value[1..]),
+        b'+' => (1, &value[1..]),
+        _ => (1, value),
+    };
+    let integer_part = digits.split('.').next().unwrap_or_default();
+    let magnitude = if integer_part.is_empty() {
+        0
+    } else {
+        integer_part
+            .parse::<i64>()
+            .map_err(|_| TwipsError::OutOfRange)?
+    };
+    Ok(Some(TwipsMeasure::Number(sign * magnitude)))
+}
+
+/// [`read_twips_measure`] without the plain/universal distinction.
+pub(crate) fn read_twips(value: &str) -> Result<Option<i64>, TwipsError> {
+    Ok(read_twips_measure(value)?.map(|measure| measure.twips()))
+}
+
+/// A number as Word reads it in a twips attribute: an optional sign, digits,
+/// and an optional fraction, with at least one digit (".5" and "720." read;
+/// "1e3", "12abc" and "." do not).
+fn is_word_twips_number(s: &str) -> bool {
+    let unsigned = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    digits(integer) && digits(fraction) && !(integer.is_empty() && fraction.is_empty())
+}
+
+/// A grid column width (`w:gridCol/@w:w`, ST_TwipsMeasure), read by
+/// [`read_twips`]. Word repairs a non-number here (recomputing the grid from
+/// the cells), which the import cannot, so it is refused; a negative width
+/// is refused as outside ST_TwipsMeasure. An empty value is no width (0, as
+/// an omitted one is, §17.4.16).
+pub(crate) fn parse_grid_col_width(s: &str, context: &str) -> Result<u32, RuntimeError> {
+    let twips = match read_twips(s) {
+        Ok(twips) => twips.unwrap_or(0),
+        Err(TwipsError::NotANumber) => {
+            return Err(invalid_docx(&format!(
+                "invalid width value '{s}' in {context}"
+            )));
+        }
+        Err(TwipsError::OutOfRange) => {
+            return Err(invalid_docx(&format!(
+                "width value '{s}' out of range in {context}"
+            )));
+        }
+    };
+    u32::try_from(twips)
+        .map_err(|_| invalid_docx(&format!("width value '{s}' out of range in {context}")))
+}
+
+/// A row height (`w:trHeight/@w:val`, ST_TwipsMeasure), read by
+/// [`read_twips`]. CONTRACT DEFAULT (Word 16, verified): a value that is not
+/// a number ("abc") is no height. Word opens the file and saves the row
+/// without `w:trHeight`, so the model holds none; an empty value is none as
+/// well. An untouched row keeps its bytes. A negative or too large number is
+/// refused.
+fn parse_row_height(s: &str, context: &str) -> Result<Option<u32>, RuntimeError> {
+    let twips = match read_twips(s) {
+        Ok(twips) => twips,
+        Err(TwipsError::NotANumber) => return Ok(None),
+        Err(TwipsError::OutOfRange) => {
+            return Err(invalid_docx(&format!(
+                "height value '{s}' out of range in {context}"
+            )));
+        }
+    };
+    twips
+        .map(|twips| {
+            u32::try_from(twips)
+                .map_err(|_| invalid_docx(&format!("height value '{s}' out of range in {context}")))
+        })
+        .transpose()
+}
+
+/// A `w:trHeight` element's height: `Some(height)` for the element as read
+/// (its `w:val` absent is `Some(None)`), or `None` when Word reads it as no
+/// element because its value holds no number (see [`parse_row_height`]).
+fn row_height_element(
+    element: &Element,
+    context: &str,
+) -> Result<Option<Option<u32>>, RuntimeError> {
+    match attr_get(element, "w:val") {
+        None => Ok(Some(None)),
+        Some(value) => Ok(parse_row_height(value, context)?.map(Some)),
+    }
 }
 
 /// A `w:w` attribute value on a CT_TblWidth carrier (`w:tblW`, `w:tcW`,
@@ -7049,10 +8081,10 @@ pub(crate) fn parse_twips_measure(s: &str, context: &str) -> Result<u32, Runtime
 /// matching how Word consumes such files).
 #[derive(Debug, PartialEq)]
 pub(crate) enum MeasurementOrPercent {
-    /// Plain decimal number (tolerant of float spellings like "9634.0");
-    /// unit depends on the declared `w:type` (dxa → twips, pct → fiftieths
-    /// of a percent). Negative values are accepted here — carriers whose
-    /// model is unsigned range-check at their own edge.
+    /// Plain decimal number, read by [`read_twips_measure`] (a decimal
+    /// truncates toward zero); unit depends on the declared `w:type` (dxa →
+    /// twips, pct → fiftieths of a percent). Negative values are accepted
+    /// here — carriers whose model is unsigned range-check at their own edge.
     Number(i64),
     /// ST_Percentage literal (`-?[0-9]+(\.[0-9]+)?%`, e.g. "33.3%").
     /// `fiftieths` is the value normalized to fiftieths of a percent
@@ -7062,6 +8094,10 @@ pub(crate) enum MeasurementOrPercent {
     /// ST_UniversalMeasure (`-?[0-9]+(\.[0-9]+)?(mm|cm|in|pt|pc|pi)`,
     /// e.g. "1.5in"), converted to twips (rounded to nearest).
     UniversalTwips(i64),
+    /// No number: an empty value or one Word reads as no number ("abc").
+    /// Word opens the file; each carrier says what it reads this as (`w:tblW`
+    /// and `w:tcW` as 0, `w:tblInd` as no indent).
+    NotANumber,
 }
 
 /// Check the numeric part of an ST_Percentage / ST_UniversalMeasure value:
@@ -7090,10 +8126,12 @@ pub(crate) fn universal_measure_unit_to_twips(unit: &str) -> Option<f64> {
     }
 }
 
-/// Parse an ST_MeasurementOrPercent attribute value (§17.18.107).
+/// Parse an ST_MeasurementOrPercent attribute value (§17.18.107): a percent
+/// literal, or a twips measure read by [`read_twips_measure`].
 ///
-/// Fail-fast: a value matching none of the three legal forms is an
-/// InvalidDocx error naming the value and the carrier element.
+/// Fail-fast: a malformed percent literal or an out-of-range value is an
+/// InvalidDocx error naming the value and the carrier element. A value with
+/// no number is [`MeasurementOrPercent::NotANumber`], for the carrier to read.
 pub(crate) fn parse_measurement_or_percent(
     s: &str,
     context: &str,
@@ -7123,32 +8161,12 @@ pub(crate) fn parse_measurement_or_percent(
             literal: s.to_string(),
         });
     }
-    // ST_UniversalMeasure: "-?N(.N)?(mm|cm|in|pt|pc|pi)".
-    if s.len() > 2 && s.is_char_boundary(s.len() - 2) {
-        let (num, unit) = s.split_at(s.len() - 2);
-        if let Some(twips_per_unit) = universal_measure_unit_to_twips(unit) {
-            if !is_schema_decimal(num) {
-                return Err(invalid());
-            }
-            let n: f64 = num.parse().map_err(|_| invalid())?;
-            let twips = (n * twips_per_unit).round();
-            if !(i64::MIN as f64..=i64::MAX as f64).contains(&twips) {
-                return Err(out_of_range());
-            }
-            return Ok(MeasurementOrPercent::UniversalTwips(twips as i64));
-        }
+    match read_twips_measure(s) {
+        Ok(Some(TwipsMeasure::Number(n))) => Ok(MeasurementOrPercent::Number(n)),
+        Ok(Some(TwipsMeasure::Universal(t))) => Ok(MeasurementOrPercent::UniversalTwips(t)),
+        Ok(None) | Err(TwipsError::NotANumber) => Ok(MeasurementOrPercent::NotANumber),
+        Err(TwipsError::OutOfRange) => Err(out_of_range()),
     }
-    // ST_DecimalNumber — integer per the schema, but some real-world
-    // producers emit float spellings like "9634.0"; parse tolerantly and
-    // truncate, same policy as parse_twips.
-    if let Ok(n) = s.parse::<i64>() {
-        return Ok(MeasurementOrPercent::Number(n));
-    }
-    let f: f64 = s.parse().map_err(|_| invalid())?;
-    if !(i64::MIN as f64..=i64::MAX as f64).contains(&f) {
-        return Err(out_of_range());
-    }
-    Ok(MeasurementOrPercent::Number(f as i64))
 }
 
 /// Parse a table measurement (e.g., w:tblW, w:tcW) from a properties element.
@@ -7195,6 +8213,11 @@ fn parse_table_measurement(
                     MeasurementOrPercent::UniversalTwips(t) => {
                         (to_u32(t, s)?, WidthType::Dxa, None)
                     }
+                    // CONTRACT DEFAULT (Word 16, verified on w:tblW and
+                    // w:tcW): a width that is no number ("abc") reads as 0
+                    // of the declared type; Word opens the file and saves
+                    // w:w="0". An untouched table keeps its bytes.
+                    MeasurementOrPercent::NotANumber => (0, declared_type, None),
                 },
             };
             // MS-OI29500 §2.1.166: Word lays out a w=0 width as "auto" whatever
@@ -7229,6 +8252,7 @@ fn parse_tbl_pr_ex(el: &Element) -> Result<TableFormatting, RuntimeError> {
         borders: parse_border_set(el, "tblBorders")?,
         width: parse_table_measurement(el, "tblW")?,
         default_cell_margins: parse_cell_margins(el, "tblCellMar"),
+        cell_margins_pct: parse_pct_margins(el, "tblCellMar"),
         alignment: parse_table_alignment(el),
         indent: parse_table_indent(el),
         layout: parse_table_layout(el)?,
@@ -7335,7 +8359,7 @@ fn parse_grid_cols(tbl_grid: &Element) -> Result<Vec<u32>, RuntimeError> {
             && is_w_tag(el, "gridCol")
         {
             let w = match attr_get(el, "w:w") {
-                Some(s) => parse_twips_measure(s, "gridCol element")?,
+                Some(s) => parse_grid_col_width(s, "gridCol element")?,
                 None => 0,
             };
             cols.push(w);
@@ -8497,6 +9521,7 @@ fn parse_previous_table_properties(
         row_band_size: parse_band_size(tbl_pr, "tblStyleRowBandSize"),
         col_band_size: parse_band_size(tbl_pr, "tblStyleColBandSize"),
         has_direct_borders: direct_borders.is_some(),
+        cell_margins_pct: parse_pct_margins(tbl_pr, "tblCellMar"),
         has_direct_cell_margins: direct_cell_margins.is_some(),
         has_direct_alignment: direct_alignment.is_some(),
         has_direct_indent: direct_indent.is_some(),
@@ -8585,10 +9610,9 @@ fn parse_tr_pr_change(tr_pr: &Element) -> Result<Option<RowFormattingChange>, Ru
             for child in &inner_el.children {
                 if let XMLNode::Element(prop_el) = child
                     && is_w_tag(prop_el, "trHeight")
+                    && let Some(read) = row_height_element(prop_el, "trPrChange trHeight element")?
                 {
-                    h = attr_get(prop_el, "w:val")
-                        .map(|v| parse_twips_measure(v, "trPrChange trHeight element"))
-                        .transpose()?;
+                    h = read;
                     hr = attr_get(prop_el, "w:hRule")
                         .map(|s| HeightRule::from_xml_str(s))
                         .transpose()
@@ -8841,7 +9865,7 @@ pub(crate) fn compute_table_structure_hash(rows: &[TableRowNode]) -> String {
     out
 }
 /// Extract plain text from inline nodes with Caps mark normalization.
-/// Applies `.to_uppercase()` to text nodes with caps=On to match
+/// Reads text nodes with caps=On as shown (`local_change::caps_shown`) to match
 /// the text projection used by the redline extract path.
 pub(crate) fn extract_inline_text_simple(inlines: &[InlineNode]) -> String {
     let mut out = String::new();
@@ -8849,7 +9873,7 @@ pub(crate) fn extract_inline_text_simple(inlines: &[InlineNode]) -> String {
         match inline {
             InlineNode::Text(t) => {
                 if t.style_props.caps == MarkValue::On {
-                    out.push_str(&t.text.to_uppercase());
+                    out.push_str(&crate::local_change::caps_shown(&t.text));
                 } else {
                     out.push_str(&t.text);
                 }
@@ -9063,7 +10087,8 @@ pub(crate) fn strip_literal_prefix(inlines: &mut Vec<InlineNode>) -> Option<Stri
 }
 
 /// Like [`strip_literal_prefix`], but refuses the hoist when any character it
-/// would consume comes from a TRACKED inline. `tracked` is aligned
+/// would consume comes from a TRACKED inline (inserted, deleted, or a run
+/// whose properties carry a `w:rPrChange`). `tracked` is aligned
 /// index-for-index with `inlines` (empty = nothing is tracked).
 ///
 /// `literal_prefix` is an untracked presentational field: hoisting tracked
@@ -9205,7 +10230,10 @@ fn strip_literal_prefix_with_metadata(
         }
         match inline {
             InlineNode::Text(t) => {
-                if tracked.get(i).copied().unwrap_or(false) {
+                // A run whose properties carry a tracked change (`w:rPrChange`)
+                // is tracked too: the label field has no formatting-change
+                // carrier, so hoisting would drop the revision.
+                if tracked.get(i).copied().unwrap_or(false) || t.formatting_change.is_some() {
                     return None;
                 }
                 guard_remaining -= t.text.len().min(guard_remaining);
@@ -9636,11 +10664,11 @@ fn paragraph_from_element(
     // Resolved here (before the literal-prefix strip) so the strip can see
     // whether the paragraph carries structural numbering.
     // DirectNumPr::Suppressed (numId=0, §17.9.18) blocks style and pStyle binding.
-    let mut resolved_num_pr = if let Some(sd) = style_defs {
-        sd.resolve_effective_num_props(effective_style_id, &view.num_props)
-    } else {
-        view.num_props.clone()
-    };
+    let mut resolved_num_pr = crate::styles::resolve_effective_direct_num_props(
+        style_defs,
+        effective_style_id,
+        &view.num_props,
+    );
 
     // §17.9.23: pStyle reverse binding — if no numPr from direct or style,
     // check if any numbering level claims this paragraph's style via <w:pStyle>.
@@ -9657,6 +10685,9 @@ fn paragraph_from_element(
     let effective_num_props = match &resolved_num_pr {
         crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
         crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+        crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
+            "numId {num_id} without a level is resolved to an active level before this point"
+        ),
     };
 
     // MODEL: a paragraph that carries structural numbering (w:numPr resolving to
@@ -10170,8 +11201,16 @@ fn paragraph_from_element(
         // Numbering resolved from a style (§17.7.4.14) or bound via the
         // abstractNum's pStyle reverse link (§17.9.23) is inherited, not direct,
         // and must not be materialized onto the paragraph's pPr on rebuild.
-        has_direct_numbering: matches!(view.num_props, crate::word_ir::DirectNumPr::Active(_)),
+        has_direct_numbering: matches!(
+            view.num_props,
+            crate::word_ir::DirectNumPr::Active(_)
+                | crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
+        ),
         numbering_suppressed: matches!(view.num_props, crate::word_ir::DirectNumPr::Suppressed),
+        direct_numbering_omits_ilvl: matches!(
+            view.num_props,
+            crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
+        ),
         materialized_numbering: None,
         rendered_text,
         literal_prefix,
@@ -10249,6 +11288,7 @@ fn paragraph_from_element(
         cnf_style: view.cnf_style.clone(),
         source_paragraph_attrs,
         preserved_ppr: view.preserved.clone(),
+        cell_move_id: None,
     };
     attach_mark_only_formatting_change(&mut paragraph, mark_only_change.as_ref())?;
     Ok(BlockNode::from(paragraph))
@@ -10645,6 +11685,31 @@ pub(crate) fn reresolve_run_style_props(
     Ok(())
 }
 
+/// A run's formatting resolved through the style cascade from the direct
+/// properties its `marks`/`style_props`/`rpr_authored` write, in a
+/// paragraph of style `para_style_id`: what importing a text run written so
+/// yields ([`reresolve_run_style_props`]). For a run held as written (an
+/// object's wrapper run), so it compares with text runs by effective value.
+#[doc(hidden)]
+pub fn resolved_run_formatting(
+    marks: &[Mark],
+    style_props: &StyleProps,
+    rpr_authored: crate::domain::RunRprAuthored,
+    style_defs: &crate::styles::StyleDefinitions,
+    para_style_id: Option<&str>,
+) -> Result<(Vec<Mark>, StyleProps), RuntimeError> {
+    let mut marks = marks.to_vec();
+    let mut style_props = style_props.clone();
+    reresolve_run_style_props(
+        &mut marks,
+        &mut style_props,
+        rpr_authored,
+        style_defs,
+        para_style_id,
+    )?;
+    Ok((marks, style_props))
+}
+
 /// Convert a word_ir::PprChange to a domain::ParagraphFormattingChange.
 ///
 /// The inner pPr is converted as authored DIRECT formatting per §17.13.5.29.
@@ -10818,9 +11883,9 @@ fn convert_ppr_change(
     // previous pPr is the paragraph's direct properties before the change, and
     // rejecting the change makes it the live pPr again, so it follows the
     // direct numPr's rule (`extract_num_props`): numId 0 suppresses whatever
-    // the level, and any other partial pair is refused rather than given an
-    // invented level. Accepting it here alone left reject with a numbering the
-    // model could not write and the import would not reopen.
+    // the level, a list without a level takes the level Word resolves against
+    // the previous style (Word renders the Original view so), and a level
+    // without a list is refused rather than given an invented list.
     let style_num_pr = style_defs
         .resolve_effective_num_props(effective_style_id, &crate::word_ir::DirectNumPr::Absent);
     let mut resolved_num_pr = match &direct_numbering {
@@ -10832,11 +11897,16 @@ fn convert_ppr_change(
             (Some(num_id), Some(ilvl)) => {
                 crate::word_ir::DirectNumPr::Active(crate::word_ir::NumProps { num_id, ilvl })
             }
+            (Some(num_id), None) => crate::styles::resolve_effective_direct_num_props(
+                Some(style_defs),
+                effective_style_id,
+                &crate::word_ir::DirectNumPr::ListWithoutLevel { num_id },
+            ),
             (num_id, ilvl) => {
                 return Err(invalid_docx(&format!(
                     "pPrChange previous w:numPr has an incomplete numbering pair \
-                     (numId={num_id:?}, ilvl={ilvl:?}); refusing rather than defaulting \
-                     the missing coordinate, as for a direct w:numPr"
+                     (numId={num_id:?}, ilvl={ilvl:?}) that names no list; refusing rather \
+                     than inventing the list, as for a direct w:numPr"
                 )));
             }
         },
@@ -10851,6 +11921,9 @@ fn convert_ppr_change(
     let effective_num_props = match &resolved_num_pr {
         crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
         crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+        crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
+            "numId {num_id} without a level is resolved to an active level before this point"
+        ),
     };
     let effective_numbering = effective_num_props
         .as_ref()
@@ -11117,6 +12190,21 @@ pub(crate) fn unlinked_text_inlines(
     data: &crate::domain::HyperlinkData,
     id_prefix: &NodeId,
 ) -> Result<Vec<InlineNode>, RuntimeError> {
+    hyperlink_display_inlines(data, id_prefix, None, None)
+}
+
+/// A hyperlink's display runs as the text runs they are, through the
+/// ordinary run importer ([`unlinked_text_inlines`]). With `style_defs`,
+/// their formatting is resolved as import resolves a paragraph's runs (the
+/// paragraph's style `para_style_id`), so they compare with the paragraph's
+/// other runs by effective value.
+#[doc(hidden)]
+pub fn hyperlink_display_inlines(
+    data: &crate::domain::HyperlinkData,
+    id_prefix: &NodeId,
+    style_defs: Option<&crate::styles::StyleDefinitions>,
+    para_style_id: Option<&str>,
+) -> Result<Vec<InlineNode>, RuntimeError> {
     let refuse = |message: &str| invalid_docx(&format!("unlink {:?}: {message}", data.text));
     if data.runs.is_empty() {
         return Err(refuse("no authored display runs"));
@@ -11211,7 +12299,7 @@ pub(crate) fn unlinked_text_inlines(
             "source run payload disagrees with hyperlink display text",
         ));
     }
-    inline_nodes_from_atoms(id_prefix, &view.atoms, &mut 0, None, None)
+    inline_nodes_from_atoms(id_prefix, &view.atoms, &mut 0, style_defs, para_style_id)
 }
 
 fn inline_nodes_from_atoms(
@@ -11364,6 +12452,7 @@ fn inline_nodes_from_atoms(
                                 || (note_reference && matches!(next.kind, AtomKind::Widget { .. })))
                     });
                 out.push(InlineNode::from(crate::domain::OpaqueInlineNode {
+                    formatting_change: convert_rpr_change(&atom.marks)?,
                     id,
                     kind,
                     opaque_ref: format!("paragraph:{}:widget:{}", block_id.0, local_index),
@@ -11387,6 +12476,7 @@ fn inline_nodes_from_atoms(
                     docx_anchor: format!("paragraph:{}:hyperlink:{}", block_id.0, local_index),
                 };
                 out.push(InlineNode::from(crate::domain::OpaqueInlineNode {
+                    formatting_change: None,
                     id,
                     kind: OpaqueKind::Hyperlink(data.clone()),
                     opaque_ref: format!("paragraph:{}:hyperlink:{}", block_id.0, local_index),
@@ -11410,6 +12500,7 @@ fn inline_nodes_from_atoms(
                     docx_anchor: format!("paragraph:{}:atom:{}", block_id.0, local_index),
                 };
                 out.push(InlineNode::from(DecorationNode {
+                    formatting_change: None,
                     id,
                     kind: DecorationType::EmptyRun,
                     source_run_attrs: atom.source_run_attrs.clone(),
@@ -11446,14 +12537,45 @@ fn inline_nodes_from_atoms(
                 // run with adjacent text, so re-emitting that run's rPr onto the
                 // atom-split marker run would only duplicate the formatting the
                 // text run already carries — leave those empty.
-                let (wrapper_marks, wrapper_style_props) =
+                let (wrapper_marks, wrapper_style_props, formatting_change) =
                     if decoration_wrapper_rpr_is_load_bearing(name) {
                         (
                             convert_text_marks_to_marks(&atom.marks),
                             convert_text_marks_to_style_props(&atom.marks)?,
+                            convert_rpr_change(&atom.marks)?,
                         )
                     } else {
-                        (Vec::new(), StyleProps::default())
+                        // The run's formatting and tracked formatting change
+                        // stay with the content sharing the run (text, a
+                        // break, an object), which carries them. A run
+                        // holding nothing else (Word writes
+                        // lastRenderedPageBreak alone in a run; a soft hyphen
+                        // alone in a run renders, at a line end, in that
+                        // run's formatting) carries them on the mark: its run
+                        // is captured like a note mark's, so the formatting
+                        // is written back and the change is listed, resolved
+                        // and written back.
+                        let alone = atom.origin.run_index.is_some()
+                            && !atoms.iter().any(|other| {
+                                other.origin.run_index == atom.origin.run_index
+                                    && matches!(
+                                        other.kind,
+                                        AtomKind::Text(_)
+                                            | AtomKind::Tab
+                                            | AtomKind::NoBreakHyphen
+                                            | AtomKind::Break { .. }
+                                            | AtomKind::Widget { .. }
+                                    )
+                            });
+                        if alone {
+                            (
+                                convert_text_marks_to_marks(&atom.marks),
+                                convert_text_marks_to_style_props(&atom.marks)?,
+                                convert_rpr_change(&atom.marks)?,
+                            )
+                        } else {
+                            (Vec::new(), StyleProps::default(), None)
+                        }
                     };
                 let local_name = name.split(':').next_back().unwrap_or(name);
                 let joins_following_text_run = crate::word_ir::is_run_decoration(local_name)
@@ -11466,6 +12588,7 @@ fn inline_nodes_from_atoms(
                             )
                     });
                 out.push(InlineNode::from(DecorationNode {
+                    formatting_change,
                     id,
                     kind: deco_type,
                     source_run_attrs: atom.source_run_attrs.clone(),
@@ -11498,6 +12621,7 @@ fn inline_nodes_from_atoms(
                     docx_anchor: format!("paragraph:{}:atom:{}", block_id.0, local_index),
                 };
                 out.push(InlineNode::from(DecorationNode {
+                    formatting_change: None,
                     id,
                     kind: DecorationType::MoveRange,
                     source_run_attrs: Vec::new(),
@@ -11528,6 +12652,7 @@ fn inline_nodes_from_atoms(
                     docx_anchor: format!("paragraph:{}:atom:{}", block_id.0, local_index),
                 };
                 out.push(InlineNode::from(DecorationNode {
+                    formatting_change: None,
                     id,
                     kind: DecorationType::BidiWrapper,
                     source_run_attrs: Vec::new(),
@@ -11568,6 +12693,7 @@ fn inline_nodes_from_atoms(
                     docx_anchor: format!("paragraph:{}:atom:{}", block_id.0, local_index),
                 };
                 out.push(InlineNode::from(DecorationNode {
+                    formatting_change: None,
                     id,
                     kind,
                     source_run_attrs: Vec::new(),
@@ -11692,30 +12818,56 @@ pub(crate) fn resolve_hyperlink_urls(
     }
 }
 
-/// Resolve each header and footer story's external hyperlink URLs from its own
-/// part's relationships (`word/_rels/header1.xml.rels`): a link's `r:id` names
-/// a relationship of the part it is written in, not of the main document.
+/// Resolve each story's external hyperlink URLs from its own part's
+/// relationships (`word/_rels/header1.xml.rels`, `word/_rels/footnotes.xml.rels`,
+/// ...): a link's `r:id` names a relationship of the part it is written in,
+/// not of the main document. Headers and footers each have their own part;
+/// every footnote, every endnote and every comment shares its kind's one part,
+/// found through the main document's relationships (`rels`).
 pub(crate) fn resolve_story_hyperlink_urls(
     doc: &mut CanonDoc,
     archive: &DocxArchive,
+    rels: &DocumentRelationships,
     main_dir: &str,
 ) -> Result<(), RuntimeError> {
-    let stories = doc
-        .headers
-        .iter_mut()
-        .filter(|story| !story.synthesized)
-        .map(|story| (&story.part_name, &mut story.blocks))
-        .chain(
-            doc.footers
-                .iter_mut()
-                .filter(|story| !story.synthesized)
-                .map(|story| (&story.part_name, &mut story.blocks)),
-        );
-    for (part_name, blocks) in stories {
+    let part_hyperlinks = |part_name: &str| -> Result<_, RuntimeError> {
         let part_path = resolve_relationship_target(part_name, main_dir);
-        let rels = parse_document_relationships(archive, &part_path)?;
-        for block in blocks.iter_mut() {
-            resolve_hyperlink_urls_in_block(&mut block.block, &rels.hyperlinks);
+        Ok(parse_document_relationships(archive, &part_path)?.hyperlinks)
+    };
+    for story in doc.headers.iter_mut().filter(|story| !story.synthesized) {
+        let hyperlinks = part_hyperlinks(&story.part_name)?;
+        for block in &mut story.blocks {
+            resolve_hyperlink_urls_in_block(&mut block.block, &hyperlinks);
+        }
+    }
+    for story in doc.footers.iter_mut().filter(|story| !story.synthesized) {
+        let hyperlinks = part_hyperlinks(&story.part_name)?;
+        for block in &mut story.blocks {
+            resolve_hyperlink_urls_in_block(&mut block.block, &hyperlinks);
+        }
+    }
+    if let Some(rel) = &rels.footnotes {
+        let hyperlinks = part_hyperlinks(&rel.target)?;
+        for story in &mut doc.footnotes {
+            for block in &mut story.blocks {
+                resolve_hyperlink_urls_in_block(&mut block.block, &hyperlinks);
+            }
+        }
+    }
+    if let Some(rel) = &rels.endnotes {
+        let hyperlinks = part_hyperlinks(&rel.target)?;
+        for story in &mut doc.endnotes {
+            for block in &mut story.blocks {
+                resolve_hyperlink_urls_in_block(&mut block.block, &hyperlinks);
+            }
+        }
+    }
+    if let Some(rel) = &rels.comments {
+        let hyperlinks = part_hyperlinks(&rel.target)?;
+        for story in &mut doc.comments {
+            for block in &mut story.blocks {
+                resolve_hyperlink_urls_in_block(&mut block.block, &hyperlinks);
+            }
         }
     }
     Ok(())
@@ -11759,6 +12911,13 @@ fn resolve_hyperlink_urls_in_block(
 /// hashing them would make an unchanged reference look different across a
 /// persistence boundary.
 pub(crate) fn opaque_content_hash(kind: &OpaqueKind, raw_xml: &[u8]) -> Option<String> {
+    opaque_content_hash_of(kind, raw_xml)
+}
+
+/// [`opaque_content_hash`], for a producer outside the engine that rewrote an
+/// opaque's raw XML and must keep its hash current.
+#[doc(hidden)]
+pub fn opaque_content_hash_of(kind: &OpaqueKind, raw_xml: &[u8]) -> Option<String> {
     match kind {
         OpaqueKind::CommentReference(_)
         | OpaqueKind::FootnoteReference(_)
@@ -11769,13 +12928,57 @@ pub(crate) fn opaque_content_hash(kind: &OpaqueKind, raw_xml: &[u8]) -> Option<S
 
 /// The SHA-256 of an opaque fragment's canonical spelling: parsed, then
 /// re-serialized with only the namespace declarations it uses. Two spellings
-/// of one element (an unused `xmlns:w14`, `/>` against ` />`) are the same
-/// content, so they hash equally whichever producer wrote them.
+/// of one element (an unused `xmlns:w14`, `/>` against ` />`, attributes in
+/// another order) are the same content, so they hash equally whichever
+/// producer wrote them.
 pub(crate) fn canonical_raw_hash(raw_xml: &[u8]) -> String {
     let mut element = word_xml::parse_raw_fragment(raw_xml)
         .expect("opaque raw XML is a fragment serialized from a parsed element");
-    drop_inert_space_preserve(&mut element);
+    canonical_spelling(&mut element);
     sha256_hex(&word_xml::serialize_raw_fragment(&element))
+}
+
+/// Rewrite an element tree into its canonical spelling: what is left once
+/// everything XML says carries no content is removed. The order of an
+/// element's attributes is not significant (XML 1.0 §3.1), so attributes are
+/// put in one order, by namespace and then local name; an inert
+/// `xml:space="preserve"` is dropped (see [`drop_inert_space_preserve`]); a
+/// drawing's id is dropped (see [`drop_drawing_ids`]).
+fn canonical_spelling(element: &mut Element) {
+    drop_inert_space_preserve(element);
+    drop_drawing_ids(element);
+    sort_attributes(element);
+}
+
+/// Remove each drawing's id (`wp:docPr/@id`, §20.4.2.5): a package-local
+/// identifier, unique within a document, that a writer may renumber (and a
+/// comparison does, for an inserted copy of a drawing), not drawing content.
+fn drop_drawing_ids(element: &mut Element) {
+    if element.name == "docPr"
+        && element.namespace.as_deref()
+            == Some("http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing")
+    {
+        element
+            .attributes
+            .retain(|name, _| !(name.local_name == "id" && name.namespace.is_none()));
+    }
+    for child in &mut element.children {
+        if let XMLNode::Element(child) = child {
+            drop_drawing_ids(child);
+        }
+    }
+}
+
+fn sort_attributes(element: &mut Element) {
+    element.attributes.sort_by(|a, _, b, _| {
+        (a.namespace.as_deref(), a.local_name.as_str())
+            .cmp(&(b.namespace.as_deref(), b.local_name.as_str()))
+    });
+    for child in &mut element.children {
+        if let XMLNode::Element(child) = child {
+            sort_attributes(child);
+        }
+    }
 }
 
 /// Remove `xml:space="preserve"` where it preserves nothing: the element's
@@ -12516,6 +13719,10 @@ pub(crate) fn parse_comments(
             .or_else(|| attr_get(el, "date"))
             .cloned();
 
+        let initials = attr_get(el, "w:initials")
+            .or_else(|| attr_get(el, "initials"))
+            .cloned();
+
         let parsed_blocks = parse_note_blocks(el, numbering_defs, style_defs, default_tab_stop)
             .map_err(|e| with_part_context(&part_path, e))?;
         let content_hash = compute_story_content_hash(&parsed_blocks);
@@ -12528,6 +13735,7 @@ pub(crate) fn parse_comments(
             id,
             author,
             date,
+            initials,
             blocks,
             content_hash,
             tracking_status: None,
@@ -12646,6 +13854,7 @@ fn parse_story_blocks(
         compat_settings: &default_compat,
         rel_lookup: &empty_rel_lookup,
         active_move_name: None,
+        open_paragraph_move_ranges: Vec::new(),
         active_move_status: None,
     };
 
@@ -12945,6 +14154,11 @@ fn parse_story_block(
     } else {
         element
     };
+    // Only the blocks parsed here: a wrapper's children come back through
+    // this function one by one.
+    if is_w_tag(element, "p") || is_w_tag(element, "tbl") {
+        note_twips_read_without_a_number(element, "a header, footer, note or comment part", ctx);
+    }
 
     // Handle w:p (paragraph)
     if is_w_tag(element, "p") {
@@ -13056,11 +14270,11 @@ fn parse_story_block(
 
         // Resolve effective numPr: direct wins, else style-resolved (§17.7.4.14).
         // DirectNumPr::Suppressed (numId=0, §17.9.18) blocks style and pStyle binding.
-        let mut resolved_num_pr = if let Some(sd) = ctx.style_defs {
-            sd.resolve_effective_num_props(effective_style_id, &view.num_props)
-        } else {
-            view.num_props.clone()
-        };
+        let mut resolved_num_pr = crate::styles::resolve_effective_direct_num_props(
+            ctx.style_defs,
+            effective_style_id,
+            &view.num_props,
+        );
 
         // §17.9.23: pStyle reverse binding — if no numPr from direct or style,
         // check if any numbering level claims this paragraph's style via <w:pStyle>.
@@ -13077,6 +14291,9 @@ fn parse_story_block(
         let effective_num_props = match &resolved_num_pr {
             crate::word_ir::DirectNumPr::Active(numbering) => Some(numbering.clone()),
             crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
+            crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
+                "numId {num_id} without a level is resolved to an active level before this point"
+            ),
         };
 
         // Synthesize numbering if available
@@ -13436,8 +14653,16 @@ fn parse_story_block(
             block_text_hash: Some(sha256_hex(block_text.as_bytes())),
             numbering: numbering.clone(),
             // See paragraph_from_element: emit direct numPr only when authored.
-            has_direct_numbering: matches!(view.num_props, crate::word_ir::DirectNumPr::Active(_)),
+            has_direct_numbering: matches!(
+                view.num_props,
+                crate::word_ir::DirectNumPr::Active(_)
+                    | crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
+            ),
             numbering_suppressed: matches!(view.num_props, crate::word_ir::DirectNumPr::Suppressed),
+            direct_numbering_omits_ilvl: matches!(
+                view.num_props,
+                crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
+            ),
             materialized_numbering: None,
             rendered_text,
             literal_prefix,
@@ -13517,6 +14742,7 @@ fn parse_story_block(
             cnf_style: view.cnf_style.clone(),
             source_paragraph_attrs,
             preserved_ppr: view.preserved.clone(),
+            cell_move_id: None,
         };
         attach_mark_only_formatting_change(&mut paragraph, mark_only_change.as_ref())?;
         return Ok(Some(BlockNode::from(paragraph)));
@@ -13562,6 +14788,7 @@ fn parse_note_blocks(
         compat_settings: &default_compat2,
         rel_lookup: &empty_rel_lookup,
         active_move_name: None,
+        open_paragraph_move_ranges: Vec::new(),
         active_move_status: None,
     };
 
@@ -13937,7 +15164,12 @@ fn decoration_type_from_name(name: &str) -> DecorationType {
         s if s.starts_with("perm") => DecorationType::PermissionRange,
         "proofErr" => DecorationType::ProofError,
         s if s.starts_with("customXml") => DecorationType::CustomXmlRange,
-        s if s.starts_with("move") => DecorationType::MoveRange,
+        // The WordprocessingML move markers by their exact names: a foreign
+        // element whose name merely starts with "move" is foreign markup,
+        // and the move logic reads a MoveRange decoration as one of these.
+        // (`name` is the local name; the parser drops the prefix.)
+        "moveFromRangeStart" | "moveFromRangeEnd" | "moveToRangeStart" | "moveToRangeEnd"
+        | "moveFrom" | "moveTo" => DecorationType::MoveRange,
         // Anything else reaching here is a FOREIGN-namespace element that
         // word_ir preserved verbatim as a zero-width decoration (e.g. a
         // PowerTools/Templafy <Insert> placeholder). Label it honestly rather
@@ -14181,6 +15413,29 @@ mod tests {
         assert!(base_ref.starts_with("body_item_sha256:"));
     }
 
+    /// XML attribute order carries no meaning (XML 1.0 §3.1): one body-level
+    /// marker written by two producers in different attribute orders is one
+    /// opaque block, while a marker with another name is another.
+    #[test]
+    fn body_opaque_identity_ignores_attribute_order() {
+        let wrap = |marker: &str| {
+            format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Before</w:t></w:r></w:p>{marker}<w:p><w:r><w:t>After</w:t></w:r></w:p></w:body></w:document>"#
+            )
+        };
+        let id_first = import_single_body_opaque_ref(
+            wrap(r#"<w:bookmarkStart w:id="3" w:name="place"/>"#).as_bytes(),
+        );
+        let name_first = import_single_body_opaque_ref(
+            wrap(r#"<w:bookmarkStart w:name="place" w:id="3"/>"#).as_bytes(),
+        );
+        let renamed = import_single_body_opaque_ref(
+            wrap(r#"<w:bookmarkStart w:id="3" w:name="elsewhere"/>"#).as_bytes(),
+        );
+        assert_eq!(id_first, name_first, "attribute order is spelling");
+        assert_ne!(id_first, renamed, "a different name is a different marker");
+    }
+
     /// Pre-Rung-6 whole-tree archive build: materialize the entire document.xml
     /// tree up front, parse header/footer refs from it, then run the body loop.
     /// Kept ONLY in tests as the oracle the streaming `build_canonical_from_archive`
@@ -14295,7 +15550,7 @@ mod tests {
         doc.compat_settings = compat_settings;
         doc.comments_extended = comments_extended;
         resolve_hyperlink_urls(&mut doc, &rels.hyperlinks);
-        resolve_story_hyperlink_urls(&mut doc, archive, main_dir)?;
+        resolve_story_hyperlink_urls(&mut doc, archive, &rels, main_dir)?;
         Ok((doc, diagnostics))
     }
 
@@ -14852,6 +16107,7 @@ mod tests {
 
     fn vmerge_test_cell(id: &str, v_merge: VerticalMerge) -> TableCellNode {
         TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id.to_string()),
             blocks: Vec::new(),
             grid_span: 1,
@@ -15365,47 +16621,56 @@ mod tests {
     }
 
     // =========================================================================
-    // parse_twips tests
+    // read_twips tests: Word 16's reading of a twips value (verified)
     // =========================================================================
 
     #[test]
-    fn parse_twips_integer_value() {
-        assert_eq!(parse_twips("9634", "test").unwrap(), 9634);
+    fn read_twips_truncates_a_decimal_toward_zero() {
+        for (value, twips) in [
+            ("9634", 9634),
+            ("9634.0", 9634),
+            ("720.6", 720),
+            ("720.5", 720),
+            ("720.99", 720),
+            ("-200.6", -200),
+            ("-720.5", -720),
+            ("-0.5", 0),
+            ("0", 0),
+        ] {
+            assert_eq!(read_twips(value), Ok(Some(twips)), "{value}");
+        }
     }
 
     #[test]
-    fn parse_twips_float_value_truncates_to_integer() {
-        // Real-world producers sometimes emit "9634.0" instead of "9634".
-        // Twips are integer units, so we truncate.
-        assert_eq!(parse_twips("9634.0", "test").unwrap(), 9634);
-    }
-
-    #[test]
-    fn parse_twips_float_with_fractional_part_truncates() {
-        assert_eq!(parse_twips("9634.7", "test").unwrap(), 9634);
-    }
-
-    #[test]
-    fn parse_twips_zero() {
-        assert_eq!(parse_twips("0", "test").unwrap(), 0);
-        assert_eq!(parse_twips("0.0", "test").unwrap(), 0);
-    }
-
-    #[test]
-    fn parse_twips_non_numeric_returns_error() {
-        let err = parse_twips("abc", "tblW element").unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidDocx);
-        assert!(
-            err.message.contains("abc") && err.message.contains("tblW element"),
-            "error should include the bad value and context, got: {}",
-            err.message
+    fn read_twips_accepts_a_plus_sign_and_universal_measures() {
+        assert_eq!(read_twips("+500"), Ok(Some(500)));
+        assert_eq!(read_twips(".5in"), Ok(Some(720)));
+        assert_eq!(
+            read_twips_measure("12pt"),
+            Ok(Some(TwipsMeasure::Universal(240)))
+        );
+        assert_eq!(
+            read_twips_measure("720.6"),
+            Ok(Some(TwipsMeasure::Number(720)))
         );
     }
 
     #[test]
-    fn parse_twips_negative_returns_error() {
-        let err = parse_twips("-100", "tblW element").unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidDocx);
+    fn read_twips_reads_an_empty_value_as_none() {
+        assert_eq!(read_twips(""), Ok(None));
+    }
+
+    #[test]
+    fn read_twips_finds_no_number_in_other_spellings() {
+        for value in [
+            "abc", "12abc", "1e3", ".", "-", "in", "1.5.0", "inf", " 720",
+        ] {
+            assert_eq!(read_twips(value), Err(TwipsError::NotANumber), "{value}");
+        }
+        assert_eq!(
+            read_twips("99999999999999999999"),
+            Err(TwipsError::OutOfRange)
+        );
     }
 
     // =========================================================================
@@ -15418,7 +16683,7 @@ mod tests {
             parse_measurement_or_percent("5000", "test").unwrap(),
             MeasurementOrPercent::Number(5000)
         );
-        // Tolerant float spelling, same policy as parse_twips.
+        // A decimal truncates toward zero (read_twips).
         assert_eq!(
             parse_measurement_or_percent("9634.7", "test").unwrap(),
             MeasurementOrPercent::Number(9634)
@@ -15472,10 +16737,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_measurement_rejects_illegal_values() {
-        // Fail-fast stays: values matching none of the three legal forms are
-        // InvalidDocx errors, with the value and carrier in the message.
-        for bad in ["abc", "%", "1.5.0%", "12xx", "--5%", "1e3%", "in"] {
+    fn parse_measurement_rejects_a_malformed_percent() {
+        // Fail-fast stays for a percent literal that is not one, with the
+        // value and carrier in the message.
+        for bad in ["%", "1.5.0%", "--5%", "1e3%"] {
             let err = parse_measurement_or_percent(bad, "tblW element").unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidDocx, "value: {bad}");
             assert!(
@@ -15487,13 +16752,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_twips_measure_universal_and_plain() {
-        // ST_TwipsMeasure (gridCol/@w, trHeight/@val) admits a positive
-        // universal measure alongside plain twips.
-        assert_eq!(parse_twips_measure("1in", "gridCol element").unwrap(), 1440);
-        assert_eq!(parse_twips_measure("720", "gridCol element").unwrap(), 720);
-        // Percent is NOT in ST_TwipsMeasure's value space — fail-fast.
-        assert!(parse_twips_measure("50%", "gridCol element").is_err());
+    fn parse_measurement_reports_a_value_with_no_number() {
+        // Word opens a CT_TblWidth with no number; each carrier reads it.
+        for value in ["abc", "12xx", "in", ""] {
+            assert_eq!(
+                parse_measurement_or_percent(value, "tblW element").unwrap(),
+                MeasurementOrPercent::NotANumber,
+                "value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_col_width_reads_twips_and_refuses_what_word_repairs() {
+        // ST_TwipsMeasure (gridCol/@w) admits a universal measure alongside
+        // plain twips; a decimal truncates.
+        assert_eq!(
+            parse_grid_col_width("1in", "gridCol element").unwrap(),
+            1440
+        );
+        assert_eq!(
+            parse_grid_col_width("720.6", "gridCol element").unwrap(),
+            720
+        );
+        // Percent is not in ST_TwipsMeasure's value space, and Word repairs a
+        // non-number here: both refused.
+        assert!(parse_grid_col_width("50%", "gridCol element").is_err());
+        assert!(parse_grid_col_width("abc", "gridCol element").is_err());
+        assert!(parse_grid_col_width("-100", "gridCol element").is_err());
     }
 
     // =========================================================================
@@ -16324,27 +17610,39 @@ mod tests {
     }
 
     #[test]
-    fn ppr_change_positive_num_id_without_ilvl_is_refused_as_the_direct_form_is() {
-        // Word resolves an omitted ilvl at level zero, but the engine does not
-        // invent the level for a direct numPr, and rejecting the change makes
-        // this previous numPr the direct one: both positions refuse it.
+    fn ppr_change_previous_list_without_a_level_is_kept_as_written() {
+        // Word renders the Original view of a previous numPr that names a list
+        // but no level at the style's level, else level 0, and saves the
+        // previous numPr still without a level.
         let bytes = docx_with_body_and_numbering(
             r#"<w:p><w:pPr><w:pPrChange w:id="8" w:author=""><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:pPrChange></w:pPr><w:r><w:t>Item text.</w:t></w:r></w:p>"#,
             r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="3"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num></w:numbering>"#,
         );
-        let error = build_canonical_from_docx_preserving_tracked(
+        let (document, _) = build_canonical_from_docx_preserving_tracked(
             &bytes,
             DocFingerprint("partial-previous-numpr".to_string()),
         )
-        .expect_err("a previous numId without ilvl is refused");
-        assert_eq!(error.code, ErrorCode::InvalidDocx);
-        assert!(
-            error
-                .message
-                .contains("incomplete numbering pair (numId=Some(7), ilvl=None)"),
-            "{}",
-            error.message
+        .expect("a previous list without a level imports");
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0].block else {
+            panic!("test body contains one paragraph")
+        };
+        let change = paragraph.formatting_change.as_ref().expect("pPrChange");
+        assert_eq!(
+            change.previous.direct.numbering,
+            DirectParagraphNumbering::Present(crate::domain::DirectParagraphNumPr {
+                num_id: Some(7),
+                ilvl: None,
+                extra_attrs: Vec::new(),
+                preserved: Vec::new(),
+            })
         );
+        let effective = change
+            .previous
+            .effective
+            .numbering
+            .as_ref()
+            .expect("the previous list is effective");
+        assert_eq!((effective.num_id, effective.ilvl), (7, 0));
     }
 
     #[test]

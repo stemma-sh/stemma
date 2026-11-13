@@ -243,6 +243,7 @@ pub(crate) fn apply_wrap(
     }
 
     let sdt_inline = InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: sdt_node_id.clone(),
         kind: OpaqueKind::Sdt,
         opaque_ref: format!("sdtref_{}", sdt_node_id.0),
@@ -382,6 +383,7 @@ pub(crate) fn apply_set_value(
             step_index,
         })?;
 
+    refuse_content_lock(&element, sdt_id, step_index)?;
     apply_value_to_sdt(&mut element, value, sdt_id, step_index)?;
 
     let new_raw = serialize_raw_fragment(&element);
@@ -516,6 +518,81 @@ impl DetectedKind {
 /// [`crate::opaque_meta::sdt_control_kind`] (one parser, two callers): the verb
 /// keeps its own `DetectedKind` (used for the write-path type-mismatch checks),
 /// but the element walk that classifies the kind lives in one place.
+/// The `w:lock` value (§17.5.2.23) of a control's `w:sdtPr` that forbids
+/// editing its contents, or `None` when its contents may be edited.
+/// `contentLocked` and `sdtContentLocked` lock the contents; `sdtLocked` only
+/// keeps the control from being deleted and `unlocked` locks nothing. Any
+/// other value is returned too: an unknown lock is not assumed open.
+pub(crate) fn content_lock(sdt_pr: &Element) -> Option<String> {
+    let lock = sdt_pr.children.iter().find_map(|child| match child {
+        XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "lock") => Some(e),
+        _ => None,
+    })?;
+    let value = crate::xml_attrs::attr_get(lock, "w:val")
+        .cloned()
+        .unwrap_or_default();
+    (!matches!(value.as_str(), "sdtLocked" | "unlocked")).then_some(value)
+}
+
+/// The open block-level controls (a `BlockSdtWrap` over ordinary blocks)
+/// whose lock forbids editing their contents: the range of top-level block
+/// indexes each spans, its first block's id, and the lock value.
+pub(crate) fn content_locked_block_controls(
+    doc: &crate::domain::CanonDoc,
+) -> Vec<(std::ops::Range<usize>, NodeId, String)> {
+    fn walk(
+        doc: &crate::domain::CanonDoc,
+        start: usize,
+        wrap: &crate::domain::BlockSdtWrap,
+        out: &mut Vec<(std::ops::Range<usize>, NodeId, String)>,
+    ) {
+        let sdt_pr = parse_raw_fragment(&wrap.wrapper.sdt_pr_xml)
+            .expect("w:sdtPr bytes are an element written by import or an authoring verb");
+        if let Some(lock) = content_lock(&sdt_pr) {
+            out.push((
+                start..start + wrap.span,
+                super::super::block_id_of(&doc.blocks[start].block).clone(),
+                lock,
+            ));
+        }
+        for nested in &wrap.nested {
+            walk(doc, start + nested.start, &nested.control, out);
+        }
+    }
+    let mut out = Vec::new();
+    for (index, tracked) in doc.blocks.iter().enumerate() {
+        if let Some(wrap) = &tracked.block_sdt_wrap {
+            walk(doc, index, wrap, &mut out);
+        }
+    }
+    out
+}
+
+/// [`content_lock`] of a `w:sdt` element.
+pub(crate) fn sdt_content_lock(sdt: &Element) -> Option<String> {
+    sdt.children.iter().find_map(|child| match child {
+        XMLNode::Element(e) if crate::word_xml::is_w_tag(e, "sdtPr") => content_lock(e),
+        _ => None,
+    })
+}
+
+/// Refuse an edit of the contents of control `sdt_id` when its lock forbids
+/// one.
+pub(crate) fn refuse_content_lock(
+    sdt: &Element,
+    sdt_id: &NodeId,
+    step_index: usize,
+) -> Result<(), EditError> {
+    match sdt_content_lock(sdt) {
+        None => Ok(()),
+        Some(lock) => Err(EditError::ContentControlLocked {
+            sdt_id: sdt_id.clone(),
+            lock,
+            step_index,
+        }),
+    }
+}
+
 fn detect_control_kind(sdt: &Element) -> DetectedKind {
     DetectedKind::from(crate::opaque_meta::sdt_control_kind(sdt))
 }

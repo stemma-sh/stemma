@@ -1560,9 +1560,88 @@ fn an_edit_inside_a_pending_insertion_is_not_a_new_revision_of_its_author() {
     assert!(
         matches!(
             &report.preexisting_revisions[0].disposition,
-            RevisionDisposition::Modified { after_excerpt } if after_excerpt.contains("45") && after_excerpt.contains("days")
+            RevisionDisposition::EditedInside { after_excerpt } if after_excerpt.contains("45") && after_excerpt.contains("days")
         ),
-        "Alice's insertion is edited inside, all of it still hers: {:?}",
+        "Alice's insertion is edited inside by Bob's tracked change, all of it still hers: {:?}",
         report.preexisting_revisions[0].disposition
+    );
+}
+
+/// The same insertion changed WITHOUT a covering revision (another
+/// producer rewrote "45 days" as "60 days", still marked as Alice's), while a
+/// tracked edit elsewhere gives the proof something to reject. Rejecting that
+/// revision restores the other paragraph, never her insertion: an untracked
+/// edit inside a pending revision is never "edited inside" and never
+/// "untouched". The reject-all delta cannot see it either, because rejecting
+/// her insertion discards the edited text with it.
+#[test]
+fn an_untracked_edit_inside_a_pending_insertion_is_never_edited_inside() {
+    let before = make_docx_with_body(
+        r#"<w:p><w:r><w:t xml:space="preserve">Payment is due within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">45 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of invoice.</w:t></w:r></w:p><w:p><w:r><w:t>Interest accrues monthly.</w:t></w:r></w:p>"#,
+    );
+    let after = make_docx_with_body(
+        r#"<w:p><w:r><w:t xml:space="preserve">Payment is due within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T09:00:00Z"><w:r><w:t xml:space="preserve">60 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of invoice.</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Interest accrues </w:t></w:r><w:del w:id="13" w:author="Bob" w:date="2026-10-02T09:00:00Z"><w:r><w:delText>monthly</w:delText></w:r></w:del><w:ins w:id="12" w:author="Bob" w:date="2026-10-02T09:00:00Z"><w:r><w:t>quarterly</w:t></w:r></w:ins><w:r><w:t>.</w:t></w:r></w:p>"#,
+    );
+    let report = stemma::audit(&before, &after).unwrap();
+    assert!(
+        report
+            .new_revisions
+            .iter()
+            .any(|r| r.author.as_deref() == Some("Bob")),
+        "the tracked edit elsewhere is new: {:?}",
+        report.new_revisions
+    );
+    assert_eq!(report.preexisting_revisions.len(), 1);
+    assert!(
+        matches!(
+            report.preexisting_revisions[0].disposition,
+            RevisionDisposition::Modified { .. } | RevisionDisposition::Resolved
+        ),
+        "an untracked change inside her insertion is a finding: {:?}",
+        report.preexisting_revisions[0].disposition
+    );
+}
+
+/// One paragraph deleted without tracking from the middle of twenty: the
+/// audit reports that one deletion, not a modification of every paragraph
+/// after it. The finding stands (an untracked deletion is a direct change);
+/// only the account is exact.
+#[test]
+fn one_untracked_paragraph_deletion_is_one_direct_deletion() {
+    let numbered: Vec<String> = (1..=20).map(|n| format!("Clause {n} applies.")).collect();
+    let body = |paragraphs: &[&String]| -> String {
+        paragraphs
+            .iter()
+            .map(|text| format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"))
+            .collect()
+    };
+    let all: Vec<&String> = numbered.iter().collect();
+    let without_third: Vec<&String> = numbered
+        .iter()
+        .filter(|t| *t != "Clause 3 applies.")
+        .collect();
+    let before = make_docx_with_body(&body(&all));
+    let after = make_docx_with_body(&body(&without_third));
+
+    let report = stemma::audit(&before, &after).unwrap();
+    let rows: Vec<(DirectChangeKind, Option<String>, Option<String>)> = report
+        .direct_changes
+        .iter()
+        .map(|c| (c.kind, c.old_excerpt.clone(), c.new_excerpt.clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(
+            DirectChangeKind::BlockDeleted,
+            Some("Clause 3 applies.".to_string()),
+            None
+        )],
+        "{:?}",
+        report.direct_changes
+    );
+    assert!(
+        report.untouched.violations.is_empty(),
+        "{:?}",
+        report.untouched.violations
     );
 }

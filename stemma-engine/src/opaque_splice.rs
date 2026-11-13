@@ -92,18 +92,89 @@ pub(crate) fn splice_region_text(
     // "First occurrence" means first in the region's DOCUMENT-ORDER visible
     // text — the text discovery reports — with direct runs and transparent
     // wrappers interleaved as written. (Trying direct runs first would edit a
-    // doc-LATER direct occurrence over a doc-earlier hyperlinked one.) Build
-    // the doc-order segmentation, locate the occurrence, and splice inside
-    // the ONE container that holds it; a span straddling a container
-    // boundary is genuinely ambiguous and refuses.
-    enum Seg {
-        /// Text in this region's own direct runs; `direct_prefix` is the byte
-        /// offset of this segment within the direct-runs-only concatenation.
-        Direct { direct_prefix: usize },
-        /// Text inside the transparent wrapper at child index `i`.
-        Wrapper { child_index: usize },
+    // doc-LATER direct occurrence over a doc-earlier hyperlinked one.)
+    let Some(start) = region_text(region).find(find) else {
+        return Err(SpliceError::TextNotFound);
+    };
+    splice_located(
+        region,
+        start,
+        start + find.len(),
+        replacement,
+        base,
+        rev_counter,
+        tracked,
+    )
+}
+
+/// Splice several replacements into `region`'s editable text at once: each
+/// `(start, end, replacement)` is a byte range of [`region_text`] as it reads
+/// BEFORE any of them is applied. The ranges must be in order and must not
+/// overlap. Each becomes its own change (its own `w:del`/`w:ins` ids in tracked
+/// mode). An empty range with a replacement is an insertion at that offset; it
+/// takes the formatting of the text before it (of the text after it at offset
+/// 0), as typing there does. Refuses a region that already carries tracked changes, as
+/// [`splice_region_text`] does; any refusal leaves `region` untouched.
+pub(crate) fn splice_region_spans(
+    region: &mut Element,
+    spans: &[(usize, usize, String)],
+    base: &RevisionInfo,
+    rev_counter: &mut u32,
+    tracked: bool,
+) -> Result<(), SpliceError> {
+    assert!(
+        spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "splice spans must be ordered and disjoint: {spans:?}"
+    );
+    if region_has_tracked_containers(region) {
+        return Err(SpliceError::RegionHasTrackedChanges);
     }
-    let mut segments: Vec<(Seg, usize)> = Vec::new(); // (segment, byte length)
+    let text = region_text(region);
+    if spans.iter().any(|(start, end, replacement)| {
+        start > end || (start == end && replacement.is_empty()) || text.get(*start..*end).is_none()
+    }) {
+        return Err(SpliceError::TextNotFound);
+    }
+    // Last span first: a splice changes only the text at and after its own
+    // start, so the offsets of every earlier span still hold.
+    let mut edited = region.clone();
+    for (start, end, replacement) in spans.iter().rev() {
+        splice_located(
+            &mut edited,
+            *start,
+            *end,
+            replacement,
+            base,
+            rev_counter,
+            tracked,
+        )?;
+    }
+    *region = edited;
+    Ok(())
+}
+
+/// The region's editable text in document order: its direct text runs and the
+/// text of transparent wrappers (hyperlinks, smart tags) interleaved as
+/// written. Barrier children (drawings, fields, nested controls) contribute
+/// nothing. This is the text [`splice_region_text`] searches and the text
+/// [`splice_region_spans`] offsets index.
+pub(crate) fn region_text(region: &Element) -> String {
+    region_segments(region).0
+}
+
+/// One container of a region's editable text.
+enum Seg {
+    /// Text in this region's own direct runs; `direct_prefix` is the byte
+    /// offset of this segment within the direct-runs-only concatenation.
+    Direct { direct_prefix: usize },
+    /// Text inside the transparent wrapper at child index `child_index`.
+    Wrapper { child_index: usize },
+}
+
+/// The region's editable text and its containers with their byte lengths, in
+/// document order.
+fn region_segments(region: &Element) -> (String, Vec<(Seg, usize)>) {
+    let mut segments: Vec<(Seg, usize)> = Vec::new();
     let mut full = String::new();
     let mut direct_len = 0usize;
     // One Direct segment per maximal run of non-wrapper children: adjacent
@@ -137,18 +208,38 @@ pub(crate) fn splice_region_text(
     if let Some((direct_prefix, len)) = open_direct.take() {
         segments.push((Seg::Direct { direct_prefix }, len));
     }
+    (full, segments)
+}
 
-    let Some(start) = full.find(find) else {
-        return Err(SpliceError::TextNotFound);
-    };
-    let end = start + find.len();
-
-    // Locate the one container the occurrence lies in.
+/// Splice `replacement` in for the byte range `[start, end)` of the region's
+/// editable text, inside the ONE container that holds it; a range straddling
+/// a container boundary is genuinely ambiguous and refuses (`TextNotFound`).
+fn splice_located(
+    region: &mut Element,
+    start: usize,
+    end: usize,
+    replacement: &str,
+    base: &RevisionInfo,
+    rev_counter: &mut u32,
+    tracked: bool,
+) -> Result<(), SpliceError> {
+    let (full, segments) = region_segments(region);
+    let find = full
+        .get(start..end)
+        .ok_or(SpliceError::TextNotFound)?
+        .to_string();
     let mut seg_start = 0usize;
     for (seg, len) in &segments {
         let seg_end = seg_start + len;
-        // Skip zero-length and non-overlapping segments.
-        if *len > 0 && start < seg_end && end > seg_start {
+        // Skip zero-length and non-overlapping segments. An insertion point
+        // (`start == end`) belongs to the container whose text ends at it, or
+        // to the first container when it is at offset 0.
+        let holds = if start == end {
+            start <= seg_end && (start > seg_start || start == 0)
+        } else {
+            start < seg_end && end > seg_start
+        };
+        if *len > 0 && holds {
             if start < seg_start || end > seg_end {
                 // Straddles this container's boundary — not present in any
                 // single container's text: genuinely ambiguous, refuse.
@@ -157,7 +248,7 @@ pub(crate) fn splice_region_text(
             return match seg {
                 Seg::Direct { direct_prefix } => splice_direct_at(
                     region,
-                    find,
+                    &find,
                     direct_prefix + (start - seg_start),
                     replacement,
                     base,
@@ -168,7 +259,15 @@ pub(crate) fn splice_region_text(
                     let XMLNode::Element(w) = &mut region.children[*child_index] else {
                         unreachable!("wrapper segment indexes a wrapper element");
                     };
-                    splice_region_text(w, find, replacement, base, rev_counter, tracked)
+                    splice_located(
+                        w,
+                        start - seg_start,
+                        end - seg_start,
+                        replacement,
+                        base,
+                        rev_counter,
+                        tracked,
+                    )
                 }
             };
         }
@@ -295,7 +394,17 @@ fn splice_direct_at(
                 }
                 // The run that contains the END of the span is where the change
                 // block lands — after this run's pre, before its post.
-                if !change_emitted && run_start < end && end <= run_end && end > start {
+                // An insertion point sits after the text before it: in the run
+                // that ends at or spans it, or in the first run at offset 0.
+                let lands_here = if end > start {
+                    run_start < end && end <= run_end
+                } else {
+                    start <= run_end && (start > run_start || start == 0)
+                };
+                if !change_emitted && lands_here {
+                    if insert_rpr.is_none() {
+                        insert_rpr = Some(rpr.cloned().unwrap_or_else(|| w_el("rPr")));
+                    }
                     seams.push(new_children.len());
                     emit_change(
                         &mut new_children,

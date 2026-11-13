@@ -32,7 +32,11 @@ profile.
 Re-read a block after editing it. Span handles and guards become stale after a
 write to the same block. Revision ids are content-derived: a revision whose own
 content is untouched keeps its id across save, reopen, and the resolution of
-other revisions (see [id durability](cli.md#extract)). Read them from
+other revisions (see [id durability](cli.md#extract)). Among changes that
+look exactly alike (same kind, author, date and text), ids are kept by
+Stemma's own save, reopen and resolutions; after another editor changes the
+file, lookalikes are numbered again by document order, so re-read ids after
+any edit made outside Stemma. Read them from
 `list_revisions` or a receipt, never from raw XML; the one exception is a
 change inside a textbox, whose id is its own `w:id`.
 
@@ -148,12 +152,11 @@ input. Only the host operator should raise process-wide limits.
 | `ParagraphContainsTrackedSegments` | The requested span operation lacks a safe coordinate space (wire code `UnsupportedEdit`). | Resolve the paragraph or use `replace_text`. |
 | `StyleNotFound` | A requested style does not exist (wire code `AnchorNotFound`). | Read current styles or create the style in the same transaction. |
 | `PrefixDuplicatesLabel` | The content starts with the paragraph's own label, which would print twice, or with a different label on automatic list numbering. | Send the body only; the message names the content to send. Change list numbering with `set_numbering`. |
-| `ReplaceTextInsideInlineObjects` | The phrase also stands in a hyperlink's display text or a content control's value, which text replacement does not edit; `unreached_matches` names each object and the op that edits it (wire code `UnsupportedEdit` on `replace_text`). | Edit those with the named op first, or narrow the scope, then replace the rest. |
+| `ReplaceTextInsideInlineObjects` | The phrase also stands in a link or content control whose text cannot be replaced (a content-locked, non-text or placeholder control, pending changes inside it, or a replacement that would empty it); `unreached_matches` names each object and why (wire code `UnsupportedEdit` on `replace_text`). | Unlock, fill or resolve that object first, or narrow the scope, then replace. |
 | `ExpectCrossesInlineObject` | `expect` runs across a field, image, break, or other inline object the operation cannot span (wire code `UnsupportedEdit`). | Give text on one side of the named object. |
 | `TableColumnHeaderMismatch` | A column op's `expect_header` is not the text of that column's top cell (wire code `UnsupportedEdit`). | Take the index from the refusal, which lists every column with its header. |
 | `NoteBodyLineCountMismatch` | An `edit_note` body has a different number of lines than the note has paragraphs (wire code `UnsupportedEdit`). | Give one line per paragraph, in order, repeating a line to keep it. |
 | `BlockedJoin` | A selective resolution would join paragraphs across blocks that another pending revision removes (wire code `UnsupportedEdit`; `context` lists `required_revision_ids`). | Resolve the listed revisions together. |
-| pending `cell_merge` | A table has a pending tracked cell merge, so every resolution refuses, accept-all and reject-all included (wire code `UnsupportedEdit`; `context` starts `revision_kind=cell_merge`). | Resolve the merge in Word, then resolve the rest. |
 | `doc_id_required` | The call omitted `doc_id` while no document or several documents are open; `open_doc_ids` lists them. | Pass the `doc_id` that `open_docx` returned. |
 | `InvalidRange` | A revision selector matched nothing. | Re-read revisions and correct the selector. |
 | `FormatRevisionConflict` | The target already carries a pending formatting revision from another proposal. | Resolve that revision, leave it pending, or comment; the refusal names which. |

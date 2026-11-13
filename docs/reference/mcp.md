@@ -95,6 +95,7 @@ Prefer targeted `inspect_docx` queries:
 | `revisions` | List current pending revisions, optionally filtered by author, kind, or block range. |
 | `styles` | Inspect authored style state. |
 | `notes` | Read editable footnote and endnote rows. |
+| `comments` | Read every comment: `id`, `author`, `date`, `text`, `resolved`, and the thread position (`parent_id`, with the raw `parent_para_id`). The `id` is the `parent_comment_id` that `comment_reply` takes; the fields are the same as `comments` in [`stemma read`](cli.md#read). |
 | `headers_footers` | Discover authored header/footer part names, story kinds, block ids, text and opaque field anchors before `edit_header`/`edit_footer`. Page with `offset`/`limit` (default 8, maximum 64); select `pattern:"<part_name>"` and `block_id` for exact detail, optionally `detail:"formatting"` and table `cell_offset`/`cell_limit`. Block ids are story-local; an ambiguous id requires a part selection. Synthesized blank stories have no editable package part and are excluded. |
 | `nested_form_fields` | Discover legacy fields inside opaque body controls, with positional addresses, containing-block hashes, instructions, cached results and paragraph context. Page with `offset`/`limit` (default 8, maximum 64). Names may repeat. Use `set_block_form_text` for a FORMTEXT result, not the enclosing control's first-text fill. |
 | `redline`, `accepted`, `rejected` | Read the current, accept-all, or reject-all projection. |
@@ -137,9 +138,10 @@ For a replacement worklist:
 - preview first;
 - reissue only refused items after correcting them;
 - scope by block id when the intended text is not unique;
-- edit text inside a hyperlink or content control through that object: an
-  item whose text also stands there refuses, listing each one in
-  `unreached_matches`.
+- text inside a hyperlink's display text or a content control's value is
+  replaced there too; an item whose text stands in a control that cannot be
+  edited (content-locked, a drop-down or date, showing its placeholder)
+  refuses, listing each one with its reason in `unreached_matches`.
 
 The omitted replacement scope covers top-level and table-cell paragraphs.
 Preview runs the ordered worklist against a throwaway snapshot, including the
@@ -159,7 +161,11 @@ should report:
 
 - no unexpected direct delta;
 - no untouched-scope violations;
-- every pre-existing revision in its intended disposition;
+- every pre-existing revision in its intended disposition: `untouched`, or
+  `edited_inside` when the delivery's own tracked changes are stacked inside
+  it (rejecting them restores it; it counts as an expected change), or
+  `resolved` by a resolution the session made. `modified` (changed without a
+  covering tracked change) is always unexpected;
 - `validator.new_issue_count: 0`.
 
 `baseline_validator` reports findings that already existed when the source was

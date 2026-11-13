@@ -3699,6 +3699,7 @@ fn sentinel_tracked_replace_of_inline_sdt_refuses_unqualified_insertion() {
         .diff_and_redline(&ia.doc_handle, &ib.doc_handle, redline_meta())
         .expect_err("a whole inserted SDT envelope must refuse before output");
 
+    // The comparison refuses the inserted control before materializing it.
     assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
     assert!(
         error.message.contains("inline content-control envelope"),
@@ -6064,8 +6065,11 @@ fn sentinel_partial_shared_grid_resolution_is_explicitly_refused() {
     // One prior coordinate frame describes both property owners. Until the
     // model can rebase mixed readings, selecting only half is not a valid
     // transition; it must not return a successful document with mixed frames.
+    // The two cell property changes are by different reviewers: one
+    // reviewer's cell property changes in a table are one revision (as Word
+    // lists them), which cannot be split.
     let source = pack(&document(
-        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="3000"/><w:tblGridChange w:id="21"><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/><w:gridCol w:w="2000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="1000" w:type="dxa"/><w:tcPrChange w:id="23" w:author="Reviewer"><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:gridSpan w:val="2"/></w:tcPr></w:tcPrChange></w:tcPr><w:p><w:r><w:t>First</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:tcPrChange w:id="24" w:author="Reviewer"><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr><w:p><w:r><w:t>Second</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        r#"<w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="3000"/><w:tblGridChange w:id="21"><w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/><w:gridCol w:w="2000"/></w:tblGrid></w:tblGridChange></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="1000" w:type="dxa"/><w:tcPrChange w:id="23" w:author="Reviewer"><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:gridSpan w:val="2"/></w:tcPr></w:tcPrChange></w:tcPr><w:p><w:r><w:t>First</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:tcPrChange w:id="24" w:author="Second reviewer"><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr><w:p><w:r><w:t>Second</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
     ));
     let original = stemma::api::Document::parse(&source).unwrap();
     let first = original

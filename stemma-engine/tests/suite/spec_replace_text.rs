@@ -687,49 +687,145 @@ fn zero_match_genuinely_absent_needle_has_empty_diagnosis() {
     }
 }
 
-/// Inside a hyperlink. Text replacement does not reach a link's visible text,
-/// so a needle that occurs there refuses, naming the link and the op that
-/// changes its text.
+/// Inside a hyperlink. A link's display text is text of the paragraph, so a
+/// needle that occurs there is matched and replaced inside the link.
 #[test]
-fn zero_match_inside_hyperlink_names_the_link_and_replace() {
+fn a_needle_inside_hyperlink_text_is_matched_in_the_link() {
     let body = r#"<w:p><w:r><w:t xml:space="preserve">Write to </w:t></w:r><w:hyperlink w:anchor="Contact"><w:r><w:t>old@example.com</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="1" w:name="Contact"/><w:r><w:t>Contact</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
     let canonical = doc.snapshot().canonical.as_ref().clone();
-    let err = plan_replace_text(&canonical, &opts("old@example.com", "new@example.com"))
-        .expect_err("link text is not reached by text replacement");
-    let d = inline_object_refusal(err);
-    assert!(
-        d.contains("hyperlink") && d.contains("replace") && d.contains("_hyperlink_"),
-        "the probe names the link id and the replace route: {d}"
-    );
+    let plan = plan_replace_text(&canonical, &opts("old@example.com", "new@example.com"))
+        .expect("link text is replaced through the link");
+    assert_eq!(plan.matches.len(), 1);
+    assert!(matches!(
+        plan.steps.as_slice(),
+        [stemma::edit::EditStep::ReplaceInlineObjectText { .. }]
+    ));
 }
 
-/// On a SHORT count: a heading and a contents line both say "CONCLUSION", but
-/// the contents line is a hyperlink. Replacing the heading alone would leave
-/// the other occurrence; the refusal names the link holding it and the op that
-/// changes its text, so the agent is not left guessing.
+/// On a count: a heading and a contents line both say "CONCLUSION", and the
+/// contents line is a hyperlink. Both occurrences count and both are replaced.
 #[test]
-fn a_short_count_names_the_hyperlink_holding_the_missing_occurrence() {
+fn a_count_includes_the_occurrence_in_a_hyperlink() {
     let body = r#"<w:p><w:hyperlink w:anchor="Conclusion"><w:r><w:t xml:space="preserve">CONCLUSION	30</w:t></w:r></w:hyperlink></w:p><w:p><w:bookmarkStart w:id="1" w:name="Conclusion"/><w:r><w:t>CONCLUSION</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>"#;
     let doc = Document::parse(&make_docx_with_body(body)).expect("parse");
     let canonical = doc.snapshot().canonical.as_ref().clone();
     let mut options = opts("CONCLUSION", "SECTION 5. CONCLUSION");
     options.expected = ExpectedMatches::Count(2);
-    let d = inline_object_refusal(
-        plan_replace_text(&canonical, &options).expect_err("one of two is reachable"),
-    );
-    assert!(
-        d.contains("_hyperlink_") && d.contains("replace"),
-        "the link and the replace route are named: {d}"
+    let plan = plan_replace_text(&canonical, &options).expect("both occurrences are reachable");
+    assert_eq!(plan.matches.len(), 2);
+    assert_eq!(plan.steps.len(), 2, "one splice and one link edit");
+}
+
+// ─── Range scopes over tables, and matches outside the searched regions ─────
+
+/// A paragraph, a two-cell table, and a closing paragraph.
+fn paragraph_table_paragraph() -> Document {
+    Document::parse(&make_docx_with_body(
+        r#"<w:p><w:r><w:t>Opening words</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>the meadow lark</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>the river otter</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Closing words</w:t></w:r></w:p>"#,
+    ))
+    .expect("parse")
+}
+
+fn top_level_ids(doc: &Document) -> Vec<NodeId> {
+    doc.snapshot()
+        .canonical
+        .blocks
+        .iter()
+        .map(|tb| match &tb.block {
+            BlockNode::Paragraph(p) => p.id.clone(),
+            BlockNode::Table(t) => t.id.clone(),
+            BlockNode::OpaqueBlock(o) => o.id.clone(),
+        })
+        .collect()
+}
+
+/// A block range holds every block between its endpoints in document order,
+/// so a table between them is searched cell by cell, as the default scope
+/// searches table cells.
+#[test]
+fn a_range_scope_searches_the_cells_of_a_table_inside_it() {
+    let doc = paragraph_table_paragraph();
+    let ids = top_level_ids(&doc);
+    let mut options = opts("otter", "beaver");
+    options.scope = ReplaceTextScope::Range {
+        from: ids[0].clone(),
+        to: ids[2].clone(),
+    };
+    let edited = apply(&doc, &options).expect("the cell match lies inside the range");
+    assert_eq!(
+        edited.read_accepted().unwrap().to_text(),
+        "Opening words\n\nthe meadow lark the river beaver\n\nClosing words"
     );
 }
 
-/// The refusal for an occurrence inside an inline object, as its message.
-fn inline_object_refusal(err: ReplaceTextError) -> String {
-    match err {
-        ReplaceTextError::Engine(
-            error @ stemma::edit::EditError::ReplaceTextInsideInlineObjects { .. },
-        ) => error.to_string(),
-        other => panic!("expected ReplaceTextInsideInlineObjects, got {other:?}"),
+/// A table id is a block id a read reports, so it is a range endpoint: as
+/// either end it stands for the whole table.
+#[test]
+fn a_table_id_is_a_range_endpoint() {
+    let doc = paragraph_table_paragraph();
+    let ids = top_level_ids(&doc);
+    for (from, to) in [
+        (ids[1].clone(), ids[1].clone()),
+        (ids[0].clone(), ids[1].clone()),
+        (ids[1].clone(), ids[2].clone()),
+    ] {
+        let mut options = opts("otter", "beaver");
+        options.scope = ReplaceTextScope::Range {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        let edited = apply(&doc, &options)
+            .unwrap_or_else(|e| panic!("range {from}..{to} reaches the cell: {e}"));
+        assert!(
+            edited.read_accepted().unwrap().to_text().contains("beaver"),
+            "range {from}..{to}"
+        );
     }
+}
+
+/// A match in a cell outside a restricted scope is reported as outside the
+/// scope, never as a near miss (a typo) of something inside it.
+#[test]
+fn a_cell_match_outside_a_range_is_reported_out_of_scope() {
+    let doc = paragraph_table_paragraph();
+    let ids = top_level_ids(&doc);
+    let canonical = doc.snapshot().canonical.as_ref().clone();
+    let mut options = opts("the river otter", "the sea otter");
+    options.scope = ReplaceTextScope::SingleBlock(ids[2].clone());
+    let err = plan_replace_text(&canonical, &options).expect_err("absent from the scope");
+    let d = one_diagnosis(err);
+    assert!(
+        d.contains("OUTSIDE") && !d.contains("near miss"),
+        "the cell match is outside the scope: {d}"
+    );
+}
+
+/// The default scope searches the body and its tables, not the notes. A
+/// needle found only in a footnote is reported where it is, never as a
+/// near miss of body text.
+#[test]
+fn a_match_only_in_a_footnote_is_reported_where_it_is() {
+    let doc = Document::parse(&make_docx_with_body(
+        r#"<w:p><w:r><w:t>The Lessee pays monthly.</w:t></w:r></w:p>"#,
+    ))
+    .expect("parse");
+    let json = serde_json::json!({"ops":[{"op":"insert_note","target":top_level_ids(&doc)[0],
+        "expect":"monthly","note_kind":"footnote","body":"The Lessor pays yearly."}],
+        "materialization_mode":"direct","revision":{"author":"Editor"}})
+    .to_string();
+    let txn = stemma::edit_v4::parse_transaction(&json)
+        .unwrap()
+        .into_edit_transaction()
+        .unwrap();
+    let doc = doc.apply(&txn).expect("footnote");
+    let canonical = doc.snapshot().canonical.as_ref().clone();
+    let mut options = opts("The Lessor pays", "The Owner pays");
+    options.scope = ReplaceTextScope::BodyAndTables;
+    let err = plan_replace_text(&canonical, &options).expect_err("not in the body");
+    let d = one_diagnosis(err);
+    assert!(
+        d.contains("footnote") && !d.contains("near miss"),
+        "the footnote match is named, not a typo: {d}"
+    );
 }

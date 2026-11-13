@@ -244,11 +244,11 @@ impl NumberingDefinitions {
             };
 
             if is_w_tag(element, "abstractNum") {
-                if let Some(abstract_num) = parse_abstract_num(element) {
+                if let Some(abstract_num) = parse_abstract_num(element)? {
                     abstract_nums.insert(abstract_num.abstract_num_id, abstract_num);
                 }
             } else if is_w_tag(element, "num")
-                && let Some(num_instance) = parse_num_instance(element)
+                && let Some(num_instance) = parse_num_instance(element)?
             {
                 num_instances.insert(num_instance.num_id, num_instance);
             }
@@ -673,7 +673,7 @@ fn format_lvl_text(
     result
 }
 
-fn parse_abstract_num(element: &Element) -> Option<AbstractNum> {
+fn parse_abstract_num(element: &Element) -> Result<Option<AbstractNum>, String> {
     // §17.9.1: abstractNumId is required. A w:abstractNum missing it cannot
     // be referenced by any w:num instance, so the whole definition is inert.
     // This is malformed OOXML a compliant producer never emits, but we don't
@@ -685,7 +685,7 @@ fn parse_abstract_num(element: &Element) -> Option<AbstractNum> {
             tracing::warn!(
                 "w:abstractNum missing required abstractNumId attribute; skipping definition"
             );
-            return None;
+            return Ok(None);
         }
     };
     let mut levels = HashMap::new();
@@ -699,7 +699,9 @@ fn parse_abstract_num(element: &Element) -> Option<AbstractNum> {
         };
 
         if is_w_tag(el, "lvl") {
-            if let Some(level) = parse_level(el) {
+            if let Some(level) =
+                parse_level(el).map_err(|err| format!("w:abstractNum {abstract_num_id}: {err}"))?
+            {
                 levels.insert(level.ilvl, level);
             }
         } else if is_w_tag(el, "numStyleLink") {
@@ -711,15 +713,15 @@ fn parse_abstract_num(element: &Element) -> Option<AbstractNum> {
         }
     }
 
-    Some(AbstractNum {
+    Ok(Some(AbstractNum {
         abstract_num_id,
         levels,
         num_style_link,
         style_link,
-    })
+    }))
 }
 
-fn parse_level(element: &Element) -> Option<LevelDef> {
+fn parse_level(element: &Element) -> Result<Option<LevelDef>, String> {
     // §17.9.6: ilvl is required. Without it we can't key the level, so this
     // one <w:lvl> is skipped (isolated to the single level, not the whole
     // abstractNum) with an observable warning rather than silently vanishing.
@@ -727,7 +729,7 @@ fn parse_level(element: &Element) -> Option<LevelDef> {
         Some(v) => v,
         None => {
             tracing::warn!("w:lvl missing required ilvl attribute; skipping level definition");
-            return None;
+            return Ok(None);
         }
     };
     let mut num_fmt = NumFormat::Decimal;
@@ -781,7 +783,7 @@ fn parse_level(element: &Element) -> Option<LevelDef> {
             restart_level = attr_value_u32(el, "val");
         } else if is_w_tag(el, "pPr") {
             // §17.9.22: numbering level paragraph properties (indentation).
-            indent = parse_level_indent(el);
+            indent = parse_level_indent(el).map_err(|err| format!("w:lvl {ilvl}: {err}"))?;
         } else if is_w_tag(el, "pStyle") {
             // §17.9.23: reverse binding — this level claims a paragraph style.
             p_style = attr_value(el, "val").map(|s| s.to_string());
@@ -793,7 +795,7 @@ fn parse_level(element: &Element) -> Option<LevelDef> {
         }
     }
 
-    Some(LevelDef {
+    Ok(Some(LevelDef {
         ilvl,
         num_fmt,
         start,
@@ -803,75 +805,70 @@ fn parse_level(element: &Element) -> Option<LevelDef> {
         indent,
         p_style,
         suffix,
-    })
+    }))
 }
 
-/// Parse an `i32` numbering-level indent attribute, warning (rather than
-/// silently coalescing to "absent") when the attribute is present but its
-/// value doesn't parse — a malformed value is not the same as an omitted one.
-fn parse_indent_i32(v: &str, attr_name: &str) -> Option<i32> {
-    match v.parse() {
-        Ok(n) => Some(n),
-        Err(e) => {
-            tracing::warn!(
-                attr = attr_name,
-                value = %v,
-                error = %e,
-                "numbering level w:ind attribute has an unparseable value; ignoring"
-            );
-            None
-        }
-    }
-}
-
-/// Parse `w:ind` from a numbering level's `w:pPr` element (§17.9.22).
-fn parse_level_indent(p_pr: &Element) -> Option<LevelIndent> {
-    let ind = p_pr.children.iter().find_map(|child| {
+/// Parse `w:ind` from a numbering level's `w:pPr` element (§17.9.22), read
+/// as a paragraph's own `w:ind` is read
+/// (`word_ir::parse_paragraph_twip_measure`): a decimal truncates toward
+/// zero, and a value that is not a number is refused, as Word refuses it.
+fn parse_level_indent(p_pr: &Element) -> Result<Option<LevelIndent>, String> {
+    let Some(ind) = p_pr.children.iter().find_map(|child| {
         if let XMLNode::Element(el) = child
             && is_w_tag(el, "ind")
         {
             return Some(el);
         }
         None
-    })?;
+    }) else {
+        return Ok(None);
+    };
+    let twips = |attribute: &'static str, allows_negative: bool| {
+        crate::word_ir::parse_paragraph_twip_measure(ind, "ind", attribute, allows_negative)
+            .map_err(|err| format!("pPr/ind: {err}"))?
+            .map(|twips| {
+                i32::try_from(twips)
+                    .map_err(|_| format!("pPr/ind: w:{attribute} value {twips} is outside i32"))
+            })
+            .transpose()
+    };
 
-    let left = attr_value(ind, "left")
-        .or_else(|| attr_value(ind, "start"))
-        .and_then(|v| parse_indent_i32(v, "left/start"));
-
-    let right = attr_value(ind, "right")
-        .or_else(|| attr_value(ind, "end"))
-        .and_then(|v| parse_indent_i32(v, "right/end"));
-
+    let left = if attr_value(ind, "left").is_some() {
+        twips("left", true)?
+    } else {
+        twips("start", true)?
+    };
+    let right = if attr_value(ind, "right").is_some() {
+        twips("right", true)?
+    } else {
+        twips("end", true)?
+    };
     // §17.3.1.12: "firstLine and hanging are mutually exclusive,
     // if both are specified, the firstLine value is ignored" — hanging wins.
-    let first_line = if let Some(hanging) = attr_value(ind, "hanging") {
-        parse_indent_i32(hanging, "hanging").map(|v| -v)
-    } else if let Some(first) = attr_value(ind, "firstLine") {
-        parse_indent_i32(first, "firstLine")
-    } else {
-        None
+    let first_line = match twips("hanging", false)? {
+        Some(hanging) => Some(-hanging),
+        None => twips("firstLine", true)?,
     };
 
     if left.is_some() || right.is_some() || first_line.is_some() {
-        Some(LevelIndent {
+        Ok(Some(LevelIndent {
             left,
             right,
             effective_first_line_twips: first_line,
-        })
+        }))
     } else {
-        None
+        Ok(None)
     }
 }
 
-fn parse_num_instance(element: &Element) -> Option<NumInstance> {
+fn parse_num_instance(element: &Element) -> Result<Option<NumInstance>, String> {
     // §17.9.18: numId is required to key this instance; without it the
     // definition can never be referenced by a paragraph's numPr.
     let num_id = match attr_value_u32(element, "numId") {
         Some(id) => id,
         None => {
             tracing::warn!("w:num missing required numId attribute; skipping numbering instance");
-            return None;
+            return Ok(None);
         }
     };
     let mut abstract_num_id = None;
@@ -898,7 +895,8 @@ fn parse_num_instance(element: &Element) -> Option<NumInstance> {
                 };
 
                 if is_w_tag(ovr_el, "lvl") {
-                    level = parse_level(ovr_el);
+                    level = parse_level(ovr_el)
+                        .map_err(|err| format!("w:num {num_id} lvlOverride: {err}"))?;
                 } else if is_w_tag(ovr_el, "startOverride") {
                     start_override = attr_value_u32(ovr_el, "val");
                 }
@@ -922,14 +920,14 @@ fn parse_num_instance(element: &Element) -> Option<NumInstance> {
             num_id,
             "w:num missing required abstractNumId child; skipping numbering instance"
         );
-        return None;
+        return Ok(None);
     };
 
-    Some(NumInstance {
+    Ok(Some(NumInstance {
         num_id,
         abstract_num_id,
         level_overrides,
-    })
+    }))
 }
 
 fn is_w_tag(element: &Element, local: &str) -> bool {
@@ -1764,10 +1762,10 @@ mod tests {
         assert_eq!(defs.get_level(1, 0).unwrap().start, 0);
     }
 
-    /// A present-but-malformed `w:ind` attribute is ignored (treated as
-    /// absent) rather than failing the whole level definition.
+    /// A level indent that is not a number is refused, as Word refuses one on
+    /// a paragraph (Word 16, verified): read as a paragraph's own `w:ind`.
     #[test]
-    fn malformed_indent_attr_is_ignored() {
+    fn a_level_indent_that_is_not_a_number_is_refused() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
@@ -1781,12 +1779,10 @@ mod tests {
   </w:num>
 </w:numbering>"#;
 
-        let defs = NumberingDefinitions::parse(xml.as_bytes()).unwrap();
-        let indent = defs.get_level(1, 0).unwrap().indent.as_ref().unwrap();
-        assert_eq!(
-            indent.left, None,
-            "malformed left is ignored, not defaulted to 0"
+        let err = NumberingDefinitions::parse(xml.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("w:abstractNum 0") && err.contains("not-a-number"),
+            "the refusal names the definition and the value: {err}"
         );
-        assert_eq!(indent.right, Some(360));
     }
 }

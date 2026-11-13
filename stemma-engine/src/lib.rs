@@ -97,6 +97,8 @@ mod audit_image;
 #[doc(hidden)]
 pub mod block_controls;
 pub mod domain;
+#[doc(hidden)]
+pub mod drawing_ids;
 mod literal_prefix;
 #[doc(hidden)]
 pub mod local_change;
@@ -143,6 +145,8 @@ pub(crate) mod package_ops;
 pub(crate) mod serialize;
 pub(crate) mod settings;
 pub(crate) mod styles;
+#[doc(hidden)]
+pub use styles::StyleDefinitions;
 pub(crate) mod word_ir;
 // Internal OOXML plumbing — not part of the public surface. No consumer
 // (stemma-mcp, downstream apps) reaches these; they are referenced only via

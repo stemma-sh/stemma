@@ -4,65 +4,42 @@ Every name here is re-exported from ``stemma``. Each method maps to one call on
 the Rust facade (``stemma::api::Document``, ``stemma::api::{audit, validate}``,
 ``stemma_diff::diff[_as]_detailed``); the docstrings name it.
 
-``Transaction`` and the ``TypedDict`` classes describe return shapes for type
-checkers only; they do not exist at runtime.
+The return and argument shapes (``Transaction`` and the ``TypedDict`` classes)
+live in ``stemma._types``, which exists at runtime.
 """
 
 import os
-from typing import Any, Iterable, Literal, Optional, TypedDict, Union
+from typing import Any, Iterable, Literal, Optional, Union, final
 
+from ._types import (
+    Diagnostic,
+    FlattenedInputRevisions,
+    Revision,
+    SaveReceipt,
+    Transaction,
+    ValidationIssue,
+    ValidationReport,
+)
+
+__all__ = [
+    "AmbiguousAnchorAfterMove",
+    "AmbiguousFormatTarget",
+    "AuthorLabelCollision",
+    "Comparison",
+    "Document",
+    "FormatRevisionConflict",
+    "InvalidRange",
+    "NoOpEdit",
+    "OpaqueDestroyed",
+    "StaleEdit",
+    "StemmaError",
+    "TransactionError",
+    "__version__",
+    "audit",
+    "compare",
+    "validate",
+]
 __version__: str
-
-Transaction = Union[str, dict[str, Any]]
-"""A v4 transaction: the JSON text, or a dict that encodes to it."""
-
-class Diagnostic(TypedDict):
-    level: Literal["Info", "Warning"]
-    message: str
-    context: Optional[str]
-
-class Revision(TypedDict):
-    revision_id: int
-    """Engine identity that ``Document.project`` selects; 0 = census-only, not selectable."""
-    wire_id: int
-    """The raw OOXML ``w:id``; diagnostics only, never an address."""
-    author: Optional[str]
-    date: Optional[str]
-    kind: Literal[
-        "insert",
-        "delete",
-        "format_run",
-        "format_paragraph",
-        "format_paragraph_mark",
-        "format_table",
-        "format_row",
-        "format_cell",
-        "format_section",
-        "opaque_interior",
-        "move",
-    ]
-    block_id: str
-    location: Any
-    """The story: ``"Body"``, or e.g. ``{"Footnote": {"id": "2"}}``."""
-    excerpt: str
-
-class ValidationIssue(TypedDict):
-    code: Literal["package_invariant", "wordprocessing_invariant", "schema_invariant"]
-    message: str
-    context: Optional[str]
-
-class ValidationReport(TypedDict):
-    ok: bool
-    issues: list[ValidationIssue]
-
-class SaveReceipt(TypedDict):
-    path: str
-    bytes: int
-    sha256: str
-
-class FlattenedInputRevisions(TypedDict):
-    base: list[Revision]
-    target: list[Revision]
 
 class StemmaError(Exception):
     """An engine refusal. Nothing was changed: every refused call is atomic.
@@ -107,6 +84,7 @@ class FormatRevisionConflict(StemmaError):
 class AmbiguousFormatTarget(StemmaError):
     """A formatting ``expect`` matched more than one span; lengthen it."""
 
+@final
 class Document:
     """An immutable Word document: content plus its tracked changes.
 
@@ -115,7 +93,7 @@ class Document:
     """
 
     @staticmethod
-    def from_bytes(data: bytes) -> Document:
+    def from_bytes(data: Union[bytes, bytearray, memoryview]) -> Document:
         """Parse DOCX bytes (``Document::parse``). Raises ``StemmaError`` (e.g. ``InvalidDocx``)."""
     @staticmethod
     def open(path: Union[str, os.PathLike[str]]) -> Document:
@@ -173,6 +151,7 @@ class Document:
     ) -> SaveReceipt:
         """Serialize and write. Existing path: ``FileExistsError`` unless ``overwrite=True`` (atomic replace)."""
 
+@final
 class Comparison:
     """Result of ``compare()`` (``stemma_diff::ComparisonResult``)."""
 
@@ -198,8 +177,10 @@ def compare(
     An empty ``author`` is refused; pass None for an anonymous redline.
     """
 
-def audit(before: bytes, after: bytes) -> dict[str, Any]:
+def audit(
+    before: Union[bytes, bytearray, memoryview], after: Union[bytes, bytearray, memoryview]
+) -> dict[str, Any]:
     """Audit any before/after DOCX pair (``stemma::api::audit``). Same shape as ``Document.review()``."""
 
-def validate(data: bytes) -> ValidationReport:
+def validate(data: Union[bytes, bytearray, memoryview]) -> ValidationReport:
     """Validate DOCX bytes as they are (``stemma::api::validate``). Invalid bytes are a result, not an exception."""

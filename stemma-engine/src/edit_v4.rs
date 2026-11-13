@@ -302,6 +302,15 @@ pub enum FormatMarks {
     Legacy(Vec<Mark>),
 }
 
+/// The contract default for an omitted `set_format.marks`: the empty object
+/// patch, which changes no toggle. The op still has to change something
+/// (see `SchemaError::EmptyFormatMarks`).
+impl Default for FormatMarks {
+    fn default() -> Self {
+        Self::Patch(FormatMarksPatch::default())
+    }
+}
+
 impl FormatMarks {
     fn is_empty(&self) -> bool {
         match self {
@@ -799,6 +808,9 @@ pub enum Op {
         expect: String,
         #[serde(default)]
         semantic_hash: Option<String>,
+        /// Omitted means no boolean toggle changes (an empty patch): a
+        /// colour-, size- or font-only change needs no `marks`.
+        #[serde(default)]
         marks: FormatMarks,
         /// Literal text color: 6-hex-digit RGB (e.g. `"FF0000"`) or `"auto"`.
         #[serde(default)]
@@ -3030,7 +3042,7 @@ pub enum SchemaError {
     EmptyAttrPatch {
         op_index: usize,
     },
-    /// A `set_format` op supplied no marks.
+    /// A `set_format` op changes nothing: no mark toggles and no value field.
     EmptyFormatMarks {
         op_index: usize,
     },
@@ -3407,7 +3419,12 @@ impl std::fmt::Display for SchemaError {
                 write!(f, "ops[{op_index}]: set_attr.attrs sets no fields")
             }
             SchemaError::EmptyFormatMarks { op_index } => {
-                write!(f, "ops[{op_index}]: set_format.marks is empty")
+                write!(
+                    f,
+                    "ops[{op_index}]: set_format changes nothing: give marks toggles or at \
+                     least one of color, highlight, font_family, font_size_half_points, \
+                     caps, small_caps, char_spacing"
+                )
             }
             SchemaError::MixedFormatMarkForms { op_index } => write!(
                 f,
@@ -3925,7 +3942,7 @@ pub fn validate_schema(txn: &EditTransactionV4) -> Result<(), SchemaError> {
                 char_spacing,
                 ..
             } => {
-                if matches!(marks, FormatMarks::Patch(_))
+                if matches!(marks, FormatMarks::Patch(patch) if !patch.is_empty())
                     && (caps.is_some() || small_caps.is_some())
                 {
                     return Err(SchemaError::MixedFormatMarkForms { op_index });

@@ -38,8 +38,10 @@ fn make_text(id: &str, text: &str, marks: Vec<Mark>) -> InlineNode {
 
 fn make_hyperlink(id: &str) -> InlineNode {
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from(id),
         kind: OpaqueKind::Hyperlink(HyperlinkData {
+            flattened_wrappers: Vec::new(),
             url: Some("https://example.com".to_string()),
             anchor: None,
             text: "example".to_string(),
@@ -105,6 +107,7 @@ fn build_paragraph(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -147,6 +150,7 @@ fn build_paragraph(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         formatting_change: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -386,8 +390,9 @@ fn match_spanning_bold_to_normal_run_break_keeps_surrounding_marks() {
 
 // ─── Barrier straddle: skipped vs fails loud ──────────────────────────────────
 
-/// Build a paragraph "click [hyperlink] here" where the needle "here" lives
-/// AFTER the barrier (matchable) and "clickhere" would straddle it.
+/// Build a paragraph reading "click example then click here" ("example" is a
+/// link) where the needle "here" lives AFTER the barrier (matchable) and
+/// "click example" straddles the link's edge.
 fn doc_with_barrier() -> CanonDoc {
     let para = build_paragraph(
         "p1",
@@ -403,9 +408,12 @@ fn doc_with_barrier() -> CanonDoc {
 #[test]
 fn barrier_straddle_skip_leaves_paragraph_untouched() {
     let base = doc_with_barrier();
-    // "click then click" straddles the hyperlink barrier (it spans the anchor):
-    // it is present in the full visible text but in no single section.
-    let mut o = opts("click  then click", "X"); // visible text = "click  then click here"
+    // "click example" runs across the link's edge: it is present in the text
+    // as read ("click example then click here") but neither in the paragraph's
+    // own text nor wholly inside the link. (The link's text is part of the
+    // reading: "click  then click", which only occurs with the link's text
+    // left out, is not in the paragraph at all.)
+    let mut o = opts("click example", "X");
     o.on_barrier_match = BarrierPolicy::Skip;
     let plan = plan_find_replace_all(&base, &o).expect("plan");
     assert!(
@@ -417,7 +425,7 @@ fn barrier_straddle_skip_leaves_paragraph_untouched() {
 #[test]
 fn barrier_straddle_fail_errors_loud() {
     let base = doc_with_barrier();
-    let mut o = opts("click  then click", "X");
+    let mut o = opts("click example", "X");
     o.on_barrier_match = BarrierPolicy::Fail;
     let err = plan_find_replace_all(&base, &o).expect_err("must fail loud");
     assert!(

@@ -785,7 +785,11 @@ fn now_epoch_secs() -> u64 {
 // v47: The paragraph mark's OFF forms retain an authored vertAlign baseline.
 // v48: A section's document grid character space is signed.
 // v49: A run border's width, spacing and colour are optional, as authored.
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 49;
+// v50: TableCellNode models a pending tracked cell merge (w:cellMerge).
+// v51: A paragraph records a direct numPr that names a list but no level.
+// v52: A table-cell paragraph carries its move group (`cell_move_id`).
+// v53: HyperlinkData records the run wrappers its runs flatten (`flattened_wrappers`).
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 53;
 const SNAPSHOT_BLOB_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
@@ -2008,6 +2012,9 @@ pub fn max_revision_id(doc: &CanonDoc) -> u32 {
                         }
                         if let Some(fc) = &cell.formatting_change {
                             *max_id = (*max_id).max(fc.revision_id);
+                        }
+                        if let Some(merge) = &cell.cell_merge {
+                            *max_id = (*max_id).max(merge.revision.revision_id);
                         }
                         for cell_block in &cell.blocks {
                             max_id_in_block(cell_block, max_id);
@@ -5065,7 +5072,15 @@ fn ensure_reconcilable_style_state(
 
     let referenced = collect_referenced_style_ids(doc);
     let collisions =
-        crate::styles::detect_style_collisions(base_styles_xml, target_styles_xml, &referenced);
+        crate::styles::detect_style_collisions(base_styles_xml, target_styles_xml, &referenced)
+            .map_err(|message| RuntimeError {
+                code: ErrorCode::InvalidDocx,
+                message,
+                details: ErrorDetails {
+                    context: Some("package style reconciliation".to_string()),
+                    ..ErrorDetails::default()
+                },
+            })?;
     if let Some(collision) = collisions.first() {
         return Err(RuntimeError {
             code: ErrorCode::UnsupportedEdit,
@@ -5162,6 +5177,7 @@ pub(crate) const BLOCKING_RULES: &[&str] = &[
     "I-ANN-010", // one comment identity cannot delimit/reference multiple ranges (Word repairs it)
     "I-TC-001",  // tracked change content model (no hyperlink/fldSimple inside del/ins)
     "I-TC-002",  // tracked change missing w:id
+    "I-TC-004",  // w:delText inside w:moveFrom (Word repairs and loses the revisions)
     "I-TC-003",  // tracked-change nesting: del-in-ins allowed, same-type nesting never
     //             (promoted to blocking with stacked revisions —
     //             cheap insurance against a same-type-nesting emission bug)
@@ -5177,6 +5193,7 @@ pub(crate) const BLOCKING_RULES: &[&str] = &[
     "I-REL-003", // relationship target missing from the package (repair/data-loss class)
     "I-REL-005", // w:hyperlink r:id bound to a non-hyperlink relationship (Word repairs it)
     "I-XREF-003", // w:commentReference without a comments.xml definition (Word repairs it)
+    "I-XREF-006", // one note referenced twice (Word reports the file corrupted and repairs it)
     "I-NS-002", // undeclared namespace prefix — the part is not even well-formed XML at the use site
 ];
 
@@ -5220,6 +5237,20 @@ fn apply_opaque_child_text_sets(
                 set.body_index,
             ));
         };
+        if let Some(lock) = crate::edit::verbs::content_controls::sdt_content_lock(el) {
+            return Err(RuntimeError {
+                code: ErrorCode::UnsupportedEdit,
+                message: format!(
+                    "sdt_text_fill: the content control at body index {} is locked \
+                     (w:lock=\"{lock}\"): its contents cannot be edited",
+                    set.body_index
+                ),
+                details: ErrorDetails {
+                    context: Some(format!("body_index={} lock={lock}", set.body_index)),
+                    ..ErrorDetails::default()
+                },
+            });
+        }
         let value_rpr = crate::edit::verbs::sdt_text_fill::leave_placeholder(el)
             .map_err(|reason| fail(&reason, set.body_index))?;
         let content =
@@ -5552,6 +5583,61 @@ fn track_body_sdt_content_change(
     descend(element, revision, annotation_id, change);
 }
 
+/// The element of a body range marker that relocation turns inline, and
+/// whether it came from the target. A marker anchored to a body child
+/// (`body_index:` in the base, `target_body_index:` in the target) is taken
+/// from that child; one written from its metadata (see
+/// [`crate::import::range_marker_written_from_metadata`]) from the element its
+/// `range_marker` holds, on the side its status names (`from_target`).
+fn marker_source(
+    opaque: &crate::domain::OpaqueBlockNode,
+    from_target: bool,
+    base_children: &mut HashMap<usize, XMLNode>,
+    target_children: &mut HashMap<usize, XMLNode>,
+) -> Result<(XMLNode, bool), RuntimeError> {
+    let error = |message: &str| RuntimeError {
+        code: ErrorCode::InvalidDocx,
+        message: message.to_string(),
+        details: ErrorDetails {
+            block_id: Some(opaque.id.clone()),
+            context: Some(opaque.proof_ref.docx_anchor.clone()),
+            ..ErrorDetails::default()
+        },
+    };
+    let anchor = opaque.proof_ref.docx_anchor.as_str();
+    if crate::import::range_marker_written_from_metadata(anchor) {
+        let marker = opaque
+            .range_marker
+            .as_ref()
+            .ok_or_else(|| error("metadata-written body marker has no range marker"))?;
+        let element = word_xml::parse_raw_fragment(&marker.raw_xml)
+            .map_err(|_| error("body range marker metadata does not parse"))?;
+        return Ok((XMLNode::Element(element), from_target));
+    }
+    let (index, children, target_origin) = if let Some(index) = anchor.strip_prefix("body_index:") {
+        (index, base_children, false)
+    } else if let Some(index) = anchor.strip_prefix("target_body_index:") {
+        (index, target_children, true)
+    } else {
+        return Err(error("body range marker has no body proof anchor"));
+    };
+    let child = index
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| children.remove(&index))
+        .ok_or_else(|| error("body range-marker proof anchor has no source child"))?;
+    Ok((child, target_origin))
+}
+
+/// One half of a pending body range marker: its family, `w:id`, role, and
+/// whether it came from the target.
+type PendingRangeHalf = (
+    crate::domain::RangeMarkerFamily,
+    String,
+    crate::domain::RangeMarkerRole,
+    bool,
+);
+
 /// Move pending direct-body range halves onto the nearest modeled paragraph.
 /// Direct `w:body` range markers have no generic tracked-change envelope. The
 /// same zero-width boundary is legal at the start of the following paragraph
@@ -5573,6 +5659,9 @@ fn relocate_pending_body_range_markers(
     struct RelocatedMarker {
         boundary: usize,
         terminal: MarkerTerminal,
+        /// Which range and half this is: family, `w:id`, role, and whether it
+        /// came from the target.
+        range: PendingRangeHalf,
         segment: TrackedSegment,
     }
 
@@ -5625,6 +5714,19 @@ fn relocate_pending_body_range_markers(
                 None
             }
             BlockNode::OpaqueBlock(_) => None,
+        }
+    }
+
+    fn contains_paragraph(block: &BlockNode) -> bool {
+        match block {
+            BlockNode::Paragraph(_) => true,
+            BlockNode::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .flat_map(|cell| &cell.blocks)
+                .any(contains_paragraph),
+            BlockNode::OpaqueBlock(_) => false,
         }
     }
 
@@ -5686,6 +5788,7 @@ fn relocate_pending_body_range_markers(
                     RangeMarkerFamily::CommentRange => unreachable!("comments handled above"),
                 };
                 Ok(InlineNode::from(DecorationNode {
+                    formatting_change: None,
                     source_run_attrs: Vec::new(),
                     id: opaque.id.clone(),
                     kind,
@@ -5698,6 +5801,58 @@ fn relocate_pending_body_range_markers(
                     origin: target_origin.then(|| "target".to_string()),
                 }))
             }
+        }
+    }
+
+    // A pending bookmark (or other range) whose start and end are both body
+    // markers with the same status was inserted or deleted as one range: its
+    // halves are one change and share the start's revision, so resolving the
+    // change keeps or removes the whole range, never one half of it.
+    let pending_kind = |status: &TrackingStatus| match status {
+        TrackingStatus::Inserted(_) => Some(true),
+        TrackingStatus::Deleted(_) => Some(false),
+        TrackingStatus::Normal | TrackingStatus::InsertedThenDeleted(_) => None,
+    };
+    let range_key = |tracked: &TrackedBlock| {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            return None;
+        };
+        let marker = opaque.range_marker.as_ref()?;
+        let inserted = pending_kind(&tracked.status)?;
+        Some((
+            marker.family,
+            marker.id.clone(),
+            inserted,
+            opaque
+                .proof_ref
+                .docx_anchor
+                .starts_with("target_body_index:"),
+        ))
+    };
+    let mut range_start_status = HashMap::new();
+    for tracked in &doc.blocks {
+        if let Some(key) = range_key(tracked)
+            && let BlockNode::OpaqueBlock(opaque) = &tracked.block
+            && opaque
+                .range_marker
+                .as_ref()
+                .is_some_and(|marker| marker.role == crate::domain::RangeMarkerRole::Start)
+        {
+            range_start_status
+                .entry(key)
+                .or_insert_with(|| tracked.status.clone());
+        }
+    }
+    for tracked in &mut doc.blocks {
+        if let Some(key) = range_key(tracked)
+            && let BlockNode::OpaqueBlock(opaque) = &tracked.block
+            && opaque
+                .range_marker
+                .as_ref()
+                .is_some_and(|marker| marker.role == crate::domain::RangeMarkerRole::End)
+            && let Some(status) = range_start_status.get(&key)
+        {
+            tracked.status = status.clone();
         }
     }
 
@@ -5731,47 +5886,13 @@ fn relocate_pending_body_range_markers(
             });
         }
 
-        let (index_text, children, target_origin) =
-            if let Some(index) = opaque.proof_ref.docx_anchor.strip_prefix("body_index:") {
-                (index, &mut *base_children, false)
-            } else if let Some(index) = opaque
-                .proof_ref
-                .docx_anchor
-                .strip_prefix("target_body_index:")
-            {
-                (index, &mut *target_children, true)
-            } else {
-                return Err(RuntimeError {
-                    code: ErrorCode::InvalidDocx,
-                    message: "pending body range marker has no body proof anchor".to_string(),
-                    details: ErrorDetails {
-                        block_id: Some(opaque.id.clone()),
-                        context: Some(opaque.proof_ref.docx_anchor.clone()),
-                        ..ErrorDetails::default()
-                    },
-                });
-            };
-        let index = index_text.parse::<usize>().map_err(|source| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: "invalid body proof anchor on pending range marker".to_string(),
-            details: ErrorDetails {
-                block_id: Some(opaque.id.clone()),
-                context: Some(format!(
-                    "anchor={} err={source}",
-                    opaque.proof_ref.docx_anchor
-                )),
-                ..ErrorDetails::default()
-            },
-        })?;
-        let child = children.remove(&index).ok_or_else(|| RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: "body range-marker proof anchor has no source child".to_string(),
-            details: ErrorDetails {
-                block_id: Some(opaque.id.clone()),
-                context: Some(opaque.proof_ref.docx_anchor.clone()),
-                ..ErrorDetails::default()
-            },
-        })?;
+        // Inserted markers come from the target, deleted ones from the base.
+        let (child, target_origin) = marker_source(
+            opaque,
+            matches!(tracked.status, TrackingStatus::Inserted(_)),
+            base_children,
+            target_children,
+        )?;
         let inline = marker_inline(opaque, &child, target_origin)?;
         let terminal = match &tracked.status {
             TrackingStatus::Inserted(_) => MarkerTerminal::Accept,
@@ -5779,9 +5900,15 @@ fn relocate_pending_body_range_markers(
             TrackingStatus::InsertedThenDeleted(_) => MarkerTerminal::Either,
             TrackingStatus::Normal => unreachable!("normal body markers are retained above"),
         };
+        let marker = opaque
+            .range_marker
+            .as_ref()
+            .expect("marker_inline accepted a range marker");
+        let range = (marker.family, marker.id.clone(), marker.role, target_origin);
         relocated.push(RelocatedMarker {
             boundary: retained.len(),
             terminal,
+            range,
             segment: TrackedSegment {
                 status: tracked.status,
                 inlines: vec![inline],
@@ -5790,45 +5917,127 @@ fn relocate_pending_body_range_markers(
     }
     doc.blocks = retained;
 
-    let mut groups: Vec<(usize, MarkerTerminal, Vec<TrackedSegment>)> = Vec::new();
-    for item in relocated {
-        if let Some((boundary, terminal, segments)) = groups.last_mut()
-            && *boundary == item.boundary
-            && *terminal == item.terminal
-        {
-            segments.push(item.segment);
-        } else {
-            groups.push((item.boundary, item.terminal, vec![item.segment]));
-        }
+    // A pending marker moves to the start of the next paragraph that survives
+    // its resolution (or the end of the previous one at the end of the body).
+    // Unchanged body-level range markers between it and that paragraph would
+    // then sit on the wrong side of it — a renamed bookmark's start after its
+    // own unchanged end — so they move with it, unchanged. Everything placed
+    // in one paragraph keeps its document order: a pending marker at boundary
+    // `b` sat before `doc.blocks[b]`, so its order key is `2b`, and the
+    // unchanged marker `doc.blocks[i]` has key `2i + 1`.
+    fn is_carried_marker(tracked: &TrackedBlock) -> bool {
+        matches!(
+            &tracked.block,
+            BlockNode::OpaqueBlock(opaque)
+                if opaque.range_marker.is_some()
+                    && tracked.status == TrackingStatus::Normal
+                    && opaque.proof_ref.docx_anchor
+                        != crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR
+        )
     }
-    for (boundary, terminal, segments) in groups {
-        let (before, after) = doc.blocks.split_at_mut(boundary);
-        if let Some(paragraph) = after
-            .iter_mut()
-            .filter(|tracked| block_survives(tracked, terminal))
-            .find_map(|tracked| first_paragraph(&mut tracked.block))
+    let mut carry = |tracked: &TrackedBlock| -> Result<TrackedSegment, RuntimeError> {
+        let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
+            unreachable!("only body range markers are carried")
+        };
+        let (child, target_origin) = marker_source(opaque, false, base_children, target_children)?;
+        Ok(TrackedSegment {
+            status: TrackingStatus::Normal,
+            inlines: vec![marker_inline(opaque, &child, target_origin)?],
+        })
+    };
+
+    // (anchor block, at its start?) -> (order key, pending range half, segment)
+    type Placed = (usize, Option<PendingRangeHalf>, TrackedSegment);
+    let mut placements: std::collections::BTreeMap<(usize, bool), Vec<Placed>> =
+        std::collections::BTreeMap::new();
+    let mut carried: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for item in relocated {
+        let survives_with_paragraph = |tracked: &TrackedBlock| {
+            block_survives(tracked, item.terminal) && contains_paragraph(&tracked.block)
+        };
+        let (anchor, at_start, between) = if let Some(anchor) =
+            (item.boundary..doc.blocks.len()).find(|&i| survives_with_paragraph(&doc.blocks[i]))
         {
-            paragraph.segments.splice(0..0, segments);
-        } else if let Some(paragraph) = before
-            .iter_mut()
+            (anchor, true, item.boundary..anchor)
+        } else if let Some(anchor) = (0..item.boundary)
             .rev()
-            .filter(|tracked| block_survives(tracked, terminal))
-            .find_map(|tracked| last_paragraph(&mut tracked.block))
+            .find(|&i| survives_with_paragraph(&doc.blocks[i]))
         {
-            paragraph.segments.extend(segments);
+            (anchor, false, anchor + 1..item.boundary)
         } else {
             return Err(RuntimeError {
                 code: ErrorCode::UnsupportedEdit,
                 message: "cannot anchor a pending body range marker without a paragraph"
                     .to_string(),
                 details: ErrorDetails {
-                    context: Some(format!("body_boundary={boundary}")),
+                    context: Some(format!("body_boundary={}", item.boundary)),
                     ..ErrorDetails::default()
                 },
             });
+        };
+        let placed = placements.entry((anchor, at_start)).or_default();
+        for index in between {
+            if is_carried_marker(&doc.blocks[index]) && carried.insert(index) {
+                placed.push((2 * index + 1, None, carry(&doc.blocks[index])?));
+            }
+        }
+        placed.push((2 * item.boundary, Some(item.range), item.segment));
+    }
+    for ((anchor, at_start), mut placed) in placements {
+        // Stable: pending markers at one boundary keep their order.
+        placed.sort_by_key(|(key, _, _)| *key);
+        let segments = pending_ranges_together(placed)
+            .into_iter()
+            .map(|(_, _, segment)| segment);
+        if at_start {
+            let paragraph = first_paragraph(&mut doc.blocks[anchor].block)
+                .expect("the anchor block contains a paragraph");
+            paragraph.segments.splice(0..0, segments);
+        } else {
+            let paragraph = last_paragraph(&mut doc.blocks[anchor].block)
+                .expect("the anchor block contains a paragraph");
+            paragraph.segments.extend(segments);
         }
     }
+    for index in carried.into_iter().rev() {
+        doc.blocks.remove(index);
+    }
     Ok(())
+}
+
+/// Markers placed together in one paragraph are all at one position: no
+/// content lies between them, so their order matters only within each range
+/// (start before end). A pending range whose start and end are both here was
+/// inserted or deleted whole; its end goes right after its start, so the two
+/// form one stretch that its resolution keeps or removes as a unit (a
+/// resolution keeps the halves of a range that straddle surviving markers:
+/// see `tracked_model::retain_segments_keeping_range_markers`).
+fn pending_ranges_together(
+    placed: Vec<(usize, Option<PendingRangeHalf>, TrackedSegment)>,
+) -> Vec<(usize, Option<PendingRangeHalf>, TrackedSegment)> {
+    use crate::domain::RangeMarkerRole;
+    let mut rest: Vec<Option<_>> = placed.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(rest.len());
+    for index in 0..rest.len() {
+        let Some(item) = rest[index].take() else {
+            continue;
+        };
+        let partner = match &item.1 {
+            Some((family, id, RangeMarkerRole::Start, target_origin)) => rest[index + 1..]
+                .iter()
+                .position(|other| {
+                    matches!(other, Some((_, Some((f, i, RangeMarkerRole::End, t)), _))
+                        if f == family && i == id && t == target_origin)
+                })
+                .map(|offset| index + 1 + offset),
+            _ => None,
+        };
+        out.push(item);
+        if let Some(partner) = partner {
+            out.push(rest[partner].take().expect("partner not yet placed"));
+        }
+    }
+    out
 }
 
 pub(crate) fn serialize_canonical_docx(
@@ -6268,10 +6477,11 @@ pub(crate) fn serialize_canonical_docx(
         // tracked. Other target-origin opaque block kinds still have no honest
         // tracked representation and are refused rather than silently lost.
         if let BlockNode::OpaqueBlock(opaque) = &tracked.block
-            && opaque.proof_ref.docx_anchor == crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR
+            && crate::import::range_marker_written_from_metadata(&opaque.proof_ref.docx_anchor)
         {
-            // A range marker between an open control's blocks is written from
-            // its metadata; pending ones were made Normal above.
+            // A range marker between an open control's blocks, or inside a
+            // body-level w:ins/w:del, is written from its metadata; pending
+            // ones were made Normal or relocated above.
             let element =
                 serialize_tracked_block(tracked, &mut annotation_id, &body_bookmark_policy, None)?;
             w.write_element(&element).map_err(map_xml_write_error)?;
@@ -6432,7 +6642,9 @@ pub(crate) fn serialize_canonical_docx(
                         &body_bookmark_policy,
                         Some(&mut rid_resolver),
                     )?;
-                    w.write_element(&el).map_err(map_xml_write_error)?;
+                    for node in crate::serialize::with_trailing_move_range_end(el) {
+                        w.write_xml_node(&node).map_err(map_xml_write_error)?;
+                    }
                     if ends_range {
                         w.write_element(&word_xml::w_move_from_range_end(from_bm))
                             .map_err(map_xml_write_error)?;
@@ -6453,7 +6665,9 @@ pub(crate) fn serialize_canonical_docx(
                         &body_bookmark_policy,
                         Some(&mut rid_resolver),
                     )?;
-                    w.write_element(&el).map_err(map_xml_write_error)?;
+                    for node in crate::serialize::with_trailing_move_range_end(el) {
+                        w.write_xml_node(&node).map_err(map_xml_write_error)?;
+                    }
                     if ends_range {
                         w.write_element(&word_xml::w_move_to_range_end(to_bm))
                             .map_err(map_xml_write_error)?;
@@ -6474,7 +6688,10 @@ pub(crate) fn serialize_canonical_docx(
             &body_bookmark_policy,
             Some(&mut rid_resolver),
         )?;
-        w.write_element(&el).map_err(map_xml_write_error)?;
+        // A move range closing on this paragraph ends after it.
+        for node in crate::serialize::with_trailing_move_range_end(el) {
+            w.write_xml_node(&node).map_err(map_xml_write_error)?;
+        }
     }
 
     write_block_sdt_boundary(&mut w, &sdt_boundaries[doc.blocks.len()], doc.blocks.len())?;
@@ -7064,9 +7281,11 @@ fn collect_bookmark_ids(
 /// A complete OOXML field is `fldChar(begin) → instrText → fldChar(separate) →
 /// result → fldChar(end)`. If the merge pipeline deletes only part of that
 /// sequence — e.g. the `begin` lands inside `<w:del>` while its matching `end`
-/// does not — Word treats the paragraph as corrupt. This guard detects such an
-/// imbalance in the OUTPUT and refuses, naming the part, UNLESS the same part in
-/// an input (base or target) already carried a deleted-fldChar imbalance: an
+/// does not — Word treats the paragraph as corrupt; likewise an inserted
+/// `begin` whose `end` is not inserted (Accept then shows the field code as
+/// text). This guard detects such an imbalance on either side in the OUTPUT and
+/// refuses, naming the part, UNLESS the same part in an input (base or target)
+/// already carried a tracked-fldChar imbalance: an
 /// imbalance the input shipped is the user's, passes through byte-faithfully,
 /// and is not ours to launder. Only an imbalance the serialization INTRODUCED is
 /// an engine bug.
@@ -7094,13 +7313,13 @@ fn enforce_story_field_char_integrity(
         let Ok(root) = word_xml::parse_document_xml(xml_bytes) else {
             continue;
         };
-        if !part_has_del_field_char_imbalance(&root) {
+        if !part_has_tracked_field_char_imbalance(&root) {
             continue;
         }
         // Output is imbalanced — inherited only if an input part of the same
         // name was already imbalanced.
-        let inherited = input_part_has_del_field_char_imbalance(base_archive, &path)
-            || input_part_has_del_field_char_imbalance(target_archive, &path);
+        let inherited = input_part_has_tracked_field_char_imbalance(base_archive, &path)
+            || input_part_has_tracked_field_char_imbalance(target_archive, &path);
         if inherited {
             if runtime_timing_logs_enabled() {
                 eprintln!(
@@ -7112,10 +7331,12 @@ fn enforce_story_field_char_integrity(
         return Err(RuntimeError {
             code: ErrorCode::ValidationFailed,
             message: format!(
-                "serialization introduced an unbalanced deleted field character sequence in \
-                 {path}: a fldChar begin/end inside <w:del> has no matching counterpart also \
-                 deleted — engine bug (the merge pipeline tore a field across a tracked-change \
-                 boundary); refusing to emit (Word treats this as document corruption)"
+                "serialization introduced an unbalanced tracked field character sequence in \
+                 {path}: a fldChar begin/end inside <w:del> or <w:ins> has no matching \
+                 counterpart tracked the same way — a field was torn across a tracked-change \
+                 boundary (by a merge, or by resolving one part of a field on its own); \
+                 refusing to emit (Word treats this as document \
+                 corruption, and Accept shows the field code as text)"
             ),
             details: ErrorDetails {
                 context: Some(format!("part={path}")),
@@ -7129,14 +7350,14 @@ fn enforce_story_field_char_integrity(
 /// Same imbalance check over a part in an input archive (empty/false when the
 /// part is absent or unparseable — an unparseable INPUT contributes nothing we
 /// can inherit from).
-fn input_part_has_del_field_char_imbalance(archive: &DocxArchive, path: &str) -> bool {
+fn input_part_has_tracked_field_char_imbalance(archive: &DocxArchive, path: &str) -> bool {
     let Some(bytes) = archive.get(path) else {
         return false;
     };
     let Ok(root) = word_xml::parse_document_xml(bytes) else {
         return false;
     };
-    part_has_del_field_char_imbalance(&root)
+    part_has_tracked_field_char_imbalance(&root)
 }
 
 /// True if any complex field in the story has different deletion state on its
@@ -7146,30 +7367,46 @@ fn input_part_has_del_field_char_imbalance(archive: &DocxArchive, path: &str) ->
 /// first result paragraph and ends in its last), so balance must be evaluated in
 /// story order rather than independently per paragraph. The stack also handles
 /// nested PAGEREF fields inside a spanning TOC field.
-fn part_has_del_field_char_imbalance(root: &Element) -> bool {
-    field_deletion_state_imbalanced(root)
+fn part_has_tracked_field_char_imbalance(root: &Element) -> bool {
+    field_tracking_state_imbalanced(root)
 }
 
 /// Paragraph-scoped wrapper retained for focused detector tests. Production
 /// validation calls the same detector on the complete story root.
 #[cfg(test)]
-fn paragraph_del_field_chars_imbalanced(para: &Element) -> bool {
-    field_deletion_state_imbalanced(para)
+fn paragraph_tracked_field_chars_imbalanced(para: &Element) -> bool {
+    field_tracking_state_imbalanced(para)
 }
 
-fn field_deletion_state_imbalanced(root: &Element) -> bool {
-    fn walk(el: &Element, inside_deletion: bool, stack: &mut Vec<bool>) -> bool {
-        let inside_deletion = inside_deletion || is_w_tag(el, "del");
+fn field_tracking_state_imbalanced(root: &Element) -> bool {
+    /// Whether a field character sits inside a deletion and inside an
+    /// insertion. A field's begin and end must agree on both: a field is
+    /// deleted, or inserted, whole.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Tracking {
+        deleted: bool,
+        inserted: bool,
+    }
+    impl Tracking {
+        fn tracked(self) -> bool {
+            self.deleted || self.inserted
+        }
+    }
+    fn walk(el: &Element, tracking: Tracking, stack: &mut Vec<Tracking>) -> bool {
+        let tracking = Tracking {
+            deleted: tracking.deleted || is_w_tag(el, "del"),
+            inserted: tracking.inserted || is_w_tag(el, "ins"),
+        };
 
         if is_w_tag(el, "fldChar")
             && let Some(field_type) = attr_get(el, "w:fldCharType")
         {
             match field_type.as_str() {
-                "begin" => stack.push(inside_deletion),
+                "begin" => stack.push(tracking),
                 "end" => match stack.pop() {
-                    Some(begin_deleted) if begin_deleted != inside_deletion => return true,
+                    Some(begin) if begin != tracking => return true,
                     Some(_) => {}
-                    None if inside_deletion => return true,
+                    None if tracking.tracked() => return true,
                     None => {}
                 },
                 _ => {}
@@ -7178,7 +7415,7 @@ fn field_deletion_state_imbalanced(root: &Element) -> bool {
 
         for child in &el.children {
             if let XMLNode::Element(child) = child
-                && walk(child, inside_deletion, stack)
+                && walk(child, tracking, stack)
             {
                 return true;
             }
@@ -7186,8 +7423,12 @@ fn field_deletion_state_imbalanced(root: &Element) -> bool {
         false
     }
 
+    let untracked = Tracking {
+        deleted: false,
+        inserted: false,
+    };
     let mut field_stack = Vec::new();
-    walk(root, false, &mut field_stack) || field_stack.into_iter().any(|deleted| deleted)
+    walk(root, untracked, &mut field_stack) || field_stack.into_iter().any(Tracking::tracked)
 }
 
 /// Read-only guard: `w:delText`/`w:delInstrText` may appear only inside `w:del`
@@ -7506,7 +7747,7 @@ fn with_char_style(rpr_xml: Option<&[u8]>, style_id: &str) -> Result<Vec<u8>, Ru
 /// external relationship in that part's rels, created for a story that had no
 /// rels part. Hyperlinks are the only relationship the serializer allocates
 /// while writing blocks; any other request is a programming error.
-fn story_hyperlink_rid(
+pub(crate) fn story_hyperlink_rid(
     story_rels: &mut Option<crate::docx_package::RelationshipSet>,
     rels_path: &str,
     part_path: &str,
@@ -7524,7 +7765,7 @@ fn story_hyperlink_rid(
 
 /// Convert a story part path to its `.rels` file path.
 /// e.g. `word/footer3.xml` → `word/_rels/footer3.xml.rels`
-fn story_part_rels_path(part_path: &str) -> String {
+pub(crate) fn story_part_rels_path(part_path: &str) -> String {
     if let Some(slash_pos) = part_path.rfind('/') {
         let dir = &part_path[..slash_pos];
         let filename = &part_path[slash_pos + 1..];
@@ -7820,7 +8061,10 @@ fn write_story_blocks_with_sdt_envelopes(
             bookmark_policy,
             Some(&mut *resolve_rel_rid),
         )?;
-        w.write_element(&el).map_err(map_xml_write_error)?;
+        // A move range closing on this paragraph ends after it.
+        for node in crate::serialize::with_trailing_move_range_end(el) {
+            w.write_xml_node(&node).map_err(map_xml_write_error)?;
+        }
     }
     write_block_sdt_boundary(w, &boundaries[blocks.len()], blocks.len())?;
     Ok(())
@@ -8563,7 +8807,8 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::NoteEmptyBody { .. }
         | EditError::NoteIdNotNumeric { .. }
         | EditError::NoteBodyMultiParagraph { .. }
-        | EditError::NoteBodyLineCountMismatch { .. } => ErrorCode::UnsupportedEdit,
+        | EditError::NoteBodyLineCountMismatch { .. }
+        | EditError::NoteBodyObjectCountMismatch { .. } => ErrorCode::UnsupportedEdit,
         EditError::ExpectMismatch { .. }
         | EditError::BlockSemanticHashMismatch { .. }
         | EditError::SpanHandleStale { .. }
@@ -8652,6 +8897,9 @@ pub fn map_edit_error(e: crate::edit::EditError) -> RuntimeError {
         | EditError::MultipleDistinctTextboxes { .. }
         | EditError::OpaqueTextMissingRawXml { .. }
         | EditError::OpaqueTextEditOnHyperlink { .. }
+        | EditError::InlineObjectTextTargetNotFound { .. }
+        | EditError::ContentControlLocked { .. }
+        | EditError::InlineObjectTextNotEditable { .. }
         | EditError::OpaqueTextRawXmlParse { .. }
         | EditError::OpaqueTextNotFound { .. }
         | EditError::OpaqueTextRegionHasTrackedChanges { .. }
@@ -9105,9 +9353,10 @@ fn reanchor_body_opaque_blocks(
         let BlockNode::OpaqueBlock(opaque) = &tracked.block else {
             continue;
         };
-        // A marker inside an open control is written from the model and lives
-        // in no scaffold slot: nothing to re-anchor.
-        if opaque.proof_ref.docx_anchor == crate::import::IN_CONTROL_RANGE_MARKER_ANCHOR {
+        // A marker written from its metadata (inside an open control or a
+        // body-level w:ins/w:del) lives in no scaffold slot: nothing to
+        // re-anchor.
+        if crate::import::range_marker_written_from_metadata(&opaque.proof_ref.docx_anchor) {
             continue;
         }
         let previous_node = if let Some(index) = opaque
@@ -9467,6 +9716,15 @@ fn style_id_is_known(style_id: &str, defined: &HashSet<String>) -> bool {
 }
 
 impl EditSnapshot {
+    /// The package's resolvable style table, loaded exactly as import loads
+    /// it (for comparison, which reads a table's style chain).
+    #[doc(hidden)]
+    pub fn comparison_style_definitions(
+        &self,
+    ) -> Result<crate::styles::StyleDefinitions, RuntimeError> {
+        style_definitions_from_package(&self.scaffold.package)
+    }
+
     /// Enumerate legacy fields inside opaque body carriers. Names may repeat;
     /// address ordinals are bound to the returned containing-block hash.
     pub fn block_form_field_targets(
@@ -9563,6 +9821,53 @@ impl EditSnapshot {
                         step_index,
                     }));
                 }
+            }
+        }
+
+        // Lock check for a fill of a SEALED block content control (addressed
+        // by `body_index`). Its `w:sdt` bytes, `w:lock` included, live in the
+        // serialize scaffold, which the pure core cannot see — so the core
+        // stages the fill, and this caller, which holds the scaffold, is the
+        // layer that refuses it, with the same typed error every other route
+        // gives a control whose contents are locked (§17.5.2.23). Refused here,
+        // the edit fails as an edit naming its step, never as a later save.
+        for (step_index, step) in txn.steps.iter().enumerate() {
+            let crate::edit::EditStep::SdtTextFill {
+                sdt_id: None,
+                body_index: Some(body_index),
+                ..
+            } = step
+            else {
+                continue;
+            };
+            // A body index naming no sealed control is the core's own
+            // refusal (`SdtFillBlockNotFound`).
+            let anchor = format!("body_index:{body_index}");
+            let control = self
+                .canonical
+                .blocks
+                .iter()
+                .find_map(|tracked| match &tracked.block {
+                    crate::domain::BlockNode::OpaqueBlock(opaque)
+                        if matches!(opaque.kind, crate::domain::OpaqueKind::Sdt)
+                            && opaque.proof_ref.docx_anchor == anchor =>
+                    {
+                        Some(opaque.id.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(sdt_id) = control
+                && let Some(XMLNode::Element(sdt)) =
+                    self.scaffold.body_template.opaque_children.get(body_index)
+                && let Some(lock) = crate::edit::verbs::content_controls::sdt_content_lock(sdt)
+            {
+                return Err(map_edit_error(
+                    crate::edit::EditError::ContentControlLocked {
+                        sdt_id,
+                        lock,
+                        step_index,
+                    },
+                ));
             }
         }
 
@@ -9996,29 +10301,6 @@ impl EditSnapshot {
         // interiors because they have no engine identity and leaves them
         // disclosed by preflight.
         let mut full_resolution: Option<bool> = None;
-        // A pending tracked vertical cell merge (§17.13.5.3) is reported by
-        // the census but not modeled: no resolution may proceed and report a
-        // resolved document that still carries it.
-        if let Some(merge) = crate::tracked_model::first_pending_cell_merge(&resolved) {
-            return Err(RuntimeError {
-                code: ErrorCode::UnsupportedEdit,
-                message: format!(
-                    "resolution refused: the {:?} table {} has a pending tracked cell merge \
-                     (w:cellMerge, §17.13.5.3) at {}; resolving vertical merge changes is not \
-                     supported, so no change in this document can be accepted or rejected \
-                     while it is pending",
-                    merge.location, merge.block_id.0, merge.excerpt
-                ),
-                details: ErrorDetails {
-                    block_id: Some(merge.block_id),
-                    context: Some(format!(
-                        "revision_kind=cell_merge wire_id={}",
-                        merge.wire_id
-                    )),
-                    ..ErrorDetails::default()
-                },
-            });
-        }
         // Preflight (M0.1 fail-loud): the accept/reject descent resolves
         // revisions inside opaque `raw_xml` by reparsing the fragment. If a
         // fragment cannot be parsed yet its bytes carry a revision marker, the
@@ -10162,16 +10444,19 @@ impl EditSnapshot {
                     Err(crate::tracked_model::SelectionError::BlockedJoin {
                         paragraph_id,
                         required_ids,
+                        blocker_ids,
                     }) => {
                         return Err(RuntimeError {
                             code: ErrorCode::UnsupportedEdit,
                             message: format!(
-                                "selective resolution refused: removing the paragraph mark of {} joins it across blocks another pending revision removes; resolve {required_ids:?} together",
+                                "selective resolution refused: removing the paragraph mark of {} joins it across a table whose revision {blocker_ids:?} is still pending, so the result would depend on that table's later fate (Word pulls the paragraph into the pending table's first cell and can then lose its text); resolve the table's revision {blocker_ids:?} first, or {required_ids:?} together",
                                 paragraph_id.0
                             ),
                             details: ErrorDetails {
                                 block_id: Some(paragraph_id),
-                                context: Some(format!("required_revision_ids={required_ids:?}")),
+                                context: Some(format!(
+                                    "required_revision_ids={required_ids:?} blocking_table_revision_ids={blocker_ids:?}"
+                                )),
                                 ..ErrorDetails::default()
                             },
                         });
@@ -10277,7 +10562,16 @@ impl EditSnapshot {
         } else {
             redline_bytes
         };
-        rebuild_snapshot(self, resolved, &projected_bytes)
+        let mut next = rebuild_snapshot(self, resolved, &projected_bytes)?;
+        // A resolution changes what a bound control reads as an edit does, and
+        // Word refills the control from its store on open: the store follows.
+        if crate::data_binding::sync_bound_stores(
+            &self.scaffold.package,
+            &mut next.scaffold.package,
+        )? {
+            next = rebuild_metadata_snapshot(self, next)?;
+        }
+        Ok(next)
     }
 }
 
@@ -10573,7 +10867,8 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
     //   I-MATH-001/002 — m:oMath nested in oMath (Word repairs) / oMath outside a
     //                     paragraph (Word cannot open);
     //   I-PERM-001     — non-integer permStart/permEnd w:id;
-    //   I-RANGE-001    — lone colFirst/colLast on bookmarkStart/permStart.
+    //   I-RANGE-001    — lone colFirst/colLast on bookmarkStart/permStart;
+    //   I-TC-004       — w:delText inside w:moveFrom (Word repairs).
     if let Some(main_part) = &main_part
         && let Some(doc_xml) = archive.get(main_part)
     {
@@ -10581,11 +10876,15 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
             Ok(root) => {
                 use crate::docx_validate_annotations::{
                     check_colfirst_collast_pairing, check_custom_xml_range_pairing,
-                    check_footnote_endnote_id_range, check_omath_placement, check_perm_id_validity,
+                    check_footnote_endnote_id_range, check_move_from_text_form,
+                    check_omath_placement, check_perm_id_validity,
                 };
                 let story = [(main_part.clone(), &root)];
                 let mut structural = check_omath_placement(&story);
                 structural.extend(check_perm_id_validity(&story));
+                // I-TC-004 — w:delText inside w:moveFrom (Word repairs the
+                // file and loses its revisions).
+                structural.extend(check_move_from_text_form(&story));
                 structural.extend(check_colfirst_collast_pairing(&story));
                 // I-ANN-009 — torn customXml*Range pairs (start without end, or
                 // vice versa; §17.13.5.4-.11). The transparent-wrapper model
@@ -10930,7 +11229,7 @@ fn import_and_anchor(
 
     // Resolve external hyperlink URLs from document relationships
     resolve_hyperlink_urls(&mut canonical, &rels.hyperlinks);
-    crate::import::resolve_story_hyperlink_urls(&mut canonical, &archive, &main_dir)?;
+    crate::import::resolve_story_hyperlink_urls(&mut canonical, &archive, &rels, &main_dir)?;
 
     // Extract cached body nodes for later use by serialize_canonical_docx,
     // avoiding a redundant full xmltree re-parse of document.xml.
@@ -12010,8 +12309,8 @@ mod tests {
             r#"<w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r>
                <w:r><w:fldChar w:fldCharType="end"/></w:r></w:del>"#,
         );
-        assert!(!paragraph_del_field_chars_imbalanced(&para));
-        assert!(!part_has_del_field_char_imbalance(&para));
+        assert!(!paragraph_tracked_field_chars_imbalanced(&para));
+        assert!(!part_has_tracked_field_char_imbalance(&para));
     }
 
     #[test]
@@ -12022,8 +12321,42 @@ mod tests {
             r#"<w:del><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:del>
                <w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
         );
-        assert!(paragraph_del_field_chars_imbalanced(&para));
-        assert!(part_has_del_field_char_imbalance(&para));
+        assert!(paragraph_tracked_field_chars_imbalanced(&para));
+        assert!(part_has_tracked_field_char_imbalance(&para));
+    }
+
+    #[test]
+    fn ins_field_chars_balanced_begin_and_end_is_not_an_imbalance() {
+        // A fully inserted field: begin and end both inside <w:ins>.
+        let para = parse_para(
+            r#"<w:ins><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+               <w:r><w:fldChar w:fldCharType="separate"/></w:r></w:ins>
+               <w:ins><w:r><w:fldChar w:fldCharType="end"/></w:r></w:ins>"#,
+        );
+        assert!(!paragraph_tracked_field_chars_imbalanced(&para));
+    }
+
+    #[test]
+    fn ins_field_char_begin_without_inserted_end_is_an_imbalance() {
+        // An inserted begin whose end was rejected away: Accept would show
+        // the field code as text.
+        let para = parse_para(
+            r#"<w:ins><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+               <w:r><w:instrText> NUMPAGES </w:instrText></w:r>
+               <w:r><w:fldChar w:fldCharType="separate"/></w:r></w:ins>
+               <w:ins><w:r><w:t>1</w:t></w:r></w:ins>"#,
+        );
+        assert!(paragraph_tracked_field_chars_imbalanced(&para));
+        assert!(part_has_tracked_field_char_imbalance(&para));
+    }
+
+    #[test]
+    fn ins_field_char_begin_with_untracked_end_is_an_imbalance() {
+        let para = parse_para(
+            r#"<w:ins><w:r><w:fldChar w:fldCharType="begin"/></w:r></w:ins>
+               <w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        );
+        assert!(paragraph_tracked_field_chars_imbalanced(&para));
     }
 
     #[test]
@@ -12043,7 +12376,7 @@ mod tests {
         ))
         .expect("story XML");
 
-        assert!(!part_has_del_field_char_imbalance(&story));
+        assert!(!part_has_tracked_field_char_imbalance(&story));
     }
 
     #[test]
@@ -12058,7 +12391,7 @@ mod tests {
         ))
         .expect("story XML");
 
-        assert!(part_has_del_field_char_imbalance(&story));
+        assert!(part_has_tracked_field_char_imbalance(&story));
     }
 
     #[test]
@@ -12066,7 +12399,7 @@ mod tests {
         // instrText inside <w:del> does not affect field balance and must not
         // trip the guard (it is preserved for the reject view's opaque markers).
         let para = parse_para(r#"<w:del><w:r><w:instrText> PAGE </w:instrText></w:r></w:del>"#);
-        assert!(!paragraph_del_field_chars_imbalanced(&para));
+        assert!(!paragraph_tracked_field_chars_imbalanced(&para));
     }
     use zip::ZipWriter;
     use zip::write::FileOptions;
@@ -13559,6 +13892,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -13601,6 +13935,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 
@@ -13972,6 +14307,7 @@ mod tests {
                 source_row_attrs: Vec::new(),
                 id: NodeId::from("row1"),
                 cells: vec![TableCellNode {
+                    cell_merge: None,
                     id: NodeId::from("cell1"),
                     blocks: cell_blocks,
                     grid_span: 1,
@@ -13982,6 +14318,7 @@ mod tests {
                         width: None,
                         v_align: None,
                         margins: None,
+                        margins_pct: Default::default(),
                         no_wrap: None,
                         text_direction: None,
                         tc_fit_text: None,
@@ -14025,6 +14362,7 @@ mod tests {
                 grid_cols: vec![],
                 grid_history: None,
                 default_cell_margins: None,
+                cell_margins_pct: Default::default(),
                 alignment: None,
                 indent: None,
                 layout: None,
@@ -14426,6 +14764,7 @@ mod tests {
                 r#"<w:drawing xmlns:w="{STYLES_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:blip r:embed="{logical_rid}"/></w:drawing>"#
             );
             let opaque = InlineNode::from(crate::domain::OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("op1"),
                 kind: OpaqueKind::Drawing,
                 opaque_ref: "op_ref_1".to_string(),
@@ -14465,8 +14804,10 @@ mod tests {
         /// the opaque-fragment path used by drawings and embedded objects.
         fn doc_with_inserted_table_hyperlink(rid: &str, url: &str) -> CanonDoc {
             let opaque = InlineNode::from(crate::domain::OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("link1"),
                 kind: OpaqueKind::Hyperlink(crate::domain::HyperlinkData {
+                    flattened_wrappers: Vec::new(),
                     url: Some(url.to_string()),
                     anchor: None,
                     text: "Link".to_string(),
@@ -14562,6 +14903,7 @@ mod tests {
         /// exactly `raw`. Used to exercise the unparseable-fragment preflight.
         fn doc_with_opaque_raw(kind: OpaqueKind, raw: &[u8]) -> CanonDoc {
             let opaque = InlineNode::from(crate::domain::OpaqueInlineNode {
+                formatting_change: None,
                 id: NodeId::from("op1"),
                 kind,
                 opaque_ref: "op_ref_1".to_string(),

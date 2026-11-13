@@ -297,16 +297,15 @@ fn comment_anchor_on_deleted_content_is_refused_with_alternative() {
     );
 }
 
-// ── Test 5: comment survives accept-all AND reject-all ───────────────────────
+// ── Test 5: accept-all keeps the comment, reject-all removes it ──────────────
 
-/// A comment enclosing the insertion must stay well-formed under BOTH
-/// resolutions. On accept-all the insertion becomes permanent; on reject-all it
-/// is removed and the range collapses to the remaining anchor — but the markers
-/// stay PAIRED (they are Normal decorations, never inside the `w:ins`), so the
-/// comment is retained, never orphaned. This pins the domain-correct reject-all
-/// behavior: shrink the range, keep the comment.
+/// A comment anchored on inserted text is about that text. Accept-all makes
+/// the insertion permanent and keeps the comment fully anchored; reject-all
+/// removes the insertion and with it all the commented text, so the comment
+/// goes whole (range, reference and definition), as Word does
+/// (`comment_anchor_resolution`). Both results are well-formed.
 #[test]
-fn comment_enclosing_insertion_survives_accept_and_reject() {
+fn comment_enclosing_insertion_survives_accept_and_goes_on_reject() {
     let base = Document::parse(&tracked_insertion_clause()).expect("parse");
     let block_id = first_block_id(&base.snapshot().canonical);
 
@@ -314,30 +313,37 @@ fn comment_enclosing_insertion_survives_accept_and_reject() {
         .apply(&txn(vec![create_step(
             block_id,
             "hre",
-            "Survives both resolutions.",
+            "Survives acceptance only.",
         )]))
         .expect("comment applies");
 
     let accepted = edited.project(Resolution::AcceptAll).expect("accept");
     let rejected = edited.project(Resolution::RejectAll).expect("reject");
 
-    for (doc, label) in [(&accepted, "accept-all"), (&rejected, "reject-all")] {
-        let bytes = doc.serialize(&ExportOptions::default()).expect("serialize");
-        let doc_xml = document_xml(&bytes);
-        // Markers not orphaned: the range pair and the reference all survive.
-        assert_fully_anchored(&doc_xml);
-        assert_annotations_clean(&bytes, label);
-    }
+    let accepted_bytes = accepted
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    assert_fully_anchored(&document_xml(&accepted_bytes));
+    assert_annotations_clean(&accepted_bytes, "accept-all");
+    assert!(
+        document_xml(&accepted_bytes).contains("three"),
+        "accept keeps insertion"
+    );
 
-    // Accept-all keeps the inserted word; reject-all removes it (range collapses
-    // but the comment is retained).
-    let accepted_xml = document_xml(&accepted.serialize(&ExportOptions::default()).unwrap());
-    let rejected_xml = document_xml(&rejected.serialize(&ExportOptions::default()).unwrap());
-    assert!(accepted_xml.contains("three"), "accept keeps insertion");
+    let rejected_bytes = rejected
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    assert_annotations_clean(&rejected_bytes, "reject-all");
+    let rejected_xml = document_xml(&rejected_bytes);
     assert!(
         !rejected_xml.contains(">three<"),
-        "reject removes the inserted word: {rejected_xml}"
+        "reject removes the inserted word"
     );
+    assert!(
+        !rejected_xml.contains("commentRange") && !rejected_xml.contains("commentReference"),
+        "the comment goes whole: {rejected_xml}"
+    );
+    assert!(rejected.snapshot().canonical.comments.is_empty());
 }
 
 // ── Test 6: an unlocatable anchor is still CommentAnchorNotFound ──────────────

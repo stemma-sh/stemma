@@ -424,6 +424,7 @@ fn compare_comments(
             id,
             author,
             date,
+            initials,
             blocks,
             content_hash: _, // computed digest for cross-document alignment
             tracking_status,
@@ -432,6 +433,7 @@ fn compare_comments(
             id: b_id,
             author: b_author,
             date: b_date,
+            initials: b_initials,
             blocks: b_blocks,
             content_hash: _,
             tracking_status: b_tracking_status,
@@ -439,6 +441,7 @@ fn compare_comments(
         compare_val(diffs, &format!("{p}.id"), id, b_id);
         compare_opt(diffs, &format!("{p}.author"), author, b_author);
         compare_opt(diffs, &format!("{p}.date"), date, b_date);
+        compare_opt(diffs, &format!("{p}.initials"), initials, b_initials);
         compare_tracked_blocks(diffs, &format!("{p}.blocks"), blocks, b_blocks);
         compare_opt_tracking_status(
             diffs,
@@ -639,6 +642,7 @@ fn compare_paragraphs(
         numbering,
         has_direct_numbering,
         numbering_suppressed,
+        direct_numbering_omits_ilvl,
         // Derived cache: the pre-materialization numbering snapshot. Restored
         // into `numbering` during projection, so comparing `numbering` already
         // covers the structural fidelity; this is a transient bookkeeping field.
@@ -685,6 +689,7 @@ fn compare_paragraphs(
         source_paragraph_attrs,
         cnf_style,
         preserved_ppr,
+        cell_move_id,
     } = a;
     let ParagraphNode {
         id: _,
@@ -718,6 +723,7 @@ fn compare_paragraphs(
         numbering: b_numbering,
         has_direct_numbering: b_has_direct_numbering,
         numbering_suppressed: b_numbering_suppressed,
+        direct_numbering_omits_ilvl: b_direct_numbering_omits_ilvl,
         materialized_numbering: _,
         rendered_text: _,
         literal_prefix: b_literal_prefix,
@@ -761,6 +767,7 @@ fn compare_paragraphs(
         cnf_style: b_cnf_style,
         source_paragraph_attrs: b_source_paragraph_attrs,
         preserved_ppr: b_preserved_ppr,
+        cell_move_id: b_cell_move_id,
     } = b;
 
     compare_val(
@@ -826,6 +833,12 @@ fn compare_paragraphs(
         &format!("{path}.numbering_suppressed"),
         numbering_suppressed,
         b_numbering_suppressed,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.direct_numbering_omits_ilvl"),
+        direct_numbering_omits_ilvl,
+        b_direct_numbering_omits_ilvl,
     );
     compare_opt(
         diffs,
@@ -1016,6 +1029,12 @@ fn compare_paragraphs(
         &format!("{path}.preserved_ppr"),
         preserved_ppr,
         b_preserved_ppr,
+    );
+    compare_opt(
+        diffs,
+        &format!("{path}.cell_move_id"),
+        cell_move_id,
+        b_cell_move_id,
     );
 }
 
@@ -1429,6 +1448,7 @@ fn compare_opaque_inlines(
         // be redundant and noisier (equal hash ⇒ equal bytes).
         raw_xml: _,
         content_hash,
+        formatting_change,
     } = a;
     let OpaqueInlineNode {
         id: _,
@@ -1442,6 +1462,7 @@ fn compare_opaque_inlines(
         joins_following_text_run: b_joins_following_text_run,
         raw_xml: _,
         content_hash: b_content_hash,
+        formatting_change: b_formatting_change,
     } = b;
     match (kind, b_kind) {
         (OpaqueKind::Hyperlink(a), OpaqueKind::Hyperlink(b)) => {
@@ -1495,6 +1516,12 @@ fn compare_opaque_inlines(
         content_hash,
         b_content_hash,
     );
+    compare_opt_text_formatting_change(
+        diffs,
+        &format!("{path}.formatting_change"),
+        formatting_change,
+        b_formatting_change,
+    );
 }
 
 /// The load-bearing identity inside a decoration's verbatim bytes: the
@@ -1544,6 +1571,7 @@ fn compare_decorations(
         // origin is a serializer-side bookmark-id policy hint, not document
         // content; it steers id assignment at write time and is recomputed.
         origin: _,
+        formatting_change,
     } = a;
     let DecorationNode {
         source_run_attrs: b_source_run_attrs,
@@ -1556,6 +1584,7 @@ fn compare_decorations(
         joins_following_text_run: b_joins_following_text_run,
         raw_xml: b_raw_xml,
         origin: _,
+        formatting_change: b_formatting_change,
     } = b;
     compare_val(diffs, &format!("{path}.decoration.kind"), kind, b_kind);
     compare_val(
@@ -1587,6 +1616,12 @@ fn compare_decorations(
         &format!("{path}.decoration.joins_following_text_run"),
         joins_following_text_run,
         b_joins_following_text_run,
+    );
+    compare_opt_text_formatting_change(
+        diffs,
+        &format!("{path}.decoration.formatting_change"),
+        formatting_change,
+        b_formatting_change,
     );
 }
 
@@ -1879,6 +1914,7 @@ fn compare_table_cells(
             formatting,
             formatting_change,
             tracking_status,
+            cell_merge,
             row_sdt_wrapper,
             content_sdt_wraps,
             cnf_style,
@@ -1893,6 +1929,7 @@ fn compare_table_cells(
             formatting: b_formatting,
             formatting_change: b_formatting_change,
             tracking_status: b_tracking_status,
+            cell_merge: b_cell_merge,
             row_sdt_wrapper: b_row_sdt_wrapper,
             content_sdt_wraps: b_content_sdt_wraps,
             cnf_style: b_cnf_style,
@@ -1914,6 +1951,35 @@ fn compare_table_cells(
             tracking_status,
             b_tracking_status,
         );
+        match (cell_merge, b_cell_merge) {
+            (None, None) => {}
+            (Some(ma), Some(mb)) => {
+                compare_val(
+                    diffs,
+                    &format!("{p}.cell_merge.after"),
+                    &ma.after,
+                    &mb.after,
+                );
+                compare_val(
+                    diffs,
+                    &format!("{p}.cell_merge.before"),
+                    &ma.before,
+                    &mb.before,
+                );
+                compare_tracking_revision_info(
+                    diffs,
+                    &format!("{p}.cell_merge.revision"),
+                    &ma.revision,
+                    &mb.revision,
+                );
+            }
+            _ => diff(
+                diffs,
+                &format!("{p}.cell_merge"),
+                cell_merge.is_some(),
+                b_cell_merge.is_some(),
+            ),
+        }
         // row_sdt_wrapper: compare presence only. The wrapper bytes are raw
         // `w:sdtPr` XML preserved verbatim for roundtrip; presence is the
         // structural fidelity the comparator asserts.
@@ -2259,6 +2325,7 @@ mod tests {
                 numbering: None,
                 has_direct_numbering: true,
                 numbering_suppressed: false,
+                direct_numbering_omits_ilvl: false,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -2301,6 +2368,7 @@ mod tests {
                 cnf_style: None,
                 source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
+                cell_move_id: None,
             })));
         let diffs = compare_canon_docs(&a, &b);
         assert_eq!(diffs.len(), 1);
@@ -2346,6 +2414,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -2388,6 +2457,7 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 
@@ -2598,6 +2668,7 @@ mod tests {
                 }),
                 has_direct_numbering: true,
                 numbering_suppressed: false,
+                direct_numbering_omits_ilvl: false,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -2640,6 +2711,7 @@ mod tests {
                 cnf_style: None,
                 source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
+                cell_move_id: None,
             }))
         };
 
@@ -2677,6 +2749,7 @@ mod segment_coalescing_tests {
 
     fn bookmark_end() -> InlineNode {
         InlineNode::from(DecorationNode {
+            formatting_change: None,
             source_run_attrs: Vec::new(),
             id: NodeId::from("d"),
             kind: DecorationType::Bookmark,
@@ -2804,8 +2877,15 @@ fn compare_hyperlink(
         r_id,
         runs,
         extra_attrs,
+        flattened_wrappers,
     } = a;
     compare_val(diffs, &format!("{path}.url"), url, &b.url);
+    compare_val(
+        diffs,
+        &format!("{path}.flattened_wrappers"),
+        flattened_wrappers,
+        &b.flattened_wrappers,
+    );
     compare_val(diffs, &format!("{path}.anchor"), anchor, &b.anchor);
     compare_val(diffs, &format!("{path}.text"), text, &b.text);
     // `r_id` is package-local addressing: the serializer resolves the

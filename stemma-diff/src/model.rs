@@ -296,5 +296,8 @@ pub struct CommentPayload {
     pub date: Option<String>,
     pub segments: Vec<InlineChange>,
     pub resolved: bool,
+    /// This comment's own thread key: its last paragraph's `w14:paraId`, the
+    /// value a reply's `parent_para_id` names. `None` when it carries none.
+    pub para_id: Option<String>,
     pub parent_para_id: Option<String>,
 }

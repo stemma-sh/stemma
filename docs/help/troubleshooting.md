@@ -46,15 +46,23 @@ with a fresh output path.
 
 ## A match is inside a link or content control
 
-A text replacement searches body and table-cell paragraphs, but it does not
-edit a hyperlink's display text or a content control's value. When the text
-also occurs there, the item refuses rather than replacing only the occurrences
-it can reach: the CLI receipt reports `matches_inside_inline_objects`, and MCP
-`replace_text` reports `ReplaceTextInsideInlineObjects` with `unreached_matches`
-naming each object and the operation that edits it.
+A text replacement searches body and table-cell paragraphs, a hyperlink's
+display text and an inline content control's value included, and replaces an
+occurrence there inside the link or control. Some controls cannot be edited
+this way: one whose content is locked (`w:lock` `contentLocked` or
+`sdtContentLocked`), a drop-down, date, checkbox or other control whose value
+is not free text, and one showing its placeholder. A link or control already
+holding pending changes, or one the replacement would leave empty, is not
+edited either. When the text occurs in one of those, the item refuses rather
+than replacing only the other occurrences: the CLI receipt reports
+`matches_inside_inline_objects`, and MCP `replace_text` reports
+`ReplaceTextInsideInlineObjects` with `unreached_matches` naming each object
+and why.
 
-Edit those occurrences with the named operation first, or narrow the scope to
-exclude them, then run the replacement again. Headers, footers, notes and
+Unlock or fill the control (or resolve its pending changes) first, or narrow
+the scope to exclude it, then run the replacement again. A match that runs
+across a link's or control's edge refuses as a straddle: which part of the new
+text belongs inside the object is not known. Headers, footers, notes and
 comments are not searched at all; the CLI receipt lists them under
 `coverage.unsearched`.
 
@@ -142,14 +150,6 @@ header; pick the index from that list.
 A note of several paragraphs takes one line per paragraph, separated by `\n`
 and in order (`NoteBodyLineCountMismatch`). Repeat a paragraph's current text
 to keep it.
-
-## Every accept or reject refuses: a tracked cell merge is pending
-
-A table with a pending tracked vertical cell merge (`w:cellMerge`) blocks
-every resolution of that document, Accept All and Reject All included,
-because resolving merge changes is not supported. The revision census lists
-it with kind `cell_merge` and id `0`, and the refusal names the table. Resolve
-that merge in Word, then resolve the rest with Stemma.
 
 ## A saved snapshot blob is refused
 

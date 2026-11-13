@@ -598,6 +598,16 @@ pub struct ParagraphNode {
     /// silently letting the paragraph re-inherit its style's numbering.
     #[serde(default)]
     pub numbering_suppressed: bool,
+    /// True when the paragraph's direct `w:numPr` names a list (`w:numId`)
+    /// but writes no `w:ilvl` (both children are schema-optional, CT_NumPr
+    /// §17.3.1.19). `numbering.ilvl` then holds the level Word resolves for it
+    /// (`styles::resolve_omitted_direct_level`), not an authored value, and the
+    /// serializer writes the `w:numPr` back without a `w:ilvl`.
+    ///
+    /// Invariant: true only with `has_direct_numbering` and
+    /// `numbering: Some(..)`. Every verb that authors a level clears it.
+    #[serde(default)]
+    pub direct_numbering_omits_ilvl: bool,
     /// Original numbering info saved before materialization into inline `_npfx`
     /// nodes. Set by `materialize_numbering_prefix` / `_in_place` when
     /// `numbering` is cleared to prevent the serializer from double-emitting
@@ -796,6 +806,15 @@ pub struct ParagraphNode {
     /// Mirrors `StyleProps::preserved` for the paragraph-properties container.
     #[serde(default)]
     pub preserved_ppr: Vec<PreservedProp>,
+    /// The move group (the move range's `w:name`, §17.13.5.24–.27) of a
+    /// paragraph inside a table cell that is one half of a tracked move:
+    /// Word writes a paragraph moved from the body into a cell as a moveTo
+    /// destination there (Word 16 records no move whose source is a cell).
+    /// A top-level paragraph carries its move group on
+    /// [`TrackedBlock::move_id`] and keeps this `None`; a cell's blocks have
+    /// no tracked-block wrapper to carry it.
+    #[serde(default)]
+    pub cell_move_id: Option<String>,
 }
 
 /// Transitional `ST_Cnf`: the legacy 12-bit conditional-formatting mask.
@@ -1265,6 +1284,7 @@ impl ParagraphNode {
             numbering: None,
             has_direct_numbering: false,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -1307,6 +1327,7 @@ impl ParagraphNode {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         }
     }
 }
@@ -2243,6 +2264,7 @@ pub fn numbering_structurally_eq(a: &Option<NumberingInfo>, b: &Option<Numbering
 pub fn paragraph_numbering_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> bool {
     a.has_direct_numbering == b.has_direct_numbering
         && a.numbering_suppressed == b.numbering_suppressed
+        && a.direct_numbering_omits_ilvl == b.direct_numbering_omits_ilvl
         && numbering_structurally_eq(&a.numbering, &b.numbering)
 }
 
@@ -2455,6 +2477,10 @@ pub struct TableCellNode {
     pub formatting_change: Option<CellFormattingChange>,
     /// Tracked change status (from w:cellIns / w:cellDel in tcPr).
     pub tracking_status: Option<TrackingStatus>,
+    /// Tracked change to this cell's vertical merge (from w:cellMerge in tcPr,
+    /// §17.13.5.3). See [`CellMergeChange`].
+    #[serde(default)]
+    pub cell_merge: Option<CellMergeChange>,
     /// SDT wrapper around this cell at the row level (§17.5.2).
     /// When present, the cell was originally wrapped in `w:sdt` inside the row.
     pub row_sdt_wrapper: Option<SdtWrapper>,
@@ -2479,6 +2505,44 @@ pub struct TableCellNode {
     /// `TCPR_CONSUMED`).
     #[serde(default)]
     pub preserved: Vec<PreservedProp>,
+}
+
+/// A pending tracked change to a cell's vertical merge (`w:cellMerge`,
+/// §17.13.5.3).
+///
+/// The element records the cell's merge state after the change (`w:vMerge`)
+/// and before it (`w:vMergeOrig`); a missing attribute means the cell is not
+/// vertically merged on that side. While the change is pending, the cell's own
+/// `w:vMerge` element ([`TableCellNode::v_merge`]) is only what is displayed:
+/// Accept sets the merge to `after` and Reject sets it to `before`, and a cell
+/// either resolution leaves as a continuation loses its content, pending
+/// changes inside it included. The cell merges of one vertically contiguous
+/// run of cells in one grid column are one revision and share one identity.
+/// (Word 16 behaviour; see `tracked_model::resolve_cell_merge`.)
+///
+/// Invariant: `after` and `before` are never both [`VerticalMerge::None`]. A
+/// `w:cellMerge` with neither attribute "can be ignored" (§17.13.5.3); import
+/// keeps it verbatim in [`TableCellNode::preserved`] and it is no revision.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CellMergeChange {
+    pub revision: RevisionInfo,
+    /// The merge state the change made (`w:vMerge`: `rest`/`cont`; absent =
+    /// not merged).
+    pub after: VerticalMerge,
+    /// The merge state before the change (`w:vMergeOrig`; absent = not merged).
+    pub before: VerticalMerge,
+}
+
+impl CellMergeChange {
+    /// The merge state the cell takes when this change is accepted
+    /// (`accept == true`) or rejected.
+    pub fn resolved(&self, accept: bool) -> VerticalMerge {
+        if accept {
+            self.after.clone()
+        } else {
+            self.before.clone()
+        }
+    }
 }
 
 /// Preserved SDT (structured document tag / content control) wrapper.
@@ -2588,6 +2652,10 @@ pub struct TableFormatting {
     pub grid_history: Option<TableGridHistory>,
     /// Default cell margins from w:tblCellMar (twips).
     pub default_cell_margins: Option<CellMargins>,
+    /// w:tblCellMar edges written with `w:type="pct"`, kept as authored (see
+    /// [`PctMarginsAsWritten`]); `default_cell_margins` leaves them unspecified.
+    #[serde(default)]
+    pub cell_margins_pct: PctMarginsAsWritten,
     /// Table alignment from w:jc (§17.4.28).
     pub alignment: Option<Alignment>,
     /// Table indent from w:tblInd w:w (§17.4.51), in twips.
@@ -2653,6 +2721,7 @@ impl Default for TableFormatting {
             grid_cols: Vec::new(),
             grid_history: None,
             default_cell_margins: None,
+            cell_margins_pct: PctMarginsAsWritten::default(),
             alignment: None,
             indent: None,
             layout: None,
@@ -2773,6 +2842,10 @@ pub struct CellFormatting {
     pub v_align: Option<VerticalAlignment>,
     /// Per-cell margin overrides from w:tcMar (twips).
     pub margins: Option<CellMargins>,
+    /// w:tcMar edges written with `w:type="pct"`, kept as authored (see
+    /// [`PctMarginsAsWritten`]); `margins` leaves them unspecified.
+    #[serde(default)]
+    pub margins_pct: PctMarginsAsWritten,
     /// No text wrapping in cell (from w:noWrap, §17.4.30).
     pub no_wrap: Option<bool>,
     /// Text direction in cell (from w:textDirection, §17.4.72).
@@ -2806,6 +2879,7 @@ impl Default for CellFormatting {
             width: None,
             v_align: None,
             margins: None,
+            margins_pct: PctMarginsAsWritten::default(),
             no_wrap: None,
             text_direction: None,
             tc_fit_text: None,
@@ -2824,6 +2898,49 @@ pub struct CellMargins {
     pub bottom: Option<u32>,
     pub left: Option<u32>,
     pub right: Option<u32>,
+}
+
+/// Margin edges of a `w:tblCellMar` or `w:tcMar` written with `w:type="pct"`.
+///
+/// Word does not read such an edge as a percentage: it renders the edge as not
+/// specified (Word oracle, 2026-11-10: a 500 pct left margin renders like no
+/// margin, not like a 450-twip one) and keeps a tcMar pct edge on save. So a
+/// pct edge is no part of the effective margins ([`CellMargins`], which leave
+/// it `None`) and no part of equality: two formattings that differ only here
+/// render alike and compare equal. It is kept only so the edge is written back
+/// as authored, never as a dxa value that would add a visible margin.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PctMarginsAsWritten {
+    pub top: Option<PctMarginEdge>,
+    /// `w:left` or its alias `w:start`.
+    pub left: Option<PctMarginEdge>,
+    pub bottom: Option<PctMarginEdge>,
+    /// `w:right` or its alias `w:end`.
+    pub right: Option<PctMarginEdge>,
+}
+
+impl PctMarginsAsWritten {
+    pub fn is_empty(&self) -> bool {
+        self.top.is_none() && self.left.is_none() && self.bottom.is_none() && self.right.is_none()
+    }
+}
+
+/// See [`PctMarginsAsWritten`]: these edges carry no meaning, so they never
+/// make two formattings unequal.
+impl PartialEq for PctMarginsAsWritten {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PctMarginsAsWritten {}
+
+/// One pct margin edge as authored: its element's local name (`top`, `left`,
+/// `start`, `bottom`, `right`, `end`) and its `w:w` text, if it had one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PctMarginEdge {
+    pub element: String,
+    pub w: Option<String>,
 }
 
 /// A set of border edges.
@@ -3775,7 +3892,7 @@ pub struct RangeMarkerMeta {
 /// The paired-range families the torn-range repair understands. `customXml` and
 /// move ranges are deliberately excluded (they are the markup of a wrapper/move
 /// revision and resolve as a unit, not collapsed to a point).
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RangeMarkerFamily {
     Bookmark,
     CommentRange,
@@ -4985,6 +5102,68 @@ impl RunRprAuthored {
             .collect()
     }
 
+    /// The properties either run writes, as one mask for
+    /// [`Self::direct_style_props`] and [`Self::direct_marks`]: each property
+    /// authored by `self` or by `other`. The explicit-off flags and the
+    /// placement hint are cleared, so a masked mark reads as its resolved
+    /// presence.
+    pub fn either_writes(self, other: Self) -> Self {
+        Self {
+            rpr_after_content: false,
+            font_family: self.font_family || other.font_family,
+            font_family_theme: self.font_family_theme || other.font_family_theme,
+            font_east_asia: self.font_east_asia || other.font_east_asia,
+            font_east_asia_theme: self.font_east_asia_theme || other.font_east_asia_theme,
+            font_cs: self.font_cs || other.font_cs,
+            font_cs_theme: self.font_cs_theme || other.font_cs_theme,
+            font_hint: self.font_hint || other.font_hint,
+            font_size: self.font_size || other.font_size,
+            font_size_cs: self.font_size_cs || other.font_size_cs,
+            color: self.color || other.color,
+            color_theme: self.color_theme || other.color_theme,
+            lang: self.lang || other.lang,
+            lang_east_asia: self.lang_east_asia || other.lang_east_asia,
+            lang_bidi: self.lang_bidi || other.lang_bidi,
+            kern: self.kern || other.kern,
+            char_spacing: self.char_spacing || other.char_spacing,
+            bold: self.bold || other.bold,
+            italic: self.italic || other.italic,
+            bold_off: false,
+            italic_off: false,
+            underline: self.underline || other.underline,
+            underline_off: false,
+            vert_align: self.vert_align || other.vert_align,
+            strike: self.strike || other.strike,
+            double_strike: self.double_strike || other.double_strike,
+            caps: self.caps || other.caps,
+            small_caps: self.small_caps || other.small_caps,
+            vanish: self.vanish || other.vanish,
+            web_hidden: self.web_hidden || other.web_hidden,
+            emboss: self.emboss || other.emboss,
+            imprint: self.imprint || other.imprint,
+            outline: self.outline || other.outline,
+            shadow: self.shadow || other.shadow,
+            bold_cs: self.bold_cs || other.bold_cs,
+            italic_cs: self.italic_cs || other.italic_cs,
+            rtl: self.rtl || other.rtl,
+            cs: self.cs || other.cs,
+            no_proof: self.no_proof || other.no_proof,
+            spec_vanish: self.spec_vanish || other.spec_vanish,
+            o_math: self.o_math || other.o_math,
+            snap_to_grid: self.snap_to_grid || other.snap_to_grid,
+            highlight: self.highlight || other.highlight,
+            underline_style: self.underline_style || other.underline_style,
+            position: self.position || other.position,
+            char_width_scaling: self.char_width_scaling || other.char_width_scaling,
+            char_style_id: self.char_style_id || other.char_style_id,
+            run_border: self.run_border || other.run_border,
+            run_shading: self.run_shading || other.run_shading,
+            emphasis_mark: self.emphasis_mark || other.emphasis_mark,
+            text_effect: self.text_effect || other.text_effect,
+            fit_text: self.fit_text || other.fit_text,
+        }
+    }
+
     /// Direct formatting identity, excluding the imported placement hint for
     /// whether `w:rPr` followed the run content. That hint affects lossless
     /// replay but is not a run-formatting value that `w:rPrChange` can switch.
@@ -5218,6 +5397,13 @@ pub struct OpaqueInlineNode {
     pub raw_xml: Option<Vec<u8>>,
     /// SHA-256 of raw_xml bytes — enables comparing image/object identity.
     pub content_hash: Option<String>,
+    /// Tracked change to the formatting of the run wrapper carrying this
+    /// element (`w:rPrChange` in the wrapper's `w:rPr`, §17.13.5.31), as for
+    /// text runs and breaks. Word lists, accepts and rejects it on a field
+    /// character or field code run like on any other run. Appended last
+    /// (positional snapshot encoding).
+    #[serde(default)]
+    pub formatting_change: Option<FormattingChange>,
 }
 
 /// Zero-width decoration node (bookmarks, comments, etc.).
@@ -5240,10 +5426,12 @@ pub struct DecorationNode {
     /// marker element, so the wrapper `rPr` MUST be captured here and
     /// re-synthesized around the marker on serialization — otherwise the wrapper
     /// collapses to a bare `<w:r>` and the rPr is silently dropped on every
-    /// rebuild of the story. Empty for decorations with no independent host-run
-    /// rPr: paragraph-level markers (bookmarks, comment/move/customXml ranges)
-    /// and the non-glyph run decorations (`w:lastRenderedPageBreak`,
-    /// `w:softHyphen`) that share a run with adjacent text (see
+    /// rebuild of the story. Also captured for a run decoration alone in its
+    /// run (`w:lastRenderedPageBreak`, `w:softHyphen`, which renders in its
+    /// run's formatting at a line end). Empty for decorations with no
+    /// independent host-run rPr: paragraph-level markers (bookmarks,
+    /// comment/move/customXml ranges) and the non-glyph run decorations that
+    /// share a run with adjacent text (see
     /// `import::decoration_wrapper_rpr_is_load_bearing`). Mirrors
     /// [`OpaqueInlineNode::wrapper_marks`]/`wrapper_style_props`.
     #[serde(default)]
@@ -5270,6 +5458,14 @@ pub struct DecorationNode {
     ///
     /// Base-origin decorations always keep their original ids verbatim.
     pub origin: Option<String>,
+    /// Tracked change to the formatting of the run wrapper carrying a
+    /// glyph-rendering note mark (`w:rPrChange` in the wrapper's `w:rPr`,
+    /// §17.13.5.31), as for text runs and object runs. Only on a decoration
+    /// whose wrapper rPr is captured (`wrapper_marks`); a run decoration
+    /// sharing its run with text leaves the change to that text. Appended
+    /// last (positional snapshot encoding).
+    #[serde(default)]
+    pub formatting_change: Option<FormattingChange>,
 }
 
 /// Type of decoration element.
@@ -6604,6 +6800,15 @@ pub struct HyperlinkData {
     /// (e.g. `w:history`, `w:tgtFrame`, `w:tooltip`, `w:docLocation`).
     /// Stored as `(qname, value)` pairs for roundtripping.
     pub extra_attrs: Vec<(String, String)>,
+    /// The run-wrapping elements inside the link (`w:fldSimple`, `w:sdt`,
+    /// `w:smartTag`, `w:customXml`, `w:dir`, `w:bdo`, a nested
+    /// `w:hyperlink`), by local name in document order, whose runs `runs`
+    /// holds flat. `runs` cannot re-emit them, so an edit that rebuilds the
+    /// link from `runs` would lose them; the link's text edit refuses
+    /// instead (`ObjectTextBlock::WrappedText`). Empty for a link whose runs
+    /// are the whole link.
+    #[serde(default)]
+    pub flattened_wrappers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -6879,7 +7084,40 @@ pub enum InlineChange {
         /// exact drawing it read (rather than the containing block's guard, which
         /// is a different hash). None when the node carries no hash.
         content_hash: Option<String>,
+        /// A paired object whose content changes, compared inside the object:
+        /// its runs as the redline shows them. Only on an `Equal` pair of a
+        /// comparison plan of a hyperlink (its display runs) or an inline
+        /// content control (the runs of its `w:sdtContent`); `None`
+        /// everywhere else, where a pair whose payloads differ is replaced
+        /// whole. Materialization provenance, like `rpr_authored`: not part
+        /// of the published read model.
+        #[serde(skip)]
+        object_runs: Option<Vec<ObjectRunChange>>,
     },
+}
+
+/// One run of a paired object's content in a comparison plan
+/// ([`InlineChange::Opaque`]'s `object_runs`): kept (in both objects),
+/// deleted (a base run's text) or inserted (a target run's text). Read in
+/// order, the kept and deleted runs spell the base object's runs and the
+/// kept and inserted runs the target object's. A run is text and run
+/// properties only (`HyperlinkRun` without verbatim XML).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectRunChange {
+    /// The paragraph of the object's content the run is in: always 0 for a
+    /// hyperlink or an inline content control (one run of text); a text
+    /// box's paragraph, in order.
+    pub paragraph: usize,
+    pub change: InlineChangeSegmentType,
+    /// The run, untracked (`status` is `Normal`): materialization gives a
+    /// deleted or inserted run its revision.
+    pub run: HyperlinkRun,
+    /// For a kept run whose properties the comparison found equal to the
+    /// target's only by effective value (they are written differently, and
+    /// resolve the same): the target's own runs for these characters. The
+    /// kept run keeps the base's spelling; the target's spelling is what
+    /// the kept and inserted runs are checked to spell. Empty otherwise.
+    pub target_spelling: Vec<HyperlinkRun>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -6909,4 +7147,14 @@ pub enum OpaqueSegmentKind {
     /// Custom XML wrapper — transparent container, content shows through.
     CustomXml,
     Unknown(String),
+    /// The zero-width start of a comment's range (§17.13.4.4); the segment's
+    /// `reference_id` is the comment id and its `opaque_id` the marker's read
+    /// id `comment_<id>_start`. Appended last: snapshot blobs encode variant
+    /// indices.
+    CommentRangeStart,
+    /// The zero-width end of a comment's range (§17.13.4.3), the partner of
+    /// [`OpaqueSegmentKind::CommentRangeStart`]: `opaque_id` is
+    /// `comment_<id>_end`. The range is the text between the two; the
+    /// comment's reference (`CommentReference`) is a separate anchor.
+    CommentRangeEnd,
 }

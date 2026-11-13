@@ -538,7 +538,7 @@ const INLINE_OPAQUE_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "kind",
-        r#"What the anchor is: "Drawing", "Omml", "Hyperlink", "Field", "Sdt", "Ruby", "SmartArt", "CommentReference", "FootnoteReference", "EndnoteReference", "SmartTag", "Sym", "Ptab", "CustomXml", or {"Unknown":name}."#,
+        r#"What the anchor is: "Drawing", "Omml", "Hyperlink", "Field", "Sdt", "Ruby", "SmartArt", "CommentReference", "FootnoteReference", "EndnoteReference", "SmartTag", "Sym", "Ptab", "CustomXml", {"Unknown":name}, or the zero-width comment range markers "CommentRangeStart" and "CommentRangeEnd"."#,
     ),
     ("opaque_id", "The anchor's stable id."),
     (
@@ -551,7 +551,7 @@ const INLINE_OPAQUE_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "reference_id",
-        "The `w:id` for footnote, endnote, and comment references; else null.",
+        "The `w:id` for footnote, endnote, and comment references and comment range markers; else null.",
     ),
     (
         "field_kind",
@@ -910,22 +910,11 @@ const REVISION_RECORD_FIELDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The complete revision `kind` vocabulary, as `RevisionKind::as_str` emits it.
-/// The wildcard-free match in `enum_vocabularies_are_pinned` breaks compilation
-/// here when a variant is added, forcing this list and the page to follow.
-const REVISION_KIND_TAGS: &[&str] = &[
-    "insert",
-    "delete",
-    "format_run",
-    "format_paragraph",
-    "format_table",
-    "format_row",
-    "format_cell",
-    "format_section",
-    "opaque_interior",
-    "move",
-    "cell_merge",
-];
+/// The complete revision `kind` vocabulary, as `RevisionKind::as_str` emits
+/// it, derived from the engine's exhaustively pinned `RevisionKind::ALL`.
+fn revision_kind_tags() -> Vec<&'static str> {
+    RevisionKind::ALL.iter().map(|kind| kind.as_str()).collect()
+}
 
 // ─── Compile-time pins ──────────────────────────────────────────────────────
 
@@ -996,7 +985,9 @@ fn enum_vocabularies_are_pinned() {
         | OpaqueSegmentKind::SmartTag
         | OpaqueSegmentKind::Sym
         | OpaqueSegmentKind::Ptab
-        | OpaqueSegmentKind::CustomXml => (),
+        | OpaqueSegmentKind::CustomXml
+        | OpaqueSegmentKind::CommentRangeStart
+        | OpaqueSegmentKind::CommentRangeEnd => (),
         OpaqueSegmentKind::Unknown(_) => (),
     };
     let _ = |m: MoveDirection| match m {
@@ -1070,7 +1061,7 @@ fn render() -> String {
         .expect("exemplar carries pending revisions")
         .clone();
     assert!(
-        REVISION_KIND_TAGS.contains(&first_kind.as_str()),
+        revision_kind_tags().contains(&first_kind.as_str()),
         "revision kind {:?} missing from the documented tag list",
         first_kind.as_str()
     );
@@ -1424,7 +1415,8 @@ Three honest caveats a builder should know:
 | Revision census and lean redline rendering | `stemma read` | `Document::read()` plus `Document::revisions()` | `GET /api/documents/{{id}}` plus `GET /api/documents/{{id}}/revisions` |
 | Resolve all, by author, by id, or with mixed outcomes | all, author, id, and one-call mixed plan | all and selective resolution; compose mixed outcomes in memory | selective ids; compose author groups client-side |
 | Complete value formatting and assets | not exposed | full render view | `GET /api/documents/{{id}}/rich` |
-| Headers, footers, comments, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, comments, and page geometry but omits footnote and endnote stories |
+| Comments (author, date, text, resolved, thread) | `stemma read` `comments` | full render view, or `stemma_diff::comment_readings` | `/rich` includes comments |
+| Headers, footers, notes, and page geometry | not exposed | full render view | partial: `/rich` includes headers, footers, and page geometry but omits footnote and endnote stories |
 | Stable installed local process boundary | yes | library API, not a process boundary | no; source-only demonstration transport |
 
 ## Units
@@ -1601,7 +1593,7 @@ blocks use:
 | Story | Shape |
 |---|---|
 | `footnotes`, `endnotes` | `{{\"id\", \"segments\"}}` per story. |
-| `comments` | `{{\"id\", \"author\", \"date\", \"segments\", \"resolved\", \"parent_para_id\"}}`; `resolved` comes from the comments-extended part, and `parent_para_id` links a reply to its thread parent. A commented span in the body carries a `CommentReference` opaque anchor whose `reference_id` equals the comment `id`. |
+| `comments` | `{{\"id\", \"author\", \"date\", \"segments\", \"resolved\", \"para_id\", \"parent_para_id\"}}`; `resolved` comes from the comments-extended part, `para_id` is the comment's own thread key, and a reply's `parent_para_id` equals its parent's `para_id`. A commented span in the body (or a table cell) is bracketed by a `CommentRangeStart` and a `CommentRangeEnd` opaque anchor whose `reference_id` equals the comment `id` (opaque ids `comment_<id>_start` / `comment_<id>_end`); the comment's reference is a separate `CommentReference` anchor with the same `reference_id`. |
 | `headers`, `footers` | One band per reference the body section binds: `{{\"kind\": \"default\"/\"first\"/\"even\", \"paragraphs\": [...]}}`, each paragraph carrying `align`, `tab_stops`, and `segments` so a centered footer renders centered. |
 
 ### Section properties
@@ -1698,7 +1690,7 @@ omit records with `revision_id` 0, which are reported but never selectable).
         tab_stop_table = field_table(TAB_STOP_FIELDS),
         section_properties_table = field_table(SECTION_PROPERTIES_FIELDS),
         revision_record_table = field_table(REVISION_RECORD_FIELDS),
-        revision_kinds_list = REVISION_KIND_TAGS
+        revision_kinds_list = revision_kind_tags()
             .iter()
             .map(|t| format!("`{t}`"))
             .collect::<Vec<_>>()
@@ -1754,4 +1746,70 @@ fn regenerate_read_model_reference() {
 #[test]
 fn enum_pins_compile() {
     enum_vocabularies_are_pinned();
+}
+
+/// Every hand-written surface that lists the revision `kind` vocabulary as
+/// complete names every kind the engine emits (`RevisionKind::ALL`) and
+/// nothing else, so a new kind cannot leave one of them behind.
+#[test]
+fn every_complete_kind_list_matches_the_engine() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let read = |relative: &str| {
+        std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"))
+    };
+    let expected: std::collections::BTreeSet<String> = revision_kind_tags()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let backticked = |text: &str| -> std::collections::BTreeSet<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| RevisionKind::parse(word).is_some())
+            .map(str::to_string)
+            .collect()
+    };
+    // The paragraph that opens with `marker`, up to the next blank line.
+    let paragraph = |page: &str, relative: &str, marker: &str| -> String {
+        let start = page
+            .find(marker)
+            .unwrap_or_else(|| panic!("{relative} lost the paragraph starting {marker:?}"));
+        let rest = &page[start..];
+        rest[..rest.find("\n\n").unwrap_or(rest.len())].to_string()
+    };
+
+    let http = read("docs/reference/http.md");
+    assert_eq!(
+        backticked(&paragraph(&http, "http.md", "The complete `kind`")),
+        expected,
+        "docs/reference/http.md"
+    );
+    let cli = read("docs/reference/cli.md");
+    assert_eq!(
+        backticked(&paragraph(
+            &cli,
+            "cli.md",
+            "`kind` is the engine's full revision vocabulary"
+        )),
+        expected,
+        "docs/reference/cli.md"
+    );
+
+    let stub = read("stemma-py/python/stemma/_types.py");
+    let class = &stub[stub
+        .find("class Revision(TypedDict)")
+        .expect("_types.py declares Revision")..];
+    let literal = &class[class.find("kind: Literal[").expect("Revision.kind literal")..];
+    let literal = &literal[..literal.find(']').expect("closed literal")];
+    let quoted: std::collections::BTreeSet<String> = literal
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        quoted, expected,
+        "stemma-py/python/stemma/_types.py Revision.kind"
+    );
 }

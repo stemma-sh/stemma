@@ -274,6 +274,81 @@ fn collect_comment_references(element: &Element, out: &mut Vec<String>) {
 }
 
 // =============================================================================
+// I-XREF-006: one reference per footnote / endnote
+// =============================================================================
+
+/// Each footnote or endnote is referenced once: `w:footnoteReference` /
+/// `w:endnoteReference` (§17.11.14 / §17.11.7) name a note by `w:id`, and a
+/// second reference to one note, anywhere in the package (also inside
+/// `w:del` or `w:ins`), makes Word report the file as corrupted and repair
+/// it (observed in Word: a deleted and an inserted reference sharing an id).
+pub(crate) fn check_xref_006_note_reference_ids(state: &PackageState) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for reference in ["footnoteReference", "endnoteReference"] {
+        let mut seen: HashSet<String> = HashSet::new();
+        for (part_name, root) in &state.story_parts {
+            let mut ids = Vec::new();
+            collect_element_ids(root, reference, &mut ids);
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    findings.push(ValidationFinding {
+                        rule_id: "I-XREF-006",
+                        severity: ValidationSeverity::Error,
+                        message: format!(
+                            "w:{reference} w:id='{id}' is referenced more than once; each note belongs to one reference"
+                        ),
+                        location: part_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    findings
+}
+
+// =============================================================================
+// I-XREF-007: unique drawing ids
+// =============================================================================
+
+/// `wp:docPr/@id` (§20.4.2.5) is unique within the document. Word opens a
+/// package with a repeated drawing id without repair (observed), so this is
+/// a warning: non-conformant, not corrupting.
+pub(crate) fn check_xref_007_drawing_ids(state: &PackageState) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (part_name, root) in &state.story_parts {
+        let mut ids = Vec::new();
+        collect_element_ids(root, "docPr", &mut ids);
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                findings.push(ValidationFinding {
+                    rule_id: "I-XREF-007",
+                    severity: ValidationSeverity::Warning,
+                    message: format!("drawing id wp:docPr id='{id}' is used more than once"),
+                    location: part_name.clone(),
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// The `id` attribute of every element named `name` (local name), in
+/// document order.
+fn collect_element_ids(element: &Element, name: &str, out: &mut Vec<String>) {
+    if local_name(&element.name) == name
+        && let Some(id) = get_val_attr(element, "id")
+    {
+        out.push(id.to_string());
+    }
+    for child in &element.children {
+        if let XMLNode::Element(el) = child {
+            collect_element_ids(el, name, out);
+        }
+    }
+}
+
+// =============================================================================
 // I-XREF-004: Style count must not exceed 4,079 (MS-OE376 §2.1.243)
 // =============================================================================
 
@@ -907,5 +982,39 @@ mod tests {
         assert_eq!(findings[0].rule_id, "I-XREF-003");
         assert_eq!(findings[0].severity, ValidationSeverity::Error);
         assert!(findings[0].message.contains("5"));
+    }
+
+    /// A deleted and an inserted reference naming one footnote: Word reports
+    /// the file corrupted. Two references to two notes are fine.
+    #[test]
+    fn xref_006_flags_a_note_referenced_twice() {
+        let doc = |second: u32| {
+            format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:del w:id="9" w:author="x"><w:r><w:footnoteReference w:id="1"/></w:r></w:del><w:ins w:id="8" w:author="x"><w:r><w:footnoteReference w:id="{second}"/></w:r></w:ins></w:p></w:body></w:document>"#
+            )
+        };
+        let shared = make_state(&[("word/document.xml", &doc(1))]);
+        let findings = check_xref_006_note_reference_ids(&shared);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule_id, "I-XREF-006");
+        assert_eq!(findings[0].severity, ValidationSeverity::Error);
+        let distinct = make_state(&[("word/document.xml", &doc(2))]);
+        assert!(check_xref_006_note_reference_ids(&distinct).is_empty());
+    }
+
+    /// A repeated drawing id is a warning (Word opens the file unrepaired).
+    #[test]
+    fn xref_007_warns_on_a_repeated_drawing_id() {
+        let doc = |second: u32| {
+            format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body><w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="A"/></wp:inline></w:drawing></w:r><w:r><w:drawing><wp:inline><wp:docPr id="{second}" name="B"/></wp:inline></w:drawing></w:r></w:p></w:body></w:document>"#
+            )
+        };
+        let repeated = make_state(&[("word/document.xml", &doc(1))]);
+        let findings = check_xref_007_drawing_ids(&repeated);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].severity, ValidationSeverity::Warning);
+        let distinct = make_state(&[("word/document.xml", &doc(2))]);
+        assert!(check_xref_007_drawing_ids(&distinct).is_empty());
     }
 }

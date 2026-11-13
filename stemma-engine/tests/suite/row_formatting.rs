@@ -70,6 +70,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -112,6 +113,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 
@@ -137,6 +139,7 @@ fn single_borders() -> BorderSet {
 
 fn plain_cell(id: &str, text: &str) -> TableCellNode {
     TableCellNode {
+        cell_merge: None,
         id: NodeId::from(id),
         blocks: vec![BlockNode::from(text_para(&format!("{id}_p"), text))],
         grid_span: 1,
@@ -484,6 +487,7 @@ fn set_row_format_preserves_a_cell_opaque_inline() {
     // A row whose cell holds an opaque inline (a field). A trPr change must
     // leave the cell's content — including the opaque — byte-identical.
     let opaque = InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: NodeId::from("t1_r0c0_field"),
         kind: OpaqueKind::Field(stemma::FieldData {
             field_kind: stemma::FieldKind::Simple,
@@ -512,6 +516,7 @@ fn set_row_format_preserves_a_cell_opaque_inline() {
         seg.inlines.push(opaque);
     }
     let cell = TableCellNode {
+        cell_merge: None,
         id: NodeId::from("t1_r0c0"),
         blocks: vec![BlockNode::from(para)],
         grid_span: 1,

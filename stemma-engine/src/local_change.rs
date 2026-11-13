@@ -720,6 +720,139 @@ pub fn opaque_kind_to_segment_kind(kind: &OpaqueKind) -> OpaqueSegmentKind {
     }
 }
 
+/// How a change's text spells a line feed written inside a text run.
+///
+/// In a change's text `'\n'` is a hard break (`w:br`, a node of its own). A
+/// line feed can also be written as a character of a run's text; it is a
+/// different thing, and a change that carried it as `'\n'` would come back as
+/// a hard break. U+FFFF is not an XML character (XML 1.0 §2.2), so no run's
+/// text contains it and it cannot be mistaken for written text. Producers
+/// spell a written line feed with it ([`change_text_of_run`]); the change
+/// decoder turns it back into the line feed in a text run.
+#[doc(hidden)]
+pub const TEXT_LINE_FEED: char = '\u{FFFF}';
+
+/// How a change's text spells a non-breaking hyphen written as the element
+/// `w:noBreakHyphen` (ECMA-376 §17.3.3.18, a text node with
+/// [`TextRole::NoBreakHyphen`](crate::domain::TextRole::NoBreakHyphen)).
+///
+/// Such a node reads as U+2011, as a typed U+2011 does, but they are
+/// different content (Word can lay them out differently), and a change that
+/// carried the element as U+2011 would come back as typed text. U+FFFE is
+/// not an XML character (XML 1.0 §2.2), so no run's text contains it.
+/// Producers spell the element with it ([`change_text_of_run`]); the change
+/// decoder turns it back into the element.
+#[doc(hidden)]
+pub const TEXT_NO_BREAK_HYPHEN: char = '\u{FFFE}';
+
+/// A text node's text as a change spells it: a written line feed becomes
+/// [`TEXT_LINE_FEED`], a `w:noBreakHyphen` [`TEXT_NO_BREAK_HYPHEN`],
+/// everything else is kept. `text` is the node's text as read (possibly
+/// shown in capitals), one character for one.
+///
+/// # Panics
+///
+/// When a no-break hyphen node does not hold exactly one character (the
+/// importer gives it U+2011).
+#[doc(hidden)]
+pub fn change_text_of_run(node: &crate::domain::TextNode, text: &str) -> String {
+    if node.text_role == Some(crate::domain::TextRole::NoBreakHyphen) {
+        assert_eq!(
+            text.chars().count(),
+            1,
+            "a no-break hyphen node holds one character: {}",
+            node.id.0
+        );
+        return TEXT_NO_BREAK_HYPHEN.to_string();
+    }
+    text.replace('\n', &TEXT_LINE_FEED.to_string())
+}
+
+/// What a run under all caps (`w:caps`, ECMA-376 §17.3.2.5) reads as: each
+/// letter in its upper case. All caps is display formatting; the run keeps
+/// its own letters, and comparison reads it as shown so a capitalised
+/// "Notice" and a typed "NOTICE" compare as the reader sees them.
+///
+/// One character for one character: a letter whose upper case is several
+/// characters (`ß` → `SS`) is read as itself. That keeps every comparison
+/// position on the letter it was written with, so a change found on the
+/// comparison text writes its span with the letters the document has, at the
+/// cost of comparing such a letter by its written form.
+#[doc(hidden)]
+pub fn caps_shown(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// The changes for comparison characters the comparison found equal on both
+/// sides (`len` of them, at `old_offset` and `new_offset`). When both sides
+/// write them with the same letters they are kept, with any formatting
+/// change; when the letters differ (a capitalised "Notice" against a typed
+/// "NOTICE") the text itself changed and is deleted and inserted, so Accept
+/// All writes the target's letters and Reject All the base's.
+#[doc(hidden)]
+pub fn kept_text_changes(
+    old: (&[char], &[CharFormatting], usize),
+    new: (&[char], &[CharFormatting], usize),
+    len: usize,
+    comparison: RunFormatting,
+    styles: Option<RunStyles<'_>>,
+) -> Vec<InlineChange> {
+    let (old_written, old_fmt, old_offset) = old;
+    let (new_written, new_fmt, new_offset) = new;
+    let old_text: String = old_written[old_offset..old_offset + len].iter().collect();
+    let new_text: String = new_written[new_offset..new_offset + len].iter().collect();
+    if old_text == new_text {
+        // Each stretch whose formatting is one run on both sides is its own
+        // kept change: a token that crosses a run boundary on either side
+        // (the "rd" of a superscript ordinal "3rd") keeps each run's own
+        // formatting, and its formatting change each run's own previous
+        // formatting.
+        let mut cuts = std::collections::BTreeSet::new();
+        for (fmt, offset) in [(old_fmt, old_offset), (new_fmt, new_offset)] {
+            let mut at = 0usize;
+            for (run_len, _) in formatting_runs_for_token_range(fmt, offset, len) {
+                at += run_len;
+                cuts.insert(at);
+            }
+        }
+        let new_chars: Vec<char> = new_text.chars().collect();
+        let mut from = 0usize;
+        let mut changes = Vec::new();
+        for to in cuts {
+            if to == from || to > len {
+                continue;
+            }
+            let piece = to - from;
+            let (marks, style_props, rpr_authored, formatting_change) = detect_formatting_change(
+                &formatting_for_token_range(old_fmt, old_offset + from, piece),
+                &formatting_for_token_range(new_fmt, new_offset + from, piece),
+                comparison,
+                styles,
+            );
+            changes.push(InlineChange::Unchanged {
+                text: new_chars[from..to].iter().collect(),
+                marks,
+                style_props,
+                rpr_authored,
+                formatting_change,
+            });
+            from = to;
+        }
+        return changes;
+    }
+    let mut changes = deleted_token_changes(&old_text, old_fmt, old_offset);
+    changes.extend(inserted_token_changes(&new_text, new_fmt, new_offset));
+    changes
+}
+
 #[doc(hidden)]
 pub fn extract_inline_text(inlines: &[InlineNode]) -> String {
     let mut out = String::new();
@@ -730,7 +863,7 @@ pub fn extract_inline_text(inlines: &[InlineNode]) -> String {
                 // This ensures "this instrument" with Caps mark compares equal
                 // to "THIS INSTRUMENT" stored as actual uppercase.
                 let text = if t.style_props.caps == MarkValue::On {
-                    t.text.to_uppercase()
+                    caps_shown(&t.text)
                 } else {
                     t.text.clone()
                 };
@@ -1135,20 +1268,29 @@ pub struct CharFormatting {
 }
 
 /// Extract text from inlines along with a per-character formatting mapping.
-/// Returns (text, char_fmt) where char_fmt[i] contains the formatting for character i.
+/// Returns (text, char_fmt, opaques, written) where char_fmt[i] contains the
+/// formatting for character i and written[i] the letter character i was
+/// written with: `text` reads a caps run as shown ([`caps_shown`]), `written`
+/// keeps the run's own letters, position for position.
 #[doc(hidden)]
 pub fn extract_text_with_marks_and_opaques<'a>(
     inlines: &'a [InlineNode],
-) -> (String, Vec<CharFormatting>, Vec<OpaqueTracker<'a>>) {
+) -> (
+    String,
+    Vec<CharFormatting>,
+    Vec<OpaqueTracker<'a>>,
+    Vec<char>,
+) {
     let mut text = String::new();
     let mut char_fmt: Vec<CharFormatting> = Vec::new();
     let mut opaques: Vec<OpaqueTracker<'a>> = Vec::new();
+    let mut written: Vec<char> = Vec::new();
 
     for (inline_index, inline) in inlines.iter().enumerate() {
         match inline {
             InlineNode::Text(t) => {
                 let node_text = if t.style_props.caps == MarkValue::On {
-                    t.text.to_uppercase()
+                    caps_shown(&t.text)
                 } else {
                     t.text.clone()
                 };
@@ -1161,9 +1303,11 @@ pub fn extract_text_with_marks_and_opaques<'a>(
                     char_fmt.push(fmt.clone());
                 }
                 text.push_str(&node_text);
+                written.extend(change_text_of_run(t, &t.text).chars());
             }
             InlineNode::HardBreak(hard_break) => {
                 text.push('\n');
+                written.push('\n');
                 char_fmt.push(CharFormatting {
                     marks: hard_break.wrapper_marks.clone(),
                     style_props: hard_break.wrapper_style_props.clone(),
@@ -1180,6 +1324,7 @@ pub fn extract_text_with_marks_and_opaques<'a>(
                     char_fmt.push(CharFormatting::default());
                 }
                 text.push_str(&tag);
+                written.extend(tag.chars());
             }
             InlineNode::Decoration(_)
             | InlineNode::CommentRangeStart { .. }
@@ -1187,7 +1332,8 @@ pub fn extract_text_with_marks_and_opaques<'a>(
         }
     }
 
-    (text, char_fmt, opaques)
+    debug_assert_eq!(text.chars().count(), written.len());
+    (text, char_fmt, opaques, written)
 }
 
 /// Get formatting at a specific character offset, or default if out of bounds.
@@ -1268,6 +1414,34 @@ pub fn formatting_runs_for_token_range(
     runs
 }
 
+/// Inserted text spanning `offset..offset+text.len()` of the target, one
+/// change per run of equal formatting (the mirror of
+/// [`deleted_token_changes`]).
+#[doc(hidden)]
+pub fn inserted_token_changes(
+    text: &str,
+    char_fmt: &[CharFormatting],
+    offset: usize,
+) -> Vec<InlineChange> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = 0usize;
+    formatting_runs_for_token_range(char_fmt, offset, chars.len())
+        .into_iter()
+        .map(|(len, fmt)| {
+            let piece: String = chars[at..at + len].iter().collect();
+            at += len;
+            InlineChange::Inserted {
+                text: piece,
+                marks: fmt.marks,
+                style_props: fmt.style_props,
+                rpr_authored: fmt.rpr_authored,
+                formatting_change: None,
+                rev_id: 0,
+            }
+        })
+        .collect()
+}
+
 /// The `Deleted` changes for a token removed from the old text: one per
 /// formatting run (see [`formatting_runs_for_token_range`]).
 #[doc(hidden)]
@@ -1295,6 +1469,76 @@ pub fn deleted_token_changes(
         .collect()
 }
 
+/// How a kept span's run formatting is compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunFormatting {
+    /// As written: the runs' direct (authored) properties.
+    AsWritten,
+    /// By effective value: a property either run writes is a change only
+    /// when its resolved value differs. A run's formatting is resolved
+    /// through its character style, its paragraph style and the document
+    /// defaults ([`crate::styles::StyleDefinitions`]), so a run that writes
+    /// out what it already inherits (a docDefaults language or size) is the
+    /// same run. Fonts compare by the font each script slot selects
+    /// ([`crate::styles::StyleDefinitions::effective_fonts`]) when the runs'
+    /// styles are given ([`RunStyles`]) and the selection is decided,
+    /// otherwise as written; colour compares as written (a literal paired
+    /// with a theme selector, whose precedence across style levels is only
+    /// partly modelled). Only for runs whose resolution is complete: not in
+    /// a table whose style chain declares run properties, which the
+    /// resolution covers only in part. A kept span equal by effective value
+    /// keeps the base run's spelling.
+    ByEffectiveValue,
+}
+
+/// Each side's styles and paragraph style, for comparing kept runs' fonts
+/// by the font each slot selects ([`RunFormatting::ByEffectiveValue`]).
+#[derive(Clone, Copy)]
+pub struct RunStyles<'a> {
+    pub base: (&'a crate::styles::StyleDefinitions, Option<&'a str>),
+    pub target: (&'a crate::styles::StyleDefinitions, Option<&'a str>),
+}
+
+/// Whether a `w:rPr` child kept verbatim is the run's `w:rFonts`.
+fn is_rfonts(prop: &crate::domain::PreservedProp) -> bool {
+    prop.name.rsplit(':').next() == Some("rFonts")
+}
+
+/// The fonts a run selects per script slot, through its own `w:rFonts`
+/// (kept verbatim), its character style, its paragraph style and the
+/// document defaults; `None` where that is not decided.
+fn selected_fonts(
+    fmt: &CharFormatting,
+    (styles, paragraph_style): (&crate::styles::StyleDefinitions, Option<&str>),
+) -> Option<crate::styles::EffectiveFonts> {
+    let mut written = fmt.style_props.preserved.iter().filter(|p| is_rfonts(p));
+    let authored = fmt.rpr_authored;
+    let writes_fonts = authored.font_family
+        || authored.font_family_theme
+        || authored.font_east_asia
+        || authored.font_east_asia_theme
+        || authored.font_cs
+        || authored.font_cs_theme
+        || authored.font_hint;
+    let direct = match (written.next(), written.next()) {
+        // A run recorded as writing fonts without its `w:rFonts` kept is
+        // not decided.
+        (None, _) if writes_fonts => return None,
+        (None, _) => None,
+        (Some(prop), None) => {
+            let el = xmltree::Element::parse(prop.raw_xml.as_bytes()).ok()?;
+            Some(crate::styles::authored_fonts_of(&el)?)
+        }
+        (Some(_), Some(_)) => return None,
+    };
+    let char_style = fmt
+        .style_props
+        .char_style_id
+        .as_deref()
+        .or_else(|| styles.default_char_style_id());
+    styles.effective_fonts(direct.as_ref(), char_style, paragraph_style)
+}
+
 /// Detect formatting-only changes between old and new character positions.
 ///
 /// When text is unchanged (ChangeTag::Equal) but marks or style_props differ,
@@ -1305,6 +1549,8 @@ pub fn deleted_token_changes(
 pub fn detect_formatting_change(
     old_fmt: &CharFormatting,
     new_fmt: &CharFormatting,
+    comparison: RunFormatting,
+    styles: Option<RunStyles<'_>>,
 ) -> (
     Vec<Mark>,
     StyleProps,
@@ -1328,9 +1574,57 @@ pub fn detect_formatting_change(
     let new_direct_props = new_fmt
         .rpr_authored
         .direct_style_props(&new_fmt.style_props);
-    let changed = old_direct_marks != new_direct_marks
+    let written_differently = old_direct_marks != new_direct_marks
         || old_direct_props != new_direct_props
         || old_fmt.rpr_authored.formatting_identity() != new_fmt.rpr_authored.formatting_identity();
+    let changed = written_differently
+        && match comparison {
+            RunFormatting::AsWritten => true,
+            // The properties either run writes, compared by their resolved
+            // values: a restatement of an inherited value drops out, and a
+            // value only a style changed stays with the style's carrier.
+            RunFormatting::ByEffectiveValue => {
+                let written = old_fmt.rpr_authored.either_writes(new_fmt.rpr_authored);
+                // Fonts compare by the font each script slot selects, where
+                // that is decided for both runs: then the runs' written
+                // fonts (their resolved projection, and the `w:rFonts` kept
+                // verbatim in `preserved`) leave the comparison. Otherwise
+                // they compare as written: a differently written `w:rFonts`
+                // is a change below. Colour pairs a literal with a theme
+                // selector whose precedence across style levels is only
+                // partly modelled: it compares as written.
+                let same_fonts = styles.is_some_and(|styles| {
+                    match (
+                        selected_fonts(old_fmt, styles.base),
+                        selected_fonts(new_fmt, styles.target),
+                    ) {
+                        (Some(old), Some(new)) => old == new,
+                        _ => false,
+                    }
+                });
+                let props = |fmt: &CharFormatting| {
+                    let mut props = written.direct_style_props(&fmt.style_props);
+                    if same_fonts {
+                        props.font_family = None;
+                        props.font_family_theme = None;
+                        props.font_east_asia = None;
+                        props.font_east_asia_theme = None;
+                        props.font_cs = None;
+                        props.font_cs_theme = None;
+                        props.font_hint = None;
+                        props.preserved.retain(|p| !is_rfonts(p));
+                    }
+                    props
+                };
+                let colour = |fmt: &CharFormatting| {
+                    let direct = fmt.rpr_authored.direct_style_props(&fmt.style_props);
+                    (direct.color, direct.color_theme)
+                };
+                written.direct_marks(&old_fmt.marks) != written.direct_marks(&new_fmt.marks)
+                    || props(old_fmt) != props(new_fmt)
+                    || colour(old_fmt) != colour(new_fmt)
+            }
+        };
     if changed {
         (
             new_fmt.marks.clone(),
@@ -1383,6 +1677,7 @@ pub fn build_opaque_change(
         alt_text: None,
         url: opaque_url(&tracker.node.kind),
         content_hash: tracker.node.content_hash.clone(),
+        object_runs: None,
     }
 }
 
@@ -1399,8 +1694,10 @@ pub fn diff_block_content_resolving_opaques(
     note_markers: &HashMap<String, String>,
 ) -> Vec<InlineChange> {
     let heuristics = DiffHeuristics::from_env();
-    let (old_text, old_char_fmt, old_opaques) = extract_text_with_marks_and_opaques(old_inlines);
-    let (new_text, new_char_fmt, new_opaques) = extract_text_with_marks_and_opaques(new_inlines);
+    let (old_text, old_char_fmt, old_opaques, old_written) =
+        extract_text_with_marks_and_opaques(old_inlines);
+    let (new_text, new_char_fmt, new_opaques, new_written) =
+        extract_text_with_marks_and_opaques(new_inlines);
 
     if should_bail_out_with_config(&old_text, &new_text, &heuristics) {
         return sort_opaque_runs_by_inline_index(build_full_replace(
@@ -1463,31 +1760,31 @@ pub fn diff_block_content_resolving_opaques(
                 }
             }
         } else {
-            // Regular text — same logic as diff_block_content_with_marks_and_notes
+            // Regular text — same logic as diff_block_content_with_marks_and_notes.
+            // A change writes its span with the letters the document has
+            // (`*_written`), not the comparison's reading of a caps run.
             match change.tag() {
                 ChangeTag::Equal => {
-                    let old_fmt = formatting_for_token_range(&old_char_fmt, old_offset, len);
-                    let new_fmt = formatting_for_token_range(&new_char_fmt, new_offset, len);
-                    let (marks, style_props, rpr_authored, formatting_change) =
-                        detect_formatting_change(&old_fmt, &new_fmt);
-                    result.push(InlineChange::Unchanged {
-                        text,
-                        marks,
-                        style_props,
-                        rpr_authored,
-                        formatting_change,
-                    });
+                    result.extend(kept_text_changes(
+                        (&old_written, &old_char_fmt, old_offset),
+                        (&new_written, &new_char_fmt, new_offset),
+                        len,
+                        RunFormatting::AsWritten,
+                        None,
+                    ));
                     old_offset += len;
                     new_offset += len;
                 }
                 ChangeTag::Delete => {
-                    result.extend(deleted_token_changes(&text, &old_char_fmt, old_offset));
+                    let written: String =
+                        old_written[old_offset..old_offset + len].iter().collect();
+                    result.extend(deleted_token_changes(&written, &old_char_fmt, old_offset));
                     old_offset += len;
                 }
                 ChangeTag::Insert => {
                     let fmt = formatting_for_token_range(&new_char_fmt, new_offset, len);
                     result.push(InlineChange::Inserted {
-                        text,
+                        text: new_written[new_offset..new_offset + len].iter().collect(),
                         marks: fmt.marks,
                         style_props: fmt.style_props,
                         rpr_authored: fmt.rpr_authored,
@@ -2504,7 +2801,7 @@ pub fn inlines_to_segments(
             InlineNode::Text(t) => {
                 let seg = match change_type {
                     "insert" => InlineChange::Inserted {
-                        text: t.text.clone(),
+                        text: change_text_of_run(t, &t.text),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
                         rpr_authored: t.rpr_authored,
@@ -2512,7 +2809,7 @@ pub fn inlines_to_segments(
                         rev_id: 0,
                     },
                     "delete" => InlineChange::Deleted {
-                        text: t.text.clone(),
+                        text: change_text_of_run(t, &t.text),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
                         rpr_authored: t.rpr_authored,
@@ -2520,7 +2817,7 @@ pub fn inlines_to_segments(
                         rev_id: 0,
                     },
                     _ => InlineChange::Unchanged {
-                        text: t.text.clone(),
+                        text: change_text_of_run(t, &t.text),
                         marks: t.marks.clone(),
                         style_props: t.style_props.clone(),
                         rpr_authored: t.rpr_authored,
@@ -2575,36 +2872,37 @@ pub fn inlines_to_segments(
                     alt_text: None,
                     url: opaque_url(&o.kind),
                     content_hash: o.content_hash.clone(),
+                    object_runs: None,
                 });
             }
-            // Comment anchor markers (§17.13.4). These are zero-width — they
+            // Comment range markers (§17.13.4). These are zero-width — they
             // carry NO text and don't advance the offset — but a redline-review
-            // frontend needs them to LOCATE the commented span: it pairs the
-            // start marker with the end-reference (matched by `reference_id`,
-            // which is the comment's `w:id` = the `CommentPayload.id`) and
-            // highlights the text between. We surface them as opaque segments of
-            // kind `CommentReference` carrying that `reference_id`, mirroring how
-            // footnote/endnote references are projected. `CommentRangeStart`
-            // marks the span open; `CommentReference` (emitted at the span's end
-            // by the engine) marks the close. `CommentRangeEnd` is the redundant
-            // structural twin of `CommentReference` and is dropped to avoid a
-            // double close marker.
-            //
-            // The start marker's `opaque_id` is the id every read gives it
-            // (`comment_<id>_start`, `view::comment_range_anchor_id`), never the
+            // frontend needs them to LOCATE the commented span: it pairs a
+            // `CommentRangeStart` with the `CommentRangeEnd` carrying the same
+            // `reference_id` (the comment's `w:id` = the `CommentPayload.id`)
+            // and highlights the text between. The comment's reference is its
+            // own `CommentReference` anchor and need not sit at the range end
+            // (a range may close in a later paragraph). Each marker's
+            // `opaque_id` is the id every read gives it (`comment_<id>_start` /
+            // `comment_<id>_end`, `view::comment_range_anchor_id`), never the
             // comment id, which names the comment and is also its reference's:
             // a replace naming the marker by what a cell paragraph's segments
             // show must find it.
-            InlineNode::CommentRangeStart { id } => {
+            InlineNode::CommentRangeStart { id } | InlineNode::CommentRangeEnd { id } => {
+                let (kind, side) = match inline {
+                    InlineNode::CommentRangeStart { .. } => (
+                        OpaqueSegmentKind::CommentRangeStart,
+                        crate::view::CommentRangeSide::Start,
+                    ),
+                    _ => (
+                        OpaqueSegmentKind::CommentRangeEnd,
+                        crate::view::CommentRangeSide::End,
+                    ),
+                };
                 segments.push(InlineChange::Opaque {
                     segment_type: change_type_to_segment_type(change_type),
-                    kind: OpaqueSegmentKind::CommentReference,
-                    opaque_id: crate::view::comment_range_anchor_id(
-                        id,
-                        crate::view::CommentRangeSide::Start,
-                    )
-                    .0
-                    .to_string(),
+                    kind,
+                    opaque_id: crate::view::comment_range_anchor_id(id, side).0.to_string(),
                     inline_index,
                     text: None,
                     reference_id: Some(id.clone()),
@@ -2616,11 +2914,10 @@ pub fn inlines_to_segments(
                     alt_text: None,
                     url: None,
                     content_hash: None,
+                    object_runs: None,
                 });
             }
-            // Skip decorations and the redundant comment range-end marker
-            // (the range-start + comment-reference pair already bracket the span).
-            InlineNode::Decoration(_) | InlineNode::CommentRangeEnd { .. } => {}
+            InlineNode::Decoration(_) => {}
         }
     }
     // Word often splits text across multiple XML runs arbitrarily (editing
@@ -2703,5 +3000,156 @@ pub fn extract_opaque_metadata(
             (Some("\t".to_string()), None, None, None)
         }
         _ => (None, None, None, None),
+    }
+}
+
+/// One side of a run-property comparison by effective value: the document's
+/// styles, the run's raw `w:rPr` (none for a run without one), and its
+/// paragraph's style.
+#[derive(Clone, Copy)]
+pub struct RunPropertySide<'a> {
+    pub styles: &'a crate::styles::StyleDefinitions,
+    pub rpr_xml: Option<&'a [u8]>,
+    pub paragraph_style: Option<&'a str>,
+}
+
+/// `w:rPr` children whose value the style cascade resolves completely
+/// (direct, character style, paragraph style, document defaults).
+const RESOLVED_RPR_CHILDREN: &[&str] = &[
+    "b",
+    "bCs",
+    "i",
+    "iCs",
+    "caps",
+    "smallCaps",
+    "strike",
+    "dstrike",
+    "vanish",
+    "webHidden",
+    "emboss",
+    "imprint",
+    "outline",
+    "shadow",
+    "vertAlign",
+    "sz",
+    "szCs",
+    "highlight",
+    "lang",
+    "spacing",
+    "position",
+    "kern",
+    "w",
+    "cs",
+    "rtl",
+];
+
+/// `w:rPr` children compared as written: colour (a literal paired with a
+/// theme selector, whose precedence across style levels is only partly
+/// modelled), the character style and underline (whose style attributes
+/// the cascade does not fully carry). Fonts (`w:rFonts`) compare by the
+/// fonts the cascade selects per script slot, where that is provable
+/// ([`crate::styles::StyleDefinitions::effective_fonts`]).
+const WRITTEN_RPR_CHILDREN: &[&str] = &["color", "rStyle", "u"];
+
+/// Whether two runs' raw `w:rPr` are the same by effective value, the rule
+/// of [`RunFormatting::ByEffectiveValue`] for runs the comparison holds only
+/// as raw XML (inside a hyperlink or an inline content control). Each side
+/// resolves through its own styles and paragraph style. Only when every
+/// child of both elements is one the cascade resolves, or one compared as
+/// written and written the same, each at most once; anything else is not
+/// provable and reads as different.
+pub fn run_properties_equivalent(base: RunPropertySide<'_>, target: RunPropertySide<'_>) -> bool {
+    use xmltree::{Element, XMLNode};
+    let parse = |side: &RunPropertySide<'_>| -> Option<Element> {
+        match side.rpr_xml {
+            None => Some(Element::new("rPr")),
+            Some(bytes) => Element::parse(bytes).ok(),
+        }
+    };
+    let (Some(base_el), Some(target_el)) = (parse(&base), parse(&target)) else {
+        return false;
+    };
+    // A child's identity as written: name, attributes by name, children.
+    fn written(el: &Element) -> String {
+        let mut attrs: Vec<String> = el
+            .attributes
+            .iter()
+            .map(|(k, v)| format!("{}={v}", k.local_name))
+            .collect();
+        attrs.sort();
+        let children: Vec<String> = el
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                XMLNode::Element(e) => Some(written(e)),
+                _ => None,
+            })
+            .collect();
+        format!("{}[{}]{{{}}}", el.name, attrs.join(" "), children.join(""))
+    }
+    let children = |el: &Element| -> Option<Vec<(String, String)>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for child in &el.children {
+            let XMLNode::Element(c) = child else { continue };
+            let name = c.name.as_str();
+            if !(RESOLVED_RPR_CHILDREN.contains(&name)
+                || WRITTEN_RPR_CHILDREN.contains(&name)
+                || name == "rFonts")
+                || !seen.insert(name.to_string())
+            {
+                return None;
+            }
+            if WRITTEN_RPR_CHILDREN.contains(&name) {
+                out.push((name.to_string(), written(c)));
+            }
+        }
+        out.sort();
+        Some(out)
+    };
+    match (children(&base_el), children(&target_el)) {
+        (Some(b), Some(t)) if b == t => {}
+        _ => return false,
+    }
+    let resolved = |side: &RunPropertySide<'_>, el: &Element| {
+        let direct = crate::word_ir::parse_rpr_element(el).ok()?;
+        let char_style = direct
+            .char_style_id
+            .as_deref()
+            .or_else(|| side.styles.default_char_style_id());
+        let paragraph_style = side
+            .paragraph_style
+            .or_else(|| side.styles.default_para_style_id());
+        // Fonts: the selection per script slot, compared below; the
+        // resolved projection of them is left out.
+        let fonts = match el.children.iter().find_map(|child| match child {
+            XMLNode::Element(c) if c.name == "rFonts" => Some(c),
+            _ => None,
+        }) {
+            Some(rfonts) => Some(crate::styles::authored_fonts_of(rfonts)?),
+            None => None,
+        };
+        let fonts = side
+            .styles
+            .effective_fonts(fonts.as_ref(), char_style, paragraph_style)?;
+        let mut marks = side.styles.resolve(&direct, char_style, paragraph_style);
+        marks.rpr_after_content = false;
+        marks.authored_rfonts = Default::default();
+        marks.rpr_change = None;
+        marks.font_family = None;
+        marks.font_family_theme = None;
+        marks.font_east_asia = None;
+        marks.font_east_asia_theme = None;
+        marks.font_cs = None;
+        marks.font_cs_theme = None;
+        marks.font_hint = None;
+        marks
+            .preserved
+            .retain(|p| p.name.rsplit(':').next() != Some("rFonts"));
+        Some((fonts, marks))
+    };
+    match (resolved(&base, &base_el), resolved(&target, &target_el)) {
+        (Some(b), Some(t)) => b == t,
+        _ => false,
     }
 }

@@ -28,7 +28,22 @@
 //!     the inner run as content. We flatten it into sibling runs, each keeping
 //!     its OWN run properties, with content order preserved.
 //!
-//! A third shape — `<w:tbl>` as a direct child of `<w:p>` (`CT_P`,
+//! Two more shapes are schema-VALID but carry tracked numbering the model
+//! spells another way; Word's reading of each is verified on the oracle and
+//! the rewrite reproduces it (see `rewrite_tracked_numbering`):
+//!  3. `w:numPr/w:numberingChange` (legacy previous numbering
+//!     text). Word lists no revision for it and drops it on Accept and on
+//!     Reject alike, the numbering staying. It is not modeled (an untouched
+//!     paragraph is still written as it was read).
+//!  4. `w:numPr/w:ins` (inserted numbering). Word lists one
+//!     revision and keeps the numbering on Accept AND on Reject, dropping only
+//!     the marker. That is a tracked paragraph-property change whose previous
+//!     properties equal the current ones: it becomes a `w:pPrChange` carrying
+//!     the marker's id, author and date. A paragraph that already has a
+//!     `w:pPrChange` keeps the marker, and the import refuses it as before:
+//!     two revisions cannot become one.
+//!
+//! A further shape — `<w:tbl>` as a direct child of `<w:p>` (`CT_P`,
 //! §17.3.1.22, has no `tbl` child) — is tolerated too, but its rewrite is
 //! structural: the table becomes a new BLOCK-LEVEL sibling. That hoist lives
 //! next to block assembly in `import::append_blocks_from_element`; this module
@@ -62,6 +77,9 @@ fn has_nested_run(run: &Element) -> bool {
 /// cloned (mirrors the MCE preprocessor's `needs_transform` gate).
 pub(crate) fn subtree_has_tolerated_shape(element: &Element) -> bool {
     if is_shd_val_none(element) {
+        return true;
+    }
+    if is_w_tag(element, "p") && paragraph_num_pr(element).is_some_and(has_tracked_numbering) {
         return true;
     }
     if is_run(element) && has_nested_run(element) {
@@ -126,7 +144,96 @@ pub(crate) fn normalize_tolerated_shapes(
 ) -> Element {
     let mut out = element.clone();
     out.children = rewrite_children(&element.children, diagnostics);
+    if is_w_tag(&out, "p") {
+        rewrite_tracked_numbering(&mut out, diagnostics);
+    }
     out
+}
+
+/// The live `w:pPr/w:numPr` of a paragraph (never the previous one inside a
+/// `w:pPrChange`).
+fn paragraph_num_pr(paragraph: &Element) -> Option<&Element> {
+    find_child(paragraph, "pPr").and_then(|ppr| find_child(ppr, "numPr"))
+}
+
+fn find_child<'a>(element: &'a Element, local: &str) -> Option<&'a Element> {
+    element.children.iter().find_map(|child| match child {
+        XMLNode::Element(e) if is_w_tag(e, local) => Some(e),
+        _ => None,
+    })
+}
+
+fn has_tracked_numbering(num_pr: &Element) -> bool {
+    num_pr.children.iter().any(|child| {
+        matches!(child, XMLNode::Element(e) if is_w_tag(e, "ins") || is_w_tag(e, "numberingChange"))
+    })
+}
+
+/// Shapes 3 and 4: rewrite a paragraph's tracked numbering children as Word
+/// reads them, one diagnostic per rewrite.
+fn rewrite_tracked_numbering(paragraph: &mut Element, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(ppr) = paragraph.children.iter_mut().find_map(|child| match child {
+        XMLNode::Element(e) if is_w_tag(e, "pPr") => Some(e),
+        _ => None,
+    }) else {
+        return;
+    };
+    let has_ppr_change = find_child(ppr, "pPrChange").is_some();
+    let Some(num_pr) = ppr.children.iter_mut().find_map(|child| match child {
+        XMLNode::Element(e) if is_w_tag(e, "numPr") => Some(e),
+        _ => None,
+    }) else {
+        return;
+    };
+    let before = num_pr.children.len();
+    num_pr
+        .children
+        .retain(|child| !matches!(child, XMLNode::Element(e) if is_w_tag(e, "numberingChange")));
+    if num_pr.children.len() != before {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "w:numPr/w:numberingChange (legacy previous numbering text) is not \
+                      modeled: Word lists no revision for it and drops it on Accept and on \
+                      Reject, keeping the numbering; an untouched paragraph keeps it as written"
+                .to_string(),
+            context: Some("w:numberingChange".to_string()),
+        });
+    }
+    if has_ppr_change {
+        return;
+    }
+    let Some(index) = num_pr
+        .children
+        .iter()
+        .position(|child| matches!(child, XMLNode::Element(e) if is_w_tag(e, "ins")))
+    else {
+        return;
+    };
+    let XMLNode::Element(ins) = num_pr.children.remove(index) else {
+        unreachable!("position found an element");
+    };
+    let mut previous = w_el("pPr");
+    previous.children = ppr
+        .children
+        .iter()
+        .filter(|child| {
+            !matches!(child, XMLNode::Element(e)
+                if is_w_tag(e, "rPr") || is_w_tag(e, "sectPr") || is_w_tag(e, "pPrChange"))
+        })
+        .cloned()
+        .collect();
+    let mut change = w_el("pPrChange");
+    change.attributes = ins.attributes.clone();
+    change.children = vec![XMLNode::Element(previous)];
+    ppr.children.push(XMLNode::Element(change));
+    diagnostics.push(Diagnostic {
+        level: DiagnosticLevel::Info,
+        message: "read w:numPr/w:ins (inserted numbering) as \
+                  Word does: one revision whose Accept and Reject both keep the numbering, \
+                  written back as a w:pPrChange with the same previous properties"
+            .to_string(),
+        context: Some("w:numPr/w:ins".to_string()),
+    });
 }
 
 /// Rebuild a children list, applying both within-subtree tolerances:

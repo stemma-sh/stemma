@@ -185,6 +185,32 @@ def test_save_refuses_an_existing_path_unless_overwrite(source: Path, tmp_path: 
     assert stemma.Document.open(out).read_accepted().to_text() == edited.read_accepted().to_text()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_save_overwrite_keeps_the_replaced_files_mode(source: Path, tmp_path: Path) -> None:
+    # Overwriting replaces the content, not the file's access policy: a
+    # group-writable document stays group-writable.
+    doc = stemma.Document.open(source)
+    out = tmp_path / "shared.docx"
+    out.write_bytes(b"old")
+    out.chmod(0o664)
+    doc.save(out, overwrite=True)
+    assert out.stat().st_mode & 0o777 == 0o664
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_save_overwrite_creates_a_new_file_with_the_umask_mode(source: Path, tmp_path: Path) -> None:
+    # A file that did not exist is created like any other new file: 0666
+    # less the process umask, never a private 0600 staging mode.
+    doc = stemma.Document.open(source)
+    umask = os.umask(0o022)
+    try:
+        out = tmp_path / "fresh.docx"
+        doc.save(out, overwrite=True)
+    finally:
+        os.umask(umask)
+    assert out.stat().st_mode & 0o777 == 0o644
+
+
 def test_open_missing_file_raises_file_not_found(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         stemma.Document.open(tmp_path / "absent.docx")
@@ -375,17 +401,34 @@ def test_the_distribution_has_no_runtime_dependencies() -> None:
     assert importlib.metadata.version("stemma-py") == stemma.__version__
 
 
+def test_the_documented_shapes_are_importable_at_runtime() -> None:
+    # Annotations such as ``def f(r: stemma.Revision)`` must not fail when
+    # evaluated at runtime (dataclasses, pydantic, typing.get_type_hints).
+    from stemma import Revision, SaveReceipt, Transaction, ValidationReport
+
+    assert "kind" in Revision.__annotations__
+    assert set(SaveReceipt.__annotations__) == {"path", "bytes", "sha256"}
+    assert "issues" in ValidationReport.__annotations__
+    assert Transaction is not None
+
+
+def test_bytes_like_inputs_are_accepted(source: Path) -> None:
+    data = source.read_bytes()
+    for wrap in (bytes, bytearray, memoryview):
+        doc = stemma.Document.from_bytes(wrap(data))
+        assert doc.to_text() == stemma.Document.from_bytes(data).to_text()
+        assert stemma.validate(wrap(data))["ok"] is True
+        assert stemma.audit(wrap(data), wrap(data))["direct_changes"] == []
+    with pytest.raises(TypeError, match="data must be bytes, bytearray or memoryview"):
+        stemma.Document.from_bytes("not bytes")
+
+
 def test_the_stub_declares_exactly_the_runtime_surface() -> None:
     stub_path = Path(stemma._native.__file__).with_name("_native.pyi")
     tree = ast.parse(stub_path.read_text(encoding="utf-8"))
-    typing_only = {"Transaction"}
     stub_names: dict[str, set[str]] = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
-            bases = {ast.unparse(base) for base in node.bases}
-            if "TypedDict" in bases:
-                typing_only.add(node.name)
-                continue
             stub_names[node.name] = {
                 item.name for item in node.body if isinstance(item, ast.FunctionDef)
             }
@@ -393,7 +436,9 @@ def test_the_stub_declares_exactly_the_runtime_surface() -> None:
             stub_names[node.name] = set()
     runtime = {name for name in dir(stemma._native) if not name.startswith("_")}
     assert set(stub_names) == runtime, "stub and native module declare different names"
-    assert set(stemma.__all__) - {"__version__"} == runtime
+    shapes = {"Transaction", "Diagnostic", "Revision", "ValidationIssue", "ValidationReport",
+              "SaveReceipt", "FlattenedInputRevisions"}
+    assert set(stemma.__all__) - {"__version__"} == runtime | shapes
     for name in ("Document", "Comparison"):
         members = {m for m in vars(getattr(stemma, name)) if not m.startswith("_")}
         assert stub_names[name] == members, f"stub and runtime differ on {name}"

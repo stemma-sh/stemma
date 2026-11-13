@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use stemma::ExportOptions;
 use stemma::api::Document;
 use stemma::domain::BlockNode;
-use stemma::runtime::{ErrorCode, RuntimeError};
+use stemma::runtime::RuntimeError;
 
 const DOCUMENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:r><w:t>Body paragraph.</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid><w:tr><w:tc><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Cell region alpha wording.</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>Nested region gamma wording.</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Final paragraph.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
@@ -229,29 +229,33 @@ fn a_comment_lands_in_a_nested_cell_paragraph() {
     assert!(para.contains("<w:commentRangeStart"), "{para}");
 }
 
-/// `move` names the cell as the reason it cannot reach the paragraph.
+/// `move` reaches a cell paragraph, as Word records it (see
+/// `spec_cell_paragraph_move`): out of a cell it is a tracked deletion plus a
+/// tracked insertion, from the body into a cell it is a move.
 #[test]
-fn move_refuses_a_cell_paragraph_as_in_a_cell() {
+fn move_reaches_a_cell_paragraph_as_word_records_it() {
     let doc = Document::parse(&docx()).expect("parse");
     let (body, cell, _) = ids(&doc);
-    for op in [
+    let out_of_cell = apply(
+        &doc,
         json!({"op":"move","target":cell,"destination":{"anchor":body,"position":"after"}}),
+    )
+    .expect("a cell paragraph moves out of its cell");
+    let xml = document_xml(&out_of_cell);
+    assert!(
+        !xml.contains("<w:moveFrom") && xml.contains("<w:del ") && xml.contains("<w:ins "),
+        "{xml}"
+    );
+    let into_cell = apply(
+        &doc,
         json!({"op":"move","target":body,"destination":{"anchor":cell,"position":"after"}}),
-    ] {
-        let Err(err) = apply(&doc, op.clone()) else {
-            panic!("{op}: move cannot reach a cell paragraph")
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains("table cell") && !message.contains("not found"),
-            "{op}: {message}"
-        );
-        assert_eq!(err.code, ErrorCode::UnsupportedEdit, "{op}: {message}");
-        assert!(
-            message.contains(&format!("'{cell}'")),
-            "{op}: the refusal names the cell paragraph: {message}"
-        );
-    }
+    )
+    .expect("a body paragraph moves into a cell");
+    let xml = document_xml(&into_cell);
+    assert!(
+        xml.contains("<w:moveFrom ") && xml.contains("<w:moveTo "),
+        "{xml}"
+    );
 }
 
 /// An image in a cell can be re-laid-out and have its media replaced by the

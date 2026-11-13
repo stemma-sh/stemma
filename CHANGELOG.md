@@ -8,7 +8,370 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
-## [0.7.0] — 2026-11-06
+## [0.8.0] — 2026-11-12
+
+### Added
+
+- **Comments can be read from the CLI and core MCP.** Comments could be
+  created, replied to, resolved and deleted, but no CLI or core MCP read
+  returned a comment's author, date, body, resolved state or thread: an
+  agent could reply to a thread it could not read. `stemma read` gains a
+  `comments` array (additive to `stemma.read.v0`) and core MCP gains
+  `inspect_docx query='comments'`. Each row has `id`, `author`, `date`,
+  `text`, `resolved` (derived from the thread) and `parent_id`; the raw
+  `parent_para_id` is kept, so a reply whose parent is missing stays
+  visible instead of reading as a root. Rust callers get the same rows
+  from `stemma_diff::comment_readings`.
+- **Validator rule I-TC-004: deleted text inside a move's source.** Word
+  reports a file whose `w:moveFrom` runs spell their text as `w:delText` as
+  corrupted, and its repair loses the move. The rule names the part and the
+  run's text and blocks the save, as I-XREF-006 does for a duplicated note
+  reference. Such a file still opens, reading the run as the moved text it
+  is, with a warning; every move Stemma writes spells the text as `w:t`.
+  The same holds for a field instruction spelled `w:delInstrText` there:
+  Word writes `w:instrText` in a move's source and reports the other
+  spelling as corrupted.
+- **Validator rules I-XREF-006 and I-XREF-007.** I-XREF-006 (error): a
+  footnote or endnote id referenced more than once; each note belongs to
+  one reference, Word reports such a file as corrupted, and the save is
+  blocked. I-XREF-007 (warning): a drawing id (`wp:docPr`) used more than
+  once; Word opens such a file without repair, so the save goes through.
+- **Notes holding a link, field or line break can be edited.** `edit_note`
+  refused any note holding an inline object, so a footnote with a hyperlink
+  could not be edited at all. The notes read now gives one line per
+  paragraph with one U+FFFC per inline object or break, and `edit_note`
+  takes the same text back, carrying each object in its place. A line with
+  a different placeholder count is refused
+  (`NoteBodyObjectCountMismatch`); a table in a note is still refused.
+  The read shows a note's accepted text: tracked `edit_note` refuses a note
+  with pending changes (`ParagraphContainsTrackedSegments`), and direct
+  `edit_note` accepts them and applies the edit.
+- **Edits inside another author's inserted paragraph stack on it.** A span
+  replace, `set_format`, `delete` and `comment_create` were refused in a
+  paragraph that is wholly another author's pending insertion, though the
+  same edits inside an inserted run already stacked. They now stack as
+  they do in a run. This is the edit operations; a worklist item (`stemma
+  apply`, MCP `replacement_worklist`) whose text is in such a paragraph is
+  still refused.
+- **The worklist and `replace_text` match across bookmark, comment and
+  permission boundaries**, as Word's Find does, keeping each marker at its
+  text offset. A refusal for an occurrence that straddles something now
+  names what it crosses (an inline object or break by id, a pending
+  deletion by author, or the edge of a pending insertion).
+- **Documents with tracked numbering children open.** A paragraph whose
+  `w:numPr` carried `w:ins` or `w:numberingChange` was refused at open.
+  Word opens both: an inserted `w:numPr` is read as the one paragraph
+  property revision Word lists (both resolutions keep the numbering), and a
+  `w:numberingChange` is no revision. Each reading records an import
+  diagnostic.
+- **`RevisionKind::ALL` lists every revision kind**, and the read-model
+  page, the HTTP and CLI references, the MCP `by_kind` refusal and the
+  Python stub are checked against it (several lacked `format_paragraph_mark`
+  or `cell_merge`).
+
+- **Tracked cell merges resolve as Word resolves them.** A `w:cellMerge`
+  (§17.13.5.3), which Word writes when it compares documents, is a
+  selectable `cell_merge` revision: Accept gives the cell the merge in
+  `w:vMerge`, Reject the one in `w:vMergeOrig` (a missing attribute means
+  not merged), and a cell left as a continuation loses its content, pending
+  changes in it included. The cell merges of one run of cells in one column
+  are one revision. Both resolution paths, the census and compare inputs
+  handle them, a cell merge inside a textbox included. 0.7 refused every
+  resolution while one was pending.
+
+- **Replacements reach text inside links and content controls.** The
+  replace-text worklist (MCP `replace_text`, `replace_text_batch`, the CLI
+  `apply` worklist) and `replace_all` replace an occurrence in a hyperlink's
+  display text or an inline content control's value inside that object, as a
+  tracked change there (each occurrence its own change) or directly, through
+  the new `EditStep::ReplaceInlineObjectText`. A control bound to a data
+  store gets the new value in its store. Occurrences there count toward
+  `expected_matches`. Still refused, naming the object and why
+  (`ReplaceTextInsideInlineObjects`, `InlineObjectMatch::reason`): a control whose
+  content is locked, one whose value is not free text, one showing its
+  placeholder, an object holding pending changes, and a replacement that would
+  leave one empty. A match running across a link's or control's edge is a
+  wall (`FindReplaceBarrierStraddle`, or `skipped_straddles` under `skip`).
+  MCP's `unreached_matches` entries carry `reason` in place of `route`.
+
+- **Table-cell paragraphs move, as Word records it.** `move` takes a
+  paragraph (or a range) from the body into a cell as one tracked move:
+  Accept gives the target, Reject the base, either half resolves the whole
+  move, and the same after save and reopen. From inside a cell (within it, to
+  another cell, or to the body) Word records no move but a tracked deletion
+  plus a tracked insertion, and so does `move`; the MCP receipt says so in
+  `cell_paragraph_moves`. A cell's last paragraph keeps its end mark: its text
+  moves and an empty paragraph stays, as in Word. A cell's whole content
+  (that is `move_row`), a destination after a cell's last paragraph, and a
+  table into a cell are refused, each saying why. A move Word wrote into a
+  cell now reads as one move (it read as an unpaired insertion and deletion)
+  and keeps its markup through a save.
+
+- **Numbering that names a list but no level opens.** A paragraph whose
+  `w:numPr` has a `w:numId` but no `w:ilvl`, and the same in a tracked
+  paragraph change's previous numbering, was refused at open. It now takes
+  the level Word gives it: the nearest `w:ilvl` along its paragraph style's
+  `basedOn` chain, otherwise level 0, with Word's one exception (a level in a
+  style that names no list, under a style that names one, is ignored). An
+  untouched paragraph is saved as written; Reject writes the resolved level,
+  as Word does; and every numbering verb writes the level it sets.
+
+### Changed
+
+- **Breaking: the audit tells an edit stacked inside a revision from an
+  unexplained change (`RevisionDisposition::EditedInside`).** The audit had
+  one `Modified` disposition for two different things: a pre-existing
+  revision with another author's new tracked changes stacked inside it, and
+  a revision changed without any covering change. `RevisionDisposition`
+  gains `EditedInside { after_excerpt }` for the first, proved by
+  projection: rejecting exactly the new revisions must give back the
+  revision's content; otherwise, or when no new revision can be selected,
+  it stays `Modified`. `stemma apply`, `stemma verify`, the MCP save audit
+  and verify-task now share one delivery policy, so the same edit can no
+  longer pass apply and fail verify. verify's summary gains
+  `preexisting_revisions_edited_inside`; Python reports the disposition as
+  `edited_inside`. An edit beside another author's tracked paragraph mark
+  leaves that revision `Untouched` (it was `Modified`).
+- **Bookmark and permission ranges grow at a paragraph edge, as in Word.**
+  A paragraph added after the last paragraph a bookmark or permission range
+  covers, or before its first, now lands inside the range, in the body and
+  in table cells, tracked or direct. A comment range does not grow: new
+  paragraphs land outside it, as before.
+- **Resolutions follow Word's rules (each checked in Word):**
+  - Accepting a move removes the bookmarks that cover nothing but the moved
+    text; a bookmark that also covers text that stays is kept, its moved
+    end left where the text was. Reject already matched.
+  - A resolution that takes a comment's anchor (the insertion holding its
+    reference, or everything in its range) removes the comment whole,
+    reference and extensions included. The comment stays while anything
+    remains in its range: text inside a link or content control, a
+    picture, a tab. An insertion holding only the
+    reference of a comment on kept text is no revision.
+  - Accepting the removal of a whole paragraph drops ranges lying wholly
+    inside it, re-anchors a surviving range start at the next paragraph,
+    and puts a surviving range end right after the previous paragraph.
+  - A pending inserted or deleted final paragraph mark settles to a no-op
+    and never leaves an empty tail paragraph, so resolving revisions one at
+    a time gives the same document as resolving all.
+  - Text one author inserted and another then moved away is a revision of
+    its own beside the move, and resolves in Word's order.
+- **Font sizes are read as Word reads them**, in runs and in styles alike:
+  a decimal size truncates toward zero, a universal measure ("10.5pt")
+  converts, and a non-numeric size is 0, a documented default (Word saves 0
+  and renders the minimum size). Styles silently dropped such sizes before.
+  A negative size is still refused.
+- **`set_format` no longer needs `marks` for a value-only change.** An
+  omitted `marks` is the empty patch; an op that changes nothing is still
+  refused, and the refusal names the fields that would make it meaningful.
+- **Audit rows are less noisy.** Deleting one paragraph from a document is
+  reported as one deletion, not as every later paragraph modified, and
+  revisions in textboxes and tracked link-text edits in table cells are
+  accounted for in their host block.
+- **The full view shows a comment's range end.** `OpaqueSegmentKind` gains
+  `CommentRangeStart` and `CommentRangeEnd`, so a reader no longer pairs a
+  range start with the comment's reference.
+- **Python.** `from_bytes`, `audit` and `validate` accept `bytearray` and
+  `memoryview`; `save(overwrite=True)` keeps the replaced file's
+  permissions instead of leaving mode 0600; the type stub matches the
+  runtime module (`mypy.stubtest` clean), with the return shapes importable
+  from `stemma` and `Document` and `Comparison` final.
+- **Docs: ids of lookalike changes can trade places after an outside
+  edit.** Among changes that look exactly alike (same kind, author, date
+  and text), ids are stable across Stemma's own saves and resolutions, but
+  once another editor changes the file, two lookalikes can trade ids. The
+  CLI, guide, review guide and MCP reference now say so and tell readers
+  to re-read ids after any edit made outside Stemma.
+- **Release pipeline.** The release run now publishes the crates to
+  crates.io itself, through trusted publishing, with no stored token. npm
+  publication waits up to about 15 minutes for each new version to become
+  visible, and a timed-out run resumes. The approval gate shows the
+  qualification checklist while it waits.
+
+- `NormalizeError::UnmodeledRevision` is replaced by
+  `NormalizeError::InvalidCellMerge`: the byte path now refuses only a
+  malformed cell merge (a value outside `rest`/`cont`, or two on one cell),
+  as import does. Snapshot blobs move to schema 53 (`TableCellNode` gains
+  `cell_merge`; a paragraph records a list reference without a level; a
+  table-cell paragraph carries its move group).
+
+### Migration
+
+- **Rust callers matching exhaustively on `RevisionDisposition` need an
+  `EditedInside` arm.** Code that treated every `Modified` as "needs
+  review" should decide what an edit stacked inside a revision means to
+  it; Stemma's own delivery policy counts it as an expected change.
+- **Rust callers matching exhaustively on `OpaqueSegmentKind` need
+  `CommentRangeStart` and `CommentRangeEnd` arms.**
+- **Rust callers that build IR values with struct literals, or destructure
+  them without `..`, need the new fields:** `ParagraphNode`
+  (`direct_numbering_omits_ilvl`, `cell_move_id`), `TableCellNode`
+  (`cell_merge`), `TableFormatting` (`cell_margins_pct`), `CellFormatting`
+  (`margins_pct`), `OpaqueInlineNode` and `DecorationNode`
+  (`formatting_change`), `HyperlinkData` (`flattened_wrappers`) and the
+  `InlineChange::Opaque` variant (`object_runs`). The IR is
+  engine-version-bound; these types are not `#[non_exhaustive]`.
+- **Rust callers matching exhaustively on `EditStep` or `EditError` need
+  arms for** `EditStep::ReplaceInlineObjectText` and
+  `EditError::{NoteBodyObjectCountMismatch, ContentControlLocked,
+  InlineObjectTextTargetNotFound, InlineObjectTextNotEditable}`;
+  `EditError::FindReplaceBarrierStraddle` gains `walls`.
+- **CLI, MCP and Python consumers of audit dispositions** may see
+  `edited_inside` where 0.7.0 reported `modified`.
+- **Rust callers matching on `NormalizeError`:** `UnmodeledRevision` is
+  gone and `InvalidCellMerge` takes its place.
+- **MCP consumers of `unreached_matches`:** each entry carries `reason`
+  where 0.7.0 carried `route`.
+- **Consumers of the CLI apply receipt's `coverage`:** `hyperlink_text`
+  and `content_control_values` move from `searched_not_edited` (now empty)
+  to `supported`.
+- **Consumers that parse the blocked-join refusal of a selective
+  resolve:** `details.context` now reads
+  `required_revision_ids=[…] blocking_table_revision_ids=[…]`; 0.7.0 ended
+  after the first list.
+- **A file with `w:delText` or `w:delInstrText` inside `w:moveFrom` no
+  longer saves untouched** (I-TC-004); resolve or rewrite the move first.
+  Nor does one whose footnote or endnote id is referenced twice
+  (I-XREF-006).
+- **Re-read revision ids after any edit made outside Stemma.**
+
+- **Snapshot blobs written by 0.7 are not read by 0.8**: the snapshot
+  schema moves to 53; re-import the DOCX instead of loading an old blob.
+
+### Fixed
+
+- **Text typed right before another author's moved text is no longer
+  swallowed by the move (regression from 0.6.0).** A whole-paragraph
+  replace that inserted text right before (or after) an inline move source
+  wrote the new insertion inside that author's `w:moveFrom`, so Accept All
+  dropped the new text, Reject All kept it, and rejecting the editor's own
+  revision did not remove it. The new text now stays outside the move.
+- **Comparison:**
+  - Content holding a footnote or endnote reference that moved gave both
+    copies the same note, and Word reported the redline as corrupted. Each
+    inserted copy now gets a note of its own.
+  - A complex field whose code changed (a PAGE field becoming NUMPAGES) was
+    kept as unchanged, a silent loss, and a page number field replaced by
+    text was deleted as several revisions. A field is now kept only when
+    every part is kept, and is otherwise replaced whole as one revision.
+  - A table cell paragraph replaced whole keeps its typed list label
+    ("1.") inside the change, instead of leaving it behind to join a
+    neighbouring paragraph.
+  - A paragraph split is one inserted paragraph mark, as Word records it,
+    so Reject All gives the one paragraph back instead of joining it to
+    the next.
+  - A comment the target adds on kept text is carried untracked, as Word's
+    own compare does; Reject All left it empty but anchored. A comment
+    added on inserted text still goes with the insertion.
+  - Text under `w:caps` was written uppercased in the redline, so Reject
+    All showed the base's appearance but not its letters. The redline now
+    stores the characters each input wrote: kept text that differs only
+    in letter case keeps the base's spelling, or the target's when only the
+    base has caps, so both readings render right. A heavily edited
+    paragraph replaced as one deletion and insertion writes each side's
+    own letters.
+  - Drawing ids (`wp:docPr`) stay unique in a redline: an inserted drawing
+    whose id another drawing already uses gets an unused one.
+  - A comment the target adds inside a newly inserted paragraph is
+    recorded as inserted with it.
+- **Accepting the deletion of every cell in a row no longer crashes the
+  save**: the row goes with its cells.
+- **Tracked moves:**
+  - A move of text across a paragraph break is one move, not a move plus a
+    deletion and an insertion; a moved paragraph's range ends after it, so
+    the paragraphs after a moved one are no longer folded into the move,
+    and a saved pending move keeps its range and its move pilcrows.
+  - Resolving a deletion inside a move's destination no longer panics when
+    the deleted words repeat in the moved text.
+  - A move keeps its id after a deletion inside its destination is
+    accepted or rejected, and after an insertion settles into it; resolving
+    a move names the insertions it settles in `cascaded_resolution_ids`.
+  - A change nested in an unnamed move container is read as stacked, so
+    Reject All no longer writes the deleted words twice; a moved
+    document-final paragraph's mark reads untracked, as Word writes it.
+- **Tables.** A tracked `merge_cells` is one direct change, as in Word: its
+  text relocation was tracked, so Reject All hid text in a continuation
+  cell. A whole-table replace gives its cells ids of their own (an edit
+  could reach another table's cell). Margins written as `pct` are kept as
+  written instead of becoming visible twips margins. One reviewer's cell
+  property changes in a table are one revision, and accepting a deleted
+  column gives its width away only where Word merges the cell.
+- **`replace_text` with a range scope searches table cells**, and a table
+  id at either end stands for the whole table. A zero-match diagnosis
+  names matches in headers, footers, notes and comments.
+- **A tracked link-text edit gives its deletion and insertion their own
+  ids**; both carried one `w:id`, which must be unique in a part.
+- **Text added beside a proofing bracket stays outside it.**
+- **The byte path keeps a note nothing referred to.** `normalize_docx` and
+  `reject_all_docx` removed a footnote or endnote that had no reference in
+  the input; only a note whose last reference a resolution takes goes now.
+- **Import keeps more revisions and formatting.** A tracked formatting
+  change on a field part's run, a note mark's run or a lone page-break or
+  soft-hyphen run is kept as a revision, and a soft hyphen alone in its
+  run keeps the run's formatting; a bookmark inside a body-level insertion
+  or deletion is kept; a comment that loses its reference is removed
+  whole; a deleted cell
+  paragraph's typed label goes with its deletion; a deletion beside moved
+  text is its own revision.
+
+- **A re-saved move keeps its paragraph marks in the move.** A move Word
+  wrote (whole paragraphs, in the body or into a cell) was written back with
+  its range end inside the last moved paragraph, before the paragraph's end,
+  so Word read that paragraph's mark on each side as a separate insertion or
+  deletion: four revisions instead of two, and resolving the move alone left
+  two stray mark revisions and an empty paragraph. The range now ends after
+  the paragraph, where Word writes it.
+- **A cell join blocked by a pending nested table is refused alone.**
+  Accepting (or rejecting) only a cell paragraph's mark, when a nested table
+  another pending revision removes stands between it and the next paragraph,
+  spent the mark unjoined, so resolving the table afterwards left two
+  paragraphs where Accept All joins them. It is now refused like the body
+  case. Both refusals name the table's revision to resolve first (then the
+  mark joins the paragraphs, as in Word), or the revisions to resolve
+  together. Word itself pulls the paragraph into the pending
+  table's first cell, after which accepting the table loses the paragraph's
+  text.
+- **A content control whose contents are locked is not edited.**
+  `set_content_control_value`, `opaque_text_edit`, `sdt_text_fill` (inline,
+  open block and sealed block controls) and text replacement inside an open
+  block control edited a control with `w:lock` `contentLocked` or
+  `sdtContentLocked` (§17.5.2.23); they now refuse with
+  `ContentControlLocked`, naming the lock. `sdtLocked`, which only keeps the
+  control from being deleted, still allows them. A fill of a locked sealed
+  block control is refused as an edit, naming the step. Generic paragraph
+  edits (`replace`, `delete`, `insert`, formatting, comments, notes,
+  bookmarks) inside a locked block control are not yet checked.
+- **Selective resolution reports every revision it removes.** A pending
+  paragraph mark settled because its paragraph became the document's last
+  is now named in `cascaded_revision_ids`.
+- **Tracked cell merges resolve on the file path in tables whose cells are
+  wrapped in content controls.** `normalize_docx` and `reject_all_docx`
+  skipped a cell inside a cell-level `w:sdt`, shifting the columns after it.
+- **Replacement inside a link whose text sits in a wrapper is refused.** A
+  link holding a simple field, content control, smart tag, custom XML
+  element or bidi wrapper was rebuilt from plain runs, turning a field into
+  static text; `replace_text` and `replace_all` now refuse it
+  (`ReplaceTextInsideInlineObjects`, reason `WrappedText`). Known
+  limitation, unchanged from 0.7: any other edit to the paragraph holding
+  such a link still flattens the wrapper.
+- **No barrier straddle is reported for text that is not there.** A needle
+  that only occurs once a link's or control's text is left out no longer
+  counts as a straddle.
+- **Resolving a change in a data-bound content control updates its store.**
+  Reject All (and any resolution) of a tracked edit in a control bound to a
+  data store left the store holding the edited text, which Word shows again
+  when it refills the control on open; the store now follows the resolved
+  text, as it does after an edit.
+
+- **Twips measures are read as Word reads them.** Paragraph, tab, frame,
+  section, table, style and numbering measures share one reader: a decimal
+  truncates toward zero, `+500` and `.5in` convert, and an empty value is
+  absent. A value that is not a number is refused, naming the element and
+  attribute, where Word refuses the file, and is read as Word reads it, with
+  an import diagnostic, on table and run measures. Before, a decimal tab
+  position refused the document, and a decimal in a frame's size or position
+  was dropped when the paragraph was edited and saved.
+
+## [0.7.0] — 2026-11-07
 
 ### Added
 
@@ -1701,7 +2064,8 @@ applications.
   per-cell data.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/stemma-sh/stemma/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/stemma-sh/stemma/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/stemma-sh/stemma/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/stemma-sh/stemma/compare/v0.5.1...v0.5.2

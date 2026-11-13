@@ -6,7 +6,6 @@ use std::process::ExitCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use stemma::api::{Diagnostic, Document};
-use stemma::audit::RevisionDisposition;
 use stemma::edit::{
     BarrierPolicy, EditError, EditTransaction, ExpectedMatches, MatchMode, MaterializationMode,
     ReplaceTextError, ReplaceTextOptions, ReplaceTextScope, plan_replace_text,
@@ -224,20 +223,28 @@ struct SummaryReceipt {
 
 #[derive(Serialize)]
 struct CoverageReceipt {
-    supported: [&'static str; 2],
+    /// Where an item's text is searched and replaced.
+    supported: [&'static str; 4],
     default_scope: &'static str,
     /// Text in covered paragraphs that is matched but not edited: an
-    /// occurrence there refuses its item.
-    searched_not_edited: [&'static str; 2],
+    /// occurrence there refuses its item. Nothing is, since link text and
+    /// content control values became editable; the field stays so a
+    /// consumer reading it finds the answer.
+    searched_not_edited: [&'static str; 0],
     unsearched: [&'static str; 6],
 }
 
 impl Default for CoverageReceipt {
     fn default() -> Self {
         Self {
-            supported: ["body_paragraphs", "table_cell_paragraphs"],
+            supported: [
+                "body_paragraphs",
+                "table_cell_paragraphs",
+                "hyperlink_text",
+                "content_control_values",
+            ],
             default_scope: "all_body_and_table_paragraphs",
-            searched_not_edited: ["hyperlink_text", "content_control_values"],
+            searched_not_edited: [],
             unsearched: [
                 "headers",
                 "footers",
@@ -606,11 +613,6 @@ where
     };
     let deliverable = refused == 0;
     let should_emit_output = applied > 0 && (deliverable || emit_partial);
-    let edited_blocks: BTreeSet<String> = outcomes
-        .iter()
-        .filter(|item| matches!(item.status, ItemStatus::Applied))
-        .flat_map(|item| item.changed_block_ids.iter().cloned())
-        .collect();
 
     let in_memory_report = if applied == 0 {
         None
@@ -618,7 +620,7 @@ where
         let report = document
             .review()
             .map_err(|e| format!("cannot verify worklist result: {e}"))?;
-        verify_report(&report, &edited_blocks)?;
+        verify_report(&report)?;
         let audited_revision_ids: BTreeSet<u32> = report
             .new_revisions
             .iter()
@@ -650,7 +652,7 @@ where
             None,
         )),
         (Some(_), Some(bytes)) => {
-            let report = verify_serialized_delivery(input.bytes(), bytes, &edited_blocks)?;
+            let report = verify_serialized_delivery(input.bytes(), bytes)?;
             let audited_revision_ids: BTreeSet<u32> = report
                 .new_revisions
                 .iter()
@@ -1038,58 +1040,22 @@ fn runtime_error_code(code: ErrorCode) -> &'static str {
     }
 }
 
-/// The delivery policy over the exact candidate: valid, every change tracked,
-/// untouched content unchanged, and no pre-existing revision resolved. A
-/// pre-existing revision may be edited inside only where the worklist edited
-/// (`edited_blocks`): a change inside another author's pending insertion
-/// narrows that insertion, which is the edit asked for.
-fn verify_report(
-    report: &stemma::audit::AuditReport,
-    edited_blocks: &BTreeSet<String>,
-) -> Result<(), String> {
-    if !report.validator.ok {
-        return Err("worklist result failed structural validation".to_string());
+/// The delivery policy over the exact candidate: `tracked-delivery-v0`, the
+/// same policy `stemma verify` checks (see `crate::delivery`).
+fn verify_report(report: &stemma::audit::AuditReport) -> Result<(), String> {
+    match crate::delivery::tracked_delivery_failure(report) {
+        None => Ok(()),
+        Some(failure) => Err(format!("worklist result is not deliverable: {failure}")),
     }
-    if !report.direct_changes.is_empty() {
-        return Err(format!(
-            "worklist result contains {} untracked direct change(s)",
-            report.direct_changes.len()
-        ));
-    }
-    if !report.untouched.violations.is_empty() {
-        return Err(format!(
-            "worklist result contains {} unexplained untouched-scope violation(s)",
-            report.untouched.violations.len()
-        ));
-    }
-    let changed_preexisting = report
-        .preexisting_revisions
-        .iter()
-        .filter(|revision| match &revision.disposition {
-            RevisionDisposition::Untouched => false,
-            RevisionDisposition::Modified { .. } => {
-                !edited_blocks.contains(&revision.record.block_id.to_string())
-            }
-            RevisionDisposition::Resolved => true,
-        })
-        .count();
-    if changed_preexisting != 0 {
-        return Err(format!(
-            "worklist result changed or resolved {changed_preexisting} pre-existing revision(s) \
-             outside the blocks it edited"
-        ));
-    }
-    Ok(())
 }
 
 fn verify_serialized_delivery(
     input_bytes: &[u8],
     output_bytes: &[u8],
-    edited_blocks: &BTreeSet<String>,
 ) -> Result<stemma::audit::AuditReport, String> {
     let report = stemma::api::audit(input_bytes, output_bytes)
         .map_err(|error| format!("cannot audit serialized worklist result: {error}"))?;
-    verify_report(&report, edited_blocks)?;
+    verify_report(&report)?;
     Ok(report)
 }
 
@@ -1108,16 +1074,9 @@ fn verification_receipt(
         untouched_violations: report.untouched.violations.len(),
         untouched_verified_blocks: report.untouched.verified_blocks,
         untouched_parts: report.untouched.parts.clone(),
-        preexisting_revisions_preserved: report
-            .preexisting_revisions
-            .iter()
-            .filter(|revision| matches!(revision.disposition, RevisionDisposition::Untouched))
-            .count(),
-        preexisting_revisions_edited_inside: report
-            .preexisting_revisions
-            .iter()
-            .filter(|revision| matches!(revision.disposition, RevisionDisposition::Modified { .. }))
-            .count(),
+        preexisting_revisions_preserved: crate::delivery::preexisting_outcome(report).untouched,
+        preexisting_revisions_edited_inside: crate::delivery::preexisting_outcome(report)
+            .edited_inside,
         new_revisions: report.new_revisions.len(),
     }
 }
@@ -1228,7 +1187,7 @@ mod tests {
             .serialize(&ExportOptions::default())
             .expect("serialize direct edit");
 
-        let error = verify_serialized_delivery(&before, &after, &BTreeSet::new())
+        let error = verify_serialized_delivery(&before, &after)
             .expect_err("untracked direct output is not deliverable");
         assert!(
             error.contains("untracked direct change"),

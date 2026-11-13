@@ -56,8 +56,12 @@
 //! - `EditNote` edits the note story's body from the provided text, one line
 //!   per note paragraph: each paragraph is word-diffed in place (tracked) or
 //!   rewritten in place (direct), keeping its properties and the leading
-//!   `footnoteRef`/`endnoteRef` decoration; a note carrying opaque inlines or
-//!   line breaks is refused (`OpaqueDestroyed`). A line count other than the
+//!   `footnoteRef`/`endnoteRef` decoration. Each inline object or break of a
+//!   paragraph (a link, a field, a reference) stands in its line as one
+//!   U+FFFC, in order, as `note_body_text` reads it, and is carried by
+//!   reference (`NoteBodyObjectCountMismatch` when the count differs); a note
+//!   holding a table or block object is refused (`OpaqueDestroyed`). A line
+//!   count other than the
 //!   paragraph count is refused (`NoteBodyLineCountMismatch`); a one-line body
 //!   for a note of several paragraphs rebuilds it as one paragraph in `Direct`
 //!   mode and is refused in `TrackedChange` mode (`NoteBodyMultiParagraph`);
@@ -339,20 +343,17 @@ pub(crate) fn apply_edit(
         step_index,
     })?;
 
-    // Opaque preservation: neither path may drop a pre-existing opaque inline
-    // (an image, a field, a nested reference) that lived in the note story.
-    // v1 authors plain text, so any opaque present means a richer note we
-    // cannot faithfully rebuild/diff from a flat string — fail loud rather
-    // than silently destroy it.
-    let preserved = story_preserved_inlines(existing_blocks);
-    if !preserved.is_empty() {
+    // A note paragraph's inline objects (a link, a field, a reference) and
+    // breaks stand in its body line as one U+FFFC each, in order, exactly as
+    // the notes read shows them; the text between them is edited. A table or
+    // block object in the note has no place in a line of text.
+    if let Some((id, kind)) = story_block_objects(existing_blocks) {
         let preview = story_text_preview(existing_blocks);
-        let (missing_opaque_ids, missing_inline_kinds) = preserved.into_iter().unzip();
         return Err(EditError::OpaqueDestroyed {
             step_index,
             target_block_id: NodeId::from(format!("{}_{note_id}", note_kind.label())),
-            missing_opaque_ids,
-            missing_inline_kinds,
+            missing_opaque_ids: vec![id],
+            missing_inline_kinds: vec![kind],
             original_text_preview: preview,
         });
     }
@@ -376,6 +377,19 @@ pub(crate) fn apply_edit(
         });
     }
     if lines.len() == 1 && paragraph_count != 1 {
+        // Rebuilding the note as one paragraph would drop its inline objects.
+        let objects = story_preserved_inlines(existing_blocks);
+        if !objects.is_empty() {
+            let preview = story_text_preview(existing_blocks);
+            let (missing_opaque_ids, missing_inline_kinds) = objects.into_iter().unzip();
+            return Err(EditError::OpaqueDestroyed {
+                step_index,
+                target_block_id: NodeId::from(format!("{}_{note_id}", note_kind.label())),
+                missing_opaque_ids,
+                missing_inline_kinds,
+                original_text_preview: preview,
+            });
+        }
         if mode == MaterializationMode::TrackedChange {
             return Err(EditError::NoteBodyMultiParagraph {
                 note_id: note_id.to_string(),
@@ -399,12 +413,40 @@ pub(crate) fn apply_edit(
         return Ok(());
     }
 
+    // No stacking: a tracked edit refuses a note paragraph that already
+    // carries a pending tracked status or tracked segments, before its line
+    // is read against the paragraph's objects (the read shows the accepted
+    // content, which only a direct edit works on).
+    if mode == MaterializationMode::TrackedChange {
+        for tracked_block in existing_blocks {
+            validate_block_is_editable(tracked_block, step_index)?;
+        }
+    }
+
+    // Each line places the paragraph's objects; check every line before
+    // changing any paragraph.
+    let contents = existing_blocks
+        .iter()
+        .zip(&lines)
+        .enumerate()
+        .map(|(paragraph_index, (tracked_block, line))| {
+            note_line_content(
+                &tracked_block.block,
+                line,
+                note_id,
+                note_kind,
+                paragraph_index,
+                step_index,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     let direct = mode == MaterializationMode::Direct;
     let (blocks, content_hash) = note_story_mut(doc, note_id, note_kind);
-    for (tracked_block, line) in blocks.iter_mut().zip(&lines) {
+    for (tracked_block, content) in blocks.iter_mut().zip(&contents) {
         edit_note_paragraph_in_place(
             tracked_block,
-            line,
+            content,
             direct,
             revision,
             rev_counter,
@@ -443,11 +485,113 @@ fn note_story_mut<'a>(
     }
 }
 
-/// Edit one note paragraph in place to `line`: a surgical word-diff, as a
+/// The placeholder for one inline object or break in a note's editable text.
+const NOTE_OBJECT_PLACEHOLDER: char = '\u{FFFC}';
+
+/// A note's editable text, as `edit_note` takes it: one line per paragraph
+/// (joined by `\n`), each the paragraph's text with one U+FFFC per inline
+/// object or break, in order. Zero-width markers (the note's own number
+/// mark, bookmark and comment boundaries) contribute nothing.
+///
+/// A paragraph with pending tracked changes reads as its ACCEPTED content:
+/// deleted text, breaks and objects are absent, inserted ones present. The
+/// read is plain text and cannot show a segment's status, and it must be the
+/// text `edit_note` takes back: a tracked `edit_note` refuses such a note (no
+/// stacking), and a direct one works on its accepted content.
+pub fn note_body_text(blocks: &[TrackedBlock]) -> String {
+    blocks
+        .iter()
+        .map(
+            |tracked_block| match accepted_note_block(&tracked_block.block) {
+                BlockNode::Paragraph(paragraph) => paragraph
+                    .segments
+                    .iter()
+                    .flat_map(|segment| &segment.inlines)
+                    .filter_map(|inline| match inline {
+                        InlineNode::Text(text) => Some(text.text.clone()),
+                        InlineNode::OpaqueInline(_) | InlineNode::HardBreak(_) => {
+                            Some(NOTE_OBJECT_PLACEHOLDER.to_string())
+                        }
+                        InlineNode::Decoration(_)
+                        | InlineNode::CommentRangeStart { .. }
+                        | InlineNode::CommentRangeEnd { .. } => None,
+                    })
+                    .collect::<String>(),
+                BlockNode::Table(_) | BlockNode::OpaqueBlock(_) => {
+                    NOTE_OBJECT_PLACEHOLDER.to_string()
+                }
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A note block's accepted content: the block `note_body_text` reads and the
+/// paragraph a direct `edit_note` edits (`edit_note_paragraph_in_place`
+/// accepts it first), so the read's placeholders and the edit's preserved
+/// objects are the same objects.
+fn accepted_note_block(block: &BlockNode) -> BlockNode {
+    let mut accepted = block.clone();
+    super::super::project_block_for_accept_reject(&mut accepted, true);
+    accepted
+}
+
+/// The replacement content for one note paragraph from its body line: the
+/// text between the line's U+FFFC placeholders, with the paragraph's inline
+/// objects and breaks carried by reference in their places. The line must
+/// hold exactly one placeholder per object.
+fn note_line_content(
+    block: &BlockNode,
+    line: &str,
+    note_id: &str,
+    note_kind: NoteKind,
+    paragraph_index: usize,
+    step_index: usize,
+) -> Result<ParagraphContent, EditError> {
+    // The objects of the paragraph as the read shows it and a direct edit
+    // edits it: its accepted content (an object inside a pending deletion is
+    // gone, one inside a pending insertion stays).
+    let BlockNode::Paragraph(paragraph) = accepted_note_block(block) else {
+        unreachable!("story_block_objects refuses a note holding a table or block object");
+    };
+    let objects: Vec<&NodeId> = paragraph
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.inlines)
+        .filter_map(|inline| match inline {
+            InlineNode::OpaqueInline(opaque) => Some(&opaque.id),
+            InlineNode::HardBreak(hard_break) => Some(&hard_break.id),
+            _ => None,
+        })
+        .collect();
+    let sections: Vec<&str> = line.split(NOTE_OBJECT_PLACEHOLDER).collect();
+    if sections.len() != objects.len() + 1 {
+        return Err(EditError::NoteBodyObjectCountMismatch {
+            note_id: note_id.to_string(),
+            note_kind: note_kind.label(),
+            paragraph_index,
+            object_count: objects.len(),
+            placeholder_count: sections.len() - 1,
+            step_index,
+        });
+    }
+    let mut fragments = Vec::new();
+    for (index, section) in sections.iter().enumerate() {
+        if !section.is_empty() {
+            fragments.push(ContentFragment::Text((*section).to_string()));
+        }
+        if let Some(id) = objects.get(index) {
+            fragments.push(ContentFragment::PreservedInlineRef((*id).clone()));
+        }
+    }
+    Ok(ParagraphContent { fragments })
+}
+
+/// Edit one note paragraph in place to `content`: a surgical word-diff, as a
 /// body paragraph's `replace` is, keeping its properties and leading marker.
 fn edit_note_paragraph_in_place(
     tracked_block: &mut TrackedBlock,
-    line: &str,
+    content: &ParagraphContent,
     direct: bool,
     revision: &RevisionInfo,
     rev_counter: &mut u32,
@@ -497,13 +641,10 @@ fn edit_note_paragraph_in_place(
         _ => None,
     };
 
-    let content = ParagraphContent {
-        fragments: vec![ContentFragment::Text(line.to_string())],
-    };
     // No enclosing block insertion: a note paragraph has no top-level
     // block-insertion axis (the pending-block-insertion case), and the note-block guard
     // upstream refuses a tracked-inserted note block.
-    apply_replace_paragraph_text(para, &content, revision, None, rev_counter);
+    apply_replace_paragraph_text(para, content, revision, None, rev_counter);
 
     if let Some(deco) = leading_decoration {
         para.segments.insert(
@@ -662,6 +803,7 @@ fn synthesize_reference_inline(para_id: &NodeId, note_id: &str, kind: NoteKind) 
         ..StyleProps::default()
     };
     InlineNode::from(OpaqueInlineNode {
+        formatting_change: None,
         id: id.clone(),
         kind: opaque_kind,
         opaque_ref: format!("noteref_{}", id.0),
@@ -835,6 +977,7 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
         ..crate::domain::StyleProps::default()
     };
     let deco = InlineNode::from(DecorationNode {
+        formatting_change: None,
         source_run_attrs: Vec::new(),
         id: NodeId::from(format!("{para_id}_ref")),
         // Footnote/endnote auto-number markers are not in DecorationType; they
@@ -886,6 +1029,7 @@ fn reserved_note(
     para.segments = vec![TrackedSegment {
         status: TrackingStatus::Normal,
         inlines: vec![InlineNode::from(DecorationNode {
+            formatting_change: None,
             source_run_attrs: Vec::new(),
             id: NodeId::from(format!("{para_id}_mark")),
             // The importer reads both marks as foreign elements.
@@ -1022,6 +1166,18 @@ fn mark_references_deleted_in_block(
 /// such content: its plain-text body has no way to carry one. A table / opaque
 /// block in a note story is itself non-flat-text content, surfaced under its
 /// block id.
+/// The first table or block object in a note story, which a line of text
+/// cannot carry.
+fn story_block_objects(blocks: &[TrackedBlock]) -> Option<(String, &'static str)> {
+    blocks
+        .iter()
+        .find_map(|tracked_block| match &tracked_block.block {
+            BlockNode::Paragraph(_) => None,
+            BlockNode::Table(table) => Some((table.id.0.to_string(), "table")),
+            BlockNode::OpaqueBlock(opaque) => Some((opaque.id.0.to_string(), "opaque")),
+        })
+}
+
 fn story_preserved_inlines(blocks: &[TrackedBlock]) -> Vec<(String, &'static str)> {
     let mut preserved = Vec::new();
     for tb in blocks {

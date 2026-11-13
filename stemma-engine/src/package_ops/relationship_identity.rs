@@ -127,7 +127,11 @@ impl Resolver<'_> {
             let mut root = parse_opaque(opaque, raw, "resolving its relationship identity")?;
             let resolved = self.replace_relationship_ids(&mut root, rels)?;
             if remove_session_ids(&mut root) | resolved {
-                opaque.content_hash = Some(sha256_hex(&word_xml::serialize_raw_fragment(&root)));
+                // Hashed as every opaque is: in its canonical spelling, so
+                // the order of attributes, say, is not read as a change.
+                opaque.content_hash = Some(crate::import::canonical_raw_hash(
+                    &word_xml::serialize_raw_fragment(&root),
+                ));
             }
         }
         Ok(())
@@ -284,6 +288,15 @@ fn parse_opaque(
     })
 }
 
+/// Whether `element`'s subtree holds a relationship reference.
+pub(crate) fn has_relationship_attribute(element: &Element) -> bool {
+    element.attributes.keys().any(is_relationship_id_attribute)
+        || element.children.iter().any(|child| match child {
+            XMLNode::Element(child) => has_relationship_attribute(child),
+            _ => false,
+        })
+}
+
 fn has_transport_attribute(element: &Element) -> bool {
     element
         .attributes
@@ -297,7 +310,7 @@ fn has_transport_attribute(element: &Element) -> bool {
 
 /// Drop Word's drawing session identifiers from `element`'s subtree. Returns
 /// whether any was present.
-fn remove_session_ids(element: &mut Element) -> bool {
+pub(crate) fn remove_session_ids(element: &mut Element) -> bool {
     let before = element.attributes.len();
     element
         .attributes

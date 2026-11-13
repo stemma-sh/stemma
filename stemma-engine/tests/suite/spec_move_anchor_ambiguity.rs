@@ -57,6 +57,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         numbering: None,
         has_direct_numbering: true,
         numbering_suppressed: false,
+        direct_numbering_omits_ilvl: false,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -99,6 +100,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         cnf_style: None,
         source_paragraph_attrs: Vec::new(),
         preserved_ppr: Vec::new(),
+        cell_move_id: None,
     }
 }
 

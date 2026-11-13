@@ -166,8 +166,114 @@ pub struct StyleDefinitions {
     para_props: HashMap<String, RawParagraphProps>,
     /// Table styles: style_id → resolved table-level properties.
     table_styles: HashMap<String, TableStyleProps>,
+    /// The default table style ID (`w:type="table" w:default="1"`), which an
+    /// unstyled table uses (§17.7.4.17).
+    default_table_style_id: Option<String>,
+    /// Table styles whose chain (or a conditional part of it) declares a
+    /// row's hidden state (`w:trPr/w:hidden`).
+    table_styles_declaring_row_hidden: HashSet<String>,
+    /// Table styles whose whole chain resolves, mapped to whether any style
+    /// in it declares shading (`w:shd` in its `w:tblPr` or `w:tcPr`, also in
+    /// a conditional `w:tblStylePr`). A style whose chain does not resolve
+    /// (a missing or non-table `basedOn`, a cycle) is absent.
+    table_style_chains_declaring_shading: HashMap<String, bool>,
+    /// Table styles whose whole chain resolves, mapped to whether any style
+    /// in it declares run properties (a `w:rPr`, also in a conditional
+    /// `w:tblStylePr`). A style whose chain does not resolve is absent.
+    table_style_chains_declaring_run_properties: HashMap<String, bool>,
     /// Theme font definitions for resolving asciiTheme/hAnsiTheme/etc. references.
     theme_fonts: ThemeFonts,
+    /// Each style's own `w:rFonts`, as written, with its `basedOn` and
+    /// whether it links a character style: the levels
+    /// [`StyleDefinitions::effective_fonts`] reads.
+    style_fonts: HashMap<String, StyleFonts>,
+    /// The document defaults' `w:rFonts`, as written.
+    doc_default_fonts: LevelFonts,
+}
+
+/// One style level's `w:rFonts` (§17.3.2.26) as written.
+#[derive(Clone, Debug, Default)]
+enum LevelFonts {
+    /// The level names no font.
+    #[default]
+    Absent,
+    Authored(crate::domain::AuthoredRFonts),
+    /// The level's fonts are written in a form this model does not hold (an
+    /// attribute outside the font attributes, or the element twice).
+    Unmodelled,
+}
+
+#[derive(Clone, Debug)]
+struct StyleFonts {
+    fonts: LevelFonts,
+    based_on: Option<String>,
+    links_character_style: bool,
+}
+
+/// One script slot's font as the cascade selects it: a theme font, a named
+/// font, or none named at any level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FontSelection {
+    Unset,
+    Theme(IStr),
+    Named(IStr),
+}
+
+/// A run's fonts per script slot (§17.3.2.26), and its font hint, as the
+/// style cascade selects them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveFonts {
+    pub ascii: FontSelection,
+    pub h_ansi: FontSelection,
+    pub east_asia: FontSelection,
+    pub cs: FontSelection,
+    pub hint: Option<IStr>,
+}
+
+/// The font attributes of one `w:rFonts` element (§17.3.2.26), or `None`
+/// when it carries any other attribute.
+pub(crate) fn authored_fonts_of(el: &Element) -> Option<crate::domain::AuthoredRFonts> {
+    const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let mut fonts = crate::domain::AuthoredRFonts::default();
+    for (name, value) in &el.attributes {
+        if name.namespace.as_deref().is_some_and(|ns| ns != W_NS) {
+            return None;
+        }
+        let value = Some(IStr::from(value.as_str()));
+        let slot = match name.local_name.as_str() {
+            "ascii" => &mut fonts.ascii,
+            "hAnsi" => &mut fonts.h_ansi,
+            "asciiTheme" => &mut fonts.ascii_theme,
+            "hAnsiTheme" => &mut fonts.h_ansi_theme,
+            "eastAsia" => &mut fonts.east_asia,
+            "eastAsiaTheme" => &mut fonts.east_asia_theme,
+            "cs" => &mut fonts.cs,
+            "cstheme" => &mut fonts.cs_theme,
+            "hint" => &mut fonts.hint,
+            _ => return None,
+        };
+        *slot = value;
+    }
+    Some(fonts)
+}
+
+/// The `w:rFonts` of a `w:rPr` (or of none) as one style level.
+fn level_fonts(rpr: Option<&Element>) -> LevelFonts {
+    let Some(rpr) = rpr else {
+        return LevelFonts::Absent;
+    };
+    let mut found = rpr.children.iter().filter_map(|child| match child {
+        XMLNode::Element(el) if is_w_tag(el, "rFonts") => Some(el),
+        _ => None,
+    });
+    match (found.next(), found.next()) {
+        (None, _) => LevelFonts::Absent,
+        (Some(el), None) => match authored_fonts_of(el) {
+            Some(fonts) => LevelFonts::Authored(fonts),
+            None => LevelFonts::Unmodelled,
+        },
+        (Some(_), Some(_)) => LevelFonts::Unmodelled,
+    }
 }
 
 /// Resolved table style properties from a `<w:style w:type="table">` definition.
@@ -279,6 +385,11 @@ pub(crate) struct RawParagraphProps {
     borders: Option<ParagraphBorderProps>,
     /// Numbering properties from w:numPr in the style's pPr (§17.7.4.14).
     num_props: Option<DirectNumPr>,
+    /// Raw layer: the `w:ilvl` the style's own `w:numPr` writes, whether or
+    /// not it also names a list. Resolved (after `resolve_para_props_chain`):
+    /// the level a paragraph whose direct `w:numPr` names a list but no level
+    /// takes from this style (`omitted_level_along_chain`).
+    num_ilvl: Option<u32>,
     /// Contextual spacing flag from w:contextualSpacing (§17.3.1.9).
     /// None = not specified (inherit from parent), Some(true/false) = explicit.
     contextual_spacing: Option<bool>,
@@ -333,6 +444,13 @@ struct RawTableStyleProps {
     col_band_size: u32,
     /// Base paragraph alignment from the table style's root-level w:pPr/w:jc.
     base_para_alignment: Option<Alignment>,
+    /// Whether the style's w:trPr, or a w:tblStylePr's, holds w:hidden.
+    declares_row_hidden: bool,
+    /// Whether the style's w:tblPr or w:tcPr, or a w:tblStylePr's, holds
+    /// w:shd.
+    declares_shading: bool,
+    /// Whether the style, or a w:tblStylePr of it, holds a w:rPr.
+    declares_run_properties: bool,
     /// Base font size from the table style's root-level w:rPr/w:sz, in half-points.
     base_font_size: Option<u32>,
     /// Base bold from the table style's root-level w:rPr/w:b.
@@ -353,13 +471,15 @@ impl StyleDefinitions {
             .map_err(|err| format!("failed to parse word/styles.xml: {err:?}"))?;
 
         // 1. Parse document defaults
-        let doc_defaults = parse_doc_defaults(&root);
+        let doc_defaults = parse_doc_defaults(&root)?;
         let ppr_defaults = parse_ppr_defaults(&root)?;
 
         // 2. Parse all raw style entries
         let mut raw_styles: HashMap<String, RawStyle> = HashMap::new();
         let mut default_para_style_id: Option<String> = None;
         let mut default_char_style_id: Option<String> = None;
+        let mut default_table_style_id: Option<String> = None;
+        let mut style_fonts: HashMap<String, StyleFonts> = HashMap::new();
         for child in &root.children {
             let el = match child {
                 XMLNode::Element(el) => el,
@@ -391,6 +511,9 @@ impl StyleDefinitions {
             if is_default && style_type == "character" {
                 default_char_style_id = Some(style_id.clone());
             }
+            if is_default && style_type == "table" {
+                default_table_style_id = Some(style_id.clone());
+            }
             let based_on =
                 find_w_child(el, "basedOn").and_then(|el| attr_get(el, "w:val").cloned());
 
@@ -414,17 +537,35 @@ impl StyleDefinitions {
                 TextMarks::default()
             } else {
                 match find_w_child(el, "rPr") {
-                    Some(rpr) => parse_rpr_marks(rpr),
+                    Some(rpr) => parse_rpr_marks(rpr)
+                        .map_err(|err| format!("word/styles.xml style '{style_id}': {err}"))?,
                     None => TextMarks::default(),
                 }
             };
+
+            style_fonts.insert(
+                style_id.clone(),
+                StyleFonts {
+                    fonts: if is_special_ignored {
+                        LevelFonts::Absent
+                    } else {
+                        level_fonts(find_w_child(el, "rPr"))
+                    },
+                    based_on: based_on.clone(),
+                    links_character_style: style_type == "paragraph" && link.is_some(),
+                },
+            );
 
             // Extract paragraph-level properties from w:pPr.
             let (raw_tab_stops, raw_para_props) = if is_special_ignored {
                 (None, RawParagraphProps::default())
             } else {
                 let ppr = find_w_child(el, "pPr");
-                let tabs = ppr.and_then(parse_ppr_tab_stops);
+                let tabs = ppr
+                    .map(parse_ppr_tab_stops)
+                    .transpose()
+                    .map_err(|err| format!("word/styles.xml style {style_id:?}: {err}"))?
+                    .flatten();
                 let props = ppr
                     .map(extract_raw_para_props)
                     .transpose()
@@ -438,6 +579,7 @@ impl StyleDefinitions {
                 RawTableStyleProps::default()
             } else if style_type == "table" {
                 extract_raw_table_style_props(el)
+                    .map_err(|err| format!("word/styles.xml style '{style_id}': {err}"))?
             } else {
                 RawTableStyleProps::default()
             };
@@ -541,6 +683,7 @@ impl StyleDefinitions {
                 || resolved_pprops.spacing_line.is_some()
                 || resolved_pprops.borders.is_some()
                 || resolved_pprops.num_props.is_some()
+                || resolved_pprops.num_ilvl.is_some()
                 || resolved_pprops.contextual_spacing.is_some()
                 || resolved_pprops.widow_control.is_some()
                 || resolved_pprops.keep_next.is_some()
@@ -554,9 +697,25 @@ impl StyleDefinitions {
         }
 
         // Pass 3: Resolve table styles.
+        let mut table_styles_declaring_row_hidden = HashSet::new();
+        let mut table_style_chains_declaring_shading = HashMap::new();
+        let mut table_style_chains_declaring_run_properties = HashMap::new();
         for id in &style_ids {
             let raw = &raw_styles[id];
             if raw.style_type == "table" {
+                if table_style_chain_declares_row_hidden(id, &raw_styles) {
+                    table_styles_declaring_row_hidden.insert(id.clone());
+                }
+                if let Some(declares) =
+                    table_style_chain_declares(id, &raw_styles, |p| p.declares_shading)
+                {
+                    table_style_chains_declaring_shading.insert(id.clone(), declares);
+                }
+                if let Some(declares) =
+                    table_style_chain_declares(id, &raw_styles, |p| p.declares_run_properties)
+                {
+                    table_style_chains_declaring_run_properties.insert(id.clone(), declares);
+                }
                 let resolved_tprops = resolve_table_style_chain(id, &raw_styles);
                 if resolved_tprops.borders.is_some()
                     || resolved_tprops.default_cell_margins.is_some()
@@ -584,8 +743,147 @@ impl StyleDefinitions {
             para_tab_stops,
             para_props,
             table_styles,
+            default_table_style_id,
+            table_styles_declaring_row_hidden,
+            table_style_chains_declaring_shading,
+            table_style_chains_declaring_run_properties,
             theme_fonts: ThemeFonts::default(),
+            style_fonts,
+            doc_default_fonts: level_fonts(
+                find_w_child(&root, "docDefaults")
+                    .and_then(|el| find_w_child(el, "rPrDefault"))
+                    .and_then(|el| find_w_child(el, "rPr")),
+            ),
         })
+    }
+
+    /// Push style `id`'s fonts and its `basedOn` ancestors', nearest first;
+    /// `None` for a missing style, a loop, or fonts the model does not hold.
+    fn push_style_fonts<'a>(
+        &'a self,
+        id: &str,
+        levels: &mut Vec<&'a crate::domain::AuthoredRFonts>,
+    ) -> Option<()> {
+        let mut seen = HashSet::new();
+        let mut next = Some(id);
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return None;
+            }
+            let style = self.style_fonts.get(id)?;
+            match &style.fonts {
+                LevelFonts::Absent => {}
+                LevelFonts::Authored(fonts) => levels.push(fonts),
+                LevelFonts::Unmodelled => return None,
+            }
+            next = style.based_on.as_deref();
+        }
+        Some(())
+    }
+
+    /// A run's fonts per script slot as the cascade selects them (§17.7.2:
+    /// direct, character style, paragraph style, document defaults), or
+    /// `None` where this model cannot prove the selection.
+    ///
+    /// For each slot the nearest level that names its font decides it: its
+    /// theme selector, which within one `w:rFonts` takes precedence over
+    /// the literal name (§17.3.2.26), else the literal. A literal over a
+    /// lower level's theme selector for the same slot is not decided here
+    /// (Word's precedence across levels is witnessed for some shapes only),
+    /// nor is a level written in a form the model does not hold, a style
+    /// that is missing or whose `basedOn` chain loops, or a paragraph style
+    /// linked to a character style (§17.7.4.6). The hint is the nearest
+    /// level's.
+    pub fn effective_fonts(
+        &self,
+        direct: Option<&crate::domain::AuthoredRFonts>,
+        char_style_id: Option<&str>,
+        para_style_id: Option<&str>,
+    ) -> Option<EffectiveFonts> {
+        let mut levels: Vec<&crate::domain::AuthoredRFonts> = direct.into_iter().collect();
+        let push_chain = |id, levels: &mut Vec<_>| self.push_style_fonts(id, levels);
+        let default_char = self.default_char_style_id.as_deref();
+        match char_style_id {
+            Some(id) if Some(id) != default_char => {
+                push_chain(id, &mut levels)?;
+                if let Some(default) = default_char {
+                    push_chain(default, &mut levels)?;
+                }
+            }
+            Some(id) => push_chain(id, &mut levels)?,
+            None => {
+                if let Some(default) = default_char {
+                    push_chain(default, &mut levels)?;
+                }
+            }
+        }
+        if let Some(id) = para_style_id.or(self.default_para_style_id.as_deref()) {
+            if self.style_fonts.get(id)?.links_character_style {
+                return None;
+            }
+            push_chain(id, &mut levels)?;
+        }
+        match &self.doc_default_fonts {
+            LevelFonts::Absent => {}
+            LevelFonts::Authored(fonts) => levels.push(fonts),
+            LevelFonts::Unmodelled => return None,
+        }
+        type Slot = fn(&crate::domain::AuthoredRFonts) -> (&Option<IStr>, &Option<IStr>);
+        let select = |slot: Slot| -> Option<FontSelection> {
+            let Some(at) = levels.iter().position(|level| {
+                let (named, theme) = slot(level);
+                named.is_some() || theme.is_some()
+            }) else {
+                return Some(FontSelection::Unset);
+            };
+            match slot(levels[at]) {
+                (_, Some(theme)) => Some(FontSelection::Theme(theme.clone())),
+                (Some(named), None) => {
+                    let theme_below = levels[at + 1..].iter().any(|level| slot(level).1.is_some());
+                    (!theme_below).then(|| FontSelection::Named(named.clone()))
+                }
+                (None, None) => unreachable!("the deciding level names the slot"),
+            }
+        };
+        Some(EffectiveFonts {
+            ascii: select(|f| (&f.ascii, &f.ascii_theme))?,
+            h_ansi: select(|f| (&f.h_ansi, &f.h_ansi_theme))?,
+            east_asia: select(|f| (&f.east_asia, &f.east_asia_theme))?,
+            cs: select(|f| (&f.cs, &f.cs_theme))?,
+            hint: levels.iter().find_map(|level| level.hint.clone()),
+        })
+    }
+
+    /// The default table style ID (`w:type="table" w:default="1"`), if any.
+    pub fn default_table_style_id(&self) -> Option<&str> {
+        self.default_table_style_id.as_deref()
+    }
+
+    /// Whether table style `style_id`'s chain declares a row's hidden state
+    /// (`w:trPr/w:hidden`, also in a conditional `w:tblStylePr`). Word
+    /// ignores the children of `TableNormal` (MS-OI29500 §17.7.4.17a), so
+    /// it never declares one.
+    pub fn table_style_declares_row_hidden(&self, style_id: &str) -> bool {
+        self.table_styles_declaring_row_hidden.contains(style_id)
+    }
+
+    /// Whether table style `style_id`'s chain declares shading (`w:shd` in
+    /// a style's `w:tblPr` or `w:tcPr`, also in a conditional
+    /// `w:tblStylePr`): `None` when the chain does not resolve (an unknown
+    /// style, a missing or non-table `basedOn`, a cycle).
+    pub fn table_style_declares_shading(&self, style_id: &str) -> Option<bool> {
+        self.table_style_chains_declaring_shading
+            .get(style_id)
+            .copied()
+    }
+
+    /// Whether table style `style_id`'s chain declares run properties (a
+    /// `w:rPr` in a style, also in a conditional `w:tblStylePr`): `None`
+    /// when the chain does not resolve.
+    pub fn table_style_declares_run_properties(&self, style_id: &str) -> Option<bool> {
+        self.table_style_chains_declaring_run_properties
+            .get(style_id)
+            .copied()
     }
 
     /// The default paragraph style ID (w:type="paragraph" w:default="1").
@@ -934,6 +1232,8 @@ impl StyleDefinitions {
     /// - `DirectNumPr::Active` → direct wins, return the active props.
     /// - `DirectNumPr::Suppressed` → numId=0, explicitly no numbering (§17.9.18).
     /// - `DirectNumPr::Absent` → fall through to style-resolved numPr.
+    /// - `DirectNumPr::ListWithoutLevel` → the direct list at the level
+    ///   [`resolve_omitted_direct_level`] gives.
     pub fn resolve_effective_num_props(
         &self,
         style_id: Option<&str>,
@@ -941,6 +1241,12 @@ impl StyleDefinitions {
     ) -> DirectNumPr {
         match direct {
             DirectNumPr::Active(_) | DirectNumPr::Suppressed => return direct.clone(),
+            DirectNumPr::ListWithoutLevel { num_id } => {
+                return DirectNumPr::Active(NumProps {
+                    num_id: *num_id,
+                    ilvl: resolve_omitted_direct_level(Some(self), style_id),
+                });
+            }
             DirectNumPr::Absent => {}
         }
         style_id
@@ -2243,20 +2549,20 @@ fn overlay_linked_char(
 }
 
 /// Parse document defaults: w:docDefaults/w:rPrDefault/w:rPr.
-fn parse_doc_defaults(root: &Element) -> TextMarks {
+fn parse_doc_defaults(root: &Element) -> Result<TextMarks, String> {
     let doc_defaults = match find_w_child(root, "docDefaults") {
         Some(el) => el,
-        None => return TextMarks::default(),
+        None => return Ok(TextMarks::default()),
     };
     let rpr_default = match find_w_child(doc_defaults, "rPrDefault") {
         Some(el) => el,
-        None => return TextMarks::default(),
+        None => return Ok(TextMarks::default()),
     };
     let rpr = match find_w_child(rpr_default, "rPr") {
         Some(el) => el,
-        None => return TextMarks::default(),
+        None => return Ok(TextMarks::default()),
     };
-    parse_rpr_marks(rpr)
+    parse_rpr_marks(rpr).map_err(|err| format!("word/styles.xml docDefaults: {err}"))
 }
 
 /// Parse document paragraph defaults: w:docDefaults/w:pPrDefault/w:pPr.
@@ -2277,8 +2583,11 @@ fn parse_ppr_defaults(root: &Element) -> Result<RawParagraphProps, String> {
 }
 
 /// Parse formatting marks from a w:rPr element.
-/// Shared between style definitions and document defaults.
-fn parse_rpr_marks(rpr: &Element) -> TextMarks {
+/// Shared between style definitions and document defaults. A font size is
+/// read by the same ST_HpsMeasure parser as a run's
+/// (`word_ir::font_size_half_points`), so styles and runs agree, and a value is
+/// never dropped.
+fn parse_rpr_marks(rpr: &Element) -> Result<TextMarks, String> {
     let mut marks = TextMarks::default();
 
     for child in &rpr.children {
@@ -2351,15 +2660,7 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
                     .or_else(|| attr_get(el, "w:csTheme"))
                     .map(|s| IStr::from(s.as_str()));
             }
-            "sz" => {
-                marks.font_size = attr_get(el, "w:val").and_then(|v| {
-                    v.parse()
-                        .map_err(|e| {
-                            tracing::warn!("invalid w:sz value {:?}: {}", v, e);
-                        })
-                        .ok()
-                });
-            }
+            "sz" => marks.font_size = style_half_points(el, "sz")?,
             "color" => {
                 if let Some(val) = attr_get(el, "w:val") {
                     marks.color = Some(IStr::from(val.as_str()));
@@ -2381,7 +2682,9 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
                 marks.lang_bidi = attr_get(el, "w:bidi").map(|s| IStr::from(s.as_str()));
             }
             "spacing" => {
-                marks.char_spacing = attr_get(el, "w:val").and_then(|v| v.parse::<i32>().ok());
+                // Read as a run's character spacing is read.
+                marks.char_spacing = crate::word_ir::char_spacing_twips(el)
+                    .map_err(|err| format!("rPr/spacing: {err}"))?;
             }
             "position" => {
                 // w:position w:val="6" — vertical displacement in half-points (ISO 29500-1 §17.3.2.19)
@@ -2400,20 +2703,18 @@ fn parse_rpr_marks(rpr: &Element) -> TextMarks {
             "rtl" => marks.rtl = parse_toggle_value(el),
             "bCs" => marks.bold_cs = parse_toggle_value(el),
             "iCs" => marks.italic_cs = parse_toggle_value(el),
-            "szCs" => {
-                marks.font_size_cs = attr_get(el, "w:val").and_then(|v| {
-                    v.parse()
-                        .map_err(|e| {
-                            tracing::warn!("invalid w:szCs value {:?}: {}", v, e);
-                        })
-                        .ok()
-                });
-            }
+            "szCs" => marks.font_size_cs = style_half_points(el, "szCs")?,
             _ => {}
         }
     }
 
-    marks
+    Ok(marks)
+}
+
+/// A style's `w:sz` / `w:szCs` value in half-points, read as a run's is
+/// (`word_ir::font_size_half_points`).
+fn style_half_points(element: &Element, name: &'static str) -> Result<Option<u32>, String> {
+    crate::word_ir::font_size_half_points(element, name).map_err(|err| err.to_string())
 }
 
 /// Parse a toggle property value (CT_OnOff, e.g. `w:b`, `w:i`).
@@ -2508,20 +2809,32 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
         indent_hanging_chars,
     ) = match find_w_child(ppr, "ind") {
         Some(ind) => {
-            let left = attr_get(ind, "w:left")
-                .or_else(|| attr_get(ind, "w:start"))
-                .and_then(|v| v.parse().ok());
-            let right = attr_get(ind, "w:right")
-                .or_else(|| attr_get(ind, "w:end"))
-                .and_then(|v| v.parse().ok());
+            // Read as a paragraph's own w:ind is read (one twips reading).
+            let twips = |attribute: &'static str, allows_negative: bool| {
+                crate::word_ir::parse_paragraph_twip_measure(ind, "ind", attribute, allows_negative)
+                    .map_err(|err| format!("pPr/ind: {err}"))?
+                    .map(|twips| {
+                        i32::try_from(twips).map_err(|_| {
+                            format!("pPr/ind: w:{attribute} value {twips} is outside i32 twips")
+                        })
+                    })
+                    .transpose()
+            };
+            let left = if attr_get(ind, "w:left").is_some() {
+                twips("left", true)?
+            } else {
+                twips("start", true)?
+            };
+            let right = if attr_get(ind, "w:right").is_some() {
+                twips("right", true)?
+            } else {
+                twips("end", true)?
+            };
             // §17.3.1.12: "firstLine and hanging are mutually exclusive,
             // if both are specified, the firstLine value is ignored" — hanging wins.
-            let first_line = if let Some(hanging) = attr_get(ind, "w:hanging") {
-                hanging.parse::<i32>().ok().map(|v| -v)
-            } else if let Some(first) = attr_get(ind, "w:firstLine") {
-                first.parse().ok()
-            } else {
-                None
+            let first_line = match twips("hanging", false)? {
+                Some(hanging) => Some(-hanging),
+                None => twips("firstLine", true)?,
             };
             // Character-unit indents (MS-OI29500 2.1.44, §17.3.1.12): stored raw,
             // including an explicit 0 (a real override that cancels an inherited
@@ -2561,20 +2874,26 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
         spacing_line_rule,
     ) = match find_w_child(ppr, "spacing") {
         Some(sp) => {
-            let before = attr_get(sp, "w:before").and_then(|v| {
-                v.parse()
-                    .map_err(|e| {
-                        tracing::warn!("invalid w:spacing before value {:?}: {}", v, e);
-                    })
-                    .ok()
-            });
-            let after = attr_get(sp, "w:after").and_then(|v| {
-                v.parse()
-                    .map_err(|e| {
-                        tracing::warn!("invalid w:spacing after value {:?}: {}", v, e);
-                    })
-                    .ok()
-            });
+            // Read as a paragraph's own w:spacing is read (one twips reading).
+            let twips = |attribute: &'static str, allows_negative: bool| {
+                crate::word_ir::parse_paragraph_twip_measure(
+                    sp,
+                    "spacing",
+                    attribute,
+                    allows_negative,
+                )
+                .map_err(|err| format!("pPr/spacing: {err}"))
+            };
+            let before = twips("before", false)?
+                .map(|v| {
+                    u32::try_from(v).map_err(|_| format!("pPr/spacing: w:before {v} out of range"))
+                })
+                .transpose()?;
+            let after = twips("after", false)?
+                .map(|v| {
+                    u32::try_from(v).map_err(|_| format!("pPr/spacing: w:after {v} out of range"))
+                })
+                .transpose()?;
             let before_lines = attr_get(sp, "w:beforeLines").and_then(|v| v.parse().ok());
             let after_lines = attr_get(sp, "w:afterLines").and_then(|v| v.parse().ok());
             // §17.3.1.33: beforeAutospacing/afterAutospacing — ST_OnOff.
@@ -2582,7 +2901,11 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "off"));
             let after_autospacing = attr_get(sp, "w:afterAutospacing")
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "off"));
-            let line = attr_get(sp, "w:line").and_then(|v| v.parse().ok());
+            let line = twips("line", true)?
+                .map(|v| {
+                    i32::try_from(v).map_err(|_| format!("pPr/spacing: w:line {v} out of range"))
+                })
+                .transpose()?;
             let line_rule = attr_get(sp, "w:lineRule").cloned();
             (
                 before,
@@ -2602,6 +2925,7 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
 
     // Extract numPr (numId + ilvl) from w:pPr/w:numPr (§17.7.4.14).
     let num_props = extract_style_num_props(ppr);
+    let num_ilvl = extract_style_num_ilvl(ppr)?;
 
     // Extract contextualSpacing (CT_OnOff, §17.3.1.9).
     let contextual_spacing = find_w_child(ppr, "contextualSpacing").map(
@@ -2654,6 +2978,7 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
         spacing_line_rule,
         borders,
         num_props,
+        num_ilvl,
         contextual_spacing,
         widow_control,
         keep_next,
@@ -2662,6 +2987,63 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
         outline_lvl,
         shading,
     })
+}
+
+/// The level of a paragraph whose direct `w:numPr` names a list but writes no
+/// `w:ilvl` — the one place this rule lives.
+///
+/// Word (16, observed): the level the paragraph style's basedOn chain gives
+/// (`omitted_level_along_chain`), even when the style names a different list
+/// or none; else the docDefaults level; else level 0. Word renders that level
+/// and writes it into the live `w:numPr` on save.
+pub fn resolve_omitted_direct_level(
+    style_defs: Option<&StyleDefinitions>,
+    style_id: Option<&str>,
+) -> u32 {
+    style_defs
+        .and_then(|defs| {
+            style_id
+                .and_then(|id| defs.para_props.get(id))
+                .and_then(|props| props.num_ilvl)
+                .or(defs.ppr_defaults.num_ilvl)
+        })
+        .unwrap_or(0)
+}
+
+/// Resolve a paragraph's effective numbering from its direct `w:numPr` when
+/// the document may have no styles part. Without styles there is no style
+/// level, so a list without a level is at level 0.
+pub fn resolve_effective_direct_num_props(
+    style_defs: Option<&StyleDefinitions>,
+    style_id: Option<&str>,
+    direct: &DirectNumPr,
+) -> DirectNumPr {
+    match style_defs {
+        Some(defs) => defs.resolve_effective_num_props(style_id, direct),
+        None => match direct {
+            DirectNumPr::ListWithoutLevel { num_id } => DirectNumPr::Active(NumProps {
+                num_id: *num_id,
+                ilvl: resolve_omitted_direct_level(None, style_id),
+            }),
+            DirectNumPr::Absent | DirectNumPr::Suppressed | DirectNumPr::Active(_) => {
+                direct.clone()
+            }
+        },
+    }
+}
+
+/// The `w:ilvl` written in a style's `w:numPr`, with or without a `w:numId`.
+fn extract_style_num_ilvl(ppr: &Element) -> Result<Option<u32>, String> {
+    let Some(num_pr) = find_w_child(ppr, "numPr") else {
+        return Ok(None);
+    };
+    let Some(ilvl) = find_w_child(num_pr, "ilvl") else {
+        return Ok(None);
+    };
+    let raw = attr_get(ilvl, "w:val").ok_or("pPr/numPr/ilvl has no w:val")?;
+    raw.parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("pPr/numPr/ilvl w:val {raw:?} is not a level number"))
 }
 
 /// Extract numbering properties (numId + ilvl) from a w:pPr/w:numPr element in a style definition.
@@ -2733,6 +3115,32 @@ fn extract_style_border_edge(container: &Element, edge_name: &str) -> Option<Bor
     })
 }
 
+/// The level a direct list reference without a level takes from its style's
+/// basedOn chain (`chain` is child first); `None` when no style in the chain
+/// writes a `w:ilvl`.
+///
+/// Word 16, observed: the nearest `w:ilvl` along the chain applies, whether
+/// the style writing it names a list (`w:numId`) or not, and a style whose
+/// numPr writes only `w:numId` passes the level through from its parents.
+/// One exception was observed and is kept as observed: when the nearest
+/// `w:ilvl` sits in a style that names no list while a style above it does,
+/// Word ignores it and the paragraph is at level 0.
+fn omitted_level_along_chain(chain: &[&RawParagraphProps]) -> Option<u32> {
+    let (index, layer) = chain
+        .iter()
+        .enumerate()
+        .find(|(_, layer)| layer.num_ilvl.is_some())?;
+    let names_no_list = layer.num_props.is_none();
+    let list_named_above = chain[index + 1..]
+        .iter()
+        .any(|ancestor| ancestor.num_props.is_some());
+    if names_no_list && list_named_above {
+        Some(0)
+    } else {
+        layer.num_ilvl
+    }
+}
+
 /// Resolve paragraph properties through a style's basedOn chain.
 /// Per-field most-specific-wins (first non-None walking child → parent).
 fn resolve_para_props_chain(
@@ -2760,7 +3168,10 @@ fn resolve_para_props_chain(
     }
 
     // Walk child-first: first non-None wins for each field.
-    let mut resolved = RawParagraphProps::default();
+    let mut resolved = RawParagraphProps {
+        num_ilvl: omitted_level_along_chain(&chain),
+        ..Default::default()
+    };
     for layer in &chain {
         if resolved.alignment.is_none() {
             resolved.alignment = layer.alignment.clone();
@@ -2873,18 +3284,23 @@ fn resolve_para_props_chain(
 /// Parse tab stops from a w:pPr element within a style definition.
 /// Returns None if no w:tabs element is present (meaning "inherit from parent").
 /// Returns Some (possibly empty) if w:tabs is present (explicit override).
-fn parse_ppr_tab_stops(ppr: &Element) -> Option<Vec<TabStopDef>> {
-    let tabs_el = find_w_child(ppr, "tabs")?;
+///
+/// A position is read as a paragraph's own tab position is
+/// (`word_ir::tab_position_twips`); one with no position is refused, as Word
+/// refuses it on a paragraph.
+fn parse_ppr_tab_stops(ppr: &Element) -> Result<Option<Vec<TabStopDef>>, String> {
+    let Some(tabs_el) = find_w_child(ppr, "tabs") else {
+        return Ok(None);
+    };
     let mut stops = Vec::new();
     for child in &tabs_el.children {
         let el = match child {
             XMLNode::Element(el) if is_w_tag(el, "tab") => el,
             _ => continue,
         };
-        let position = match attr_get(el, "w:pos").and_then(|v| v.parse::<i32>().ok()) {
-            Some(pos) => pos,
-            None => continue,
-        };
+        let raw_position = attr_get(el, "w:pos").ok_or("pPr/tabs: w:tab without w:pos")?;
+        let position = crate::word_ir::tab_position_twips(raw_position)
+            .ok_or_else(|| format!("pPr/tabs: invalid w:tab/@w:pos value {raw_position:?}"))?;
         // w:val — parse tab alignment (ST_TabJc §17.18.81).
         // MS-OI29500 §17.18.84: "start" is an alias for "left", "end" for "right".
         let alignment = match attr_get(el, "w:val") {
@@ -2908,7 +3324,7 @@ fn parse_ppr_tab_stops(ppr: &Element) -> Option<Vec<TabStopDef>> {
             leader,
         });
     }
-    Some(stops)
+    Ok(Some(stops))
 }
 
 /// Resolve tab stops through a style's basedOn chain.
@@ -2987,13 +3403,35 @@ fn overlay_tab_stops(effective: &mut Vec<TabStopDef>, layer: &[TabStopDef]) {
 /// - `w:tblPr/w:tblCellMar` → default cell margins
 /// - `w:tcPr/w:shd` → default cell shading
 /// - `w:tblStylePr` → conditional formatting overrides
-fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
+fn extract_raw_table_style_props(style_el: &Element) -> Result<RawTableStyleProps, String> {
     let mut props = RawTableStyleProps::default();
+    let tr_pr_hidden = |el: &Element| {
+        find_w_child(el, "trPr").is_some_and(|tr_pr| find_w_child(tr_pr, "hidden").is_some())
+    };
+    props.declares_row_hidden = tr_pr_hidden(style_el)
+        || style_el.children.iter().any(|child| {
+            matches!(child, XMLNode::Element(e) if e.name == "tblStylePr" && tr_pr_hidden(e))
+        });
+    let shaded = |el: &Element| {
+        ["tblPr", "tcPr"].iter().any(|props| {
+            find_w_child(el, props).is_some_and(|props| find_w_child(props, "shd").is_some())
+        })
+    };
+    props.declares_shading = shaded(style_el)
+        || style_el.children.iter().any(
+            |child| matches!(child, XMLNode::Element(e) if e.name == "tblStylePr" && shaded(e)),
+        );
+    let has_rpr = |el: &Element| find_w_child(el, "rPr").is_some();
+    props.declares_run_properties = has_rpr(style_el)
+        || style_el.children.iter().any(
+            |child| matches!(child, XMLNode::Element(e) if e.name == "tblStylePr" && has_rpr(e)),
+        );
 
     // Table-level properties from w:tblPr.
     if let Some(tbl_pr) = find_w_child(style_el, "tblPr") {
         props.borders = extract_table_borders(tbl_pr);
-        props.default_cell_margins = extract_table_cell_margins(tbl_pr);
+        // Read as a table's own w:tblCellMar is read.
+        props.default_cell_margins = crate::import::parse_cell_margins(tbl_pr, "tblCellMar");
         // Table alignment from w:jc (§17.4.28).
         props.alignment = find_w_child(tbl_pr, "jc")
             .and_then(|jc| attr_get(jc, "w:val"))
@@ -3015,6 +3453,9 @@ fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
                     match crate::import::parse_measurement_or_percent(v, "style tblInd element") {
                         Ok(MeasurementOrPercent::Number(n)) => n,
                         Ok(MeasurementOrPercent::UniversalTwips(t)) => t,
+                        // Word's reading of a tblInd with no number (verified
+                        // on a table's own tblInd): no indent.
+                        Ok(MeasurementOrPercent::NotANumber) => return None,
                         Ok(MeasurementOrPercent::Percent { .. }) | Err(_) => {
                             tracing::warn!(
                                 value = %v,
@@ -3064,7 +3505,7 @@ fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
     // bold, color, and font_family always apply as table-style defaults.
     if let Some(rpr) = find_w_child(style_el, "rPr") {
         if let Some(sz_el) = find_w_child(rpr, "sz") {
-            props.base_font_size = attr_get(sz_el, "w:val").and_then(|v| v.parse::<u32>().ok());
+            props.base_font_size = style_half_points(sz_el, "sz")?;
         }
         if let Some(b_el) = find_w_child(rpr, "b") {
             props.base_bold = Some(parse_toggle_value(b_el) == MarkValue::On);
@@ -3112,7 +3553,7 @@ fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
         if let Some(tc_pr) = find_w_child(el, "tcPr") {
             cond_props.shading = extract_shading(tc_pr);
             cond_props.borders = extract_conditional_cell_borders(tc_pr);
-            cond_props.margins = extract_table_cell_margins(tc_pr);
+            cond_props.margins = crate::import::parse_cell_margins(tc_pr, "tblCellMar");
         }
         // §17.7.6.1: paragraph properties from pPr
         if let Some(ppr) = find_w_child(el, "pPr") {
@@ -3132,7 +3573,7 @@ fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
                 cond_props.bold = Some(parse_toggle_value(b_el) == MarkValue::On);
             }
             if let Some(sz_el) = find_w_child(rpr, "sz") {
-                cond_props.font_size = attr_get(sz_el, "w:val").and_then(|v| v.parse::<u32>().ok());
+                cond_props.font_size = style_half_points(sz_el, "sz")?;
             }
             if let Some(rfonts) = find_w_child(rpr, "rFonts") {
                 // Per §17.3.2.26: ascii/hAnsi slot determines the base font family.
@@ -3157,7 +3598,7 @@ fn extract_raw_table_style_props(style_el: &Element) -> RawTableStyleProps {
         }
     }
 
-    props
+    Ok(props)
 }
 
 /// Extract cell borders from a w:tcPr element's w:tcBorders child (for conditional formatting).
@@ -3261,32 +3702,6 @@ fn extract_domain_border_edge(container: &Element, edge_name: &str) -> Option<Bo
     })
 }
 
-/// Extract cell margins from a w:tblPr/w:tblCellMar element.
-fn extract_table_cell_margins(tbl_pr: &Element) -> Option<CellMargins> {
-    let container = find_w_child(tbl_pr, "tblCellMar")?;
-
-    let margin_value = |name: &str| -> Option<u32> {
-        find_w_child(container, name)
-            .and_then(|el| attr_get(el, "w:w").and_then(|v| v.parse().ok()))
-    };
-
-    let top = margin_value("top");
-    let bottom = margin_value("bottom");
-    let left = margin_value("left").or_else(|| margin_value("start"));
-    let right = margin_value("right").or_else(|| margin_value("end"));
-
-    if top.is_none() && bottom.is_none() && left.is_none() && right.is_none() {
-        return None;
-    }
-
-    Some(CellMargins {
-        top,
-        bottom,
-        left,
-        right,
-    })
-}
-
 /// Extract shading from a w:shd element inside a properties element.
 fn extract_shading(props: &Element) -> Option<Shading> {
     let shd = find_w_child(props, "shd")?;
@@ -3304,6 +3719,57 @@ fn extract_shading(props: &Element) -> Option<Shading> {
     } else {
         None
     }
+}
+
+/// Whether any style in `style_id`'s table-style chain declares a row's
+/// hidden state.
+fn table_style_chain_declares_row_hidden(
+    style_id: &str,
+    raw_styles: &HashMap<String, RawStyle>,
+) -> bool {
+    let mut current = Some(style_id.to_string());
+    let mut visited = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if !visited.insert(id.clone()) {
+            return false;
+        }
+        let Some(raw) = raw_styles.get(&id) else {
+            return false;
+        };
+        if raw.style_type != "table" {
+            return false;
+        }
+        if raw.raw_table_props.declares_row_hidden {
+            return true;
+        }
+        current = raw.based_on.clone();
+    }
+    false
+}
+
+/// Whether any style in `style_id`'s table-style chain declares what
+/// `declares_in` reads off its properties; `None` when the chain does not
+/// resolve (a missing or non-table style, a cycle).
+fn table_style_chain_declares(
+    style_id: &str,
+    raw_styles: &HashMap<String, RawStyle>,
+    declares_in: impl Fn(&RawTableStyleProps) -> bool,
+) -> Option<bool> {
+    let mut current = Some(style_id.to_string());
+    let mut visited = std::collections::HashSet::new();
+    let mut declares = false;
+    while let Some(id) = current {
+        if !visited.insert(id.clone()) {
+            return None;
+        }
+        let raw = raw_styles.get(&id)?;
+        if raw.style_type != "table" {
+            return None;
+        }
+        declares |= declares_in(&raw.raw_table_props);
+        current = raw.based_on.clone();
+    }
+    Some(declares)
 }
 
 /// Resolve table style properties through a style's basedOn chain.
@@ -3420,19 +3886,15 @@ pub fn detect_style_collisions(
     base_styles_xml: &[u8],
     target_styles_xml: &[u8],
     referenced_style_ids: &HashSet<IStr>,
-) -> Vec<StyleCollision> {
+) -> Result<Vec<StyleCollision>, String> {
     if base_styles_xml.is_empty() || target_styles_xml.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let base_root = match crate::word_xml::parse_document_xml(base_styles_xml) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let target_root = match crate::word_xml::parse_document_xml(target_styles_xml) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
+    let base_root = crate::word_xml::parse_document_xml(base_styles_xml)
+        .map_err(|error| format!("failed to parse base word/styles.xml: {error:?}"))?;
+    let target_root = crate::word_xml::parse_document_xml(target_styles_xml)
+        .map_err(|error| format!("failed to parse target word/styles.xml: {error:?}"))?;
 
     // Extract style elements from each document, keyed by styleId.
     let base_styles = extract_style_elements(&base_root);
@@ -3490,15 +3952,7 @@ pub fn detect_style_collisions(
             None => continue,
         };
 
-        // A direct w:rsid child records the editing session that last touched
-        // the style. It does not participate in the style cascade and Word may
-        // rewrite it on save, so it remains source-owned provenance rather
-        // than an active style collision. Every other authored child remains
-        // exact.
-        let base_xml = serialize_active_style(base_el);
-        let target_xml = serialize_active_style(target_el);
-
-        if base_xml != target_xml {
+        if !same_active_style_definition(base_el, target_el) {
             let style_type = attr_get(base_el, "w:type")
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_string());
@@ -3514,7 +3968,7 @@ pub fn detect_style_collisions(
 
     // Sort for deterministic output.
     collisions.sort_by(|a, b| a.style_id.cmp(&b.style_id));
-    collisions
+    Ok(collisions)
 }
 
 /// Whether the two style tables author the same document defaults.
@@ -3531,7 +3985,16 @@ pub fn authored_doc_defaults_equal(
         .map_err(|error| format!("failed to parse base word/styles.xml: {error:?}"))?;
     let target_root = crate::word_xml::parse_document_xml(target_styles_xml)
         .map_err(|error| format!("failed to parse target word/styles.xml: {error:?}"))?;
-    Ok(find_w_child(&base_root, "docDefaults") == find_w_child(&target_root, "docDefaults"))
+    Ok(
+        match (
+            find_w_child(&base_root, "docDefaults"),
+            find_w_child(&target_root, "docDefaults"),
+        ) {
+            (None, None) => true,
+            (Some(base), Some(target)) => same_authored_xml(base, target),
+            _ => false,
+        },
+    )
 }
 
 /// Extract `w:style` elements from a parsed styles.xml root, keyed by `w:styleId`.
@@ -3552,26 +4015,74 @@ fn extract_style_elements(root: &Element) -> HashMap<String, &Element> {
     map
 }
 
-/// Serialize an XML element to a string for comparison purposes.
-fn serialize_element(el: &Element) -> String {
-    let mut buf = Vec::new();
-    // xmltree::Element::write produces a full XML document with declaration,
-    // but since both sides use the same serializer the declaration is identical
-    // and doesn't affect the comparison.
-    let _ = el.write(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+/// Whether two definitions of one style id mean the same style.
+///
+/// A direct `w:rsid` child records the editing session that last touched the
+/// style. It does not participate in the style cascade and Word may rewrite it
+/// on save, so it is source-owned provenance, not an active difference. Every
+/// other authored child is compared by [`same_authored_xml`].
+fn same_active_style_definition(base: &Element, target: &Element) -> bool {
+    let without_rsid = |style: &Element| {
+        let mut active = style.clone();
+        active.children.retain(
+            |child| !matches!(child, XMLNode::Element(element) if is_w_tag(element, "rsid")),
+        );
+        active
+    };
+    same_authored_xml(&without_rsid(base), &without_rsid(target))
 }
 
-/// Serialize the active authored portion of one style definition.
-///
-/// Only the direct style-level `w:rsid` provenance token is excluded. Nested
-/// property state and all other children remain part of the comparison.
-fn serialize_active_style(style: &Element) -> String {
-    let mut active = style.clone();
-    active
+/// Children of an element-only element, without ignorable whitespace text.
+fn element_content(element: &Element) -> Vec<&XMLNode> {
+    element
         .children
-        .retain(|child| !matches!(child, XMLNode::Element(element) if is_w_tag(element, "rsid")));
-    serialize_element(&active)
+        .iter()
+        .filter(
+            |child| !matches!(child, XMLNode::Text(text) if text.chars().all(char::is_whitespace)),
+        )
+        .collect()
+}
+
+/// Whether two element-only style-table subtrees (`w:style`, `w:docDefaults`)
+/// author the same content.
+///
+/// One spelling: these differences are XML spelling, not meaning, and compare
+/// equal:
+/// - attribute order (XML 1.0 §3.1: attributes are unordered);
+/// - namespace prefixes and where `xmlns` is declared (Namespaces in XML §6:
+///   names are identified by namespace URI and local name);
+/// - whitespace-only text between children (`CT_Style` / `CT_DocDefaults` and
+///   their descendants have element-only content, so it is ignorable).
+///
+/// Everything else is content and stays exact: element sequence, attribute
+/// values, non-whitespace text, comments, CDATA, processing instructions.
+fn same_authored_xml(base: &Element, target: &Element) -> bool {
+    if base.namespace != target.namespace || base.name != target.name {
+        return false;
+    }
+    if base.attributes.len() != target.attributes.len() {
+        return false;
+    }
+    let attributes_match = base.attributes.iter().all(|(name, value)| {
+        target.attributes.iter().any(|(other, other_value)| {
+            other.namespace == name.namespace
+                && other.local_name == name.local_name
+                && other_value == value
+        })
+    });
+    if !attributes_match {
+        return false;
+    }
+    let base_children = element_content(base);
+    let target_children = element_content(target);
+    base_children.len() == target_children.len()
+        && base_children
+            .iter()
+            .zip(&target_children)
+            .all(|(left, right)| match (left, right) {
+                (XMLNode::Element(left), XMLNode::Element(right)) => same_authored_xml(left, right),
+                (left, right) => left == right,
+            })
 }
 
 /// Merge two `word/styles.xml` parts, preferring target definitions on
@@ -3702,7 +4213,7 @@ pub fn style_table_projection(xml_bytes: &[u8]) -> Result<StyleTableProjection, 
     let root = crate::word_xml::parse_document_xml(xml_bytes)
         .map_err(|err| format!("failed to parse word/styles.xml: {err:?}"))?;
 
-    let doc_default = project_doc_default(&root);
+    let doc_default = project_doc_default(&root)?;
 
     let mut styles = Vec::new();
     let mut default_para_style_id: Option<String> = None;
@@ -3753,10 +4264,11 @@ pub fn style_table_projection(xml_bytes: &[u8]) -> Result<StyleTableProjection, 
         let rpr = find_w_child(el, "rPr");
         let (font_family, font_family_is_theme) =
             rpr.and_then(find_rfonts_family).unwrap_or((None, false));
-        let font_size_half_points = rpr
-            .and_then(|rpr| find_w_child(rpr, "sz"))
-            .and_then(|sz| attr_get(sz, "w:val"))
-            .and_then(|v| v.parse::<u32>().ok());
+        let font_size_half_points = match rpr.and_then(|rpr| find_w_child(rpr, "sz")) {
+            Some(sz) => style_half_points(sz, "sz")
+                .map_err(|err| format!("word/styles.xml style '{style_id}': {err}"))?,
+            None => None,
+        };
         let color = rpr
             .and_then(|rpr| find_w_child(rpr, "color"))
             .and_then(|c| attr_get(c, "w:val").cloned());
@@ -3788,23 +4300,25 @@ pub fn style_table_projection(xml_bytes: &[u8]) -> Result<StyleTableProjection, 
 
 /// Read the doc-default run props straight from `w:docDefaults/w:rPrDefault/w:rPr`
 /// (no resolution). Absent at any level → `DocDefaultRun::default()`.
-fn project_doc_default(root: &Element) -> DocDefaultRun {
+fn project_doc_default(root: &Element) -> Result<DocDefaultRun, String> {
     let rpr = find_w_child(root, "docDefaults")
         .and_then(|dd| find_w_child(dd, "rPrDefault"))
         .and_then(|rd| find_w_child(rd, "rPr"));
     let rpr = match rpr {
         Some(rpr) => rpr,
-        None => return DocDefaultRun::default(),
+        None => return Ok(DocDefaultRun::default()),
     };
     let (font_family, font_family_is_theme) = find_rfonts_family(rpr).unwrap_or((None, false));
-    let font_size_half_points = find_w_child(rpr, "sz")
-        .and_then(|sz| attr_get(sz, "w:val"))
-        .and_then(|v| v.parse::<u32>().ok());
-    DocDefaultRun {
+    let font_size_half_points = match find_w_child(rpr, "sz") {
+        Some(sz) => style_half_points(sz, "sz")
+            .map_err(|err| format!("word/styles.xml docDefaults: {err}"))?,
+        None => None,
+    };
+    Ok(DocDefaultRun {
         font_family,
         font_family_is_theme,
         font_size_half_points,
-    }
+    })
 }
 
 /// Read a `w:rFonts`'s authored font family from an `rPr`, preferring a literal
@@ -3832,6 +4346,12 @@ mod tests {
     use crate::domain::AuthoredRFonts;
     use std::io::Cursor;
 
+    fn serialize_element(el: &Element) -> String {
+        let mut buf = Vec::new();
+        el.write(&mut buf).expect("serialize test element");
+        String::from_utf8(buf).expect("serialized XML is UTF-8")
+    }
+
     fn make_styles_xml(content: &str) -> Vec<u8> {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3840,6 +4360,62 @@ mod tests {
             </w:styles>"#,
         )
         .into_bytes()
+    }
+
+    /// A style's font size is an ST_HpsMeasure (§17.3.2.38), read as a run's
+    /// is (Word 16, verified): a decimal truncates toward zero ("21.6" is 21),
+    /// a non-numeric value is 0 (Word saves 0 and renders its minimum size),
+    /// never dropped so the size silently inherits. A negative size is refused
+    /// naming the style.
+    #[test]
+    fn a_style_font_size_reads_as_word_reads_it() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="large"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:styleId="Body"><w:rPr><w:sz w:val="21.6"/><w:szCs w:val="x"/></w:rPr></w:style>
+            <w:style w:type="table" w:styleId="Grid"><w:rPr><w:sz w:val="19.2"/></w:rPr><w:tblStylePr w:type="firstRow"><w:rPr><w:sz w:val="big"/></w:rPr></w:tblStylePr></w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("Word opens these sizes");
+        assert_eq!(defs.doc_defaults.font_size, Some(0));
+        let body = defs.resolve(&TextMarks::default(), None, Some("Body"));
+        assert_eq!((body.font_size, body.font_size_cs), (Some(21), Some(0)));
+        let grid = defs.table_style("Grid").expect("table style");
+        assert_eq!(grid.base_font_size, Some(19));
+        let projection = style_table_projection(&xml).expect("projection");
+        assert_eq!(projection.doc_default.font_size_half_points, Some(0));
+
+        let negative = make_styles_xml(
+            r#"<w:style w:type="character" w:styleId="Note"><w:rPr><w:sz w:val="-4"/></w:rPr></w:style>"#,
+        );
+        let error = match StyleDefinitions::parse(&negative) {
+            Ok(_) => panic!("a negative size is refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("style 'Note'") && error.contains("sz"),
+            "{error}"
+        );
+    }
+
+    /// A universal measure is a valid ST_HpsMeasure: "10.5pt" is 21
+    /// half-points in a style as in a run.
+    #[test]
+    fn a_style_font_size_in_points_reads_as_half_points() {
+        let xml = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="10.5pt"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="table" w:styleId="Grid"><w:rPr><w:sz w:val="9pt"/></w:rPr><w:tblStylePr w:type="firstRow"><w:rPr><w:sz w:val="12pt"/></w:rPr></w:tblStylePr></w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("valid sizes");
+        assert_eq!(defs.doc_defaults.font_size, Some(21));
+        let grid = defs.table_style("Grid").expect("table style");
+        assert_eq!(grid.base_font_size, Some(18));
+        let projection = style_table_projection(&xml).expect("projection");
+        assert_eq!(projection.doc_default.font_size_half_points, Some(21));
+        let grid_row = projection
+            .styles
+            .iter()
+            .find(|row| row.style_id == "Grid")
+            .expect("Grid row");
+        assert_eq!(grid_row.font_size_half_points, Some(18));
     }
 
     #[test]
@@ -4232,7 +4808,7 @@ mod tests {
             br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:b w:val="maybe"/></w:rPr>"#.as_slice(),
         ))
         .unwrap();
-        let marks = parse_rpr_marks(&rpr);
+        let marks = parse_rpr_marks(&rpr).unwrap();
         assert_eq!(
             marks.bold,
             MarkValue::On,
@@ -5272,6 +5848,29 @@ mod tests {
         assert_eq!(margins.left, Some(200));
     }
 
+    /// A pct margin edge is not specified (Word renders no margin from it),
+    /// so a style's effective margins leave it out.
+    #[test]
+    fn table_style_pct_cell_margin_is_not_specified() {
+        let xml = make_styles_xml(
+            r#"<w:style w:type="table" w:styleId="PctMargins">
+                <w:tblPr>
+                    <w:tblCellMar>
+                        <w:top w:w="100" w:type="dxa"/>
+                        <w:left w:w="500" w:type="pct"/>
+                    </w:tblCellMar>
+                </w:tblPr>
+            </w:style>"#,
+        );
+        let defs = StyleDefinitions::parse(&xml).unwrap();
+        let margins = defs
+            .table_style("PctMargins")
+            .and_then(|style| style.default_cell_margins.as_ref())
+            .expect("the dxa edge is a margin");
+        assert_eq!(margins.top, Some(100));
+        assert_eq!(margins.left, None);
+    }
+
     #[test]
     fn table_style_parses_cell_shading() {
         let xml = make_styles_xml(
@@ -5310,7 +5909,7 @@ mod tests {
             </w:style>"#,
         );
         let referenced: HashSet<IStr> = ["CustomA"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].style_id, "CustomA");
         assert_eq!(collisions[0].style_type, "paragraph");
@@ -5329,7 +5928,7 @@ mod tests {
             </w:style>"#,
         );
         let referenced: HashSet<IStr> = ["Normal"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert!(collisions.is_empty());
     }
 
@@ -5347,7 +5946,7 @@ mod tests {
         );
         // UnusedStyle is not in the referenced set.
         let referenced: HashSet<IStr> = ["Normal"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert!(collisions.is_empty());
     }
 
@@ -5363,7 +5962,7 @@ mod tests {
                 <w:rPr><w:i/></w:rPr>
             </w:style>"#,
         );
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &HashSet::new());
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &HashSet::new()).unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].style_id, "Normal");
     }
@@ -5379,7 +5978,7 @@ mod tests {
                <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Parent"/></w:style>"#,
         );
         let referenced: HashSet<IStr> = ["Child"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].style_id, "Parent");
     }
@@ -5396,7 +5995,101 @@ mod tests {
                 <w:name w:val="Normal"/><w:rsid w:val="AABBCCDD"/>
             </w:style>"#,
         );
-        assert!(detect_style_collisions(&base_xml, &target_xml, &HashSet::new()).is_empty());
+        assert!(
+            detect_style_collisions(&base_xml, &target_xml, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// XML attribute order, namespace prefix choice, and whitespace between
+    /// the children of an element-only style element carry no meaning (XML
+    /// 1.0 §3.1, Namespaces in XML §6; `CT_Style` has element-only content).
+    /// Two packages that spell one style definition differently define the
+    /// same style, so they are not an active collision.
+    #[test]
+    fn style_definition_spelling_alone_is_not_an_active_collision() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="character" w:default="1" w:styleId="InventedFont"><w:name w:val="Invented Font"/><w:uiPriority w:val="1"/><w:semiHidden/><w:rPr><w:rFonts w:ascii="Alpha" w:hAnsi="Beta"/><w:b/></w:rPr></w:style>"#,
+        );
+        let target_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <q:styles xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <q:style q:styleId="InventedFont" q:default="1" q:type="character">
+                <q:name q:val="Invented Font" />
+                <q:uiPriority q:val="1" />
+                <q:semiHidden />
+                <q:rPr>
+                  <q:rFonts q:hAnsi="Beta" q:ascii="Alpha" />
+                  <q:b />
+                </q:rPr>
+              </q:style>
+            </q:styles>"#
+            .to_vec();
+        let referenced: HashSet<IStr> = ["InventedFont"].iter().map(|s| IStr::from(*s)).collect();
+        assert!(
+            detect_style_collisions(&base_xml, &target_xml, &referenced)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The spelling rule above must not hide a real value difference: the same
+    /// reordering with one changed attribute value is still a collision.
+    #[test]
+    fn reordered_style_definition_with_a_changed_value_still_collides() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="InventedHead"><w:rPr><w:rFonts w:ascii="Alpha" w:hAnsi="Beta"/></w:rPr></w:style>"#,
+        );
+        let target_xml = make_styles_xml(
+            r#"<w:style w:styleId="InventedHead" w:type="paragraph">
+                <w:rPr><w:rFonts w:hAnsi="Gamma" w:ascii="Alpha"/></w:rPr>
+            </w:style>"#,
+        );
+        let referenced: HashSet<IStr> = ["InventedHead"].iter().map(|s| IStr::from(*s)).collect();
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].style_id, "InventedHead");
+    }
+
+    /// Element children are content, not spelling: an added property is a
+    /// different authored definition and stays a collision.
+    #[test]
+    fn style_definition_with_extra_child_still_collides() {
+        let base_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="InventedHead"><w:rPr><w:b/></w:rPr></w:style>"#,
+        );
+        let target_xml = make_styles_xml(
+            r#"<w:style w:type="paragraph" w:styleId="InventedHead"><w:rPr><w:b/><w:i/></w:rPr></w:style>"#,
+        );
+        let referenced: HashSet<IStr> = ["InventedHead"].iter().map(|s| IStr::from(*s)).collect();
+        assert_eq!(
+            detect_style_collisions(&base_xml, &target_xml, &referenced)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn style_collision_detection_fails_loud_on_malformed_xml() {
+        let valid = make_styles_xml("");
+        let referenced: HashSet<IStr> = HashSet::new();
+        let error = detect_style_collisions(b"<w:styles", &valid, &referenced).unwrap_err();
+        assert!(error.contains("base word/styles.xml"), "{error}");
+    }
+
+    #[test]
+    fn doc_defaults_spelling_alone_compares_equal() {
+        let base = make_styles_xml(
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Alpha" w:hAnsi="Beta"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        );
+        let target = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <q:styles xmlns:q="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <q:docDefaults>
+                <q:rPrDefault><q:rPr><q:rFonts q:hAnsi="Beta" q:ascii="Alpha" /></q:rPr></q:rPrDefault>
+              </q:docDefaults>
+            </q:styles>"#;
+        assert!(authored_doc_defaults_equal(&base, target).unwrap());
     }
 
     #[test]
@@ -5415,16 +6108,28 @@ mod tests {
             .iter()
             .map(|s| IStr::from(*s))
             .collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert!(collisions.is_empty());
     }
 
     #[test]
     fn collision_empty_inputs() {
         let referenced: HashSet<IStr> = ["Normal"].iter().map(|s| IStr::from(*s)).collect();
-        assert!(detect_style_collisions(&[], &[], &referenced).is_empty());
-        assert!(detect_style_collisions(b"<w:styles/>", &[], &referenced).is_empty());
-        assert!(detect_style_collisions(&[], b"<w:styles/>", &referenced).is_empty());
+        assert!(
+            detect_style_collisions(&[], &[], &referenced)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            detect_style_collisions(b"<w:styles/>", &[], &referenced)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            detect_style_collisions(&[], b"<w:styles/>", &referenced)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5478,7 +6183,7 @@ mod tests {
             .iter()
             .map(|s| IStr::from(*s))
             .collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         // Normal is identical, Heading1 and BoldChar differ.
         assert_eq!(collisions.len(), 2);
         assert_eq!(collisions[0].style_id, "BoldChar");
@@ -5502,7 +6207,7 @@ mod tests {
             </w:style>"#,
         );
         let referenced: HashSet<IStr> = ["Heading1"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].style_id, "Heading1");
         assert_eq!(collisions[0].style_name.as_deref(), Some("heading 1"));
@@ -5521,7 +6226,7 @@ mod tests {
             </w:style>"#,
         );
         let referenced: HashSet<IStr> = ["CustomA"].iter().map(|s| IStr::from(*s)).collect();
-        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced);
+        let collisions = detect_style_collisions(&base_xml, &target_xml, &referenced).unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].style_name, None);
     }
@@ -5746,5 +6451,102 @@ mod tests {
         );
         // Every row is addressable (the fail-loud styleId invariant held).
         assert!(proj.styles.iter().all(|s| !s.style_id.is_empty()));
+    }
+    fn theme(name: &str) -> FontSelection {
+        FontSelection::Theme(IStr::from(name))
+    }
+
+    fn named(name: &str) -> FontSelection {
+        FontSelection::Named(IStr::from(name))
+    }
+
+    /// §17.3.2.26 / §17.7.2: each script slot takes its font from the
+    /// nearest level that names it, and within one `w:rFonts` a theme
+    /// selector takes precedence over the literal name. A run that writes
+    /// out the theme fonts its defaults select selects the same fonts.
+    #[test]
+    fn a_run_restating_inherited_theme_fonts_selects_the_same_fonts() {
+        let xml = make_styles_xml(
+            r#"
+            <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia" w:cstheme="minorBidi"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+            <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"/>
+            <w:style w:type="character" w:styleId="Quote"><w:basedOn w:val="DefaultParagraphFont"/><w:rPr><w:rFonts w:cs="Arial"/></w:rPr></w:style>
+        "#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let inherited = defs.effective_fonts(None, None, None).expect("provable");
+        assert_eq!(inherited.ascii, theme("minorHAnsi"));
+        assert_eq!(inherited.east_asia, theme("minorEastAsia"));
+        assert_eq!(inherited.cs, theme("minorBidi"));
+        let restated = AuthoredRFonts {
+            ascii_theme: Some(IStr::from("minorHAnsi")),
+            h_ansi_theme: Some(IStr::from("minorHAnsi")),
+            east_asia_theme: Some(IStr::from("minorEastAsia")),
+            ..AuthoredRFonts::default()
+        };
+        assert_eq!(
+            defs.effective_fonts(Some(&restated), None, None),
+            Some(inherited)
+        );
+        // A theme selector beats the literal written beside it.
+        let both = AuthoredRFonts {
+            ascii: Some(IStr::from("Arial")),
+            ascii_theme: Some(IStr::from("majorHAnsi")),
+            ..AuthoredRFonts::default()
+        };
+        let fonts = defs
+            .effective_fonts(Some(&both), None, None)
+            .expect("provable");
+        assert_eq!(fonts.ascii, theme("majorHAnsi"));
+        assert_eq!(fonts.h_ansi, theme("minorHAnsi"));
+        // A character style's literal, over no theme for that slot below
+        // it... except the defaults' cs theme: not decided.
+        assert_eq!(defs.effective_fonts(None, Some("Quote"), None), None);
+    }
+
+    /// A literal named where no lower level names a theme for the slot
+    /// decides it; one over a lower theme selector is not decided (Word's
+    /// precedence across levels is not modelled for every shape).
+    #[test]
+    fn a_literal_font_over_a_lower_theme_selector_is_not_decided() {
+        let xml = make_styles_xml(
+            r#"
+            <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsiaTheme="minorEastAsia"/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"/>
+        "#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        let latin = AuthoredRFonts {
+            ascii: Some(IStr::from("Arial")),
+            ..AuthoredRFonts::default()
+        };
+        let fonts = defs
+            .effective_fonts(Some(&latin), None, None)
+            .expect("provable");
+        assert_eq!(fonts.ascii, named("Arial"));
+        assert_eq!(fonts.h_ansi, named("Calibri"));
+        let east_asian = AuthoredRFonts {
+            east_asia: Some(IStr::from("SimSun")),
+            ..AuthoredRFonts::default()
+        };
+        assert_eq!(defs.effective_fonts(Some(&east_asian), None, None), None);
+    }
+
+    /// A paragraph style linked to a character style takes its run
+    /// properties by a three-way merge (§17.7.4.6) this cascade does not
+    /// read; a style missing from the part is not resolved either.
+    #[test]
+    fn fonts_through_a_linked_or_missing_style_are_not_decided() {
+        let xml = make_styles_xml(
+            r#"
+            <w:style w:type="paragraph" w:styleId="Heading"><w:link w:val="HeadingChar"/></w:style>
+            <w:style w:type="character" w:styleId="HeadingChar"><w:link w:val="Heading"/></w:style>
+        "#,
+        );
+        let defs = StyleDefinitions::parse(&xml).expect("parse styles");
+        assert_eq!(defs.effective_fonts(None, None, Some("Heading")), None);
+        assert_eq!(defs.effective_fonts(None, Some("Missing"), None), None);
+        assert!(defs.effective_fonts(None, None, None).is_some());
     }
 }

@@ -4,10 +4,10 @@
 //! replacement carries the paragraph's preserved inlines — content controls,
 //! images, fields, line breaks — as `opaque_ref`s, every one of them. One it
 //! leaves out would be destroyed, so the edit is refused `OpaqueDestroyed`,
-//! naming what is missing. A note's body is plain text with no way to carry a
-//! preserved inline, so `edit_note` on a note holding one is refused the same
-//! way. Neither may panic: a refusal is the outcome, whatever the paragraph
-//! holds.
+//! naming what is missing. A note's body line carries each preserved inline as
+//! one U+FFFC, so an `edit_note` line that leaves one out is refused
+//! (`NoteBodyObjectCountMismatch`). Neither may panic: a refusal is the
+//! outcome, whatever the paragraph holds.
 
 use stemma::api::Document;
 use stemma::domain::{BlockNode, InlineNode};
@@ -115,7 +115,7 @@ fn a_replace_naming_one_of_two_content_controls_is_refused_naming_the_other() {
 }
 
 #[test]
-fn edit_note_on_a_note_holding_a_line_break_is_refused() {
+fn edit_note_leaving_out_a_line_break_is_refused() {
     let footnotes = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:footnotes xmlns:w="{W}"><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> First line.</w:t><w:br/><w:t>Second line.</w:t></w:r></w:p></w:footnote></w:footnotes>"#
@@ -128,13 +128,14 @@ fn edit_note_on_a_note_holding_a_line_break_is_refused() {
     let edit = transaction(serde_json::json!({"op":"edit_note","note_id":"1",
         "note_kind":"footnote","body":"Replaced note."}));
     let err = apply_transaction(&doc.snapshot().canonical, &edit)
-        .expect_err("the plain-text body cannot carry the line break");
-    let EditError::OpaqueDestroyed {
-        missing_inline_kinds,
+        .expect_err("a line without the break's placeholder would destroy it");
+    let EditError::NoteBodyObjectCountMismatch {
+        object_count,
+        placeholder_count,
         ..
     } = err
     else {
-        panic!("expected OpaqueDestroyed, got {err:?}");
+        panic!("expected NoteBodyObjectCountMismatch, got {err:?}");
     };
-    assert_eq!(missing_inline_kinds, vec!["hard_break"]);
+    assert_eq!((object_count, placeholder_count), (1, 0));
 }

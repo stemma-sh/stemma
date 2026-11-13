@@ -242,3 +242,72 @@ fn a_cell_paragraphs_range_start_has_the_id_the_body_read_gives_it() {
     .expect("the marker named by its cell-segment id is found");
     assert_eq!(commented(&edited), ("45 days".to_string(), 1, 1, 1));
 }
+
+/// A cell paragraph's segments bracket the commented text with both range
+/// markers, in reading order, each with the id the body read gives it, and
+/// carry the reference as its own anchor (§17.13.4.3-5): a reader pairs
+/// start and end by `reference_id` to find the span.
+#[test]
+fn a_cell_paragraphs_segments_carry_both_range_markers_and_the_reference() {
+    let doc = Document::parse(&docx_in_cell()).expect("parse");
+    let cell = serde_json::to_value(&doc.read().blocks[0].cells[0].paragraphs[0]).unwrap();
+    let block_id = cell["block_id"].as_str().unwrap().to_string();
+    let mut text_before_end = String::new();
+    let mut end_seen = false;
+    let mut anchors: Vec<(String, String, String)> = Vec::new();
+    for segment in cell["segments"].as_array().unwrap() {
+        if let Some(o) = segment.get("Opaque") {
+            if o["kind"] == "CommentRangeEnd" {
+                end_seen = true;
+            }
+            anchors.push((
+                serde_json::to_string(&o["kind"]).unwrap(),
+                o["opaque_id"].as_str().unwrap().to_string(),
+                o["reference_id"].as_str().unwrap_or_default().to_string(),
+            ));
+        } else if !end_seen {
+            let text = segment
+                .as_object()
+                .and_then(|variant| variant.values().next())
+                .and_then(|data| data["text"].as_str())
+                .unwrap_or_default();
+            text_before_end.push_str(text);
+        }
+    }
+    assert_eq!(anchors.len(), 3, "{anchors:?}");
+    assert_eq!(
+        anchors[0],
+        (
+            "\"CommentRangeStart\"".to_string(),
+            "comment_0_start".to_string(),
+            "0".to_string()
+        )
+    );
+    assert_eq!(
+        anchors[1],
+        (
+            "\"CommentRangeEnd\"".to_string(),
+            "comment_0_end".to_string(),
+            "0".to_string()
+        )
+    );
+    assert_eq!(anchors[2].0, "\"CommentReference\"");
+    assert_eq!(anchors[2].2, "0");
+    assert!(text_before_end.ends_with("30 days"), "{text_before_end:?}");
+
+    // The end marker named by its segment id is found by a replacement.
+    let edited = replace_in(
+        &doc,
+        &block_id,
+        serde_json::json!([
+            {"type":"text","text":"The notice period is "},
+            {"type":"opaque_ref","attrs":{"id":anchors[0].1}},
+            {"type":"text","text":"45 days"},
+            {"type":"opaque_ref","attrs":{"id":anchors[1].1}},
+            {"type":"opaque_ref","attrs":{"id":anchors[2].1}},
+            {"type":"text","text":" from the date of this letter."}
+        ]),
+    )
+    .expect("the end marker named by its cell-segment id is found");
+    assert_eq!(commented(&edited), ("45 days".to_string(), 1, 1, 1));
+}

@@ -883,6 +883,7 @@ mod tests {
 
     fn make_text_cell(id: &str, text: &str) -> TableCellNode {
         TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id.to_string()),
             blocks: vec![BlockNode::from(ParagraphNode {
                 id: NodeId::from(format!("{}_p", id)),
@@ -925,6 +926,7 @@ mod tests {
                 numbering: None,
                 has_direct_numbering: true,
                 numbering_suppressed: false,
+                direct_numbering_omits_ilvl: false,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -967,6 +969,7 @@ mod tests {
                 cnf_style: None,
                 source_paragraph_attrs: Vec::new(),
                 preserved_ppr: Vec::new(),
+                cell_move_id: None,
             })],
             grid_span: 1,
             v_merge: VerticalMerge::None,
@@ -1419,6 +1422,7 @@ mod tests {
             numbering: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
+            direct_numbering_omits_ilvl: false,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -1461,9 +1465,11 @@ mod tests {
             cnf_style: None,
             source_paragraph_attrs: Vec::new(),
             preserved_ppr: Vec::new(),
+            cell_move_id: None,
         });
 
         TableCellNode {
+            cell_merge: None,
             id: NodeId::from(id.to_string()),
             blocks: vec![para, BlockNode::from(inner_table)],
             grid_span: 1,
