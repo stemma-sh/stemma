@@ -64,6 +64,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -974,6 +975,7 @@ fn set_attr_hyperlink_rejects_when_block_is_tracked() {
             author: Some("LLM".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }),
         move_id: None,
         block_sdt_wrap: None,
@@ -1150,6 +1152,7 @@ fn set_attr_hyperlink_no_op_when_neither_field_set_after_adapter() {
             author: Some("Counsel".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let err = apply_transaction(&doc, &txn).expect_err("empty set_attr must fail");

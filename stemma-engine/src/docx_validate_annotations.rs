@@ -1252,11 +1252,14 @@ pub fn check_bookmark_name_length(stories: &[(String, &Element)]) -> Vec<Validat
 // I-MATH-001 / I-MATH-002: OMML placement
 // ---------------------------------------------------------------------------
 
-/// Word rejects two `m:oMath` misplacements (oracle-confirmed): an `m:oMath`
+/// Word rejects two math misplacements (oracle-confirmed): an `m:oMath`
 /// nested directly inside another `m:oMath` (Word repairs the file), and an
-/// `m:oMath` placed as a direct child of `w:body`, outside any paragraph (Word
-/// cannot open the file). Both are otherwise schema-detectable only by deep
-/// content-model validation, so flag them explicitly.
+/// `m:oMath` or `m:oMathPara` placed as a direct child of `w:body` or of a
+/// table cell, outside any paragraph (Word cannot open the file, whether
+/// the math comes before or after the cell's paragraph). Inside a paragraph,
+/// in the body or in a cell, both open cleanly. Both faults are otherwise
+/// schema-detectable only by deep content-model validation, so flag them
+/// explicitly.
 /// (ISO 29500-1 §22.1.2.77; MS-OI29500 §2.1.1687.)
 pub fn check_omath_placement(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
     let mut findings = Vec::new();
@@ -1274,29 +1277,29 @@ fn check_omath_inner(
     findings: &mut Vec<ValidationFinding>,
 ) {
     let is_omath = local_name(&el.name) == "oMath";
-    if is_omath {
-        if in_omath {
-            findings.push(ValidationFinding {
-                rule_id: "I-MATH-001",
-                severity: ValidationSeverity::Error,
-                message: "m:oMath nested directly inside another m:oMath; Word repairs the file \
-                     (ISO 29500-1 §22.1.2.77, MS-OI29500 §2.1.1687)"
-                    .to_string(),
-                location: part_path.to_string(),
-            });
-        }
-        if parent_is_body {
-            findings.push(ValidationFinding {
-                rule_id: "I-MATH-002",
-                severity: ValidationSeverity::Error,
-                message: "m:oMath placed as a direct child of w:body, outside any paragraph; \
-                     Word cannot open the file (ISO 29500-1 §22.1.2.77)"
-                    .to_string(),
-                location: part_path.to_string(),
-            });
-        }
+    if is_omath && in_omath {
+        findings.push(ValidationFinding {
+            rule_id: "I-MATH-001",
+            severity: ValidationSeverity::Error,
+            message: "m:oMath nested directly inside another m:oMath; Word repairs the file \
+                 (ISO 29500-1 §22.1.2.77, MS-OI29500 §2.1.1687)"
+                .to_string(),
+            location: part_path.to_string(),
+        });
     }
-    let children_parent_is_body = local_name(&el.name) == "body";
+    if (is_omath || local_name(&el.name) == "oMathPara") && parent_is_body {
+        findings.push(ValidationFinding {
+            rule_id: "I-MATH-002",
+            severity: ValidationSeverity::Error,
+            message: format!(
+                "m:{} placed as a direct child of w:body or of a table cell, outside any \
+                 paragraph; Word cannot open the file (ISO 29500-1 §22.1.2.77)",
+                local_name(&el.name)
+            ),
+            location: part_path.to_string(),
+        });
+    }
+    let children_parent_is_body = is_w_tag(el, "body") || is_w_tag(el, "tc");
     let children_in_omath = in_omath || is_omath;
     for child in &el.children {
         if let XMLNode::Element(child_el) = child {
@@ -1392,6 +1395,1824 @@ pub fn check_move_from_text_form(stories: &[(String, &Element)]) -> Vec<Validati
                 });
             }
         });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-TC-005: inserted text is plain text, deleted text is deleted text
+// ---------------------------------------------------------------------------
+
+/// Deleted text is written as `w:delText`, all other text as `w:t`
+/// (ECMA-376 §17.13.5.14, §17.13.5.18). Every case here was checked against
+/// Word, which repairs a document that spells the text the other way.
+///
+/// Inside a paragraph, any enclosing `w:del` makes the text deleted, in
+/// either nesting order: `w:delText` opens cleanly inside a deletion nested
+/// in an insertion and inside an insertion nested in a deletion, and `w:t`
+/// is repaired in both. With no `w:del`, inside a `w:ins` or outside any
+/// tracked change, the text is `w:t`.
+///
+/// A `w:del` that wraps a whole paragraph is outside the schema, but Word
+/// reads it: the paragraph's text is `w:delText`, unless the paragraph mark
+/// is itself marked deleted (`w:pPr/w:rPr/w:del`), in which case it is
+/// `w:t`. A `w:ins` that wraps a whole paragraph leaves the text `w:t`.
+///
+/// A paragraph that sits under a block-level change and also holds tracked
+/// changes of its own was not checked and is not judged. A text box starts
+/// a new scope. `w:moveFrom` is I-TC-004.
+pub fn check_tracked_text_form(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        let mut problems = Vec::new();
+        tracked_text_form_in(root, TrackedTextScope::default(), &mut problems);
+        for (place, found, expected) in problems {
+            findings.push(ValidationFinding {
+                rule_id: "I-TC-005",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-TC-005: {part_path}: a run {place} spells its text as w:{found}; text \
+                     there is written as {expected}. Word reports the file as corrupted and \
+                     repairs it"
+                ),
+                location: part_path.to_string(),
+            });
+        }
+    }
+    findings
+}
+
+/// Where a run's text sits, for [`check_tracked_text_form`].
+#[derive(Clone, Copy, Default)]
+struct TrackedTextScope {
+    /// A `w:del` / `w:ins` wraps the enclosing paragraph.
+    block_del: bool,
+    block_ins: bool,
+    in_paragraph: bool,
+    /// The enclosing paragraph's mark is marked deleted.
+    mark_deleted: bool,
+    /// Tracked changes between the run and its paragraph.
+    inline_del: bool,
+    inline_ins: bool,
+    moved: bool,
+}
+
+fn paragraph_mark_is_deleted(paragraph: &Element) -> bool {
+    element_children(paragraph)
+        .filter(|child| is_w_tag(child, "pPr"))
+        .flat_map(element_children)
+        .filter(|child| is_w_tag(child, "rPr"))
+        .flat_map(element_children)
+        .any(|child| is_w_tag(child, "del"))
+}
+
+fn tracked_text_form_in(
+    el: &Element,
+    scope: TrackedTextScope,
+    problems: &mut Vec<(&'static str, String, &'static str)>,
+) {
+    let deleted_form = is_w_tag(el, "delText") || is_w_tag(el, "delInstrText");
+    if (deleted_form || is_w_tag(el, "t")) && scope.in_paragraph && !scope.moved {
+        let block_level = scope.block_del || scope.block_ins;
+        let inline = scope.inline_del || scope.inline_ins;
+        // (place, the text must be the deleted form)
+        let expected = if block_level && inline {
+            None
+        } else if scope.inline_del {
+            Some(("inside w:del", true))
+        } else if scope.inline_ins {
+            Some(("inside w:ins", false))
+        } else if scope.block_del && scope.mark_deleted {
+            Some(("in a deleted paragraph whose mark is deleted", false))
+        } else if scope.block_del {
+            Some(("in a paragraph inside w:del", true))
+        } else if scope.block_ins {
+            Some(("in a paragraph inside w:ins", false))
+        } else {
+            Some(("outside any tracked change", false))
+        };
+        if let Some((place, must_be_deleted_form)) = expected
+            && must_be_deleted_form != deleted_form
+        {
+            problems.push((
+                place,
+                local_name(&el.name).to_string(),
+                if must_be_deleted_form {
+                    "w:delText"
+                } else {
+                    "w:t"
+                },
+            ));
+        }
+        return;
+    }
+    let mut inner = scope;
+    if is_w_tag(el, "txbxContent") {
+        inner = TrackedTextScope::default();
+    } else if is_w_tag(el, "p") {
+        inner = TrackedTextScope {
+            block_del: scope.block_del,
+            block_ins: scope.block_ins,
+            in_paragraph: true,
+            mark_deleted: paragraph_mark_is_deleted(el),
+            ..TrackedTextScope::default()
+        };
+    } else if is_w_tag(el, "del") {
+        if scope.in_paragraph {
+            inner.inline_del = true;
+        } else {
+            inner.block_del = true;
+        }
+    } else if is_w_tag(el, "ins") {
+        if scope.in_paragraph {
+            inner.inline_ins = true;
+        } else {
+            inner.block_ins = true;
+        }
+    } else if is_w_tag(el, "moveFrom") || is_w_tag(el, "moveTo") {
+        inner.moved = true;
+    } else if is_w_tag(el, "tbl") {
+        // A table inside a block-level change was not checked.
+        inner = TrackedTextScope::default();
+    }
+    for child in element_children(el) {
+        tracked_text_form_in(child, inner, problems);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I-DOC-004: a run sits in a paragraph, never directly in the body
+// ---------------------------------------------------------------------------
+
+/// `w:body` holds block-level content; a `w:r` belongs inside a paragraph
+/// (ECMA-376 §17.2.2). Checked against Word: it cannot open a document with
+/// a run, or a `w:t`, placed directly in the body, even with repair.
+pub fn check_run_directly_in_body(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if (is_w_tag(el, "r") || is_w_tag(el, "t"))
+                && path.last().map(String::as_str) == Some("body")
+            {
+                findings.push(ValidationFinding {
+                    rule_id: "I-DOC-004",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-DOC-004: {part_path}: a w:{} sits directly in w:body, outside any \
+                         paragraph. Word cannot open such a file",
+                        local_name(&el.name)
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-STORY-002: a run sits in a paragraph inside a note, comment, header or footer
+// ---------------------------------------------------------------------------
+
+/// A comment, footnote, endnote, header or footer holds block-level content,
+/// like the body. Checked against Word with the same story with and without
+/// the paragraph around its runs: a `w:r` directly in `w:comment`,
+/// `w:footnote` or `w:endnote` makes Word repair the file; directly in
+/// `w:hdr` or `w:ftr`, Word cannot open it.
+pub fn check_run_directly_in_story(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if !is_w_tag(el, "r") {
+                return;
+            }
+            let outcome = match path.last().map(String::as_str) {
+                Some("comment" | "footnote" | "endnote") => "Word repairs such a file",
+                Some("hdr" | "ftr") => "Word cannot open such a file",
+                _ => return,
+            };
+            findings.push(ValidationFinding {
+                rule_id: "I-STORY-002",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-STORY-002: {part_path}: a w:r sits directly in w:{}, outside any \
+                     paragraph. {outcome}",
+                    path.last().map(String::as_str).unwrap_or_default()
+                ),
+                location: part_path.to_string(),
+            });
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-ATTR-001: properties whose value Word requires carry it
+// ---------------------------------------------------------------------------
+
+/// Property elements Word refuses without their `w:val`, as
+/// `(element, parent, Word's outcome)`.
+///
+/// Checked against Word with one document carrying all of them, then the same
+/// document with the `w:val` of one removed: without it Word cannot open the
+/// file for `pStyle`, `jc` and `outlineLvl` in a paragraph's properties,
+/// `numId` and `ilvl` in its numbering, `rStyle` in a run's properties and
+/// `tblStyle` in a table's; it repairs the file for `highlight` and
+/// `vertAlign`. The same removal from `w:sz`, `w:color`, `w:lang` and a tab
+/// stop's `w:tab` opens cleanly, so those are not listed.
+const VALUE_REQUIRED: &[(&str, &str, &str)] = &[
+    ("pStyle", "pPr", "Word cannot open such a file"),
+    ("jc", "pPr", "Word cannot open such a file"),
+    ("outlineLvl", "pPr", "Word cannot open such a file"),
+    ("numId", "numPr", "Word cannot open such a file"),
+    ("ilvl", "numPr", "Word cannot open such a file"),
+    ("rStyle", "rPr", "Word cannot open such a file"),
+    ("tblStyle", "tblPr", "Word cannot open such a file"),
+    ("highlight", "rPr", "Word repairs such a file"),
+    ("vertAlign", "rPr", "Word repairs such a file"),
+];
+
+// ---------------------------------------------------------------------------
+// I-ATTR-002: enumerated property values are values Word knows
+// ---------------------------------------------------------------------------
+
+const ST_JC: &[&str] = &[
+    "start",
+    "center",
+    "end",
+    "both",
+    "mediumKashida",
+    "distribute",
+    "numTab",
+    "highKashida",
+    "lowKashida",
+    "thaiDistribute",
+    "left",
+    "right",
+];
+const ST_HIGHLIGHT_COLOR: &[&str] = &[
+    "black",
+    "blue",
+    "cyan",
+    "green",
+    "magenta",
+    "red",
+    "yellow",
+    "white",
+    "darkBlue",
+    "darkCyan",
+    "darkGreen",
+    "darkMagenta",
+    "darkRed",
+    "darkYellow",
+    "darkGray",
+    "lightGray",
+    "none",
+];
+const ST_VERTICAL_ALIGN_RUN: &[&str] = &["baseline", "superscript", "subscript"];
+
+const ST_TEXT_ALIGNMENT: &[&str] = &["top", "center", "baseline", "bottom", "auto"];
+const ST_TEXT_DIRECTION: &[&str] = &[
+    "tb", "rl", "lr", "tbV", "rlV", "lrV", "btLr", "lrTb", "lrTbV", "tbLrV", "tbRl", "tbRlV",
+];
+const ST_TEXT_EFFECT: &[&str] = &[
+    "blinkBackground",
+    "lights",
+    "antsBlack",
+    "antsRed",
+    "shimmer",
+    "sparkle",
+    "none",
+];
+const ST_EM: &[&str] = &["none", "dot", "comma", "circle", "underDot"];
+const ST_VERTICAL_JC: &[&str] = &["top", "center", "both", "bottom"];
+
+const CANNOT_OPEN: &str = "Word cannot open such a file";
+const REPAIRS: &str = "Word repairs such a file";
+
+/// What a property's value must be, for the properties whose wrong value
+/// Word was seen to refuse or repair.
+enum ValueRule {
+    /// One of these tokens.
+    OneOf(&'static [&'static str]),
+    /// A decimal integer.
+    Integer,
+    /// A decimal integer from 0 to 9; a number outside repairs, anything
+    /// else cannot open.
+    OutlineLevel,
+}
+
+/// `(element, parent, attribute, rule, Word's outcome)`. Each row was
+/// checked against Word with one document whose value of that one property
+/// was replaced (`bogus`, a word where a number goes, or the named value),
+/// against the same document with a valid value:
+///
+/// | property | value tried | Word |
+/// |---|---|---|
+/// | pPr `jc` | `justify`, `bogus` | cannot open |
+/// | pPr `outlineLvl` | `x` / `10` | cannot open / repairs |
+/// | pPr `textAlignment` | `bogus` | cannot open |
+/// | pPr and sectPr `textDirection` | `vertical` | cannot open |
+/// | rPr `highlight`, `vertAlign` | `bogus` | repairs |
+/// | rPr `effect`, `em` | `bogus` | repairs |
+/// | tcPr `gridSpan` | `two` | repairs |
+/// | tcPr `vAlign` | `bogus` | cannot open |
+/// | sectPr `cols/@w:num` | `two` | cannot open |
+/// | sectPr `vAlign` | `bogus` | cannot open |
+///
+/// The same change opened cleanly (and is not judged) for: pPr `spacing/@w:lineRule`,
+/// `pBdr` edge `w:val`, `tab/@w:val`; rPr `u`, `color` (`red`), `lang`,
+/// `rFonts/@w:hint`, `sz`, `kern`, `spacing` (words), `shd`, `b`; tblPr
+/// `tblLayout`, `jc`, `tblW/@w:type`; tcPr `vMerge`; trPr `trHeight/@w:hRule`;
+/// sectPr `pgSz/@w:orient`, `pgNumType/@w:fmt`; `fldChar/@w:fldCharType`.
+/// sectPr `type` is not judged: `bogus` cannot open but `page` (outside
+/// ST_SectionMark too) opens cleanly, so the values Word takes are not
+/// established.
+const VALUE_RULES: &[(&str, &str, &str, ValueRule, &str)] = &[
+    ("jc", "pPr", "val", ValueRule::OneOf(ST_JC), CANNOT_OPEN),
+    (
+        "outlineLvl",
+        "pPr",
+        "val",
+        ValueRule::OutlineLevel,
+        CANNOT_OPEN,
+    ),
+    (
+        "textAlignment",
+        "pPr",
+        "val",
+        ValueRule::OneOf(ST_TEXT_ALIGNMENT),
+        CANNOT_OPEN,
+    ),
+    (
+        "textDirection",
+        "pPr",
+        "val",
+        ValueRule::OneOf(ST_TEXT_DIRECTION),
+        CANNOT_OPEN,
+    ),
+    (
+        "textDirection",
+        "sectPr",
+        "val",
+        ValueRule::OneOf(ST_TEXT_DIRECTION),
+        CANNOT_OPEN,
+    ),
+    (
+        "highlight",
+        "rPr",
+        "val",
+        ValueRule::OneOf(ST_HIGHLIGHT_COLOR),
+        REPAIRS,
+    ),
+    (
+        "vertAlign",
+        "rPr",
+        "val",
+        ValueRule::OneOf(ST_VERTICAL_ALIGN_RUN),
+        REPAIRS,
+    ),
+    (
+        "effect",
+        "rPr",
+        "val",
+        ValueRule::OneOf(ST_TEXT_EFFECT),
+        REPAIRS,
+    ),
+    ("em", "rPr", "val", ValueRule::OneOf(ST_EM), REPAIRS),
+    ("gridSpan", "tcPr", "val", ValueRule::Integer, REPAIRS),
+    (
+        "vAlign",
+        "tcPr",
+        "val",
+        ValueRule::OneOf(ST_VERTICAL_JC),
+        CANNOT_OPEN,
+    ),
+    ("cols", "sectPr", "num", ValueRule::Integer, CANNOT_OPEN),
+    (
+        "vAlign",
+        "sectPr",
+        "val",
+        ValueRule::OneOf(ST_VERTICAL_JC),
+        CANNOT_OPEN,
+    ),
+];
+
+/// I-ATTR-002: property values outside their type, per [`VALUE_RULES`]. A
+/// missing value is I-ATTR-001's.
+pub fn check_property_value_enumerations(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            let parent = path.last().map(String::as_str);
+            for (name, expected_parent, attribute, rule, outcome) in VALUE_RULES {
+                if !is_w_tag(el, name) || parent != Some(*expected_parent) {
+                    continue;
+                }
+                let Some(value) = el
+                    .attributes
+                    .iter()
+                    .find(|(attr, _)| attr.local_name == *attribute)
+                    .map(|(_, value)| value.as_str())
+                else {
+                    continue;
+                };
+                let outcome = match rule {
+                    ValueRule::OneOf(allowed) => (!allowed.contains(&value)).then_some(*outcome),
+                    ValueRule::Integer => value.parse::<i64>().is_err().then_some(*outcome),
+                    ValueRule::OutlineLevel => match value.parse::<i64>() {
+                        Err(_) => Some(CANNOT_OPEN),
+                        Ok(level) if level > 9 => Some(REPAIRS),
+                        Ok(_) => None,
+                    },
+                };
+                if let Some(outcome) = outcome {
+                    findings.push(ValidationFinding {
+                        rule_id: "I-ATTR-002",
+                        severity: ValidationSeverity::Error,
+                        message: format!(
+                            "I-ATTR-002: {part_path}: w:{name}/@w:{attribute} {value:?} in w:{expected_parent} \
+                             is not a value Word knows for it. {outcome}"
+                        ),
+                        location: part_path.to_string(),
+                    });
+                }
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-SDT-004: what a plain-text content control holds
+// ---------------------------------------------------------------------------
+
+/// Whether a content control shows its placeholder (`w:showingPlcHdr` with a
+/// `w:placeholder`). Word opens such a control cleanly where it repairs the
+/// same control showing its own content: a picture control naming a
+/// drop-down list as well, and a drop-down list around two paragraphs, are
+/// clean when they show their placeholder (observed).
+pub(crate) fn sdt_shows_placeholder(sdt_pr: &Element) -> bool {
+    element_children(sdt_pr).any(|child| is_w_tag(child, "showingPlcHdr"))
+        && element_children(sdt_pr).any(|child| is_w_tag(child, "placeholder"))
+}
+
+/// Checked against Word, one plain-text content control (`w:text`) with
+/// and without one piece of content (the same control without `w:text`,
+/// rich text, opens cleanly in each case):
+///
+/// - a field inside it (`w:fldChar`/`w:instrText` or a `w:fldSimple`):
+///   repaired;
+/// - a `w:bookmarkEnd` inside it whose `w:bookmarkStart` is outside: repaired;
+///   a whole bookmark, or only its start, inside an inline control: clean;
+/// - in a control around paragraphs (block level), a `w:bookmarkEnd` after
+///   a run in one of its paragraphs (its start inside or outside):
+///   repaired. A bookmark end before the paragraph's runs, a bookmark start
+///   anywhere, and a bookmark end standing beside the paragraphs, directly
+///   in the control, open cleanly.
+pub fn check_plain_text_control_content(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    fn collect<'a>(element: &'a Element, out: &mut Vec<&'a Element>) {
+        for child in element_children(element) {
+            out.push(child);
+            collect(child, out);
+        }
+    }
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if !is_w_tag(el, "sdt") {
+                return;
+            }
+            let Some(sdt_pr) = element_children(el).find(|child| is_w_tag(child, "sdtPr")) else {
+                return;
+            };
+            // A control showing its placeholder is not judged: one around
+            // table cells holding a field, showing its placeholder, opens
+            // cleanly (observed).
+            if !element_children(sdt_pr).any(|child| is_w_tag(child, "text"))
+                || sdt_shows_placeholder(sdt_pr)
+            {
+                return;
+            }
+            let Some(content) = element_children(el).find(|child| is_w_tag(child, "sdtContent"))
+            else {
+                return;
+            };
+            let mut inside = Vec::new();
+            collect(content, &mut inside);
+            let block = path.last().map(String::as_str) != Some("p");
+            let id = |element: &Element| attr_get(element, "w:id").cloned();
+            let starts: Vec<Option<String>> = inside
+                .iter()
+                .filter(|e| is_w_tag(e, "bookmarkStart"))
+                .map(|e| id(e))
+                .collect();
+            let problem = if inside.iter().any(|e| {
+                is_w_tag(e, "fldChar") || is_w_tag(e, "instrText") || is_w_tag(e, "fldSimple")
+            }) {
+                Some("holds a field")
+            } else if block
+                && element_children(content)
+                    .filter(|c| is_w_tag(c, "p"))
+                    .any(|paragraph| {
+                        element_children(paragraph)
+                            .skip_while(|child| !is_w_tag(child, "r"))
+                            .any(|later| is_w_tag(later, "bookmarkEnd"))
+                    })
+            {
+                Some("holds a paragraph with a bookmark end after its text")
+            } else if !block
+                && inside
+                    .iter()
+                    .any(|e| is_w_tag(e, "bookmarkEnd") && !starts.contains(&id(e)))
+            {
+                Some("holds the end of a bookmark that starts outside it")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                findings.push(ValidationFinding {
+                    rule_id: "I-SDT-004",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-SDT-004: {part_path}: a plain-text content control {problem}. Word \
+                         repairs such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-STRUCT-001: structural faults Word refuses or repairs in a story
+// ---------------------------------------------------------------------------
+
+const ST_REL_FROM_H: &[&str] = &[
+    "margin",
+    "page",
+    "column",
+    "character",
+    "leftMargin",
+    "rightMargin",
+    "insideMargin",
+    "outsideMargin",
+];
+const ST_REL_FROM_V: &[&str] = &[
+    "margin",
+    "page",
+    "paragraph",
+    "line",
+    "topMargin",
+    "bottomMargin",
+    "insideMargin",
+    "outsideMargin",
+];
+const ST_ALIGN_H: &[&str] = &["left", "right", "center", "inside", "outside"];
+const ST_ALIGN_V: &[&str] = &["top", "bottom", "center", "inside", "outside"];
+const MATH_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+/// Each checked against Word with one document with and without the fault:
+///
+/// - a drawing's `wp:extent` with a negative or fractional `cx`/`cy`, a
+///   `wp:posOffset` that is not an integer (`.75` added, or a word), a
+///   `wp:positionH`/`wp:positionV` `relativeFrom` outside its type, or a
+///   `wp:align` outside its type (`middle`): repaired. A negative
+///   `wp:posOffset` opens cleanly;
+/// - a `w:listItem` without `w:value`: cannot open;
+/// - an `mc:AlternateContent` whose `mc:Fallback` comes before its
+///   `mc:Choice`: repaired;
+/// - a `w:bookmarkStart` without `w:name` whose `w:bookmarkEnd` is in the
+///   part: repaired (one displaced by custom XML opens cleanly);
+/// - an inline content control (in a paragraph) whose content holds a
+///   paragraph, followed in that paragraph by a run: cannot open (with only
+///   bookmark ends or nothing after it, clean);
+/// - an `m:t` outside an `m:r`: cannot open (inside a tracked change that is
+///   inside the `m:r`, clean).
+pub fn check_story_structure(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        let mut bookmark_end_ids = std::collections::HashSet::new();
+        walk_elements(root, &mut |el, _path| {
+            if is_w_tag(el, "bookmarkEnd")
+                && let Some(id) = attr_get(el, "w:id")
+            {
+                bookmark_end_ids.insert(id.clone());
+            }
+        });
+        walk_elements(root, &mut |el, path| {
+            let parent = path.last().map(String::as_str);
+            let attr = |name: &str| {
+                el.attributes
+                    .iter()
+                    .find(|(attr, _)| attr.local_name == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            let in_wp = el.namespace.as_deref() == Some(WORDPROCESSING_DRAWING_NS);
+            let local = local_name(&el.name);
+            let text = || {
+                el.get_text()
+                    .map(|t| t.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let problem: Option<(String, &str)> = if in_wp && local == "extent" {
+                ["cx", "cy"].iter().find_map(|name| {
+                    let value = attr(name)?;
+                    value
+                        .parse::<u64>()
+                        .is_err()
+                        .then(|| (format!("wp:extent/@{name} is {value:?}"), REPAIRS))
+                })
+            } else if in_wp && local == "posOffset" {
+                let value = text();
+                value
+                    .parse::<i64>()
+                    .is_err()
+                    .then(|| (format!("wp:posOffset is {value:?}"), REPAIRS))
+            } else if in_wp && (local == "positionH" || local == "positionV") {
+                let allowed = if local == "positionH" {
+                    ST_REL_FROM_H
+                } else {
+                    ST_REL_FROM_V
+                };
+                attr("relativeFrom")
+                    .filter(|value| !allowed.contains(value))
+                    .map(|value| (format!("wp:{local}/@relativeFrom is {value:?}"), REPAIRS))
+            } else if in_wp && local == "align" && matches!(parent, Some("positionH" | "positionV"))
+            {
+                let allowed = if parent == Some("positionH") {
+                    ST_ALIGN_H
+                } else {
+                    ST_ALIGN_V
+                };
+                let value = text();
+                (!allowed.contains(&value.as_str()))
+                    .then(|| (format!("wp:align is {value:?}"), REPAIRS))
+            } else if is_w_tag(el, "listItem") && attr("value").is_none() {
+                Some(("a w:listItem has no w:value".to_string(), CANNOT_OPEN))
+            } else if el.namespace.as_deref() == Some(MC_NS) && local == "AlternateContent" {
+                let order: Vec<&str> = element_children(el)
+                    .filter(|child| child.namespace.as_deref() == Some(MC_NS))
+                    .map(|child| local_name(&child.name))
+                    .collect();
+                let fallback = order.iter().position(|name| *name == "Fallback");
+                let last_choice = order.iter().rposition(|name| *name == "Choice");
+                matches!((fallback, last_choice), (Some(f), Some(c)) if f < c).then(|| {
+                    (
+                        "an mc:Fallback comes before an mc:Choice".to_string(),
+                        REPAIRS,
+                    )
+                })
+            } else if is_w_tag(el, "bookmarkStart")
+                && attr("name").is_none()
+                && attr("displacedByCustomXml").is_none()
+                && attr("id").is_some_and(|id| bookmark_end_ids.contains(id))
+            {
+                Some(("a w:bookmarkStart has no w:name".to_string(), REPAIRS))
+            } else if is_w_tag(el, "p")
+                && element_children(el)
+                    .skip_while(|child| {
+                        !(is_w_tag(child, "sdt")
+                            && element_children(child)
+                                .filter(|c| is_w_tag(c, "sdtContent"))
+                                .flat_map(element_children)
+                                .any(|c| is_w_tag(c, "p")))
+                    })
+                    .skip(1)
+                    .any(|later| is_w_tag(later, "r"))
+            {
+                Some((
+                    "an inline content control holds a paragraph and a run follows it".to_string(),
+                    CANNOT_OPEN,
+                ))
+            } else if el.namespace.as_deref() == Some(MATH_NS)
+                && local == "t"
+                && path
+                    .iter()
+                    .rev()
+                    .find(|ancestor| {
+                        !matches!(ancestor.as_str(), "ins" | "del" | "moveFrom" | "moveTo")
+                    })
+                    .map(String::as_str)
+                    != Some("r")
+            {
+                Some(("an m:t sits outside an m:r".to_string(), CANNOT_OPEN))
+            } else {
+                None
+            };
+            if let Some((what, outcome)) = problem {
+                findings.push(ValidationFinding {
+                    rule_id: "I-STRUCT-001",
+                    severity: ValidationSeverity::Error,
+                    message: format!("I-STRUCT-001: {part_path}: {what}. {outcome}"),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-NS-003: elements in a namespace Word does not know
+// ---------------------------------------------------------------------------
+
+/// Namespace URIs whose elements Word reads or skips by itself: the OOXML
+/// and Microsoft Office families. An element in any other namespace is one
+/// only `mc:Ignorable` makes Word skip.
+fn is_office_namespace(uri: &str) -> bool {
+    [
+        "http://schemas.openxmlformats.org/",
+        "http://purl.oclc.org/ooxml/",
+        "http://schemas.microsoft.com/",
+        "urn:schemas-microsoft-com:",
+        "http://www.w3.org/",
+    ]
+    .iter()
+    .any(|prefix| uri.starts_with(prefix))
+}
+
+/// I-NS-003. Checked against Word: an element in a namespace outside the
+/// Office families (`urn:example:…`, or a default-namespace element), not
+/// made ignorable by `mc:Ignorable`, in a body paragraph, at body level, in
+/// a run, in run properties, or in a header paragraph: Word cannot open
+/// the file. The same element made ignorable opens cleanly. Content inside
+/// an `mc:AlternateContent` is left to its branch selection and not judged.
+pub fn check_unknown_namespace_elements(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    fn walk(
+        part_path: &str,
+        element: &Element,
+        ignorable: &mut Vec<String>,
+        findings: &mut Vec<ValidationFinding>,
+    ) {
+        let pushed = element
+            .attributes
+            .iter()
+            .find(|(name, _)| {
+                name.local_name == "Ignorable" && name.namespace.as_deref() == Some(MC_NS)
+            })
+            .map(|(_, value)| {
+                value
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let count = pushed.len();
+        ignorable.extend(pushed);
+        let namespace = element.namespace.as_deref().unwrap_or("");
+        let skipped = element
+            .prefix
+            .as_deref()
+            .is_some_and(|prefix| ignorable.iter().any(|p| p == prefix));
+        if !skipped && !namespace.is_empty() && !is_office_namespace(namespace) {
+            findings.push(ValidationFinding {
+                rule_id: "I-NS-003",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-NS-003: {part_path}: element {:?} is in namespace {namespace:?}, which \
+                     Word does not know, and no mc:Ignorable names it. Word cannot open such \
+                     a file",
+                    element.name
+                ),
+                location: part_path.to_string(),
+            });
+        } else if !skipped
+            && !(element.namespace.as_deref() == Some(MC_NS) && element.name == "AlternateContent")
+        {
+            for child in element_children(element) {
+                walk(part_path, child, ignorable, findings);
+            }
+        }
+        ignorable.truncate(ignorable.len() - count);
+    }
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk(part_path, root, &mut Vec::new(), &mut findings);
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-RUN-003: no run or paragraph out of place inside w:t
+// ---------------------------------------------------------------------------
+
+/// `w:t` holds text only. Checked against Word: a `w:r` inside a `w:t`
+/// makes Word refuse the file; so does text after a `w:p` held in a `w:t`,
+/// and a run following, in the same paragraph, the run whose `w:t` holds a
+/// `w:p`. A `w:t` holding paragraphs and nothing after them, as the last
+/// content of its paragraph, opens cleanly (and is read as Word reads it).
+pub fn check_text_element_content(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    let mut report = |part_path: &str, what: &str| {
+        findings.push(ValidationFinding {
+            rule_id: "I-RUN-003",
+            severity: ValidationSeverity::Error,
+            message: format!("I-RUN-003: {part_path}: {what}. Word cannot open such a file"),
+            location: part_path.to_string(),
+        });
+    };
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if is_w_tag(el, "t") {
+                if element_children(el).any(|child| is_w_tag(child, "r")) {
+                    report(part_path, "a w:r sits inside a w:t");
+                }
+                let mut after_paragraph = false;
+                for child in &el.children {
+                    match child {
+                        XMLNode::Element(child) if is_w_tag(child, "p") => after_paragraph = true,
+                        XMLNode::Text(text) | XMLNode::CData(text)
+                            if after_paragraph && !text.trim().is_empty() =>
+                        {
+                            report(part_path, "text follows a w:p held inside a w:t");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if is_w_tag(el, "p") {
+                let runs: Vec<&Element> =
+                    element_children(el).filter(|c| is_w_tag(c, "r")).collect();
+                let holds_paragraph = |run: &Element| {
+                    element_children(run).any(|t| {
+                        is_w_tag(t, "t") && element_children(t).any(|inner| is_w_tag(inner, "p"))
+                    })
+                };
+                if let Some(position) = runs.iter().position(|run| holds_paragraph(run))
+                    && position + 1 < runs.len()
+                {
+                    report(
+                        part_path,
+                        "a run follows the run whose w:t holds a w:p, in the same paragraph",
+                    );
+                }
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-DRAW-003: a picture's graphic data names the picture type
+// ---------------------------------------------------------------------------
+
+const PICTURE_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+const GROUP_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup";
+
+/// `a:graphicData/@uri` names the kind of graphic it holds. Checked against
+/// Word with an inline picture whose graphic data names another kind: with
+/// `.../drawingml/2006/pictures` Word repairs the file, with the chart uri
+/// it cannot open it; with the picture uri it opens cleanly. A shape group
+/// (`wpg:wgp`) whose graphic data names `.../2006/pictures` instead of the
+/// group namespace is repaired too (a Word-clean document changed in that
+/// one value). Only graphic data holding a `pic:pic` or a `wpg:wgp` is
+/// judged: a lone shape under the group uri opens cleanly.
+pub fn check_picture_graphic_data_uri(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if el.namespace.as_deref() != Some(DRAWING_NS) || local_name(&el.name) != "graphicData"
+            {
+                return;
+            }
+            let expected = element_children(el).find_map(|child| {
+                match (child.namespace.as_deref(), local_name(&child.name)) {
+                    (Some(PICTURE_NS), "pic") => Some(("a picture", PICTURE_URI)),
+                    (Some(GROUP_NS), "wgp") => Some(("a shape group", GROUP_NS)),
+                    _ => None,
+                }
+            });
+            let uri = el
+                .attributes
+                .iter()
+                .find(|(attr, _)| attr.local_name == "uri")
+                .map(|(_, value)| value.as_str());
+            if let Some((kind, expected)) = expected
+                && let Some(uri) = uri
+                && uri != expected
+            {
+                findings.push(ValidationFinding {
+                    rule_id: "I-DRAW-003",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-DRAW-003: {part_path}: graphic data holding {kind} names {uri:?}, \
+                         not {expected:?}. Word repairs such a file or cannot open it"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+pub fn check_required_property_values(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            let Some((name, parent, outcome)) = VALUE_REQUIRED
+                .iter()
+                .find(|(name, _, _)| is_w_tag(el, name))
+            else {
+                return;
+            };
+            if path.last().map(String::as_str) != Some(*parent)
+                || el
+                    .attributes
+                    .iter()
+                    .any(|(attr, _)| attr.local_name == "val")
+            {
+                return;
+            }
+            findings.push(ValidationFinding {
+                rule_id: "I-ATTR-001",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-ATTR-001: {part_path}: a w:{name} in w:{parent} has no w:val. {outcome}"
+                ),
+                location: part_path.to_string(),
+            });
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-FLD-001: a simple field carries its instruction
+// ---------------------------------------------------------------------------
+
+/// `w:fldSimple/@w:instr` is required (ECMA-376 §17.16.19). Checked against
+/// Word: without the attribute it cannot open the file; with an empty
+/// instruction (`w:instr=""`) the file opens cleanly.
+pub fn check_simple_field_instruction(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if is_w_tag(el, "fldSimple")
+                && !el
+                    .attributes
+                    .iter()
+                    .any(|(attr, _)| attr.local_name == "instr")
+            {
+                findings.push(ValidationFinding {
+                    rule_id: "I-FLD-001",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-FLD-001: {part_path}: a w:fldSimple has no w:instr. Word cannot \
+                         open such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-SDT-003: a picture content control is no other kind as well
+// ---------------------------------------------------------------------------
+
+/// `w:sdtPr` names at most one kind of control (ECMA-376 §17.5.2.38, a
+/// choice), yet Word tolerates most doubles. Checked against Word, one
+/// content control with two kind elements: `w:picture` together with any
+/// other kind — `w:text`, `w:richText`, `w:date`, `w:dropDownList`,
+/// `w:comboBox`, `w:docPartObj`, `w:docPartList`, `w:equation`,
+/// `w:citation`, `w:group`, `w:bibliography`, `w14:checkbox` or a second
+/// `w:picture`, in either order — makes Word repair the file. Without a
+/// picture, two kinds open cleanly (two `w:text`, `w:richText` with
+/// `w:text`, `w:date` with `w:dropDownList`, `w:comboBox` with
+/// `w:dropDownList`, `w14:checkbox` with `w:text`, and `w:docPartObj`,
+/// `w:citation`, `w:equation`, `w:group` or `w:bibliography` with `w:text`).
+const CONTROL_KINDS: &[&str] = &[
+    "picture",
+    "text",
+    "richText",
+    "date",
+    "dropDownList",
+    "comboBox",
+    "docPartObj",
+    "docPartList",
+    "equation",
+    "citation",
+    "group",
+    "bibliography",
+];
+
+const WORD_2010_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+
+/// The kind a child of `w:sdtPr` names, if it names one.
+fn control_kind(child: &Element) -> Option<&str> {
+    if local_name(&child.name) == "checkbox"
+        && (child.namespace.as_deref() == Some(WORD_2010_NS)
+            || child.prefix.as_deref() == Some("w14"))
+    {
+        return Some("w14:checkbox");
+    }
+    CONTROL_KINDS
+        .iter()
+        .find(|kind| is_w_tag(child, kind))
+        .map(|_| local_name(&child.name))
+}
+
+pub fn check_picture_control_kind(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if !is_w_tag(el, "sdtPr") {
+                return;
+            }
+            let kinds: Vec<&str> = element_children(el).filter_map(control_kind).collect();
+            if kinds.contains(&"picture") && kinds.len() > 1 && !sdt_shows_placeholder(el) {
+                findings.push(ValidationFinding {
+                    rule_id: "I-SDT-003",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-SDT-003: {part_path}: a picture content control names a second \
+                         kind of control ({}). Word repairs such a file",
+                        kinds.join(", ")
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-DOC-005: text sits in a run, never directly in a paragraph
+// ---------------------------------------------------------------------------
+
+/// `w:t` belongs inside a run (ECMA-376 §17.3.3.31). Checked against Word:
+/// it cannot open a document with a `w:t` placed directly in a paragraph,
+/// even with repair.
+pub fn check_text_directly_in_paragraph(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if is_w_tag(el, "t") && path.last().map(String::as_str) == Some("p") {
+                findings.push(ValidationFinding {
+                    rule_id: "I-DOC-005",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-DOC-005: {part_path}: a w:t sits directly in w:p, outside any run. \
+                         Word cannot open such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-RUN-001: a bidirectional override or embedding states its direction
+// ---------------------------------------------------------------------------
+
+/// `w:bdo` and `w:dir` carry their direction in `w:val` (ECMA-376 §17.3.2.3,
+/// §17.3.2.8). Checked against Word: it cannot open a document with a
+/// `w:bdo` or a `w:dir` that has no `w:val`, nor one whose `w:bdo` names a
+/// direction other than `ltr` or `rtl`; with `ltr` or `rtl` it opens
+/// without repair.
+pub fn check_bidi_direction(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            let is_bdo = is_w_tag(el, "bdo");
+            if !is_bdo && !is_w_tag(el, "dir") {
+                return;
+            }
+            let direction = el
+                .attributes
+                .iter()
+                .find(|(name, _)| name.local_name == "val")
+                .map(|(_, value)| value.as_str());
+            let problem = match direction {
+                None => Some("has no w:val".to_string()),
+                Some("ltr" | "rtl") => None,
+                Some(other) if is_bdo => Some(format!("names the direction {other:?}")),
+                Some(_) => None,
+            };
+            if let Some(problem) = problem {
+                findings.push(ValidationFinding {
+                    rule_id: "I-RUN-001",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-RUN-001: {part_path}: a w:{} {problem}; the direction is ltr or \
+                         rtl. Word cannot open such a file",
+                        local_name(&el.name)
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-DOC-006: a section does not end inside a table cell
+// ---------------------------------------------------------------------------
+
+/// A paragraph's `w:sectPr` ends a section there (ECMA-376 §17.6.18).
+/// Checked against Word: it cannot open a document whose `w:sectPr` sits in
+/// a paragraph inside a table cell; in a body paragraph it opens cleanly.
+pub fn check_section_break_in_table_cell(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if !is_w_tag(el, "sectPr") || path.last().map(String::as_str) != Some("pPr") {
+                return;
+            }
+            // The nearest cell or text box decides: a text box starts its
+            // own content and is not judged here.
+            let container = path
+                .iter()
+                .rev()
+                .find(|ancestor| matches!(ancestor.as_str(), "tc" | "txbxContent"));
+            if container.map(String::as_str) == Some("tc") {
+                findings.push(ValidationFinding {
+                    rule_id: "I-DOC-006",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-DOC-006: {part_path}: a w:sectPr sits in a paragraph inside a \
+                         table cell. Word cannot open such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-RUN-002: no w:contentPart in a run
+// ---------------------------------------------------------------------------
+
+/// `w:contentPart` (ISO/IEC 29500 run content, `CT_Rel`) is not read by
+/// Word. Checked against Word with the same paragraph with and without one:
+/// Word repairs the file whatever the relationship names — an ink part as
+/// Word itself writes it (under the customXml relationship), an image, an
+/// OLE part (a compound file or not) — and when it names no relationship.
+/// Word writes ink as `w14:contentPart` inside a drawing, which is another
+/// element and is not judged here.
+pub fn check_content_part_in_run(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if is_w_tag(el, "contentPart") {
+                findings.push(ValidationFinding {
+                    rule_id: "I-RUN-002",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-RUN-002: {part_path}: a run holds a w:contentPart; Word repairs \
+                         such a file, whatever part it names"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-OBJ-001: an embedded object is not written as w:objectEmbed
+// ---------------------------------------------------------------------------
+
+/// `w:object` may name its embedded part with `w:objectEmbed` (ISO/IEC 29500
+/// `CT_ObjectEmbed`); Word writes `o:OLEObject` inside the VML instead.
+/// Checked against Word with the same object with and without the
+/// `w:objectEmbed`: with it Word cannot open the file, whether the part it
+/// names is a valid compound file, a few bytes that are not one, or empty,
+/// and whether or not the shape carries a picture. Without it, and with
+/// `o:OLEObject` naming the same part (valid or not), the file opens cleanly.
+pub fn check_object_embed(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, path| {
+            if is_w_tag(el, "objectEmbed") && path.last().map(String::as_str) == Some("object") {
+                findings.push(ValidationFinding {
+                    rule_id: "I-OBJ-001",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-OBJ-001: {part_path}: a w:object names its embedded part with \
+                         w:objectEmbed; Word cannot open such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-DRAW-001 / I-DRAW-002: a drawing carries the pieces Word requires
+// ---------------------------------------------------------------------------
+
+const WORDPROCESSING_DRAWING_NS: &str =
+    "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+const DRAWING_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const PICTURE_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+const WORDPROCESSING_SHAPE_NS: &str =
+    "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
+
+/// What Word requires of one drawing element: attributes that must be
+/// present, and children (in the listed namespace) that must be present.
+struct DrawingRequirement {
+    namespace: &'static str,
+    local: &'static str,
+    /// The element is judged only under this parent, when one is named.
+    parent: Option<&'static str>,
+    attributes: &'static [&'static str],
+    children: &'static [(&'static str, &'static str)],
+}
+
+/// Checked against Word by removing one attribute or one child at a time
+/// from four drawings it opens cleanly (an inline picture, an anchored
+/// picture, an inline text-box shape, an anchored text-box shape). Every
+/// entry here is a removal after which Word repairs the document. Removals
+/// Word opens cleanly are not listed: the `dist*` attributes,
+/// `wp:effectExtent`, `wp:cNvGraphicFramePr`, the blip's `r:embed`,
+/// `a:stretch`, `a:xfrm` and its children, `a:avLst`, and a picture's
+/// `a:prstGeom`.
+const DRAWING_REQUIREMENTS: &[DrawingRequirement] = &[
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "inline",
+        parent: None,
+        attributes: &[],
+        children: &[
+            (WORDPROCESSING_DRAWING_NS, "extent"),
+            (WORDPROCESSING_DRAWING_NS, "docPr"),
+            (DRAWING_NS, "graphic"),
+        ],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "anchor",
+        parent: None,
+        attributes: &[
+            "simplePos",
+            "relativeHeight",
+            "behindDoc",
+            "locked",
+            "layoutInCell",
+            "allowOverlap",
+        ],
+        children: &[
+            (WORDPROCESSING_DRAWING_NS, "simplePos"),
+            (WORDPROCESSING_DRAWING_NS, "positionH"),
+            (WORDPROCESSING_DRAWING_NS, "positionV"),
+            (WORDPROCESSING_DRAWING_NS, "extent"),
+            (WORDPROCESSING_DRAWING_NS, "docPr"),
+            (DRAWING_NS, "graphic"),
+        ],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "simplePos",
+        parent: Some("anchor"),
+        attributes: &["x", "y"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "positionH",
+        parent: Some("anchor"),
+        attributes: &["relativeFrom"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "positionV",
+        parent: Some("anchor"),
+        attributes: &["relativeFrom"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "extent",
+        parent: None,
+        attributes: &["cx", "cy"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "effectExtent",
+        parent: None,
+        attributes: &["l", "t", "r", "b"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: WORDPROCESSING_DRAWING_NS,
+        local: "docPr",
+        parent: None,
+        attributes: &["id", "name"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: DRAWING_NS,
+        local: "graphic",
+        parent: None,
+        attributes: &[],
+        children: &[(DRAWING_NS, "graphicData")],
+    },
+    DrawingRequirement {
+        namespace: DRAWING_NS,
+        local: "graphicData",
+        parent: Some("graphic"),
+        attributes: &["uri"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: PICTURE_NS,
+        local: "pic",
+        parent: None,
+        attributes: &[],
+        children: &[
+            (PICTURE_NS, "nvPicPr"),
+            (PICTURE_NS, "blipFill"),
+            (PICTURE_NS, "spPr"),
+        ],
+    },
+    DrawingRequirement {
+        namespace: PICTURE_NS,
+        local: "nvPicPr",
+        parent: None,
+        attributes: &[],
+        children: &[(PICTURE_NS, "cNvPr"), (PICTURE_NS, "cNvPicPr")],
+    },
+    DrawingRequirement {
+        namespace: PICTURE_NS,
+        local: "cNvPr",
+        parent: Some("nvPicPr"),
+        attributes: &["id", "name"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: PICTURE_NS,
+        local: "blipFill",
+        parent: Some("pic"),
+        attributes: &[],
+        children: &[(DRAWING_NS, "blip")],
+    },
+    DrawingRequirement {
+        namespace: DRAWING_NS,
+        local: "off",
+        parent: Some("xfrm"),
+        attributes: &["x", "y"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: DRAWING_NS,
+        local: "ext",
+        parent: Some("xfrm"),
+        attributes: &["cx", "cy"],
+        children: &[],
+    },
+    DrawingRequirement {
+        namespace: DRAWING_NS,
+        local: "prstGeom",
+        parent: None,
+        attributes: &["prst"],
+        children: &[],
+    },
+];
+
+fn drawing_prefix(namespace: &str) -> &'static str {
+    match namespace {
+        WORDPROCESSING_DRAWING_NS => "wp",
+        DRAWING_NS => "a",
+        PICTURE_NS => "pic",
+        WORDPROCESSING_SHAPE_NS => "wps",
+        _ => "w",
+    }
+}
+
+const MARKUP_COMPATIBILITY_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+fn element_children(el: &Element) -> impl Iterator<Item = &Element> {
+    el.children.iter().filter_map(|node| match node {
+        XMLNode::Element(child) => Some(child),
+        _ => None,
+    })
+}
+
+/// The element's children as Word reads them: a child wrapped in
+/// `mc:AlternateContent` (in any `mc:Choice` or the `mc:Fallback`) counts as
+/// a child. Word writes an anchor's `wp:positionH`/`wp:positionV` that way
+/// when the position is a percentage.
+fn children_through_alternate_content(el: &Element) -> Vec<&Element> {
+    let mut children = Vec::new();
+    for child in element_children(el) {
+        if child.namespace.as_deref() == Some(MARKUP_COMPATIBILITY_NS) {
+            if local_name(&child.name) == "AlternateContent" {
+                for branch in element_children(child) {
+                    children.extend(children_through_alternate_content(branch));
+                }
+            }
+        } else {
+            children.push(child);
+        }
+    }
+    children
+}
+
+/// The nearest ancestor that is not markup-compatibility wrapping.
+fn parent_through_alternate_content(path: &[String]) -> Option<&str> {
+    path.iter()
+        .rev()
+        .map(String::as_str)
+        .find(|ancestor| !matches!(*ancestor, "AlternateContent" | "Choice" | "Fallback"))
+}
+
+fn has_child(el: &Element, namespace: &str, local: &str) -> bool {
+    children_through_alternate_content(el).iter().any(|child| {
+        child.namespace.as_deref() == Some(namespace) && local_name(&child.name) == local
+    })
+}
+
+fn has_attribute(el: &Element, local: &str) -> bool {
+    el.attributes
+        .iter()
+        .any(|(name, _)| name.local_name == local)
+}
+
+/// A drawing carries the attributes and children Word requires.
+///
+/// I-DRAW-001 (Word repairs the document): a missing required attribute or
+/// child from [`DRAWING_REQUIREMENTS`]; an anchored drawing with no wrapping
+/// element; a `wp:positionH`/`wp:positionV` with no position inside; a
+/// `wps:wsp` in shape graphic data without `wps:spPr` or `wps:bodyPr`, with
+/// neither `wps:cNvSpPr` nor `wps:cNvCnPr`, or whose `wps:spPr` names no
+/// geometry; a `wp:docPr` whose `id` is not an unsigned
+/// 32-bit number. (Two drawings sharing one `wp:docPr` id open cleanly, and
+/// so does a complete picture with no image behind it.)
+///
+/// I-DRAW-002 (Word cannot open the document): a `w:drawing` that does not
+/// hold exactly one `wp:inline` or `wp:anchor`, and an `a:graphicData` with
+/// nothing inside.
+pub fn check_drawing_required_parts(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        let mut repaired = Vec::new();
+        let mut unopenable = Vec::new();
+        walk_elements(root, &mut |el, path| {
+            let local = local_name(&el.name);
+            let namespace = el.namespace.as_deref().unwrap_or_default();
+            let name = format!("{}:{local}", drawing_prefix(namespace));
+
+            if is_w_tag(el, "drawing") {
+                let children = children_through_alternate_content(el);
+                let one_frame = children.len() == 1
+                    && children[0].namespace.as_deref() == Some(WORDPROCESSING_DRAWING_NS)
+                    && matches!(local_name(&children[0].name), "inline" | "anchor");
+                if !one_frame {
+                    unopenable.push(
+                        "a w:drawing does not hold exactly one wp:inline or wp:anchor".to_string(),
+                    );
+                }
+                return;
+            }
+
+            if let Some(requirement) = DRAWING_REQUIREMENTS.iter().find(|requirement| {
+                requirement.namespace == namespace
+                    && requirement.local == local
+                    && requirement
+                        .parent
+                        .is_none_or(|parent| parent_through_alternate_content(path) == Some(parent))
+            }) {
+                for attribute in requirement.attributes {
+                    if !has_attribute(el, attribute) {
+                        repaired.push(format!("a {name} element has no {attribute} attribute"));
+                    }
+                }
+                for (child_namespace, child) in requirement.children {
+                    if !has_child(el, child_namespace, child) {
+                        repaired.push(format!(
+                            "a {name} element has no {}:{child} child",
+                            drawing_prefix(child_namespace)
+                        ));
+                    }
+                }
+            }
+
+            match (namespace, local) {
+                (WORDPROCESSING_DRAWING_NS, "anchor") => {
+                    let wrapped = children_through_alternate_content(el).iter().any(|child| {
+                        child.namespace.as_deref() == Some(WORDPROCESSING_DRAWING_NS)
+                            && matches!(
+                                local_name(&child.name),
+                                "wrapNone"
+                                    | "wrapSquare"
+                                    | "wrapTight"
+                                    | "wrapThrough"
+                                    | "wrapTopAndBottom"
+                            )
+                    });
+                    if !wrapped {
+                        repaired.push("a wp:anchor element has no wrapping element".to_string());
+                    }
+                }
+                (WORDPROCESSING_DRAWING_NS, "positionH" | "positionV")
+                    if parent_through_alternate_content(path) == Some("anchor") =>
+                {
+                    if element_children(el).next().is_none() {
+                        repaired.push(format!("a {name} element holds no position"));
+                    }
+                }
+                (WORDPROCESSING_DRAWING_NS, "docPr") => {
+                    if let Some((_, id)) = el
+                        .attributes
+                        .iter()
+                        .find(|(name, _)| name.local_name == "id")
+                        && id.trim().parse::<u32>().is_err()
+                    {
+                        repaired.push(format!(
+                            "a wp:docPr id {id:?} is not an unsigned 32-bit number"
+                        ));
+                    }
+                }
+                (DRAWING_NS, "graphicData")
+                    if parent_through_alternate_content(path) == Some("graphic") =>
+                {
+                    let children = children_through_alternate_content(el);
+                    if children.is_empty() {
+                        unopenable.push("an a:graphicData element is empty".to_string());
+                    }
+                    // A shape is judged where Word reads one: directly in
+                    // graphic data that declares the shape namespace. Word
+                    // opens a wps:wsp left under another declared kind
+                    // cleanly, whatever it lacks.
+                    let declares_shape = el.attributes.iter().any(|(name, value)| {
+                        name.local_name == "uri" && value == WORDPROCESSING_SHAPE_NS
+                    });
+                    for shape in children.iter().filter(|child| {
+                        declares_shape
+                            && child.namespace.as_deref() == Some(WORDPROCESSING_SHAPE_NS)
+                            && local_name(&child.name) == "wsp"
+                    }) {
+                        for required in ["spPr", "bodyPr"] {
+                            if !has_child(shape, WORDPROCESSING_SHAPE_NS, required) {
+                                repaired
+                                    .push(format!("a wps:wsp element has no wps:{required} child"));
+                            }
+                        }
+                        if !has_child(shape, WORDPROCESSING_SHAPE_NS, "cNvSpPr")
+                            && !has_child(shape, WORDPROCESSING_SHAPE_NS, "cNvCnPr")
+                        {
+                            repaired.push(
+                                "a wps:wsp element has neither a wps:cNvSpPr nor a wps:cNvCnPr \
+                                 child"
+                                    .to_string(),
+                            );
+                        }
+                        let geometry = children_through_alternate_content(shape)
+                            .into_iter()
+                            .filter(|child| {
+                                child.namespace.as_deref() == Some(WORDPROCESSING_SHAPE_NS)
+                                    && local_name(&child.name) == "spPr"
+                            })
+                            .all(|properties| {
+                                has_child(properties, DRAWING_NS, "prstGeom")
+                                    || has_child(properties, DRAWING_NS, "custGeom")
+                            });
+                        if !geometry {
+                            repaired.push("a wps:spPr element names no geometry".to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        for problem in repaired {
+            findings.push(ValidationFinding {
+                rule_id: "I-DRAW-001",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-DRAW-001: {part_path}: {problem}. Word reports the file as corrupted \
+                     and repairs it"
+                ),
+                location: part_path.to_string(),
+            });
+        }
+        for problem in unopenable {
+            findings.push(ValidationFinding {
+                rule_id: "I-DRAW-002",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-DRAW-002: {part_path}: {problem}. Word cannot open such a file"
+                ),
+                location: part_path.to_string(),
+            });
+        }
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-SDT-002: a list item's display text is not empty
+// ---------------------------------------------------------------------------
+
+/// A `w:listItem` of a combo-box or drop-down content control does not
+/// carry an empty `w:displayText` (I-SDT-002). Checked against Word: it
+/// cannot open a document where one does, in a combo box or a drop-down
+/// list, inline or around a paragraph, whatever the item's `w:value`. An
+/// item with no `w:displayText` at all, with an empty `w:value`, or sharing
+/// its value or display text with another item opens cleanly.
+pub fn check_content_control_list_items(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if !is_w_tag(el, "listItem") {
+                return;
+            }
+            let empty_display = el
+                .attributes
+                .iter()
+                .any(|(name, value)| name.local_name == "displayText" && value.is_empty());
+            if empty_display {
+                findings.push(ValidationFinding {
+                    rule_id: "I-SDT-002",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-SDT-002: {part_path}: a w:listItem has an empty w:displayText. Word \
+                         cannot open such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-TBL-001 / I-TBL-002: a cell ends with a paragraph; a row holds a cell
+// ---------------------------------------------------------------------------
+
+/// A table cell holds block content and its last block is not a table
+/// (ECMA-376 §17.4.66: a cell ends with a paragraph). Checked against Word:
+/// it repairs a document with a cell that is empty, holds only `w:tcPr`,
+/// holds only a table, or ends with a table; a cell ending with a paragraph
+/// (after a nested table, or inside a content control) opens cleanly, and
+/// so does one with a bookmark end after its last paragraph (I-TBL-001).
+/// Word cannot open a document with a row that holds no cell (I-TBL-002).
+pub fn check_table_cell_and_row_content(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if is_w_tag(el, "tc") {
+                let last_block = element_children(el)
+                    .filter(|child| {
+                        ["p", "tbl", "sdt", "customXml"]
+                            .iter()
+                            .any(|block| is_w_tag(child, block))
+                    })
+                    .last();
+                let problem = match last_block {
+                    None => Some("holds no paragraph"),
+                    Some(block) if is_w_tag(block, "tbl") => Some("ends with a table"),
+                    Some(_) => None,
+                };
+                if let Some(problem) = problem {
+                    findings.push(ValidationFinding {
+                        rule_id: "I-TBL-001",
+                        severity: ValidationSeverity::Error,
+                        message: format!(
+                            "I-TBL-001: {part_path}: a table cell {problem}; a cell ends with \
+                             a paragraph. Word reports the file as corrupted and repairs it"
+                        ),
+                        location: part_path.to_string(),
+                    });
+                }
+            } else if is_w_tag(el, "tr") && !contains_w_tag(el, "tc") {
+                findings.push(ValidationFinding {
+                    rule_id: "I-TBL-002",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-TBL-002: {part_path}: a table row holds no cell. Word cannot open \
+                         such a file"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        });
+    }
+    findings
+}
+
+fn contains_w_tag(el: &Element, local: &str) -> bool {
+    element_children(el).any(|child| is_w_tag(child, local) || contains_w_tag(child, local))
+}
+
+// ---------------------------------------------------------------------------
+// I-SDT-001: a single-paragraph content control holds one paragraph
+// ---------------------------------------------------------------------------
+
+/// A block-level content control of a kind that holds one value (plain
+/// text, date, drop-down list, combo box, picture) holds exactly one
+/// paragraph. Checked against Word: it repairs a document where such a
+/// control wraps two paragraphs, or a table; the same control around one
+/// paragraph opens cleanly, and a rich-text control (no kind element)
+/// around two paragraphs opens cleanly. A plain-text control inside a
+/// paragraph, around several runs, opens cleanly and is not judged.
+pub fn check_content_control_single_paragraph(
+    stories: &[(String, &Element)],
+) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        walk_elements(root, &mut |el, _path| {
+            if !is_w_tag(el, "sdt") {
+                return;
+            }
+            let child = |local: &str| element_children(el).find(|child| is_w_tag(child, local));
+            let (Some(properties), Some(content)) = (child("sdtPr"), child("sdtContent")) else {
+                return;
+            };
+            let Some(kind) = element_children(properties).find_map(|property| {
+                ["text", "date", "dropDownList", "comboBox", "picture"]
+                    .into_iter()
+                    .find(|kind| is_w_tag(property, kind))
+            }) else {
+                return;
+            };
+            let paragraphs = element_children(content)
+                .filter(|block| is_w_tag(block, "p"))
+                .count();
+            let tables = element_children(content)
+                .filter(|block| is_w_tag(block, "tbl"))
+                .count();
+            // Block level only: a control around runs, cells or rows holds
+            // no paragraph or table of its own. A control showing its
+            // placeholder is clean around several (see sdt_shows_placeholder).
+            if paragraphs + tables == 0
+                || (paragraphs == 1 && tables == 0)
+                || sdt_shows_placeholder(properties)
+            {
+                return;
+            }
+            findings.push(ValidationFinding {
+                rule_id: "I-SDT-001",
+                severity: ValidationSeverity::Error,
+                message: format!(
+                    "I-SDT-001: {part_path}: a w:{kind} content control holds {paragraphs} \
+                     paragraph(s) and {tables} table(s); such a control holds exactly one \
+                     paragraph. Word reports the file as corrupted and repairs it"
+                ),
+                location: part_path.to_string(),
+            });
+        });
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
+// I-MC-001: every prefix named by mc:Ignorable is declared
+// ---------------------------------------------------------------------------
+
+/// `mc:Ignorable` lists namespace prefixes, and each must be declared on
+/// the element (ISO/IEC 29500-3 §10.1). Checked against Word: it repairs a
+/// document whose root names an undeclared prefix in `mc:Ignorable`, and
+/// opens it cleanly once the prefix is declared or the list is empty.
+pub fn check_ignorable_prefixes_declared(stories: &[(String, &Element)]) -> Vec<ValidationFinding> {
+    let mut findings = Vec::new();
+    for (part_path, root) in stories {
+        let Some((_, ignorable)) = root.attributes.iter().find(|(name, _)| {
+            name.local_name == "Ignorable"
+                && name.namespace.as_deref()
+                    == Some("http://schemas.openxmlformats.org/markup-compatibility/2006")
+        }) else {
+            continue;
+        };
+        for prefix in ignorable.split_whitespace() {
+            let declared = root
+                .namespaces
+                .as_ref()
+                .is_some_and(|namespaces| namespaces.get(prefix).is_some());
+            if !declared {
+                findings.push(ValidationFinding {
+                    rule_id: "I-MC-001",
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "I-MC-001: {part_path}: mc:Ignorable names the prefix {prefix:?}, \
+                         which the root element does not declare. Word reports the file as \
+                         corrupted and repairs it"
+                    ),
+                    location: part_path.to_string(),
+                });
+            }
+        }
     }
     findings
 }

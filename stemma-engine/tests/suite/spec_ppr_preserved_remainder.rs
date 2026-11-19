@@ -143,6 +143,7 @@ fn preserved_ppr_children_survive_an_unrelated_edit_and_validate_full() {
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
 
@@ -228,6 +229,7 @@ fn preserved_ppr_children_survive_reimport_after_unrelated_edit() {
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let edited = doc.apply(&txn).expect("apply");
@@ -321,6 +323,7 @@ fn preserved_ppr_survives_a_tracked_text_edit_and_both_resolutions() {
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
 

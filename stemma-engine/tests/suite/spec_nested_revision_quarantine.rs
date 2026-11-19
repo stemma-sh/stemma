@@ -77,6 +77,7 @@ fn revision() -> RevisionInfo {
         author: Some("quarantine-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -157,27 +158,40 @@ fn quarantined_block_round_trips_byte_faithfully_through_edits_elsewhere() {
     );
 }
 
-// ─── Same-type nesting: invalid OOXML refuses at the entry door ──────────────
+// ─── Same-type nesting: read as Word reads it ────────────────────────────────
 
+/// Checked against Word with this document: it opens without repair; the
+/// outer insertion's own run is A's insertion and the nested one is B's.
 #[test]
-fn same_type_nesting_refuses_at_import() {
+fn same_type_nesting_reads_the_inner_change() {
     let ins_in_ins = r#"<w:p><w:ins w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:t>a</w:t></w:r><w:ins w:id="2" w:author="B" w:date="2026-01-02T00:00:00Z"><w:r><w:t>b</w:t></w:r></w:ins></w:ins></w:p>"#;
-    let err = Document::parse(&make_docx_with_body(ins_in_ins))
-        .err()
-        .expect("ins-in-ins is invalid OOXML (I-TC-003) and must refuse at import");
+    let doc = Document::parse(&make_docx_with_body(ins_in_ins)).expect("Word opens ins-in-ins");
+    let mut authors: Vec<String> = doc
+        .revisions()
+        .iter()
+        .map(|revision| format!("{:?}", revision.author))
+        .collect();
+    authors.sort();
+    assert_eq!(authors.len(), 2, "{authors:?}");
     assert!(
-        err.message.contains("ins") && err.message.to_lowercase().contains("nest"),
-        "the refusal must name the same-type nesting: {}",
-        err.message
+        authors[0].contains('A') && authors[1].contains('B'),
+        "{authors:?}"
     );
+}
 
-    let del_in_del = r#"<w:p><w:del w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText>a</w:delText></w:r><w:del w:id="2" w:author="B" w:date="2026-01-02T00:00:00Z"><w:r><w:delText>b</w:delText></w:r></w:del></w:del></w:p>"#;
-    let err = Document::parse(&make_docx_with_body(del_in_del))
+/// Word reads a run that FOLLOWS the nested insertion, still inside the
+/// outer one, as not tracked at all (checked: it is saved as plain text).
+/// That reading is not modeled, so the document is refused, never loaded
+/// with the run counted as the outer insertion.
+#[test]
+fn content_after_a_same_type_nested_change_is_refused() {
+    let body = r#"<w:p><w:ins w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:t>a</w:t></w:r><w:ins w:id="2" w:author="B" w:date="2026-01-02T00:00:00Z"><w:r><w:t>b</w:t></w:r></w:ins><w:r><w:t>c</w:t></w:r></w:ins></w:p>"#;
+    let err = Document::parse(&make_docx_with_body(body))
         .err()
-        .expect("del-in-del is invalid OOXML (I-TC-003) and must refuse at import");
+        .expect("not modeled");
     assert!(
-        err.message.contains("del") && err.message.to_lowercase().contains("nest"),
-        "the refusal must name the same-type nesting: {}",
+        err.message.to_lowercase().contains("nest"),
+        "{}",
         err.message
     );
 }
@@ -370,15 +384,14 @@ fn tracked_change_inside_a_textbox_story_is_not_nesting() {
     );
 }
 
-/// Negative control for the boundary rule: REAL same-type nesting in the SAME
-/// story still refuses at the entry door.
+/// Same-type nesting in the SAME story is one change, the inner one, as
+/// Word reads it (checked).
 #[test]
-fn same_type_nesting_in_the_same_story_still_refuses() {
-    let bad = r#"<w:p><w:ins w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:ins w:id="2" w:author="B" w:date="2026-01-02T00:00:00Z"><w:r><w:t>doubly inserted</w:t></w:r></w:ins></w:ins></w:p>"#;
-    let bytes = make_docx_with_body(&format!("{bad}{PLAIN_P}"));
-    let err = match Document::parse(&bytes) {
-        Err(e) => e,
-        Ok(_) => panic!("same-type nesting in one story must refuse"),
-    };
-    assert!(err.message.contains("same-type nesting"), "{}", err.message);
+fn same_type_nesting_in_the_same_story_is_the_inner_change() {
+    let nested = r#"<w:p><w:ins w:id="1" w:author="A" w:date="2026-01-01T00:00:00Z"><w:ins w:id="2" w:author="B" w:date="2026-01-02T00:00:00Z"><w:r><w:t>doubly inserted</w:t></w:r></w:ins></w:ins></w:p>"#;
+    let bytes = make_docx_with_body(&format!("{nested}{PLAIN_P}"));
+    let doc = Document::parse(&bytes).expect("Word opens ins-in-ins");
+    let revisions = doc.revisions();
+    assert_eq!(revisions.len(), 1, "{revisions:?}");
+    assert!(format!("{:?}", revisions[0].author).contains('B'));
 }

@@ -7,6 +7,16 @@ const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006
 const W14_NS: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
 pub(crate) const W16DU_NS: &str = "http://schemas.microsoft.com/office/word/2023/wordml/word16du";
 
+/// The explicit UTC date (`w16du:dateUtc`, MS-DOCX §2.12.2.1) of a revision
+/// element, matched by namespace so any input prefix is read; `None` when the
+/// element carries none.
+pub(crate) fn revision_date_utc(element: &Element) -> Option<String> {
+    element.attributes.iter().find_map(|(name, value)| {
+        (name.namespace.as_deref() == Some(W16DU_NS) && name.local_name == "dateUtc")
+            .then(|| value.clone())
+    })
+}
+
 pub fn attr_get<'a>(element: &'a Element, qname: &str) -> Option<&'a String> {
     let (want_prefix, want_local) = split_qname(qname);
 

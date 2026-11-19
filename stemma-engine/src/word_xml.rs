@@ -73,6 +73,22 @@ pub(crate) fn active_word_text(element: &Element) -> String {
     }
 }
 
+/// The text Word reads from text written in a `w:t` or `w:delText` leaf
+/// (`written` as [`active_word_text`] returns it): a line feed and a
+/// carriage return are one space each, not a line break; everything else,
+/// a tab character included (Word reads it as a tab), is read as written.
+///
+/// Observed by resaving through Word, with and without
+/// `xml:space="preserve"`: `one\ntwo` comes back as `one two`, `one\n\ntwo`
+/// as two spaces, `&#13;` and `&#10;` as one space each, spaces around a
+/// line feed are kept. A carriage return written before a line feed is
+/// already one line feed to the XML parser (XML 1.0 §2.11), so it is one
+/// space too. One character stands for one, so offsets into the written
+/// text are offsets into the text read.
+pub(crate) fn word_text_as_read(written: &str) -> String {
+    written.replace(['\r', '\n'], " ")
+}
+
 /// Remove inactive XML boundary whitespace from a WordprocessingML text leaf
 /// without disturbing comments or any other raw child nodes.
 pub fn normalize_word_text_boundary_space(element: &mut Element) {
@@ -450,7 +466,7 @@ pub fn document_root_ancestors(bytes: &[u8]) -> Result<Vec<Element>, WordXmlErro
             Event::Start(ref start) => {
                 let (element, frame) = element_from_start(start, &reader, &scope)?;
                 if depth == 0 {
-                    if !is_w_tag(&element, "document") {
+                    if !is_document_root(&element) {
                         return Err(WordXmlError::MissingDocument);
                     }
                     ancestors.push(element); // childless: only attrs + namespaces
@@ -525,7 +541,7 @@ pub fn parse_document_background_element(bytes: &[u8]) -> Result<Option<Element>
             Event::Start(ref start) => {
                 let (element, frame) = element_from_start(start, &reader, &scope)?;
                 if depth == 0 {
-                    if !is_w_tag(&element, "document") {
+                    if !is_document_root(&element) {
                         return Err(WordXmlError::MissingDocument);
                     }
                     scope.push(frame);
@@ -753,8 +769,10 @@ fn element_from_start(
     // These entries are dropped on serialization (`serialize_element` rebuilds
     // xmlns decls from USED prefixes), so they never leak into round-tripped bytes.
     let mut hoisted_requires: Vec<(String, String)> = Vec::new();
+    // The Choice is recognized by its namespace: the prefix bound to the
+    // markup-compatibility namespace is the producer's choice (`mc`, `ve`).
     if name == "Choice"
-        && prefix.as_deref() == Some("mc")
+        && namespace == Some(MC_NS)
         && let Some((_, requires)) = attributes
             .iter()
             .find(|(an, _)| an.prefix.is_none() && an.local_name == "Requires")
@@ -824,6 +842,17 @@ fn resolve_in_frame_then_scope<'a>(
 /// the engine reads and re-serializes, while avoiding the per-element namespace
 /// clone that dominated peak heap.
 pub fn parse_document_xml_quick(bytes: &[u8]) -> Result<Element, WordXmlError> {
+    // XML 1.0 §2.11: before parsing, a processor reads each literal
+    // carriage return, alone or before a line feed, as one line feed. A
+    // carriage return the text means is written `&#13;`, which this leaves
+    // alone. quick-xml does not do this itself.
+    let normalized;
+    let bytes = if bytes.contains(&b'\r') {
+        normalized = normalize_line_ends(bytes);
+        normalized.as_slice()
+    } else {
+        bytes
+    };
     let mut reader = Reader::from_reader(bytes);
     {
         let config = reader.config_mut();
@@ -1046,7 +1075,7 @@ pub fn for_each_body_child<E>(
                     element_from_start(start, &reader, &scope).map_err(xml_err)?;
 
                 if depth == 0 {
-                    if !is_w_tag(&element, "document") {
+                    if !is_document_root(&element) {
                         return Err(xml_err(WordXmlError::MissingDocument));
                     }
                     seen_document = true;
@@ -1086,7 +1115,7 @@ pub fn for_each_body_child<E>(
                 if depth == 0 {
                     // An empty <w:document/> is malformed for our purposes
                     // (no body) but matches MissingBody after the loop.
-                    if !is_w_tag(&element, "document") {
+                    if !is_document_root(&element) {
                         return Err(xml_err(WordXmlError::MissingDocument));
                     }
                     seen_document = true;
@@ -1286,7 +1315,28 @@ fn ensure_xml_depth_within_limit(bytes: &[u8], limit: usize) -> Result<(), WordX
 pub fn write_document_xml(element: &Element) -> Result<Vec<u8>, WordXmlError> {
     let mut out = Vec::new();
     element.write(&mut out).map_err(WordXmlError::XmlWrite)?;
-    Ok(out)
+    Ok(escape_carriage_returns(out))
+}
+
+/// A carriage return in text or an attribute value written as `&#13;`.
+///
+/// The emitter writes it as it is, and a reader takes a carriage return
+/// written as such for a line feed (XML 1.0 §2.11): a `&#13;` read in would
+/// come back as a line feed. The emitter's own markup holds none, so every
+/// one in its output is a character of the content.
+pub(crate) fn escape_carriage_returns(xml: Vec<u8>) -> Vec<u8> {
+    if !xml.contains(&b'\r') {
+        return xml;
+    }
+    let mut out = Vec::with_capacity(xml.len() + 8);
+    for byte in xml {
+        if byte == b'\r' {
+            out.extend_from_slice(b"&#13;");
+        } else {
+            out.push(byte);
+        }
+    }
+    out
 }
 
 const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
@@ -1457,8 +1507,17 @@ fn extract_prefix(name: &str) -> Option<&str> {
     }
 }
 
+/// Whether an element can be the main part's root: any element in the
+/// WordprocessingML namespace. Word opens a main part whose root is
+/// `w:wordDocument` (or any other name in that namespace) without repair
+/// and reads its body (observed); the name is not checked.
+fn is_document_root(element: &Element) -> bool {
+    element.namespace.as_deref() == Some(WORD_NS)
+        || (element.namespace.is_none() && element.prefix.as_deref() == Some("w"))
+}
+
 pub fn body_element_mut(root: &mut Element) -> Result<&mut Element, WordXmlError> {
-    if !is_w_tag(root, "document") {
+    if !is_document_root(root) {
         return Err(WordXmlError::MissingDocument);
     }
     let body_count = count_w_children(root, "body");
@@ -1469,7 +1528,7 @@ pub fn body_element_mut(root: &mut Element) -> Result<&mut Element, WordXmlError
 }
 
 pub fn body_element(root: &Element) -> Result<&Element, WordXmlError> {
-    if !is_w_tag(root, "document") {
+    if !is_document_root(root) {
         return Err(WordXmlError::MissingDocument);
     }
     let body_count = count_w_children(root, "body");
@@ -1696,7 +1755,7 @@ pub fn serialize_raw_fragment(element: &Element) -> Vec<u8> {
     stripped
         .write_with_config(&mut buf, config)
         .expect("re-serializing a parsed opaque fragment must not fail");
-    buf
+    escape_carriage_returns(buf)
 }
 
 #[doc(hidden)]
@@ -1755,51 +1814,54 @@ fn find_w_child_mut<'a>(element: &'a mut Element, local: &str) -> Option<&'a mut
     })
 }
 
-fn set_revision_date(element: &mut Element, date: &str, include_utc: bool) {
+/// Write a revision's dates: `w:date` when it has one, and `w16du:dateUtc`
+/// exactly as the revision carries it (MS-DOCX §2.12.2.1). The two are
+/// independent (Word writes the author's local clock in `w:date`), so the
+/// UTC date is never derived from `w:date` here.
+fn set_revision_date(element: &mut Element, date: &str, date_utc: Option<&str>) {
     // Revision dates are optional in OOXML. Preserve absence honestly instead
     // of serializing a missing model value as the invalid token `w:date=""`.
-    if date.is_empty() {
-        return;
+    if !date.is_empty() {
+        attr_set(element, "w:date", date);
     }
-    attr_set(element, "w:date", date);
-    if include_utc {
-        attr_set(element, "w16du:dateUtc", date);
+    if let Some(date_utc) = date_utc {
+        attr_set(element, "w16du:dateUtc", date_utc);
     }
 }
 
 /// Creates a `<w:del>` element with revision attributes
-pub fn w_del(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_del(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut del = w_el("del");
     attr_set(&mut del, "w:id", revision_id.to_string());
     attr_set(&mut del, "w:author", author);
-    set_revision_date(&mut del, date, true);
+    set_revision_date(&mut del, date, date_utc);
     del
 }
 
 /// Creates a `<w:ins>` element with revision attributes
-pub fn w_ins(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_ins(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut ins = w_el("ins");
     attr_set(&mut ins, "w:id", revision_id.to_string());
     attr_set(&mut ins, "w:author", author);
-    set_revision_date(&mut ins, date, true);
+    set_revision_date(&mut ins, date, date_utc);
     ins
 }
 
 /// Creates a `<w:moveFrom>` element with revision attributes (tracked move source).
-pub fn w_move_from(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_move_from(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut el = w_el("moveFrom");
     attr_set(&mut el, "w:id", revision_id.to_string());
     attr_set(&mut el, "w:author", author);
-    set_revision_date(&mut el, date, true);
+    set_revision_date(&mut el, date, date_utc);
     el
 }
 
 /// Creates a `<w:moveTo>` element with revision attributes (tracked move destination).
-pub fn w_move_to(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_move_to(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut el = w_el("moveTo");
     attr_set(&mut el, "w:id", revision_id.to_string());
     attr_set(&mut el, "w:author", author);
-    set_revision_date(&mut el, date, true);
+    set_revision_date(&mut el, date, date_utc);
     el
 }
 
@@ -1809,7 +1871,7 @@ pub fn w_move_from_range_start(bookmark_id: u32, name: &str, author: &str, date:
     attr_set(&mut el, "w:id", bookmark_id.to_string());
     attr_set(&mut el, "w:name", name);
     attr_set(&mut el, "w:author", author);
-    set_revision_date(&mut el, date, false);
+    set_revision_date(&mut el, date, None);
     el
 }
 
@@ -1826,7 +1888,7 @@ pub fn w_move_to_range_start(bookmark_id: u32, name: &str, author: &str, date: &
     attr_set(&mut el, "w:id", bookmark_id.to_string());
     attr_set(&mut el, "w:name", name);
     attr_set(&mut el, "w:author", author);
-    set_revision_date(&mut el, date, false);
+    set_revision_date(&mut el, date, None);
     el
 }
 
@@ -1838,20 +1900,20 @@ pub fn w_move_to_range_end(bookmark_id: u32) -> Element {
 }
 
 /// Creates a `<w:cellIns>` element with revision attributes (tracked cell insertion)
-pub fn w_cell_ins(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_cell_ins(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut cell_ins = w_el("cellIns");
     attr_set(&mut cell_ins, "w:id", revision_id.to_string());
     attr_set(&mut cell_ins, "w:author", author);
-    set_revision_date(&mut cell_ins, date, true);
+    set_revision_date(&mut cell_ins, date, date_utc);
     cell_ins
 }
 
 /// Creates a `<w:cellDel>` element with revision attributes (tracked cell deletion)
-pub fn w_cell_del(revision_id: u32, author: &str, date: &str) -> Element {
+pub fn w_cell_del(revision_id: u32, author: &str, date: &str, date_utc: Option<&str>) -> Element {
     let mut cell_del = w_el("cellDel");
     attr_set(&mut cell_del, "w:id", revision_id.to_string());
     attr_set(&mut cell_del, "w:author", author);
-    set_revision_date(&mut cell_del, date, true);
+    set_revision_date(&mut cell_del, date, date_utc);
     cell_del
 }
 
@@ -1863,6 +1925,7 @@ pub fn w_cell_merge(
     revision_id: u32,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     after: &crate::domain::VerticalMerge,
     before: &crate::domain::VerticalMerge,
 ) -> Element {
@@ -1876,7 +1939,7 @@ pub fn w_cell_merge(
     let mut cell_merge = w_el("cellMerge");
     attr_set(&mut cell_merge, "w:id", revision_id.to_string());
     attr_set(&mut cell_merge, "w:author", author);
-    set_revision_date(&mut cell_merge, date, true);
+    set_revision_date(&mut cell_merge, date, date_utc);
     if let Some(value) = annotation(after) {
         attr_set(&mut cell_merge, "w:vMerge", value);
     }
@@ -1946,15 +2009,27 @@ fn append_ppr_rpr_marker(paragraph: &mut Element, marker: Element) {
 /// OOXML requires this in addition to wrapping runs in `<w:ins>`. Without it,
 /// empty inserted paragraphs have no visible tracked insertion, and accept/reject
 /// semantics may break.
-pub fn ensure_ppr_rpr_ins(paragraph: &mut Element, rev_id: u32, author: &str, date: &str) {
-    append_ppr_rpr_marker(paragraph, w_ins(rev_id, author, date));
+pub fn ensure_ppr_rpr_ins(
+    paragraph: &mut Element,
+    rev_id: u32,
+    author: &str,
+    date: &str,
+    date_utc: Option<&str>,
+) {
+    append_ppr_rpr_marker(paragraph, w_ins(rev_id, author, date, date_utc));
 }
 
 /// Marks the paragraph mark as deleted by adding `<w:del>` inside `<w:pPr><w:rPr>`.
 ///
 /// OOXML requires this for proper accept/reject of paragraph-level deletions.
-pub fn ensure_ppr_rpr_del(paragraph: &mut Element, rev_id: u32, author: &str, date: &str) {
-    append_ppr_rpr_marker(paragraph, w_del(rev_id, author, date));
+pub fn ensure_ppr_rpr_del(
+    paragraph: &mut Element,
+    rev_id: u32,
+    author: &str,
+    date: &str,
+    date_utc: Option<&str>,
+) {
+    append_ppr_rpr_marker(paragraph, w_del(rev_id, author, date, date_utc));
 }
 
 /// Marks the paragraph mark as a MOVE DESTINATION by adding `<w:moveTo>` inside
@@ -1965,20 +2040,50 @@ pub fn ensure_ppr_rpr_del(paragraph: &mut Element, rev_id: u32, author: &str, da
 /// A plain `w:ins` on a moveTo destination's pilcrow is an INDEPENDENT
 /// paragraph-mark insertion Word rejects on its own, merging the paragraph with
 /// the next (§17.13.5.20 CT_ParaRPr permits moveTo/moveFrom on the mark).
-pub fn ensure_ppr_rpr_move_to(paragraph: &mut Element, rev_id: u32, author: &str, date: &str) {
-    append_ppr_rpr_marker(paragraph, w_move_to(rev_id, author, date));
+pub fn ensure_ppr_rpr_move_to(
+    paragraph: &mut Element,
+    rev_id: u32,
+    author: &str,
+    date: &str,
+    date_utc: Option<&str>,
+) {
+    append_ppr_rpr_marker(paragraph, w_move_to(rev_id, author, date, date_utc));
 }
 
 /// Marks the paragraph mark as a MOVE SOURCE by adding `<w:moveFrom>` inside
 /// `<w:pPr><w:rPr>`. The moveFrom-shadow twin of `ensure_ppr_rpr_del`; see
 /// `ensure_ppr_rpr_move_to`.
-pub fn ensure_ppr_rpr_move_from(paragraph: &mut Element, rev_id: u32, author: &str, date: &str) {
-    append_ppr_rpr_marker(paragraph, w_move_from(rev_id, author, date));
+pub fn ensure_ppr_rpr_move_from(
+    paragraph: &mut Element,
+    rev_id: u32,
+    author: &str,
+    date: &str,
+    date_utc: Option<&str>,
+) {
+    append_ppr_rpr_marker(paragraph, w_move_from(rev_id, author, date, date_utc));
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// XML 1.0 §2.11 end-of-line handling: `\r\n` and a lone `\r` become `\n`.
+fn normalize_line_ends(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            out.push(b'\n');
+            if bytes.get(i + 1) == Some(&b'\n') {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -2015,7 +2120,10 @@ mod tests {
 
     #[test]
     fn revision_helpers_omit_an_absent_date() {
-        for element in [w_ins(1, "Reviewer", ""), w_del(2, "Reviewer", "")] {
+        for element in [
+            w_ins(1, "Reviewer", "", None),
+            w_del(2, "Reviewer", "", None),
+        ] {
             assert!(attr_get(&element, "w:date").is_none());
             assert!(attr_get(&element, "w16du:dateUtc").is_none());
         }
@@ -2181,7 +2289,7 @@ mod tests {
         para.attributes.insert(attr_name, "AABBCCDD".to_string());
 
         // A w:ins child with w16du:dateUtc attribute (w_ins adds it).
-        let ins = w_ins(1, "test", "2025-01-01");
+        let ins = w_ins(1, "test", "2025-01-01", Some("2025-01-01"));
         para.children.push(XMLNode::Element(ins));
         root.children.push(XMLNode::Element(para));
 
@@ -2210,7 +2318,7 @@ mod tests {
         ns.put("w", WORD_NS);
         ns.put("mc", MC_NS);
 
-        let ins = w_ins(1, "test", "2025-01-01"); // adds w16du:dateUtc
+        let ins = w_ins(1, "test", "2025-01-01", Some("2025-01-01")); // adds w16du:dateUtc
         let mut para = w_el("p");
         para.children.push(XMLNode::Element(ins));
         root.children.push(XMLNode::Element(para));
@@ -2268,7 +2376,7 @@ mod tests {
         w15_el.prefix = Some("w15".to_string());
         root.children.push(XMLNode::Element(w15_el));
 
-        let ins = w_ins(1, "test", "2025-01-01"); // adds w16du:dateUtc
+        let ins = w_ins(1, "test", "2025-01-01", Some("2025-01-01")); // adds w16du:dateUtc
         let mut para = w_el("p");
         para.children.push(XMLNode::Element(ins));
         root.children.push(XMLNode::Element(para));

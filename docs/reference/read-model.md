@@ -613,6 +613,7 @@ can show what the formatting was and a reject can restore it:
 | `revision_id` | The wire `w:id` of the formatting change (Word does not keep it unique); pairing detail, never an address. |
 | `author` | Revision author. |
 | `date` | Revision date, when carried. |
+| `date_utc` | The explicit UTC revision date (`w16du:dateUtc`), when carried. |
 | `identity` | Engine-minted document-unique identity, the value the resolution surface addresses; 0 is the pre-identity sentinel. |
 
 ### Paragraph geometry
@@ -1160,6 +1161,7 @@ selective accept or reject. That loop is the same on every transport
 | `wire_id` | The raw OOXML `w:id`, diagnostics only, never an address. |
 | `author` | Author, when the source carried one. |
 | `date` | ISO-8601 date, when carried. |
+| `date_utc` | The explicit UTC date (`w16du:dateUtc`), when carried; attribution like `author` and `date`. |
 | `kind` | One of the [revision kinds](#revision-kinds). |
 | `block_id` | The block the revision lives in (`body_section` for a body-level section change). |
 | `location` | Story scope: body, header or footer, footnote, endnote, or comment. |

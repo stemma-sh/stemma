@@ -511,6 +511,8 @@ impl Document {
                 before: self.baseline_sealed_revisions.as_ref().clone(),
                 after: self.snapshot.sealed_revisions(),
             },
+            crate::audit::UntouchedEquality::Fidelity,
+            None,
         )
     }
 }
@@ -521,6 +523,23 @@ impl Document {
 /// [`crate::audit::AuditReport`] the session form produces, with the
 /// package verdict computed on `after`'s actual bytes.
 pub fn audit(before_bytes: &[u8], after_bytes: &[u8]) -> Result<AuditReport, RuntimeError> {
+    audit_with_equality(
+        before_bytes,
+        after_bytes,
+        crate::audit::UntouchedEquality::Fidelity,
+    )
+}
+
+/// [`audit`], choosing how the untouched proof decides that two blocks are
+/// the same: the same markup ([`crate::audit::UntouchedEquality::Fidelity`],
+/// what [`audit`] uses), or the same text and resolved formatting whatever
+/// the bookkeeping ([`crate::audit::UntouchedEquality::Appearance`]), for an
+/// `after` that another program has saved.
+pub fn audit_with_equality(
+    before_bytes: &[u8],
+    after_bytes: &[u8],
+    equality: crate::audit::UntouchedEquality,
+) -> Result<AuditReport, RuntimeError> {
     let before = snapshot_from_docx_bytes(before_bytes)?;
     let after = snapshot_from_docx_bytes(after_bytes)?;
     // Each document's own style table, so the committed-baseline reject
@@ -528,6 +547,22 @@ pub fn audit(before_bytes: &[u8], after_bytes: &[u8]) -> Result<AuditReport, Run
     // change (see `audit_documents`).
     let before_styles = style_table_from_docx(before_bytes)?;
     let after_styles = style_table_from_docx(after_bytes)?;
+    let mut relationships = (
+        crate::runtime::package_facts(before_bytes)?,
+        crate::runtime::package_facts(after_bytes)?,
+    );
+    if relationships.0.theme_digest != relationships.1.theme_digest
+        || relationships.0.styles_digest != relationships.1.styles_digest
+    {
+        for (facts, bytes) in [
+            (&mut relationships.0, before_bytes),
+            (&mut relationships.1, after_bytes),
+        ] {
+            let readings = crate::runtime::content_readings(bytes)?;
+            facts.theme_in_use = readings.theme_in_use;
+            facts.styleref_targets = readings.styleref_targets;
+        }
+    }
     crate::audit::audit_documents_with_identity(
         &before.canonical,
         &after.canonical,
@@ -539,6 +574,8 @@ pub fn audit(before_bytes: &[u8], after_bytes: &[u8]) -> Result<AuditReport, Run
             before: before.sealed_revisions(),
             after: after.sealed_revisions(),
         },
+        equality,
+        Some((&relationships.0, &relationships.1)),
     )
 }
 
@@ -560,6 +597,23 @@ pub fn validate(bytes: &[u8]) -> ValidationReport {
             }],
         },
     }
+}
+
+/// Validate the bytes of a file read under `file_name`: [`validate`], plus
+/// the checks that depend on the name Word would see (the main document
+/// part's content type must suit a `.docx` name; see
+/// [`crate::main_part_type_for_file_name_issue`]).
+pub fn validate_file(bytes: &[u8], file_name: &str) -> ValidationReport {
+    let mut report = validate(bytes);
+    if let Some(message) = crate::main_part_type_for_file_name_issue(bytes, file_name) {
+        report.ok = false;
+        report.issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some("[Content_Types].xml".to_string()),
+        });
+    }
+    report
 }
 
 #[cfg(test)]
@@ -687,6 +741,7 @@ mod tests {
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         }
     }
@@ -809,6 +864,7 @@ mod tests {
                 author: Some(author.to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         }
     }
@@ -962,6 +1018,7 @@ mod tests {
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         }
     }
@@ -1016,6 +1073,7 @@ mod tests {
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         };
         doc.check(&create_then_apply)
@@ -1116,15 +1174,11 @@ mod tests {
         archive.upsert("_rels/.rels", relationships.into_bytes());
         let invalid = archive.write().expect("test package serializes");
 
+        // Checked against Word with this exact document: it opens without
+        // repair, so the dangling thumbnail is not a validation issue. The
+        // load still discloses it and the save still removes the dead edge.
         let report = validate(&invalid);
-
-        assert!(!report.ok);
-        assert!(report.issues.iter().any(|issue| {
-            issue.code == ValidationIssueCode::WordprocessingInvariant
-                && issue.message.contains("rIdThumbnail")
-                && issue.message.contains("docProps/thumbnail.jpeg")
-                && issue.message.contains("does not exist in the package")
-        }));
+        assert!(report.ok, "{:?}", report.issues);
 
         let parsed = Document::parse(&invalid).expect("known Word-safe normalization imports");
         assert!(parsed.diagnostics().iter().any(|diagnostic| {

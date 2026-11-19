@@ -296,14 +296,17 @@ fn noproof_suppresses_proofing_text_unchanged() {
     );
 }
 
+/// The schema makes `w:val` optional on `w:bdo`. Checked against Word with
+/// this exact document: it cannot open it. The text reading below is how
+/// the engine resolves the shape, not a claim that the file is sound.
 #[test]
-fn bdo_val_omitted_defaults_ltr_opens_clean() {
+fn bdo_without_a_direction_is_reported() {
     let body = r#"<w:p><w:r><w:t xml:space="preserve">code </w:t></w:r><w:bdo><w:r><w:t>A1B2</w:t></w:r></w:bdo></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let (ok, detail) = opens_clean(&b);
     assert!(
-        ok,
-        "§17.3.2.3 (ECMA-376 / ISO 29500-1) + §17.18.12: val is optional on w:bdo and defaults to ltr; a val-less bdo wrapping a run is schema-valid, so Word opens it without repair. validate issues: {detail}"
+        !ok && detail.contains("I-RUN-001"),
+        "validate issues: {detail}"
     );
     assert_eq!(
         accept_text(&b),
@@ -338,14 +341,16 @@ fn noproof_run_is_proofing_only_text_preserved() {
     );
 }
 
+/// Checked against Word with this exact document (a bare `w:bdo` and a
+/// bare `w:dir`): it cannot open it.
 #[test]
-fn bare_dir_bdo_default_val_ltr_opens_clean() {
+fn bare_dir_and_bdo_are_reported() {
     let body = r#"<w:p><w:bdo><w:r><w:t>boxed</w:t></w:r></w:bdo><w:dir><w:r><w:t>embedded</w:t></w:r></w:dir></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     let (ok, detail) = opens_clean(&b);
     assert!(
-        ok,
-        "§17.3.2.3 / §17.3.2.8 (ECMA-376) + ISO 29500-1 §17.18.12 (ST_Direction): dir/bdo @val is optional and defaults to ltr; bare containers are schema-valid so Word opens them without repair. validate issues: {detail}"
+        !ok && detail.contains("I-RUN-001"),
+        "validate issues: {detail}"
     );
 }
 

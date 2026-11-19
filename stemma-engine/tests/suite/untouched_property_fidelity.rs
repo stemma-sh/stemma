@@ -351,22 +351,19 @@ fn a_universal_measure_size_is_read_in_half_points() {
 #[test]
 fn a_run_size_no_schema_form_admits_is_refused_with_its_element() {
     // A non-numeric w:sz is not here: Word reads it as 0
-    // (`font_size_word_reading`); nor is a non-numeric w:spacing, which Word
+    // (`font_size_word_reading`); nor is a negative one, which Word holds as
+    // an unsigned 16-bit number; nor is a non-numeric w:spacing, which Word
     // reads as no spacing (`twips_word_reading`).
-    for (element, rpr) in [
-        ("szCs", r#"<w:szCs w:val="-4"/>"#),
-        ("position", r#"<w:position w:val="up"/>"#),
-    ] {
-        let body = format!(r#"<w:p><w:r><w:rPr>{rpr}</w:rPr><w:t>Sized.</w:t></w:r></w:p>"#);
-        let Err(err) = Document::parse(&docx(&body, None)) else {
-            panic!("{rpr} admits no schema form; it must be refused, not dropped");
-        };
-        let message = err.to_string();
-        assert!(
-            message.contains(element) && message.contains("val"),
-            "the refusal names the element and attribute: {message}"
-        );
-    }
+    let (element, rpr) = ("position", r#"<w:position w:val="up"/>"#);
+    let body = format!(r#"<w:p><w:r><w:rPr>{rpr}</w:rPr><w:t>Sized.</w:t></w:r></w:p>"#);
+    let Err(err) = Document::parse(&docx(&body, None)) else {
+        panic!("{rpr} admits no schema form; it must be refused, not dropped");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(element) && message.contains("val"),
+        "the refusal names the element and attribute: {message}"
+    );
 }
 
 // --- Run border (§17.3.2.4 bdr, CT_Border) ----------------------------------

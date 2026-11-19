@@ -139,6 +139,7 @@ fn revision_info() -> RevisionInfo {
         author: Some("set_attr_spec".to_string()),
         date: Some("2026-05-21T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 

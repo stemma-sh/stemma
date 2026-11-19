@@ -146,6 +146,7 @@ fn apply_to_paragraph(
     // it into the numPr on save), so a new style does not move the item: the
     // resolved level becomes the written one.
     para.direct_numbering_omits_ilvl = false;
+    para.direct_num_pr_without_list = None;
 
     // Clear cached text hash / rendered text so any downstream consumer that
     // compares against a hash recomputes (mirrors paragraph_formatting.rs).
@@ -208,6 +209,7 @@ mod tests {
             has_direct_numbering: false,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -261,6 +263,7 @@ mod tests {
             author: Some("Test".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         }
     }
 

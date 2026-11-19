@@ -427,6 +427,7 @@ fn apply_block_modified(
                 paragraph.has_direct_numbering = new_para.has_direct_numbering;
                 paragraph.numbering_suppressed = new_para.numbering_suppressed;
                 paragraph.direct_numbering_omits_ilvl = false;
+                paragraph.direct_num_pr_without_list = None;
                 prefix_was_materialized = true;
             }
         }
@@ -467,6 +468,7 @@ fn apply_block_modified(
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
             paragraph.direct_numbering_omits_ilvl = new_para.direct_numbering_omits_ilvl;
+            paragraph.direct_num_pr_without_list = new_para.direct_num_pr_without_list;
             // Clear literal_prefix when gaining structural numbering to
             // prevent the serializer from writing both a text run for the
             // literal prefix AND a numPr in pPr.
@@ -737,22 +739,6 @@ fn apply_changes_to_blocks(
                 .to_string(),
             context: format!(
                 "{context}: native Word does not reliably resolve the combined final-table and final-paragraph carriers"
-            ),
-        });
-    }
-
-    // A complete row replacement resolves in Word when it is the story's only
-    // change. An unrelated physical-shell replacement can follow independent
-    // changes, but native Word Review Reject All hangs when another change
-    // follows that table in the same story. Keep the witnessed ordering
-    // boundary and refuse the unsafe composition before minting revision state.
-    if has_unqualified_row_replacement_composition(changes) {
-        return Err(MergeError {
-            kind: MergeErrorKind::UnsupportedEdit,
-            message: "table-row replacement cannot be followed by another change in the same story"
-                .to_string(),
-            context: format!(
-                "{context}: native Word Reject All does not reliably resolve a later carrier after an unrelated table-row replacement"
             ),
         });
     }
@@ -1178,38 +1164,6 @@ fn is_complete_row_replacement(change: &DiffChange) -> bool {
         )
     });
     has_deleted && has_inserted && !has_survivor
-}
-
-fn is_unrelated_row_replacement(change: &DiffChange) -> bool {
-    matches!(
-        change,
-        DiffChange::TableStructureChanged {
-            table_diff: Some(diff),
-            ..
-        } if diff
-            .row_alignment
-            .iter()
-            .any(|row| matches!(row, TableRowAlignment::Replacement { .. }))
-    )
-}
-
-fn has_unqualified_row_replacement_composition(changes: &[DiffChange]) -> bool {
-    if changes.len() > 1 && changes.iter().any(is_complete_row_replacement) {
-        return true;
-    }
-
-    let mut saw_unrelated_row_replacement = false;
-    for change in changes {
-        if is_unrelated_row_replacement(change) {
-            if saw_unrelated_row_replacement {
-                return true;
-            }
-            saw_unrelated_row_replacement = true;
-        } else if saw_unrelated_row_replacement {
-            return true;
-        }
-    }
-    false
 }
 
 fn property_history_carrier_count(changes: &[DiffChange]) -> usize {
@@ -2770,6 +2724,7 @@ mod paragraph_mark_status_tests {
             date: None,
             apply_op_id: None,
             identity: id,
+            date_utc: None,
         }
     }
 
@@ -2917,6 +2872,7 @@ mod run_formatting_history_tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }
     }
 
@@ -3072,6 +3028,7 @@ mod table_structure_carrier_tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }
     }
 
@@ -3607,106 +3564,6 @@ formatting_change: None,
     }
 
     #[test]
-    fn standalone_complete_row_replacement_remains_supported() {
-        let changes = vec![DiffChange::TableStructureChanged {
-            table_id: NodeId::from("source-table".to_string()),
-            target_table_id: NodeId::from("target-table".to_string()),
-            old_hash: "source".to_string(),
-            new_hash: "target".to_string(),
-            old_text: "source".to_string(),
-            new_text: "target".to_string(),
-            table_diff: Some(Box::new(complete_row_replacement())),
-        }];
-
-        assert!(!has_unqualified_row_replacement_composition(&changes));
-    }
-
-    #[test]
-    fn partial_row_change_can_compose_with_an_independent_story_change() {
-        let mut partial = complete_row_replacement();
-        partial.row_alignment = vec![
-            TableRowAlignment::Matched {
-                old_row: 0,
-                new_row: 0,
-            },
-            TableRowAlignment::Inserted { new_row: 1 },
-        ];
-        let changes = vec![
-            DiffChange::TableStructureChanged {
-                table_id: NodeId::from("source-table".to_string()),
-                target_table_id: NodeId::from("target-table".to_string()),
-                old_hash: "source".to_string(),
-                new_hash: "target".to_string(),
-                old_text: "source".to_string(),
-                new_text: "target".to_string(),
-                table_diff: Some(Box::new(partial)),
-            },
-            DiffChange::BlockInserted {
-                after_block_id: Some(NodeId::from("source-table".to_string())),
-                block: ParagraphNode::new_story_body("target-tail", "Target tail", None).into(),
-                move_id: None,
-            },
-        ];
-
-        assert!(!has_unqualified_row_replacement_composition(&changes));
-    }
-
-    fn unrelated_row_replacement_change() -> DiffChange {
-        let mut diff = complete_row_replacement();
-        diff.row_alignment = vec![TableRowAlignment::Replacement {
-            old_row: 0,
-            new_row: 0,
-        }];
-        DiffChange::TableStructureChanged {
-            table_id: NodeId::from("source-table"),
-            target_table_id: NodeId::from("target-table"),
-            old_hash: "source".to_string(),
-            new_hash: "target".to_string(),
-            old_text: "source".to_string(),
-            new_text: "target".to_string(),
-            table_diff: Some(Box::new(diff)),
-        }
-    }
-
-    #[test]
-    fn unrelated_row_replacement_accepts_preceding_story_changes() {
-        let changes = vec![
-            DiffChange::BlockInserted {
-                after_block_id: None,
-                block: ParagraphNode::new_story_body("target-one", "One", None).into(),
-                move_id: None,
-            },
-            DiffChange::BlockInserted {
-                after_block_id: Some(NodeId::from("target-one")),
-                block: ParagraphNode::new_story_body("target-two", "Two", None).into(),
-                move_id: None,
-            },
-            DiffChange::BlockInserted {
-                after_block_id: Some(NodeId::from("target-two")),
-                block: ParagraphNode::new_story_body("target-three", "Three", None).into(),
-                move_id: None,
-            },
-            unrelated_row_replacement_change(),
-        ];
-
-        assert!(!has_unqualified_row_replacement_composition(&changes));
-    }
-
-    #[test]
-    fn unrelated_row_replacement_refuses_a_following_story_change() {
-        let changes = vec![
-            unrelated_row_replacement_change(),
-            DiffChange::BlockInserted {
-                after_block_id: Some(NodeId::from("source-table")),
-                block: ParagraphNode::new_story_body("target-one", "One", None).into(),
-                move_id: None,
-            },
-        ];
-
-        assert!(has_unqualified_row_replacement_composition(&changes));
-    }
-
-    #[test]
     fn excessive_property_history_population_refuses_before_materialization() {
         let source = ParagraphNode::new_story_body("source", "Same text", None);
         let mut target = source.clone();
@@ -3729,6 +3586,7 @@ formatting_change: None,
                     author: String::new(),
                     date: None,
                     identity: 0,
+                    date_utc: None,
                 }),
             }],
             old_block: source.clone().into(),
@@ -3770,62 +3628,6 @@ formatting_change: None,
                 .contains(&MAX_PROPERTY_HISTORY_CARRIERS_PER_STORY.to_string())
         );
         assert!(error.context.contains("Review UI"));
-        assert_eq!(blocks, original, "refusal must precede model mutation");
-        assert_eq!(revision_counter, 0, "refusal must mint no revisions");
-    }
-
-    #[test]
-    fn complete_row_replacement_and_independent_story_change_refuse_before_materialization() {
-        let trailing = ParagraphNode::new_story_body("source-tail", "Source tail", None);
-        let changes = vec![
-            DiffChange::TableStructureChanged {
-                table_id: NodeId::from("source-table".to_string()),
-                target_table_id: NodeId::from("target-table".to_string()),
-                old_hash: "source".to_string(),
-                new_hash: "target".to_string(),
-                old_text: "source".to_string(),
-                new_text: "target".to_string(),
-                table_diff: Some(Box::new(complete_row_replacement())),
-            },
-            DiffChange::BlockInserted {
-                after_block_id: Some(trailing.id.clone()),
-                block: ParagraphNode::new_story_body("target-tail", "Target tail", None).into(),
-                move_id: None,
-            },
-        ];
-        let mut blocks = vec![
-            TrackedBlock {
-                status: TrackingStatus::Normal,
-                block: table("source-table").into(),
-                move_id: None,
-                block_sdt_wrap: None,
-            },
-            TrackedBlock {
-                status: TrackingStatus::Normal,
-                block: trailing.into(),
-                move_id: None,
-                block_sdt_wrap: None,
-            },
-        ];
-        let original = blocks.clone();
-        let mut revision_counter = 0;
-        let mut provenance = BlockProvenanceMap::new();
-
-        let error = apply_changes_to_blocks(
-            &mut blocks,
-            &changes,
-            &revision(),
-            &mut revision_counter,
-            "body",
-            None,
-            &mut provenance,
-            &ComparisonPlanResolver,
-        )
-        .expect_err("unqualified carrier composition must refuse");
-
-        assert!(error.message.contains("table-row replacement"));
-        assert!(error.message.contains("followed by another change"));
-        assert!(error.context.contains("Reject All"));
         assert_eq!(blocks, original, "refusal must precede model mutation");
         assert_eq!(revision_counter, 0, "refusal must mint no revisions");
     }

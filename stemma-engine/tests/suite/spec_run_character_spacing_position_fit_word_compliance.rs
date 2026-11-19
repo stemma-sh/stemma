@@ -363,6 +363,44 @@ fn eastasianlayout_vertcompress_ignored_layout_only_text_unchanged() {
     );
 }
 
+/// `w:fitText/@w:id` is ST_DecimalNumber, a signed integer, and Word itself
+/// writes negative ids. Checked against Word: a document whose runs carry a
+/// negative fit-text id opens without repair. The id only groups runs for
+/// layout, so the text is unchanged and the id is written back as it was.
+#[test]
+fn fittext_negative_id_loads_and_is_kept() {
+    let body = r#"<w:p><w:r><w:rPr><w:fitText w:val="720" w:id="-1503294192"/></w:rPr><w:t xml:space="preserve">quay </w:t></w:r><w:r><w:rPr><w:fitText w:val="720" w:id="-1503294192"/></w:rPr><w:t>seven</w:t></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+
+    assert_opens_clean(
+        &b,
+        "ISO 29500-1 §17.3.2.14 / §17.18.10: a negative fit-text id is a valid \
+         ST_DecimalNumber",
+    );
+    assert_eq!(accept_text(&b), "quay seven");
+    assert_eq!(
+        reserialize(&b)
+            .matches(r#"<w:fitText w:val="720" w:id="-1503294192"/>"#)
+            .count(),
+        2,
+        "both runs keep their fit-text group id"
+    );
+}
+
+/// Checked against Word: an id beyond 32 bits also opens without repair.
+/// The id is a group name, not a quantity, so it is kept whole.
+#[test]
+fn fittext_id_beyond_32_bits_loads_and_is_kept() {
+    let body = r#"<w:p><w:r><w:rPr><w:fitText w:val="720" w:id="4294967296"/></w:rPr><w:t>quay</w:t></w:r></w:p><w:sectPr/>"#;
+    let b = make_docx(body, &[]);
+
+    assert_eq!(accept_text(&b), "quay");
+    assert!(
+        reserialize(&b).contains(r#"<w:fitText w:val="720" w:id="4294967296"/>"#),
+        "the fit-text group id is written back unchanged"
+    );
+}
+
 #[test]
 fn fittext_omitted_id_links_contiguous_runs_layout_only_text_unchanged() {
     let body = r#"<w:p><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t xml:space="preserve">fit </w:t></w:r><w:r><w:rPr><w:fitText w:val="720"/></w:rPr><w:t>this</w:t></w:r></w:p><w:sectPr/>"#;

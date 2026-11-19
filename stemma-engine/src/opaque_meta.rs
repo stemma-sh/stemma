@@ -507,7 +507,7 @@ fn collect_text_descendants(element: &Element, out: &mut String) {
     if matches!(element.name.as_str(), "t" | "delText") {
         for child in &element.children {
             if let XMLNode::Text(text) = child {
-                out.push_str(text);
+                out.push_str(&crate::word_xml::word_text_as_read(text));
             }
         }
         return;

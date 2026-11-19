@@ -139,6 +139,7 @@ fn deleted_row_doc_from(docx: &[u8], row_index: usize) -> Document {
             author: Some(MUTATION_AUTHOR.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&txn).expect("apply delete_row")
@@ -178,6 +179,7 @@ fn inserted_row_doc() -> Document {
             author: Some(MUTATION_AUTHOR.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&txn).expect("apply insert_row")
@@ -223,6 +225,7 @@ fn identical_blank_rows_authored_before_an_existing_insert_get_stable_identities
             author: Some(MUTATION_AUTHOR.to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let edited = doc

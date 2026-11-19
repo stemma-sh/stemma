@@ -169,6 +169,35 @@ pub enum DirectChangeKind {
     /// The body-level section properties differ between the committed
     /// projections.
     SectionPropertiesChanged,
+    /// A document setting that bears on how the document reads or looks
+    /// differs (`appearance::settings_in_effect`); the excerpts hold the
+    /// setting as each side writes it, `None` where a side leaves it out.
+    SettingsChanged,
+    /// The document's background (`w:background`, §17.2.1) differs.
+    BackgroundChanged,
+    /// A comment present on both sides is attributed differently: its
+    /// author, initials or date (§17.13.4.2), or whether its thread is
+    /// marked resolved (MS-DOCX §2.5.1). The excerpts hold each side's.
+    CommentAttributionChanged,
+    /// What the theme gives an entry the document uses (a colour, a font,
+    /// the shape format scheme) differs; the excerpts hold the entry's name
+    /// and each side's value.
+    ThemeChanged,
+    /// A data store node a content control is bound to (§17.5.2.6) reads
+    /// differently: Word fills the control with it on open. The excerpts
+    /// hold the binding and each side's value.
+    BoundValueChanged,
+    /// A font the font table embedded (§17.8.3.3) is no longer embedded:
+    /// where it is not installed, its text shows in another font.
+    EmbeddedFontDropped,
+    /// A note separator (`w:footnote`/`w:endnote` of a separator type,
+    /// §17.11.23) differs; the excerpts hold each side's.
+    NoteSeparatorChanged,
+    /// A style a `STYLEREF` field names (§17.16.5.65) resolves differently
+    /// or no longer resolves: Word recomputes the field in headers and
+    /// footers as it lays them out. The excerpts hold the name and what it
+    /// resolves to on each side.
+    FieldStyleTargetChanged,
 }
 
 impl DirectChangeKind {
@@ -182,6 +211,14 @@ impl DirectChangeKind {
             DirectChangeKind::StoryInserted => "story_inserted",
             DirectChangeKind::StoryDeleted => "story_deleted",
             DirectChangeKind::SectionPropertiesChanged => "section_properties_changed",
+            DirectChangeKind::SettingsChanged => "settings_changed",
+            DirectChangeKind::BackgroundChanged => "background_changed",
+            DirectChangeKind::CommentAttributionChanged => "comment_attribution_changed",
+            DirectChangeKind::ThemeChanged => "theme_changed",
+            DirectChangeKind::BoundValueChanged => "bound_value_changed",
+            DirectChangeKind::EmbeddedFontDropped => "embedded_font_dropped",
+            DirectChangeKind::NoteSeparatorChanged => "note_separator_changed",
+            DirectChangeKind::FieldStyleTargetChanged => "field_style_target_changed",
         }
     }
 }
@@ -272,6 +309,8 @@ pub fn audit_documents(
         validator,
         BlockIdentity::IndependentParses,
         SealedRevisions::default(),
+        UntouchedEquality::Fidelity,
+        None,
     )
 }
 
@@ -295,6 +334,8 @@ pub fn audit_session_documents(
         validator,
         BlockIdentity::SharedSession,
         SealedRevisions::default(),
+        UntouchedEquality::Fidelity,
+        None,
     )
 }
 
@@ -309,6 +350,13 @@ pub(crate) struct SealedRevisions {
     pub(crate) after: Vec<RevisionRecord>,
 }
 
+/// Each side's package facts, before then after (`runtime::package_facts`).
+pub(crate) type RelationshipTargets<'a> = (
+    &'a crate::appearance::PackageFacts,
+    &'a crate::appearance::PackageFacts,
+);
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn audit_documents_with_identity(
     before: &CanonDoc,
     after: &CanonDoc,
@@ -317,13 +365,127 @@ pub(crate) fn audit_documents_with_identity(
     validator: ValidationReport,
     identity: BlockIdentity,
     sealed: SealedRevisions,
+    equality: UntouchedEquality,
+    // What each side's relationships point at, when the caller holds the
+    // packages. With them, a held element's references are compared by
+    // their targets under either equality.
+    relationships: Option<RelationshipTargets<'_>>,
 ) -> Result<AuditReport, RuntimeError> {
     refuse_unauditable(before, "before")?;
     refuse_unauditable(after, "after")?;
 
-    // Section 1: the census delta.
+    // A note's id pairs its reference with its story and is the writer's
+    // choice; the number a reader sees comes from the reference's place in
+    // the document. Another program's save may renumber the ids: the notes
+    // are then compared by their references' order.
+    let mut sealed = sealed;
+    let after_with_before_note_ids;
+    let after = match equality {
+        UntouchedEquality::Appearance => {
+            let renames = note_renames(before, after);
+            if renames.is_empty() {
+                after
+            } else {
+                let mut renamed = after.clone();
+                apply_note_renames(&mut renamed, &renames);
+                for record in &mut sealed.after {
+                    rename_note_scope(&mut record.location, &renames);
+                }
+                after_with_before_note_ids = renamed;
+                &after_with_before_note_ids
+            }
+        }
+        UntouchedEquality::Fidelity => after,
+    };
+    // A header or footer story is named by its relationship's target, which
+    // one writer spells relative to the main part (`header1.xml`) and
+    // another absolute (`/word/header1.xml`): the same part.
+    let after_with_before_part_names;
+    let after = match relationships {
+        Some((before_facts, after_facts)) => {
+            let renames = story_part_renames(
+                before,
+                after,
+                &before_facts.main_part,
+                &after_facts.main_part,
+            );
+            if renames.is_empty() {
+                after
+            } else {
+                let mut renamed = after.clone();
+                for story in &mut renamed.headers {
+                    if let Some(name) = renames.get(&story.part_name) {
+                        story.part_name = name.clone();
+                    }
+                }
+                for story in &mut renamed.footers {
+                    if let Some(name) = renames.get(&story.part_name) {
+                        story.part_name = name.clone();
+                    }
+                }
+                for record in &mut sealed.after {
+                    if let StoryScope::Header { part_path, .. }
+                    | StoryScope::Footer { part_path, .. } = &mut record.location
+                        && let Some(name) = renames.get(part_path)
+                    {
+                        *part_path = name.clone();
+                    }
+                }
+                let rename_references = |section: &mut crate::domain::SectionProperties| {
+                    for reference in section
+                        .header_refs
+                        .iter_mut()
+                        .chain(&mut section.footer_refs)
+                    {
+                        if let Some(name) = renames.get(&reference.part_path) {
+                            reference.part_path = name.clone();
+                        }
+                    }
+                };
+                if let Some(section) = &mut renamed.body_section_properties {
+                    rename_references(section);
+                }
+                for block in &mut renamed.blocks {
+                    if let BlockNode::Paragraph(paragraph) = &mut block.block
+                        && let Some(section) = &mut paragraph.section_properties
+                    {
+                        rename_references(section);
+                    }
+                }
+                after_with_before_part_names = renamed;
+                &after_with_before_part_names
+            }
+        }
+        None => after,
+    };
+
     let mut before_records = enumerate_revisions(before);
     before_records.extend(sealed.before);
+    let restated = {
+        let mut after_records = enumerate_revisions(after);
+        after_records.extend(sealed.after.iter().cloned());
+        restated_identities(&before_records, &after_records)
+    };
+    let after_with_before_identities;
+    let after = if restated.is_empty() {
+        after
+    } else {
+        let mut renamed = after.clone();
+        crate::import::for_each_rev_carrier_mut(&mut renamed, &mut |carrier| {
+            if let Some(identity) = restated.get(carrier.identity) {
+                *carrier.identity = *identity;
+            }
+        });
+        for record in &mut sealed.after {
+            if let Some(identity) = restated.get(&record.revision_id) {
+                record.revision_id = *identity;
+            }
+        }
+        after_with_before_identities = renamed;
+        &after_with_before_identities
+    };
+
+    // Section 1: the census delta.
     let mut after_records = enumerate_revisions(after);
     after_records.extend(sealed.after.iter().cloned());
     let (new_revisions, mut preexisting_revisions) =
@@ -345,6 +507,35 @@ pub(crate) fn audit_documents_with_identity(
     reject_all_with_styles(&mut before_committed, before_styles);
     let mut after_committed = after.clone();
     reject_all_with_styles(&mut after_committed, after_styles);
+    // Under appearance equality the committed delta is taken between the
+    // two committed documents in appearance form, so a program that rewrote
+    // bookkeeping without changing the document reports no direct change.
+    // The form is applied after the reject, which reads the provenance the
+    // form removes. Which bookmarks exist is read from the raw documents:
+    // a reject removes markers, never adds one.
+    let bookmarks = match equality {
+        UntouchedEquality::Appearance => Some((
+            crate::appearance::bookmarks_in_effect(before),
+            crate::appearance::bookmarks_in_effect(after),
+        )),
+        UntouchedEquality::Fidelity => None,
+    };
+    let before_side = crate::appearance::Side {
+        styles: before_styles.map(|styles| &styles.0),
+        bookmarks: bookmarks.as_ref().map(|(before, _)| before),
+        parts: relationships.map(|(before, _)| before),
+        relationships: None,
+    };
+    let after_side = crate::appearance::Side {
+        styles: after_styles.map(|styles| &styles.0),
+        bookmarks: bookmarks.as_ref().map(|(_, after)| after),
+        parts: relationships.map(|(_, after)| after),
+        relationships: None,
+    };
+    if equality == UntouchedEquality::Appearance {
+        crate::appearance::document_for_appearance(&mut before_committed, before_side);
+        crate::appearance::document_for_appearance(&mut after_committed, after_side);
+    }
     let committed_changes = audit_changes(&before_committed, &after_committed, identity);
     let mut direct_changes = direct_rows(&committed_changes);
     append_hyperlink_metadata_rows(
@@ -369,6 +560,125 @@ pub(crate) fn audit_documents_with_identity(
             coincides_with_resolution: Vec::new(),
         });
     }
+    if before_committed.document_background != after_committed.document_background {
+        direct_changes.push(DirectChange {
+            story: StoryScope::Body,
+            kind: DirectChangeKind::BackgroundChanged,
+            block_id: None,
+            old_excerpt: None,
+            new_excerpt: None,
+            coincides_with_resolution: Vec::new(),
+        });
+    }
+    if let Some((before_facts, after_facts)) = relationships {
+        direct_changes.extend(settings_rows(&before_facts.settings, &after_facts.settings));
+        direct_changes.extend(theme_rows(
+            &before_facts.theme_in_use,
+            &after_facts.theme_in_use,
+        ));
+        // A store value changed under controls that show what they showed:
+        // Word replaces their text with the new value on open. Where the
+        // controls' text changed too (an edit written through to the
+        // store), the change is the controls', compared where they are.
+        for old in &before_facts.bound_values {
+            if let Some(new) = after_facts
+                .bound_values
+                .iter()
+                .find(|candidate| candidate.binding == old.binding)
+                && old.value != new.value
+                && old.shown == new.shown
+            {
+                direct_changes.push(DirectChange {
+                    story: StoryScope::Body,
+                    kind: DirectChangeKind::BoundValueChanged,
+                    block_id: None,
+                    old_excerpt: Some(format!("{}: {}", old.binding, old.value)),
+                    new_excerpt: Some(format!("{}: {}", new.binding, new.value)),
+                    coincides_with_resolution: Vec::new(),
+                });
+            }
+        }
+        for (kind, rows) in [
+            (
+                DirectChangeKind::NoteSeparatorChanged,
+                (&before_facts.note_separators, &after_facts.note_separators),
+            ),
+            (
+                DirectChangeKind::FieldStyleTargetChanged,
+                (
+                    &before_facts.styleref_targets,
+                    &after_facts.styleref_targets,
+                ),
+            ),
+        ] {
+            let (old_rows, new_rows) = rows;
+            for (name, old) in old_rows {
+                if let Some((_, new)) = new_rows.iter().find(|(candidate, _)| candidate == name)
+                    && old != new
+                {
+                    direct_changes.push(DirectChange {
+                        story: StoryScope::Body,
+                        kind,
+                        block_id: None,
+                        old_excerpt: Some(format!("{name}: {old}")),
+                        new_excerpt: Some(format!("{name}: {new}")),
+                        coincides_with_resolution: Vec::new(),
+                    });
+                }
+            }
+        }
+        for font in &before_facts.embedded_fonts {
+            if !after_facts.embedded_fonts.contains(font) {
+                direct_changes.push(DirectChange {
+                    story: StoryScope::Body,
+                    kind: DirectChangeKind::EmbeddedFontDropped,
+                    block_id: None,
+                    old_excerpt: Some(font.clone()),
+                    new_excerpt: None,
+                    coincides_with_resolution: Vec::new(),
+                });
+            }
+        }
+    }
+    // A comment is its text and who wrote it when; the text is compared
+    // with the stories, the attribution here.
+    // On the documents as they stand: a comment whose anchor is itself a
+    // pending insertion is gone from the rejected reading, yet shown.
+    for before_comment in &before.comments {
+        let Some(after_comment) = after
+            .comments
+            .iter()
+            .find(|candidate| candidate.id == before_comment.id)
+        else {
+            continue;
+        };
+        let attribution = |document: &CanonDoc, comment: &crate::domain::CommentStory| {
+            format!(
+                "author={:?} initials={:?} date={:?} resolved={:?} reply_to={:?}",
+                comment.author,
+                comment.initials,
+                comment.date,
+                comment_resolved(document, comment),
+                comment_parent(document, comment)
+            )
+        };
+        let (old, new) = (
+            attribution(before, before_comment),
+            attribution(after, after_comment),
+        );
+        if old != new {
+            direct_changes.push(DirectChange {
+                story: StoryScope::Comment {
+                    id: before_comment.id.clone(),
+                },
+                kind: DirectChangeKind::CommentAttributionChanged,
+                block_id: None,
+                old_excerpt: Some(old),
+                new_excerpt: Some(new),
+                coincides_with_resolution: Vec::new(),
+            });
+        }
+    }
     annotate_resolutions(&mut direct_changes, &preexisting_revisions);
 
     // Section 3: the untouched proof, over the RAW documents (pending
@@ -379,6 +689,11 @@ pub(crate) fn audit_documents_with_identity(
     let untouched = untouched_proof(
         before,
         after,
+        &Equality {
+            mode: equality,
+            before: before_side,
+            after: after_side,
+        },
         &raw_changes,
         &direct_changes,
         &new_revisions,
@@ -420,10 +735,388 @@ fn refuse_unauditable(doc: &CanonDoc, side: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Identities `after` states differently for revisions `before` already
+/// held, as after identity -> before identity.
+///
+/// A revision's identity is derived from its record and, for a change with
+/// no inserted text, from the paragraph that carries it: the paragraph's own
+/// id where it has one. A program that gives every paragraph an id when it
+/// saves therefore shifts those identities without touching the revisions.
+/// A `before` identity `after` does not hold and an `after` identity
+/// `before` does not hold name the same revision when everything their
+/// records state is equal: story, kind, author, date and content, row for
+/// row. They pair in document order.
+///
+/// Where the revision sits is not decided here. The blocks are compared
+/// afterwards under the paired identities, and so are the accepted and
+/// rejected readings; a revision that moved or changed shows there.
+fn restated_identities(before: &[RevisionRecord], after: &[RevisionRecord]) -> HashMap<u32, u32> {
+    type Statement = Vec<(
+        StoryScope,
+        RevisionKind,
+        Option<String>,
+        Option<String>,
+        String,
+    )>;
+    fn statements(records: &[RevisionRecord], absent_from: &HashSet<u32>) -> Vec<(u32, Statement)> {
+        let mut grouped: Vec<(u32, Statement)> = Vec::new();
+        for record in records {
+            if record.revision_id == 0 || absent_from.contains(&record.revision_id) {
+                continue;
+            }
+            let row = (
+                record.location.clone(),
+                record.kind,
+                record.author.clone(),
+                record.date.clone(),
+                record.excerpt.clone(),
+            );
+            match grouped
+                .iter_mut()
+                .find(|(identity, _)| *identity == record.revision_id)
+            {
+                Some((_, rows)) => rows.push(row),
+                None => grouped.push((record.revision_id, vec![row])),
+            }
+        }
+        grouped
+    }
+    let before_identities: HashSet<u32> = before.iter().map(|r| r.revision_id).collect();
+    let after_identities: HashSet<u32> = after.iter().map(|r| r.revision_id).collect();
+    let orphaned = statements(before, &after_identities);
+    let unknown = statements(after, &before_identities);
+    let mut taken = vec![false; orphaned.len()];
+    let mut restated = HashMap::new();
+    for (after_identity, statement) in unknown {
+        let same = orphaned
+            .iter()
+            .enumerate()
+            .position(|(i, (_, candidate))| !taken[i] && *candidate == statement);
+        if let Some(i) = same {
+            taken[i] = true;
+            restated.insert(after_identity, orphaned[i].0);
+        }
+    }
+    restated
+}
+
+/// One row per document setting that differs between the two sides (each
+/// side's settings in canonical form, sorted by name).
+fn settings_rows(before: &[(String, String)], after: &[(String, String)]) -> Vec<DirectChange> {
+    let names: std::collections::BTreeSet<&String> =
+        before.iter().chain(after).map(|(name, _)| name).collect();
+    let spelling = |settings: &[(String, String)], name: &String| -> Option<String> {
+        let values: Vec<&str> = settings
+            .iter()
+            .filter(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        (!values.is_empty()).then(|| values.join(""))
+    };
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let (old, new) = (spelling(before, name), spelling(after, name));
+            (old != new).then(|| DirectChange {
+                story: StoryScope::Body,
+                kind: DirectChangeKind::SettingsChanged,
+                block_id: None,
+                old_excerpt: old,
+                new_excerpt: new,
+                coincides_with_resolution: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Whether a comment's thread is marked resolved (`w15:done` of the thread
+/// root's `w15:commentEx`, MS-DOCX §2.5.1); `None` when the comment has no
+/// record.
+fn comment_resolved(document: &CanonDoc, comment: &crate::domain::CommentStory) -> Option<bool> {
+    let record = |para_id: &str| {
+        document
+            .comments_extended
+            .iter()
+            .find(|record| record.para_id == para_id)
+    };
+    let mut current = record(comment.last_para_id()?)?;
+    // Walk to the thread root; a cycle in the parent links stops the walk.
+    for _ in 0..document.comments_extended.len() {
+        match current.para_id_parent.as_deref().and_then(record) {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    Some(current.done)
+}
+
+/// The id of the comment a comment replies to (`w15:paraIdParent` of its
+/// `w15:commentEx`, MS-DOCX §2.5.1, naming the parent's last paragraph);
+/// `None` for a comment that starts a thread or has no record.
+fn comment_parent(document: &CanonDoc, comment: &crate::domain::CommentStory) -> Option<String> {
+    let para_id = comment.last_para_id()?;
+    let record = document
+        .comments_extended
+        .iter()
+        .find(|record| record.para_id == para_id)?;
+    let parent = record.para_id_parent.as_deref()?;
+    Some(
+        document
+            .comments
+            .iter()
+            .find(|candidate| candidate.last_para_id() == Some(parent))
+            .map_or_else(
+                || format!("paragraph {parent}"),
+                |candidate| candidate.id.clone(),
+            ),
+    )
+}
+
+/// One row per theme entry both sides use whose value differs. An entry
+/// only one side uses is that side's content using it, compared where the
+/// content is.
+fn theme_rows(before: &[(String, String)], after: &[(String, String)]) -> Vec<DirectChange> {
+    before
+        .iter()
+        .filter_map(|(name, old)| {
+            let (_, new) = after.iter().find(|(candidate, _)| candidate == name)?;
+            (old != new).then(|| DirectChange {
+                story: StoryScope::Body,
+                kind: DirectChangeKind::ThemeChanged,
+                block_id: None,
+                old_excerpt: Some(format!("{name}: {old}")),
+                new_excerpt: Some(format!("{name}: {new}")),
+                coincides_with_resolution: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Per header or footer part name `after` spells differently from the one
+/// `before` gives the same part, `before`'s spelling. A name is a
+/// relationship target: absolute (`/word/header1.xml`) or relative to the
+/// main part's folder.
+fn story_part_renames(
+    before: &CanonDoc,
+    after: &CanonDoc,
+    before_main: &str,
+    after_main: &str,
+) -> HashMap<String, String> {
+    fn resolved(main: &str, name: &str) -> String {
+        match name.strip_prefix('/') {
+            Some(absolute) => crate::docx_package::normalize_package_path(absolute),
+            None => crate::docx_package::normalize_package_path(&format!(
+                "{}{name}",
+                crate::docx_package::part_dir(main)
+            )),
+        }
+    }
+    let before_names: HashMap<String, &String> = before
+        .headers
+        .iter()
+        .map(|story| &story.part_name)
+        .chain(before.footers.iter().map(|story| &story.part_name))
+        .map(|name| (resolved(before_main, name), name))
+        .collect();
+    after
+        .headers
+        .iter()
+        .map(|story| &story.part_name)
+        .chain(after.footers.iter().map(|story| &story.part_name))
+        .filter_map(|name| {
+            let before_name = before_names.get(&resolved(after_main, name))?;
+            (*before_name != name).then(|| (name.clone(), (*before_name).clone()))
+        })
+        .collect()
+}
+
+/// Which family of notes an id belongs to: footnotes and endnotes number
+/// separately (§17.11.10, §17.11.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum NoteFamily {
+    Footnote,
+    Endnote,
+}
+
+/// Per family, the `after` note ids to read as `before` ids: the note each
+/// side references n-th, in body order, is the same note. Empty for a
+/// family whose references do not pair one to one (a reference added or
+/// removed, an id referenced twice, a renamed id that would collide with a
+/// note left unrenamed): its notes are then compared by id, as written.
+fn note_renames(before: &CanonDoc, after: &CanonDoc) -> HashMap<(NoteFamily, String), String> {
+    let mut renames = HashMap::new();
+    for family in [NoteFamily::Footnote, NoteFamily::Endnote] {
+        let (Some(before_references), Some(after_references)) = (
+            note_references(before, family),
+            note_references(after, family),
+        ) else {
+            continue;
+        };
+        if before_references.len() != after_references.len() {
+            continue;
+        }
+        let distinct = |references: &[String]| {
+            references.iter().collect::<HashSet<_>>().len() == references.len()
+        };
+        if !distinct(&before_references) || !distinct(&after_references) {
+            continue;
+        }
+        let after_story_ids: Vec<&String> = match family {
+            NoteFamily::Footnote => after.footnotes.iter().map(|story| &story.id).collect(),
+            NoteFamily::Endnote => after.endnotes.iter().map(|story| &story.id).collect(),
+        };
+        let referenced: HashSet<&String> = after_references.iter().collect();
+        let collides = before_references.iter().any(|target| {
+            after_story_ids
+                .iter()
+                .any(|id| *id == target && !referenced.contains(id))
+        });
+        if collides {
+            continue;
+        }
+        for (after_id, before_id) in after_references.into_iter().zip(before_references) {
+            if after_id != before_id {
+                renames.insert((family, after_id), before_id);
+            }
+        }
+    }
+    renames
+}
+
+/// The ids of a family's note references in the body, in document order.
+/// A reference held inside an opaque block (its bytes are compared as they
+/// are, so its id cannot be read as another) yields `None`: the family's
+/// notes are then compared by id.
+fn note_references(doc: &CanonDoc, family: NoteFamily) -> Option<Vec<String>> {
+    fn collect(block: &BlockNode, family: NoteFamily, out: &mut Vec<String>) -> Option<()> {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for inline in paragraph.segments.iter().flat_map(|s| &s.inlines) {
+                    if let Some((found, reference)) = note_reference(inline)
+                        && found == family
+                    {
+                        out.push(reference.reference_id.clone());
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for block in table
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.cells)
+                    .flat_map(|cell| &cell.blocks)
+                {
+                    collect(block, family, out)?;
+                }
+            }
+            BlockNode::OpaqueBlock(opaque) => {
+                let held = match family {
+                    NoteFamily::Footnote => &opaque.note_references.footnotes,
+                    NoteFamily::Endnote => &opaque.note_references.endnotes,
+                };
+                if !held.is_empty() {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+    let mut out = Vec::new();
+    for block in &doc.blocks {
+        collect(&block.block, family, &mut out)?;
+    }
+    Some(out)
+}
+
+fn note_reference(
+    inline: &crate::domain::InlineNode,
+) -> Option<(NoteFamily, &crate::domain::NoteReferenceData)> {
+    use crate::domain::{InlineNode, OpaqueKind};
+    match inline {
+        InlineNode::OpaqueInline(opaque) => match &opaque.kind {
+            OpaqueKind::FootnoteReference(reference) => Some((NoteFamily::Footnote, reference)),
+            OpaqueKind::EndnoteReference(reference) => Some((NoteFamily::Endnote, reference)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `doc` with its notes and their body references renamed.
+fn apply_note_renames(doc: &mut CanonDoc, renames: &HashMap<(NoteFamily, String), String>) {
+    use crate::domain::{InlineNode, OpaqueKind};
+    fn rename_in(block: &mut BlockNode, renames: &HashMap<(NoteFamily, String), String>) {
+        match block {
+            BlockNode::Paragraph(paragraph) => {
+                for inline in paragraph.segments.iter_mut().flat_map(|s| &mut s.inlines) {
+                    let InlineNode::OpaqueInline(opaque) = inline else {
+                        continue;
+                    };
+                    let (family, reference) = match &mut opaque.kind {
+                        OpaqueKind::FootnoteReference(reference) => {
+                            (NoteFamily::Footnote, reference)
+                        }
+                        OpaqueKind::EndnoteReference(reference) => (NoteFamily::Endnote, reference),
+                        _ => continue,
+                    };
+                    if let Some(id) = renames.get(&(family, reference.reference_id.clone())) {
+                        reference.reference_id = id.clone();
+                    }
+                }
+            }
+            BlockNode::Table(table) => {
+                for block in table
+                    .rows
+                    .iter_mut()
+                    .flat_map(|row| &mut row.cells)
+                    .flat_map(|cell| &mut cell.blocks)
+                {
+                    rename_in(block, renames);
+                }
+            }
+            BlockNode::OpaqueBlock(_) => {}
+        }
+    }
+    for block in &mut doc.blocks {
+        rename_in(&mut block.block, renames);
+    }
+    for story in &mut doc.footnotes {
+        if let Some(id) = renames.get(&(NoteFamily::Footnote, story.id.clone())) {
+            story.id = id.clone();
+        }
+    }
+    for story in &mut doc.endnotes {
+        if let Some(id) = renames.get(&(NoteFamily::Endnote, story.id.clone())) {
+            story.id = id.clone();
+        }
+    }
+}
+
+fn rename_note_scope(scope: &mut StoryScope, renames: &HashMap<(NoteFamily, String), String>) {
+    let (family, id) = match scope {
+        StoryScope::Footnote { id } => (NoteFamily::Footnote, id),
+        StoryScope::Endnote { id } => (NoteFamily::Endnote, id),
+        _ => return,
+    };
+    if let Some(renamed) = renames.get(&(family, id.clone())) {
+        *id = renamed.clone();
+    }
+}
+
 /// The identity of a revision record across two enumerations. `revision_id` is
 /// engine-minted from the canonical revision record and is the semantic key;
-/// raw OOXML `w:id` is diagnostic only and never enters correspondence.
-type CensusKey = (StoryScope, u32, RevisionKind, Option<String>);
+/// raw OOXML `w:id` is diagnostic only and never enters correspondence. The
+/// attribution the identity does not already cover rides along: the author,
+/// and the explicit UTC date (`w16du:dateUtc`), so a result that rewrote a
+/// pre-existing revision's UTC date does not correspond to it, exactly as one
+/// that rewrote its author or `w:date` (which the identity covers).
+type CensusKey = (
+    StoryScope,
+    u32,
+    RevisionKind,
+    Option<String>,
+    Option<String>,
+);
 
 fn census_key(r: &RevisionRecord) -> CensusKey {
     (
@@ -434,6 +1127,7 @@ fn census_key(r: &RevisionRecord) -> CensusKey {
             .as_ref()
             .filter(|author| !author.is_empty())
             .cloned(),
+        r.date_utc.clone(),
     )
 }
 
@@ -1002,14 +1696,85 @@ fn annotate_resolutions(rows: &mut [DirectChange], preexisting: &[PreexistingRev
 
 // ─── Section 3: the untouched proof ──────────────────────────────────────────
 
+/// Per story key (a header's or footer's part name, a note's or comment's
+/// id): the blocks its own inner changes account for, before then after.
+type StoryRemovals = HashMap<String, (HashSet<NodeId>, HashSet<NodeId>)>;
+
 /// A block-level location a census row implicates, used to exempt its PAIR
 /// from the proof (the change is accounted for in section 1, so the pair is
 /// neither "verified untouched" nor a violation).
 type Implicated = HashSet<(StoryScope, NodeId)>;
 
+/// How the untouched proof decides that a pair of blocks is the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UntouchedEquality {
+    /// The same markup, under the round-trip fidelity comparison: the
+    /// question for a document this engine wrote.
+    #[default]
+    Fidelity,
+    /// The same text and the same resolved formatting, whatever the
+    /// bookkeeping and the run boundaries (`crate::appearance`): the
+    /// question for a document another program has saved.
+    Appearance,
+}
+
+/// The equality of one audit, with what its appearance form needs from each
+/// document.
+struct Equality<'a> {
+    mode: UntouchedEquality,
+    before: crate::appearance::Side<'a>,
+    after: crate::appearance::Side<'a>,
+}
+
+impl Equality<'_> {
+    fn differences(
+        &self,
+        before: &TrackedBlock,
+        after: &TrackedBlock,
+        story: &StoryScope,
+    ) -> Vec<crate::roundtrip_compare::Difference> {
+        let before_side = self.before.for_story(story);
+        let after_side = self.after.for_story(story);
+        let mut differences = match self.mode {
+            UntouchedEquality::Fidelity => crate::roundtrip_compare::compare_tracked_block_pair(
+                &crate::appearance::with_relationship_targets(before, before_side),
+                &crate::appearance::with_relationship_targets(after, after_side),
+            ),
+            UntouchedEquality::Appearance => crate::roundtrip_compare::compare_tracked_block_pair(
+                &crate::appearance::for_appearance(before, before_side),
+                &crate::appearance::for_appearance(after, after_side),
+            ),
+        };
+        // What a list reference resolves to lives in the numbering part,
+        // outside the block: compared under either equality.
+        differences.extend(crate::appearance::numbering_differences(
+            before,
+            after,
+            before_side,
+            after_side,
+        ));
+        // What run formatting the styles part gives text the block holds
+        // unresolved: compared under either equality.
+        differences.extend(crate::appearance::style_differences(
+            before,
+            after,
+            before_side,
+            after_side,
+        ));
+        differences.extend(crate::appearance::table_style_differences(
+            before,
+            after,
+            before_side,
+            after_side,
+        ));
+        differences
+    }
+}
+
 fn untouched_proof(
     before: &CanonDoc,
     after: &CanonDoc,
+    equality: &Equality<'_>,
     raw_changes: &[AuditDelta],
     direct_changes: &[DirectChange],
     new_revisions: &[RevisionRecord],
@@ -1083,6 +1848,7 @@ fn untouched_proof(
         &body_after_removed,
         &implicated_before,
         &implicated_after,
+        equality,
         &mut verified,
         &mut violations,
     );
@@ -1094,15 +1860,24 @@ fn untouched_proof(
     let mut footer_touched_before: HashSet<String> = HashSet::new();
     let mut footer_touched_after: HashSet<String> = HashSet::new();
     let mut note_touched: HashMap<&'static str, HashSet<String>> = HashMap::new();
+    let mut header_removed: StoryRemovals = HashMap::new();
+    let mut footer_removed: StoryRemovals = HashMap::new();
+    let mut note_removed: HashMap<&'static str, StoryRemovals> = HashMap::new();
     for change in raw_changes {
         match change {
+            // A modified story is not exempt as a whole: the blocks its
+            // inner changes name are accounted for there, and every other
+            // block of the story must still pair and compare equal. (Two
+            // independent parses never hold equal blocks, so every story
+            // arrives here as modified; exempting it would leave a change
+            // the text diff does not see, such as formatting or the text
+            // of a link or a text box, unexamined.)
             AuditDelta::HeaderModified {
                 base_part_name,
-                target_part_name,
+                block_changes,
                 ..
             } => {
-                header_touched_before.insert(base_part_name.clone());
-                header_touched_after.insert(target_part_name.clone());
+                header_removed.insert(base_part_name.clone(), raw_removed_block_ids(block_changes));
             }
             AuditDelta::HeaderDeleted { part_name, .. } => {
                 header_touched_before.insert(part_name.clone());
@@ -1112,11 +1887,10 @@ fn untouched_proof(
             }
             AuditDelta::FooterModified {
                 base_part_name,
-                target_part_name,
+                block_changes,
                 ..
             } => {
-                footer_touched_before.insert(base_part_name.clone());
-                footer_touched_after.insert(target_part_name.clone());
+                footer_removed.insert(base_part_name.clone(), raw_removed_block_ids(block_changes));
             }
             AuditDelta::FooterDeleted { part_name, .. } => {
                 footer_touched_before.insert(part_name.clone());
@@ -1124,25 +1898,37 @@ fn untouched_proof(
             AuditDelta::FooterInserted { part_name, .. } => {
                 footer_touched_after.insert(part_name.clone());
             }
-            AuditDelta::FootnoteModified { id, .. }
-            | AuditDelta::FootnoteDeleted { id, .. }
-            | AuditDelta::FootnoteInserted { id, .. } => {
+            AuditDelta::FootnoteModified { id, block_changes } => {
+                note_removed
+                    .entry("footnotes")
+                    .or_default()
+                    .insert(id.clone(), raw_removed_block_ids(block_changes));
+            }
+            AuditDelta::FootnoteDeleted { id, .. } | AuditDelta::FootnoteInserted { id, .. } => {
                 note_touched
                     .entry("footnotes")
                     .or_default()
                     .insert(id.clone());
             }
-            AuditDelta::EndnoteModified { id, .. }
-            | AuditDelta::EndnoteDeleted { id, .. }
-            | AuditDelta::EndnoteInserted { id, .. } => {
+            AuditDelta::EndnoteModified { id, block_changes } => {
+                note_removed
+                    .entry("endnotes")
+                    .or_default()
+                    .insert(id.clone(), raw_removed_block_ids(block_changes));
+            }
+            AuditDelta::EndnoteDeleted { id, .. } | AuditDelta::EndnoteInserted { id, .. } => {
                 note_touched
                     .entry("endnotes")
                     .or_default()
                     .insert(id.clone());
             }
-            AuditDelta::CommentModified { id, .. }
-            | AuditDelta::CommentDeleted { id, .. }
-            | AuditDelta::CommentInserted { id, .. } => {
+            AuditDelta::CommentModified { id, block_changes } => {
+                note_removed
+                    .entry("comments")
+                    .or_default()
+                    .insert(id.clone(), raw_removed_block_ids(block_changes));
+            }
+            AuditDelta::CommentDeleted { id, .. } | AuditDelta::CommentInserted { id, .. } => {
                 note_touched
                     .entry("comments")
                     .or_default()
@@ -1186,9 +1972,11 @@ fn untouched_proof(
             after_stories,
             &header_touched_before,
             &header_touched_after,
+            &header_removed,
             &implicated_stories,
             &implicated_before,
             &implicated_after,
+            equality,
             &mut verified,
             &mut violations,
         );
@@ -1227,9 +2015,11 @@ fn untouched_proof(
             after_stories,
             &footer_touched_before,
             &footer_touched_after,
+            &footer_removed,
             &implicated_stories,
             &implicated_before,
             &implicated_after,
+            equality,
             &mut verified,
             &mut violations,
         );
@@ -1238,6 +2028,7 @@ fn untouched_proof(
     // sets are shared per family since ids identify both sides).
     {
         let touched = note_touched.remove("footnotes").unwrap_or_default();
+        let removed = note_removed.remove("footnotes").unwrap_or_default();
         let before_stories: Vec<(String, StoryScope, &Vec<TrackedBlock>)> = before
             .footnotes
             .iter()
@@ -1268,15 +2059,18 @@ fn untouched_proof(
             after_stories,
             &touched,
             &touched,
+            &removed,
             &implicated_stories,
             &implicated_before,
             &implicated_after,
+            equality,
             &mut verified,
             &mut violations,
         );
     }
     {
         let touched = note_touched.remove("endnotes").unwrap_or_default();
+        let removed = note_removed.remove("endnotes").unwrap_or_default();
         let before_stories: Vec<(String, StoryScope, &Vec<TrackedBlock>)> = before
             .endnotes
             .iter()
@@ -1307,15 +2101,18 @@ fn untouched_proof(
             after_stories,
             &touched,
             &touched,
+            &removed,
             &implicated_stories,
             &implicated_before,
             &implicated_after,
+            equality,
             &mut verified,
             &mut violations,
         );
     }
     {
         let touched = note_touched.remove("comments").unwrap_or_default();
+        let removed = note_removed.remove("comments").unwrap_or_default();
         let before_stories: Vec<(String, StoryScope, &Vec<TrackedBlock>)> = before
             .comments
             .iter()
@@ -1346,9 +2143,11 @@ fn untouched_proof(
             after_stories,
             &touched,
             &touched,
+            &removed,
             &implicated_stories,
             &implicated_before,
             &implicated_after,
+            equality,
             &mut verified,
             &mut violations,
         );
@@ -1566,22 +2365,14 @@ fn raw_removed_block_ids(changes: &[AuditDelta]) -> (HashSet<NodeId>, HashSet<No
             AuditDelta::BlockInserted { block, .. } => {
                 after_removed.insert(block_node_id(block));
             }
-            AuditDelta::BlockModified {
-                block_id,
-                new_block,
-                ..
-            } => {
-                before_removed.insert(block_id.clone());
-                after_removed.insert(block_node_id(new_block));
-            }
-            AuditDelta::TableStructureChanged {
-                table_id,
-                target_table_id,
-                ..
-            } => {
-                before_removed.insert(table_id.clone());
-                after_removed.insert(target_table_id.clone());
-            }
+            // A modified block stays in the sequence: it pairs with its
+            // counterpart and is compared like any other pair, unless a
+            // census or direct-change row accounts for it. A raw difference
+            // that neither the census nor the committed delta explains (a
+            // pending revision moved within its paragraph leaves both
+            // unchanged) is the proof's to report.
+            // A changed table likewise pairs with its counterpart.
+            AuditDelta::BlockModified { .. } | AuditDelta::TableStructureChanged { .. } => {}
             _ => {}
         }
     }
@@ -1618,6 +2409,7 @@ fn verify_block_sequences(
     after_removed: &HashSet<NodeId>,
     implicated_before: &Implicated,
     implicated_after: &Implicated,
+    equality: &Equality<'_>,
     verified: &mut usize,
     violations: &mut Vec<UntouchedViolation>,
 ) {
@@ -1671,11 +2463,11 @@ fn verify_block_sequences(
         // parses of identical content, and compares everything that IS
         // document content — the same classification the roundtrip suite
         // enforces exhaustively per field.
-        let mut differences: Vec<String> =
-            crate::roundtrip_compare::compare_tracked_block_pair(b, a)
-                .iter()
-                .map(|d| d.to_string())
-                .collect();
+        let mut differences: Vec<String> = equality
+            .differences(b, a, story)
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
         if let Some(difference) = sealed_bytes_difference(&b.block, &a.block) {
             differences.push(difference);
         }
@@ -1726,9 +2518,11 @@ fn verify_story_family(
     after_stories: Vec<(String, StoryScope, &Vec<TrackedBlock>)>,
     touched_before: &HashSet<String>,
     touched_after: &HashSet<String>,
+    removed: &StoryRemovals,
     implicated_stories: &HashSet<StoryScope>,
     implicated_before: &Implicated,
     implicated_after: &Implicated,
+    equality: &Equality<'_>,
     verified: &mut usize,
     violations: &mut Vec<UntouchedViolation>,
 ) {
@@ -1753,10 +2547,11 @@ fn verify_story_family(
                     &scope,
                     before_blocks,
                     after_blocks,
-                    &empty,
-                    &empty,
+                    removed.get(&key).map_or(&empty, |(before, _)| before),
+                    removed.get(&key).map_or(&empty, |(_, after)| after),
                     implicated_before,
                     implicated_after,
+                    equality,
                     verified,
                     violations,
                 );

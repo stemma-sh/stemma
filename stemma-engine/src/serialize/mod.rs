@@ -12,9 +12,9 @@ use crate::domain::{
     Alignment, BlockNode, Border, BorderSet, CanonDoc, CellMargins, CellSdtWrap, CnfStyle,
     FieldData, FieldKind, FormattingChange, FrameProperties, HyperlinkData, HyperlinkRun,
     InlineNode, LineSpacingRule, Mark, MarkValue, NodeId, OpaqueInlineNode, OpaqueKind,
-    ParagraphNode, PctMarginsAsWritten, Shading, StyleProps, TableCellNode, TableFormatting,
-    TableMeasurement, TableNode, TableRowNode, TextNode, TrackedBlock, TrackedSegment,
-    TrackingStatus, VerticalAlignment, VerticalMerge,
+    ParagraphNode, PctMarginsAsWritten, RevisionInfo, Shading, StyleProps, TableCellNode,
+    TableFormatting, TableMeasurement, TableNode, TableRowNode, TextNode, TrackedBlock,
+    TrackedSegment, TrackingStatus, VerticalAlignment, VerticalMerge,
 };
 use crate::runtime::{
     ErrorCode, ErrorDetails, HYPERLINK_REL_TYPE, RuntimeError, build_sdt_wrapper,
@@ -133,7 +133,65 @@ fn apply_text_role(run: &mut Element, text: &TextNode) {
             );
             run.children[text_children[0]] = XMLNode::Element(w_el("noBreakHyphen"));
         }
+        Some(crate::domain::TextRole::WrittenLineEnds(written)) => {
+            restore_written_line_ends(run, &text.text, written);
+        }
         Some(crate::domain::TextRole::MaterializedPrefix(_)) | None => {}
+    }
+}
+
+/// Write the text leaves of `run`, built from `text` (what Word reads), back
+/// in their source spelling `written`, where a line feed or carriage return
+/// stood for each of some spaces. Only while `written` still reads as `text`:
+/// a node whose text an edit changed is written as it now reads. Leaves
+/// whose content does not line up with `text` (a builder spelling this does
+/// not know) are left as built.
+fn restore_written_line_ends(run: &mut Element, text: &str, written: &str) {
+    if crate::word_xml::word_text_as_read(written) != text {
+        return;
+    }
+    let read: Vec<char> = text.chars().collect();
+    let written: Vec<char> = written.chars().collect();
+    // (child index, start, end) of each text leaf, in characters of `text`.
+    let mut leaves = Vec::new();
+    let mut cursor = 0;
+    for (index, child) in run.children.iter().enumerate() {
+        let XMLNode::Element(element) = child else {
+            continue;
+        };
+        match element.name.as_str() {
+            "t" | "delText" => {
+                let content: String = element
+                    .children
+                    .iter()
+                    .filter_map(|node| match node {
+                        XMLNode::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let length = content.chars().count();
+                if read
+                    .get(cursor..cursor + length)
+                    .is_none_or(|slice| !slice.iter().copied().eq(content.chars()))
+                {
+                    return;
+                }
+                leaves.push((index, cursor, cursor + length));
+                cursor += length;
+            }
+            "tab" if read.get(cursor) == Some(&'\t') => cursor += 1,
+            "rPr" => {}
+            _ => return,
+        }
+    }
+    if cursor != read.len() {
+        return;
+    }
+    for (index, start, end) in leaves {
+        if let XMLNode::Element(element) = &mut run.children[index] {
+            let spelled: String = written[start..end].iter().collect();
+            element.children = vec![XMLNode::Text(spelled)];
+        }
     }
 }
 
@@ -579,6 +637,9 @@ fn append_rpr_change(rpr: &mut Element, fc: &FormattingChange, next_id: &mut u32
     attr_set(&mut rpr_change, "w:author", fc.author.clone());
     if let Some(ref date) = fc.date {
         attr_set(&mut rpr_change, "w:date", date.clone());
+    }
+    if let Some(ref date_utc) = fc.date_utc {
+        attr_set(&mut rpr_change, "w16du:dateUtc", date_utc.clone());
     }
     // The previous-props snapshot has its OWN direct-formatting
     // provenance. Filtering it through the live run's provenance
@@ -1278,7 +1339,37 @@ fn append_single_inline(
                 if deco.kind == crate::domain::DecorationType::CustomXmlWrapperEnd {
                     attr_set(&mut element, WRAPPER_CLOSE_MARKER_ATTR, "1");
                 }
-                if decoration_requires_run_wrapper(&element) {
+                let physical_change = deco
+                    .formatting_change
+                    .as_ref()
+                    .filter(|change| change.is_physical_revision());
+                if deco.kind == crate::domain::DecorationType::EmptyRun
+                    && (!deco.wrapper_marks.is_empty()
+                        || !deco.wrapper_style_props.is_empty()
+                        || physical_change.is_some())
+                {
+                    // An empty run whose properties are modeled (it arrived
+                    // with a tracked formatting change) is held bare; write
+                    // its properties and any pending change back into it.
+                    if element.children.iter().any(|c| matches!(c, XMLNode::Element(el) if el.name == "w:rPr" || el.name == "rPr")) {
+                        return Err(RuntimeError {
+                            code: ErrorCode::UnsupportedEdit,
+                            message: "an empty run holding its own run properties cannot also \
+                                      take modeled run properties"
+                                .to_string(),
+                            details: ErrorDetails {
+                                context: Some(format!("opaque_ref={}", deco.opaque_ref)),
+                                ..ErrorDetails::default()
+                            },
+                        });
+                    }
+                    let mut rpr = build_rpr(&deco.wrapper_marks, &deco.wrapper_style_props);
+                    if let Some(change) = physical_change {
+                        append_rpr_change(&mut rpr, change, next_id);
+                    }
+                    element.children.insert(0, XMLNode::Element(rpr));
+                    parent.children.push(XMLNode::Element(element));
+                } else if decoration_requires_run_wrapper(&element) {
                     let mut run = w_el("r");
                     apply_source_run_attrs(&mut run, &deco.source_run_attrs);
                     // Restore the host run's rPr (note-reference character style,
@@ -1290,11 +1381,20 @@ fn append_single_inline(
                         .formatting_change
                         .as_ref()
                         .filter(|change| change.is_physical_revision());
+                    let off_toggles = deco
+                        .wrapper_rpr_authored
+                        .is_some_and(|authored| authored.bold_off || authored.italic_off);
                     if !deco.wrapper_marks.is_empty()
                         || !deco.wrapper_style_props.is_empty()
                         || physical_change.is_some()
+                        || off_toggles
                     {
                         let mut rpr = build_rpr(&deco.wrapper_marks, &deco.wrapper_style_props);
+                        // An explicit OFF the source run wrote (against a
+                        // style that turns the toggle on) is kept.
+                        if let Some(authored) = deco.wrapper_rpr_authored {
+                            append_authored_off_toggles(&mut rpr, &deco.wrapper_marks, authored);
+                        }
                         // The wrapper run's tracked formatting change, as on
                         // a text run.
                         if let Some(change) = physical_change {
@@ -1539,6 +1639,9 @@ fn build_paragraph_mark_rpr(paragraph: &ParagraphNode, next_id: &mut u32) -> Opt
         attr_set(&mut rpr_change, "w:author", fc.author.clone());
         if let Some(ref date) = fc.date {
             attr_set(&mut rpr_change, "w:date", date.clone());
+        }
+        if let Some(ref date_utc) = fc.date_utc {
+            attr_set(&mut rpr_change, "w16du:dateUtc", date_utc.clone());
         }
         let mut prev_rpr = build_rpr_with_underline_off(
             &previous.marks,
@@ -2196,6 +2299,7 @@ pub fn serialize_paragraph_node(
         has_direct_numbering: _,    // → pPr (numPr) — gate: emit only paragraph-authored numPr
         numbering_suppressed: _,    // → pPr (numPr w:numId=0, §17.9.18)
         direct_numbering_omits_ilvl: _, // → pPr (numPr written without w:ilvl)
+        direct_num_pr_without_list: _, // → pPr (numPr written without w:numId)
         materialized_numbering: _,  // internal — projection roundtrip, not serialized
         rendered_text: _,           // derived — diff comparison, not serialized
         literal_prefix: _,          // → here (prefix text run)
@@ -2348,6 +2452,7 @@ pub fn serialize_paragraph_node(
                     next_annotation_id(next_id),
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )
             }
             TrackingStatus::Deleted(rev) if block_move_from => {
@@ -2356,6 +2461,7 @@ pub fn serialize_paragraph_node(
                     next_annotation_id(next_id),
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )
             }
             TrackingStatus::Inserted(rev) => {
@@ -2366,6 +2472,7 @@ pub fn serialize_paragraph_node(
                     wire_id,
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )
             }
             TrackingStatus::Deleted(rev) => {
@@ -2376,6 +2483,7 @@ pub fn serialize_paragraph_node(
                     wire_id,
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )
             }
             TrackingStatus::InsertedThenDeleted(sr) => {
@@ -2387,12 +2495,14 @@ pub fn serialize_paragraph_node(
                     next_annotation_id(next_id),
                     sr.inserted.author.as_deref().unwrap_or(""),
                     sr.inserted.date.as_deref().unwrap_or(""),
+                    sr.inserted.date_utc.as_deref(),
                 );
                 crate::word_xml::ensure_ppr_rpr_del(
                     &mut p,
                     next_annotation_id(next_id),
                     sr.deleted.author.as_deref().unwrap_or(""),
                     sr.deleted.date.as_deref().unwrap_or(""),
+                    sr.deleted.date_utc.as_deref(),
                 );
             }
             TrackingStatus::Normal => {}
@@ -2446,6 +2556,7 @@ pub fn serialize_paragraph_node(
         // Use w:moveFrom instead of w:del when this block is a move source.
         let author = rev.author.as_deref().unwrap_or("");
         let date = rev.date.as_deref().unwrap_or("");
+        let date_utc = rev.date_utc.as_deref();
         let container_kind = if is_move {
             TrackedContainer::MoveFrom
         } else {
@@ -2454,9 +2565,9 @@ pub fn serialize_paragraph_node(
         if let Some(prefix) = &literal_prefix {
             let mut prefix_container = match &container_kind {
                 TrackedContainer::MoveFrom => {
-                    word_xml::w_move_from(next_annotation_id(next_id), author, date)
+                    word_xml::w_move_from(next_annotation_id(next_id), author, date, date_utc)
                 }
-                _ => w_del(next_annotation_id(next_id), author, date),
+                _ => w_del(next_annotation_id(next_id), author, date, date_utc),
             };
             let _ = append_literal_prefix_runs(
                 &mut prefix_container,
@@ -2490,6 +2601,7 @@ pub fn serialize_paragraph_node(
             &container_kind,
             author,
             date,
+            date_utc,
             None,
             next_id,
             None,
@@ -2510,6 +2622,7 @@ pub fn serialize_paragraph_node(
     if let Some(TrackingStatus::Inserted(rev)) = block_status {
         let rev_author = rev.author.as_deref().unwrap_or("");
         let rev_date = rev.date.as_deref().unwrap_or("");
+        let rev_date_utc = rev.date_utc.as_deref();
         let block_container_kind = if is_move {
             TrackedContainer::MoveTo
         } else {
@@ -2517,10 +2630,18 @@ pub fn serialize_paragraph_node(
         };
         if let Some(prefix) = &literal_prefix {
             let mut wrapper = match &block_container_kind {
-                TrackedContainer::MoveTo => {
-                    word_xml::w_move_to(next_annotation_id(next_id), rev_author, rev_date)
-                }
-                _ => w_ins(next_annotation_id(next_id), rev_author, rev_date),
+                TrackedContainer::MoveTo => word_xml::w_move_to(
+                    next_annotation_id(next_id),
+                    rev_author,
+                    rev_date,
+                    rev_date_utc,
+                ),
+                _ => w_ins(
+                    next_annotation_id(next_id),
+                    rev_author,
+                    rev_date,
+                    rev_date_utc,
+                ),
             };
             let _ = append_literal_prefix_runs(
                 &mut wrapper,
@@ -2574,6 +2695,7 @@ pub fn serialize_paragraph_node(
                         &seg_container,
                         rev_author,
                         rev_date,
+                        rev_date_utc,
                         None,
                         next_id,
                         None,
@@ -2591,6 +2713,7 @@ pub fn serialize_paragraph_node(
                 TrackingStatus::Inserted(seg_rev) => {
                     let seg_author = seg_rev.author.as_deref().unwrap_or("");
                     let seg_date = seg_rev.date.as_deref().unwrap_or("");
+                    let seg_date_utc = seg_rev.date_utc.as_deref();
                     let seg_container = if is_move {
                         TrackedContainer::MoveTo
                     } else {
@@ -2602,6 +2725,7 @@ pub fn serialize_paragraph_node(
                         &seg_container,
                         seg_author,
                         seg_date,
+                        seg_date_utc,
                         None,
                         next_id,
                         None,
@@ -2619,12 +2743,14 @@ pub fn serialize_paragraph_node(
                 TrackingStatus::Deleted(seg_rev) => {
                     let seg_author = seg_rev.author.as_deref().unwrap_or("");
                     let seg_date = seg_rev.date.as_deref().unwrap_or("");
+                    let seg_date_utc = seg_rev.date_utc.as_deref();
                     emit_tracked_chunks(
                         &mut p,
                         &chunks,
                         &TrackedContainer::Del,
                         seg_author,
                         seg_date,
+                        seg_date_utc,
                         None,
                         next_id,
                         None,
@@ -2648,6 +2774,7 @@ pub fn serialize_paragraph_node(
                         next_annotation_id(next_id),
                         sr.inserted.author.as_deref().unwrap_or(""),
                         sr.inserted.date.as_deref().unwrap_or(""),
+                        sr.inserted.date_utc.as_deref(),
                     );
                     emit_tracked_chunks(
                         &mut ins_wrapper,
@@ -2655,6 +2782,7 @@ pub fn serialize_paragraph_node(
                         &TrackedContainer::Del,
                         sr.deleted.author.as_deref().unwrap_or(""),
                         sr.deleted.date.as_deref().unwrap_or(""),
+                        sr.deleted.date_utc.as_deref(),
                         None,
                         next_id,
                         None,
@@ -2782,6 +2910,40 @@ pub fn serialize_paragraph_node(
                 seg_idx += 2;
                 continue;
             }
+        }
+
+        // One insertion with deletions inside it (`<w:ins>…<w:del>…</w:del>…
+        // </w:ins>`) imports as several segments that share the insertion's
+        // identity: the inserted text around each deletion, and the deleted
+        // text stacked on it. Written segment by segment, each would get its
+        // own `w:ins` and its own `w:id`, and the reopened document would hold
+        // one insertion per piece. Write the run of segments as the one
+        // envelope it was.
+        let insertion_run = insertion_with_inner_deletions(&segments[seg_idx..]);
+        if insertion_run > 1 {
+            let insertion = inserted_revision(&segment.status)
+                .expect("an insertion run starts with an inserted segment");
+            let shared_wire_id = match para_mark_wire {
+                Some((false, identity, wire_id)) if insertion.identity == identity => Some(wire_id),
+                _ => None,
+            };
+            emit_insertion_with_inner_deletions(
+                &mut p,
+                &segments[seg_idx..seg_idx + insertion_run],
+                insertion,
+                shared_wire_id,
+                &mut emitted_opaques,
+                next_id,
+                bookmark_policy,
+                origin,
+                match resolve_rel_rid.as_mut() {
+                    Some(resolver) => Some(&mut **resolver as &mut dyn FnMut(&str, &str) -> String),
+                    None => None,
+                },
+                &mut pending_prefix_sep,
+            )?;
+            seg_idx += insertion_run;
+            continue;
         }
 
         let shared_wire_id = match (&segment.status, para_mark_wire) {
@@ -3184,6 +3346,9 @@ fn build_paragraph_sect_pr(
         if let Some(ref date) = change.revision.date {
             attr_set(&mut change_el, "w:date", date.clone());
         }
+        if let Some(ref date_utc) = change.revision.date_utc {
+            attr_set(&mut change_el, "w16du:dateUtc", date_utc.clone());
+        }
         if let Ok(mut previous) =
             crate::word_xml::parse_raw_fragment(&change.previous_properties_raw)
         {
@@ -3343,6 +3508,17 @@ pub(crate) fn build_paragraph_properties(
         attr_set(&mut num_id, "w:val", "0");
         num_pr.children.push(XMLNode::Element(ilvl));
         num_pr.children.push(XMLNode::Element(num_id));
+        ppr.children.push(XMLNode::Element(num_pr));
+        has_any = true;
+    } else if let Some(without_list) = paragraph.direct_num_pr_without_list {
+        // A numPr that names no list is written back as authored: Word reads
+        // the list from the style and only the level, if any, from here.
+        let mut num_pr = w_el("numPr");
+        if let Some(level) = without_list.ilvl {
+            let mut ilvl = w_el("ilvl");
+            attr_set(&mut ilvl, "w:val", level.to_string());
+            num_pr.children.push(XMLNode::Element(ilvl));
+        }
         ppr.children.push(XMLNode::Element(num_pr));
         has_any = true;
     }
@@ -3643,6 +3819,9 @@ pub(crate) fn build_paragraph_properties(
         attr_set(&mut ppr_change, "w:author", fc.author.clone());
         if let Some(ref date) = fc.date {
             attr_set(&mut ppr_change, "w:date", date.clone());
+        }
+        if let Some(ref date_utc) = fc.date_utc {
+            attr_set(&mut ppr_change, "w16du:dateUtc", date_utc.clone());
         }
         let mut prev_ppr = w_el("pPr");
         // Inner pPr inside pPrChange follows same CT_PPrBase order as build_paragraph_properties.
@@ -4003,12 +4182,31 @@ fn is_tracked_container_direct_inline(inline: &InlineNode, keep_proof_errors_ins
         || matches!(
             inline,
             InlineNode::Decoration(decoration)
-                if !matches!(
-                    (keep_proof_errors_inside, &decoration.kind),
-                    (_, crate::domain::DecorationType::Bookmark)
-                        | (true, crate::domain::DecorationType::ProofError)
-                ) && !is_run_content_decoration(decoration)
+                if is_tracked_container_direct_decoration(decoration, keep_proof_errors_inside)
         )
+}
+
+fn is_tracked_container_direct_decoration(
+    decoration: &crate::domain::DecorationNode,
+    keep_proof_errors_inside: bool,
+) -> bool {
+    !matches!(
+        (keep_proof_errors_inside, &decoration.kind),
+        (_, crate::domain::DecorationType::Bookmark)
+            | (true, crate::domain::DecorationType::ProofError)
+    ) && !is_run_content_decoration(decoration)
+}
+
+/// Whether a whole-paragraph insertion (block-level `Inserted`, not a move)
+/// writes `decoration` inside its `w:ins`. Its untracked segments are emitted
+/// with proofing markers kept inside, so a bookmark, a `w:proofErr` and a
+/// run-content decoration are inserted content, and a reopen reads them back
+/// as part of the one insertion. Every other decoration is written beside
+/// the `w:ins`.
+pub(crate) fn block_insertion_writes_decoration_inside(
+    decoration: &crate::domain::DecorationNode,
+) -> bool {
+    !is_tracked_container_direct_decoration(decoration, true)
 }
 
 /// Whether `decoration` is written as its own `w:r` (see
@@ -4039,6 +4237,7 @@ fn append_tracked_omml_opaque(
     container_kind: &TrackedContainer,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     next_id: &mut u32,
 ) -> Result<(), RuntimeError> {
     let Some(raw_xml) = &opaque.raw_xml else {
@@ -4069,10 +4268,10 @@ fn append_tracked_omml_opaque(
     // independently qualified.
     let annotation_id = next_annotation_id(next_id);
     let mut container = match container_kind {
-        TrackedContainer::Del => w_del(annotation_id, author, date),
-        TrackedContainer::Ins => w_ins(annotation_id, author, date),
-        TrackedContainer::MoveFrom => word_xml::w_move_from(annotation_id, author, date),
-        TrackedContainer::MoveTo => word_xml::w_move_to(annotation_id, author, date),
+        TrackedContainer::Del => w_del(annotation_id, author, date, date_utc),
+        TrackedContainer::Ins => w_ins(annotation_id, author, date, date_utc),
+        TrackedContainer::MoveFrom => word_xml::w_move_from(annotation_id, author, date, date_utc),
+        TrackedContainer::MoveTo => word_xml::w_move_to(annotation_id, author, date, date_utc),
     };
     container.children.push(XMLNode::Element(element));
     parent.children.push(XMLNode::Element(container));
@@ -4098,6 +4297,7 @@ fn append_tracked_hyperlink_paragraph_opaque(
     container_kind: &TrackedContainer,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     next_id: &mut u32,
 ) -> Result<(), RuntimeError> {
     let unsupported = |reason: &str| RuntimeError {
@@ -4157,8 +4357,8 @@ fn append_tracked_hyperlink_paragraph_opaque(
     .to_instruction_text();
     let deleted = matches!(container_kind, TrackedContainer::Del);
     let mut container = match container_kind {
-        TrackedContainer::Ins => w_ins(next_annotation_id(next_id), author, date),
-        TrackedContainer::Del => w_del(next_annotation_id(next_id), author, date),
+        TrackedContainer::Ins => w_ins(next_annotation_id(next_id), author, date, date_utc),
+        TrackedContainer::Del => w_del(next_annotation_id(next_id), author, date, date_utc),
         _ => return Err(unsupported("unsupported whole-link revision kind")),
     };
     let control = |kind: &str| {
@@ -4212,8 +4412,16 @@ pub(crate) fn lowered_tracked_hyperlink_runs(data: &HyperlinkData, deleted: bool
         TrackedContainer::Ins
     };
     let mut parent = w_el("p");
-    append_tracked_hyperlink_paragraph_opaque(&mut parent, data, &container_kind, "", "", &mut 0)
-        .expect("a link rebuilt from a URL or bookmark HYPERLINK field has a whole-field form");
+    append_tracked_hyperlink_paragraph_opaque(
+        &mut parent,
+        data,
+        &container_kind,
+        "",
+        "",
+        None,
+        &mut 0,
+    )
+    .expect("a link rebuilt from a URL or bookmark HYPERLINK field has a whole-field form");
     let [XMLNode::Element(container)] = parent.children.as_slice() else {
         unreachable!("the lowering writes exactly one revision container")
     };
@@ -4248,6 +4456,7 @@ fn append_tracked_inserted_complex_field(
     kind: &OpaqueKind,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     next_id: &mut u32,
 ) {
     // Engine-authored emission (tracked field insert); the note-style
@@ -4267,7 +4476,7 @@ fn append_tracked_inserted_complex_field(
         c
     };
 
-    let mut ins = w_ins(next_annotation_id(next_id), author, date);
+    let mut ins = w_ins(next_annotation_id(next_id), author, date, date_utc);
     ins.children
         .push(XMLNode::Element(field_run(fld_char("begin"), &rpr)));
 
@@ -4377,6 +4586,7 @@ pub(crate) fn fold_lowered_inserted_simple_field(parts: &[InlineNode]) -> Option
         &kind,
         "",
         "",
+        None,
         &mut next_id,
     );
     let [XMLNode::Element(insertion)] = parent.children.as_slice() else {
@@ -4437,6 +4647,7 @@ fn append_tracked_deleted_complex_field(
     kind: &OpaqueKind,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     next_id: &mut u32,
 ) {
     let rpr = build_wrapper_rpr(wrapper_marks, wrapper_style_props, kind, true);
@@ -4454,7 +4665,7 @@ fn append_tracked_deleted_complex_field(
         field_char
     };
 
-    let mut deletion = w_del(next_annotation_id(next_id), author, date);
+    let mut deletion = w_del(next_annotation_id(next_id), author, date, date_utc);
     deletion
         .children
         .push(XMLNode::Element(field_run(fld_char("begin"), &rpr)));
@@ -4510,6 +4721,7 @@ fn append_tracked_inline_sdt(
     container_kind: &TrackedContainer,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     next_id: &mut u32,
 ) -> Result<(), RuntimeError> {
     let Some(raw_xml) = &opaque.raw_xml else {
@@ -4622,7 +4834,7 @@ fn append_tracked_inline_sdt(
             let XMLNode::Element(content) = &mut element.children[content_index] else {
                 unreachable!("content index was selected from element children")
             };
-            let mut deletion = w_del(next_annotation_id(next_id), author, date);
+            let mut deletion = w_del(next_annotation_id(next_id), author, date, date_utc);
             deletion.children = std::mem::take(&mut content.children);
             coerce_opaque_run_text(&mut deletion, true);
             content.children.push(XMLNode::Element(deletion));
@@ -4728,6 +4940,7 @@ fn emit_tracked_chunks(
     container_kind: &TrackedContainer,
     author: &str,
     date: &str,
+    date_utc: Option<&str>,
     shared_wire_id: Option<u32>,
     next_id: &mut u32,
     mut emitted_opaques: Option<&mut HashSet<String>>,
@@ -4745,12 +4958,14 @@ fn emit_tracked_chunks(
                 let deleted_text = matches!(container_kind, TrackedContainer::Del);
                 let annotation_id = shared_wire_id.unwrap_or_else(|| next_annotation_id(next_id));
                 let mut container = match container_kind {
-                    TrackedContainer::Del => w_del(annotation_id, author, date),
-                    TrackedContainer::Ins => w_ins(annotation_id, author, date),
+                    TrackedContainer::Del => w_del(annotation_id, author, date, date_utc),
+                    TrackedContainer::Ins => w_ins(annotation_id, author, date, date_utc),
                     TrackedContainer::MoveFrom => {
-                        word_xml::w_move_from(annotation_id, author, date)
+                        word_xml::w_move_from(annotation_id, author, date, date_utc)
                     }
-                    TrackedContainer::MoveTo => word_xml::w_move_to(annotation_id, author, date),
+                    TrackedContainer::MoveTo => {
+                        word_xml::w_move_to(annotation_id, author, date, date_utc)
+                    }
                 };
                 append_inline_refs_to_container(
                     &mut container,
@@ -4789,7 +5004,15 @@ fn emit_tracked_chunks(
                         TrackedContainer::Ins | TrackedContainer::Del
                     )
                 {
-                    append_tracked_inline_sdt(p, opaque, container_kind, author, date, next_id)?;
+                    append_tracked_inline_sdt(
+                        p,
+                        opaque,
+                        container_kind,
+                        author,
+                        date,
+                        date_utc,
+                        next_id,
+                    )?;
                     continue;
                 }
                 if let InlineNode::OpaqueInline(opaque) = inline
@@ -4802,7 +5025,15 @@ fn emit_tracked_chunks(
                             | TrackedContainer::MoveTo
                     )
                 {
-                    append_tracked_omml_opaque(p, opaque, container_kind, author, date, next_id)?;
+                    append_tracked_omml_opaque(
+                        p,
+                        opaque,
+                        container_kind,
+                        author,
+                        date,
+                        date_utc,
+                        next_id,
+                    )?;
                     continue;
                 }
                 if let Some(set) = emitted_opaques.as_deref_mut()
@@ -4827,6 +5058,7 @@ fn emit_tracked_chunks(
                         container_kind,
                         author,
                         date,
+                        date_utc,
                         next_id,
                     )?;
                     continue;
@@ -4854,6 +5086,7 @@ fn emit_tracked_chunks(
                             &opaque.kind,
                             author,
                             date,
+                            date_utc,
                             next_id,
                         ),
                         TrackedContainer::Del => append_tracked_deleted_complex_field(
@@ -4864,6 +5097,7 @@ fn emit_tracked_chunks(
                             &opaque.kind,
                             author,
                             date,
+                            date_utc,
                             next_id,
                         ),
                         _ => unreachable!("simple field branch admits only insertion/deletion"),
@@ -4909,6 +5143,182 @@ fn segments_share_opaques(a: &TrackedSegment, b: &TrackedSegment) -> bool {
     a_keys == paragraph_opaque_keys(&b.inlines)
 }
 
+/// The insertion a segment's text belongs to: the revision of an inserted
+/// segment, or the insertion under a deletion stacked on inserted text.
+fn inserted_revision(status: &TrackingStatus) -> Option<&RevisionInfo> {
+    match status {
+        TrackingStatus::Inserted(revision) => Some(revision),
+        TrackingStatus::InsertedThenDeleted(stacked) => Some(&stacked.inserted),
+        TrackingStatus::Normal | TrackingStatus::Deleted(_) => None,
+    }
+}
+
+/// How many leading segments form ONE insertion with deletions inside it:
+/// consecutive segments whose text belongs to the same insertion (same engine
+/// identity), at least one of them deleted again. Returns 0 or 1 when the
+/// leading segment is not such a run; it is then written on its own.
+fn insertion_with_inner_deletions(segments: &[TrackedSegment]) -> usize {
+    let Some(insertion) = segments.first().and_then(|s| inserted_revision(&s.status)) else {
+        return 0;
+    };
+    // Identity 0 is "not minted": it names no revision, so it cannot prove
+    // two segments are one.
+    if insertion.identity == 0 {
+        return 0;
+    }
+    let length = segments
+        .iter()
+        .take_while(|segment| {
+            inserted_revision(&segment.status).is_some_and(|revision| {
+                revision.identity == insertion.identity
+                    && revision.author == insertion.author
+                    && revision.date == insertion.date
+            })
+        })
+        .count();
+    let has_inner_deletion = segments[..length]
+        .iter()
+        .any(|segment| matches!(segment.status, TrackingStatus::InsertedThenDeleted(_)));
+    if has_inner_deletion { length } else { 1 }
+}
+
+/// Write one insertion with deletions inside it as a single `w:ins` holding
+/// its runs and, in place, each inner `w:del` — the shape Word writes and
+/// ECMA-376 allows (CT_RunTrackChange admits `w:del` through
+/// EG_RunLevelElements). Inserted pieces are written as [`emit_segment`]
+/// writes an inserted segment, deleted pieces exactly as it writes a stacked
+/// one; the envelope is what differs.
+///
+/// Spelling and grammar markers (`w:proofErr`) inside the inserted text stay
+/// inside the envelope, as Word writes them. [`is_tracked_container_direct_inline`]
+/// keeps them inside only an envelope proven to belong to one revision; this
+/// one is, by identity, so writing them outside would split the insertion at
+/// every proofing span.
+///
+/// Content that cannot sit inside `w:ins` (a paragraph-level hyperlink or
+/// simple field: [`split_tracked_container_chunks`]) closes the envelope and is
+/// written beside it as today; the text after it opens a new one.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn emit_insertion_with_inner_deletions(
+    p: &mut Element,
+    segments: &[TrackedSegment],
+    insertion: &RevisionInfo,
+    shared_wire_id: Option<u32>,
+    emitted_opaques: &mut HashSet<String>,
+    next_id: &mut u32,
+    bookmark_policy: &BookmarkIdPolicy,
+    origin: &str,
+    mut resolve_rel_rid: Option<&mut dyn FnMut(&str, &str) -> String>,
+    pending_prefix_sep: &mut Option<String>,
+) -> Result<(), RuntimeError> {
+    let author = insertion.author.as_deref().unwrap_or("");
+    let date = insertion.date.as_deref().unwrap_or("");
+    let date_utc = insertion.date_utc.as_deref();
+    let open = |next_id: &mut u32| {
+        w_ins(
+            shared_wire_id.unwrap_or_else(|| next_annotation_id(next_id)),
+            author,
+            date,
+            date_utc,
+        )
+    };
+    let mut envelope = open(next_id);
+    for segment in segments {
+        let segment_refs: Vec<&InlineNode> = segment.inlines.iter().collect();
+        match &segment.status {
+            TrackingStatus::Inserted(_) => {
+                // Proofing markers inside the insertion stay inside it: the
+                // envelope is the insertion's own (see the doc comment).
+                let chunks = split_tracked_container_chunks(&segment_refs, true);
+                for chunk in &chunks {
+                    match chunk {
+                        TrackedContentChunk::RunContent(inlines) => {
+                            let mut piece = w_ins(0, author, date, date_utc);
+                            append_inline_refs_to_container(
+                                &mut piece,
+                                inlines,
+                                false,
+                                next_id,
+                                bookmark_policy,
+                                origin,
+                                match resolve_rel_rid.as_mut() {
+                                    Some(resolver) => Some(
+                                        &mut **resolver as &mut dyn FnMut(&str, &str) -> String,
+                                    ),
+                                    None => None,
+                                },
+                                pending_prefix_sep,
+                            )?;
+                            reassign_inserted_sdt_ids(&mut piece, next_id);
+                            envelope.children.append(&mut piece.children);
+                        }
+                        TrackedContentChunk::DirectInline(_) => {
+                            if !envelope.children.is_empty() {
+                                p.children.push(XMLNode::Element(std::mem::replace(
+                                    &mut envelope,
+                                    open(next_id),
+                                )));
+                            }
+                            emit_tracked_chunks(
+                                p,
+                                std::slice::from_ref(chunk),
+                                &TrackedContainer::Ins,
+                                author,
+                                date,
+                                date_utc,
+                                shared_wire_id,
+                                next_id,
+                                Some(emitted_opaques),
+                                bookmark_policy,
+                                origin,
+                                match resolve_rel_rid.as_mut() {
+                                    Some(resolver) => Some(
+                                        &mut **resolver as &mut dyn FnMut(&str, &str) -> String,
+                                    ),
+                                    None => None,
+                                },
+                                pending_prefix_sep,
+                            )?;
+                        }
+                    }
+                }
+            }
+            TrackingStatus::InsertedThenDeleted(stacked) => {
+                let chunks = split_tracked_container_chunks(&segment_refs, false);
+                emit_tracked_chunks(
+                    &mut envelope,
+                    &chunks,
+                    &TrackedContainer::Del,
+                    stacked.deleted.author.as_deref().unwrap_or(""),
+                    stacked.deleted.date.as_deref().unwrap_or(""),
+                    stacked.deleted.date_utc.as_deref(),
+                    None,
+                    next_id,
+                    Some(emitted_opaques),
+                    bookmark_policy,
+                    origin,
+                    match resolve_rel_rid.as_mut() {
+                        Some(resolver) => {
+                            Some(&mut **resolver as &mut dyn FnMut(&str, &str) -> String)
+                        }
+                        None => None,
+                    },
+                    pending_prefix_sep,
+                )?;
+            }
+            TrackingStatus::Normal | TrackingStatus::Deleted(_) => {
+                unreachable!(
+                    "insertion_with_inner_deletions admits only inserted and stacked segments"
+                )
+            }
+        }
+    }
+    if !envelope.children.is_empty() {
+        p.children.push(XMLNode::Element(envelope));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_segment(
     p: &mut Element,
@@ -4942,12 +5352,14 @@ fn emit_segment(
             let chunks = split_tracked_container_chunks(&segment_refs, shared_wire_id.is_some());
             let author = rev.author.as_deref().unwrap_or("");
             let date = rev.date.as_deref().unwrap_or("");
+            let date_utc = rev.date_utc.as_deref();
             emit_tracked_chunks(
                 p,
                 &chunks,
                 &TrackedContainer::Ins,
                 author,
                 date,
+                date_utc,
                 shared_wire_id,
                 next_id,
                 Some(emitted_opaques),
@@ -4965,12 +5377,14 @@ fn emit_segment(
             let chunks = split_tracked_container_chunks(&segment_refs, shared_wire_id.is_some());
             let author = rev.author.as_deref().unwrap_or("");
             let date = rev.date.as_deref().unwrap_or("");
+            let date_utc = rev.date_utc.as_deref();
             emit_tracked_chunks(
                 p,
                 &chunks,
                 &TrackedContainer::Del,
                 author,
                 date,
+                date_utc,
                 shared_wire_id,
                 next_id,
                 Some(emitted_opaques),
@@ -4997,6 +5411,7 @@ fn emit_segment(
                 next_annotation_id(next_id),
                 sr.inserted.author.as_deref().unwrap_or(""),
                 sr.inserted.date.as_deref().unwrap_or(""),
+                sr.inserted.date_utc.as_deref(),
             );
             emit_tracked_chunks(
                 &mut ins_wrapper,
@@ -5004,6 +5419,7 @@ fn emit_segment(
                 &TrackedContainer::Del,
                 sr.deleted.author.as_deref().unwrap_or(""),
                 sr.deleted.date.as_deref().unwrap_or(""),
+                sr.deleted.date_utc.as_deref(),
                 None,
                 next_id,
                 Some(emitted_opaques),
@@ -5048,8 +5464,10 @@ fn emit_interleaved_del_ins(
     };
     let del_author = del_rev.author.as_deref().unwrap_or("");
     let del_date = del_rev.date.as_deref().unwrap_or("");
+    let del_date_utc = del_rev.date_utc.as_deref();
     let ins_author = ins_rev.author.as_deref().unwrap_or("");
     let ins_date = ins_rev.date.as_deref().unwrap_or("");
+    let ins_date_utc = ins_rev.date_utc.as_deref();
 
     let del_refs: Vec<&InlineNode> = del_segment.inlines.iter().collect();
     let ins_refs: Vec<&InlineNode> = ins_segment.inlines.iter().collect();
@@ -5066,7 +5484,12 @@ fn emit_interleaved_del_ins(
     loop {
         // Emit del RunContent chunks until we hit a ParagraphOpaque or exhaust del
         while let Some(TrackedContentChunk::RunContent(inlines)) = del_iter.peek() {
-            let mut container = w_del(next_annotation_id(next_id), del_author, del_date);
+            let mut container = w_del(
+                next_annotation_id(next_id),
+                del_author,
+                del_date,
+                del_date_utc,
+            );
             let mut no_prefix_sep: Option<String> = None;
             append_inline_refs_to_container(
                 &mut container,
@@ -5089,7 +5512,12 @@ fn emit_interleaved_del_ins(
 
         // Emit ins RunContent chunks until we hit a ParagraphOpaque or exhaust ins
         while let Some(TrackedContentChunk::RunContent(inlines)) = ins_iter.peek() {
-            let mut container = w_ins(next_annotation_id(next_id), ins_author, ins_date);
+            let mut container = w_ins(
+                next_annotation_id(next_id),
+                ins_author,
+                ins_date,
+                ins_date_utc,
+            );
             let mut no_prefix_sep: Option<String> = None;
             append_inline_refs_to_container(
                 &mut container,
@@ -7270,6 +7698,9 @@ fn serialize_table_node(
                 if let Some(ref date) = change.date {
                     attr_set(&mut change_el, "w:date", date.clone());
                 }
+                if let Some(ref date_utc) = change.date_utc {
+                    attr_set(&mut change_el, "w16du:dateUtc", date_utc.clone());
+                }
                 let previous = change
                     .previous
                     .as_ref()
@@ -7378,6 +7809,7 @@ fn serialize_table_node(
                     next_annotation_id(next_id),
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )));
                 has_tr_pr = true;
             }
@@ -7386,6 +7818,7 @@ fn serialize_table_node(
                     next_annotation_id(next_id),
                     rev.author.as_deref().unwrap_or(""),
                     rev.date.as_deref().unwrap_or(""),
+                    rev.date_utc.as_deref(),
                 )));
                 has_tr_pr = true;
             }
@@ -7394,11 +7827,13 @@ fn serialize_table_node(
                     next_annotation_id(next_id),
                     sr.inserted.author.as_deref().unwrap_or(""),
                     sr.inserted.date.as_deref().unwrap_or(""),
+                    sr.inserted.date_utc.as_deref(),
                 )));
                 tr_pr.children.push(XMLNode::Element(w_del(
                     next_annotation_id(next_id),
                     sr.deleted.author.as_deref().unwrap_or(""),
                     sr.deleted.date.as_deref().unwrap_or(""),
+                    sr.deleted.date_utc.as_deref(),
                 )));
                 has_tr_pr = true;
             }
@@ -7656,6 +8091,7 @@ fn serialize_table_node(
                         next_annotation_id(next_id),
                         rev.author.as_deref().unwrap_or(""),
                         rev.date.as_deref().unwrap_or(""),
+                        rev.date_utc.as_deref(),
                     )));
                     has_tc_pr = true;
                 }
@@ -7664,6 +8100,7 @@ fn serialize_table_node(
                         next_annotation_id(next_id),
                         rev.author.as_deref().unwrap_or(""),
                         rev.date.as_deref().unwrap_or(""),
+                        rev.date_utc.as_deref(),
                     )));
                     has_tc_pr = true;
                 }
@@ -7672,11 +8109,13 @@ fn serialize_table_node(
                         next_annotation_id(next_id),
                         sr.inserted.author.as_deref().unwrap_or(""),
                         sr.inserted.date.as_deref().unwrap_or(""),
+                        sr.inserted.date_utc.as_deref(),
                     )));
                     tc_pr.children.push(XMLNode::Element(w_cell_del(
                         next_annotation_id(next_id),
                         sr.deleted.author.as_deref().unwrap_or(""),
                         sr.deleted.date.as_deref().unwrap_or(""),
+                        sr.deleted.date_utc.as_deref(),
                     )));
                     has_tc_pr = true;
                 }
@@ -7689,6 +8128,7 @@ fn serialize_table_node(
                     next_annotation_id(next_id),
                     merge.revision.author.as_deref().unwrap_or(""),
                     merge.revision.date.as_deref().unwrap_or(""),
+                    merge.revision.date_utc.as_deref(),
                     &merge.after,
                     &merge.before,
                 )));
@@ -8110,7 +8550,8 @@ pub(crate) fn build_hyperlink_element(
                 TrackingStatus::Inserted(rev) => {
                     let author = rev.author.as_deref().unwrap_or("");
                     let date = rev.date.as_deref().unwrap_or("");
-                    let mut ins = crate::word_xml::w_ins(rev.revision_id, author, date);
+                    let date_utc = rev.date_utc.as_deref();
+                    let mut ins = crate::word_xml::w_ins(rev.revision_id, author, date, date_utc);
                     for run in &data.runs[i..j] {
                         ins.children
                             .push(XMLNode::Element(build_hyperlink_run(run, false)));
@@ -8120,7 +8561,8 @@ pub(crate) fn build_hyperlink_element(
                 TrackingStatus::Deleted(rev) => {
                     let author = rev.author.as_deref().unwrap_or("");
                     let date = rev.date.as_deref().unwrap_or("");
-                    let mut del = crate::word_xml::w_del(rev.revision_id, author, date);
+                    let date_utc = rev.date_utc.as_deref();
+                    let mut del = crate::word_xml::w_del(rev.revision_id, author, date, date_utc);
                     for run in &data.runs[i..j] {
                         del.children
                             .push(XMLNode::Element(build_hyperlink_run(run, true)));
@@ -8135,11 +8577,13 @@ pub(crate) fn build_hyperlink_element(
                         sr.inserted.revision_id,
                         sr.inserted.author.as_deref().unwrap_or(""),
                         sr.inserted.date.as_deref().unwrap_or(""),
+                        sr.inserted.date_utc.as_deref(),
                     );
                     let mut del = crate::word_xml::w_del(
                         sr.deleted.revision_id,
                         sr.deleted.author.as_deref().unwrap_or(""),
                         sr.deleted.date.as_deref().unwrap_or(""),
+                        sr.deleted.date_utc.as_deref(),
                     );
                     for run in &data.runs[i..j] {
                         del.children
@@ -8263,6 +8707,7 @@ mod tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: None,
             joins_following_text_run: false,
             raw_xml: Some(raw_xml.to_vec()),
             origin: None,
@@ -8340,6 +8785,7 @@ mod tests {
             &kind,
             "Stemma",
             "2026-08-25T00:00:00Z",
+            Some("2026-08-25T00:00:00Z"),
             &mut next_id,
         );
 
@@ -8363,6 +8809,7 @@ mod tests {
             date: None,
             apply_op_id: None,
             identity: id,
+            date_utc: None,
         }
     }
 
@@ -8408,6 +8855,7 @@ mod tests {
             author: run_author.to_string(),
             date: None,
             identity: 2,
+            date_utc: None,
         });
         normal_tracked_block(BlockNode::from(paragraph))
     }
@@ -8482,6 +8930,7 @@ mod tests {
             identity: 7,
             author: "A".to_string(),
             date: None,
+            date_utc: None,
         });
         let table = TableNode {
             range_markers: Vec::new(),
@@ -9020,6 +9469,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -9077,6 +9527,7 @@ mod tests {
                 date: None,
                 apply_op_id: None,
                 identity: 17,
+                date_utc: None,
             },
         )
     }
@@ -9125,6 +9576,7 @@ mod tests {
                 author: "Editor".into(),
                 date: None,
                 identity: 2,
+                date_utc: None,
             };
             let run = build_text_run_with_leading_tabs(
                 "text",
@@ -9928,6 +10380,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: Some("2026-08-16T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let mut paragraph = minimal_paragraph_for_ppr_test();
         paragraph.literal_prefix = Some("A)".to_string());
@@ -10080,6 +10533,7 @@ mod tests {
                             },
                             wrapper_marks: Vec::new(),
                             wrapper_style_props: StyleProps::default(),
+                            wrapper_rpr_authored: None,
                             joins_following_text_run: false,
                             raw_xml: Some(bm_start_raw.to_vec()),
                             // Key: this decoration came from target during merge
@@ -10102,6 +10556,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -10159,6 +10614,7 @@ mod tests {
                 author: Some("test".to_string()),
                 date: Some("2026-01-01T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             }),
             block: crate::domain::BlockNode::from(ParagraphNode {
                 id: NodeId::from("p2"),
@@ -10194,6 +10650,7 @@ mod tests {
                         author: Some("test".to_string()),
                         date: Some("2026-01-01T00:00:00Z".to_string()),
                         apply_op_id: None,
+                        date_utc: None,
                     }),
                     inlines: vec![
                         InlineNode::from(DecorationNode {
@@ -10209,6 +10666,7 @@ mod tests {
                             },
                             wrapper_marks: Vec::new(),
                             wrapper_style_props: StyleProps::default(),
+                            wrapper_rpr_authored: None,
                             joins_following_text_run: false,
                             raw_xml: Some(bm_end_raw.to_vec()),
                             // No origin override needed — block is Inserted,
@@ -10232,6 +10690,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -10373,6 +10832,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -10506,6 +10966,7 @@ mod tests {
             // explicitly removes inherited numbering.
             numbering_suppressed: true,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -10618,6 +11079,7 @@ mod tests {
             author: Some("Test".to_string()),
             date: Some("2026-05-19T10:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let data = HyperlinkData {
             flattened_wrappers: Vec::new(),
@@ -10845,6 +11307,7 @@ mod tests {
             author: Some("Test".to_string()),
             date: Some("2026-01-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         });
         let mut next_id = 100;
 
@@ -10939,6 +11402,7 @@ mod tests {
                     &kind,
                     "Reviewer",
                     "2026-01-01T00:00:00Z",
+                    None,
                     &mut 1,
                 )
                 .unwrap();
@@ -10983,6 +11447,7 @@ mod tests {
                 &TrackedContainer::Del,
                 "Reviewer",
                 "2026-01-01T00:00:00Z",
+                None,
                 &mut next_id,
             )
             .unwrap_err();

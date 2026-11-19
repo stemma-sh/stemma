@@ -87,6 +87,7 @@ fn txn(steps: Vec<EditStep>) -> EditTransaction {
             author: Some("BCC".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }
@@ -306,7 +307,7 @@ fn tracked_mode_equals_direct_mode() {
         spec: SdtSpec {
             tag: Some("m".to_string()),
             alias: None,
-            control: SdtControl::PlainText,
+            control: SdtControl::RichText,
             binding: None,
         },
         rationale: None,
@@ -329,6 +330,49 @@ fn tracked_mode_equals_direct_mode() {
     assert_eq!(
         direct, tracked,
         "untracked SDT wrap: mode must not change the output"
+    );
+}
+
+/// A control that holds one value holds one paragraph. Checked against Word:
+/// a plain-text, date, drop-down or combo-box control around two paragraphs
+/// makes it repair the document, so the wrap is refused; a rich-text control
+/// around the same range opens cleanly and is allowed.
+#[test]
+fn a_one_value_control_around_two_paragraphs_is_refused() {
+    let docx = make_docx(&["The ferry leaves at noon.", "Tickets are sold on the quay."]);
+    let base = Document::parse(&docx).expect("parse");
+    let canon = base.snapshot().canonical.clone();
+    let wrap = |control: SdtControl| EditStep::WrapBlocksInContentControl {
+        start_block_id: block_id_at(&canon, 0),
+        end_block_id: block_id_at(&canon, 1),
+        spec: SdtSpec {
+            tag: Some("timetable".to_string()),
+            alias: None,
+            control,
+            binding: None,
+        },
+        rationale: None,
+    };
+    for control in [
+        SdtControl::PlainText,
+        SdtControl::Date,
+        SdtControl::Dropdown { items: Vec::new() },
+        SdtControl::ComboBox { items: Vec::new() },
+    ] {
+        let Err(error) = base.apply(&txn(vec![wrap(control.clone())])) else {
+            panic!("{control:?}: a one-value control cannot hold two paragraphs");
+        };
+        assert!(
+            error.to_string().contains("holds exactly one paragraph"),
+            "{control:?}: {error}"
+        );
+    }
+    let wrapped = base
+        .apply(&txn(vec![wrap(SdtControl::RichText)]))
+        .expect("a rich-text control holds any range");
+    assert_eq!(
+        count(&doc_xml(&serialize_validated(&wrapped)), "<w:sdt>"),
+        1
     );
 }
 

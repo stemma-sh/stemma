@@ -127,6 +127,165 @@ pub(crate) fn para_mark_join_needed(
     stacked || (keep_inserted && has_del_mark) || (!keep_inserted && has_ins_mark)
 }
 
+// ─── Accepting a deleted final paragraph mark of a table cell ──────────────
+//
+// Observed in Word 16 (Accept All; Reject All restores the original every
+// time). The mark of a cell's final paragraph ends the cell, and accepting
+// its deletion removes that boundary exactly as accepting a deleted mark
+// joins two body paragraphs (§17.13.5.15): the cell's paragraph joins
+// whatever comes next in document order, and the following paragraph's
+// properties survive.
+//
+// - A cell that is not the last of its row joins the FIRST paragraph of the
+//   next cell, whatever else that cell holds and whatever either cell spans,
+//   and whether or not any of the donor's text survives (a cell whose text
+//   is all deleted simply goes). The cell whose mark survives keeps its
+//   properties; the removed cell's grid columns move to the row's trailing
+//   span (`w:gridAfter`, width [`trailing_width_after_join`]). Neighbouring
+//   cells chain.
+// - The last cell of a row: nothing happens, unless every cell of the row
+//   goes this way. Then the row goes and its text continues into the first
+//   paragraph of the next row's first cell or, for the table's last row,
+//   into the paragraph after the table; a table left with no row goes.
+//
+// Still unobserved, so left as the cell-local resolution has it: a donor of
+// two or more blocks (Word's own Accept All failed on a cell of two
+// paragraphs whose final mark is deleted), a cell that is tracked
+// (`w:cellIns`/`w:cellDel`), vertically merged, has a pending `w:cellMerge`
+// or sits in a content control, a next cell that starts with anything but a
+// paragraph, a tracked row, and a row going into anything but a paragraph.
+// A row goes only in a table whose rows are all plain (`table_rows_plain`:
+// no tracked row or cell, no vertical merge, no pending `w:cellMerge`), so
+// the rows it is read against are the rows the resolution keeps.
+
+/// One table cell as the cell-boundary join rules read it, extracted by each
+/// resolution path from its own representation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CellMarkShape {
+    /// The cell holds exactly one block, and it is a paragraph.
+    pub single_paragraph: bool,
+    /// The cell's first block is a paragraph (what a join lands in).
+    pub starts_with_paragraph: bool,
+    /// The final paragraph's mark is a tracked deletion (not stacked on an
+    /// insertion) which this resolution accepts.
+    pub mark_deletion_accepted: bool,
+    /// The cell is not itself tracked (`w:cellIns`/`w:cellDel`), not
+    /// vertically merged, has no pending `w:cellMerge` and sits in no
+    /// content control.
+    pub plain_cell: bool,
+    /// The grid columns the cell spans (`w:gridSpan`, at least 1).
+    pub grid_span: u32,
+    /// The cell's preferred width in twips, when it is given in `dxa`.
+    pub dxa_width: Option<u32>,
+}
+
+/// Whether the cell is a donor in the observed shape: a plain cell whose
+/// only paragraph has a deleted mark this resolution accepts.
+fn cell_mark_join_observed(cell: CellMarkShape) -> bool {
+    cell.single_paragraph && cell.mark_deletion_accepted && cell.plain_cell
+}
+
+/// Whether a cell can receive a join: plain, starting with a paragraph.
+fn receives_join(cell: CellMarkShape) -> bool {
+    cell.starts_with_paragraph && cell.plain_cell
+}
+
+/// Whether accepting the deleted final paragraph mark of `donor` joins the
+/// cell into the `next` cell of the same row (see the section comment).
+pub(crate) fn cell_mark_joins_next_cell(
+    donor: CellMarkShape,
+    next: CellMarkShape,
+    row_untracked: bool,
+) -> bool {
+    row_untracked && cell_mark_join_observed(donor) && receives_join(next)
+}
+
+/// Whether every cell of a row goes on this resolution, so the row itself
+/// goes and its text continues past it (see the section comment). Where it
+/// continues is the caller's: [`row_goes_into_next_row`] or
+/// [`last_row_goes_into_following_paragraph`].
+fn row_goes(cells: &[CellMarkShape], table_rows_plain: bool) -> bool {
+    table_rows_plain && !cells.is_empty() && cells.iter().copied().all(cell_mark_join_observed)
+}
+
+/// Whether a row that is not the table's last goes, its text continuing into
+/// the first paragraph of the next row's first cell (observed in Word).
+pub(crate) fn row_goes_into_next_row(
+    cells: &[CellMarkShape],
+    next_row_first_cell: Option<CellMarkShape>,
+    table_rows_plain: bool,
+) -> bool {
+    row_goes(cells, table_rows_plain) && next_row_first_cell.is_some_and(receives_join)
+}
+
+/// Whether the table's last row goes, its text continuing into the paragraph
+/// directly after the table (observed in Word, with the table's only row as
+/// well as its last of two). The caller checks the table block is plain (an
+/// untracked block with no range markers, in the same content controls as
+/// the paragraph) and passes it as `followed_by_paragraph`.
+pub(crate) fn last_row_goes_into_following_paragraph(
+    cells: &[CellMarkShape],
+    followed_by_paragraph: bool,
+    table_rows_plain: bool,
+) -> bool {
+    followed_by_paragraph && row_goes(cells, table_rows_plain)
+}
+
+/// The `w:wAfter` twips a row holds once a joined cell's grid columns move
+/// into its trailing span: `trailing` is the span's width so far (0 for a
+/// row without `w:gridAfter`), `donor` the joined cell's width. Word writes
+/// the sum (observed). When either has no `dxa` width the span's width is
+/// unknown in twips and `None` means no `w:wAfter` is written: the grid
+/// alone gives the span (`w:wAfter` is optional, §17.4.85).
+pub(crate) fn trailing_width_after_join(trailing: Option<u32>, donor: Option<u32>) -> Option<u32> {
+    Some(
+        trailing?
+            .checked_add(donor?)
+            .expect("a row's trailing width overflows u32 twips"),
+    )
+}
+
+// ─── A row the resolution empties ──────────────────────────────────────────
+//
+// Observed in Word 16 on a table row moved with tracking on (every cell
+// paragraph's text in `w:moveFrom`, its mark moved from; the destination
+// row the same with `w:moveTo`; no row marks), in a table that also held
+// inserted rows: Accept All removes the source row, Reject All the
+// destination row. Both are one rule: a row whose every cell paragraph loses
+// its mark and all of its content on this resolution goes. It agrees with
+// the deleted-mark joins above (a row whose cells and text all go leaves
+// nothing to continue anywhere) and, unlike them, does not need the table's
+// rows to be plain, since nothing of the row survives to land somewhere.
+// Content that keeps the row: anything this resolution keeps, a zero-width
+// anchor (bookmark, comment range or reference, permission) included; a
+// move's range bracket and a proofing mark are not content.
+
+/// One cell as [`row_emptied_by_resolution`] reads it: `None` when it holds
+/// anything but paragraphs, else, per paragraph, whether its mark is tracked
+/// and goes on this resolution and whether all of its content goes.
+pub(crate) type EmptiedCell = Option<Vec<(bool, bool)>>;
+
+/// Whether this resolution removes a row by emptying it (see the section
+/// comment): it has a cell, and every cell is paragraphs only, each losing
+/// its mark and all of its content.
+pub(crate) fn row_emptied_by_resolution(cells: impl IntoIterator<Item = EmptiedCell>) -> bool {
+    let mut saw_cell = false;
+    for cell in cells {
+        saw_cell = true;
+        let Some(paragraphs) = cell else {
+            return false;
+        };
+        if paragraphs.is_empty()
+            || !paragraphs
+                .iter()
+                .all(|&(mark_goes, content_goes)| mark_goes && content_goes)
+        {
+            return false;
+        }
+    }
+    saw_cell
+}
+
 /// Local element-names (WordprocessingML `w:` namespace) of the ZERO-WIDTH
 /// BODY MARKERS a paragraph-mark join steps over: bookmarks, comment /
 /// permission / move / customXml range delimiters, and proof errors. These
@@ -316,6 +475,86 @@ mod tests {
         assert!(table_emptied_by_resolution([false, false].into_iter()));
         // A mix with one survivor keeps the table.
         assert!(!table_emptied_by_resolution([false, true].into_iter()));
+    }
+
+    // Post-condition: the trailing span's width is the sum of known twips,
+    // and unknown (no wAfter written) once any part has no dxa width.
+    #[test]
+    fn trailing_width_sums_only_known_twips() {
+        assert_eq!(trailing_width_after_join(Some(0), Some(2000)), Some(2000));
+        assert_eq!(trailing_width_after_join(Some(3192), Some(917)), Some(4109));
+        assert_eq!(trailing_width_after_join(None, Some(2000)), None);
+        assert_eq!(trailing_width_after_join(Some(0), None), None);
+    }
+
+    // Post-condition: only the Word-observed cell shape joins, and a row goes
+    // only when every cell does and its text has somewhere to go.
+    #[test]
+    fn cell_mark_join_needs_the_observed_shape() {
+        let observed = CellMarkShape {
+            single_paragraph: true,
+            starts_with_paragraph: true,
+            mark_deletion_accepted: true,
+            plain_cell: true,
+            grid_span: 1,
+            dxa_width: None,
+        };
+        let plain = CellMarkShape {
+            mark_deletion_accepted: false,
+            ..observed
+        };
+        let two_paragraphs = CellMarkShape {
+            single_paragraph: false,
+            ..plain
+        };
+        assert!(cell_mark_joins_next_cell(observed, plain, true));
+        assert!(cell_mark_joins_next_cell(observed, two_paragraphs, true));
+        assert!(!cell_mark_joins_next_cell(observed, plain, false));
+        for donor in [
+            CellMarkShape {
+                single_paragraph: false,
+                ..observed
+            },
+            CellMarkShape {
+                mark_deletion_accepted: false,
+                ..observed
+            },
+            CellMarkShape {
+                plain_cell: false,
+                ..observed
+            },
+        ] {
+            assert!(!cell_mark_joins_next_cell(donor, plain, true), "{donor:?}");
+        }
+        let nested_table_first = CellMarkShape {
+            starts_with_paragraph: false,
+            single_paragraph: false,
+            ..plain
+        };
+        assert!(!cell_mark_joins_next_cell(
+            observed,
+            nested_table_first,
+            true
+        ));
+
+        let row = [observed, observed];
+        assert!(row_goes_into_next_row(&row, Some(plain), true));
+        assert!(!row_goes_into_next_row(&row, None, true));
+        assert!(!row_goes_into_next_row(
+            &row,
+            Some(nested_table_first),
+            true
+        ));
+        assert!(!row_goes_into_next_row(&row, Some(plain), false));
+        assert!(!row_goes_into_next_row(
+            &[observed, plain],
+            Some(plain),
+            true
+        ));
+        assert!(last_row_goes_into_following_paragraph(&row, true, true));
+        assert!(!last_row_goes_into_following_paragraph(&row, false, true));
+        assert!(!last_row_goes_into_following_paragraph(&row, true, false));
+        assert!(!last_row_goes_into_following_paragraph(&[], true, true));
     }
 
     // Post-condition: a row survives iff its own marks survive and at least

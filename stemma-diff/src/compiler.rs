@@ -39,14 +39,13 @@ use crate::domain::{
 };
 // Shared with the engine: one implementation of the change pipeline.
 use stemma::local_change::{
-    CharFormatting, DiffHeuristics, RunFormatting, build_full_replace,
+    CharClass, CharFormatting, DiffHeuristics, RunFormatting, build_full_replace, char_class,
     cleanup_inline_changes_with_config, content_similarity, detect_formatting_change,
     extract_inline_text, formatting_for_token_range, normalize_for_similarity,
-    opaque_identity_hash, opaque_placeholder, parse_drawing_metadata, should_bail_out_with_config,
-    text_similarity,
+    opaque_identity_hash, opaque_placeholder, parse_drawing_metadata, text_similarity,
 };
 pub(crate) use stemma::local_change::{
-    diff_block_content_resolving_opaques, find_blip_rid, inlines_to_segments,
+    diff_block_content_resolving_opaques_with_config, find_blip_rid, inlines_to_segments,
     opaque_kind_to_segment_kind, opaque_url, tokenize,
 };
 use stemma::view::heading_level_to_u8;
@@ -3199,7 +3198,22 @@ pub(crate) fn cell_paragraph_changes(
     base_inlines: &[InlineNode],
     target_inlines: &[InlineNode],
 ) -> Vec<InlineChange> {
-    let plan = diff_block_content_resolving_opaques(base_inlines, target_inlines, &HashMap::new());
+    if replaced_whole(
+        &extract_inline_text(base_inlines),
+        &extract_inline_text(target_inlines),
+    ) {
+        return stemma::local_change::sort_opaque_runs_by_inline_index(build_full_replace(
+            base_inlines,
+            target_inlines,
+            &HashMap::new(),
+        ));
+    }
+    let plan = join_changes_separated_by_no_word(diff_block_content_resolving_opaques_with_config(
+        base_inlines,
+        target_inlines,
+        &HashMap::new(),
+        &comparison_heuristics(),
+    ));
     if crate::fields::plan_tears_a_field(&plan) {
         diff_block_content_with_marks(base_inlines, target_inlines)
     } else {
@@ -3349,26 +3363,208 @@ pub fn diff_block_content_with_marks(
     diff_block_content_with_marks_and_notes(old_inlines, new_inlines, &HashMap::new())
 }
 
+/// The change-pipeline configuration of a comparison.
+///
+/// Word's Compare marks each changed word on its own: four word
+/// substitutions in one sentence are four deletions and four insertions, and
+/// a sentence reworked around kept words keeps those words. The comparison
+/// therefore switches off the two heuristics that coarsen a plan for the
+/// authoring paths: the bail-out to one whole replacement for long, dissimilar
+/// text, and the zipper collapse of alternating changes between short anchors.
+/// In place of the bail-out, a paragraph is replaced whole by Word's own line
+/// (`replaced_whole`), checked before this configuration's token diff. The
+/// authoring paths keep the shared default (`DiffHeuristics::from_env`).
+pub(crate) fn comparison_heuristics() -> DiffHeuristics {
+    DiffHeuristics {
+        // A similarity is never below 0: the bail-out never fires.
+        bail_out_similarity_threshold: 0.0,
+        // No region has this many change runs: no alternation collapse.
+        zipper_min_change_runs: usize::MAX,
+        ..DiffHeuristics::from_env()
+    }
+}
+
+/// Below this share of kept units, a paragraph is replaced whole.
+///
+/// Word's Compare either edits a changed paragraph in place or deletes it
+/// whole and inserts the new one. Measured on Word's own Compare results
+/// (80 one-to-one paragraph pairs: 7 replaced whole, 73 edited in place),
+/// the two groups separate cleanly on the units (words and punctuation
+/// marks, `rewrite_units`) the two paragraphs share in order, over the
+/// longer paragraph's units: every paragraph Word replaced whole shares at
+/// most 0.183 of them, every paragraph it edited in place at least 0.247.
+/// Short paragraphs follow the same line (a four-word sentence sharing only
+/// its full stop is replaced whole), and digits are no exception.
+const REPLACED_WHOLE_BELOW: f64 = 0.2;
+
+/// A paragraph's units for the replaced-whole measure: each word (letters,
+/// digits and `_`, with an apostrophe between two such characters inside
+/// it) and each other character that is not white space.
+fn rewrite_units(text: &str) -> Vec<&str> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let (start, c) = chars[index];
+        if c.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        if is_word(c) {
+            while end < chars.len() {
+                let next = chars[end].1;
+                let apostrophe_inside = matches!(next, '\'' | '\u{2019}')
+                    && chars.get(end + 1).is_some_and(|&(_, after)| is_word(after));
+                if is_word(next) {
+                    end += 1;
+                } else if apostrophe_inside {
+                    end += 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        let stop = chars.get(end).map_or(text.len(), |&(at, _)| at);
+        units.push(&text[start..stop]);
+        index = end;
+    }
+    units
+}
+
+/// Whether Word's Compare would replace this paragraph whole rather than
+/// edit it in place: the units both texts share in order (a longest common
+/// subsequence) are fewer than [`REPLACED_WHOLE_BELOW`] of the longer
+/// text's units. A side with no units is an insertion or a deletion, not a
+/// rewrite.
+fn replaced_whole(old_text: &str, new_text: &str) -> bool {
+    let old_units = rewrite_units(old_text);
+    let new_units = rewrite_units(new_text);
+    if old_units.is_empty() || new_units.is_empty() {
+        return false;
+    }
+    let shared: usize = similar::capture_diff_slices(Algorithm::Myers, &old_units, &new_units)
+        .iter()
+        .map(|op| match op {
+            similar::DiffOp::Equal { len, .. } => *len,
+            _ => 0,
+        })
+        .sum();
+    let longer = old_units.len().max(new_units.len());
+    (shared as f64) < REPLACED_WHOLE_BELOW * longer as f64
+}
+
+/// The tokens a comparison diffs: the engine's tokens, with each run of
+/// adjacent punctuation characters (no space between them) joined into one,
+/// as Word's Compare treats it: replacing `("` with `(\u{201C}` is one
+/// deletion of `("` and one insertion of `(\u{201C}`.
+fn comparison_tokens(text: &str) -> Vec<&str> {
+    let is_punctuation = |token: &str| {
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|c| c != '\u{FFFC}' && c != '\n' && char_class(c) == CharClass::Punctuation)
+    };
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in tokenize(text) {
+        if is_punctuation(token)
+            && let Some(last) = tokens.last_mut()
+            && is_punctuation(last)
+        {
+            let start = last.as_ptr() as usize - text.as_ptr() as usize;
+            let end = token.as_ptr() as usize - text.as_ptr() as usize + token.len();
+            *last = &text[start..end];
+            continue;
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// Changes separated by no word are one change, as in Word's Compare:
+/// replacing "Seller shall" with "Supplier must" is one deletion and one
+/// insertion, not two of each around a kept space, and so is a change on
+/// each side of a kept ", ". In Word's own Compare results, no kept text
+/// between two changes is without a letter or digit: every one of the 160
+/// kept spans between two changes holds at least one word.
+///
+/// The rule, exactly: a run of the plan that starts and ends with a deletion
+/// or an insertion, in which every kept span is non-empty and holds only
+/// spaces and punctuation (no letter, digit or `_`, no tab, line break or
+/// object), is rewritten as one deletion of the run's source text followed
+/// by one insertion of its target text (`collapse_region`, which writes the
+/// kept characters on both arms, the deletion with the source's formatting
+/// and the insertion with the target's). Kept text holding a word, a tab, a
+/// line break or an object keeps two changes apart, and a run with no such
+/// kept span is left as it is.
+fn join_changes_separated_by_no_word(changes: Vec<InlineChange>) -> Vec<InlineChange> {
+    let is_change = |change: &InlineChange| {
+        matches!(
+            change,
+            InlineChange::Deleted { .. } | InlineChange::Inserted { .. }
+        )
+    };
+    let is_space_gap = |change: &InlineChange| {
+        matches!(change, InlineChange::Unchanged { text, .. }
+        if !text.is_empty() && text.chars().all(|c| {
+            !c.is_alphanumeric() && !matches!(c, '_' | '\t' | '\n' | '\u{FFFC}')
+        }))
+    };
+    let mut joined = Vec::with_capacity(changes.len());
+    let mut index = 0;
+    while index < changes.len() {
+        if !is_change(&changes[index]) {
+            joined.push(changes[index].clone());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index;
+        loop {
+            while end < changes.len() && is_change(&changes[end]) {
+                end += 1;
+            }
+            if end + 1 < changes.len()
+                && is_space_gap(&changes[end])
+                && is_change(&changes[end + 1])
+            {
+                end += 1;
+                continue;
+            }
+            break;
+        }
+        let run = &changes[start..end];
+        if run.iter().any(is_space_gap) {
+            joined.extend(stemma::local_change::collapse_region(run));
+        } else {
+            joined.extend(run.iter().cloned());
+        }
+        index = end;
+    }
+    joined
+}
+
 fn diff_block_content_with_marks_and_notes(
     old_inlines: &[InlineNode],
     new_inlines: &[InlineNode],
     note_markers: &HashMap<String, String>,
 ) -> Vec<InlineChange> {
-    let heuristics = DiffHeuristics::from_env();
+    let heuristics = comparison_heuristics();
     // Extract text and build char->formatting mapping
     let old = extract_text_with_marks(old_inlines);
     let new = extract_text_with_marks(new_inlines);
     let (old_text, old_char_fmt) = (&old.text, &old.char_fmt);
     let (new_text, new_char_fmt) = (&new.text, &new.char_fmt);
 
-    // Layer 3: Early bail-out for heavily rewritten text
-    if should_bail_out_with_config(old_text, new_text, &heuristics) {
+    // A paragraph rewritten past Word's line is replaced whole.
+    if replaced_whole(old_text, new_text) {
         return build_full_replace(old_inlines, new_inlines, note_markers);
     }
 
     // Tokenize and diff
-    let old_tokens = tokenize(old_text);
-    let new_tokens = tokenize(new_text);
+    let old_tokens = comparison_tokens(old_text);
+    let new_tokens = comparison_tokens(new_text);
     let diff = TextDiff::configure()
         .algorithm(Algorithm::Patience)
         .diff_slices(&old_tokens, &new_tokens);
@@ -3428,7 +3624,7 @@ fn diff_block_content_with_marks_and_notes(
 
     // Layer 2: Post-processing cleanup (zipper collapse)
     let plan = spell_plan(
-        cleanup_inline_changes_with_config(result, &heuristics),
+        join_changes_separated_by_no_word(cleanup_inline_changes_with_config(result, &heuristics)),
         &old,
         &new,
     );
@@ -3527,7 +3723,7 @@ fn spell_plan(
 #[cfg(test)]
 fn should_bail_out(old_text: &str, new_text: &str) -> bool {
     let heuristics = DiffHeuristics::from_env();
-    should_bail_out_with_config(old_text, new_text, &heuristics)
+    stemma::local_change::should_bail_out_with_config(old_text, new_text, &heuristics)
 }
 
 // =============================================================================
@@ -4932,6 +5128,7 @@ mod tests {
             has_direct_numbering: false,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -5208,6 +5405,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: Some("2026-08-16T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let mut accepted = merge_diff(&base, &target, &diff, &revision)
             .expect("diff should merge")
@@ -5345,6 +5543,7 @@ formatting_change: None,
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: None,
             joins_following_text_run: false,
             raw_xml: Some(raw_xml.into()),
             origin: None,
@@ -5458,6 +5657,7 @@ formatting_change: None,
             author: Some("Reviewer".to_string()),
             date: Some("2026-08-16T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let merged = merge_diff(&base, &target, &diff, &revision)
             .expect("opaque replacement should merge")
@@ -7464,6 +7664,7 @@ formatting_change: None,
                     identity: 0,
                     author: String::new(),
                     date: None,
+                    date_utc: None,
                 }),
             },
             InlineChange::Inserted {
@@ -8694,6 +8895,7 @@ formatting_change: None,
             date: Some("2026-08-16T00:00:00Z".to_string()),
             apply_op_id: None,
             identity: 0,
+            date_utc: None,
         };
         let merged = merge_diff(&base, &target, &diff, &revision)
             .expect("complete replacement should merge")
@@ -8770,6 +8972,7 @@ formatting_change: None,
             date: Some("2026-09-01T00:00:00Z".to_string()),
             apply_op_id: None,
             identity: 0,
+            date_utc: None,
         };
         let merged = merge_diff(&base, &target, &diff, &revision)
             .expect("complete replacement should merge")
@@ -8907,6 +9110,7 @@ formatting_change: None,
             date: Some("2026-09-01T00:00:00Z".to_string()),
             apply_op_id: None,
             identity: 0,
+            date_utc: None,
         };
         let merged = merge_diff(&base, &target, &diff, &revision)
             .expect("content-bearing final hyperlink replacement should merge")
@@ -9178,6 +9382,7 @@ formatting_change: None,
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -9777,9 +9982,150 @@ formatting_change: None,
         );
     }
 
-    // --- Test 3: Bold defined term preserved through collapse ---
-    // Region collapses cleanly while preserving mark boundaries: bold "Company"
-    // stays as a separate segment on both DEL and INS sides.
+    // --- Changes separated only by spaces join; a kept word keeps them apart ---
+    // Word's Compare replaces "Seller shall" with "Supplier must" as one
+    // deletion and one insertion, and marks the other changed words of the
+    // sentence on their own.
+    #[test]
+    fn comparison_joins_changes_separated_only_by_spaces() {
+        let old_inlines = make_inlines(&[("The Seller shall deliver the goods.", vec![])]);
+        let new_inlines = make_inlines(&[("The Supplier must deliver the goods.", vec![])]);
+        let changes = diff_block_content_with_marks(&old_inlines, &new_inlines);
+        assert_inline_structure(
+            &changes,
+            &[
+                "EQ:The ",
+                "DEL:Seller shall",
+                "INS:Supplier must",
+                "EQ: deliver the goods.",
+            ],
+        );
+    }
+
+    #[test]
+    fn comparison_keeps_changes_separated_by_a_word_apart() {
+        let old_inlines = make_inlines(&[("The Seller shall promptly pay the sum.", vec![])]);
+        let new_inlines = make_inlines(&[("The Supplier must promptly remit the sum.", vec![])]);
+        let changes = diff_block_content_with_marks(&old_inlines, &new_inlines);
+        assert_inline_structure(
+            &changes,
+            &[
+                "EQ:The ",
+                "DEL:Seller shall",
+                "INS:Supplier must",
+                "EQ: promptly ",
+                "DEL:pay",
+                "INS:remit",
+                "EQ: the sum.",
+            ],
+        );
+    }
+
+    // Word's Compare never leaves kept text without a word between two
+    // changes: a change on each side of a kept ", " is one change.
+    #[test]
+    fn comparison_joins_changes_separated_only_by_punctuation() {
+        let old_inlines = make_inlines(&[("Seller, Buyer and Agent", vec![])]);
+        let new_inlines = make_inlines(&[("Supplier, Customer and Agent", vec![])]);
+        let changes = diff_block_content_with_marks(&old_inlines, &new_inlines);
+        assert_inline_structure(
+            &changes,
+            &[
+                "DEL:Seller, Buyer",
+                "INS:Supplier, Customer",
+                "EQ: and Agent",
+            ],
+        );
+    }
+
+    // Word's Compare treats adjacent punctuation characters as one unit:
+    // straight quotes replaced by curly ones next to a bracket are a
+    // deletion of `("` and an insertion of `(\u{201C}`.
+    #[test]
+    fn comparison_treats_adjacent_punctuation_as_one_unit() {
+        let old_inlines = make_inlines(&[("The parties (\"Buyer\") agree.", vec![])]);
+        let new_inlines = make_inlines(&[("The parties (\u{201C}Buyer\u{201D}) agree.", vec![])]);
+        let changes = diff_block_content_with_marks(&old_inlines, &new_inlines);
+        assert_inline_structure(
+            &changes,
+            &[
+                "EQ:The parties ",
+                "DEL:(\"",
+                "INS:(\u{201C}",
+                "EQ:Buyer",
+                "DEL:\")",
+                "INS:\u{201D})",
+                "EQ: agree.",
+            ],
+        );
+    }
+
+    // Word's Compare replaces a paragraph whole when the words and
+    // punctuation it shares in order with the new one are fewer than a fifth
+    // of the longer one's (Word: at most 0.183 shared when replaced whole, at
+    // least 0.247 when edited in place). Below the line: one deletion and
+    // one insertion, even though a few words recur.
+    #[test]
+    fn comparison_replaces_a_paragraph_below_the_line_whole() {
+        let old = "Every tenant must return the keys to the office before the end of the month in which the lease ends.";
+        let new = "Our caretaker collects the access cards from each flat on the final working day and logs them.";
+        assert!(replaced_whole(old, new));
+        let changes = diff_block_content_with_marks(
+            &make_inlines(&[(old, vec![])]),
+            &make_inlines(&[(new, vec![])]),
+        );
+        assert_inline_structure(&changes, &[&format!("DEL:{old}"), &format!("INS:{new}")]);
+    }
+
+    // Above the line the paragraph is edited in place: the words both keep
+    // stay kept.
+    #[test]
+    fn comparison_edits_a_paragraph_above_the_line_in_place() {
+        let old = "The tenant pays the rent on the first day of each month by bank transfer to the owner.";
+        let new =
+            "The tenant pays the deposit on the last day of each quarter by cheque to the agent.";
+        assert!(!replaced_whole(old, new));
+        let changes = diff_block_content_with_marks(
+            &make_inlines(&[(old, vec![])]),
+            &make_inlines(&[(new, vec![])]),
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, InlineChange::Unchanged { text, .. } if text.contains("The tenant pays the "))),
+            "{changes:?}"
+        );
+    }
+
+    // The measure: units are words and single punctuation characters, the
+    // share is the longest common subsequence over the longer side.
+    #[test]
+    fn replaced_whole_measures_shared_units_over_the_longer_side() {
+        assert_eq!(
+            rewrite_units("Don't stop: the 2nd draft."),
+            ["Don't", "stop", ":", "the", "2nd", "draft", "."]
+        );
+        // "Bring the signed forms." / "All visitors must register first."
+        // share only the full stop: 1 of 6 units, replaced whole (as Word).
+        assert!(replaced_whole(
+            "Bring the signed forms.",
+            "All visitors must register first."
+        ));
+        // One word changed in four: edited in place (as Word).
+        assert!(!replaced_whole(
+            "Bring the signed forms.",
+            "Bring the printed forms."
+        ));
+        // A side with no units is an insertion or deletion, not a rewrite.
+        assert!(!replaced_whole("", "Anything at all."));
+    }
+
+    // --- Test 3: Bold defined term kept; the rewritten rest is one change ---
+    // Comparison follows Word's Compare: words both sentences keep stay kept
+    // (the bold defined term "Company" and the final full stop), and changed
+    // words separated only by spaces are one deletion and one insertion
+    // (Word's Compare replaces "Seller shall" with "Supplier must" as one of
+    // each).
     #[test]
     fn golden_phrase_rewrite_with_bold_defined_term() {
         let old_inlines = make_inlines(&[
@@ -9804,8 +10150,10 @@ formatting_change: None,
             &[
                 "EQ:The ",
                 "EQ:Company",
-                "DEL: shall maintain adequate insurance coverage at all times.",
-                "INS: must ensure sufficient protective measures are continuously in effect.",
+                "EQ: ",
+                "DEL:shall maintain adequate insurance coverage at all times",
+                "INS:must ensure sufficient protective measures are continuously in effect",
+                "EQ:.",
             ],
         );
     }
@@ -9926,6 +10274,9 @@ formatting_change: None,
     }
 
     // --- Test 11: Bold "Investor" anchors correctly ---
+    // As in Word's Compare, every word both sentences keep ("to the",
+    // "Investor", "the", "to", "shall", the full stop) stays kept, and changed
+    // words separated only by spaces are one deletion and one insertion.
     #[test]
     fn golden_bold_defined_term_as_anchor_not_blocker() {
         let old_inlines = make_inlines(&[
@@ -9948,11 +10299,20 @@ formatting_change: None,
         assert_inline_structure(
             &changes,
             &[
-                "DEL:Upon written notice to the ",
-                "INS:Following delivery of formal notification to the ",
+                "DEL:Upon written notice",
+                "INS:Following delivery of formal notification",
+                "EQ: to the ",
                 "EQ:Investor",
-                "DEL:, the obligation to fund additional capital contributions shall terminate.",
-                "INS:, the requirement to provide supplementary funding shall cease.",
+                "EQ:, the ",
+                "DEL:obligation",
+                "INS:requirement",
+                "EQ: to ",
+                "DEL:fund additional capital contributions",
+                "INS:provide supplementary funding",
+                "EQ: shall ",
+                "DEL:terminate",
+                "INS:cease",
+                "EQ:.",
             ],
         );
     }

@@ -1272,7 +1272,7 @@ fn apply_edits_inside_another_authors_pending_insertion() {
         "verify must agree with the deliverable apply receipt: {verify:?}"
     );
     let verification: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
-    assert_eq!(verification["status"], "pass");
+    assert_eq!(verification["verdict"], "pass");
     assert_eq!(
         verification["summary"]["preexisting_revisions_edited_inside"],
         1
@@ -1302,7 +1302,7 @@ fn verify_fails_an_untracked_rewrite_inside_another_authors_insertion() {
     let verify = run(&["verify", before.to_str().unwrap(), after.to_str().unwrap()]);
     assert_eq!(verify.status.code(), Some(3), "{verify:?}");
     let verification: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
-    assert_eq!(verification["status"], "fail");
+    assert_eq!(verification["verdict"], "fail");
     assert_eq!(
         verification["summary"]["preexisting_revisions_edited_inside"],
         0
@@ -1311,6 +1311,165 @@ fn verify_fails_an_untracked_rewrite_inside_another_authors_insertion() {
         verification["summary"]["modified_or_resolved_preexisting"],
         1
     );
+    // The changed revision is named, not only counted.
+    let changed = verification["preexisting_changed"].as_array().unwrap();
+    assert_eq!(changed.len(), 1, "{verification}");
+    assert_eq!(changed[0]["author"], "Alice");
+    // Her "45 days" is no longer among the pending changes (a revision's
+    // identity follows its content, so the rewritten one is a new revision).
+    assert_eq!(changed[0]["disposition"], "resolved");
+    assert_eq!(changed[0]["excerpt"], "45 days");
+}
+
+#[test]
+fn verify_fails_a_rewritten_utc_date_on_another_authors_revision() {
+    // Alice's pending insertion carries her local clock in `w:date` and the
+    // UTC time in `w16du:dateUtc`. A result that rewrote the UTC date (to her
+    // local time) changed her revision's attribution, like a changed author
+    // or date: not a tracked delivery under either policy. The same result
+    // with the dates untouched passes.
+    let dir = tempfile::tempdir().unwrap();
+    let body = |utc: &str| {
+        format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Notice within </w:t></w:r><w:ins w:id="11" w:author="Alice" w:date="2026-10-01T11:00:00Z" xmlns:w16du="http://schemas.microsoft.com/office/word/2023/wordml/word16du" w16du:dateUtc="{utc}"><w:r><w:t xml:space="preserve">45 days</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> of delivery.</w:t></w:r></w:p>"#
+        )
+    };
+    let before = dir.path().join("before.docx");
+    let rewritten = dir.path().join("rewritten.docx");
+    let untouched = dir.path().join("untouched.docx");
+    std::fs::write(&before, minimal_docx(&body("2026-10-01T09:00:00Z"))).unwrap();
+    std::fs::write(&rewritten, minimal_docx(&body("2026-10-01T11:00:00Z"))).unwrap();
+    std::fs::write(&untouched, minimal_docx(&body("2026-10-01T09:00:00Z"))).unwrap();
+
+    for policy in ["tracked-delivery-v0", "tracked-delivery-v1"] {
+        let verify = |after: &Path| {
+            let output = run(&[
+                "verify",
+                "--policy",
+                policy,
+                before.to_str().unwrap(),
+                after.to_str().unwrap(),
+            ]);
+            let verification: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            (output.status.code(), verification)
+        };
+        let (code, verification) = verify(&rewritten);
+        assert_eq!(code, Some(3), "{policy}: {verification}");
+        assert_eq!(verification["verdict"], "fail", "{policy}");
+        assert_eq!(
+            verification["summary"]["modified_or_resolved_preexisting"], 1,
+            "{policy}: {verification}"
+        );
+        let (code, verification) = verify(&untouched);
+        assert_eq!(code, Some(0), "{policy}: {verification}");
+        assert_eq!(verification["verdict"], "pass", "{policy}");
+    }
+}
+
+/// A document whose one paragraph optionally carries one comment.
+fn docx_with_comment(comment: Option<&str>) -> Vec<u8> {
+    const HEAD: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
+    const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+    let anchored = comment.is_some();
+    let body = format!(
+        r#"<w:p>{}<w:r><w:t>Notice must be given within 45 days.</w:t></w:r>{}</w:p>"#,
+        if anchored {
+            r#"<w:commentRangeStart w:id="1"/>"#
+        } else {
+            ""
+        },
+        if anchored {
+            r#"<w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r>"#
+        } else {
+            ""
+        },
+    );
+    let mut files = vec![
+        DocxFile {
+            name: "[Content_Types].xml".to_string(),
+            data: format!(
+                r#"{HEAD}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>{}</Types>"#,
+                if anchored {
+                    r#"<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>"#
+                } else {
+                    ""
+                }
+            )
+            .into_bytes(),
+        },
+        DocxFile {
+            name: "_rels/.rels".to_string(),
+            data: format!(
+                r#"{HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#
+            )
+            .into_bytes(),
+        },
+        DocxFile {
+            name: "word/_rels/document.xml.rels".to_string(),
+            data: format!(
+                r#"{HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}</Relationships>"#,
+                if anchored {
+                    r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#
+                } else {
+                    ""
+                }
+            )
+            .into_bytes(),
+        },
+        DocxFile {
+            name: "word/document.xml".to_string(),
+            data: format!(
+                r#"{HEAD}<w:document {W}><w:body>{body}<w:sectPr/></w:body></w:document>"#
+            )
+            .into_bytes(),
+        },
+    ];
+    if let Some(text) = comment {
+        files.push(DocxFile {
+            name: "word/comments.xml".to_string(),
+            data: format!(
+                r#"{HEAD}<w:comments {W}><w:comment w:id="1" w:author="Alice" w:initials="A"><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:comment></w:comments>"#
+            )
+            .into_bytes(),
+        });
+    }
+    DocxArchive::from_parts(files).write().unwrap()
+}
+
+#[test]
+fn verify_passes_an_added_comment_and_fails_a_changed_or_removed_one() {
+    // A comment is an attributed note beside the text. Adding one changes
+    // nothing a tracked change would have to record; rewriting or removing
+    // someone's comment does.
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, comment: Option<&str>| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, docx_with_comment(comment)).unwrap();
+        path
+    };
+    let plain = write("plain.docx", None);
+    let commented = write("commented.docx", Some("Is 45 days agreed?"));
+    let reworded = write("reworded.docx", Some("45 days is agreed."));
+    let verify = |before: &Path, after: &Path| {
+        let output = run(&["verify", before.to_str().unwrap(), after.to_str().unwrap()]);
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), receipt)
+    };
+
+    let (code, receipt) = verify(&plain, &commented);
+    assert_eq!(code, Some(0), "{receipt}");
+    assert_eq!(receipt["verdict"], "pass");
+    assert_eq!(receipt["reasons"], serde_json::json!([]));
+    assert_eq!(receipt["summary"]["comments_added"], 1);
+
+    let (code, receipt) = verify(&commented, &reworded);
+    assert_eq!(code, Some(3), "a reworded comment: {receipt}");
+    assert_eq!(receipt["reasons"], serde_json::json!(["untracked_change"]));
+    assert_eq!(receipt["summary"]["comments_added"], 0);
+
+    let (code, receipt) = verify(&commented, &plain);
+    assert_eq!(code, Some(3), "a removed comment: {receipt}");
+    assert_eq!(receipt["summary"]["comments_added"], 0);
 }
 
 /// Run a worklist over "The Customer shall pay the Price." / "The Supplier
@@ -1781,14 +1940,14 @@ fn compare_does_not_use_word_complete_document_pivot() {
     .expect("main document is UTF-8");
     let first_source_paragraph = document
         .split("</w:p>")
-        .find(|paragraph| paragraph.contains("Alpha beta gamma delta epsilon."))
+        .find(|paragraph| paragraph.contains("Alpha beta gamma delta epsilon"))
         .expect("redline retains the first source paragraph");
     assert!(
-        first_source_paragraph.contains("Uno dos tres cuatro cinco."),
+        first_source_paragraph.contains("Uno dos tres cuatro cinco"),
         "Stemma should retain target order around the necessary physical boundary"
     );
     assert!(
-        !first_source_paragraph.contains("Seis siete ocho nueve diez."),
+        !first_source_paragraph.contains("Seis siete ocho nueve diez"),
         "Stemma must not copy Word Compare's first-source/last-target pivot"
     );
 
@@ -2273,11 +2432,15 @@ fn garbage_input_fails_actionably_without_panicking() {
     std::fs::write(&garbage, b"this is not a docx package").unwrap();
 
     let output = run(&["validate", garbage.to_str().unwrap()]);
-    assert!(!output.status.success(), "garbage input must fail");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "a file that is not a package is corrupt"
+    );
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
-        stderr.starts_with("error:"),
-        "one-line actionable error: {stderr:?}"
+        stderr.starts_with("corrupt:"),
+        "one-line actionable verdict: {stderr:?}"
     );
     assert!(
         stderr.contains("garbage.docx"),
@@ -2667,9 +2830,22 @@ fn execute_alias_and_verify_form_one_tracked_delivery_flow() {
     );
     let receipt: serde_json::Value =
         serde_json::from_slice(&verify.stdout).expect("verification JSON");
-    assert_eq!(receipt["schema"], "stemma.verify.v0");
-    assert_eq!(receipt["policy"], "tracked-delivery-v0");
-    assert_eq!(receipt["status"], "pass");
+    assert_eq!(receipt["schema"], "stemma.verify.v1");
+    assert_eq!(receipt["policy"], "tracked-delivery-v1");
+    assert_eq!(receipt["verdict"], "pass");
+    // What `execute` delivers also passes the stricter, markup-level policy.
+    let strict = run(&[
+        "verify",
+        "--policy",
+        "tracked-delivery-v0",
+        input.to_str().unwrap(),
+        redline.to_str().unwrap(),
+    ]);
+    assert!(strict.status.success(), "strict policy: {strict:?}");
+    let strict_receipt: serde_json::Value =
+        serde_json::from_slice(&strict.stdout).expect("verification JSON");
+    assert_eq!(strict_receipt["policy"], "tracked-delivery-v0");
+    assert_eq!(strict_receipt["verdict"], "pass");
     assert_eq!(receipt["summary"]["direct_changes"], 0);
     assert_eq!(receipt["summary"]["modified_or_resolved_preexisting"], 0);
     assert_eq!(receipt["summary"]["validator_ok"], true);
@@ -2700,8 +2876,99 @@ fn verify_refuses_to_certify_an_untracked_replacement() {
     assert_eq!(output.status.code(), Some(3));
     let receipt: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("failure remains structured JSON");
-    assert_eq!(receipt["status"], "fail");
+    assert_eq!(receipt["verdict"], "fail");
+    assert!(
+        receipt["reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("untracked_change")),
+        "{receipt}"
+    );
     assert!(receipt["summary"]["direct_changes"].as_u64().unwrap() > 0);
+    assert_eq!(receipt["direct_changes"][0]["story"], "Body");
+}
+
+/// A result that is not a sound package fails, with the validator's issues:
+/// it is an answer about the result, not an operational error.
+#[test]
+fn verify_fails_a_result_that_is_not_a_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken.docx");
+    std::fs::write(&broken, b"this is not a zip archive").unwrap();
+    let output = run(&[
+        "verify",
+        fixture("simple-text/before.docx").to_str().unwrap(),
+        broken.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["schema"], "stemma.verify.v1");
+    assert_eq!(receipt["verdict"], "fail");
+    assert_eq!(receipt["reasons"], serde_json::json!(["invalid_result"]));
+    assert_eq!(receipt["validator"]["ok"], false);
+}
+
+/// A result the model reads but Word would repair fails as an invalid
+/// result. The comparison is not attempted on it, so nothing later can turn
+/// the answer into "cannot assess".
+#[test]
+fn verify_fails_a_readable_result_that_is_not_sound() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = dir.path().join("before.docx");
+    let after = dir.path().join("after.docx");
+    let text = r#"<w:r><w:t>Notice must be given within 45 days.</w:t></w:r>"#;
+    std::fs::write(&before, minimal_docx(&format!("<w:p>{text}</w:p>"))).unwrap();
+    // A comment reference with no comments part behind it.
+    std::fs::write(
+        &after,
+        minimal_docx(&format!(
+            r#"<w:p>{text}<w:r><w:commentReference w:id="7"/></w:r></w:p>"#
+        )),
+    )
+    .unwrap();
+    let output = run(&["verify", before.to_str().unwrap(), after.to_str().unwrap()]);
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(3), "{receipt}");
+    assert_eq!(receipt["verdict"], "fail");
+    assert_eq!(receipt["reasons"], serde_json::json!(["invalid_result"]));
+    assert_eq!(receipt["validator"]["ok"], false);
+}
+
+/// A baseline the model does not read gives no verdict on the result: the
+/// comparison was not made. Exit 4, and the reason is stated.
+#[test]
+fn verify_cannot_assess_against_a_baseline_it_does_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken.docx");
+    std::fs::write(&broken, b"this is not a zip archive").unwrap();
+    let output = run(&[
+        "verify",
+        broken.to_str().unwrap(),
+        fixture("simple-text/after.docx").to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["verdict"], "cannot_assess");
+    assert!(
+        receipt["cannot_assess"]
+            .as_str()
+            .unwrap()
+            .contains("baseline"),
+        "{receipt}"
+    );
+    assert!(receipt.get("summary").is_none());
+}
+
+/// A file that is not there is an operational failure, as for every command.
+#[test]
+fn verify_reports_a_missing_file_as_an_error() {
+    let output = run(&[
+        "verify",
+        fixture("simple-text/before.docx").to_str().unwrap(),
+        "no-such-file.docx",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -3716,30 +3983,107 @@ fn validate_format_json_reports_ok_with_counts() {
     assert!(output.status.success(), "{output:?}");
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("validation JSON on stdout");
-    assert_eq!(payload["schema"], "stemma.validate.v0");
-    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["schema"], "stemma.validate.v1");
+    assert_eq!(payload["verdict"], "sound");
+    assert!(payload["cannot_assess"].is_null());
     assert_eq!(payload["pending_revision_count"], 2);
     assert!(payload["block_count"].as_u64().unwrap() >= 1);
     assert!(payload["issues"].as_array().unwrap().is_empty());
 }
 
-/// An invalid-but-parseable package is a structured `"invalid"` RESULT in JSON
-/// mode (issues enumerated, exit `1`), mirroring `verify`'s pass/fail shape —
-/// not an unstructured `error:` line a consumer would have to regex.
+/// A package with a fault is a structured `"corrupt"` RESULT in JSON mode
+/// (issues enumerated, exit `3`), mirroring `verify`'s pass/fail shape, not
+/// an unstructured `error:` line a consumer would have to regex.
 #[test]
-fn validate_format_json_reports_invalid_with_structured_issues() {
+fn validate_format_json_reports_corrupt_with_structured_issues() {
     let dir = tempfile::tempdir().unwrap();
     let invalid = dir.path().join("dangling-link.docx");
     std::fs::write(&invalid, dangling_hyperlink_docx()).unwrap();
 
     let output = run(&["validate", invalid.to_str().unwrap(), "--format", "json"]);
-    assert_eq!(output.status.code(), Some(1), "invalid still exits 1");
+    assert_eq!(output.status.code(), Some(3), "a corrupt document exits 3");
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("validation JSON on stdout");
-    assert_eq!(payload["status"], "invalid");
+    assert_eq!(payload["verdict"], "corrupt");
     let issues = payload["issues"].as_array().unwrap();
     assert!(!issues.is_empty(), "the issues are enumerated");
     assert!(issues[0]["code"].is_string() && issues[0]["message"].is_string());
+}
+
+/// The three verdicts, and the one answer that is not about the document.
+///
+/// - A file that is not a package at all is corrupt: Word cannot open it.
+/// - A package whose checks find nothing, but which holds a shape the model
+///   does not read, cannot be assessed: no verdict on the document, exit 4,
+///   with the reason. (Here: a compatibility `Choice` whose `Requires` names
+///   a prefix declared nowhere.)
+/// - A file that cannot be opened is an operational failure, exit 1.
+#[test]
+fn validate_separates_corrupt_from_cannot_assess_from_operational_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = |path: &Path| {
+        let output = run(&["validate", path.to_str().unwrap(), "--format", "json"]);
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("a structured result on stdout: {output:?}"));
+        (output.status.code(), payload)
+    };
+
+    let garbage = dir.path().join("garbage.docx");
+    std::fs::write(&garbage, b"this is not a docx package").unwrap();
+    let (code, payload) = json(&garbage);
+    assert_eq!(code, Some(3));
+    assert_eq!(payload["verdict"], "corrupt");
+    assert!(payload["block_count"].is_null());
+    assert!(!payload["issues"].as_array().unwrap().is_empty());
+
+    let unread = dir.path().join("unread.docx");
+    std::fs::write(
+        &unread,
+        DocxArchive::from_parts(vec![
+            DocxFile {
+                name: "[Content_Types].xml".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_vec(),
+            },
+            DocxFile {
+                name: "_rels/.rels".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_vec(),
+            },
+            DocxFile {
+                name: "word/_rels/document.xml.rels".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#.to_vec(),
+            },
+            DocxFile {
+                name: "word/document.xml".to_string(),
+                data: br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><w:body><w:p><w:r><w:t xml:space="preserve">Notice period: </w:t></w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:r><w:t>45 days</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>six weeks</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p><w:sectPr/></w:body></w:document>"#.to_vec(),
+            },
+        ])
+        .write()
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, payload) = json(&unread);
+    assert_eq!(code, Some(4), "{payload}");
+    assert_eq!(payload["verdict"], "cannot_assess");
+    assert!(payload["issues"].as_array().unwrap().is_empty());
+    assert!(
+        payload["cannot_assess"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Requires")),
+        "the reason names what was not read: {payload}"
+    );
+
+    let missing = run(&[
+        "validate",
+        dir.path().join("absent.docx").to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).starts_with("error:"),
+        "{missing:?}"
+    );
 }
 
 /// A package with a comment thread (comment 1, replied to by comment 2) and a

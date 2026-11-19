@@ -93,6 +93,7 @@ fn unrelated_edit(doc: &Document) -> Document {
             author: Some("Current Author".to_string()),
             date: Some("2026-07-16T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("apply unrelated edit")

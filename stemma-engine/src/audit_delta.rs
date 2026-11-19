@@ -75,18 +75,15 @@ pub(crate) enum AuditDelta {
         block_id: NodeId,
         old_text: String,
         new_text: String,
-        new_block: BlockNode,
     },
     TableStructureChanged {
         table_id: NodeId,
-        target_table_id: NodeId,
         old_text: String,
         new_text: String,
     },
     HeaderModified {
         kind: HeaderFooterKind,
         base_part_name: String,
-        target_part_name: String,
         block_changes: Vec<AuditDelta>,
     },
     HeaderDeleted {
@@ -102,7 +99,6 @@ pub(crate) enum AuditDelta {
     FooterModified {
         kind: HeaderFooterKind,
         base_part_name: String,
-        target_part_name: String,
         block_changes: Vec<AuditDelta>,
     },
     FooterDeleted {
@@ -175,7 +171,6 @@ pub(crate) fn audit_changes(
                 changes.push(AuditDelta::HeaderModified {
                     kind: source.kind.clone(),
                     base_part_name: source.part_name.clone(),
-                    target_part_name: target.part_name.clone(),
                     block_changes: block_changes(&source.blocks, &target.blocks, identity),
                 });
             }
@@ -211,7 +206,6 @@ pub(crate) fn audit_changes(
                 changes.push(AuditDelta::FooterModified {
                     kind: source.kind.clone(),
                     base_part_name: source.part_name.clone(),
-                    target_part_name: target.part_name.clone(),
                     block_changes: block_changes(&source.blocks, &target.blocks, identity),
                 });
             }
@@ -414,7 +408,6 @@ fn positional_block_changes(before: &[TrackedBlock], after: &[TrackedBlock]) -> 
                 }
                 changes.push(AuditDelta::TableStructureChanged {
                     table_id: source_table.id.clone(),
-                    target_table_id: target_table.id.clone(),
                     old_text: extract_block_text_for_hash(&source.block),
                     new_text: extract_block_text_for_hash(&target.block),
                 });
@@ -440,7 +433,6 @@ fn positional_block_changes(before: &[TrackedBlock], after: &[TrackedBlock]) -> 
                     block_id: block_node_id(&source.block),
                     old_text,
                     new_text,
-                    new_block: target.block.clone(),
                 });
             }
             _ => {

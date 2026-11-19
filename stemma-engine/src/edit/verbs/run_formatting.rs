@@ -662,6 +662,7 @@ fn apply_marks(
                     previous_rpr_authored: baseline_rpr_authored,
                     author: revision.author.clone().unwrap_or_default(),
                     date: revision.date.clone(),
+                    date_utc: None,
                 });
             }
         }

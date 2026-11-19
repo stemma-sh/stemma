@@ -1861,6 +1861,7 @@ mod tests {
                 author: Some("Test".to_string()),
                 date: Some("2026-05-31T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         }
     }
@@ -2209,6 +2210,7 @@ mod tests {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-06-01T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         };
         let edited = doc.apply(&txn).expect("CommentCreate applies");

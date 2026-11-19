@@ -203,6 +203,7 @@ const SPLIT_PLACEHOLDER_NUM_ID_BASE: u32 = 0xF000_0000;
 pub(crate) fn write_resolved_list_levels(doc: &mut CanonDoc) {
     fn paragraph(p: &mut ParagraphNode) {
         p.direct_numbering_omits_ilvl = false;
+        p.direct_num_pr_without_list = None;
         if let Some(change) = &mut p.formatting_change
             && let crate::domain::DirectParagraphNumbering::Present(previous) =
                 &mut change.previous.direct.numbering
@@ -460,6 +461,7 @@ fn apply_to_paragraph(
             para.numbering_suppressed = target_numbering_suppressed;
             // The verb writes the level it sets (or removes the list).
             para.direct_numbering_omits_ilvl = false;
+            para.direct_num_pr_without_list = None;
             para.numbering = new_numbering;
         }
         // Direct mutation: set the new numbering, no tracked change.
@@ -468,6 +470,7 @@ fn apply_to_paragraph(
             para.numbering_suppressed = target_numbering_suppressed;
             // The verb writes the level it sets (or removes the list).
             para.direct_numbering_omits_ilvl = false;
+            para.direct_num_pr_without_list = None;
             para.numbering = new_numbering;
             para.formatting_change = None;
         }
@@ -809,6 +812,7 @@ mod tests {
             has_direct_numbering: false,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -862,6 +866,7 @@ mod tests {
             author: Some("Test".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         }
     }
 

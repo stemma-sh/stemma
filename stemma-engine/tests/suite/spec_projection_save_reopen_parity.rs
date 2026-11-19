@@ -419,6 +419,7 @@ fn spec_pprchange_previous_state_preserves_numbering_suppression() {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-02-01T10:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("apply tracked alignment change");
@@ -531,7 +532,8 @@ fn spec_preserved_boundary_whitespace_survives_save() {
 
 /// The reading side of the same rule: without `xml:space="preserve"`, edge
 /// whitespace in a `w:t` is not content, so Word shows `<w:t> Lead\n</w:t>` as
-/// "Lead". With it, every character is content.
+/// "Lead". With it, every character is content, a line feed read as the
+/// space Word reads it as (observed: Word saves it back as a space).
 #[test]
 fn spec_unpreserved_boundary_whitespace_is_not_content() {
     let body = "<w:p><w:r><w:t> Lead\n</w:t></w:r></w:p><w:p><w:r><w:t xml:space=\"preserve\"> Kept\n</w:t></w:r></w:p>";
@@ -554,7 +556,7 @@ fn spec_unpreserved_boundary_whitespace_is_not_content() {
             _ => panic!("the fixture holds paragraphs"),
         })
         .collect();
-    assert_eq!(texts, ["Lead", " Kept\n"]);
+    assert_eq!(texts, ["Lead", " Kept "]);
 }
 
 /// `xml:space` is inherited (XML 1.0 §2.10): a part that declares

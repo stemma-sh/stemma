@@ -650,6 +650,7 @@ fn flush_group(
             author: Some(author.to_string()),
             date: Some(date.to_string()),
             apply_op_id: apply_op_id.map(|s| s.to_string()),
+            date_utc: (!date.is_empty()).then(|| date.to_string()),
         }),
         GroupKind::Deleted => TrackingStatus::Deleted(RevisionInfo {
             revision_id,
@@ -657,6 +658,7 @@ fn flush_group(
             author: Some(author.to_string()),
             date: Some(date.to_string()),
             apply_op_id: apply_op_id.map(|s| s.to_string()),
+            date_utc: (!date.is_empty()).then(|| date.to_string()),
         }),
     };
     out.push(TrackedSegment { status, inlines });
@@ -758,6 +760,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -924,6 +927,7 @@ mod tests {
                 author: Some("Native".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             }),
             // Even though this run carries strike + red color, it is
             // already inside a Deleted segment and must not be

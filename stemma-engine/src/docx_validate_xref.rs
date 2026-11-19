@@ -226,13 +226,26 @@ pub(crate) fn check_xref_003_comment_ids(state: &PackageState) -> Vec<Validation
         }
     };
 
+    // Word reads an id that is not a decimal number as 0, on the comment and
+    // on the reference alike: a comment `c1` matches a reference `0` or
+    // `c1` (clean), and a reference `2` to a comment renamed `c1` dangles
+    // (repaired) (observed).
+    let as_word_reads = |id: &str| match id.parse::<i64>() {
+        Ok(number) => number.to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let defined_comment_ids: HashSet<String> = defined_comment_ids
+        .iter()
+        .map(|id| as_word_reads(id))
+        .collect();
+
     for (part_name, id) in &all_references {
-        if !defined_comment_ids.contains(id.as_str()) {
+        if !defined_comment_ids.contains(&as_word_reads(id)) {
             findings.push(ValidationFinding {
                 rule_id: "I-XREF-003",
                 severity: ValidationSeverity::Error,
                 message: format!(
-                    "commentReference w:id='{id}' is referenced but not defined in word/comments.xml"
+                    "commentReference w:id='{id}' is referenced but not defined in the comments part"
                 ),
                 location: part_name.clone(),
             });
@@ -600,6 +613,7 @@ mod tests {
             story_parts,
             styles_root,
             numbering_root,
+            settings_root: None,
             main_part: Some("word/document.xml".to_string()),
         }
     }

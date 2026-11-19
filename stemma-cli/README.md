@@ -63,7 +63,7 @@ stemma apply    <input.docx> --worklist <changes.json> -o <redline.docx>
                 [--allow-existing-author]
 stemma inspect  <input.docx> [--format markdown|json]
 stemma execute  <input.docx> --plan <changes.json> -o <redline.docx>
-stemma verify   <before.docx> <after.docx> [--policy tracked-delivery-v0]
+stemma verify   <before.docx> <after.docx> [--policy tracked-delivery-v1|tracked-delivery-v0]
 stemma verify-task <manifest.json> [--root <artifact-dir>]
 stemma compare  <base.docx> <target.docx> -o <redline.docx> [--author NAME]
                 [--format text|json]
@@ -117,8 +117,10 @@ stemma validate <file.docx> [--format text|json]
   writing; `--format json` emits a `stemma.resolve_receipt.v0` on stdout.
 - `compare --format json` and `validate --format json` likewise emit
   schema-tagged results on stdout (`stemma.compare_receipt.v0`,
-  `stemma.validate.v0` — structured for invalid packages too).
-- `validate` exits `0` with an `OK` line, nonzero with the structured reason.
+  `stemma.validate.v1`: one of three verdicts, sound, corrupt or cannot
+  assess).
+- `validate` exits `0` for a sound document, `3` for a corrupt one and `4`
+  when the document holds a shape Stemma does not read.
 
 stdout carries data, stderr carries diagnostics; every failure exits nonzero
 with a one-line actionable `error:` message. For `apply`, the durable sidecar

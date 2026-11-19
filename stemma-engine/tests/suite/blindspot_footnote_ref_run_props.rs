@@ -36,12 +36,17 @@ const REF_RPR: &str = concat!(
 /// and a `word/footnotes.xml` whose content footnote carries the styled
 /// `w:footnoteRef` reference run above.
 fn make_docx_with_footnote() -> Vec<u8> {
+    make_docx("")
+}
+
+/// The same document, with `separator_rpr` on the footnote separator's run.
+fn make_docx(separator_rpr: &str) -> Vec<u8> {
     let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Body paragraph with a note.</w:t></w:r><w:r><w:rPr><w:rStyle w:val="Refdenotaalpie"/></w:rPr><w:footnoteReference w:id="1"/></w:r></w:p><w:sectPr/></w:body></w:document>"#;
 
     let footnotes_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r>{REF_RPR}<w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> The footnote body text.</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:type="separator" w:id="-1"><w:p><w:r>{separator_rpr}<w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote><w:footnote w:id="1"><w:p><w:r>{REF_RPR}<w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> The footnote body text.</w:t></w:r></w:p></w:footnote></w:footnotes>"#
     );
 
     let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#;
@@ -105,6 +110,7 @@ fn footnote_ref_run_retains_rpr_after_body_edit() {
             author: Some("Editor".to_string()),
             date: Some("2026-07-09T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
 
@@ -187,6 +193,7 @@ fn imported_body_reference_run_keeps_captured_rpr_without_style_injection() {
             author: Some("Editor".to_string()),
             date: Some("2026-07-09T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let edited = base.apply(&txn).expect("apply body edit");
@@ -243,4 +250,66 @@ fn make_docx_with_parts(document_xml: &str) -> Vec<u8> {
         zip.finish().unwrap();
     }
     buf
+}
+
+/// The footnotes part after an unrelated body edit, saved.
+fn footnotes_after_body_edit(docx: &[u8]) -> String {
+    let base = Document::parse(docx).expect("parse");
+    let block_id = first_block_id(&base.snapshot().canonical);
+    let txn = EditTransaction {
+        steps: vec![EditStep::SetParagraphFormatting {
+            block_id,
+            semantic_hash: None,
+            patch: ParagraphFormattingPatch {
+                align: Some(Alignment::Center),
+                ..ParagraphFormattingPatch::default()
+            },
+            rationale: None,
+        }],
+        summary: None,
+        materialization_mode: MaterializationMode::Direct,
+        revision: RevisionInfo {
+            revision_id: 1,
+            identity: 0,
+            author: Some("Editor".to_string()),
+            date: Some("2026-07-09T00:00:00Z".to_string()),
+            apply_op_id: None,
+            date_utc: None,
+        },
+    };
+    let bytes = base
+        .apply(&txn)
+        .expect("apply body edit")
+        .serialize(&ExportOptions::default())
+        .expect("serialize");
+    let archive = DocxArchive::read(&bytes).expect("read exported docx");
+    String::from_utf8(
+        archive
+            .get("word/footnotes.xml")
+            .expect("footnotes.xml")
+            .to_vec(),
+    )
+    .expect("footnotes.xml utf8")
+    .replace(" />", "/>")
+}
+
+/// An explicit OFF on the separator's run (`<w:b w:val="0"/>`, which turns
+/// off a bold the paragraph style gives, §17.7.3) is written back: the resolved
+/// marks say "not bold" either way, so only the source run's own markup tells
+/// "off" from "not set".
+#[test]
+fn separator_run_keeps_an_explicit_off_after_body_edit() {
+    let footnotes = footnotes_after_body_edit(&make_docx(
+        r#"<w:rPr><w:b w:val="0"/><w:bCs w:val="0"/></w:rPr>"#,
+    ));
+    assert!(
+        footnotes.contains(r#"<w:b w:val="0"/><w:bCs w:val="0"/></w:rPr><w:separator/>"#),
+        "separator run lost its explicit OFF:\n{footnotes}"
+    );
+    // A separator run with no properties stays bare: nothing is invented.
+    let bare = footnotes_after_body_edit(&make_docx(""));
+    assert!(
+        bare.contains("<w:r><w:separator/></w:r>"),
+        "separator run gained properties:\n{bare}"
+    );
 }

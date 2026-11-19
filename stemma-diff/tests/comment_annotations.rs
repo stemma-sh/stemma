@@ -18,12 +18,32 @@ const COMMENT_TEXT: &str = "Please confirm the delivery window.";
 /// A package whose body is `body`, with a comments part holding comment 0
 /// when `with_comment`.
 fn docx(body: &str, with_comment: bool) -> Vec<u8> {
+    let comments: &[(&str, &str)] = if with_comment {
+        &[("0", COMMENT_TEXT)]
+    } else {
+        &[]
+    };
+    docx_with_comments(body, comments)
+}
+
+/// A package whose body is `body`, with a comments part holding each
+/// `(id, words)` comment (none: no comments part).
+fn docx_with_comments(body: &str, comments: &[(&str, &str)]) -> Vec<u8> {
+    let with_comment = !comments.is_empty();
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>"#
     );
+    let definitions: String = comments
+        .iter()
+        .map(|(id, words)| {
+            format!(
+                r#"<w:comment w:id="{id}" w:author="Reviewer" w:date="2026-03-02T09:00:00Z" w:initials="RV"><w:p><w:r><w:t>{words}</w:t></w:r></w:p></w:comment>"#
+            )
+        })
+        .collect();
     let comments_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="Reviewer" w:date="2026-03-02T09:00:00Z" w:initials="RV"><w:p><w:r><w:t>{COMMENT_TEXT}</w:t></w:r></w:p></w:comment></w:comments>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{definitions}</w:comments>"#
     );
     let comments_override = if with_comment {
         r#"<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>"#
@@ -268,4 +288,100 @@ fn a_comment_inside_an_inserted_paragraph_is_inserted_with_it() {
             "Reject All leaves no comment in the comments part"
         );
     }
+}
+
+/// A paragraph holding `text`, annotated with comment `id`.
+fn annotated(id: &str, text: &str) -> String {
+    format!(
+        r#"<w:p><w:commentRangeStart w:id="{id}"/>{}<w:commentRangeEnd w:id="{id}"/><w:r><w:commentReference w:id="{id}"/></w:r></w:p>"#,
+        run(text)
+    )
+}
+
+const FIRST: &str = "Deliveries arrive at the north gate.";
+const SECOND: &str = "Invoices are due within thirty days.";
+const REMOVED_WORDS: &str = "Is the north gate staffed at night?";
+const ADDED_WORDS: &str = "Confirm the payment term with finance.";
+
+/// Word's Compare writes no tracked revision for a comment added or removed:
+/// comparing a base that annotates one paragraph with a target that drops
+/// that comment and annotates the other paragraph, Word's result holds both
+/// comments, untracked. Here the added comment, on text both documents keep,
+/// is carried untracked as in Word, and the removed comment keeps its tracked
+/// deletion, so the target's comment is never lost: Accept All reads as the
+/// target, and Reject All as the base carrying the added comment, its words
+/// included (the named departure of `a_comment_added_on_kept_text_is_carried_untracked`).
+#[test]
+fn a_comment_added_on_kept_text_and_another_removed_compare() {
+    let base = Document::parse(&docx_with_comments(
+        &format!("{}<w:p>{}</w:p>", annotated("1", FIRST), run(SECOND)),
+        &[("1", REMOVED_WORDS)],
+    ))
+    .expect("parse base");
+    let target = Document::parse(&docx_with_comments(
+        &format!("<w:p>{}</w:p>{}", run(FIRST), annotated("2", SECOND)),
+        &[("2", ADDED_WORDS)],
+    ))
+    .expect("parse target");
+    let base_with_added = Document::parse(&docx_with_comments(
+        &format!("{}{}", annotated("1", FIRST), annotated("2", SECOND)),
+        &[("1", REMOVED_WORDS), ("2", ADDED_WORDS)],
+    ))
+    .expect("parse base with the added comment");
+
+    let redline = reopened(&stemma_diff::diff_as(&base, &target, "compare").expect("compare"));
+    // Comments are compared as a set: their order in the comments part
+    // carries no meaning.
+    let sorted = |(text, mut comments): (String, Vec<(bool, String)>)| {
+        comments.sort();
+        (text, comments)
+    };
+
+    assert_eq!(
+        sorted(reading(&redline)).1,
+        vec![
+            (true, ADDED_WORDS.to_string()),
+            (true, REMOVED_WORDS.to_string())
+        ],
+        "the redline holds both comments"
+    );
+    assert_eq!(
+        sorted(resolved(&redline, Resolution::AcceptAll)),
+        sorted(reading(&target))
+    );
+    assert_eq!(
+        sorted(resolved(&redline, Resolution::RejectAll)),
+        sorted(reading(&base_with_added))
+    );
+}
+
+/// A comment the target adds on inserted text rides inside that insertion,
+/// and another comment the base had is removed. Word opens such a redline
+/// without repair, and its Reject All leaves the base (with its comment) and
+/// its Accept All the target (with its comment). Here: Accept All reads as
+/// the target and Reject All as the base, each with its one comment.
+#[test]
+fn a_comment_added_on_inserted_text_and_another_removed_compare() {
+    let base = Document::parse(&docx_with_comments(
+        &format!("{}<w:p>{}</w:p>", annotated("1", FIRST), run(SECOND)),
+        &[("1", REMOVED_WORDS)],
+    ))
+    .expect("parse base");
+    let target = Document::parse(&docx_with_comments(
+        &format!(
+            "<w:p>{}</w:p><w:p>{}</w:p>{}",
+            run(FIRST),
+            run(SECOND),
+            annotated("2", "Pallets over one tonne need a booked slot.")
+        ),
+        &[("2", ADDED_WORDS)],
+    ))
+    .expect("parse target");
+
+    let redline = reopened(&stemma_diff::diff_as(&base, &target, "compare").expect("compare"));
+
+    assert_eq!(resolved(&redline, Resolution::AcceptAll), reading(&target));
+    assert_eq!(resolved(&redline, Resolution::RejectAll), reading(&base));
+    assert_eq!(reading(&target).1, vec![(true, ADDED_WORDS.to_string())]);
+    assert_eq!(reading(&base).1, vec![(true, REMOVED_WORDS.to_string())]);
 }

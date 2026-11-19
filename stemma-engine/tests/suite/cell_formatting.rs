@@ -71,6 +71,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -946,6 +947,7 @@ fn a_tracked_paragraph_format_in_a_cell_survives_persistence() {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-03-01T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("centre the cell paragraph");

@@ -88,6 +88,7 @@ fn edited_first_para(body: &str) -> String {
             author: Some("fid".into()),
             date: Some("2026-07-02T00:00:00Z".into()),
             apply_op_id: None,
+            date_utc: None,
         },
         summary: None,
     };
@@ -253,6 +254,7 @@ fn rejecting_a_deletion_restores_a_space_indented_label_unchanged() {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-07-25T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("delete the labelled paragraph");
@@ -305,6 +307,7 @@ fn a_labelled_whole_paragraph_deletion_reopens_as_a_block_deletion() {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-07-25T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("delete the labelled paragraph");
@@ -370,6 +373,7 @@ fn a_prefix_keeps_its_formatting_when_the_first_word_is_formatted() {
                     author: Some("Reviewer".into()),
                     date: Some("2026-06-01T00:00:00Z".into()),
                     apply_op_id: None,
+                    date_utc: None,
                 },
             })
             .expect("format the first word");

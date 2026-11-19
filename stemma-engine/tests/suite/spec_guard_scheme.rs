@@ -70,6 +70,7 @@ fn revision() -> RevisionInfo {
         author: Some("guard-test".to_string()),
         date: Some("2026-06-09T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 

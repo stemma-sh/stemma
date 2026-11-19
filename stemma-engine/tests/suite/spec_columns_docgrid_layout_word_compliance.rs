@@ -286,3 +286,47 @@ fn cols_num_ignored_when_unequal_width_col_count_authoritative() {
         "ISO 29500-1 §17.6.4: num is read-time-ignored under equalWidth=false; a num/col-count divergence is consumed leniently, so stemma's validity check must report no errors",
     );
 }
+
+/// Some producers write a negative `charSpace` as its unsigned 32-bit form.
+/// Checked against Word: it opens the file without repair, reads the signed
+/// number, and writes that back ("4294965247" becomes "-2049"). The value
+/// read is pinned beside the parser.
+#[test]
+fn docgrid_charspace_in_unsigned_32_bit_form_is_the_negative_number() {
+    let body = r#"<w:p><w:r><w:t>The tide table is pinned by the door.</w:t></w:r></w:p><w:sectPr><w:docGrid w:type="linesAndChars" w:linePitch="360" w:charSpace="4294965247"/></w:sectPr>"#;
+    let b = make_docx(body, &[]);
+    assert_opens_clean(
+        &b,
+        "Word reads an unsigned 32-bit charSpace as the signed number",
+    );
+    assert!(
+        reserialize(&b).contains(r#"w:charSpace="4294965247""#),
+        "an untouched section keeps the spelling it was written with, which Word opens"
+    );
+}
+
+/// Beyond both 32-bit ranges there is no reading Word is known to give.
+#[test]
+fn docgrid_charspace_beyond_32_bits_is_refused() {
+    let body = r#"<w:p><w:r><w:t>The tide table is pinned by the door.</w:t></w:r></w:p><w:sectPr><w:docGrid w:type="linesAndChars" w:linePitch="360" w:charSpace="4294967296"/></w:sectPr>"#;
+    let error = Document::parse(&make_docx(body, &[]))
+        .err()
+        .expect("a charSpace beyond 32 bits must be refused");
+    assert!(
+        format!("{error:?}").contains("charSpace"),
+        "the refusal names the attribute; got {error:?}"
+    );
+}
+
+/// Checked against Word: a negative column width opens without repair and
+/// Word writes it back unchanged.
+#[test]
+fn col_with_negative_width_loads_and_is_kept() {
+    let body = r#"<w:p><w:r><w:t>The tide table is pinned by the door.</w:t></w:r></w:p><w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="-1" w:space="720"/><w:col w:w="4000"/></w:cols></w:sectPr>"#;
+    let b = make_docx(body, &[]);
+    assert_opens_clean(&b, "Word opens a negative column width without repair");
+    assert!(
+        reserialize(&b).contains(r#"<w:col w:w="-1" w:space="720"/>"#),
+        "the column width is written back unchanged"
+    );
+}

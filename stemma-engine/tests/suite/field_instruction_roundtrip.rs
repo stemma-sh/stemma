@@ -27,7 +27,7 @@
 
 use stemma::api::Document;
 use stemma::runtime::{ExportMode, ExportOptions, ValidatorLevel};
-use stemma::{ErrorCode, FieldData, FieldSemantic, InlineNode, OpaqueKind};
+use stemma::{FieldData, FieldSemantic, InlineNode, OpaqueKind};
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -253,46 +253,38 @@ fn collect_instr_attrs(docx: &[u8]) -> Vec<String> {
     out
 }
 
-// ─── (2) Malformed fldSimple is refused at import ─────────────────────────────
+// ─── (2) An incomplete fldSimple instruction loads without a typed reading ────
 
-/// A structurally-complete-but-invalid `w:fldSimple` instruction has no
-/// fragment excuse: the whole instruction is present in the `w:instr`
-/// attribute. Per the no-silent-fallback rule, import must FAIL with
-/// `InvalidDocx` and an actionable message rather than degrade to a generic /
-/// empty field.
+/// Word opens a `w:fldSimple` whose instruction names a field but lacks its
+/// argument (`HYPERLINK` with no target, `IF` with no alternatives,
+/// `MERGEFIELD` with no name) without repair, and keeps the instruction as
+/// written. The document loads; the field has no typed reading; the
+/// instruction text survives a save unchanged.
 #[test]
-fn malformed_fldsimple_is_refused_at_import() {
-    // Each case: (instruction, the parse error the message should mention).
-    let cases: &[(&str, &str)] = &[
-        // HYPERLINK with no URL and no bookmark.
-        (r#"HYPERLINK"#, "HYPERLINK"),
-        // IF with no quoted true/false alternatives.
-        (r#"IF a &gt; b"#, "IF"),
-        // MERGEFIELD with no field name.
-        (r#"MERGEFIELD"#, "MERGEFIELD"),
-    ];
-
-    for (instr, needle) in cases {
+fn incomplete_fldsimple_instruction_loads_without_a_typed_reading() {
+    for instr in [r#"HYPERLINK"#, r#"IF a &gt; b"#, r#"MERGEFIELD"#] {
         let body = fld_simple_para(instr, "x");
         let bytes = make_docx_with_body(&body);
-        let err = match Document::parse(&bytes) {
-            Ok(_) => panic!(
-                "fldSimple with malformed instruction {instr:?} must be refused, not imported"
-            ),
-            Err(e) => e,
-        };
+        let doc = Document::parse(&bytes)
+            .unwrap_or_else(|e| panic!("fldSimple {instr:?} must load, got {e:?}"));
         assert_eq!(
-            err.code,
-            ErrorCode::InvalidDocx,
-            "malformed fldSimple {instr:?} should fail with InvalidDocx, got {:?}: {}",
-            err.code,
-            err.message
+            simple_field_semantics(&doc),
+            vec![None],
+            "{instr:?} has no typed reading"
         );
+        let saved = doc
+            .serialize(&stemma::ExportOptions::default())
+            .expect("save");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(saved)).expect("zip");
+        let mut xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("word/document.xml").expect("document"),
+            &mut xml,
+        )
+        .expect("read");
         assert!(
-            err.message.to_uppercase().contains(&needle.to_uppercase())
-                || err.message.contains("fldSimple"),
-            "error for {instr:?} should be actionable (mention the field/instruction); got: {}",
-            err.message
+            xml.contains(&format!(r#"w:instr="{instr}""#)),
+            "the instruction is written back as it arrived: {xml}"
         );
     }
 }
@@ -320,9 +312,7 @@ fn empty_fldsimple_instr_is_refused_at_import() {
 /// The contrast case: the SAME garbage instruction carried in a *complex*
 /// field (`w:instrText`) is a mere fragment of a possibly multi-run
 /// instruction, so the importer tolerates it (`Ok`, no typed semantic) rather
-/// than failing the whole document. This is the intentional asymmetry with the
-/// fldSimple refusal above — pin it so a future change can't quietly make
-/// complex fields strict (or fldSimple lax) without updating this test.
+/// than failing the whole document, as for the simple field above.
 #[test]
 fn malformed_complex_field_is_tolerated_at_import() {
     for instr in [r#"HYPERLINK"#, r#"IF a &gt; b"#, r#"MERGEFIELD"#] {

@@ -111,6 +111,7 @@ fn root_xml_space_preserve_survives_rebuild_and_keeps_textbox_space() {
             author: Some("Gate".to_string()),
             date: Some("2026-07-09T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
         summary: Some("unrelated body edit".to_string()),
     };

@@ -67,6 +67,7 @@ fn txn(steps: Vec<EditStep>) -> EditTransaction {
             author: Some("Spec".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }

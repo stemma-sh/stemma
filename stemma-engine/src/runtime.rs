@@ -789,7 +789,8 @@ fn now_epoch_secs() -> u64 {
 // v51: A paragraph records a direct numPr that names a list but no level.
 // v52: A table-cell paragraph carries its move group (`cell_move_id`).
 // v53: HyperlinkData records the run wrappers its runs flatten (`flattened_wrappers`).
-const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 53;
+// v54: Revisions and run/paragraph/table-exception property changes retain their explicit UTC dates.
+const SNAPSHOT_BLOB_SCHEMA_VERSION: u32 = 54;
 const SNAPSHOT_BLOB_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EDIT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_BLOB_ZSTD_LEVEL: i32 = 3;
@@ -5176,11 +5177,13 @@ fn collect_referenced_style_ids(doc: &CanonDoc) -> HashSet<IStr> {
 pub(crate) const BLOCKING_RULES: &[&str] = &[
     "I-ANN-010", // one comment identity cannot delimit/reference multiple ranges (Word repairs it)
     "I-TC-001",  // tracked change content model (no hyperlink/fldSimple inside del/ins)
-    "I-TC-002",  // tracked change missing w:id
-    "I-TC-004",  // w:delText inside w:moveFrom (Word repairs and loses the revisions)
-    "I-TC-003",  // tracked-change nesting: del-in-ins allowed, same-type nesting never
-    //             (promoted to blocking with stacked revisions —
-    //             cheap insurance against a same-type-nesting emission bug)
+    // I-TC-002 (tracked change missing w:id) is not blocking: Word opens such
+    // a document without repair and numbers the change itself, and an
+    // untouched document that came in that way must save.
+    "I-TC-004", // w:delText inside w:moveFrom (Word repairs and loses the revisions)
+    // I-TC-003 (same-type nesting) is not blocking either: Word opens it
+    // without repair, reading the inner change, and an untouched document
+    // that came in that way must save.
     "I-DOC-001",  // root must be w:document
     "I-DOC-002",  // exactly one w:body
     "I-PKG-000",  // package unreadable (ZIP open/read failure)
@@ -5358,10 +5361,16 @@ fn track_body_sdt_content_change(
     annotation_id: &mut u32,
     change: BodySdtChange,
 ) {
-    fn revision_marker(change: BodySdtChange, id: u32, author: &str, date: &str) -> Element {
+    fn revision_marker(
+        change: BodySdtChange,
+        id: u32,
+        author: &str,
+        date: &str,
+        date_utc: Option<&str>,
+    ) -> Element {
         match change {
-            BodySdtChange::Inserted => word_xml::w_ins(id, author, date),
-            BodySdtChange::Deleted => word_xml::w_del(id, author, date),
+            BodySdtChange::Inserted => word_xml::w_ins(id, author, date, date_utc),
+            BodySdtChange::Deleted => word_xml::w_del(id, author, date, date_utc),
         }
     }
 
@@ -5400,18 +5409,21 @@ fn track_body_sdt_content_change(
     ) {
         let author = revision.author.as_deref().unwrap_or("");
         let date = revision.date.as_deref().unwrap_or("");
+        let date_utc = revision.date_utc.as_deref();
         match change {
             BodySdtChange::Inserted => word_xml::ensure_ppr_rpr_ins(
                 paragraph,
                 next_annotation_id(annotation_id),
                 author,
                 date,
+                date_utc,
             ),
             BodySdtChange::Deleted => word_xml::ensure_ppr_rpr_del(
                 paragraph,
                 next_annotation_id(annotation_id),
                 author,
                 date,
+                date_utc,
             ),
         }
 
@@ -5447,6 +5459,7 @@ fn track_body_sdt_content_change(
         ) {
             let author = revision.author.as_deref().unwrap_or("");
             let date = revision.date.as_deref().unwrap_or("");
+            let date_utc = revision.date_utc.as_deref();
             let children: Vec<XMLNode> = parent.children.drain(..).collect();
             for child in children {
                 match child {
@@ -5478,6 +5491,7 @@ fn track_body_sdt_content_change(
                             next_annotation_id(annotation_id),
                             author,
                             date,
+                            date_utc,
                         );
                         tracked.children.push(XMLNode::Element(content));
                         parent.children.push(XMLNode::Element(tracked));
@@ -5506,8 +5520,13 @@ fn track_body_sdt_content_change(
                         &mut content,
                         matches!(change, BodySdtChange::Deleted),
                     );
-                    let mut tracked =
-                        revision_marker(change, next_annotation_id(annotation_id), author, date);
+                    let mut tracked = revision_marker(
+                        change,
+                        next_annotation_id(annotation_id),
+                        author,
+                        date,
+                        date_utc,
+                    );
                     tracked.children.push(XMLNode::Element(content));
                     paragraph.children.push(XMLNode::Element(tracked));
                 }
@@ -5524,7 +5543,14 @@ fn track_body_sdt_content_change(
     ) {
         let author = revision.author.as_deref().unwrap_or("");
         let date = revision.date.as_deref().unwrap_or("");
-        let marker = revision_marker(change, next_annotation_id(annotation_id), author, date);
+        let date_utc = revision.date_utc.as_deref();
+        let marker = revision_marker(
+            change,
+            next_annotation_id(annotation_id),
+            author,
+            date,
+            date_utc,
+        );
         let tr_pr_index = row
             .children
             .iter()
@@ -5796,6 +5822,7 @@ fn relocate_pending_body_range_markers(
                     proof_ref: opaque.proof_ref.clone(),
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: crate::domain::StyleProps::default(),
+                    wrapper_rpr_authored: None,
                     joins_following_text_run: false,
                     raw_xml: Some(word_xml::serialize_raw_fragment(element)),
                     origin: target_origin.then(|| "target".to_string()),
@@ -6731,6 +6758,9 @@ pub(crate) fn serialize_canonical_docx(
             }
             if let Some(ref date) = change.revision.date {
                 attr_set(&mut sect_pr_change, "w:date", date.clone());
+            }
+            if let Some(ref date_utc) = change.revision.date_utc {
+                attr_set(&mut sect_pr_change, "w16du:dateUtc", date_utc.clone());
             }
             if let Ok(mut prev_el) = word_xml::parse_raw_fragment(&change.previous_properties_raw) {
                 materialize_empty_sect_pr_snapshot(&mut prev_el);
@@ -9686,6 +9716,465 @@ pub fn style_table_from_docx(
     )))
 }
 
+/// What the audit takes from a package beyond the document model
+/// (`appearance::PackageFacts`).
+///
+/// Relationships: per source part, by relationship id, a digest of an
+/// internal target (`appearance::part_digest`, the target's own
+/// relationships read the same way) or an external target's address; the
+/// main document part is also listed under
+/// [`crate::appearance::MAIN_PART`]. Two packages can name the same image by
+/// different ids, and one id can come to name another image; what a
+/// reference means is its target.
+///
+/// Numbering: per `(numId, ilvl)`, a digest of the level definition the
+/// reference resolves to (its `w:lvlOverride`, else the level of its
+/// abstract numbering). A reference the numbering part does not resolve has
+/// no entry.
+pub(crate) fn package_facts(bytes: &[u8]) -> Result<crate::appearance::PackageFacts, RuntimeError> {
+    let invalid = |message: String| RuntimeError {
+        code: ErrorCode::InvalidDocx,
+        message,
+        details: ErrorDetails::default(),
+    };
+    let archive = DocxArchive::read(bytes).map_err(|source| {
+        invalid(format!(
+            "package_facts: not a valid DOCX archive: {source:?}"
+        ))
+    })?;
+    let package = DocxPackage::from_archive(&archive)
+        .map_err(|source| invalid(format!("package_facts: package decode failed: {source}")))?;
+    let main_part = package.main_document_part_name().to_string();
+    let numbering_levels = numbering_level_digests(&archive, &main_part);
+    // Per source part, its relationships: id and target (an internal part
+    // path, or an external address).
+    let mut declared: HashMap<String, Vec<(String, RelationshipTarget)>> = HashMap::new();
+    // The main part's internal targets by relationship type.
+    let mut main_part_targets: HashMap<String, String> = HashMap::new();
+    let mut main_part_all_targets: Vec<(String, String)> = Vec::new();
+    let rels_paths: Vec<String> = archive
+        .names()
+        .filter(|name| name.ends_with(".rels") && name.contains("_rels/"))
+        .map(str::to_string)
+        .collect();
+    for rels_path in rels_paths {
+        // `dir/_rels/name.rels` describes the part `dir/name`.
+        let Some((directory, file)) = rels_path.rsplit_once("_rels/") else {
+            continue;
+        };
+        let part = format!("{directory}{}", file.trim_end_matches(".rels"));
+        let Some(rels_bytes) = archive.get(&rels_path) else {
+            continue;
+        };
+        let relationships = RelationshipSet::parse(rels_bytes, &rels_path).map_err(|source| {
+            invalid(format!("package_facts: cannot read {rels_path}: {source}"))
+        })?;
+        if part == main_part {
+            for relationship in &relationships.entries {
+                if crate::docx_package::relationship_target_mode_is_internal(
+                    relationship.target_mode.as_deref(),
+                ) {
+                    let target = match relationship.target.strip_prefix('/') {
+                        Some(absolute) => crate::docx_package::normalize_package_path(absolute),
+                        None => crate::docx_package::normalize_package_path(&format!(
+                            "{directory}{}",
+                            relationship.target
+                        )),
+                    };
+                    main_part_targets.insert(relationship.rel_type.clone(), target.clone());
+                    main_part_all_targets.push((relationship.rel_type.clone(), target));
+                }
+            }
+        }
+        let entries = relationships
+            .entries
+            .iter()
+            .map(|relationship| {
+                let target = if crate::docx_package::relationship_target_mode_is_internal(
+                    relationship.target_mode.as_deref(),
+                ) {
+                    RelationshipTarget::Part(match relationship.target.strip_prefix('/') {
+                        Some(absolute) => crate::docx_package::normalize_package_path(absolute),
+                        None => crate::docx_package::normalize_package_path(&format!(
+                            "{directory}{}",
+                            relationship.target
+                        )),
+                    })
+                } else {
+                    RelationshipTarget::External(relationship.target.clone())
+                };
+                (relationship.id.clone(), target)
+            })
+            .collect();
+        declared.insert(part, entries);
+    }
+    let mut meanings = PartMeanings {
+        archive: &archive,
+        declared: &declared,
+        digests: HashMap::new(),
+        open: HashSet::new(),
+    };
+    let mut parts = crate::appearance::PartRelationships::new();
+    for part in declared.keys() {
+        let targets = meanings.relationships_of(part);
+        if *part == main_part {
+            parts.insert(crate::appearance::MAIN_PART.to_string(), targets.clone());
+        }
+        parts.insert(part.clone(), targets);
+    }
+    let part_of_type = |rel_type: &str| {
+        main_part_targets
+            .get(rel_type)
+            .and_then(|path| archive.get(path).map(|bytes| (path.clone(), bytes)))
+    };
+    let settings = match part_of_type(SETTINGS_REL_TYPE) {
+        Some((path, bytes)) => crate::appearance::settings_in_effect(bytes)
+            .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))?,
+        None => Vec::new(),
+    };
+    let theme_colors = match part_of_type(THEME_REL_TYPE) {
+        Some((path, bytes)) => crate::appearance::theme_colors(bytes)
+            .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))?,
+        None => HashMap::new(),
+    };
+    let theme_digest = part_of_type(THEME_REL_TYPE)
+        .map(|(_, bytes)| crate::appearance::part_digest(bytes, &HashMap::new()));
+    let styles_digest = part_of_type(STYLES_REL_TYPE)
+        .map(|(_, bytes)| crate::appearance::part_digest(bytes, &HashMap::new()));
+    let paragraph_styles = match part_of_type(STYLES_REL_TYPE) {
+        Some((path, bytes)) => crate::appearance::paragraph_style_properties(bytes)
+            .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))?,
+        None => HashMap::new(),
+    };
+    let mut note_separators = Vec::new();
+    for (rel_type, family) in [
+        (FOOTNOTES_REL_TYPE, "footnotes"),
+        (ENDNOTES_REL_TYPE, "endnotes"),
+    ] {
+        if let Some((path, bytes)) = part_of_type(rel_type) {
+            note_separators.extend(crate::appearance::note_separators(bytes, family).map_err(
+                |source| invalid(format!("package_facts: cannot read {path}: {source}")),
+            )?);
+        }
+    }
+    let table_styles = match part_of_type(STYLES_REL_TYPE) {
+        Some((path, bytes)) => crate::appearance::table_styles(bytes)
+            .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))?,
+        None => crate::appearance::TableStyles::default(),
+    };
+    let bound_values = crate::data_binding::bound_values(&package)?;
+    let embedded_fonts = match part_of_type(FONT_TABLE_REL_TYPE) {
+        Some((path, bytes)) => crate::appearance::embedded_fonts(bytes)
+            .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))?,
+        None => Vec::new(),
+    };
+    Ok(crate::appearance::PackageFacts {
+        main_part,
+        relationships: parts,
+        numbering_levels,
+        settings,
+        theme_colors,
+        theme_in_use: Vec::new(),
+        theme_digest,
+        styles_digest,
+        table_styles,
+        paragraph_styles,
+        note_separators,
+        styleref_targets: Vec::new(),
+        bound_values,
+        embedded_fonts,
+    })
+}
+
+/// What a package's content takes from its theme and styles parts: the
+/// theme entries it uses (`appearance::theme_in_use`) and the styles its
+/// `STYLEREF` fields name (`appearance::styleref_targets`). The content is
+/// the main part and the parts it relates as headers, footers, notes,
+/// comments, numbering, charts and diagrams, with the styles they use.
+/// Read only for packages whose themes or styles differ, as the reading
+/// parses every content part again.
+pub(crate) fn content_readings(bytes: &[u8]) -> Result<ContentReadings, RuntimeError> {
+    let invalid = |message: String| RuntimeError {
+        code: ErrorCode::InvalidDocx,
+        message,
+        details: ErrorDetails::default(),
+    };
+    let archive = DocxArchive::read(bytes).map_err(|source| {
+        invalid(format!(
+            "theme_in_use: not a valid DOCX archive: {source:?}"
+        ))
+    })?;
+    let package = DocxPackage::from_archive(&archive)
+        .map_err(|source| invalid(format!("theme_in_use: package decode failed: {source}")))?;
+    let main_part = package.main_document_part_name().to_string();
+    let rels_path = format!(
+        "{}_rels/{}.rels",
+        crate::docx_package::part_dir(&main_part),
+        main_part.rsplit('/').next().unwrap_or(&main_part)
+    );
+    let mut main_part_targets: HashMap<String, String> = HashMap::new();
+    let mut main_part_all_targets: Vec<(String, String)> = Vec::new();
+    if let Some(rels_bytes) = archive.get(&rels_path) {
+        let relationships = RelationshipSet::parse(rels_bytes, &rels_path).map_err(|source| {
+            invalid(format!("theme_in_use: cannot read {rels_path}: {source}"))
+        })?;
+        let directory = crate::docx_package::part_dir(&main_part);
+        for relationship in &relationships.entries {
+            if crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            ) {
+                let target = match relationship.target.strip_prefix('/') {
+                    Some(absolute) => crate::docx_package::normalize_package_path(absolute),
+                    None => crate::docx_package::normalize_package_path(&format!(
+                        "{directory}{}",
+                        relationship.target
+                    )),
+                };
+                main_part_targets.insert(relationship.rel_type.clone(), target.clone());
+                main_part_all_targets.push((relationship.rel_type.clone(), target));
+            }
+        }
+    }
+    let part_of_type = |rel_type: &str| {
+        main_part_targets
+            .get(rel_type)
+            .and_then(|path| archive.get(path).map(|bytes| (path.clone(), bytes)))
+    };
+    Ok({
+        let parse = |path: &str| -> Result<Option<Element>, RuntimeError> {
+            let Some(bytes) = archive.get(path) else {
+                return Ok(None);
+            };
+            let xml = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+            crate::word_xml::parse_raw_fragment(xml)
+                .map(Some)
+                .map_err(|source| invalid(format!("package_facts: cannot read {path}: {source}")))
+        };
+        // The parts whose content is shown: the main part, and what it
+        // relates as headers, footers, notes, comments, numbering, charts
+        // and diagrams.
+        const SHOWN: &[&str] = &[
+            "/header",
+            "/footer",
+            "/footnotes",
+            "/endnotes",
+            "/comments",
+            "/numbering",
+            "/chart",
+            "/diagramData",
+            "/diagramColors",
+            "/diagramDrawing",
+            "/diagramLayout",
+            "/diagramQuickStyle",
+        ];
+        let mut content = Vec::new();
+        if let Some(main) = parse(&main_part)? {
+            content.push(main);
+        }
+        for (rel_type, path) in &main_part_all_targets {
+            if SHOWN.iter().any(|suffix| rel_type.ends_with(suffix))
+                && let Some(part) = parse(path)?
+            {
+                content.push(part);
+            }
+        }
+        let styles_path = main_part_targets.get(STYLES_REL_TYPE).cloned();
+        let styles = match styles_path {
+            Some(path) => parse(&path)?,
+            None => None,
+        };
+        let styleref_targets = crate::appearance::styleref_targets(&content, styles.as_ref());
+        if let Some(styles) = &styles {
+            let used = crate::appearance::styles_in_use(styles, &content);
+            content.extend(used);
+        }
+        let theme = part_of_type(THEME_REL_TYPE).map(|(_, bytes)| bytes);
+        ContentReadings {
+            theme_in_use: crate::appearance::theme_in_use(theme, &content)
+                .map_err(|source| invalid(format!("package_facts: theme: {source}")))?,
+            styleref_targets,
+        }
+    })
+}
+
+/// What [`content_readings`] reads from a package's content parts.
+pub(crate) struct ContentReadings {
+    pub(crate) theme_in_use: Vec<(String, String)>,
+    pub(crate) styleref_targets: Vec<(String, String)>,
+}
+
+/// Where a relationship points.
+enum RelationshipTarget {
+    Part(String),
+    External(String),
+}
+
+/// What each part of a package is ([`crate::appearance::part_digest`]),
+/// its own relationships read as what they point at, computed once per part.
+struct PartMeanings<'a> {
+    archive: &'a DocxArchive,
+    declared: &'a HashMap<String, Vec<(String, RelationshipTarget)>>,
+    digests: HashMap<String, String>,
+    /// Parts whose digest is being computed: a relationship back to one of
+    /// them closes a cycle, read as `cycle` (the same on both sides
+    /// whatever the parts are named).
+    open: HashSet<String>,
+}
+
+impl PartMeanings<'_> {
+    /// Per relationship id of `part`, what it points at.
+    fn relationships_of(&mut self, part: &str) -> HashMap<String, String> {
+        let Some(entries) = self.declared.get(part) else {
+            return HashMap::new();
+        };
+        entries
+            .iter()
+            .map(|(id, target)| {
+                let meaning = match target {
+                    RelationshipTarget::External(address) => format!("external:{address}"),
+                    RelationshipTarget::Part(path) => self.meaning_of(path),
+                };
+                (id.clone(), meaning)
+            })
+            .collect()
+    }
+
+    fn meaning_of(&mut self, path: &str) -> String {
+        if let Some(digest) = self.digests.get(path) {
+            return digest.clone();
+        }
+        if self.open.contains(path) {
+            return "cycle".to_string();
+        }
+        let Some(bytes) = self.archive.get(path) else {
+            return format!("missing:{path}");
+        };
+        self.open.insert(path.to_string());
+        let relationships = self.relationships_of(path);
+        self.open.remove(path);
+        let meaning = format!(
+            "part:{}",
+            crate::appearance::part_digest(bytes, &relationships)
+        );
+        self.digests.insert(path.to_string(), meaning.clone());
+        meaning
+    }
+}
+
+/// See [`package_facts`]. A package with no numbering part, or one that
+/// does not parse (reported by validation), yields no entries.
+fn numbering_level_digests(archive: &DocxArchive, main_part: &str) -> HashMap<(u32, u32), String> {
+    let mut digests = HashMap::new();
+    let part = format!("{}numbering.xml", crate::docx_package::part_dir(main_part));
+    let Some(root) = archive
+        .get(&part)
+        .and_then(|bytes| crate::word_xml::parse_document_xml(bytes).ok())
+    else {
+        return digests;
+    };
+    let children = |element: &Element, local: &'static str| -> Vec<Element> {
+        element
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                XMLNode::Element(child) if child.name.rsplit(':').next() == Some(local) => {
+                    Some(child.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let attribute = |element: &Element, local: &str| -> Option<String> {
+        element
+            .attributes
+            .iter()
+            .find(|(name, _)| name.local_name == local)
+            .map(|(_, value)| value.clone())
+    };
+    let number = |element: &Element, local: &str| -> Option<u32> {
+        attribute(element, local).and_then(|value| value.parse().ok())
+    };
+    // abstractNumId -> ilvl -> level
+    let mut abstracts: HashMap<u32, HashMap<u32, Element>> = HashMap::new();
+    // abstractNumId -> the numbering style it takes its levels from
+    // (`w:numStyleLink`, §17.9.21); numbering style -> the abstractNum that
+    // defines it (`w:styleLink`, §17.9.27).
+    let mut linked_to: HashMap<u32, String> = HashMap::new();
+    let mut defining: HashMap<String, u32> = HashMap::new();
+    for abstract_num in children(&root, "abstractNum") {
+        let Some(id) = number(&abstract_num, "abstractNumId") else {
+            continue;
+        };
+        let levels = children(&abstract_num, "lvl")
+            .into_iter()
+            .filter_map(|level| Some((number(&level, "ilvl")?, level)))
+            .collect();
+        abstracts.insert(id, levels);
+        if let Some(style) = children(&abstract_num, "numStyleLink")
+            .first()
+            .and_then(|element| attribute(element, "val"))
+        {
+            linked_to.insert(id, style);
+        }
+        if let Some(style) = children(&abstract_num, "styleLink")
+            .first()
+            .and_then(|element| attribute(element, "val"))
+        {
+            defining.insert(style, id);
+        }
+    }
+    // A level the abstractNum does not define comes from the abstractNum
+    // that defines the numbering style it links to, as the model reads it
+    // (`NumberingDefinitions::get_level`).
+    for (id, style) in &linked_to {
+        let Some(target) = defining
+            .get(style)
+            .and_then(|target| abstracts.get(target))
+            .cloned()
+        else {
+            continue;
+        };
+        let levels = abstracts.entry(*id).or_default();
+        for (ilvl, level) in target {
+            levels.entry(ilvl).or_insert(level);
+        }
+    }
+    for num in children(&root, "num") {
+        let Some(num_id) = number(&num, "numId") else {
+            continue;
+        };
+        let Some(abstract_id) = children(&num, "abstractNumId")
+            .first()
+            .and_then(|element| number(element, "val"))
+        else {
+            continue;
+        };
+        let mut levels = abstracts.get(&abstract_id).cloned().unwrap_or_default();
+        let mut starts: HashMap<u32, String> = HashMap::new();
+        for level_override in children(&num, "lvlOverride") {
+            let Some(ilvl) = number(&level_override, "ilvl") else {
+                continue;
+            };
+            if let Some(level) = children(&level_override, "lvl").into_iter().next() {
+                levels.insert(ilvl, level);
+            }
+            if let Some(start) = children(&level_override, "startOverride")
+                .first()
+                .and_then(|element| attribute(element, "val"))
+            {
+                starts.insert(ilvl, start);
+            }
+        }
+        for (ilvl, level) in &levels {
+            digests.insert(
+                (num_id, *ilvl),
+                crate::appearance::level_digest(level, starts.get(ilvl).map(String::as_str)),
+            );
+        }
+    }
+    digests
+}
+
 fn defined_style_ids(package: &DocxPackage) -> HashSet<String> {
     let Some(bytes) = package.get_part("word/styles.xml") else {
         return HashSet::new();
@@ -10785,6 +11274,1332 @@ pub(crate) fn snapshot_and_diagnostics_from_docx_bytes(
     Ok((snapshot, diagnostics))
 }
 
+/// Describe bytes that lie outside the ZIP archive, if any.
+///
+/// A `.docx` must be a ZIP archive and nothing else: it starts with a local
+/// file header and ends with the end-of-central-directory record and the
+/// comment that record declares. ZIP readers tolerate extra bytes on either
+/// side, so every part still reads, but Word repairs such a file (observed,
+/// Word 16.0, down to a single trailing byte). A declared ZIP comment is part
+/// of the archive and is fine.
+///
+/// Bytes in front are found from the archive's own offsets: its central
+/// directory sits further into the file than its end record declares. That
+/// covers a file that is a document followed by a second copy of itself,
+/// which starts with a local file header like any archive.
+///
+/// Only called on bytes that already read as a ZIP archive.
+fn bytes_outside_zip_archive(bytes: &[u8]) -> Option<String> {
+    const LOCAL_FILE_HEADER: &[u8] = b"PK\x03\x04";
+    const END_RECORD: &[u8] = b"PK\x05\x06";
+    const END_RECORD_LEN: usize = 22;
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    match archive.offset() {
+        0 => {}
+        1 => {
+            return Some("1 byte precedes the ZIP archive; Word repairs such a file".to_string());
+        }
+        extra => {
+            return Some(format!(
+                "{extra} bytes precede the ZIP archive; Word repairs such a file"
+            ));
+        }
+    }
+    if !bytes.starts_with(LOCAL_FILE_HEADER) {
+        return Some(
+            "the file does not start with a ZIP local file header; Word repairs such a file"
+                .to_string(),
+        );
+    }
+    // The end record is the last one whose declared comment fits in the file.
+    // Search from the end, as ZIP readers do; the record plus the longest
+    // possible comment bounds how far back it can be.
+    let earliest = bytes
+        .len()
+        .saturating_sub(END_RECORD_LEN + usize::from(u16::MAX));
+    let archive_end = (earliest..=bytes.len().checked_sub(END_RECORD_LEN)?)
+        .rev()
+        .filter(|&at| bytes[at..].starts_with(END_RECORD))
+        .find_map(|at| {
+            let comment_len = usize::from(u16::from_le_bytes([bytes[at + 20], bytes[at + 21]]));
+            let end = at + END_RECORD_LEN + comment_len;
+            (end <= bytes.len()).then_some(end)
+        })?;
+    match bytes.len() - archive_end {
+        0 => None,
+        1 => {
+            Some("1 byte follows the end of the ZIP archive; Word repairs such a file".to_string())
+        }
+        extra => Some(format!(
+            "{extra} bytes follow the end of the ZIP archive; Word repairs such a file"
+        )),
+    }
+}
+
+/// The content types Word accepts for the main document part: document or
+/// template, plain or macro-enabled.
+const MAIN_DOCUMENT_CONTENT_TYPES: [&str; 4] = [
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+    "application/vnd.ms-word.document.macroEnabled.main+xml",
+    "application/vnd.ms-word.template.macroEnabledTemplate.main+xml",
+];
+
+/// Whether the main document part is declared with a content type Word does
+/// not take for a main document.
+///
+/// Word finds the main part by its content type. Observed, Word 16.0: with
+/// the part's Override removed (so it falls to a generic `application/xml`
+/// Default) or pointing at another type, Word cannot open the file, even
+/// with repair. The type may come from an Override or from the extension's
+/// Default: packages that declare the main type as the `xml` Default open
+/// without repair.
+///
+/// An unparsable `[Content_Types].xml`, and a part with no declared type at
+/// all, are reported by the content-type check and not again here.
+fn main_part_content_type_issue(archive: &DocxArchive, main_part: &str) -> Option<String> {
+    let content_types = crate::docx_package::ContentTypes::parse(
+        archive.get(crate::docx_package::CONTENT_TYPES_PATH)?,
+    )
+    .ok()?;
+    let declared = content_types.content_type_for_part(main_part)?;
+    if MAIN_DOCUMENT_CONTENT_TYPES
+        .iter()
+        .any(|accepted| accepted.eq_ignore_ascii_case(declared))
+    {
+        return None;
+    }
+    Some(format!(
+        "main document part {main_part:?} is declared with content type {declared:?}, which is \
+         not a WordprocessingML main document type; Word cannot open such a file"
+    ))
+}
+
+/// The main document part's content type against the file's name.
+///
+/// Word takes the kind of file from its name as well as from the main part's
+/// content type. Observed, Word 16.0, with one small package opened under a
+/// `.docx` name: the document main type opens cleanly; the template, the
+/// macro-enabled document and the macro-enabled template types each make
+/// Word refuse the file ("Word was unable to read this document"). So under
+/// a `.docx` name only the document type is sound. Other names (`.docm`,
+/// `.dotx`, `.dotm`) were not observed and are not judged; nor is a package
+/// read without a name, since the bytes alone do not say which applies.
+pub fn main_part_type_for_file_name_issue(docx_bytes: &[u8], file_name: &str) -> Option<String> {
+    let is_docx_name = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("docx"));
+    if !is_docx_name {
+        return None;
+    }
+    let archive = DocxArchive::read(docx_bytes).ok()?;
+    let main_part = crate::docx_package::resolve_main_document_part(&archive).ok()?;
+    let content_types = crate::docx_package::ContentTypes::parse(
+        archive.get(crate::docx_package::CONTENT_TYPES_PATH)?,
+    )
+    .ok()?;
+    let declared = content_types.content_type_for_part(&main_part)?;
+    let other_main_type = MAIN_DOCUMENT_CONTENT_TYPES[1..]
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case(declared));
+    other_main_type.then(|| {
+        format!(
+            "main document part {main_part:?} is declared with content type {declared:?}, which \
+             Word does not open under a .docx name ({file_name:?}); only \
+             {:?} is opened as a .docx",
+            MAIN_DOCUMENT_CONTENT_TYPES[0]
+        )
+    })
+}
+
+/// The parts the main document relates to that Word locates by content type,
+/// as `(relationship kind, content type)`.
+const RELATED_PART_CONTENT_TYPES: [(&str, &str); 11] = [
+    (
+        "styles",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+    ),
+    (
+        "numbering",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+    ),
+    (
+        "settings",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+    ),
+    (
+        "fontTable",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml",
+    ),
+    (
+        "webSettings",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml",
+    ),
+    (
+        "theme",
+        "application/vnd.openxmlformats-officedocument.theme+xml",
+    ),
+    (
+        "footnotes",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+    ),
+    (
+        "endnotes",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+    ),
+    (
+        "header",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+    ),
+    (
+        "footer",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+    ),
+    (
+        "comments",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+    ),
+];
+
+/// Faults in how the main document's related parts are declared and reached.
+///
+/// Observed, Word 16.0, by changing documents it opens cleanly:
+///
+/// - With the content-type Override of a related styles, numbering,
+///   settings, font table, web settings, theme, footnotes, endnotes, header,
+///   footer or comments part removed, so that the part is left with another
+///   type, Word repairs the document. The type may come from an Override or
+///   from the extension's Default.
+/// - With such a part not well-formed XML, Word repairs the document (a
+///   truncated styles or settings part) or cannot open it (a header that is
+///   empty, whitespace only, or truncated).
+/// - With the footnotes, endnotes or comments relationship removed while the
+///   document still holds footnote, endnote or comment references, Word
+///   repairs the document, whether or not a part of the usual name is still
+///   in the package. The same holds when the settings part names separator
+///   notes (`w:footnotePr`/`w:endnotePr` with note children) and the notes
+///   relationship is gone, even with no note reference in the body.
+/// - With a footnote or endnote reference naming an id the related notes
+///   part does not define, Word repairs the document.
+///
+/// Relationships and content types that do not parse are reported by other
+/// checks and not judged here.
+fn related_part_issues(archive: &DocxArchive, main_part: &str, document: &Element) -> Vec<String> {
+    let rels_path = crate::docx_package::rels_part_path(main_part);
+    let relationships = archive
+        .get(&rels_path)
+        .and_then(|bytes| RelationshipSet::parse(bytes, &rels_path).ok())
+        .map(|set| set.entries)
+        .unwrap_or_default();
+    let internal: Vec<_> = relationships
+        .iter()
+        .filter(|relationship| {
+            crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+        })
+        .collect();
+    let mut messages = Vec::new();
+
+    if let Some(content_types) = archive
+        .get(crate::docx_package::CONTENT_TYPES_PATH)
+        .and_then(|bytes| crate::docx_package::ContentTypes::parse(bytes).ok())
+    {
+        let base = crate::docx_package::part_dir(main_part);
+        for relationship in &internal {
+            let Some((kind, expected)) = RELATED_PART_CONTENT_TYPES.iter().find(|(kind, _)| {
+                crate::docx_validate::relationship_is_kind(&relationship.rel_type, kind)
+            }) else {
+                continue;
+            };
+            let part = if let Some(absolute) = relationship.target.strip_prefix('/') {
+                crate::docx_package::normalize_package_path(absolute)
+            } else {
+                crate::docx_package::normalize_package_path(&format!(
+                    "{base}{}",
+                    relationship.target
+                ))
+            };
+            let Some(bytes) = archive.get(&part) else {
+                continue;
+            };
+            if Element::parse(bytes).is_err() {
+                messages.push(format!(
+                    "{kind} part {part:?} is not well-formed XML; Word cannot open such a file \
+                     or repairs it"
+                ));
+                continue;
+            }
+            let Some(declared) = content_types.content_type_for_part(&part) else {
+                continue;
+            };
+            // Word reads the comments part only when the document refers to
+            // a comment: with no w:commentReference, a comments part under
+            // the wrong content type opens cleanly.
+            if *kind == "comments" && !contains_w_element(document, "commentReference") {
+                continue;
+            }
+            if !declared.eq_ignore_ascii_case(expected) {
+                messages.push(format!(
+                    "{kind} part {part:?} is declared with content type {declared:?}, not \
+                     {expected:?}; Word repairs such a file"
+                ));
+            }
+        }
+    }
+
+    let related_part = |kind: &str| -> Option<String> {
+        let base = crate::docx_package::part_dir(main_part);
+        internal
+            .iter()
+            .find(|relationship| {
+                crate::docx_validate::relationship_is_kind(&relationship.rel_type, kind)
+            })
+            .map(|relationship| {
+                if relationship.target.starts_with('/') {
+                    crate::docx_package::normalize_package_path(&relationship.target)
+                } else {
+                    crate::docx_package::normalize_package_path(&format!(
+                        "{base}{}",
+                        relationship.target
+                    ))
+                }
+            })
+    };
+    let parse_part = |part: &str| {
+        archive
+            .get(part)
+            .and_then(|bytes| Element::parse(bytes).ok())
+    };
+    let settings = related_part("settings").and_then(|part| parse_part(&part));
+
+    // The main part has at most one relationship of each of these kinds.
+    // Word-observed: with two for styles, settings, web settings, the font
+    // table or numbering (to one part or to two) it repairs the file. Two
+    // for footnotes, endnotes, comments or one image open cleanly. Only
+    // relationships of the officeDocument type count: Word ignores one whose
+    // type merely ends in the same name (observed with a second font table
+    // under `http://schemas.openxmlformats.org/wordprocessingml/2006/fontTable`,
+    // alone or beside the standard one: clean).
+    for kind in [
+        "styles",
+        "settings",
+        "webSettings",
+        "fontTable",
+        "numbering",
+    ] {
+        let count = internal
+            .iter()
+            .filter(|relationship| is_office_document_relationship(&relationship.rel_type, kind))
+            .count();
+        if count > 1 {
+            messages.push(format!(
+                "the main document part has {count} {kind} relationships; Word repairs a \
+                 file with more than one"
+            ));
+        }
+    }
+
+    // Every font in the font table has a name. Checked against Word: a
+    // `w:font` without `w:name` makes Word repair the file.
+    if let Some(fonts) = related_part("fontTable").and_then(|part| parse_part(&part)) {
+        let unnamed = fonts
+            .children
+            .iter()
+            .filter(|child| {
+                matches!(child, XMLNode::Element(font)
+                    if is_w_tag(font, "font") && attr_get(font, "w:name").is_none())
+            })
+            .count();
+        if unnamed > 0 {
+            messages.push(format!(
+                "the font table has {unnamed} w:font without w:name; Word repairs such a file"
+            ));
+        }
+    }
+
+    // A custom XML data part the main document relates to is well-formed
+    // XML. Checked against Word: the same item truncated (not well-formed)
+    // makes Word repair the file.
+    for relationship in internal.iter().filter(|relationship| {
+        crate::docx_validate::relationship_is_kind(&relationship.rel_type, "customXml")
+    }) {
+        let base = crate::docx_package::part_dir(main_part);
+        let target = relationship.target.replace('\\', "/");
+        let part = if let Some(absolute) = target.strip_prefix('/') {
+            crate::docx_package::normalize_package_path(absolute)
+        } else {
+            crate::docx_package::normalize_package_path(&format!("{base}{target}"))
+        };
+        // An empty item (zero bytes) opens cleanly; whitespace only, or a
+        // declaration with no element, is repaired (observed).
+        if let Some(bytes) = archive.get(&part)
+            && !bytes.is_empty()
+            && Element::parse(bytes).is_err()
+        {
+            messages.push(format!(
+                "custom XML part {part:?} is not well-formed XML; Word repairs such a file"
+            ));
+        }
+    }
+
+    // A list level's picture bullet exists. Word-observed: a
+    // `w:lvlPicBulletId` naming no `w:numPicBullet` in the numbering part
+    // makes Word repair the file, whether or not a paragraph uses the list.
+    if let Some(numbering) = related_part("numbering").and_then(|part| parse_part(&part)) {
+        let val = |element: &Element, local: &str| {
+            element
+                .attributes
+                .iter()
+                .find(|(name, _)| name.local_name == local)
+                .map(|(_, value)| value.clone())
+        };
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut named: Vec<String> = Vec::new();
+        let mut pending: Vec<&Element> = vec![&numbering];
+        while let Some(element) = pending.pop() {
+            match element.name.rsplit(':').next() {
+                Some("numPicBullet") => {
+                    defined.extend(val(element, "numPicBulletId"));
+                    if num_pic_bullet_is_empty(element) {
+                        messages.push(format!(
+                            "picture bullet {:?} (w:numPicBullet) holds no picture: it has no \
+                             w:pict or w:drawing, or that element is empty; Word repairs such a \
+                             file",
+                            val(element, "numPicBulletId").unwrap_or_default()
+                        ));
+                    }
+                }
+                Some("lvlPicBulletId") => named.extend(val(element, "val")),
+                _ => {}
+            }
+            pending.extend(element.children.iter().filter_map(|child| match child {
+                XMLNode::Element(child) => Some(child),
+                _ => None,
+            }));
+        }
+        named.sort();
+        named.dedup();
+        for id in named.iter().filter(|id| !defined.contains(*id)) {
+            messages.push(format!(
+                "a list level names picture bullet {id:?} (w:lvlPicBulletId), but the numbering \
+                 part defines no such w:numPicBullet; Word repairs such a file"
+            ));
+        }
+    }
+
+    for (reference, kind) in [
+        ("footnoteReference", "footnotes"),
+        ("endnoteReference", "endnotes"),
+        ("commentReference", "comments"),
+    ] {
+        let Some(part) = related_part(kind) else {
+            if contains_w_element(document, reference) {
+                messages.push(format!(
+                    "the document holds a w:{reference} but has no {kind} relationship; Word \
+                     repairs such a file"
+                ));
+            }
+            continue;
+        };
+        // A reference must name a note the related part defines. Comments
+        // are left to the comment-reference check (I-XREF-003).
+        let note = match kind {
+            "footnotes" => "footnote",
+            "endnotes" => "endnote",
+            _ => continue,
+        };
+        let Some(notes) = parse_part(&part) else {
+            continue;
+        };
+        let mut defined = HashSet::new();
+        collect_w_ids(&notes, note, &mut defined);
+        let mut referenced = BTreeSet::new();
+        collect_w_ids(document, reference, &mut referenced);
+        for id in referenced.iter().filter(|id| !defined.contains(*id)) {
+            messages.push(format!(
+                "w:{reference} names {note} {id:?}, which {part} does not define; Word repairs \
+                 such a file"
+            ));
+        }
+    }
+
+    // Settings name the separator notes (w:footnotePr/w:footnote, and the
+    // endnote twin); with them present, Word needs the notes part.
+    if let Some(settings) = &settings {
+        for (container, note, kind) in [
+            ("footnotePr", "footnote", "footnotes"),
+            ("endnotePr", "endnote", "endnotes"),
+        ] {
+            let Some(notes_part) = related_part(kind) else {
+                if names_separator_notes(settings, container, note) {
+                    messages.push(format!(
+                        "the settings name separator {kind} (w:{container}/w:{note}) but the \
+                         document has no {kind} relationship; Word repairs such a file"
+                    ));
+                }
+                continue;
+            };
+            // Each separator note the settings name exists in the notes part.
+            // Checked against Word: with the separator and continuation
+            // separator notes removed from the notes part while the settings
+            // still name them, Word repairs the file; with the settings
+            // naming none, the same notes part opens cleanly.
+            let Some(notes) = parse_part(&notes_part) else {
+                continue;
+            };
+            let mut defined = HashSet::new();
+            collect_w_ids(&notes, note, &mut defined);
+            for id in separator_note_ids(settings, container, note) {
+                // The note the settings name as a separator has a type Word
+                // knows. Checked against Word: the separator footnote's
+                // w:type set to `sep` makes Word repair the file when the
+                // settings name it; when they do not, it opens cleanly.
+                if let Some(note_type) = note_type_of(&notes, note, &id)
+                    && ![
+                        "normal",
+                        "separator",
+                        "continuationSeparator",
+                        "continuationNotice",
+                    ]
+                    .contains(&note_type.as_str())
+                {
+                    messages.push(format!(
+                        "the settings name {note} {id:?} as a separator, and its w:type is \
+                         {note_type:?}, not a note type Word knows; Word repairs such a file"
+                    ));
+                }
+                if !defined.contains(&id) {
+                    messages.push(format!(
+                        "the settings name {note} {id:?} (w:{container}/w:{note}) as a \
+                         separator, but {notes_part} does not define it; Word repairs such \
+                         a file"
+                    ));
+                }
+            }
+        }
+        if let Some(message) = attached_template_issue(archive, &related_part, settings) {
+            messages.push(message);
+        }
+    }
+    messages
+}
+
+/// The `w:type` of the `w:<note>` with `w:id` `id` in a notes part.
+fn note_type_of(notes: &Element, note: &str, id: &str) -> Option<String> {
+    notes.children.iter().find_map(|child| match child {
+        XMLNode::Element(child)
+            if is_w_tag(child, note) && attr_get(child, "w:id").map(String::as_str) == Some(id) =>
+        {
+            attr_get(child, "w:type").cloned()
+        }
+        _ => None,
+    })
+}
+
+/// The `w:id` of each `w:<note>` inside the settings' `w:<container>`.
+fn separator_note_ids(settings: &Element, container: &str, note: &str) -> Vec<String> {
+    settings
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(child) if is_w_tag(child, container) => Some(child),
+            _ => None,
+        })
+        .flat_map(|container| container.children.iter())
+        .filter_map(|grandchild| match grandchild {
+            XMLNode::Element(grandchild) if is_w_tag(grandchild, note) => {
+                attr_get(grandchild, "w:id").cloned()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The settings' `w:attachedTemplate r:id` names a relationship of the
+/// settings part. Checked against Word: with that relationship removed, or
+/// the settings part's relationships part removed, Word repairs the file;
+/// with it present (an external template) the file opens cleanly.
+fn attached_template_issue(
+    archive: &DocxArchive,
+    related_part: &dyn Fn(&str) -> Option<String>,
+    settings: &Element,
+) -> Option<String> {
+    let template = settings.children.iter().find_map(|child| match child {
+        XMLNode::Element(child) if is_w_tag(child, "attachedTemplate") => Some(child),
+        _ => None,
+    })?;
+    let id = template
+        .attributes
+        .iter()
+        .find(|(name, _)| {
+            name.local_name == "id"
+                && (name.namespace.as_deref()
+                    == Some("http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+                    || name.prefix.as_deref() == Some("r"))
+        })
+        .map(|(_, value)| value.clone())
+        .filter(|id| !id.is_empty())?;
+    let settings_part = related_part("settings")?;
+    let rels_path = crate::docx_package::rels_part_path(&settings_part);
+    let defined = archive
+        .get(&rels_path)
+        .and_then(|bytes| RelationshipSet::parse(bytes, &rels_path).ok())
+        .is_some_and(|set| set.entries.iter().any(|relationship| relationship.id == id));
+    (!defined).then(|| {
+        format!(
+            "the settings' w:attachedTemplate names relationship {id:?}, which {rels_path} \
+             does not define; Word repairs such a file"
+        )
+    })
+}
+
+/// Whether an element is `w:document` in the transitional or strict
+/// WordprocessingML namespace.
+///
+/// Only the namespace matters: Word opens a main part whose root is
+/// `w:wordDocument` or any other name in that namespace, reading its body,
+/// without repair (observed); with the namespace misspelt it cannot open
+/// the file.
+fn is_word_document_root(root: &Element) -> bool {
+    matches!(
+        root.namespace.as_deref(),
+        Some(
+            "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                | "http://purl.oclc.org/ooxml/wordprocessingml/main"
+        )
+    )
+}
+
+/// Whether a relationship type is the officeDocument relationship of `kind`,
+/// transitional or strict.
+fn is_office_document_relationship(rel_type: &str, kind: &str) -> bool {
+    [
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/",
+    ]
+    .iter()
+    .any(|base| rel_type.strip_prefix(base) == Some(kind))
+}
+
+/// Whether a `w:numPicBullet` carries no picture.
+///
+/// CT_NumPicBullet holds exactly one `w:pict` or `w:drawing`. Checked against
+/// Word with one numbering part with and without the bullet: a bullet with no
+/// child, with an empty `w:pict`, or with an empty `w:drawing` makes Word
+/// repair the file, whether or not a list level uses it; with no bullet, or
+/// with a VML picture (a shape with or without image data), it opens cleanly.
+/// Only the empty forms are judged: what Word requires inside a non-empty
+/// picture is not established. Word itself writes the bullet as an
+/// `mc:AlternateContent` (a `w:drawing` choice, a `w:pict` fallback), which
+/// opens cleanly, so any child other than an empty `w:pict`/`w:drawing`
+/// means the bullet is not judged empty.
+fn num_pic_bullet_is_empty(bullet: &Element) -> bool {
+    fn child_elements(element: &Element) -> impl Iterator<Item = &Element> {
+        element.children.iter().filter_map(|child| match child {
+            XMLNode::Element(child) => Some(child),
+            _ => None,
+        })
+    }
+    child_elements(bullet).all(|child| {
+        (is_w_tag(child, "pict") || is_w_tag(child, "drawing"))
+            && child_elements(child).next().is_none()
+    })
+}
+
+/// The values of ST_DocPartGallery (ECMA-376 Part 1, §17.18.16), compared
+/// exactly: Word repairs `Placeholder` where `placeholder` is clean.
+const DOC_PART_GALLERIES: &[&str] = &[
+    "placeholder",
+    "any",
+    "default",
+    "docParts",
+    "coverPg",
+    "eq",
+    "ftrs",
+    "hdrs",
+    "pgNum",
+    "tbls",
+    "watermarks",
+    "autoTxt",
+    "txtBox",
+    "pgNumT",
+    "pgNumB",
+    "pgNumMargins",
+    "tblOfContents",
+    "bib",
+    "custQuickParts",
+    "custCoverPg",
+    "custEq",
+    "custFtrs",
+    "custHdrs",
+    "custPgNum",
+    "custTbls",
+    "custWatermarks",
+    "custAutoTxt",
+    "custTxtBox",
+    "custPgNumT",
+    "custPgNumB",
+    "custPgNumMargins",
+    "custTblOfContents",
+    "custBib",
+    "custom1",
+    "custom2",
+    "custom3",
+    "custom4",
+    "custom5",
+];
+
+const GLOSSARY_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.glossary+xml";
+
+/// Building blocks whose gallery is not one Word knows, as `(part, message)`.
+///
+/// Checked against Word with one glossary part whose `w:category/w:gallery`
+/// value changes: `placeholder`, `docParts`, `custQuickParts` open cleanly;
+/// `quickParts`, `bogus` and `Placeholder` make Word repair the file, as
+/// does a `w:gallery` with no `w:val`. With no `w:gallery` at all, or with
+/// the glossary part left without its content type (Word then does not read
+/// it), the file opens cleanly. A glossary part that is absent or not
+/// well-formed is not judged here.
+fn glossary_gallery_issues(archive: &DocxArchive, main_part: &str) -> Vec<(String, String)> {
+    let rels_path = crate::docx_package::rels_part_path(main_part);
+    let Some(relationships) = archive
+        .get(&rels_path)
+        .and_then(|bytes| RelationshipSet::parse(bytes, &rels_path).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(content_types) = archive
+        .get(crate::docx_package::CONTENT_TYPES_PATH)
+        .and_then(|bytes| crate::docx_package::ContentTypes::parse(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let base = crate::docx_package::part_dir(main_part);
+    let mut issues = Vec::new();
+    for relationship in &relationships.entries {
+        if !crate::docx_validate::relationship_is_kind(&relationship.rel_type, "glossaryDocument")
+            || !crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+        {
+            continue;
+        }
+        let part = if let Some(absolute) = relationship.target.strip_prefix('/') {
+            crate::docx_package::normalize_package_path(absolute)
+        } else {
+            crate::docx_package::normalize_package_path(&format!("{base}{}", relationship.target))
+        };
+        if !content_types
+            .content_type_for_part(&part)
+            .is_some_and(|declared| declared.eq_ignore_ascii_case(GLOSSARY_CONTENT_TYPE))
+        {
+            continue;
+        }
+        let Some(root) = archive
+            .get(&part)
+            .and_then(|bytes| Element::parse(bytes).ok())
+        else {
+            continue;
+        };
+        let mut galleries = Vec::new();
+        collect_galleries(&root, false, &mut galleries);
+        for gallery in galleries {
+            let problem = match gallery {
+                None => "has no w:val".to_string(),
+                Some(value) if DOC_PART_GALLERIES.contains(&value.as_str()) => continue,
+                Some(value) => format!("names {value:?}, which is not a gallery Word knows"),
+            };
+            issues.push((
+                part.clone(),
+                format!(
+                    "{part}: a building block's w:category/w:gallery {problem}; Word repairs \
+                     such a file"
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+/// The `w:val` of every `w:gallery` directly inside a `w:category`.
+fn collect_galleries(element: &Element, in_category: bool, out: &mut Vec<Option<String>>) {
+    if in_category && is_w_tag(element, "gallery") {
+        out.push(attr_get(element, "w:val").cloned());
+    }
+    let is_category = is_w_tag(element, "category");
+    for child in &element.children {
+        if let XMLNode::Element(child) = child {
+            collect_galleries(child, is_category, out);
+        }
+    }
+}
+
+const DOCX_PACKAGE_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const MAIN_DOCUMENT_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+
+/// An imported chunk (`w:altChunk`, relationship `aFChunk`) declared as a
+/// WordprocessingML document whose bytes are not a package.
+///
+/// Checked against Word with one host document and an altChunk naming
+/// different parts: a complete .docx package opens cleanly whether it is
+/// declared with the package content type or the main-document type, and so
+/// do an HTML and a plain-text chunk; bare document XML (no package around
+/// it) declared with either of those two types makes Word refuse the file
+/// ("error processing the XML file"), whatever the part's name. A chunk whose
+/// part is missing is reported by the relationship checks.
+fn alt_chunk_issues(archive: &DocxArchive, main_part: &str) -> Vec<(String, String)> {
+    let rels_path = crate::docx_package::rels_part_path(main_part);
+    let Some(relationships) = archive
+        .get(&rels_path)
+        .and_then(|bytes| RelationshipSet::parse(bytes, &rels_path).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(content_types) = archive
+        .get(crate::docx_package::CONTENT_TYPES_PATH)
+        .and_then(|bytes| crate::docx_package::ContentTypes::parse(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let base = crate::docx_package::part_dir(main_part);
+    let mut issues = Vec::new();
+    for relationship in &relationships.entries {
+        if !crate::docx_validate::relationship_is_kind(&relationship.rel_type, "aFChunk")
+            || !crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+        {
+            continue;
+        }
+        let part = if let Some(absolute) = relationship.target.strip_prefix('/') {
+            crate::docx_package::normalize_package_path(absolute)
+        } else {
+            crate::docx_package::normalize_package_path(&format!("{base}{}", relationship.target))
+        };
+        let Some(bytes) = archive.get(&part) else {
+            continue;
+        };
+        let Some(declared) = content_types.content_type_for_part(&part) else {
+            continue;
+        };
+        let declared_wordprocessing = declared.eq_ignore_ascii_case(DOCX_PACKAGE_CONTENT_TYPE)
+            || declared.eq_ignore_ascii_case(MAIN_DOCUMENT_CONTENT_TYPE);
+        if declared_wordprocessing && !bytes.starts_with(b"PK\x03\x04") {
+            issues.push((
+                part.clone(),
+                format!(
+                    "imported chunk {part:?} (w:altChunk, relationship {:?}) is declared as a \
+                     WordprocessingML document ({declared:?}) but is not a package; Word cannot \
+                     open such a file",
+                    relationship.id
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+/// A package thumbnail relationship that targets the main document part.
+///
+/// Checked against Word with the same package and its thumbnail relationship
+/// pointing at a JPEG image (clean) or at the main document part (repaired).
+/// A thumbnail whose target is absent is normalized on import, not judged
+/// here. Other targets are not judged: Word also repaired a PNG image and an
+/// unrelated XML part as the thumbnail, but which image formats it accepts
+/// is not established.
+fn package_thumbnail_issues(archive: &DocxArchive, main_part: &str) -> Vec<String> {
+    let Some(root_rels) = archive
+        .get(crate::docx_package::ROOT_RELS_PATH)
+        .and_then(|bytes| RelationshipSet::parse(bytes, crate::docx_package::ROOT_RELS_PATH).ok())
+    else {
+        return Vec::new();
+    };
+    root_rels
+        .entries
+        .iter()
+        .filter(|relationship| {
+            relationship.rel_type == crate::docx_package::PACKAGE_THUMBNAIL_REL_TYPE
+                && crate::docx_package::relationship_target_mode_is_internal(
+                    relationship.target_mode.as_deref(),
+                )
+                && crate::docx_package::normalize_package_path(&relationship.target) == main_part
+        })
+        .map(|relationship| {
+            format!(
+                "the package thumbnail relationship {:?} targets the main document part \
+                 {main_part:?}; Word repairs such a file",
+                relationship.id
+            )
+        })
+        .collect()
+}
+
+/// Collect the `w:id` of every `w:<local>` element under `element`, outside
+/// text boxes.
+///
+/// Notes cannot be referenced from a text box. Observed, Word 16.0: a
+/// footnote reference inside `w:txbxContent` naming an undefined footnote
+/// opens without repair, where the same reference in a body paragraph is
+/// repaired. So a text box's content is not searched.
+fn collect_w_ids<C: Extend<String>>(element: &Element, local: &str, out: &mut C) {
+    if is_w_tag(element, "txbxContent") {
+        return;
+    }
+    if is_w_tag(element, local)
+        && let Some(id) = attr_get(element, "w:id")
+    {
+        out.extend([id.clone()]);
+    }
+    for child in &element.children {
+        if let XMLNode::Element(child) = child {
+            collect_w_ids(child, local, out);
+        }
+    }
+}
+
+/// Whether the settings root holds a `w:<container>` with a `w:<note>` child.
+fn names_separator_notes(settings: &Element, container: &str, note: &str) -> bool {
+    settings.children.iter().any(|child| {
+        match child {
+        XMLNode::Element(child) if is_w_tag(child, container) => {
+            child.children.iter().any(|grandchild| {
+                matches!(grandchild, XMLNode::Element(grandchild) if is_w_tag(grandchild, note))
+            })
+        }
+        _ => false,
+    }
+    })
+}
+
+/// The story parts the main document relates to, as `(relationship kind,
+/// part, root)`: headers, footers, footnotes, endnotes and comments, each part
+/// once. A related part that is absent or not well-formed is reported by
+/// [`related_part_issues`] or the relationship checks, not returned here.
+fn related_story_parts(
+    archive: &DocxArchive,
+    main_part: &str,
+) -> Vec<(&'static str, String, Element)> {
+    let rels_path = crate::docx_package::rels_part_path(main_part);
+    let Some(relationships) = archive
+        .get(&rels_path)
+        .and_then(|bytes| RelationshipSet::parse(bytes, &rels_path).ok())
+    else {
+        return Vec::new();
+    };
+    let base = crate::docx_package::part_dir(main_part);
+    let mut stories = Vec::new();
+    let mut seen = HashSet::new();
+    for relationship in &relationships.entries {
+        let Some(kind) = ["header", "footer", "footnotes", "endnotes", "comments"]
+            .into_iter()
+            .find(|kind| crate::docx_validate::relationship_is_kind(&relationship.rel_type, kind))
+        else {
+            continue;
+        };
+        if !crate::docx_package::relationship_target_mode_is_internal(
+            relationship.target_mode.as_deref(),
+        ) {
+            continue;
+        }
+        let part = if let Some(absolute) = relationship.target.strip_prefix('/') {
+            crate::docx_package::normalize_package_path(absolute)
+        } else {
+            crate::docx_package::normalize_package_path(&format!("{base}{}", relationship.target))
+        };
+        if !seen.insert(part.clone()) {
+            continue;
+        }
+        let Some(root) = archive
+            .get(&part)
+            .and_then(|bytes| Element::parse(bytes).ok())
+        else {
+            continue;
+        };
+        stories.push((kind, part, root));
+    }
+    stories
+}
+
+/// Findings in the stories the main document relates to:
+///
+/// - I-DRAW-001/002 in headers, footers, footnotes and endnotes;
+/// - I-STORY-002, a run directly in a comment, note, header or footer;
+/// - I-REL-001, a relationship reference the story's own relationships part
+///   does not define. Checked against Word with a hyperlink in each of a
+///   comment, footnote, endnote, header and footer: with its relationship
+///   removed (or the story's relationships part removed) Word repairs the
+///   file, as it does for the body.
+fn related_story_issues(
+    archive: &DocxArchive,
+    main_part: &str,
+) -> Vec<crate::docx_validate::ValidationFinding> {
+    let mut findings = Vec::new();
+    for (kind, part, root) in related_story_parts(archive, main_part) {
+        let story = [(part.clone(), &root)];
+        if kind != "comments" {
+            findings.extend(crate::docx_validate_annotations::check_drawing_required_parts(&story));
+        }
+        findings.extend(crate::docx_validate_annotations::check_run_directly_in_story(&story));
+        // Observed in headers and footers: a plain-text control holding a
+        // field or a bookmark end, and an element in an unknown namespace.
+        if kind == "header" || kind == "footer" {
+            findings
+                .extend(crate::docx_validate_annotations::check_plain_text_control_content(&story));
+            findings
+                .extend(crate::docx_validate_annotations::check_unknown_namespace_elements(&story));
+        }
+        let rels_path = crate::docx_package::rels_part_path(&part);
+        findings.extend(crate::docx_validate::check_story_rel_references(
+            &part,
+            &root,
+            archive.get(&rels_path),
+        ));
+    }
+    findings
+}
+
+fn contains_w_element(element: &Element, local: &str) -> bool {
+    is_w_tag(element, local)
+        || element.children.iter().any(|child| match child {
+            XMLNode::Element(child) => contains_w_element(child, local),
+            _ => false,
+        })
+}
+
+/// Relationship ids used more than once within one relationships part, as
+/// `(relationships part, message)`.
+///
+/// Observed, Word 16.0: Word repairs a document whose relationships part
+/// holds two `Relationship` elements with the same `Id`. A relationships
+/// part that is not well-formed XML is not judged here.
+fn duplicate_relationship_id_issues(archive: &DocxArchive) -> Vec<(String, String)> {
+    let mut issues = Vec::new();
+    let mut rels_parts: Vec<&str> = archive
+        .list()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".rels"))
+        .collect();
+    rels_parts.sort_unstable();
+    for rels_part in rels_parts {
+        let Some(root) = archive
+            .get(rels_part)
+            .and_then(|bytes| Element::parse(bytes).ok())
+        else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        let mut reported = BTreeSet::new();
+        for child in &root.children {
+            let XMLNode::Element(relationship) = child else {
+                continue;
+            };
+            let Some(id) = attr_get(relationship, "Id") else {
+                continue;
+            };
+            if !seen.insert(id.as_str()) {
+                reported.insert(id.as_str());
+            }
+        }
+        for id in reported {
+            issues.push((
+                rels_part.to_string(),
+                format!(
+                    "relationship id {id:?} is used more than once in {rels_part}; Word repairs \
+                     such a file"
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+/// Entries `[Content_Types].xml` gives more than once: a `Default` for one
+/// extension, or an `Override` for one part name, compared ignoring case.
+///
+/// Word-observed: it repairs a package with two `Default` entries for one
+/// extension, whether they are identical, differ only in the extension's
+/// case (`png` and `PNG`), or name different content types; and a package
+/// with two `Override` entries for one part name, identical or naming
+/// different content types, for the main document part as for any other.
+/// One entry opens cleanly. A part that does not parse is reported by other
+/// checks.
+fn content_type_part_name_issues(archive: &DocxArchive, main_part: Option<&str>) -> Vec<String> {
+    // An Override names its part with an absolute part name (OPC §10.1.2.3:
+    // it starts with "/"). Checked against Word: the main document's
+    // Override written as `word/document.xml` makes Word refuse the file;
+    // the styles part's written the same way makes Word repair it.
+    let Some(types) = archive
+        .get(crate::docx_package::CONTENT_TYPES_PATH)
+        .and_then(|bytes| Element::parse(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    types
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(entry) if entry.name == "Override" => entry
+                .attributes
+                .iter()
+                .find(|(name, _)| name.local_name == "PartName")
+                .map(|(_, value)| value.clone()),
+            _ => None,
+        })
+        .filter(|part_name| !part_name.starts_with('/'))
+        .map(|part_name| {
+            let outcome = if main_part.is_some_and(|main| main.eq_ignore_ascii_case(&part_name)) {
+                "Word cannot open such a file"
+            } else {
+                "Word repairs such a file"
+            };
+            format!(
+                "[Content_Types].xml has an Override for {part_name:?}, a part name without \
+                 its leading \"/\"; {outcome}"
+            )
+        })
+        .collect()
+}
+
+/// Faults Word repairs in the core properties part (found through the
+/// package's core-properties relationship).
+///
+/// Checked against Word: a core properties part that is not well-formed
+/// XML, or a `dcterms:created` or `dcterms:modified` typed
+/// `dcterms:W3CDTF` holding a value that is not a W3CDTF date
+/// (`02/01/2024 3:04 PM`), makes Word repair the file; a date alone
+/// (`2024-01-02`) opens cleanly.
+fn core_properties_issues(archive: &DocxArchive) -> Vec<(String, String)> {
+    let Some(root_rels) = archive
+        .get(crate::docx_package::ROOT_RELS_PATH)
+        .and_then(|bytes| RelationshipSet::parse(bytes, crate::docx_package::ROOT_RELS_PATH).ok())
+    else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    for relationship in root_rels.entries.iter().filter(|relationship| {
+        relationship
+            .rel_type
+            .ends_with("/relationships/metadata/core-properties")
+            && crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+    }) {
+        let part = crate::docx_package::normalize_package_path(&relationship.target);
+        let Some(bytes) = archive.get(&part) else {
+            continue;
+        };
+        let root = match Element::parse(bytes) {
+            Ok(root) => root,
+            Err(_) => {
+                issues.push((
+                    part.clone(),
+                    format!(
+                        "core properties part {part:?} is not well-formed XML; Word repairs \
+                         such a file"
+                    ),
+                ));
+                continue;
+            }
+        };
+        for child in &root.children {
+            let XMLNode::Element(date) = child else {
+                continue;
+            };
+            let is_dated = matches!(date.name.as_str(), "created" | "modified")
+                && date.namespace.as_deref() == Some("http://purl.org/dc/terms/");
+            let typed_w3cdtf = date.attributes.iter().any(|(name, value)| {
+                name.local_name == "type" && value.rsplit(':').next() == Some("W3CDTF")
+            });
+            if !(is_dated && typed_w3cdtf) {
+                continue;
+            }
+            let value = date
+                .get_text()
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            if !is_w3cdtf(&value) {
+                issues.push((
+                    part.clone(),
+                    format!(
+                        "core properties dcterms:{} is typed W3CDTF but holds {value:?}, which \
+                         is not a W3CDTF date; Word repairs such a file",
+                        date.name
+                    ),
+                ));
+            }
+        }
+    }
+    issues
+}
+
+/// Whether a value is one of the W3CDTF forms (a profile of ISO 8601) as
+/// Word reads them: `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, or a date with
+/// `Thh:mm`, `Thh:mm:ss` or `Thh:mm:ss.s+` and an optional zone designator
+/// (`Z` or `+hh:mm` / `-hh:mm`).
+fn is_w3cdtf(value: &str) -> bool {
+    fn digits(s: &str, n: usize) -> bool {
+        s.len() == n && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    let (date, time) = match value.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (value, None),
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    let date_ok = match parts.as_slice() {
+        [year] => digits(year, 4),
+        [year, month] => digits(year, 4) && digits(month, 2),
+        [year, month, day] => digits(year, 4) && digits(month, 2) && digits(day, 2),
+        _ => false,
+    };
+    let Some(time) = time else {
+        return date_ok;
+    };
+    if !date_ok || parts.len() != 3 {
+        return false;
+    }
+    // The zone designator may be left out: Word opens
+    // `2008-04-16T01:11:07.625` (no zone) without repair (observed in Word-
+    // clean documents), though W3CDTF requires one.
+    let (clock, zone) = if let Some(clock) = time.strip_suffix('Z') {
+        (clock, Some("Z"))
+    } else if let Some(index) = time.rfind(['+', '-']) {
+        (&time[..index], Some(&time[index..]))
+    } else {
+        (time, None)
+    };
+    let zone_ok = match zone {
+        None | Some("Z") => true,
+        Some(zone) => zone[1..]
+            .split_once(':')
+            .is_some_and(|(hours, minutes)| digits(hours, 2) && digits(minutes, 2)),
+    };
+    let fields: Vec<&str> = clock.split(':').collect();
+    let clock_ok = match fields.as_slice() {
+        [hours, minutes] => digits(hours, 2) && digits(minutes, 2),
+        [hours, minutes, seconds] => {
+            let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+            digits(hours, 2)
+                && digits(minutes, 2)
+                && digits(whole, 2)
+                && !fraction.is_empty()
+                && fraction.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    };
+    zone_ok && clock_ok
+}
+
+fn content_type_default_issues(archive: &DocxArchive) -> Vec<String> {
+    let Some(types) = archive
+        .get(crate::docx_package::CONTENT_TYPES_PATH)
+        .and_then(|bytes| Element::parse(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+    let mut reported: HashSet<(&'static str, String)> = HashSet::new();
+    let mut messages = Vec::new();
+    for child in &types.children {
+        let XMLNode::Element(entry) = child else {
+            continue;
+        };
+        let (kind, key_attribute, what) = match entry.name.as_str() {
+            "Default" => ("Default", "Extension", "extension"),
+            "Override" => ("Override", "PartName", "part"),
+            _ => continue,
+        };
+        let Some(key) = entry
+            .attributes
+            .iter()
+            .find(|(name, _)| name.local_name == key_attribute)
+            .map(|(_, value)| value.to_ascii_lowercase())
+        else {
+            continue;
+        };
+        let entry_key = (kind, key.clone());
+        if !seen.insert(entry_key.clone()) && reported.insert(entry_key) {
+            messages.push(format!(
+                "[Content_Types].xml declares {kind} for {what} {key:?} more than once (names \
+                 compare ignoring case); Word repairs such a file"
+            ));
+        }
+    }
+    messages
+}
+
+const CUSTOM_PROPERTIES_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.custom-properties+xml";
+
+/// Faults Word repairs in the custom document properties part, found through
+/// the package's custom-properties relationship (transitional or strict).
+///
+/// A package without that relationship, or whose root relationships do not
+/// parse (reported with the main document part), has nothing to check here.
+fn custom_properties_issues(archive: &DocxArchive) -> Vec<String> {
+    let Some(root_rels) = archive
+        .get(crate::docx_package::ROOT_RELS_PATH)
+        .and_then(|bytes| RelationshipSet::parse(bytes, crate::docx_package::ROOT_RELS_PATH).ok())
+    else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for relationship in root_rels.entries.iter().filter(|relationship| {
+        relationship
+            .rel_type
+            .ends_with("/relationships/custom-properties")
+            && crate::docx_package::relationship_target_mode_is_internal(
+                relationship.target_mode.as_deref(),
+            )
+    }) {
+        let part = crate::docx_package::normalize_package_path(&relationship.target);
+        let Some(bytes) = archive.get(&part) else {
+            continue;
+        };
+        // The part is declared as custom properties. Word-observed: under
+        // the default `application/xml` (no Override) Word repairs the file.
+        if let Some(declared) = archive
+            .get(crate::docx_package::CONTENT_TYPES_PATH)
+            .and_then(|bytes| crate::docx_package::ContentTypes::parse(bytes).ok())
+            .and_then(|types| types.content_type_for_part(&part).map(str::to_string))
+            && !declared.eq_ignore_ascii_case(CUSTOM_PROPERTIES_CONTENT_TYPE)
+        {
+            messages.push(format!(
+                "custom properties part {part:?} is declared with content type {declared:?}, \
+                 not {CUSTOM_PROPERTIES_CONTENT_TYPE:?}; Word repairs such a file"
+            ));
+        }
+        match crate::docprops::custom_properties_word_faults(bytes) {
+            Ok(faults) => messages.extend(faults),
+            Err(error) => messages.push(format!("cannot read {part}: {error}")),
+        }
+    }
+    messages
+}
+
+/// Whether a ZIP item is discarded space Word itself left in the package.
+///
+/// Word writes such items as `[trash]/NNNN.dat` (four hexadecimal digits:
+/// `[trash]/000a.dat` follows `[trash]/0009.dat`, observed), starting with
+/// four `FF` bytes, and never declares a content type for them. They are not
+/// package parts, and Word opens a document carrying them without repair.
+///
+/// The rule is exactly as narrow as Word's (observed, Word 16.0): the same
+/// bytes under any other name, or a `[trash]/NNNN.dat` item without the
+/// marker, make Word repair the document, so those are still parts that need
+/// a declared content type.
+fn is_word_trash_item(name: &str, bytes: &[u8]) -> bool {
+    const MARKER: [u8; 4] = [0xFF; 4];
+    let numbered = name
+        .strip_prefix("[trash]/")
+        .and_then(|rest| rest.strip_suffix(".dat"))
+        .is_some_and(|digits| digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_hexdigit()));
+    numbered && bytes.starts_with(&MARKER)
+}
+
 /// Validate DOCX bytes as a property of the bytes (no handle / session).
 ///
 /// Shares the package-level checks used by
@@ -10803,6 +12618,13 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
             return Ok(ValidationReport { ok: false, issues });
         }
     };
+    if let Some(message) = bytes_outside_zip_archive(docx_bytes) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: None,
+        });
+    }
     if is_encrypted_docx(&archive) {
         issues.push(ValidationIssue {
             code: ValidationIssueCode::PackageInvariant,
@@ -10822,6 +12644,12 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
                     !name.ends_with('/')
                         && !name.eq_ignore_ascii_case(crate::docx_package::CONTENT_TYPES_PATH)
                 }) {
+                    if archive
+                        .get(part_name)
+                        .is_some_and(|bytes| is_word_trash_item(part_name, bytes))
+                    {
+                        continue;
+                    }
                     if content_types.content_type_for_part(part_name).is_none() {
                         issues.push(ValidationIssue {
                             code: ValidationIssueCode::PackageInvariant,
@@ -10861,6 +12689,80 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
             None
         }
     };
+    if let Some(main_part) = &main_part
+        && let Some(message) = main_part_content_type_issue(&archive, main_part)
+    {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+        });
+    }
+    for (rels_part, message) in duplicate_relationship_id_issues(&archive) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(rels_part),
+        });
+    }
+    for message in content_type_part_name_issues(&archive, main_part.as_deref()) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+        });
+    }
+    for (part, message) in core_properties_issues(&archive) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(part),
+        });
+    }
+    for message in content_type_default_issues(&archive) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(crate::docx_package::CONTENT_TYPES_PATH.to_string()),
+        });
+    }
+    if let Some(main_part) = &main_part {
+        for message in package_thumbnail_issues(&archive, main_part) {
+            issues.push(ValidationIssue {
+                code: ValidationIssueCode::PackageInvariant,
+                message,
+                context: Some(crate::docx_package::ROOT_RELS_PATH.to_string()),
+            });
+        }
+        for (part, message) in crate::docx_validate_parts::part_issues(&archive, main_part) {
+            issues.push(ValidationIssue {
+                code: ValidationIssueCode::PackageInvariant,
+                message,
+                context: Some(part),
+            });
+        }
+        for (part, message) in alt_chunk_issues(&archive, main_part) {
+            issues.push(ValidationIssue {
+                code: ValidationIssueCode::PackageInvariant,
+                message,
+                context: Some(part),
+            });
+        }
+        for (part, message) in glossary_gallery_issues(&archive, main_part) {
+            issues.push(ValidationIssue {
+                code: ValidationIssueCode::PackageInvariant,
+                message,
+                context: Some(part),
+            });
+        }
+    }
+    for message in custom_properties_issues(&archive) {
+        issues.push(ValidationIssue {
+            code: ValidationIssueCode::PackageInvariant,
+            message,
+            context: Some(crate::docprops::CUSTOM_PROPS_PATH.to_string()),
+        });
+    }
     // Curated structural checks that mirror genuine Word rejections. The rich
     // content-model validator is not generally on the production path, so run
     // this targeted subset on the main document story here:
@@ -10873,11 +12775,32 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
         && let Some(doc_xml) = archive.get(main_part)
     {
         match xmltree::Element::parse(doc_xml) {
+            Ok(root) if !is_word_document_root(&root) => {
+                // The main part's root is in the WordprocessingML namespace
+                // (transitional or strict). With the `w` prefix bound to a
+                // misspelt namespace Word cannot open the file; any root name
+                // in the right namespace opens (see is_word_document_root).
+                issues.push(ValidationIssue {
+                    code: ValidationIssueCode::PackageInvariant,
+                    message: format!(
+                        "main document part {main_part} has root element {:?} in namespace \
+                         {:?}, not in the WordprocessingML namespace; Word cannot \
+                         open such a file",
+                        root.name,
+                        root.namespace.as_deref().unwrap_or("")
+                    ),
+                    context: Some(main_part.clone()),
+                });
+            }
             Ok(root) => {
                 use crate::docx_validate_annotations::{
-                    check_colfirst_collast_pairing, check_custom_xml_range_pairing,
-                    check_footnote_endnote_id_range, check_move_from_text_form,
-                    check_omath_placement, check_perm_id_validity,
+                    check_bidi_direction, check_colfirst_collast_pairing,
+                    check_content_control_single_paragraph, check_drawing_required_parts,
+                    check_footnote_endnote_id_range, check_ignorable_prefixes_declared,
+                    check_move_from_text_form, check_omath_placement, check_perm_id_validity,
+                    check_run_directly_in_body, check_section_break_in_table_cell,
+                    check_table_cell_and_row_content, check_text_directly_in_paragraph,
+                    check_tracked_text_form,
                 };
                 let story = [(main_part.clone(), &root)];
                 let mut structural = check_omath_placement(&story);
@@ -10885,21 +12808,87 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
                 // I-TC-004 — w:delText inside w:moveFrom (Word repairs the
                 // file and loses its revisions).
                 structural.extend(check_move_from_text_form(&story));
+                // I-TC-005 — w:delText inside w:ins, w:t inside w:del (Word
+                // repairs); I-DOC-004 — a run directly in the body (Word
+                // cannot open the file).
+                structural.extend(check_tracked_text_form(&story));
+                structural.extend(check_run_directly_in_body(&story));
+                structural.extend(check_text_directly_in_paragraph(&story));
+                // I-DRAW-001/002 — a drawing missing a piece Word requires
+                // (Word repairs, or cannot open). Headers, footers and notes
+                // hold drawings too, so they are checked with the body.
+                structural.extend(check_drawing_required_parts(&story));
+                structural.extend(related_story_issues(&archive, main_part));
+                // I-SDT-001 — a one-value content control around more than
+                // one paragraph; I-MC-001 — mc:Ignorable naming an
+                // undeclared prefix (Word repairs both).
+                structural.extend(check_content_control_single_paragraph(&story));
+                // I-SDT-002 — a list item with an empty display text (Word
+                // cannot open the file).
+                structural.extend(
+                    crate::docx_validate_annotations::check_content_control_list_items(&story),
+                );
+                structural.extend(check_ignorable_prefixes_declared(&story));
+                // I-TBL-001 — a cell that does not end with a paragraph (Word
+                // repairs); I-TBL-002 — a row with no cell (Word cannot open).
+                structural.extend(check_table_cell_and_row_content(&story));
+                // I-RUN-001 — w:bdo/w:dir without a direction; I-DOC-006 — a
+                // section break inside a table cell (Word cannot open either).
+                structural.extend(check_bidi_direction(&story));
+                structural.extend(check_section_break_in_table_cell(&story));
+                // I-RUN-002 — a w:contentPart in a run (Word repairs);
+                // I-OBJ-001 — an object written with w:objectEmbed (Word
+                // cannot open the file).
+                structural.extend(crate::docx_validate_annotations::check_content_part_in_run(
+                    &story,
+                ));
+                structural.extend(crate::docx_validate_annotations::check_object_embed(&story));
+                // I-ATTR-001 — a property whose w:val Word requires;
+                // I-FLD-001 — a simple field with no instruction; I-SDT-003 —
+                // a picture control that is a text control as well.
+                structural.extend(
+                    crate::docx_validate_annotations::check_required_property_values(&story),
+                );
+                structural.extend(
+                    crate::docx_validate_annotations::check_simple_field_instruction(&story),
+                );
+                structural
+                    .extend(crate::docx_validate_annotations::check_picture_control_kind(&story));
+                // I-ATTR-002 — an enumerated property value Word does not
+                // know; I-RUN-003 — a run or misplaced content inside w:t;
+                // I-DRAW-003 — a picture's graphic data naming another kind.
+                structural.extend(
+                    crate::docx_validate_annotations::check_property_value_enumerations(&story),
+                );
+                structural
+                    .extend(crate::docx_validate_annotations::check_text_element_content(&story));
+                structural.extend(
+                    crate::docx_validate_annotations::check_picture_graphic_data_uri(&story),
+                );
+                // I-SDT-004 — what a plain-text control holds; I-STRUCT-001 —
+                // structural faults in drawings, controls, bookmarks, compatibility
+                // blocks and math; I-NS-003 — an element in a namespace Word
+                // does not know and may not skip.
+                structural.extend(
+                    crate::docx_validate_annotations::check_plain_text_control_content(&story),
+                );
+                structural.extend(crate::docx_validate_annotations::check_story_structure(
+                    &story,
+                ));
+                structural.extend(
+                    crate::docx_validate_annotations::check_unknown_namespace_elements(&story),
+                );
+                for message in related_part_issues(&archive, main_part, &root) {
+                    issues.push(ValidationIssue {
+                        code: ValidationIssueCode::PackageInvariant,
+                        message,
+                        context: Some(crate::docx_package::rels_part_path(main_part)),
+                    });
+                }
                 structural.extend(check_colfirst_collast_pairing(&story));
-                // I-ANN-009 — torn customXml*Range pairs (start without end, or
-                // vice versa; §17.13.5.4-.11). The transparent-wrapper model
-                // (task #6) carries these as paired Decoration markers, so an
-                // edit could tear a pair; Word treats a torn range as
-                // non-conformant.
-                //
-                // NOTE: this `story` is the BODY part only, so I-ANN-009 catches
-                // body-local torn pairs; a pair that legitimately spans
-                // body↔header/footer would not be checkable here. Comment range
-                // identity is checked package-wide below by I-ANN-010 because
-                // Word scopes each comment identity to one range in one story.
-                // Bookmark pairing remains outside this body-only production
-                // check until its cross-story semantics are modeled explicitly.
-                structural.extend(check_custom_xml_range_pairing(&story));
+                // A customXml*Range start or end with no partner is not
+                // reported: Word opens such a document without repair, for
+                // all four range families and for either half.
                 // I-ANN-006 — footnote/endnote REFERENCE ids past Word's 32767 ceiling
                 // (MS-OI29500 §2.1.300-302). References live in the body story; the note
                 // definitions in footnotes.xml/endnotes.xml are covered by the rich
@@ -10964,6 +12953,9 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
     // These package-wide carrier invariants cannot be reconstructed from the
     // main story alone: tracked changes can live in auxiliary stories, and a
     // relationship in any `.rels` part can target a missing package part.
+    // A tracked change with no w:id (I-TC-002) and an insertion nested in an
+    // insertion or a deletion in a deletion (I-TC-003) are not among them:
+    // Word opens both without repair.
     // Surface only findings that make the accepted input unsafe. Other rich
     // findings retain their existing product policy because ordinary
     // serialization deliberately normalizes some of them (for example a
@@ -10976,7 +12968,7 @@ pub fn validate_docx_report(docx_bytes: &[u8]) -> Result<ValidationReport, Runti
         .filter(|finding| {
             matches!(
                 finding.rule_id,
-                "I-TC-002" | "I-TC-003" | "I-ANN-010" | "I-REL-003" | "I-REL-005" | "I-XREF-003"
+                "I-ANN-010" | "I-REL-003" | "I-REL-005" | "I-XREF-003"
             )
         })
     {
@@ -12181,6 +14173,7 @@ pub fn map_docx_error(err: DocxError) -> RuntimeError {
         DocxError::ZipWrite(source) => format!("docx write failed: {source}"),
         DocxError::Io(source) => format!("docx io error: {source}"),
         DocxError::MissingFile(name) => format!("docx missing file: {name}"),
+        DocxError::InvalidEncoding(detail) => format!("docx unreadable text: {detail}"),
         DocxError::ZipBomb(detail) => format!("docx rejected: {detail}"),
         DocxError::DuplicatePartName { name, existing } => format!(
             "docx rejected: duplicate ZIP part name {name:?} (case-equivalent to {existing:?}); \
@@ -12273,6 +14266,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: Some("2026-08-16T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
 
         track_body_sdt_content_change(&mut sdt, &revision, &mut 10, BodySdtChange::Deleted);
@@ -12671,6 +14665,7 @@ mod tests {
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         };
 
@@ -12919,6 +14914,7 @@ mod tests {
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T01:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         };
         runtime
@@ -13187,6 +15183,7 @@ mod tests {
                 author: Some("Stemma".to_string()),
                 date: Some("2026-04-09T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         };
 
@@ -13673,6 +15670,7 @@ mod tests {
             identity: 0,
             author: "TestAuthor".to_string(),
             date: Some("2024-01-01T00:00:00Z".to_string()),
+            date_utc: None,
         };
 
         let run = build_text_run(
@@ -13779,6 +15777,7 @@ mod tests {
                     identity: 0,
                     author: "Author1".to_string(),
                     date: Some("2024-06-01T00:00:00Z".to_string()),
+                    date_utc: None,
                 }),
             })],
         }];
@@ -13790,6 +15789,7 @@ mod tests {
             author: Some("Deleter".to_string()),
             date: Some("2024-06-02T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         });
         let p_el = serialize_paragraph_node(
             &para,
@@ -13893,6 +15893,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -14788,6 +16789,7 @@ mod tests {
                     author: None,
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 }),
                 inlines: vec![opaque],
             };
@@ -14850,6 +16852,7 @@ mod tests {
                 author: Some("Reviewer".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             });
             let mut doc = empty_canon();
             doc.blocks = vec![inserted];

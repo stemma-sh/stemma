@@ -337,6 +337,7 @@ fn revision(id: u32, author: &str) -> RevisionInfo {
         author: Some(author.to_string()),
         date: Some("2026-07-04T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -1539,6 +1540,7 @@ fn an_edit_inside_a_pending_insertion_is_not_a_new_revision_of_its_author() {
                 author: Some("Bob".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("apply");

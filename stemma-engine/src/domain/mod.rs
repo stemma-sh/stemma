@@ -72,6 +72,13 @@ pub enum TextRole {
     /// sensitive, so canonical serialization must restore the element rather
     /// than emit a literal U+2011 inside `w:t`.
     NoBreakHyphen,
+    /// The node's text as its source wrote it, where it differs from what
+    /// Word reads: a line feed or carriage return written in `w:t` reads as
+    /// one space (`crate::word_xml::word_text_as_read`), which is the node's
+    /// `text`. A spelling, not content: serialization writes it back while
+    /// the text is still what it reads as, so an untouched run keeps its
+    /// bytes, and comparison ignores it ([`TextNode::content_role`]).
+    WrittenLineEnds(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -608,6 +615,20 @@ pub struct ParagraphNode {
     /// `numbering: Some(..)`. Every verb that authors a level clears it.
     #[serde(default)]
     pub direct_numbering_omits_ilvl: bool,
+    /// The paragraph's own `w:numPr` names no list: it has no `w:numId`
+    /// (both children are schema-optional, CT_NumPr §17.3.1.19).
+    ///
+    /// Checked against Word: such a `w:numPr` neither starts nor removes
+    /// numbering. The list is the one the paragraph's style gives, if any,
+    /// and a written `w:ilvl` selects the level in that inherited list.
+    /// `numbering` holds that resolved result; the serializer writes the
+    /// `w:numPr` back as authored.
+    ///
+    /// Invariant: `Some` only when `has_direct_numbering` and
+    /// `numbering_suppressed` are both false. Every verb that authors a list
+    /// reference clears it.
+    #[serde(default)]
+    pub direct_num_pr_without_list: Option<NumPrWithoutList>,
     /// Original numbering info saved before materialization into inline `_npfx`
     /// nodes. Set by `materialize_numbering_prefix` / `_in_place` when
     /// `numbering` is cleared to prevent the serializer from double-emitting
@@ -1285,6 +1306,7 @@ impl ParagraphNode {
             has_direct_numbering: false,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -1335,7 +1357,7 @@ impl ParagraphNode {
 pub fn materialized_prefix_kind_for_text(text: &TextNode) -> Option<MaterializedPrefixKind> {
     match text.text_role.as_ref() {
         Some(TextRole::MaterializedPrefix(kind)) => Some(*kind),
-        Some(TextRole::NoBreakHyphen) | None => None,
+        Some(TextRole::NoBreakHyphen | TextRole::WrittenLineEnds(_)) | None => None,
     }
 }
 
@@ -2039,8 +2061,9 @@ pub struct PaperSource {
 /// Individual column definition from w:cols/w:col (MS-OI29500 §17.6.3).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
-    /// Column width in twips.
-    pub width: u32,
+    /// Column width in twips. Signed: Word opens a negative width without
+    /// repair and writes it back unchanged.
+    pub width: i32,
     /// Space after this column in twips (defaults to 0 per MS-OI29500 §17.6.3).
     pub space: u32,
 }
@@ -2137,10 +2160,11 @@ pub struct Indentation {
 /// Paragraph spacing values (§17.3.1.33).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ParagraphSpacing {
-    /// Space before paragraph in twips.
-    pub before: Option<u32>,
-    /// Space after paragraph in twips.
-    pub after: Option<u32>,
+    /// Space before paragraph in twips. Signed: the schema says unsigned,
+    /// but Word opens and keeps a negative value as written.
+    pub before: Option<i32>,
+    /// Space after paragraph in twips. Signed, as `before`.
+    pub after: Option<i32>,
     /// Space before in hundredths of a line (100 = one line).
     /// Per §17.3.1.33, takes precedence over `before` when both are present.
     pub before_lines: Option<u32>,
@@ -2186,6 +2210,14 @@ pub struct ParagraphBorders {
     pub between: Option<Border>,
     /// Vertical bar border drawn to the side of the paragraph.
     pub bar: Option<Border>,
+}
+
+/// A direct `w:numPr` that names no list (see
+/// `ParagraphNode::direct_num_pr_without_list`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumPrWithoutList {
+    /// The `w:ilvl` it writes, if any.
+    pub ilvl: Option<u32>,
 }
 
 /// Numbering information for a paragraph using Word auto-numbering.
@@ -2265,6 +2297,7 @@ pub fn paragraph_numbering_state_eq(a: &ParagraphNode, b: &ParagraphNode) -> boo
     a.has_direct_numbering == b.has_direct_numbering
         && a.numbering_suppressed == b.numbering_suppressed
         && a.direct_numbering_omits_ilvl == b.direct_numbering_omits_ilvl
+        && a.direct_num_pr_without_list == b.direct_num_pr_without_list
         && numbering_structurally_eq(&a.numbering, &b.numbering)
 }
 
@@ -3662,8 +3695,10 @@ impl TextEffect {
 pub struct FitText {
     /// Width in twips that the text should be compressed/expanded to fit.
     pub width: u32,
-    /// Grouping ID — runs with the same ID are fitted together.
-    pub id: Option<u32>,
+    /// Grouping ID — runs with the same ID are fitted together. Signed
+    /// (ST_DecimalNumber): Word itself writes negative ids, and opens ids
+    /// beyond 32 bits without repair.
+    pub id: Option<i64>,
 }
 
 /// Width type for table/cell measurements per §17.18.90 `ST_TblWidth`.
@@ -3712,8 +3747,11 @@ impl WidthType {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TableMeasurement {
     /// Width value, normalized: twips when `width_type` is `Dxa`, fiftieths
-    /// of a percent when `Pct` (e.g. 5000 = 100%).
-    pub w: u32,
+    /// of a percent when `Pct` (e.g. 5000 = 100%). Signed: Word opens a
+    /// negative cell width (`w:tcW w:w="-2300"`, `pct` or `dxa`) without
+    /// repair and saves it as written. A width an edit computes (from grid
+    /// columns, held unsigned) widens losslessly into this type.
+    pub w: i64,
     /// Width type per §17.18.90 `ST_TblWidth`.
     pub width_type: WidthType,
     /// Exact source spelling when the width arrived as an ST_Percentage
@@ -4378,6 +4416,13 @@ pub struct ParagraphFormattingChange {
     /// paragraph-property revision.
     #[serde(default)]
     pub carrier: ParagraphFormattingChangeCarrier,
+    /// Explicit UTC revision date (`w16du:dateUtc`, MS-DOCX §2.12.2.1) as the
+    /// document gave it, independent of `date` (Word writes the author's
+    /// local clock in `w:date`). `None` when the element carried none; a save
+    /// writes exactly this value, so it never invents or rewrites one.
+    /// Appended LAST for the bincode-positional reason above.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4454,6 +4499,13 @@ pub struct TablePropertyExceptionChange {
     pub date: Option<String>,
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date (`w16du:dateUtc`, MS-DOCX §2.12.2.1) as the
+    /// document gave it, independent of `date` (Word writes the author's
+    /// local clock in `w:date`). `None` when the element carried none; a save
+    /// writes exactly this value, so it never invents or rewrites one.
+    /// Appended LAST for the bincode-positional reason above.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 /// Tracked row formatting change: the "before" state from w:trPrChange (§17.13.5.37).
@@ -4624,6 +4676,13 @@ pub struct FormattingChange {
     /// on `revision_id`.
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date (`w16du:dateUtc`, MS-DOCX §2.12.2.1) as the
+    /// document gave it, independent of `date` (Word writes the author's
+    /// local clock in `w:date`). `None` when the element carried none; a save
+    /// writes exactly this value, so it never invents or rewrites one.
+    /// Appended LAST for the bincode-positional reason above.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 impl FormattingChange {
@@ -5262,6 +5321,17 @@ pub struct TextNode {
     pub formatting_change: Option<FormattingChange>,
 }
 
+impl TextNode {
+    /// The node's role as content: a written spelling of its text
+    /// ([`TextRole::WrittenLineEnds`]) is not one.
+    pub fn content_role(&self) -> Option<&TextRole> {
+        match &self.text_role {
+            Some(TextRole::WrittenLineEnds(_)) | None => None,
+            Some(role) => Some(role),
+        }
+    }
+}
+
 /// Break type per ISO 29500-1 §17.3.3.1 (ST_BrType).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum BreakType {
@@ -5438,6 +5508,13 @@ pub struct DecorationNode {
     pub wrapper_marks: Vec<Mark>,
     #[serde(default)]
     pub wrapper_style_props: StyleProps,
+    /// Which of the wrapper's run properties the source run wrote itself,
+    /// for a wrapper captured from a source run: what keeps an explicit
+    /// OFF (`<w:b w:val="0"/>` against a bold style, §17.7.3) that the
+    /// resolved marks cannot hold. `None` for a marker without a source run
+    /// (synthesized), whose properties are written as given.
+    #[serde(default)]
+    pub wrapper_rpr_authored: Option<RunRprAuthored>,
     /// This run-level decoration and the immediately following TextNode were
     /// children of the same imported w:r. The serializer may rejoin exactly
     /// that proven pair; `false` means the boundary is unknown and must remain
@@ -6877,6 +6954,13 @@ pub struct RevisionInfo {
     /// bincode-positional reason above.
     #[serde(default)]
     pub identity: u32,
+    /// Explicit UTC revision date (`w16du:dateUtc`, MS-DOCX §2.12.2.1) as the
+    /// document gave it, independent of `date` (Word writes the author's
+    /// local clock in `w:date`). `None` when the element carried none; a save
+    /// writes exactly this value, so it never invents or rewrites one.
+    /// Appended LAST for the bincode-positional reason above.
+    #[serde(default)]
+    pub date_utc: Option<String>,
 }
 
 /// Tracked change for section properties (w:sectPrChange).

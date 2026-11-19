@@ -5086,6 +5086,7 @@ impl StemmaServer {
                 author: Some("stemma".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         };
 
@@ -5267,6 +5268,7 @@ impl StemmaServer {
                 author: Some(options.author.clone()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         };
 
@@ -5416,6 +5418,7 @@ impl StemmaServer {
                             author: Some(args.author.clone()),
                             date: None,
                             apply_op_id: None,
+                            date_utc: None,
                         },
                     };
                     let outcome = if let Some(snapshot) = &preview_snapshot {

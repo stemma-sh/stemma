@@ -29,6 +29,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("Sentinel".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -2675,6 +2676,7 @@ fn a_second_author_formatting_a_run_keeps_the_first_change_previous_state() {
             author: Some(author.to_string()),
             date: Some("2026-03-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
 

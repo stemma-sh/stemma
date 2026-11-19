@@ -170,6 +170,7 @@ fn edit_a_different_paragraph(doc: &Document, target_text: &str) -> Vec<u8> {
             author: Some("Spec".to_string()),
             date: Some("2026-07-06T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let edited = doc.apply(&txn).expect("apply unrelated edit");
@@ -443,6 +444,7 @@ fn reject_restores_untouched_ind_and_all_texts() {
             author: Some("Spec".to_string()),
             date: Some("2026-07-06T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let redlined = doc.apply(&txn).expect("apply tracked edit");

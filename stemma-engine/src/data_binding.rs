@@ -264,7 +264,11 @@ fn read_controls(bytes: &[u8]) -> Result<Vec<(Binding, Reading)>, String> {
                 _ => {}
             },
             Event::Text(text) if in_text => {
+                // As Word reads a `w:t`: a line feed or carriage return is a
+                // space. This reader does not apply XML 1.0 §2.11 itself, so
+                // a written CR LF is first made the one line feed it is.
                 let text = text.unescape().map_err(|e| e.to_string())?;
+                let text = crate::word_xml::word_text_as_read(&text.replace("\r\n", "\n"));
                 for control in open.iter_mut().filter(|c| c.in_content) {
                     if deleted_depth == 0 {
                         control.current.push_str(&text);
@@ -748,4 +752,103 @@ mod tests {
         assert_eq!(controls[0].0.store_item_id, "{ABC}");
         assert_eq!(controls[0].1, Reading::Text("Criminal Appeal".to_string()));
     }
+}
+
+/// What each binding of the package's content controls reads in its store,
+/// as Word fills the controls with on open: per binding (store id and
+/// XPath), the bound node's text, `absent` when the store has no such node,
+/// or why it cannot be read (no store part, an XPath beyond plain steps, a
+/// store that does not parse). The reasons are compared as they are, so two
+/// packages that cannot read a binding the same way agree on it.
+pub(crate) fn bound_values(package: &DocxPackage) -> Result<Vec<BoundValue>, RuntimeError> {
+    let readings = match bound_readings(package) {
+        Ok(readings) => readings,
+        Err(error) => {
+            return Ok(vec![BoundValue {
+                binding: "content controls".to_string(),
+                value: format!("unreadable: {}", error.message),
+                shown: String::new(),
+            }]);
+        }
+    };
+    let mut values = Vec::new();
+    for (binding, shown) in readings {
+        let key = format!("{} {}", binding.store_item_id, binding.xpath);
+        let value = match store_part(package, &binding.store_item_id) {
+            Err(error) => format!("unreadable: {}", error.message),
+            Ok(None) => "no store".to_string(),
+            Ok(Some(part)) => match parse_xpath(&binding) {
+                Err(error) => format!("unreadable: {}", error.message),
+                Ok(steps) => {
+                    let bytes = package
+                        .get_part(&part)
+                        .expect("store_part names a part of this package");
+                    match read_node(bytes, &steps) {
+                        Ok(Some(text)) => format!("value: {text}"),
+                        Ok(None) => "absent".to_string(),
+                        Err(message) => format!("unreadable: {message}"),
+                    }
+                }
+            },
+        };
+        values.push(BoundValue {
+            binding: key,
+            value,
+            shown: format!("{shown:?}"),
+        });
+    }
+    Ok(values)
+}
+
+/// One data binding of a package's content controls: the store node's
+/// value, and what the controls bound to it show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundValue {
+    /// Store id and XPath.
+    pub(crate) binding: String,
+    pub(crate) value: String,
+    pub(crate) shown: String,
+}
+
+/// The text of the element `steps` addresses, `None` when the store has no
+/// such element.
+fn read_node(bytes: &[u8], steps: &[Step]) -> Result<Option<String>, String> {
+    let xml = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let root =
+        xmltree::Element::parse(xml).map_err(|e| format!("the store does not parse: {e}"))?;
+    let matches = |element: &xmltree::Element, step: &Step| {
+        element.name == step.local && element.namespace.as_deref() == step.namespace.as_deref()
+    };
+    let Some((first, rest)) = steps.split_first() else {
+        return Ok(None);
+    };
+    if !matches(&root, first) || first.position != 1 {
+        return Ok(None);
+    }
+    let mut current = &root;
+    for step in rest {
+        let found = current
+            .children
+            .iter()
+            .filter_map(|node| match node {
+                xmltree::XMLNode::Element(e) if matches(e, step) => Some(e),
+                _ => None,
+            })
+            .nth(step.position - 1);
+        match found {
+            Some(element) => current = element,
+            None => return Ok(None),
+        }
+    }
+    let mut text = String::new();
+    for node in &current.children {
+        match node {
+            xmltree::XMLNode::Text(t) | xmltree::XMLNode::CData(t) => text.push_str(t),
+            xmltree::XMLNode::Element(_) => {
+                return Err("the bound node holds elements, not a value".to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(text))
 }

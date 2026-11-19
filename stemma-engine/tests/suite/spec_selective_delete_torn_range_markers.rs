@@ -109,6 +109,7 @@ fn tracked_delete_block(doc: &Document, block: &NodeId, expect: &str) -> Documen
             author: Some("Reviewer".to_string()),
             date: Some("2026-07-10T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&txn).expect("apply tracked delete")

@@ -236,33 +236,29 @@ fn spec_fldsimple_preserved_in_output() {
 
 // ── opaque-roundtrip sample (real-world fixture) ─────────────────────────
 
-/// The smaller synthesized fixtures above continue to prove legal hyperlink
-/// and field ordering. This broader sample also contains an unrelated table-row
-/// replacement followed by later story changes. Native Word Review Reject All
-/// hangs on that carrier order, so comparison must refuse before producing an
-/// artifact rather than weakening the opaque-ordering guarantees.
+/// The smaller synthesized fixtures above prove legal hyperlink and field
+/// ordering. This broader sample also contains a changed table row followed
+/// by later story changes, a carrier order comparison used to refuse: Word
+/// opens such redlines without repair and its Reject All and Accept All
+/// complete and leave the base and the target. Its redline must keep the
+/// same ordering guarantees: no `w:hyperlink` or `w:fldSimple` inside
+/// `w:del`/`w:ins`.
 #[test]
-fn spec_opaque_roundtrip_refuses_the_unqualified_table_carrier_order() {
+fn spec_opaque_roundtrip_redline_keeps_opaques_out_of_run_revisions() {
     let before_path = std::path::PathBuf::from("testdata").join("opaque-roundtrip/before.docx");
     let after_path = std::path::PathBuf::from("testdata").join("opaque-roundtrip/after.docx");
-    let before = fs::read(&before_path).expect("read opaque-roundtrip before");
-    let after = fs::read(&after_path).expect("read opaque-roundtrip after");
-    let runtime = SimpleRuntime::new();
-    let ib = runtime.import_docx(&before).expect("import before");
-    let ia = runtime.import_docx(&after).expect("import after");
-    let error = runtime
-        .diff_and_redline(
-            &ib.doc_handle,
-            &ia.doc_handle,
-            TransactionMeta {
-                author: "spec_opaque_redline".to_string(),
-                reason: Some("opaque redline carrier boundary".to_string()),
-                timestamp_utc: Some("2025-01-15T10:30:00Z".to_string()),
-            },
-        )
-        .expect_err("unsafe table carrier order must refuse");
-
-    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
-    assert!(error.message.contains("table-row replacement"));
-    assert!(error.message.contains("followed by another change"));
+    let bytes = redline_export(
+        &before_path.to_string_lossy(),
+        &after_path.to_string_lossy(),
+    );
+    let root = parse_xml(&extract_document_xml(&bytes));
+    for parent in ["del", "ins"] {
+        for child in ["hyperlink", "fldSimple"] {
+            assert_eq!(
+                find_illegal_nesting(&root, parent, child),
+                None,
+                "w:{child} inside w:{parent} violates CT_RunTrackChange"
+            );
+        }
+    }
 }

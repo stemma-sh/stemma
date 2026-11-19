@@ -143,6 +143,7 @@ fn apply(doc: &Document, step: EditStep) -> Result<Document, String> {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .map_err(|e| format!("{:?}: {}", e.code, e.message))
@@ -258,6 +259,7 @@ fn a_fill_of_a_sealed_control_whose_contents_are_locked_is_refused_as_an_edit() 
                         author: Some("Reviewer".to_string()),
                         date: None,
                         apply_op_id: None,
+                        date_utc: None,
                     },
                 })
                 .err()

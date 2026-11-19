@@ -28,6 +28,17 @@
 //!     the inner run as content. We flatten it into sibling runs, each keeping
 //!     its OWN run properties, with content order preserved.
 //!
+//!  5. a `w:del` or `w:ins` inside a `w:r` — `CT_R` has no such child.
+//!     Checked against Word (accept, reject and plain resave): it reads the
+//!     run's content up to the change as ordinary text and the change's
+//!     content as that change on a run with the outer run's properties, and
+//!     writes `<w:del><w:r>…</w:r></w:del>` on save. The run is split that
+//!     way. Only the confirmed shape is rewritten: the change is the run's
+//!     last child and holds run content only (no run, no nested change, and
+//!     for a deletion no `w:t`). Content after the change in the same run is
+//!     read by Word as part of the change too; that is not rewritten, and the
+//!     import refuses it as before.
+//!
 //! Two more shapes are schema-VALID but carry tracked numbering the model
 //! spells another way; Word's reading of each is verified on the oracle and
 //! the rewrite reproduces it (see `rewrite_tracked_numbering`):
@@ -83,6 +94,9 @@ pub(crate) fn subtree_has_tolerated_shape(element: &Element) -> bool {
         return true;
     }
     if is_run(element) && has_nested_run(element) {
+        return true;
+    }
+    if is_run(element) && tracked_change_in_run(element).is_some() {
         return true;
     }
     element
@@ -199,9 +213,6 @@ fn rewrite_tracked_numbering(paragraph: &mut Element, diagnostics: &mut Vec<Diag
             context: Some("w:numberingChange".to_string()),
         });
     }
-    if has_ppr_change {
-        return;
-    }
     let Some(index) = num_pr
         .children
         .iter()
@@ -209,6 +220,42 @@ fn rewrite_tracked_numbering(paragraph: &mut Element, diagnostics: &mut Vec<Diag
     else {
         return;
     };
+    // A marker in a numPr that names no list (no w:numId, no w:ilvl): Word
+    // lists no revision for it and keeps it, inert, through Accept All,
+    // Reject All and a plain save (observed). The model drops it.
+    let marker_only = !num_pr.children.iter().any(
+        |child| matches!(child, XMLNode::Element(e) if is_w_tag(e, "numId") || is_w_tag(e, "ilvl")),
+    );
+    if marker_only {
+        num_pr.children.remove(index);
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "w:numPr/w:ins in a numPr that names no list is not modeled: Word lists \
+                      no revision for it and keeps it inert on Accept, Reject and save"
+                .to_string(),
+            context: Some("w:numPr/w:ins".to_string()),
+        });
+        return;
+    }
+    if has_ppr_change {
+        // With a w:pPrChange beside it, Word lists the marker as its own
+        // paragraph-number revision; Accept keeps the numbering and the
+        // current properties, Reject restores the previous properties, with
+        // their numbering or without it (observed, the previous properties
+        // naming the same list, and naming none). Dropping the marker gives
+        // the same Accept and Reject results; the model then lists one
+        // revision fewer than Word.
+        num_pr.children.remove(index);
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "w:numPr/w:ins beside a w:pPrChange is not modeled as its own revision: \
+                      Word lists it separately, but Accept and Reject give the same \
+                      paragraphs without it"
+                .to_string(),
+            context: Some("w:numPr/w:ins".to_string()),
+        });
+        return;
+    }
     let XMLNode::Element(ins) = num_pr.children.remove(index) else {
         unreachable!("position found an element");
     };
@@ -253,7 +300,16 @@ fn rewrite_children(children: &[XMLNode], diagnostics: &mut Vec<Diagnostic>) -> 
             }
         };
 
-        if is_run(element) && has_nested_run(element) {
+        if is_run(element)
+            && let Some(change) = tracked_change_in_run(element)
+        {
+            diagnostics.push(tracked_change_in_run_diagnostic(&change.name));
+            result.extend(
+                lift_tracked_change(element, change)
+                    .into_iter()
+                    .map(XMLNode::Element),
+            );
+        } else if is_run(element) && has_nested_run(element) {
             diagnostics.push(nested_run_diagnostic());
             for run in flatten_run(element, diagnostics) {
                 result.push(XMLNode::Element(run));
@@ -347,6 +403,92 @@ fn flatten_run(run: &Element, diagnostics: &mut Vec<Diagnostic>) -> Vec<Element>
     result
 }
 
+/// The `w:del` or `w:ins` a run holds as its last child, when the run has the
+/// shape [`lift_tracked_change`] rewrites: exactly one such child, nothing
+/// after it, and inside it only run content — no `w:r`, no nested change,
+/// and for a deletion no `w:t` (Word repairs that; it is left for validation
+/// to report).
+fn tracked_change_in_run(run: &Element) -> Option<&Element> {
+    let children: Vec<&Element> = run
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(element) => Some(element),
+            _ => None,
+        })
+        .collect();
+    let is_change = |element: &Element| is_w_tag(element, "del") || is_w_tag(element, "ins");
+    let changes: Vec<&&Element> = children.iter().filter(|child| is_change(child)).collect();
+    let [change] = changes.as_slice() else {
+        return None;
+    };
+    if !std::ptr::eq(**change, *children.last()?) {
+        return None;
+    }
+    let is_deletion = is_w_tag(change, "del");
+    let holds_run_content_only = change.children.iter().all(|child| match child {
+        XMLNode::Element(inner) => {
+            !is_run(inner)
+                && !is_change(inner)
+                && !is_w_tag(inner, "moveFrom")
+                && !is_w_tag(inner, "moveTo")
+                && !is_w_tag(inner, "rPr")
+                && !(is_deletion && is_w_tag(inner, "t"))
+        }
+        _ => true,
+    });
+    holds_run_content_only.then_some(**change)
+}
+
+/// Split a run holding a tracked change (see [`tracked_change_in_run`]):
+/// the content before the change stays a run with the run's properties, and
+/// the change's content becomes a run with the same properties inside a copy
+/// of the change element.
+fn lift_tracked_change(run: &Element, change: &Element) -> Vec<Element> {
+    let rpr = run.children.iter().find_map(|child| match child {
+        XMLNode::Element(element) if is_w_tag(element, "rPr") => Some(element.clone()),
+        _ => None,
+    });
+    let before: Vec<XMLNode> = run
+        .children
+        .iter()
+        .filter(|child| match child {
+            XMLNode::Element(element) => {
+                !is_w_tag(element, "rPr") && !std::ptr::eq(element, change)
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    let mut out = Vec::new();
+    if !before.is_empty() {
+        let mut head = run.clone();
+        head.children = rpr.iter().cloned().map(XMLNode::Element).collect();
+        head.children.extend(before);
+        out.push(head);
+    }
+    let mut inner = run.clone();
+    inner.children = rpr.iter().cloned().map(XMLNode::Element).collect();
+    inner.children.extend(change.children.iter().cloned());
+    let mut wrapper = change.clone();
+    wrapper.children = vec![XMLNode::Element(inner)];
+    out.push(wrapper);
+    out
+}
+
+fn tracked_change_in_run_diagnostic(change: &str) -> Diagnostic {
+    Diagnostic {
+        level: DiagnosticLevel::Warning,
+        message: format!(
+            "tolerated schema-invalid <{change}> inside <w:r>: CT_R (ISO/IEC 29500-1 \
+             §17.3.2.25) has no such child, but Word opens such documents without repair \
+             and reads the change's content as that change on a run with the outer run's \
+             properties — rewritten that way"
+        ),
+        context: Some("w:r".to_string()),
+    }
+}
+
 /// Emit the buffered non-run content (if any) as one run carrying `rpr`.
 fn flush_pending(result: &mut Vec<Element>, pending: &mut Vec<XMLNode>, rpr: &Option<Element>) {
     if pending.is_empty() {
@@ -363,6 +505,201 @@ fn make_run(rpr: &Option<Element>, content: Vec<XMLNode>) -> Element {
     }
     run.children.extend(content);
     run
+}
+
+/// Zero-width markers that may follow the run holding paragraphs (see
+/// [`split_paragraphs_in_text`]) or precede it.
+const MARKERS: [&str; 3] = ["bookmarkStart", "bookmarkEnd", "proofErr"];
+
+fn element_children(element: &Element) -> impl Iterator<Item = &Element> {
+    element.children.iter().filter_map(|node| match node {
+        XMLNode::Element(element) => Some(element),
+        _ => None,
+    })
+}
+
+/// The run of `paragraph` whose `w:t` holds paragraphs, with its index among
+/// the paragraph's children, when the paragraph has the shape
+/// [`split_paragraphs_in_text`] reads.
+fn run_holding_paragraphs(paragraph: &Element) -> Option<(usize, &Element)> {
+    let holds = |run: &Element| {
+        element_children(run)
+            .any(|t| is_w_tag(t, "t") && element_children(t).any(|p| is_w_tag(p, "p")))
+    };
+    let (index, run) =
+        paragraph
+            .children
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| match node {
+                XMLNode::Element(run) if is_run(run) && holds(run) => Some((index, run)),
+                _ => None,
+            })?;
+    // The run holds its properties and the one w:t.
+    let run_children: Vec<&Element> = element_children(run).collect();
+    let [.., text] = run_children.as_slice() else {
+        return None;
+    };
+    if run_children.len() > 2 || (run_children.len() == 2 && !is_w_tag(run_children[0], "rPr")) {
+        return None;
+    }
+    // The w:t holds optional text, then paragraphs only, and no text after
+    // the first paragraph.
+    let mut seen_paragraph = false;
+    for node in &text.children {
+        match node {
+            XMLNode::Element(inner) if is_w_tag(inner, "p") => seen_paragraph = true,
+            XMLNode::Element(_) => return None,
+            XMLNode::Text(t) | XMLNode::CData(t) if seen_paragraph && !t.trim().is_empty() => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    // Before the run: properties, runs and markers; after it: markers only.
+    let fits = |element: &Element, after: bool| {
+        MARKERS.iter().any(|marker| is_w_tag(element, marker))
+            || (!after && (is_w_tag(element, "pPr") || is_run(element)))
+    };
+    for (position, node) in paragraph.children.iter().enumerate() {
+        if let XMLNode::Element(element) = node
+            && position != index
+            && !fits(element, position > index)
+        {
+            return None;
+        }
+    }
+    Some((index, run))
+}
+
+/// Whether a paragraph has a run whose `w:t` holds paragraphs, in the shape
+/// [`split_paragraphs_in_text`] reads.
+pub(crate) fn paragraph_has_paragraphs_in_text(paragraph: &Element) -> bool {
+    run_holding_paragraphs(paragraph).is_some()
+}
+
+/// Read a paragraph whose run holds paragraphs inside its `w:t` the way Word
+/// does. `w:t` holds text only, but Word opens such a paragraph without
+/// repair and shows the paragraphs inside (observed, Word 16.0, by plain
+/// resave):
+///
+/// - the first inner paragraph takes the outer paragraph's content before
+///   the run and the w:t's own leading text (a run with the outer run's
+///   properties), then its own runs. Its properties are its own, or, when it
+///   has none, the outer paragraph's; its paragraph-mark run properties are
+///   the outer run's, overlaid by its own (its own win where both state one);
+/// - the other inner paragraphs follow as they are;
+/// - the outer paragraph remains, with its own properties and the markers
+///   that followed the run, and no text.
+///
+/// Read only when the w:t holds nothing after its first paragraph but
+/// paragraphs, the run holds only its properties and that w:t, and the outer
+/// paragraph holds only runs and markers before it and markers after it.
+/// Word cannot open text or a run after the inner paragraphs (reported by
+/// validation); other shapes are not read.
+pub(crate) fn split_paragraphs_in_text(paragraph: &Element) -> Option<Vec<Element>> {
+    let (index, run) = run_holding_paragraphs(paragraph)?;
+    let run_properties = element_children(run).find(|child| is_w_tag(child, "rPr"));
+    let text = element_children(run).find(|child| is_w_tag(child, "t"))?;
+    let outer_properties = element_children(paragraph).find(|child| is_w_tag(child, "pPr"));
+
+    let leading_text: String = text
+        .children
+        .iter()
+        .take_while(|node| !matches!(node, XMLNode::Element(_)))
+        .filter_map(|node| match node {
+            XMLNode::Text(t) | XMLNode::CData(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut inner = element_children(text).filter(|child| is_w_tag(child, "p"));
+    let first = inner.next()?;
+
+    // The first paragraph's properties.
+    let own_properties = element_children(first).find(|child| is_w_tag(child, "pPr"));
+    let mut properties = match (own_properties, outer_properties) {
+        (Some(own), _) => own.clone(),
+        (None, Some(outer)) => {
+            let mut outer = outer.clone();
+            outer
+                .children
+                .retain(|node| !matches!(node, XMLNode::Element(el) if is_w_tag(el, "rPr")));
+            outer
+        }
+        (None, None) => w_el("pPr"),
+    };
+    if let Some(run_properties) = run_properties {
+        let own_mark = element_children(&properties)
+            .find(|child| is_w_tag(child, "rPr"))
+            .cloned();
+        let mut mark = run_properties.clone();
+        if let Some(own_mark) = own_mark {
+            for property in element_children(&own_mark) {
+                mark.children.retain(
+                    |node| !matches!(node, XMLNode::Element(el) if el.name == property.name),
+                );
+                mark.children.push(XMLNode::Element(property.clone()));
+            }
+        }
+        properties
+            .children
+            .retain(|node| !matches!(node, XMLNode::Element(el) if is_w_tag(el, "rPr")));
+        properties.children.push(XMLNode::Element(mark));
+    }
+
+    let mut first_paragraph = first.clone();
+    first_paragraph.children = Vec::new();
+    if !properties.children.is_empty() || !properties.attributes.is_empty() {
+        first_paragraph.children.push(XMLNode::Element(properties));
+    }
+    for node in &paragraph.children[..index] {
+        if !matches!(node, XMLNode::Element(el) if is_w_tag(el, "pPr")) {
+            first_paragraph.children.push(node.clone());
+        }
+    }
+    if !leading_text.is_empty() {
+        let mut lead_text = text.clone();
+        lead_text.children = vec![XMLNode::Text(leading_text)];
+        let mut lead_run = run.clone();
+        lead_run.children = run_properties
+            .iter()
+            .map(|rpr| XMLNode::Element((*rpr).clone()))
+            .collect();
+        lead_run.children.push(XMLNode::Element(lead_text));
+        first_paragraph.children.push(XMLNode::Element(lead_run));
+    }
+    first_paragraph.children.extend(
+        first
+            .children
+            .iter()
+            .filter(|node| !matches!(node, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+            .cloned(),
+    );
+
+    let mut out = vec![first_paragraph];
+    out.extend(inner.cloned());
+    let mut remainder = paragraph.clone();
+    remainder.children = outer_properties
+        .iter()
+        .map(|ppr| XMLNode::Element((*ppr).clone()))
+        .collect();
+    remainder
+        .children
+        .extend(paragraph.children[index + 1..].iter().cloned());
+    out.push(remainder);
+    Some(out)
+}
+
+pub(crate) fn paragraphs_in_text_diagnostic(context: String) -> Diagnostic {
+    Diagnostic {
+        level: DiagnosticLevel::Warning,
+        message: "tolerated schema-invalid <w:p> inside <w:t>: CT_Text holds text only, but \
+                  Word opens such documents without repair and shows the inner paragraphs — \
+                  read as Word reads them: the inner paragraphs, then the outer paragraph \
+                  emptied of the run"
+            .to_string(),
+        context: Some(context),
+    }
 }
 
 /// Split a `w:p` carrying direct-child `w:tbl` elements into the paragraph with

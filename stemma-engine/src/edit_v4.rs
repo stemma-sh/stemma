@@ -5062,6 +5062,7 @@ impl EditTransactionV4 {
                 author: Some(self.revision.author),
                 date,
                 apply_op_id: self.revision.apply_op_id,
+                date_utc: None,
             },
         })
     }
@@ -5382,9 +5383,24 @@ fn translate_op(op_index: usize, op: Op) -> Result<EditStep, AdapterError> {
                         Some(rule) => Some(parse_line_rule(op_index, &rule)?),
                         None => None,
                     };
+                    // The wire takes non-negative twips (ST_TwipsMeasure);
+                    // the model holds them signed, as Word does.
+                    let signed = |field: &str, value: Option<u32>| {
+                        value
+                            .map(|twips| {
+                                i32::try_from(twips).map_err(|_| AdapterError::SchemaConflict {
+                                    message: format!(
+                                        "op {op_index}: spacing.{field} {twips} is out of range \
+                                         (at most {} twips)",
+                                        i32::MAX
+                                    ),
+                                })
+                            })
+                            .transpose()
+                    };
                     Some(ParagraphSpacing {
-                        before: p.before,
-                        after: p.after,
+                        before: signed("before", p.before)?,
+                        after: signed("after", p.after)?,
                         before_lines: None,
                         after_lines: None,
                         before_autospacing: None,
@@ -6771,7 +6787,7 @@ fn parse_measurement(
             value: p.width_type.clone(),
         })?;
     Ok(TableMeasurement {
-        w: p.w,
+        w: i64::from(p.w),
         width_type,
         // Programmatic widths are canonical-form: no source percent literal.
         pct_literal: None,

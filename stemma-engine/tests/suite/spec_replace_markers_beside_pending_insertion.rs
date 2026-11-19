@@ -64,6 +64,7 @@ fn replace_first_paragraph(doc: &Document, expect: &str, new_text: &str) -> Docu
             author: Some("Reviewer".to_string()),
             date: Some("2026-11-05T19:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&txn).expect("apply replace")

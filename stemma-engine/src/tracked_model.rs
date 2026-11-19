@@ -190,6 +190,7 @@ pub fn next_revision(base: &RevisionInfo, counter: &mut u32) -> RevisionInfo {
         author: base.author.clone(),
         date: base.date.clone(),
         apply_op_id: base.apply_op_id.clone(),
+        date_utc: base.date_utc.clone(),
     };
     *counter += 1;
     rev
@@ -929,6 +930,7 @@ pub fn inline_changes_to_tracked_segments(
                         identity: 0,
                         author: revision.author.clone().unwrap_or_default(),
                         date: revision.date.clone(),
+                        date_utc: None,
                     });
                 (
                     TrackingStatus::Normal,
@@ -1540,7 +1542,7 @@ pub fn reconstruct_opaques_with_change_detection(
                                         revision_id: next_revision(revision, rev_counter).revision_id,
                                         identity: 0,
                                         author: fc.author.clone(),
-                                        date: fc.date.clone(),
+                                        date: fc.date.clone(), date_utc: fc.date_utc.clone(),
                                     });
                                 }
                                 None => {
@@ -2074,10 +2076,11 @@ fn tracked_run_elements(
             TrackingStatus::Inserted(rev) | TrackingStatus::Deleted(rev) => {
                 let author = rev.author.as_deref().unwrap_or("");
                 let date = rev.date.as_deref().unwrap_or("");
+                let date_utc = rev.date_utc.as_deref();
                 let mut container = if deleted {
-                    crate::word_xml::w_del(rev.revision_id, author, date)
+                    crate::word_xml::w_del(rev.revision_id, author, date, date_utc)
                 } else {
-                    crate::word_xml::w_ins(rev.revision_id, author, date)
+                    crate::word_xml::w_ins(rev.revision_id, author, date, date_utc)
                 };
                 container.children.extend(built);
                 out.push(xmltree::XMLNode::Element(container));
@@ -4205,6 +4208,8 @@ fn normalize_deleted_final_mark(
             final_paragraph.numbering_suppressed = accepted_final_properties.numbering_suppressed;
             final_paragraph.direct_numbering_omits_ilvl =
                 accepted_final_properties.direct_numbering_omits_ilvl;
+            final_paragraph.direct_num_pr_without_list =
+                accepted_final_properties.direct_num_pr_without_list;
             final_paragraph.materialized_numbering =
                 accepted_final_properties.materialized_numbering.clone();
 
@@ -4795,6 +4800,7 @@ pub fn apply_paragraph_changes_in_cell(
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
             paragraph.direct_numbering_omits_ilvl = false;
+            paragraph.direct_num_pr_without_list = None;
             prefix_was_materialized = true;
         }
     }
@@ -4817,6 +4823,7 @@ pub fn apply_paragraph_changes_in_cell(
             paragraph.has_direct_numbering = new_para.has_direct_numbering;
             paragraph.numbering_suppressed = new_para.numbering_suppressed;
             paragraph.direct_numbering_omits_ilvl = new_para.direct_numbering_omits_ilvl;
+            paragraph.direct_num_pr_without_list = new_para.direct_num_pr_without_list;
             if new_para.has_resolved_numbering() {
                 paragraph.literal_prefix = None;
             }
@@ -7123,25 +7130,256 @@ fn merge_marked_paragraphs_bare(blocks: &mut Vec<BlockNode>, keep_inserted: bool
             }
             continue;
         };
-        // Take segments from paragraph i and prepend to paragraph j.
-        let donor_segments = match &mut blocks[i] {
-            BlockNode::Paragraph(p) => std::mem::take(&mut p.segments),
-            _ => unreachable!(),
-        };
-        match &mut blocks[j] {
-            BlockNode::Paragraph(target) => {
-                if donor_segments.iter().any(segment_has_versioned_content) {
-                    target.text_id = None;
-                }
-                let mut merged = donor_segments;
-                merged.append(&mut target.segments);
-                target.segments = merged;
-            }
-            _ => unreachable!(),
-        }
-        // Remove the donor paragraph.
-        blocks.remove(i);
+        join_cell_paragraph_into(blocks, i, j);
         // Don't increment i — the next element shifted into position i.
+    }
+}
+
+/// Join cell paragraph `donor` into the cell paragraph `target` after it
+/// (only zero-width markers or emptied tables between) as a body paragraph
+/// joins the one after it (`merge_paragraph_into_following`): the donor's
+/// content and its literal label come first, the target supplies the
+/// paragraph properties. Word keeps the label of a cell paragraph whose
+/// inserted mark Reject All removes (Word 16, a lettered item joined into
+/// the paragraph after it in the same cell).
+fn join_cell_paragraph_into(blocks: &mut Vec<BlockNode>, donor: usize, target: usize) {
+    assert!(donor < target, "a join target follows its donor");
+    let (left, right) = blocks.split_at_mut(target);
+    match (&mut left[donor], &mut right[0]) {
+        (BlockNode::Paragraph(donor), BlockNode::Paragraph(target)) => {
+            merge_paragraph_into_following(donor, target);
+        }
+        _ => unreachable!("the join search returns two paragraphs"),
+    }
+    blocks.remove(donor);
+}
+
+/// Whether this resolution accepts a paragraph mark's tracked deletion (only
+/// asked about a mark that is a plain deletion).
+type MarkAccepted<'a> = &'a dyn Fn(&Option<TrackingStatus>) -> bool;
+
+/// Accept All accepts every mark deletion.
+fn accept_all_marks(status: &Option<TrackingStatus>) -> bool {
+    matches!(status, Some(TrackingStatus::Deleted(_)))
+}
+
+/// A cell as the shared cell-boundary join rules read it
+/// (`resolution_rules::CellMarkShape`).
+fn cell_mark_shape(
+    cell: &TableCellNode,
+    mark_accepted: MarkAccepted<'_>,
+) -> crate::resolution_rules::CellMarkShape {
+    let single = match cell.blocks.as_slice() {
+        [BlockNode::Paragraph(paragraph)] => Some(paragraph),
+        _ => None,
+    };
+    crate::resolution_rules::CellMarkShape {
+        single_paragraph: single.is_some(),
+        starts_with_paragraph: matches!(cell.blocks.first(), Some(BlockNode::Paragraph(_))),
+        mark_deletion_accepted: single.is_some_and(|p| {
+            matches!(p.para_mark_status, Some(TrackingStatus::Deleted(_)))
+                && !p.para_split
+                && mark_accepted(&p.para_mark_status)
+        }),
+        plain_cell: matches!(cell.tracking_status, None | Some(TrackingStatus::Normal))
+            && cell.v_merge == crate::domain::VerticalMerge::None
+            && cell.cell_merge.is_none()
+            && cell.row_sdt_wrapper.is_none()
+            && cell.content_sdt_wraps.is_empty(),
+        grid_span: cell.grid_span.max(1),
+        dxa_width: dxa_twips(cell.formatting.width.as_ref()),
+    }
+}
+
+/// A cell's width in twips when it is a usable `dxa` width. A negative width
+/// (which Word keeps as written) gives none.
+fn dxa_twips(width: Option<&crate::domain::TableMeasurement>) -> Option<u32> {
+    width
+        .filter(|width| width.width_type == crate::domain::WidthType::Dxa)
+        .and_then(|width| u32::try_from(width.w).ok())
+}
+
+fn row_is_untracked(row: &crate::domain::TableRowNode) -> bool {
+    matches!(row.tracking_status, None | Some(TrackingStatus::Normal))
+}
+
+/// `table_rows_plain` of the shared rules: no tracked row or cell, no
+/// vertical merge, no pending cell merge, no table-level range marker.
+fn table_rows_plain(table: &TableNode) -> bool {
+    table.range_markers.is_empty()
+        && table.rows.iter().all(|row| {
+            row_is_untracked(row)
+                && row.cells.iter().all(|cell| {
+                    matches!(cell.tracking_status, None | Some(TrackingStatus::Normal))
+                        && cell.v_merge == crate::domain::VerticalMerge::None
+                        && cell.cell_merge.is_none()
+                })
+        })
+}
+
+/// The first paragraph of a cell the rules let receive a join.
+fn first_cell_paragraph(cell: &mut TableCellNode) -> &mut ParagraphNode {
+    match cell.blocks.first_mut() {
+        Some(BlockNode::Paragraph(paragraph)) => paragraph,
+        _ => unreachable!("the shared rules only join into a cell starting with a paragraph"),
+    }
+}
+
+/// The one paragraph a going row leaves: its cells' paragraphs joined in
+/// order, the last one's properties and deleted mark kept.
+fn joined_row_paragraph(row: crate::domain::TableRowNode) -> Box<ParagraphNode> {
+    let mut paragraphs = row.cells.into_iter().map(|cell| {
+        let Some(BlockNode::Paragraph(paragraph)) = cell.blocks.into_iter().next() else {
+            unreachable!("a going row's cells each hold one paragraph");
+        };
+        paragraph
+    });
+    let mut joined = paragraphs.next().expect("a going row has a cell");
+    for mut next in paragraphs {
+        merge_paragraph_into_following(&mut joined, &mut next);
+        joined = next;
+    }
+    joined
+}
+
+/// Accept the deleted final paragraph marks that join a cell into the next
+/// cell of its row (`resolution_rules::cell_mark_joins_next_cell`, observed in
+/// Word): the cell's paragraph joins the next cell's first paragraph as a
+/// body paragraph joins the one after it (`merge_paragraph_into_following`,
+/// the next paragraph's properties win), the cell goes, and its grid columns
+/// move to `w:gridAfter`, its width to `w:wAfter`
+/// (`resolution_rules::trailing_width_after_join`). Joins chain left to
+/// right; the row's last cell never joins. Runs before the cell-level merge,
+/// which then finds no mark to resolve in a joined cell.
+fn join_cells_across_accepted_marks(
+    row: &mut crate::domain::TableRowNode,
+    mark_accepted: MarkAccepted<'_>,
+) {
+    let row_untracked = row_is_untracked(row);
+    let mut trailing_width = if row.grid_after == 0 {
+        Some(0)
+    } else {
+        dxa_twips(row.w_after.as_ref())
+    };
+    let mut joined = false;
+    let mut k = 0;
+    while k + 1 < row.cells.len() {
+        let donor = cell_mark_shape(&row.cells[k], mark_accepted);
+        let next = cell_mark_shape(&row.cells[k + 1], mark_accepted);
+        if !crate::resolution_rules::cell_mark_joins_next_cell(donor, next, row_untracked) {
+            k += 1;
+            continue;
+        }
+        let removed = row.cells.remove(k);
+        let Some(BlockNode::Paragraph(mut donor_paragraph)) = removed.blocks.into_iter().next()
+        else {
+            unreachable!("cell_mark_joins_next_cell requires a single-paragraph donor");
+        };
+        merge_paragraph_into_following(
+            &mut donor_paragraph,
+            first_cell_paragraph(&mut row.cells[k]),
+        );
+        row.grid_after += donor.grid_span;
+        trailing_width =
+            crate::resolution_rules::trailing_width_after_join(trailing_width, donor.dxa_width);
+        joined = true;
+        // Do not advance: the cell now at `k` holds the joined paragraph and
+        // its own mark may join it onward.
+    }
+    if joined {
+        row.w_after = trailing_width.map(|w| crate::domain::TableMeasurement {
+            w: i64::from(w),
+            width_type: crate::domain::WidthType::Dxa,
+            pct_literal: None,
+        });
+    }
+}
+
+/// Remove each row, other than the last, whose every cell goes on this
+/// resolution (`resolution_rules::row_goes_into_next_row`, observed in Word):
+/// its text continues into the first paragraph of the next row's first cell.
+/// Top-down, so a run of going rows chains into the first row that stays.
+fn join_rows_across_accepted_marks(table: &mut TableNode, mark_accepted: MarkAccepted<'_>) {
+    let plain = table_rows_plain(table);
+    let mut r = 0;
+    while r + 1 < table.rows.len() {
+        let shapes: Vec<_> = table.rows[r]
+            .cells
+            .iter()
+            .map(|cell| cell_mark_shape(cell, mark_accepted))
+            .collect();
+        let next_first = table.rows[r + 1]
+            .cells
+            .first()
+            .map(|cell| cell_mark_shape(cell, mark_accepted));
+        if !crate::resolution_rules::row_goes_into_next_row(&shapes, next_first, plain) {
+            r += 1;
+            continue;
+        }
+        let mut joined = joined_row_paragraph(table.rows.remove(r));
+        merge_paragraph_into_following(
+            &mut joined,
+            first_cell_paragraph(&mut table.rows[r].cells[0]),
+        );
+        // Do not advance: the row now at `r` may go onward.
+    }
+}
+
+/// Resolve, for each table in a story's block list, the rows accepting
+/// removes (observed in Word): rows that go into the next row
+/// ([`join_rows_across_accepted_marks`]), then a going last row
+/// (`resolution_rules::last_row_goes_into_following_paragraph`). The last
+/// row's text joins the paragraph after the table. A table left with no row
+/// is replaced by that text as a paragraph keeping the last cell's deleted
+/// mark, so the paragraph-mark merge that runs next joins it into the
+/// following paragraph like any body paragraph; a table keeping rows joins
+/// the text into the following paragraph here, the same merge. Either way
+/// the block count stays, so content-control spans stay true. Runs before
+/// the control membership the merge reads is taken.
+fn resolve_tables_closed_by_accepted_marks(
+    blocks: &mut [TrackedBlock],
+    mark_accepted: MarkAccepted<'_>,
+) {
+    let controls = crate::block_controls::membership(blocks);
+    for index in 0..blocks.len() {
+        let followed_by_paragraph = index + 1 < blocks.len()
+            && matches!(blocks[index + 1].block, BlockNode::Paragraph(_))
+            && matches!(blocks[index + 1].status, TrackingStatus::Normal)
+            && same_controls(&controls, &blocks[index], &blocks[index + 1]);
+        let tracked = &mut blocks[index];
+        if !matches!(tracked.status, TrackingStatus::Normal) || tracked.move_id.is_some() {
+            continue;
+        }
+        let BlockNode::Table(table) = &mut tracked.block else {
+            continue;
+        };
+        join_rows_across_accepted_marks(table, mark_accepted);
+        let Some(last) = table.rows.last() else {
+            continue;
+        };
+        let shapes: Vec<_> = last
+            .cells
+            .iter()
+            .map(|cell| cell_mark_shape(cell, mark_accepted))
+            .collect();
+        if !crate::resolution_rules::last_row_goes_into_following_paragraph(
+            &shapes,
+            followed_by_paragraph,
+            table_rows_plain(table),
+        ) {
+            continue;
+        }
+        let row = table.rows.pop().expect("read the last row above");
+        let mut joined = joined_row_paragraph(row);
+        if table.rows.is_empty() {
+            blocks[index].block = BlockNode::Paragraph(joined);
+            continue;
+        }
+        table.structure_hash = crate::import::compute_table_structure_hash(&table.rows);
+        let BlockNode::Paragraph(following) = &mut blocks[index + 1].block else {
+            unreachable!("followed_by_paragraph read a paragraph");
+        };
+        merge_paragraph_into_following(&mut joined, following);
     }
 }
 
@@ -7171,7 +7409,37 @@ fn row_survives_accept_reject(row: &crate::domain::TableRowNode, keep_inserted: 
         marks(&row.tracking_status),
         row.cells.iter().map(|cell| marks(&cell.tracking_status)),
         keep_inserted,
+    ) && !crate::resolution_rules::row_emptied_by_resolution(
+        row.cells
+            .iter()
+            .map(|cell| emptied_cell_shape(cell, keep_inserted)),
     )
+}
+
+/// A cell as `resolution_rules::row_emptied_by_resolution` reads it.
+fn emptied_cell_shape(
+    cell: &TableCellNode,
+    keep_inserted: bool,
+) -> crate::resolution_rules::EmptiedCell {
+    cell.blocks
+        .iter()
+        .map(|block| {
+            let BlockNode::Paragraph(p) = block else {
+                return None;
+            };
+            let mark_goes = p.para_mark_status.as_ref().is_some_and(|status| {
+                !matches!(status, TrackingStatus::Normal)
+                    && !block_survives_retain(status, keep_inserted)
+            });
+            let content_goes = p.literal_prefix.is_none()
+                && p.section_properties.is_none()
+                && p.segments.iter().all(|segment| {
+                    !block_survives_retain(&segment.status, keep_inserted)
+                        || segment.inlines.iter().all(settled_by_full_resolution)
+                });
+            Some((mark_goes, content_goes))
+        })
+        .collect()
 }
 
 /// A table the accept/reject resolution empties COMPLETELY: it had rows and the
@@ -7222,11 +7490,10 @@ fn tracked_block_removed_by_accept_reject(tb: &TrackedBlock, keep_inserted: bool
 /// instead stays as its own paragraph, its mark becoming that paragraph's
 /// terminating mark.
 ///
-/// Crucially this fires ONLY when the paragraph HAD content that the resolution
-/// removed — a paragraph that was ALREADY empty in the base (e.g. a trailing
-/// empty paragraph whose mark merely became inserted to append a NEW paragraph
-/// after it) is base content: rejecting the insertion removes what was appended,
-/// not the base paragraph, so it must survive.
+/// A paragraph that was empty to begin with counts: it is nothing but its
+/// mark, and Word removes it when the mark is resolved away (an inserted mark
+/// rejected, a deleted mark accepted), before a paragraph, before a table and
+/// at the start of the body alike.
 ///
 /// A terminal donor is kept only when it is the container's sole surviving
 /// paragraph. If an earlier paragraph survives, keeping the emptied terminal
@@ -7241,17 +7508,20 @@ fn paragraph_emptied_by_accept_reject(p: &ParagraphNode, keep_inserted: bool) ->
     // move is rejected is empty although its brackets were Normal.
     // Zero-width anchors are positions, not content either: they move to a
     // neighbouring paragraph when this one goes.
-    let has_content = |seg: &TrackedSegment| {
-        seg.inlines
-            .iter()
-            .any(|inline| !settled_by_full_resolution(inline) && !is_zero_width_anchor(inline))
-    };
-    let had_content = p.segments.iter().any(has_content);
-    let keeps_content = p
-        .segments
+    !p.segments
         .iter()
-        .any(|seg| block_survives_retain(&seg.status, keep_inserted) && has_content(seg));
-    had_content && !keeps_content
+        .any(|seg| block_survives_retain(&seg.status, keep_inserted) && segment_has_content(seg))
+}
+
+fn segment_has_content(seg: &TrackedSegment) -> bool {
+    seg.inlines
+        .iter()
+        .any(|inline| !settled_by_full_resolution(inline) && !is_zero_width_anchor(inline))
+}
+
+/// Whether the paragraph holds anything but its mark, tracked or not.
+fn paragraph_has_content(p: &ParagraphNode) -> bool {
+    p.segments.iter().any(segment_has_content)
 }
 
 /// An inline the full resolution removes: a move's range bracket or a
@@ -8057,6 +8327,63 @@ fn same_controls(
     path(a) == path(b)
 }
 
+/// Whether a paragraph whose mark a resolution removes, with a table as the
+/// next surviving block, joins the first paragraph of the table's first cell
+/// (Word 16, Reject All of an inserted mark on a paragraph with untracked
+/// text directly before a table: the text continued at the start of the first
+/// cell, in that paragraph's properties, and the table stayed). Planned for
+/// an untracked table, not a move half, whose first row stays and is
+/// untracked, and whose first cell is plain and starts with a paragraph,
+/// with a paragraph after it in the story (as in the observed document; a
+/// story the join would leave ending in a table is not observed, and the
+/// donor stays there as its own paragraph). Only Reject of an inserted mark
+/// is observed; Accept of a deleted mark before a table keeps the donor as
+/// its own paragraph, as before.
+fn joins_first_cell_of_table(
+    tracked: &TrackedBlock,
+    row_survives: impl Fn(&crate::domain::TableRowNode) -> bool,
+) -> bool {
+    let BlockNode::Table(table) = &tracked.block else {
+        return false;
+    };
+    let Some(row) = table.rows.first() else {
+        return false;
+    };
+    let Some(cell) = row.cells.first() else {
+        return false;
+    };
+    matches!(tracked.status, TrackingStatus::Normal)
+        && tracked.move_id.is_none()
+        && table.range_markers.is_empty()
+        && row_is_untracked(row)
+        && row_survives(row)
+        && matches!(cell.tracking_status, None | Some(TrackingStatus::Normal))
+        && cell.v_merge == crate::domain::VerticalMerge::None
+        && cell.cell_merge.is_none()
+        && cell.row_sdt_wrapper.is_none()
+        && cell.content_sdt_wraps.is_empty()
+        && matches!(cell.blocks.first(), Some(BlockNode::Paragraph(_)))
+}
+
+/// Join paragraph `blocks[donor]` into the first paragraph of the first cell
+/// of the table `blocks[table]` ([`joins_first_cell_of_table`]), as a removed
+/// mark joins the paragraph after it, and remove the donor.
+fn join_into_first_cell_of_table(blocks: &mut Vec<TrackedBlock>, donor: usize, table: usize) {
+    assert!(donor < table, "the table follows the donor");
+    let (left, right) = blocks.split_at_mut(table);
+    let BlockNode::Paragraph(paragraph) = &mut left[donor].block else {
+        unreachable!("the donor is a paragraph");
+    };
+    let BlockNode::Table(table) = &mut right[0].block else {
+        unreachable!("joins_first_cell_of_table read a table");
+    };
+    let Some(BlockNode::Paragraph(target)) = table.rows[0].cells[0].blocks.first_mut() else {
+        unreachable!("joins_first_cell_of_table read a first cell paragraph");
+    };
+    merge_paragraph_into_following(paragraph, target);
+    blocks.remove(donor);
+}
+
 fn merge_marked_paragraphs_tracked(
     blocks: &mut Vec<TrackedBlock>,
     keep_inserted: bool,
@@ -8083,6 +8410,7 @@ fn merge_marked_paragraphs_tracked(
         // wrapper, or a table emptied of every row) and zero-width markers, but
         // stopping at any other surviving block (real content blocks the join).
         let mut next_para_idx = None;
+        let mut blocking = None;
         for (offset, b) in blocks[(i + 1)..].iter().enumerate() {
             if tracked_block_removed_by_accept_reject(b, keep_inserted) {
                 continue;
@@ -8101,6 +8429,7 @@ fn merge_marked_paragraphs_tracked(
             }
             // Hit surviving flow content (a table with surviving rows, an sdt,
             // …) — the join is blocked.
+            blocking = Some(i + 1 + offset);
             break;
         }
         let Some(j) = next_para_idx else {
@@ -8113,7 +8442,22 @@ fn merge_marked_paragraphs_tracked(
                 block_survives_retain(&tracked.status, keep_inserted)
                     && matches!(tracked.block, BlockNode::Paragraph(_))
             });
+            // A paragraph appended at the end of a story or of a block
+            // content control has its break written on the paragraph before
+            // it. When that paragraph is empty and the appended one goes, the
+            // empty paragraph is what the story or control ends with again:
+            // it was there before the append.
+            let holds_the_break_of_a_removed_append = matches!(&blocks[i].block,
+                    BlockNode::Paragraph(p) if !paragraph_has_content(p))
+                && blocks.get(i + 1).is_some_and(|next| {
+                    tracked_block_removed_by_accept_reject(next, keep_inserted)
+                })
+                && blocks[(i + 1)..]
+                    .iter()
+                    .find(|b| !tracked_block_removed_by_accept_reject(b, keep_inserted))
+                    .is_none_or(|next| !same_controls(controls, &blocks[i], next));
             let drop_empty = (i + 1 < blocks.len() || another_paragraph_survives)
+                && !holds_the_break_of_a_removed_append
                 && matches!(&blocks[i].block,
                     BlockNode::Paragraph(p) if paragraph_emptied_by_accept_reject(p, keep_inserted));
             if drop_empty {
@@ -8126,6 +8470,16 @@ fn merge_marked_paragraphs_tracked(
                 hold_anchors_beside_dropped_paragraph(blocks, i, anchors, |tb| {
                     block_survives_retain(&tb.status, keep_inserted)
                 });
+            } else if let Some(k) = blocking
+                && !keep_inserted
+                && blocks[(k + 1)..]
+                    .iter()
+                    .any(|b| matches!(b.block, BlockNode::Paragraph(_)))
+                && joins_first_cell_of_table(&blocks[k], |row| {
+                    row_survives_accept_reject(row, keep_inserted)
+                })
+            {
+                join_into_first_cell_of_table(blocks, i, k);
             } else {
                 i += 1;
             }
@@ -8835,6 +9189,18 @@ fn project_block_inner(
                 )
             };
 
+            // Accepting a cell's deleted final mark joins the cell into the
+            // next one, and a row whose every cell goes into the next row
+            // (Word). Read before the row loop clears the row's tracking. A
+            // tracked column op addresses cells by index, so its rows are
+            // left to that resolution.
+            if keep_inserted && column_slots.is_none() {
+                join_rows_across_accepted_marks(t, &accept_all_marks);
+                for row in &mut t.rows {
+                    join_cells_across_accepted_marks(row, &accept_all_marks);
+                }
+            }
+
             let mut resolved_merges: Vec<(usize, usize)> = Vec::new();
             for (row_index, row) in t.rows.iter_mut().enumerate() {
                 row.tracking_status = None;
@@ -8853,7 +9219,7 @@ fn project_block_inner(
                         if width != t.formatting.grid_cols[index] {
                             row.cells[index].formatting.width =
                                 Some(crate::domain::TableMeasurement {
-                                    w: width,
+                                    w: i64::from(width),
                                     width_type: crate::domain::WidthType::Dxa,
                                     pct_literal: None,
                                 });
@@ -9070,6 +9436,9 @@ fn project_blocks_for_accept_reject(
     defs: ResolutionDefinitions<'_>,
     geometry_policy: DerivedGeometryPolicy,
 ) {
+    if keep_inserted {
+        resolve_tables_closed_by_accepted_marks(blocks, &accept_all_marks);
+    }
     // Resolving removes blocks; content controls keep the ones that remain.
     let controls = crate::block_controls::membership(blocks);
     project_blocks_for_accept_reject_keeping_controls(
@@ -9134,11 +9503,18 @@ fn project_blocks_for_accept_reject_keeping_controls(
         dissolved.is_empty(),
         "a full resolution selects every move with its origins, so none dissolves"
     );
+    extend_resolved_field_markers_over_their_fields(blocks, action, None);
+    let replaced_sources = if action == ResolveSelectionAction::Reject {
+        return_differing_move_destinations_to_their_sources(blocks, None)
+    } else {
+        HashSet::new()
+    };
     apply_move_destination_deletion_cascade(
         blocks,
         action,
         &all_move_mixture_ids,
         &move_destination_deletions,
+        &replaced_sources,
     );
 
     // Snapshot the story's inline range-pair markers BEFORE resolution, so a
@@ -9781,6 +10157,7 @@ fn table_range_inline(marker: &crate::domain::RangeMarkerMeta, owner: &NodeId) -
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: crate::domain::StyleProps::default(),
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(crate::word_xml::serialize_raw_fragment(&element)),
         origin: None,
@@ -10473,22 +10850,7 @@ fn merge_marked_paragraphs_bare_selected(
             }
             continue;
         };
-        let donor_segments = match &mut blocks[i] {
-            BlockNode::Paragraph(p) => std::mem::take(&mut p.segments),
-            _ => unreachable!(),
-        };
-        match &mut blocks[j] {
-            BlockNode::Paragraph(target) => {
-                if donor_segments.iter().any(segment_has_versioned_content) {
-                    target.text_id = None;
-                }
-                let mut merged = donor_segments;
-                merged.append(&mut target.segments);
-                target.segments = merged;
-            }
-            _ => unreachable!(),
-        }
-        blocks.remove(i);
+        join_cell_paragraph_into(blocks, i, j);
     }
 }
 
@@ -10603,6 +10965,7 @@ fn merge_marked_paragraphs_tracked_selected(
         // or a table emptied of every row) and zero-width markers, stopping at
         // any other surviving block (real content blocks the join).
         let mut next_para_idx = None;
+        let mut blocking = None;
         for (offset, b) in blocks[(i + 1)..].iter().enumerate() {
             if tracked_block_removed_by_selected(b, action, selected_revision_ids)
                 || vanishing.contains(block_id(&b.block))
@@ -10619,6 +10982,7 @@ fn merge_marked_paragraphs_tracked_selected(
             if is_zero_width_marker_block(&b.block) {
                 continue;
             }
+            blocking = Some(i + 1 + offset);
             break;
         }
         let Some(j) = next_para_idx else {
@@ -10638,6 +11002,16 @@ fn merge_marked_paragraphs_tracked_selected(
                 hold_anchors_beside_dropped_paragraph(blocks, i, anchors, |tb| {
                     tracked_block_survives_selected(&tb.status, action, selected_revision_ids)
                 });
+            } else if let Some(k) = blocking
+                && action == ResolveSelectionAction::Reject
+                && blocks[(k + 1)..]
+                    .iter()
+                    .any(|b| matches!(b.block, BlockNode::Paragraph(_)))
+                && joins_first_cell_of_table(&blocks[k], |row| {
+                    row_survives_selected(row, action, selected_revision_ids)
+                })
+            {
+                join_into_first_cell_of_table(blocks, i, k);
             } else {
                 i += 1;
             }
@@ -10896,6 +11270,10 @@ pub struct RevisionRecord {
     pub author: Option<String>,
     /// ISO-8601 date, when carried.
     pub date: Option<String>,
+    /// The explicit UTC date (`w16du:dateUtc`), when carried. Attribution like
+    /// `author` and `date`: the audit's correspondence key includes it, so a
+    /// save that rewrote it reads as a changed pre-existing revision.
+    pub date_utc: Option<String>,
     /// Which OOXML change element carries this revision.
     pub kind: RevisionKind,
     /// The TOP-LEVEL block hosting the revision (table revisions report the
@@ -10975,6 +11353,7 @@ pub fn enumerate_revisions(doc: &CanonDoc) -> Vec<RevisionRecord> {
             wire_id: change.revision.revision_id,
             author: change.revision.author.clone(),
             date: change.revision.date.clone(),
+            date_utc: change.revision.date_utc.clone(),
             kind: RevisionKind::FormatSection,
             block_id: NodeId::from(BODY_SECTION_SENTINEL_BLOCK_ID),
             location: StoryScope::Body,
@@ -11340,6 +11719,7 @@ fn enumerate_table_revisions(
             wire_id: fc.revision_id,
             author: some_author(&fc.author),
             date: fc.date.clone(),
+            date_utc: fc.date_utc.clone(),
             kind: RevisionKind::FormatTable,
             block_id: block_id.clone(),
             location: location.clone(),
@@ -11367,6 +11747,7 @@ fn enumerate_table_revisions(
                 wire_id: fc.revision_id,
                 author: some_author(&fc.author),
                 date: fc.date.clone(),
+                date_utc: fc.date_utc.clone(),
                 kind: RevisionKind::FormatRow,
                 block_id: block_id.clone(),
                 location: location.clone(),
@@ -11379,6 +11760,7 @@ fn enumerate_table_revisions(
                 wire_id: fc.revision_id,
                 author: some_author(&fc.author),
                 date: fc.date.clone(),
+                date_utc: fc.date_utc.clone(),
                 kind: RevisionKind::FormatRow,
                 block_id: block_id.clone(),
                 location: location.clone(),
@@ -11395,6 +11777,7 @@ fn enumerate_table_revisions(
                     wire_id: fc.revision_id,
                     author: some_author(&fc.author),
                     date: fc.date.clone(),
+                    date_utc: fc.date_utc.clone(),
                     kind: RevisionKind::FormatCell,
                     block_id: block_id.clone(),
                     location: location.clone(),
@@ -11493,6 +11876,7 @@ fn enumerate_cell_merge_revisions(
             wire_id: first.revision.revision_id,
             author: first.revision.author.clone(),
             date: first.revision.date.clone(),
+            date_utc: first.revision.date_utc.clone(),
             kind: RevisionKind::CellMerge,
             block_id: block_id.clone(),
             location: location.clone(),
@@ -11549,6 +11933,7 @@ fn enumerate_paragraph_revisions(
                             wire_id: fc.revision_id,
                             author: some_author(&fc.author),
                             date: fc.date.clone(),
+                            date_utc: fc.date_utc.clone(),
                             kind: RevisionKind::FormatRun,
                             block_id: block_id.clone(),
                             location: location.clone(),
@@ -11565,6 +11950,7 @@ fn enumerate_paragraph_revisions(
                             wire_id: fc.revision_id,
                             author: some_author(&fc.author),
                             date: fc.date.clone(),
+                            date_utc: fc.date_utc.clone(),
                             kind: RevisionKind::FormatRun,
                             block_id: block_id.clone(),
                             location: location.clone(),
@@ -11590,6 +11976,7 @@ fn enumerate_paragraph_revisions(
                             wire_id: fc.revision_id,
                             author: some_author(&fc.author),
                             date: fc.date.clone(),
+                            date_utc: fc.date_utc.clone(),
                             kind: RevisionKind::FormatRun,
                             block_id: block_id.clone(),
                             location: location.clone(),
@@ -11624,6 +12011,7 @@ fn enumerate_paragraph_revisions(
                             wire_id: fc.revision_id,
                             author: some_author(&fc.author),
                             date: fc.date.clone(),
+                            date_utc: fc.date_utc.clone(),
                             kind: RevisionKind::FormatRun,
                             block_id: block_id.clone(),
                             location: location.clone(),
@@ -11649,6 +12037,7 @@ fn enumerate_paragraph_revisions(
             wire_id: fc.revision_id,
             author: some_author(&fc.author),
             date: fc.date.clone(),
+            date_utc: fc.date_utc.clone(),
             kind: if fc.carrier
                 == crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties
             {
@@ -11678,6 +12067,7 @@ fn enumerate_paragraph_revisions(
             wire_id: change.revision.revision_id,
             author: change.revision.author.clone(),
             date: change.revision.date.clone(),
+            date_utc: change.revision.date_utc.clone(),
             kind: RevisionKind::FormatSection,
             block_id: block_id.clone(),
             location: location.clone(),
@@ -11715,6 +12105,7 @@ fn push_status_records(
             wire_id: r.revision_id,
             author: r.author.clone(),
             date: r.date.clone(),
+            date_utc: r.date_utc.clone(),
             kind,
             block_id: block_id.clone(),
             location: location.clone(),
@@ -11755,6 +12146,7 @@ fn opaque_interior_record(
     location: &StoryScope,
     author: Option<String>,
     date: Option<String>,
+    date_utc: Option<String>,
     excerpt: String,
 ) -> RevisionRecord {
     RevisionRecord {
@@ -11762,6 +12154,7 @@ fn opaque_interior_record(
         wire_id: revision_id,
         author,
         date,
+        date_utc,
         kind: RevisionKind::OpaqueInterior,
         block_id: block_id.clone(),
         location: location.clone(),
@@ -11783,6 +12176,7 @@ pub(crate) struct FragmentCarrier {
     pub resolvable: bool,
     pub author: Option<String>,
     pub date: Option<String>,
+    pub date_utc: Option<String>,
 }
 
 /// The interior carrier kinds that are individually resolvable BY ID:
@@ -11839,6 +12233,7 @@ pub(crate) fn visit_fragment_carriers(
             resolvable,
             author: crate::xml_attrs::attr_get(element, "w:author").cloned(),
             date: crate::xml_attrs::attr_get(element, "w:date").cloned(),
+            date_utc: crate::xml_attrs::revision_date_utc(element),
         });
         child_has_ancestor = true;
     }
@@ -11977,6 +12372,7 @@ fn enumerate_opaque_interior_revisions(
             location,
             None,
             None,
+            None,
             "inside embedded content (textbox/object); carries tracked changes \
              that could not be parsed — not individually resolvable"
                 .to_string(),
@@ -12027,6 +12423,7 @@ fn walk_opaque_interior_revisions(
             location,
             c.author,
             c.date,
+            c.date_utc,
             format!(
                 "inside embedded content (textbox/object); w:{} — {resolvability}",
                 c.name
@@ -12082,6 +12479,7 @@ pub(crate) fn enumerate_body_opaque_block_revisions(
                 &StoryScope::Body,
                 c.author,
                 c.date,
+                c.date_utc,
                 format!(
                     "inside a preserved body block (sealed content control or unmodeled \
                      element); w:{} — resolved by accept-all/reject-all, not individually",
@@ -12113,6 +12511,7 @@ fn enumerate_opaque_block_interior(
             0,
             block_id,
             location,
+            None,
             None,
             None,
             "inside quarantined nested tracked-change content; not individually \
@@ -12171,6 +12570,7 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
         author: _,
         date: _,
         carrier: _,
+        date_utc: _,
     } = fc;
     let crate::domain::PreviousParagraphProperties {
         direct,
@@ -12240,6 +12640,9 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
     p.has_direct_spacing = direct_spacing.is_some();
     p.authored_spacing = direct_spacing;
     p.spacing = spacing;
+    // Every restored direct numbering is written with its level (see below).
+    p.direct_numbering_omits_ilvl = false;
+    p.direct_num_pr_without_list = None;
     match direct_numbering {
         crate::domain::DirectParagraphNumbering::Absent => {
             p.has_direct_numbering = false;
@@ -12273,9 +12676,34 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
                 }
                 p.has_direct_numbering = true;
                 p.numbering_suppressed = false;
+            } else if direct.num_id.is_none()
+                && direct.extra_attrs.is_empty()
+                && direct.preserved.is_empty()
+            {
+                // The previous numPr named no list. Word's Reject All does
+                // not write that shape back (Word 16 probe): with no level it
+                // writes no numPr; with a level it writes the complete pair
+                // when the style gives a list, and an explicit removal
+                // (numId 0) when it gives none. Word keeps the level beside
+                // numId 0; the removal written here carries level 0, which
+                // numbers nothing either.
+                match (direct.ilvl, numbering.is_some()) {
+                    (None, _) => {
+                        p.has_direct_numbering = false;
+                        p.numbering_suppressed = false;
+                    }
+                    (Some(_), true) => {
+                        p.has_direct_numbering = true;
+                        p.numbering_suppressed = false;
+                    }
+                    (Some(_), false) => {
+                        p.has_direct_numbering = false;
+                        p.numbering_suppressed = true;
+                    }
+                }
             } else {
-                // ParagraphNode's legacy direct-numbering fields cannot encode
-                // a partial CT_NumPr. Retain that valid authored container in
+                // ParagraphNode's direct-numbering fields cannot encode a
+                // numPr with extra attributes or children. Retain that container in
                 // the explicit preserved-pPr remainder so reject and a later
                 // serialization stay wire-exact without inventing children.
                 p.has_direct_numbering = false;
@@ -12289,8 +12717,6 @@ pub fn reject_paragraph_formatting(p: &mut ParagraphNode) {
             }
         }
     }
-    // Every restored direct numbering is written with its level (see above).
-    p.direct_numbering_omits_ilvl = false;
     p.numbering = numbering;
     // A restored effective numbering value supersedes the transient hoisted
     // representation; keeping both violates ParagraphNode's numbering invariant.
@@ -12881,6 +13307,7 @@ pub(crate) fn reject_text_formatting(t: &mut crate::domain::TextNode) {
         identity: _,
         author: _,
         date: _,
+        date_utc: _,
     } = fc;
     t.marks = previous_marks;
     t.style_props = previous_style_props;
@@ -12900,6 +13327,7 @@ pub(crate) fn reject_hard_break_formatting(hard_break: &mut crate::domain::HardB
         identity: _,
         author: _,
         date: _,
+        date_utc: _,
     } = fc;
     hard_break.wrapper_marks = previous_marks;
     hard_break.wrapper_style_props = previous_style_props;
@@ -12962,6 +13390,7 @@ pub(crate) fn reject_decoration_formatting(deco: &mut crate::domain::DecorationN
         identity: _,
         author: _,
         date: _,
+        date_utc: _,
     } = fc;
     deco.wrapper_marks = previous_marks;
     deco.wrapper_style_props = previous_style_props;
@@ -12982,6 +13411,7 @@ pub(crate) fn reject_opaque_formatting(opaque: &mut crate::domain::OpaqueInlineN
         identity: _,
         author: _,
         date: _,
+        date_utc: _,
     } = fc;
     opaque.wrapper_marks = previous_marks;
     opaque.wrapper_style_props = previous_style_props;
@@ -13012,7 +13442,7 @@ pub(crate) fn reject_table_formatting(t: &mut crate::domain::TableNode) {
 
 /// Property owners of this table's auxiliary grid. Nested tables have their
 /// own grid and are intentionally not included in this owner set.
-fn table_property_identities(table: &TableNode) -> Vec<u32> {
+pub(crate) fn table_property_identities(table: &TableNode) -> Vec<u32> {
     let mut identities = Vec::new();
     if let Some(change) = &table.formatting_change {
         identities.push(change.identity);
@@ -13718,6 +14148,17 @@ fn project_block_for_selected_resolution(
                     .expect("validated selected column geometry"),
                 )
             };
+            // The selected twin of the full path's cell join: accepting a
+            // selected deleted final mark joins the cell into the next one.
+            if accept && column_slots.is_none() {
+                let mark_accepted = |status: &Option<TrackingStatus>| {
+                    para_mark_needs_selected_merge(status, action, selected_revision_ids)
+                };
+                join_rows_across_accepted_marks(t, &mark_accepted);
+                for row in &mut t.rows {
+                    join_cells_across_accepted_marks(row, &mark_accepted);
+                }
+            }
             let mut resolved_merges: Vec<(usize, usize)> = Vec::new();
             for (row_index, row) in t.rows.iter_mut().enumerate() {
                 match selected_optional_tracking_outcome(
@@ -13760,7 +14201,7 @@ fn project_block_for_selected_resolution(
                         if width != t.formatting.grid_cols[index] {
                             row.cells[index].formatting.width =
                                 Some(crate::domain::TableMeasurement {
-                                    w: width,
+                                    w: i64::from(width),
                                     width_type: crate::domain::WidthType::Dxa,
                                     pct_literal: None,
                                 });
@@ -13858,6 +14299,12 @@ fn project_blocks_for_selected_resolution(
     interior_selected: &HashSet<u32>,
     defs: ResolutionDefinitions<'_>,
 ) {
+    if action == ResolveSelectionAction::Accept {
+        let mark_accepted = |status: &Option<TrackingStatus>| {
+            para_mark_needs_selected_merge(status, action, selected_revision_ids)
+        };
+        resolve_tables_closed_by_accepted_marks(blocks, &mark_accepted);
+    }
     // Resolving removes blocks; content controls keep the ones that remain.
     let controls = crate::block_controls::membership(blocks);
     project_blocks_for_selected_resolution_keeping_controls(
@@ -13895,11 +14342,18 @@ fn project_blocks_for_selected_resolution_keeping_controls(
         &inserted_move_origins,
         action,
     ));
+    extend_resolved_field_markers_over_their_fields(blocks, action, Some(selected_revision_ids));
+    let replaced_sources = if action == ResolveSelectionAction::Reject {
+        return_differing_move_destinations_to_their_sources(blocks, Some(selected_revision_ids))
+    } else {
+        HashSet::new()
+    };
     apply_move_destination_deletion_cascade(
         blocks,
         action,
         selected_revision_ids,
         &move_destination_deletions,
+        &replaced_sources,
     );
     // A settled origin turns the source's runs into the move's own deletion,
     // which can make a selected move recognizable only now.
@@ -14249,8 +14703,9 @@ fn move_destination_deletion_plans(blocks: &[TrackedBlock]) -> Vec<MoveDestinati
     }
     // The same mixture inside paragraphs that stay: a deletion nested in the
     // move's moveTo runs. Its source clone is the paragraph holding the
-    // moveFrom runs (one paragraph; a move of text across paragraphs with a
-    // nested deletion is not planned).
+    // moveFrom runs; a move of text across several paragraphs has one clone
+    // per paragraph on each side, paired in document order (planned only when
+    // both sides have as many).
     for moved in moved_runs(blocks) {
         let identity = moved.move_revision.identity;
         let mut sources: Vec<usize> = moved
@@ -14263,9 +14718,16 @@ fn move_destination_deletion_plans(blocks: &[TrackedBlock]) -> Vec<MoveDestinati
             .map(|(block_index, ..)| *block_index)
             .collect();
         sources.dedup();
-        let [source_index] = sources.as_slice() else {
-            continue;
-        };
+        let mut clones: Vec<usize> = moved
+            .segments
+            .iter()
+            .filter(|(_, _, side, status)| {
+                *side == MoveSide::To
+                    && matches!(status, TrackingStatus::Inserted(r) if r.identity == identity)
+            })
+            .map(|(block_index, ..)| *block_index)
+            .collect();
+        clones.dedup();
         let mut destinations: Vec<usize> = Vec::new();
         for (block_index, _, side, status) in &moved.segments {
             if *side == MoveSide::To
@@ -14275,14 +14737,27 @@ fn move_destination_deletion_plans(blocks: &[TrackedBlock]) -> Vec<MoveDestinati
                 destinations.push(*block_index);
             }
         }
+        let paired_source = |destination_index: usize| -> Option<usize> {
+            match sources.as_slice() {
+                [only] => Some(*only),
+                _ if sources.len() == clones.len() => clones
+                    .iter()
+                    .position(|clone| *clone == destination_index)
+                    .map(|k| sources[k]),
+                _ => None,
+            }
+        };
         for destination_index in destinations {
+            let Some(source_index) = paired_source(destination_index) else {
+                continue;
+            };
             let BlockNode::Paragraph(paragraph) = &blocks[destination_index].block else {
                 unreachable!("moved runs sit in paragraphs")
             };
             let deletions =
                 destination_clone_deletions(paragraph, identity, MoveCloneScope::MovedRuns);
             plans.push(MoveDestinationDeletionPlan {
-                source_id: block_id(&blocks[*source_index].block).clone(),
+                source_id: block_id(&blocks[source_index].block).clone(),
                 destination_id: block_id(&blocks[destination_index].block).clone(),
                 move_revision: moved.move_revision.clone(),
                 deletions,
@@ -14298,6 +14773,7 @@ fn apply_move_destination_deletion_cascade(
     action: ResolveSelectionAction,
     selected_revision_ids: &HashSet<u32>,
     plans: &[MoveDestinationDeletionPlan],
+    sources_already_replaced: &HashSet<u32>,
 ) {
     for plan in plans {
         let deletion_identities: HashSet<u32> = plan
@@ -14314,7 +14790,9 @@ fn apply_move_destination_deletion_cascade(
         if !rejecting_move && !rejecting_inner_deletion && !accepting_inner_deletion {
             continue;
         }
-        if rejecting_move || accepting_inner_deletion {
+        if (rejecting_move || accepting_inner_deletion)
+            && !sources_already_replaced.contains(&plan.move_revision.identity)
+        {
             let Some(source) = blocks
                 .iter_mut()
                 .find(|block| block_id(&block.block) == &plan.source_id)
@@ -14324,7 +14802,10 @@ fn apply_move_destination_deletion_cascade(
             let BlockNode::Paragraph(source_paragraph) = &mut source.block else {
                 continue;
             };
-            for (revision, start, text) in &plan.deletions {
+            // Last deletion first: a struck stretch leaves the source clone's
+            // searched text, so striking from the end keeps every earlier
+            // deletion's offset true.
+            for (revision, start, text) in plan.deletions.iter().rev() {
                 if accepting_inner_deletion && !selected_revision_ids.contains(&revision.identity) {
                     continue;
                 }
@@ -14389,6 +14870,396 @@ fn apply_move_destination_deletion_cascade(
     }
 }
 
+/// A field is resolved as a whole.
+///
+/// Word-observed, for a hyperlink field and an AUTHOR field alike: when a
+/// field's begin or end marker is a tracked insertion, rejecting it removes
+/// the whole field, its displayed result included, even where the result
+/// runs carry no tracked change of their own; when a marker is a tracked
+/// deletion, accepting it removes the whole field the same way. (Accepting
+/// the insertion, or rejecting the deletion, keeps the field and its result.)
+/// A field whose result spans paragraphs goes the same way (Word 16, a
+/// bibliography field whose markers were inserted and whose result of
+/// several paragraphs carried no change: Reject All removed it with every
+/// paragraph mark inside it, leaving one paragraph with the properties of
+/// the paragraph holding the end marker), so the untracked marks between
+/// its begin and end markers take the marker's status too and join as a
+/// resolved mark does.
+///
+/// Before the ordinary projection, this gives every inline from such a
+/// field's begin marker to its end marker the status of the marker being
+/// resolved, so the projection removes them together. A field that spans
+/// paragraphs is planned only across untracked paragraph blocks whose
+/// marks are untracked, with nothing but paragraphs between its markers;
+/// `selected` is the set of revisions being resolved (`None`: all of them).
+fn extend_resolved_field_markers_over_their_fields(
+    blocks: &mut [TrackedBlock],
+    action: ResolveSelectionAction,
+    selected: Option<&HashSet<u32>>,
+) {
+    /// A field marker still waiting for its end: where it is, the status
+    /// that removes the field (when its begin marker carries one), and
+    /// whether the field may still be planned across the paragraphs it has
+    /// crossed so far.
+    struct Open {
+        block: usize,
+        position: usize,
+        trigger: Option<TrackingStatus>,
+        crossable: bool,
+    }
+    /// A field to remove: from (block, position) to (block, position).
+    struct Removed {
+        begin: (usize, usize),
+        end: (usize, usize),
+        status: TrackingStatus,
+    }
+    let removes_field = |status: &TrackingStatus| -> bool {
+        let revision = match (status, action) {
+            (TrackingStatus::Inserted(revision), ResolveSelectionAction::Reject)
+            | (TrackingStatus::Deleted(revision), ResolveSelectionAction::Accept) => revision,
+            _ => return false,
+        };
+        selected.is_none_or(|selected| selected.contains(&revision.identity))
+    };
+    let mut open: Vec<Open> = Vec::new();
+    let mut removed: Vec<Removed> = Vec::new();
+    for (block_index, block) in blocks.iter().enumerate() {
+        let BlockNode::Paragraph(paragraph) = &block.block else {
+            for field in &mut open {
+                field.crossable = false;
+            }
+            continue;
+        };
+        let mut position = 0usize;
+        for segment in &paragraph.segments {
+            for inline in &segment.inlines {
+                if let InlineNode::OpaqueInline(opaque) = inline
+                    && let crate::domain::OpaqueKind::Field(field) = &opaque.kind
+                {
+                    let trigger = removes_field(&segment.status).then(|| segment.status.clone());
+                    match field.field_kind {
+                        crate::domain::FieldKind::Begin => open.push(Open {
+                            block: block_index,
+                            position,
+                            trigger,
+                            crossable: true,
+                        }),
+                        crate::domain::FieldKind::End => {
+                            if let Some(begin) = open.pop()
+                                && (begin.block == block_index || begin.crossable)
+                                && let Some(status) = begin.trigger.or(trigger)
+                            {
+                                removed.push(Removed {
+                                    begin: (begin.block, begin.position),
+                                    end: (block_index, position),
+                                    status,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                position += 1;
+            }
+        }
+        // A field still open crosses this paragraph's mark.
+        let crossable_mark = matches!(block.status, TrackingStatus::Normal)
+            && block.move_id.is_none()
+            && matches!(
+                paragraph.para_mark_status,
+                None | Some(TrackingStatus::Normal)
+            );
+        if !crossable_mark {
+            for field in &mut open {
+                field.crossable = false;
+            }
+        }
+    }
+    if removed.is_empty() {
+        return;
+    }
+    for (block_index, block) in blocks.iter_mut().enumerate() {
+        let BlockNode::Paragraph(paragraph) = &mut block.block else {
+            continue;
+        };
+        // The outermost removed field decides (an inner field goes with it).
+        let status_at = |position: usize| -> Option<TrackingStatus> {
+            removed
+                .iter()
+                .filter(|field| {
+                    field.begin <= (block_index, position) && (block_index, position) <= field.end
+                })
+                .min_by_key(|field| field.begin)
+                .map(|field| field.status.clone())
+        };
+        // A mark inside a removed field: between its begin and end markers.
+        if let Some(field) = removed
+            .iter()
+            .filter(|field| field.begin.0 <= block_index && block_index < field.end.0)
+            .min_by_key(|field| field.begin)
+        {
+            paragraph.para_mark_status = Some(field.status.clone());
+        }
+        if !removed
+            .iter()
+            .any(|field| field.begin.0 <= block_index && block_index <= field.end.0)
+        {
+            continue;
+        }
+        let mut rebuilt: Vec<TrackedSegment> = Vec::new();
+        let mut position = 0usize;
+        for segment in std::mem::take(&mut paragraph.segments) {
+            for inline in segment.inlines {
+                let status = status_at(position).unwrap_or_else(|| segment.status.clone());
+                position += 1;
+                if let Some(last) = rebuilt.last_mut()
+                    && last.status == status
+                {
+                    last.inlines.push(inline);
+                } else {
+                    rebuilt.push(TrackedSegment {
+                        status,
+                        inlines: vec![inline],
+                    });
+                }
+            }
+        }
+        paragraph.segments = rebuilt;
+    }
+}
+
+/// Rejecting a move returns the DESTINATION's content to the source.
+///
+/// Word-observed: for a move whose two halves are paired by range markers,
+/// Reject All leaves at the source the text the destination held, not the
+/// text the source held ("Quay seven. " moved and written "Pier nine now."
+/// at the destination comes back as "Pier nine now."). When the two clones
+/// hold the same text the two readings coincide and the source's own runs
+/// are restored as before. When they differ, this replaces the source
+/// clone's content with a copy of the destination clone's: the moved text
+/// as the move's deletion (which the rejection then restores), and any
+/// deletion nested in the destination still pending on it.
+///
+/// Planned per pair of clones, each a whole paragraph or the runs inside the
+/// move's containers in one paragraph, whose source holds only the move's
+/// own deletion. A move of several paragraphs has a clone per paragraph on
+/// each side; they pair in document order when both sides have as many
+/// (Word 16, Reject All of a heading and its paragraphs moved and then
+/// reworded at the destination: each source paragraph came back holding its
+/// destination counterpart's text). `selected`
+/// is the set of revisions being rejected (`None`: all of them). Returns the
+/// identities of the moves whose source was replaced.
+fn return_differing_move_destinations_to_their_sources(
+    blocks: &mut [TrackedBlock],
+    selected: Option<&HashSet<u32>>,
+) -> HashSet<u32> {
+    struct Clone {
+        block_index: usize,
+        scope: MoveCloneScope,
+        revision: RevisionInfo,
+    }
+    let is_move_range = |inline: &InlineNode| {
+        matches!(inline, InlineNode::Decoration(decoration)
+            if decoration.kind == crate::domain::DecorationType::MoveRange)
+    };
+    let content_of = |inlines: &[InlineNode]| -> Vec<InlineNode> {
+        inlines
+            .iter()
+            .filter(|inline| !is_move_range(inline))
+            .cloned()
+            .collect()
+    };
+
+    let mut names: Vec<String> = blocks
+        .iter()
+        .filter_map(|block| block.move_id.clone())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut replaced = HashSet::new();
+    for name in names {
+        // The clones of this move: a paragraph whose own mark is the move
+        // half, or the segments inside its containers.
+        let mut sources: Vec<Clone> = Vec::new();
+        let mut destinations: Vec<Clone> = Vec::new();
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.move_id.as_deref() != Some(name.as_str()) {
+                continue;
+            }
+            let BlockNode::Paragraph(paragraph) = &block.block else {
+                continue;
+            };
+            // The move's own carriers are the deletions inside its
+            // moveFrom and the insertions inside its moveTo. The paragraph
+            // is a whole-paragraph clone when its mark carries the same
+            // revision; a mark changed by anything else leaves the runs a
+            // clone inside a paragraph that stays.
+            let sides = move_container_sides(paragraph);
+            let half = |wanted: MoveSide| {
+                paragraph
+                    .segments
+                    .iter()
+                    .zip(&sides)
+                    .find_map(|(segment, side)| match (&segment.status, side) {
+                        (TrackingStatus::Deleted(revision), Some(MoveSide::From))
+                            if wanted == MoveSide::From =>
+                        {
+                            Some(revision.clone())
+                        }
+                        (TrackingStatus::Inserted(revision), Some(MoveSide::To))
+                            if wanted == MoveSide::To =>
+                        {
+                            Some(revision.clone())
+                        }
+                        _ => None,
+                    })
+            };
+            if let Some(revision) = half(MoveSide::From) {
+                let scope = match &paragraph.para_mark_status {
+                    Some(TrackingStatus::Deleted(mark)) if mark.identity == revision.identity => {
+                        MoveCloneScope::WholeParagraph
+                    }
+                    _ => MoveCloneScope::MovedRuns,
+                };
+                sources.push(Clone {
+                    block_index,
+                    scope,
+                    revision,
+                });
+            }
+            if let Some(revision) = half(MoveSide::To) {
+                let scope = match &paragraph.para_mark_status {
+                    Some(TrackingStatus::Inserted(mark)) if mark.identity == revision.identity => {
+                        MoveCloneScope::WholeParagraph
+                    }
+                    _ => MoveCloneScope::MovedRuns,
+                };
+                destinations.push(Clone {
+                    block_index,
+                    scope,
+                    revision,
+                });
+            }
+        }
+        // A move of several paragraphs has a clone per paragraph on each
+        // side; the clones pair up in document order.
+        if sources.is_empty() || sources.len() != destinations.len() {
+            continue;
+        }
+        for (source, destination) in sources.iter().zip(&destinations) {
+            let identity = source.revision.identity;
+            if destination.revision.identity != identity
+                || source.scope != destination.scope
+                || source.block_index == destination.block_index
+                || selected.is_some_and(|selected| !selected.contains(&identity))
+            {
+                continue;
+            }
+
+            // The destination clone: the move's insertions and the moved text
+            // deleted there since, in order. Anything else inside it (text
+            // another change inserted later) is not moved text.
+            let BlockNode::Paragraph(destination_paragraph) =
+                &blocks[destination.block_index].block
+            else {
+                unreachable!("a move clone is a paragraph")
+            };
+            let destination_sides = move_container_sides(destination_paragraph);
+            let mut returned: Vec<TrackedSegment> = Vec::new();
+            for (segment, side) in destination_paragraph
+                .segments
+                .iter()
+                .zip(&destination_sides)
+            {
+                if !segment_in_clone(destination.scope, *side, MoveSide::To) {
+                    continue;
+                }
+                let status = match &segment.status {
+                    TrackingStatus::Inserted(revision) if revision.identity == identity => {
+                        TrackingStatus::Deleted(source.revision.clone())
+                    }
+                    TrackingStatus::Deleted(revision) if revision.identity != identity => {
+                        segment.status.clone()
+                    }
+                    _ => continue,
+                };
+                let inlines = content_of(&segment.inlines);
+                if !inlines.is_empty() {
+                    returned.push(TrackedSegment { status, inlines });
+                }
+            }
+            let destination_text: String = returned
+                .iter()
+                .map(|segment| extract_inlines_text(&segment.inlines))
+                .collect();
+
+            let BlockNode::Paragraph(source_paragraph) = &mut blocks[source.block_index].block
+            else {
+                unreachable!("a move clone is a paragraph")
+            };
+            let source_sides = move_container_sides(source_paragraph);
+            // The source clone's content: the move's own deletion. In a whole
+            // paragraph nothing else may sit beside it (text inserted there
+            // before the move is an origin mixture, planned elsewhere).
+            let is_the_move = |segment: &TrackedSegment| {
+                matches!(&segment.status,
+                TrackingStatus::Deleted(revision) if revision.identity == identity)
+            };
+            let in_source: Vec<bool> = source_paragraph
+                .segments
+                .iter()
+                .zip(&source_sides)
+                .map(|(segment, side)| {
+                    segment_in_clone(source.scope, *side, MoveSide::From) && is_the_move(segment)
+                })
+                .collect();
+            if source.scope == MoveCloneScope::WholeParagraph
+                && !source_paragraph
+                    .segments
+                    .iter()
+                    .all(|segment| is_the_move(segment) || content_of(&segment.inlines).is_empty())
+            {
+                continue;
+            }
+            let source_text: String = source_paragraph
+                .segments
+                .iter()
+                .zip(&in_source)
+                .filter(|(_, inside)| **inside)
+                .map(|(segment, _)| extract_inlines_text(&content_of(&segment.inlines)))
+                .collect();
+            if source_text == destination_text {
+                continue;
+            }
+
+            // Empty the source clone of its content (the move's containers
+            // stay where they are) and put the returned content where the
+            // clone's content began.
+            let mut rebuilt: Vec<TrackedSegment> = Vec::new();
+            let mut returned = Some(returned);
+            for (mut segment, inside) in std::mem::take(&mut source_paragraph.segments)
+                .into_iter()
+                .zip(in_source)
+            {
+                if !inside {
+                    rebuilt.push(segment);
+                    continue;
+                }
+                segment.inlines.retain(|inline| is_move_range(inline));
+                if !segment.inlines.is_empty() {
+                    rebuilt.push(segment);
+                }
+                if let Some(returned) = returned.take() {
+                    rebuilt.extend(returned);
+                }
+            }
+            source_paragraph.segments = rebuilt;
+            replaced.insert(identity);
+        }
+    }
+    replaced
+}
+
 /// Strike `text`, which starts `start` characters into a move's destination
 /// clone, at the same characters of the source clone with `deletion`. The
 /// two clones of one move hold the same text: the source's moved text
@@ -14426,13 +15297,15 @@ fn overlay_clone_deletion(
         .collect();
     let end = start + text.chars().count();
     let struck: String = clone_text.chars().skip(start).take(end - start).collect();
-    assert_eq!(
-        struck, text,
-        "the two clones of move {move_identity} in paragraph {:?} hold the same text: the \
-         destination deletion at {start} must strike the same characters of the source \
-         (source clone text {clone_text:?})",
-        paragraph.id
-    );
+    if struck != text {
+        // The two clones differ here (Word writes such moves: a space or a
+        // word changed at the destination outside any tracked change). The
+        // deletion has no counterpart in the source, which keeps its text
+        // while the move is pending; rejecting the move replaces the source
+        // with the destination's content
+        // (`return_differing_move_destinations_to_their_sources`).
+        return;
+    }
     let struck_status = |status: &TrackingStatus| match status {
         TrackingStatus::Inserted(origin) => {
             TrackingStatus::InsertedThenDeleted(Box::new(crate::domain::StackedRevision {
@@ -16143,6 +17016,16 @@ pub(crate) fn resolve_selected_revisions_with_definitions(
         .copied()
         .collect();
 
+    if action == ResolveSelectionAction::Accept {
+        adopt_story_refs_of_removed_section_breaks(doc, &|tracked, paragraph| {
+            !tracked_block_survives_selected(&tracked.status, action, selected_revision_ids)
+                || para_mark_needs_selected_merge(
+                    &paragraph.para_mark_status,
+                    action,
+                    selected_revision_ids,
+                )
+        });
+    }
     project_blocks_for_selected_resolution(
         &mut doc.blocks,
         action,
@@ -16549,6 +17432,101 @@ pub fn pending_revision_authors(doc: &CanonDoc) -> Vec<PendingRevisionAuthor> {
         .collect()
 }
 
+/// A section break whose deletion this resolution accepts (its paragraph
+/// mark goes, or the paragraph with it) merges its section into the next
+/// one, which keeps its own properties. Word 16, Accept All of the deleted
+/// break of a document's FIRST section, the next section having no header
+/// or footer references of its own: the references the next section had
+/// inherited from the removed one are written into it (a first-page header
+/// and a default footer, with no `w:titlePg` added), so the merged section,
+/// now the first, shows what it showed before. Word 16 does NOT do this for
+/// a later section whose next section has references of its own (headers
+/// but no footer): the merged section keeps its own references only and
+/// inherits the rest from the section before, as Word's result writes it.
+/// Which of the two conditions decides is not observed, so the references
+/// are written only when both hold. The model keeps an inherited reference
+/// as a `synthesized` one, which is never written; this makes those the
+/// next section's own. Rejecting an inserted section break is not this
+/// either: Word 16 Reject All leaves the next section with its own
+/// references only. Runs before the body projection, while the removed
+/// marks are still there to read.
+fn adopt_story_refs_of_removed_section_breaks(
+    doc: &mut CanonDoc,
+    removed: &dyn Fn(&TrackedBlock, &ParagraphNode) -> bool,
+) {
+    fn authored(refs: &[crate::domain::StoryRef]) -> Vec<crate::domain::StoryRef> {
+        refs.iter().filter(|r| !r.synthesized).cloned().collect()
+    }
+    fn adopt(
+        section: &mut SectionProperties,
+        headers: &[crate::domain::StoryRef],
+        footers: &[crate::domain::StoryRef],
+    ) {
+        if section
+            .header_refs
+            .iter()
+            .chain(&section.footer_refs)
+            .any(|own| !own.synthesized)
+        {
+            return;
+        }
+        for (refs, carried) in [
+            (&mut section.header_refs, headers),
+            (&mut section.footer_refs, footers),
+        ] {
+            refs.retain(|own| !carried.iter().any(|source| source.kind == own.kind));
+            refs.extend(carried.iter().map(|source| crate::domain::StoryRef {
+                source_order: None,
+                synthesized: false,
+                ..source.clone()
+            }));
+        }
+    }
+    // The authored references of the removed sections that open the
+    // document, latest first per kind; `None` once a section stays.
+    let mut carried: Option<(Vec<crate::domain::StoryRef>, Vec<crate::domain::StoryRef>)> =
+        Some((Vec::new(), Vec::new()));
+    let merge = |into: &mut Vec<crate::domain::StoryRef>, from: Vec<crate::domain::StoryRef>| {
+        for source in from {
+            into.retain(|r| r.kind != source.kind);
+            into.push(source);
+        }
+    };
+    for tracked in &mut doc.blocks {
+        let goes = match &tracked.block {
+            BlockNode::Paragraph(paragraph) if paragraph.section_properties.is_some() => {
+                removed(tracked, paragraph)
+            }
+            _ => continue,
+        };
+        let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+            unreachable!("matched a paragraph above");
+        };
+        let section = paragraph
+            .section_properties
+            .as_mut()
+            .expect("matched a section carrier above");
+        let Some((headers, footers)) = carried.as_mut() else {
+            return;
+        };
+        if goes {
+            merge(headers, authored(&section.header_refs));
+            merge(footers, authored(&section.footer_refs));
+            continue;
+        }
+        if !headers.is_empty() || !footers.is_empty() {
+            adopt(section, headers, footers);
+        }
+        carried = None;
+    }
+    if let (Some((headers, footers)), Some(section)) =
+        (carried, doc.body_section_properties.as_mut())
+        && (!headers.is_empty() || !footers.is_empty())
+    {
+        adopt(section, &headers, &footers);
+    }
+}
+
 pub fn accept_all(doc: &mut CanonDoc) {
     accept_all_with_definitions(doc, ResolutionDefinitions::NONE);
 }
@@ -16562,6 +17540,10 @@ pub(crate) fn accept_all_with_definitions(doc: &mut CanonDoc, defs: ResolutionDe
     // can restore a materialized literal prefix. That changes derived indent
     // and tab geometry and therefore needs the package definitions to match a
     // save/reopen projection.
+    adopt_story_refs_of_removed_section_breaks(doc, &|tracked, paragraph| {
+        !block_survives_retain(&tracked.status, true)
+            || para_mark_needs_merge(&paragraph.para_mark_status, true)
+    });
     project_blocks_for_accept_reject(&mut doc.blocks, true, defs, DerivedGeometryPolicy::Resolve);
     for story in &mut doc.headers {
         if story.synthesized {
@@ -18155,6 +19137,7 @@ mod tests {
             author: Some("A".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut change = crate::edit::snapshot_paragraph_formatting(&p, &revision);
         change.previous.effective.literal_prefix_leading_tab_twips = Some(720);
@@ -18225,6 +19208,7 @@ mod tests {
             has_direct_numbering: false,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -18279,6 +19263,7 @@ mod tests {
             author: Some("author".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let blocks = vec![
             TrackedBlock {
@@ -18408,6 +19393,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -18470,6 +19456,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let first = make_paragraph("p1", "target");
         let mut terminal = make_paragraph("p2", "");
@@ -18547,6 +19534,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut rev_counter = 0;
         let segments = inline_changes_to_segments_with_opaques(
@@ -18645,6 +19633,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let inserted = TrackingStatus::Inserted(RevisionInfo {
             revision_id: 2,
@@ -18652,6 +19641,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -18702,6 +19692,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let inserted = TrackingStatus::Inserted(RevisionInfo {
             revision_id: 2,
@@ -18709,6 +19700,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -18767,6 +19759,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let inserted = TrackingStatus::Inserted(RevisionInfo {
             revision_id: 2,
@@ -18774,6 +19767,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -18842,6 +19836,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let inserted = TrackingStatus::Inserted(RevisionInfo {
             revision_id: 2,
@@ -18849,6 +19844,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -18912,6 +19908,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
         let inserted = TrackingStatus::Inserted(RevisionInfo {
             revision_id: 2,
@@ -18919,6 +19916,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -18986,6 +19984,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let (deleted, inserted) = (
             TrackingStatus::Deleted(revision(1)),
@@ -19039,6 +20038,7 @@ mod tests {
             author: Some("tester".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         });
 
         let segments = vec![
@@ -19194,6 +20194,7 @@ mod tests {
             author: Some("t".into()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }
     }
 
@@ -19866,6 +20867,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let rev2 = RevisionInfo {
             revision_id: 2,
@@ -19873,6 +20875,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -19942,6 +20945,7 @@ mod tests {
             author: Some("Editor".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let pending_block = RevisionInfo {
             revision_id: 2,
@@ -19949,6 +20953,7 @@ mod tests {
             author: Some("Counterparty".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
 
         let mut edited = make_paragraph("edited", "");
@@ -20012,6 +21017,7 @@ mod tests {
             author: Some("Editor".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("clause", "Clause body");
         let BlockNode::Paragraph(paragraph) = &mut block else {
@@ -20098,6 +21104,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let rev2 = RevisionInfo {
             revision_id: 12,
@@ -20105,6 +21112,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20181,6 +21189,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20243,6 +21252,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20293,6 +21303,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20360,6 +21371,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20404,6 +21416,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let mut block = make_paragraph("p1", "");
         let paragraph = match &mut block {
@@ -20494,6 +21507,7 @@ mod tests {
                 author: Some("AI".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             }
         }
 
@@ -20524,6 +21538,7 @@ mod tests {
                     identity: 4,
                     author: "AI".to_string(),
                     date: None,
+                    date_utc: None,
                 });
                 formatted
             },
@@ -20700,6 +21715,7 @@ mod tests {
             identity: 25,
             author: "AI".to_string(),
             date: None,
+            date_utc: None,
         });
 
         let top_table = TableNode {
@@ -21007,6 +22023,7 @@ mod tests {
                         author: Some("USER".to_string()),
                         date: None,
                         apply_op_id: None,
+                        date_utc: None,
                     }),
                 ),
             ];
@@ -21171,6 +22188,7 @@ mod tests {
                     author: Some("USER".to_string()),
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 })),
                 &[interior],
             )
@@ -21451,6 +22469,7 @@ mod tests {
             identity: 0,
             author: "legacy".to_string(),
             date: None,
+            date_utc: None,
         });
         para.segments = vec![seg];
         let doc = make_doc(vec![BlockNode::Paragraph(para)]);
@@ -21499,6 +22518,7 @@ mod tests {
                 identity: 41,
                 author: "AI".to_string(),
                 date: None,
+                date_utc: None,
             }),
             joins_following_text_run: false,
         });
@@ -21566,6 +22586,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut paragraph_change = crate::edit::snapshot_paragraph_formatting(&source, &revision);
         paragraph_change.identity = 41;
@@ -21586,6 +22607,7 @@ mod tests {
             identity: 0,
             author: "AI".to_string(),
             date: None,
+            date_utc: None,
         });
         let document = make_doc(vec![BlockNode::Paragraph(current)]);
 
@@ -21643,6 +22665,7 @@ mod tests {
             author: Some("AI".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
 
         let mut source_table = match h2_table(
@@ -21679,6 +22702,7 @@ mod tests {
             identity: 0,
             author: "AI".to_string(),
             date: None,
+            date_utc: None,
         });
         let document = make_doc(vec![BlockNode::Table(current_table)]);
 
@@ -21773,6 +22797,7 @@ mod tests {
                 author: Some("Reviewer".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             }),
         )];
 
@@ -21831,6 +22856,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
         target.segments = vec![tracked_text_segment(
@@ -21893,6 +22919,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         donor.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
         donor.segments = vec![tracked_text_segment(
@@ -21955,6 +22982,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
         target.segments.push(tracked_text_segment(
@@ -22017,6 +23045,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         target.para_mark_status = Some(TrackingStatus::Deleted(deleted.clone()));
         target.segments = vec![tracked_text_segment(
@@ -22173,6 +23202,7 @@ mod tests {
                     author: None,
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 }),
                 inlines: vec![text("tracked", "middle")],
             },
@@ -22265,6 +23295,7 @@ mod tests {
                     author: None,
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 }),
                 inlines: vec![text("right", "boundary", "00445566")],
             },
@@ -22594,6 +23625,7 @@ mod tests {
             author: Some("A".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut change = crate::edit::snapshot_paragraph_formatting(&previous, &revision);
         change.identity = 71;
@@ -22695,6 +23727,7 @@ mod tests {
             author: Some("author".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         let mut change = crate::edit::snapshot_paragraph_formatting(&source, &revision);
         change.identity = identity;
@@ -22785,6 +23818,7 @@ mod tests {
             author: Some("test".to_string()),
             date: Some("2026-01-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
 
         let make_inserted_row = |id: &str, cell_id: &str, para_id: &str, text: &str| TableRowNode {
@@ -22970,6 +24004,7 @@ mod tests {
             author: Some(author.to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }
     }
 

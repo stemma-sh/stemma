@@ -158,7 +158,7 @@ fn untouched_ac_with_ignorable_list_survives_roundtrip_verbatim() {
 
 #[test]
 fn ac_in_del_reject_restores_accept_removes() {
-    let body = r#"<w:p><w:r><w:t xml:space="preserve">before </w:t></w:r><w:del w:id="7" w:author="A" w:date="2026-06-14T00:00:00Z"><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="w"><w:t>CHOSEN</w:t></mc:Choice><mc:Fallback><w:t>FB</w:t></mc:Fallback></mc:AlternateContent></w:r></w:del><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:t xml:space="preserve">before </w:t></w:r><w:del w:id="7" w:author="A" w:date="2026-06-14T00:00:00Z"><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="w"><w:delText>CHOSEN</w:delText></mc:Choice><mc:Fallback><w:delText>FB</w:delText></mc:Fallback></mc:AlternateContent></w:r></w:del><w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert_eq!(
         accept_text(&b).trim(),
@@ -172,7 +172,7 @@ fn ac_in_del_reject_restores_accept_removes() {
     );
     assert_opens_clean(
         &b,
-        "ISO/IEC 29500-3 §7.5: a well-formed AC with declared mc namespace inside a valid w:del is conformant OOXML",
+        "ISO/IEC 29500-3 §7.5: a well-formed AC with declared mc namespace inside a valid w:del is conformant OOXML. Checked against Word with this document: clean when the branches hold w:delText, repaired when they hold w:t",
     );
 }
 

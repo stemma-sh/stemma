@@ -11,6 +11,7 @@
 * [Use Stemma with an agent](guides/use-with-an-agent.md)
 * [Review and resolve changes](guides/review-and-resolve.md)
 * [Verify a task delivery](guides/verify-task-delivery.md)
+* [Check documents in CI](guides/check-documents-in-ci.md)
 
 ## Understand the model
 

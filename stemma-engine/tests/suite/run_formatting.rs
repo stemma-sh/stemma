@@ -63,6 +63,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -163,6 +164,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("Test Author".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -892,6 +894,7 @@ fn span_refuses_when_any_covered_run_has_an_independent_format_revision() {
         previous_rpr_authored: RunRprAuthored::default(),
         author: "Earlier reviewer".to_string(),
         date: None,
+        date_utc: None,
     });
     let para = make_para("p1", normal_segment(vec![alpha, InlineNode::from(beta)]));
     let base = make_doc(vec![normal_tracked_block(BlockNode::from(para))]);
@@ -946,6 +949,7 @@ fn unrelated_pending_segment_does_not_lock_normal_format_target() {
         author: Some("Other".to_string()),
         date: None,
         apply_op_id: None,
+        date_utc: None,
     };
     let para = make_para(
         "p1",
@@ -1000,6 +1004,7 @@ fn first_format_revision_on_pending_insertion_is_independently_resolvable() {
         author: Some("Inserter".to_string()),
         date: None,
         apply_op_id: None,
+        date_utc: None,
     };
     let para = make_para(
         "p1",
@@ -1061,6 +1066,7 @@ fn pending_deletion_format_target_has_a_specific_refusal() {
         author: Some("Deleter".to_string()),
         date: None,
         apply_op_id: None,
+        date_utc: None,
     };
     let para = make_para(
         "p1",
@@ -1116,6 +1122,7 @@ fn pending_insertion_with_format_revision_reports_both_identities() {
         author: Some("Inserter".to_string()),
         date: None,
         apply_op_id: None,
+        date_utc: None,
     };
     let BlockNode::Paragraph(paragraph) = &mut pending.blocks[0].block else {
         unreachable!()

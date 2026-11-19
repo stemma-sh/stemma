@@ -92,6 +92,7 @@ fn modify_style_preserves_fields_the_definition_does_not_model() {
             author: Some("fid".into()),
             date: Some("2026-07-02T00:00:00Z".into()),
             apply_op_id: None,
+            date_utc: None,
         },
         summary: Some("change ClauseText font only".to_string()),
     };

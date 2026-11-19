@@ -78,6 +78,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
             author: Some("Gate".to_string()),
             date: Some("2026-06-06T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }
@@ -303,6 +304,7 @@ fn reject_all_persists_the_reverted_mark_after_a_save() {
                 author: Some("Gate".to_string()),
                 date: Some("2026-06-06T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("tracked SetRunFormatting applies");
@@ -373,6 +375,7 @@ fn read_rejected_markdown_and_a_persisted_save_agree_on_the_reverted_mark() {
                 author: Some("Gate".to_string()),
                 date: Some("2026-06-06T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("tracked SetRunFormatting applies");

@@ -89,6 +89,7 @@
 
 // --- Tier 1: the facade ---------------------------------------------------
 pub mod api;
+mod appearance;
 pub mod audit;
 mod audit_delta;
 mod audit_image;
@@ -140,11 +141,13 @@ pub(crate) mod data_binding;
 pub(crate) mod docx_package;
 pub(crate) mod docx_validate_namespaces;
 pub(crate) mod docx_validate_ordering;
+pub(crate) mod docx_validate_parts;
 pub(crate) mod docx_validate_xref;
 pub(crate) mod package_ops;
 pub(crate) mod serialize;
 pub(crate) mod settings;
 pub(crate) mod styles;
+pub(crate) mod wml_schema_names;
 #[doc(hidden)]
 pub use styles::StyleDefinitions;
 pub(crate) mod word_ir;

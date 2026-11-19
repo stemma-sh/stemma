@@ -191,7 +191,7 @@ fn reject_text(bytes: &[u8]) -> String {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn content_part_run_child_imports_clean() {
+fn content_part_run_child_loads_and_is_reported() {
     // ECMA-376 Part 1 §17.3.3.2; MS-OI29500 §2.1.102 (Part 1 §17.3.3.2).
     // A run carrying w:contentPart is conformant run content; the consumer
     // "should continue to process the file"; Word loads it (silently ignoring
@@ -200,13 +200,15 @@ fn content_part_run_child_imports_clean() {
         r#"<w:p><w:r><w:contentPart r:id="rId8"/></w:r></w:p><w:sectPr/>"#,
         &[],
     );
+    // Stemma loads the element (it is schema-valid run content), but Word,
+    // asked about a document with and without it, repairs every document
+    // holding a w:contentPart in a run, whatever part it names. `validate`
+    // reports it (I-RUN-002).
+    Document::parse(&b).expect("w:contentPart is read, not refused at load");
     assert!(
-        opens_clean(&b),
-        "contentPart is conformant run content (ECMA §17.3.3.2: consumer 'should \
-         continue to process the file'; MS-OI29500 §2.1.102: Word loads it, \
-         silently ignoring an unrecognized root namespace) — stemma must \
-         import+validate without error rather than fail-fast as \
-         UnknownRunElement. validate: {}",
+        !opens_clean(&b) && issues_dump(&b).contains("I-RUN-002"),
+        "Word repairs a run holding w:contentPart; validate must report \
+         I-RUN-002. validate: {}",
         issues_dump(&b)
     );
     // Round-trip: contentPart is opaque run content preserved verbatim — the
@@ -243,12 +245,10 @@ fn embedded_object_run_roundtrips_byte_stable_and_opens_clean() {
          survive roundtrip so the embedded-object relationship is not orphaned. \
          document.xml:\n{xml}"
     );
-    assert!(
-        opens_clean(&b),
-        "an embedded object is conformant run content (§17.3.3.19); after \
-         roundtrip the document must validate without errors. validate: {}",
-        issues_dump(&b)
-    );
+    // No claim that this fixture opens in Word: checked against Word, it
+    // cannot open this exact document at all (the object's drawing is a bare
+    // wp:inline with no content, and no OLE part exists). The test is about
+    // the wrapper surviving the round trip unchanged.
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn ruby_child_order_rubypr_rt_rubybase_preserved_opens_clean() {
 }
 
 #[test]
-fn embedded_object_vml_drawing_objectembed_roundtrip_opens_clean() {
+fn embedded_object_vml_drawing_objectembed_round_trips_and_is_reported() {
     // ISO 29500-1 §17.3.3.19 / §17.3.3.20; ECMA-376 Part 1 §A.1 (CT_Object).
     // An OLE object (w:object with VML pict static rep + w:objectEmbed) is one
     // opaque inline; the VML and objectEmbed survive and the package stays valid.
@@ -383,10 +383,14 @@ fn embedded_object_vml_drawing_objectembed_roundtrip_opens_clean() {
          subtree (CT_Object, §17.3.3.19); verbatim preservation re-emits them \
          unchanged. document.xml:\n{xml}"
     );
+    // Stemma loads and preserves the object, but Word cannot open a
+    // w:object written with w:objectEmbed (asked about the same object with
+    // and without it, with a valid compound file and without one).
+    // `validate` reports it (I-OBJ-001).
     assert!(
-        opens_clean(&b),
-        "a w:object with a VML static shape plus objectEmbed is a valid \
-         CT_Object and must open without repair. validate: {}",
+        !opens_clean(&b) && issues_dump(&b).contains("I-OBJ-001"),
+        "Word cannot open a w:object written with w:objectEmbed; validate must \
+         report I-OBJ-001. validate: {}",
         issues_dump(&b)
     );
 }

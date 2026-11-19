@@ -541,6 +541,7 @@ where
                 author: Some(worklist.author.clone()),
                 date: None,
                 apply_op_id: Some(change.id.clone()),
+                date_utc: None,
             },
         };
         let edited = match document.apply_authored(&transaction, allow_existing_author) {
@@ -1179,6 +1180,7 @@ mod tests {
                 author: Some("Approved Reviewer".to_string()),
                 date: None,
                 apply_op_id: Some("direct-sentinel".to_string()),
+                date_utc: None,
             },
         };
         let after = document

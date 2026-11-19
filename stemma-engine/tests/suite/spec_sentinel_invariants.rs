@@ -1370,6 +1370,7 @@ fn sentinel_cell_paragraph_insertion_preserves_native_projections() {
                                 author: Some("Editor".into()),
                                 date: Some("2026-07-01T00:00:00Z".into()),
                                 apply_op_id: None,
+                                date_utc: None,
                             },
                         })
                         .expect("cell paragraph insertion is supported");
@@ -1512,6 +1513,7 @@ fn sentinel_explicit_template_preserves_complete_run_context() {
                         author: Some("Editor".into()),
                         date: None,
                         apply_op_id: None,
+                        date_utc: None,
                     },
                 })
                 .unwrap();
@@ -1596,7 +1598,7 @@ fn sentinel_column_delete_partition_restores_native_geometry() {
         assert_eq!(table.formatting.grid_cols, grid);
         assert_eq!(table.rows[0].cells.len(), grid.len());
         for (cell, width) in table.rows[0].cells.iter().zip(&grid) {
-            assert_eq!(cell.formatting.width.as_ref().unwrap().w, *width);
+            assert_eq!(cell.formatting.width.as_ref().unwrap().w, i64::from(*width));
         }
         let bytes = projected
             .serialize(&stemma::ExportOptions::default())
@@ -1616,7 +1618,7 @@ fn sentinel_column_delete_partition_restores_native_geometry() {
         };
         assert_eq!(table.formatting.grid_cols, grid);
         for (cell, width) in table.rows[0].cells.iter().zip(&grid) {
-            assert_eq!(cell.formatting.width.as_ref().unwrap().w, *width);
+            assert_eq!(cell.formatting.width.as_ref().unwrap().w, i64::from(*width));
         }
     }
 }
@@ -1713,7 +1715,7 @@ fn sentinel_column_partition_resolves_each_boundary_in_both_paths() {
                 for (row_index, row) in table.rows.iter().enumerate() {
                     assert_eq!(row.cells.len(), expected.len());
                     for (cell, &(column, width)) in row.cells.iter().zip(&expected) {
-                        assert_eq!(cell.formatting.width.as_ref().unwrap().w, width);
+                        assert_eq!(cell.formatting.width.as_ref().unwrap().w, i64::from(width));
                         let BlockNode::Paragraph(paragraph) = &cell.blocks[0] else {
                             panic!("cell paragraph")
                         };
@@ -1838,7 +1840,7 @@ fn sentinel_authored_column_deletion_is_reversible_and_one_intention() {
                 for (cell, &(index, width)) in row.cells.iter().zip(&expected) {
                     assert_eq!(
                         cell.formatting.width.as_ref().unwrap().w,
-                        if accept { width } else { width + 100 }
+                        i64::from(if accept { width } else { width + 100 })
                     );
                     assert_eq!(
                         cell.formatting.shading,
@@ -2053,6 +2055,7 @@ fn sentinel_cell_interior_paragraph_deletion_preserves_native_projections() {
                         author: Some("Editor".into()),
                         date: Some("2026-07-01T00:00:00Z".into()),
                         apply_op_id: None,
+                        date_utc: None,
                     },
                 })
                 .expect("interior cell paragraph deletion must preserve the terminating paragraph");
@@ -2193,6 +2196,7 @@ fn sentinel_cell_paragraph_deletion_refuses_unsafe_boundaries_and_stale_guards()
                     author: Some("Editor".into()),
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 },
             });
             let error = result.err().expect("unsafe or stale deletion must refuse");
@@ -2258,6 +2262,7 @@ fn sentinel_cell_paragraph_deletions_resolve_independently() {
                 author: Some("Editor".into()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .unwrap();
@@ -2378,6 +2383,7 @@ fn sentinel_cell_paragraph_deletion_refuses_pending_carriers() {
                     author: Some("Editor".into()),
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 },
             });
             let error = result
@@ -2426,6 +2432,7 @@ fn sentinel_cell_insertion_refuses_tracked_ancestor() {
             author: Some("Editor".into()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let Err(error) = doc.apply(&transaction) else {
@@ -2590,6 +2597,7 @@ fn revision() -> RevisionInfo {
         author: Some("sentinel".to_string()),
         date: Some("2026-06-01T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 

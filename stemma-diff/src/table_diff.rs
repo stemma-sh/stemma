@@ -3,9 +3,10 @@
 //! Uses patience diff on row/column signatures to align rows between tables,
 //! then performs cell-level diffing within aligned rows.
 //!
-//! Row alignment is comparison-specific on purpose. Comparison keeps an
-//! aligned row whose content is unrelated as a `Replacement` and shows it as
-//! one replaced row; the engine's explicit table edits instead split a
+//! Row alignment is comparison-specific on purpose. Comparison keeps a row
+//! that changed in place (same position between matching rows, same grid) as
+//! the same row and compares its cells word by word, as Word's Compare does
+//! (`align_replace_block`); the engine's explicit table edits instead split a
 //! low-similarity match into a deleted and an inserted row. Cell text diffing
 //! and everything after alignment is the engine's.
 
@@ -204,9 +205,24 @@ fn row_grid_shape_matches(
         })
 }
 
-/// Pair only positional rows whose physical grid is compatible. This is not a
-/// correspondence heuristic: every paired row is explicitly classified as an
-/// unrelated replacement and its content is fully revised on both sides.
+/// Align the rows of one replaced region (rows that differ between the
+/// tables, between rows that match).
+///
+/// When the region has as many rows on each side, the rows correspond by
+/// position: each source row and the target row in its place, in tables whose
+/// unchanged rows around the region match, are the same row with changed
+/// cells. That is Word's reading: Word's Compare keeps such a row and marks
+/// the changed words inside each cell (a row whose words all changed comes
+/// out as each cell's content deleted and inserted, by the same word
+/// comparison). Such a pair is `Matched` when its physical grid is the same,
+/// and its cells are compared word by word.
+///
+/// When the region's sides differ in length, position does not say which
+/// rows correspond, and no row lineage is inferred from text similarity:
+/// rows paired by position with a compatible grid share only their physical
+/// shell (`Replacement`: every source payload deleted, every target payload
+/// inserted), and the rest are tracked row deletions and insertions. A pair
+/// whose grid differs is always a row deletion and a row insertion.
 fn align_replace_block(
     old: &CanonicalTable,
     new: &CanonicalTable,
@@ -216,15 +232,18 @@ fn align_replace_block(
     new_len: usize,
     alignments: &mut Vec<RowAlignment>,
 ) {
+    let same_rows_by_position = old_len == new_len;
     let paired_len = old_len.min(new_len);
     for offset in 0..paired_len {
         let old_row = old_index + offset;
         let new_row = new_index + offset;
-        if row_grid_shape_matches(old, new, old_row, new_row) {
-            alignments.push(RowAlignment::Replacement { old_row, new_row });
-        } else {
+        if !row_grid_shape_matches(old, new, old_row, new_row) {
             alignments.push(RowAlignment::Deleted { old_row });
             alignments.push(RowAlignment::Inserted { new_row });
+        } else if same_rows_by_position {
+            alignments.push(RowAlignment::Matched { old_row, new_row });
+        } else {
+            alignments.push(RowAlignment::Replacement { old_row, new_row });
         }
     }
     for offset in paired_len..old_len {
@@ -536,6 +555,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -720,49 +740,40 @@ mod tests {
 
         let diff = diff_tables(&old, &new).expect("diff should succeed");
 
-        // Exact rows retain semantic identity. A changed row shares only its
-        // compatible physical shell and retains no inferred content lineage.
-        assert_eq!(diff.row_alignment.len(), 2);
-        assert!(
-            matches!(
-                diff.row_alignment[0],
+        // Word's Compare keeps a row that changed in place as the same row and
+        // marks only the changed words inside its cells.
+        assert_eq!(
+            diff.row_alignment,
+            vec![
                 RowAlignment::Matched {
                     old_row: 0,
                     new_row: 0
-                }
-            ),
-            "First row (headers) should be matched"
-        );
-        assert!(
-            matches!(
-                diff.row_alignment[1],
-                RowAlignment::Replacement {
+                },
+                RowAlignment::Matched {
                     old_row: 1,
                     new_row: 1
-                }
-            ),
-            "changed row should be a physical replacement"
+                },
+            ]
         );
-
-        // Every cell in an unrelated replacement row is revised completely,
-        // including cells whose text happens to be equal.
-        let modified_cells: Vec<_> = diff
+        let modified: Vec<_> = diff
             .cell_diffs
             .iter()
             .filter(|c| c.diff_type == CellDiffType::Modified)
             .collect();
-        assert_eq!(
-            modified_cells.len(),
-            3,
-            "every replacement-row cell should be Modified"
+        assert_eq!(modified.len(), 1, "only the changed cell is modified");
+        let changes = modified[0].text_diff.as_ref().expect("its text changed");
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, InlineChange::Unchanged { text, .. } if text.contains('B'))),
+            "the kept word stays kept: {changes:?}"
         );
-        assert!(modified_cells.iter().all(|cell| {
-            cell.text_diff.as_ref().is_some_and(|changes| {
-                changes
-                    .iter()
-                    .all(|change| !matches!(change, InlineChange::Unchanged { .. }))
-            })
-        }));
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, InlineChange::Deleted { text, .. } if text == "Data")),
+            "the changed word is deleted: {changes:?}"
+        );
     }
 
     #[test]
@@ -946,6 +957,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -1084,40 +1096,30 @@ mod tests {
 
         let diff = diff_tables(&old, &new).expect("diff should succeed");
 
-        // A content change inside a nested table does not prove semantic row
-        // lineage. The shell is a physical replacement candidate; the compiler
-        // later refuses it because nested payload replacement is not qualified.
-        assert_eq!(diff.row_alignment.len(), 1);
+        // The row changed in place, so it is the same row (as in Word's
+        // Compare), and the change inside its nested table is compared.
         assert!(matches!(
-            diff.row_alignment[0],
-            RowAlignment::Replacement {
+            diff.row_alignment[..],
+            [RowAlignment::Matched {
                 old_row: 0,
                 new_row: 0
-            }
+            }]
         ));
-
-        // The cell should be Modified because inner table text changed.
         let modified: Vec<_> = diff
             .cell_diffs
             .iter()
             .filter(|c| c.diff_type == CellDiffType::Modified)
             .collect();
         assert_eq!(modified.len(), 1, "should have 1 modified cell");
-
-        // No nested semantic relation is inferred inside an unrelated row.
         let cell_diff = modified[0];
-        assert!(
-            cell_diff.nested_table_diffs.is_empty(),
-            "replacement row must not infer nested table lineage"
+        assert_eq!(
+            cell_diff.nested_table_diffs.len(),
+            1,
+            "the nested table's change is compared"
         );
-
-        // A replacement row never retains coincidental paragraph content as
-        // unchanged lineage, even when only the nested payload triggered it.
         assert!(
-            cell_diff.text_diff.as_ref().is_some_and(|changes| changes
-                .iter()
-                .all(|change| !matches!(change, InlineChange::Unchanged { .. }))),
-            "replacement row must contain no unchanged text span"
+            cell_diff.text_diff.is_none(),
+            "the cell's own paragraph text is unchanged"
         );
     }
 
@@ -1196,23 +1198,30 @@ mod tests {
 
         let diff = diff_tables(&old, &new).expect("diff should succeed");
 
+        // The row changed in place, so it is the same row (as in Word's
+        // Compare): its paragraph text and its nested table are both compared.
+        assert!(matches!(
+            diff.row_alignment[..],
+            [RowAlignment::Matched {
+                old_row: 0,
+                new_row: 0
+            }]
+        ));
         let modified: Vec<_> = diff
             .cell_diffs
             .iter()
             .filter(|c| c.diff_type == CellDiffType::Modified)
             .collect();
         assert_eq!(modified.len(), 1);
-
         let cell_diff = modified[0];
-        // The replacement projection describes the cell text without trying
-        // to infer a nested-table relation.
         assert!(
             cell_diff.text_diff.is_some(),
             "paragraph text changed so text_diff should be Some"
         );
-        assert!(
-            cell_diff.nested_table_diffs.is_empty(),
-            "replacement row must not infer nested table lineage"
+        assert_eq!(
+            cell_diff.nested_table_diffs.len(),
+            1,
+            "the nested table's change is compared"
         );
     }
 
