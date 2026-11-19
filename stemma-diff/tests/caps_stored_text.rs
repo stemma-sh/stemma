@@ -365,15 +365,16 @@ fn page_field(result: &str) -> String {
     )
 }
 
-/// A heavily edited caps paragraph is replaced as one deletion and one
-/// insertion. The words both sides keep are spelled differently ("Notice"
-/// against "NOTICE", equal as rendered), and once they sit inside the
-/// replacement they are no longer kept text: the deletion writes the base's
-/// letters and the insertion the target's, so Reject All stores the base and
-/// Accept All the target, exactly. With and without a complex field in the
+/// A heavily edited caps paragraph. As in Word's Compare, a word both sides
+/// keep stays kept even when it is spelled differently ("Notice" against
+/// "NOTICE", equal as rendered: caps-aware comparison), and only the changed
+/// words are revisions. Each revision writes its own side's letters and kept
+/// text keeps the base's, so Reject All stores the base exactly and Accept
+/// All renders as the target (its kept words stored as the base wrote them,
+/// as for any kept caps text). With and without a complex field in the
 /// paragraph (a field is kept or replaced whole).
 #[test]
-fn a_collapsed_caps_region_writes_each_sides_letters() {
+fn a_reworked_caps_paragraph_writes_each_sides_letters() {
     let base_words = "Notice of the tenant to the owner is due by the first day of each month";
     let target_words = "NOTICE FROM A TENANT FOR ANY OWNER WAS DUE ON THE LAST DAY IN EACH WEEK";
     for with_field in [true, false] {
@@ -397,15 +398,22 @@ fn a_collapsed_caps_region_writes_each_sides_letters() {
         let redline = stemma_diff::diff_as(&base, &target, "compare").expect("compare");
         let excerpts: Vec<String> = redline.revisions().into_iter().map(|r| r.excerpt).collect();
         assert!(
-            excerpts.iter().any(|e| e.contains("Notice")),
-            "field {with_field}: the region is replaced whole, the base's kept words deleted as written: {excerpts:?}"
+            !excerpts.is_empty()
+                && excerpts
+                    .iter()
+                    .all(|e| !e.contains("Notice") && !e.contains("NOTICE")),
+            "field {with_field}: the kept word is no revision: {excerpts:?}"
         );
         let reopened_redline = reopened(&redline);
         for document in [&redline, &reopened_redline] {
             let rejected = document.project(Resolution::RejectAll).expect("reject");
             let accepted = document.project(Resolution::AcceptAll).expect("accept");
             assert_eq!(text(&rejected), text(&base), "field {with_field}: Reject");
-            assert_eq!(text(&accepted), text(&target), "field {with_field}: Accept");
+            assert_eq!(
+                rendered(&accepted),
+                rendered(&target),
+                "field {with_field}: Accept"
+            );
         }
     }
 }

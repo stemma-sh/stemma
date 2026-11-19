@@ -54,6 +54,11 @@ Tests encode these, never the current output.
 - **Measure against reality.** A claim about Word is checked in Word. A claim
   about agents is checked with agents on real documents. Numbers that are
   published are reproducible from the command that produced them.
+- **Publish what was measured blind.** A build agrees with the material it
+  was fixed on. The published figure is the one from material the build had
+  not seen when it was frozen; what it was fixed on is a regression floor,
+  and is labelled as one. A target that is missed is published as measured,
+  with the misses.
 
 ## Priorities when they compete
 

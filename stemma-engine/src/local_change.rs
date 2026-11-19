@@ -1640,6 +1640,7 @@ pub fn detect_formatting_change(
                 identity: 0,
                 author: String::new(),
                 date: None,
+                date_utc: None,
             }),
         )
     } else {
@@ -1693,13 +1694,30 @@ pub fn diff_block_content_resolving_opaques(
     new_inlines: &[InlineNode],
     note_markers: &HashMap<String, String>,
 ) -> Vec<InlineChange> {
-    let heuristics = DiffHeuristics::from_env();
+    diff_block_content_resolving_opaques_with_config(
+        old_inlines,
+        new_inlines,
+        note_markers,
+        &DiffHeuristics::from_env(),
+    )
+}
+
+/// [`diff_block_content_resolving_opaques`] with the caller's heuristics: a
+/// comparison of two documents passes its own configuration instead of the
+/// default the authoring paths use.
+#[doc(hidden)]
+pub fn diff_block_content_resolving_opaques_with_config(
+    old_inlines: &[InlineNode],
+    new_inlines: &[InlineNode],
+    note_markers: &HashMap<String, String>,
+    heuristics: &DiffHeuristics,
+) -> Vec<InlineChange> {
     let (old_text, old_char_fmt, old_opaques, old_written) =
         extract_text_with_marks_and_opaques(old_inlines);
     let (new_text, new_char_fmt, new_opaques, new_written) =
         extract_text_with_marks_and_opaques(new_inlines);
 
-    if should_bail_out_with_config(&old_text, &new_text, &heuristics) {
+    if should_bail_out_with_config(&old_text, &new_text, heuristics) {
         return sort_opaque_runs_by_inline_index(build_full_replace(
             old_inlines,
             new_inlines,
@@ -1797,7 +1815,7 @@ pub fn diff_block_content_resolving_opaques(
         }
     }
 
-    let result = cleanup_inline_changes_with_config(result, &heuristics);
+    let result = cleanup_inline_changes_with_config(result, heuristics);
     sort_opaque_runs_by_inline_index(result)
 }
 

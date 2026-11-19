@@ -34,6 +34,9 @@
 //!   kind is indistinguishable from un-wrapped content;
 //! - a `start`/`end` pair that is not a valid forward, contiguous, top-level
 //!   range ⇒ [`EditError::BlockRangeInvalid`];
+//! - a plain-text, date, drop-down or combo-box control around anything but
+//!   one paragraph ⇒ [`EditError::BlockRangeInvalid`] — Word repairs a
+//!   document where such a control holds more;
 //! - any block in the range that is not editable (tracked-inserted/deleted, or a
 //!   paragraph with tracked segments) ⇒ the usual editability errors;
 //! - any block in the range already carrying a block-level wrap ⇒
@@ -43,7 +46,7 @@
 
 use super::super::{EditError, find_block_index, validate_block_is_editable};
 use super::content_controls::SdtSpec;
-use crate::domain::{BlockSdtWrap, CanonDoc, NodeId, SdtWrapper};
+use crate::domain::{BlockSdtWrap, CanonDoc, NodeId, SdtControl, SdtWrapper};
 use crate::serialize::sdt::build_sdt_pr;
 
 /// Wrap the contiguous, top-level block range `[start_block_id, end_block_id]`
@@ -97,6 +100,32 @@ pub(crate) fn apply_wrap_blocks(
     }
 
     let span = end - start + 1;
+
+    // A control that holds one value holds one paragraph. Checked against
+    // Word: a plain-text, date, drop-down or combo-box control around two
+    // paragraphs, or around a table, makes it repair the document; around one
+    // paragraph, and for a rich-text control around several, it opens cleanly.
+    let single_value = matches!(
+        spec.control,
+        SdtControl::PlainText
+            | SdtControl::Date
+            | SdtControl::Dropdown { .. }
+            | SdtControl::ComboBox { .. }
+    );
+    let one_paragraph = span == 1
+        && matches!(
+            doc.blocks[start].block,
+            crate::domain::BlockNode::Paragraph(_)
+        );
+    if single_value && !one_paragraph {
+        return Err(EditError::BlockRangeInvalid {
+            start_block_id: start_block_id.clone(),
+            end_block_id: end_block_id.clone(),
+            reason: "a plain-text, date, drop-down or combo-box control holds exactly one \
+                     paragraph; use a rich-text control for a wider range",
+            step_index,
+        });
+    }
 
     // No block in the new range may already be enclosed by an authored
     // block-level wrap. Because the marker lives only on the FIRST block of an

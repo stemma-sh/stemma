@@ -218,11 +218,19 @@ fn footnote_reference_custommarkfollows_false_preserved_verbatim() {
         xml.contains(r#"w:customMarkFollows="0""#),
         "ECMA-376 §17.11.14, Annex A CT_FtnEdnRef — refs: verbatim-preservation contract means an explicitly authored, default-equivalent customMarkFollows=\"0\" is opaque markup the engine must round-trip unchanged, not collapse to the omitted default; got XML:\n{xml}"
     );
+    // This fixture has a note reference but no notes part. Checked against
+    // Word with this exact document: it repairs the file, for the missing
+    // notes relationship and not for the attribute under test.
     let report = stemma::api::validate(&b);
     assert!(
+        !report.ok
+            && report
+                .issues
+                .iter()
+                .all(|issue| issue.message.contains("notes relationship")),
+        "the only fault is the missing notes relationship. Got ok={} issues={:?}",
         report.ok,
-        "ECMA-376 §17.11.14, Annex A CT_FtnEdnRef — refs: ST_OnOff admits 0/false, so customMarkFollows=\"0\" on CT_FtnEdnRef is schema-valid and must open without repair. Got ok={} issues={:?}",
-        report.ok, report.issues
+        report.issues
     );
 }
 
@@ -235,11 +243,19 @@ fn footnote_reference_reserved_id_value_preserved() {
         xml.contains(r#"w:footnoteReference w:id="7""#),
         "ECMA-376 §17.11.10/§17.11.14, Annex A ST_DecimalNumber — refs: the reference id is the stable match key into the notes part; the engine must round-trip the exact authored id (7), not renumber it; got XML:\n{xml}"
     );
+    // This fixture has a note reference but no notes part. Checked against
+    // Word with this exact document: it repairs the file, for the missing
+    // notes relationship and not for the attribute under test.
     let report = stemma::api::validate(&b);
     assert!(
+        !report.ok
+            && report
+                .issues
+                .iter()
+                .all(|issue| issue.message.contains("notes relationship")),
+        "the only fault is the missing notes relationship. Got ok={} issues={:?}",
         report.ok,
-        "ECMA-376 §17.11.14, Annex A CT_FtnEdnRef — refs: id=7 is a valid ST_DecimalNumber for CT_FtnEdnRef, so the markup is schema-valid and opens without repair. Got ok={} issues={:?}",
-        report.ok, report.issues
+        report.issues
     );
 }
 
@@ -256,11 +272,19 @@ fn endnote_reference_custommarkfollows_preserved_verbatim() {
         xml.contains("w:endnoteReference"),
         "ECMA-376 §17.11.7 / ISO 29500-1 §17.11.7 — refs: the endnoteReference run must survive the roundtrip intact (the reference linkage is the body half of the endnote per §17.11); got XML:\n{xml}"
     );
+    // This fixture has a note reference but no notes part. Checked against
+    // Word with this exact document: it repairs the file, for the missing
+    // notes relationship and not for the attribute under test.
     let report = stemma::api::validate(&b);
     assert!(
+        !report.ok
+            && report
+                .issues
+                .iter()
+                .all(|issue| issue.message.contains("notes relationship")),
+        "the only fault is the missing notes relationship. Got ok={} issues={:?}",
         report.ok,
-        "ECMA-376 §17.11.7, Annex A CT_FtnEdnRef — refs: endnoteReference is CT_FtnEdnRef and customMarkFollows is an optional ST_OnOff attribute of that type, so the document is schema-valid and opens without repair. Got ok={} issues={:?}",
-        report.ok, report.issues
+        report.issues
     );
 }
 

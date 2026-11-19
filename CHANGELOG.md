@@ -8,6 +8,257 @@ pre-1.0, minor (`0.x`) releases may include breaking changes; see
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-18
+
+This release is about one promise: when `stemma validate` says a document is
+sound, Microsoft Word opens it without repair, and when `stemma verify` passes
+a result, nothing outside its tracked changes reads or looks different. The
+rules below were each confirmed against Word.
+
+### Changed
+
+- **Comparison marks changes word by word, as Word's Compare does.** A
+  sentence with a few changed words is no longer collapsed into one
+  replacement of the whole sentence or of the stretch between long kept
+  words: each changed word is its own revision, and changes separated only
+  by spaces or punctuation are one revision ("Seller shall" replaced by
+  "Supplier must"). Adjacent punctuation characters are one unit. A
+  paragraph that shares less than a fifth of its words and punctuation
+  with its counterpart is replaced whole, which is where Word's Compare
+  draws the line on the documents measured. Explicit edits (`apply`, the
+  edit operations) keep their plans unchanged.
+- **A table row that changed in place is compared cell by cell.** A row in
+  the same position between matching rows, with the same cells, is kept and
+  its changed words are marked inside its cells, as in Word's Compare. Where
+  rows were added or removed next to a changed row, no row lineage is
+  inferred from text similarity: the paired row's content is replaced whole
+  and the other rows are tracked row insertions or deletions.
+- **Comparison no longer refuses two compositions Word resolves.** A changed
+  table row followed by another change in the same story, and a comparison
+  that adds one comment and removes another, now produce a redline. Word
+  opens both without repair, and its Reject All and Accept All give the
+  base and the target.
+
+- **`validate` gives one of three verdicts, and its exit codes changed.**
+  `stemma validate --format json` now emits `stemma.validate.v1` with
+  `verdict`: `sound` (exit `0`), `corrupt` (exit `3`, with the issues) or
+  `cannot_assess` (exit `4`, with the reason). A corrupt document used to
+  exit `1`; exit `1` is now only an operational failure such as an
+  unreadable file. The package checks run before the model reads the file,
+  so a file that is not a package, or whose main part is ill-formed, is
+  `corrupt`. `cannot_assess` means the checks found no fault but the
+  document holds a shape the model does not read; it is not a pass.
+- **`verify` has a stable result format with the same three verdicts.**
+  `stemma.verify.v1` replaces `stemma.verify.v0`: `status` is now `verdict`
+  (`pass`, `fail`, `cannot_assess`), a failure lists its `reasons`
+  (`invalid_result`, `untracked_change`, `untouched_content_changed`,
+  `preexisting_revision_changed`), stories and violation kinds are written
+  as data instead of debug text, and the revisions a result resolved or
+  changed are listed in `preexisting_changed`. A result that is not a sound
+  package is a `fail`; a baseline the model does not read is
+  `cannot_assess` (exit `4`). These used to be operational errors.
+- **`verify` judges untouched content by what it reads and looks like.** The
+  default policy is now `tracked-delivery-v1`: a result another program
+  saved passes when the text and resolved formatting outside the tracked
+  changes are unchanged, even though that program rewrote revision-save
+  ids, run boundaries, attribute order, relationship ids or paragraph ids.
+  Images are compared by their bytes and list levels by their definitions.
+  The markup-level check is still available as
+  `--policy tracked-delivery-v0`, and is what `apply` enforces on its own
+  output.
+- **An added comment passes the delivery policy.** A new comment is counted
+  in `summary.comments_added`; a changed or removed comment still fails.
+  Before, `verify` failed every added comment while the MCP save accepted
+  it.
+
+### Fixed
+
+- **A bookmark moved with edited text survives Accept All.** When the base's
+  bookmarked text is deleted in one place and the target's edited copy is
+  inserted in another, the redline kept the bookmark inside the deletion, so
+  Accept All lost it and fields referring to it no longer resolved.
+  Comparison now places the bookmark on the target's copy, as Word's Compare
+  does; Reject All restores the base's text without that bookmark name,
+  which Word's own result does too.
+
+- **Accept All and Reject All match Word in more shapes.** A move written
+  with paired range markers returns its destination text to the source on
+  Reject. A field whose begin or end marker is tracked resolves whole. An
+  accepted deleted cell mark joins the cell's last paragraph with the next
+  cell's first, and a row whose every cell gives its text away is removed.
+  An empty paragraph whose mark is resolved away (inserted mark rejected,
+  deleted mark accepted) is removed, also directly before a table. A
+  table row moved with tracking goes from its source on Accept and from
+  its destination on Reject. A field whose markers are inserted and whose
+  result spans several paragraphs is rejected whole. A list item with a
+  typed label in a table cell keeps its label when its mark is rejected.
+  Accepting a deleted section break leaves the surviving section with the
+  headers and footers it was inheriting, when it is the first section's
+  break and the next section names none of its own. A paragraph whose
+  inserted mark is rejected in front of a table joins the first paragraph
+  of the table's first cell. A move of several paragraphs reworded at its
+  destination comes back paragraph by paragraph on Reject. A field with
+  inserted markers inside a preserved content control is rejected whole.
+- **Bookmarks are no longer torn by a resolution.** A bookmark start
+  inside text that one author inserted and another deleted, and a
+  bookmark ending inside a table cell's content control, lost their other
+  half at load; resolving such a document was then refused.
+- **Revisions keep their identity when another program adds paragraph ids.**
+  The audit reported every pending deletion as resolved and made again when
+  the result's paragraphs had gained `w14:paraId`. An empty paragraph with
+  an inserted mark is read the same way with and without a paragraph id.
+- **The audit sees changes it missed.** Untracked changes inside a
+  hyperlink or text box in a header or note, formatting changes in a
+  header, an image replaced under the same relationship id, and a changed
+  list marker in the numbering part are now reported.
+- **The audit compares what sits outside the blocks.** A theme colour that
+  runs use, the page background, the document settings that lay text out
+  (default tab stop, hyphenation, compatibility options; editing, viewing
+  and saving state is not compared), formatting that a run inside a link
+  takes from its styles, a paragraph style's own run properties when it
+  has a linked character style, the author and date of a comment, and the
+  formatting of a typed heading label were not compared, so an untracked
+  change to any of them passed `verify`. They are reported as direct
+  changes of kind `settings_changed`, `background_changed` and
+  `comment_attribution_changed`, or as untouched-content violations.
+  Likewise: theme colours used in shading, borders and shapes, theme
+  fonts (`theme_changed`), list levels reached through a numbering
+  style, numbering and tab stops a paragraph takes from its style,
+  formatting of field results and note references, a comment marked
+  resolved, a data-store value a bound content control shows
+  (`bound_value_changed`), and a dropped embedded font
+  (`embedded_font_dropped`). A changed document property that only a
+  field displays is not reported: Word shows the old value until fields
+  are updated.
+- **`verify` no longer passes a pending revision moved inside its
+  paragraph or cell**, and compares what a table takes from its table
+  style (with the conditional formatting each table switches on),
+  paragraph properties a style gives, footnote separators
+  (`note_separator_changed`), a style that a STYLEREF field names
+  (`field_style_target_changed`), tab leaders, and the attribution and
+  threading of a comment anchored in a pending insertion.
+- **A footnote separator keeps an explicit "not bold" or "not italic"
+  through a save.** It was dropped, which shows under a bold or italic
+  paragraph style. `DecorationNode` gains `wrapper_rpr_authored`; code
+  that builds one directly must set it.
+- **More spellings of the same thing compare equal.** A literal carriage
+  return in text is read as a line feed, as XML requires. Attribute order
+  in a block content control's properties, the prefix a held element is
+  written with, white space laid out inside a held link run, and a header
+  or footer part named by an absolute or a relative path no longer count
+  as differences. Nor do a link's attributes in another order, a repeated
+  bookmark renumbered, adjacent math runs joined or split, a renamed VML
+  shape id, or a table-grid history that no pending change owns.
+- **A save no longer rewrites a revision's UTC timestamp.** Word records
+  two times on a tracked change: `w:date` (the author's clock) and
+  `w16du:dateUtc`. Every save set the second to the first on every pending
+  revision in the document, including other authors' revisions in
+  paragraphs the edit did not touch, and added one where there was none.
+  Each revision now keeps the UTC timestamp the document gave it, or none.
+  It is part of the read model (`date_utc`), and `verify` reports a
+  pre-existing revision whose UTC timestamp was changed, dropped or
+  invented, as it does a changed author. Results written by earlier
+  releases therefore fail `verify` against an input whose revisions had no
+  UTC timestamp. The snapshot format moves to version 54.
+- **A line feed or carriage return inside text is a space, as Word reads
+  it.** Written in a `w:t` or `w:delText`, literally or as a character
+  reference, it was read as a line break. Word shows one space for each
+  (one for a carriage return and line feed together). An untouched run is
+  saved as it was written; a run that an edit rewrites is written with
+  the space. `verify` treats the two spellings as the same text and still
+  reports a real line break as a change. A `&#13;` in untouched text is
+  written back as `&#13;` instead of a raw carriage return.
+- **Text inside a field's code region is field code.** A text run between
+  a field's begin marker and its separator was read as document text, also
+  inside a link. Word does not show it.
+- **A package whose ZIP entries are named with backslashes is read.** Word
+  opens such a package without repair; `validate` called it corrupt.
+- **Saving keeps pending revisions whole.** An unrelated edit no longer
+  splits or re-attributes a pending insertion that holds range markers or
+  spelling marks, an insertion that holds a deletion is written as one
+  insertion, and a note reference inserted with its note keeps one
+  identity.
+- **Documents Word opens are no longer refused or failed**: an empty run
+  carrying a formatting change, a field instruction without its argument,
+  negative paragraph spacing, a tab stop without its kind (Word reads
+  left), an empty element Word does not know inside a run (held as
+  written), a tracked change written as the last child of a run, and a
+  relationship to an embedded-object or glossary part that is not there.
+  A missing header, footer, notes or comments part is a fault only when
+  something refers to it. Also read as Word reads them: section
+  properties written anywhere in the body (folded into the one final
+  section; a save used to lose them, and the headers and footers with
+  them), paragraphs and breaks nested inside a text element, a negative
+  cell width, a style tab stop with empty values, a format-change record
+  directly in a run, a negative list level, an indent past 32 bits, an
+  unknown break type, backslashes in a relationship target, discarded
+  items with hexadecimal names, and a second font-table relationship of
+  a non-standard type. An archive may hold up to 65,535 entries (was
+  1,000); the size limits are unchanged. Word ignores a wrong checksum on
+  a ZIP entry and reads a UTF-16 content-types file, and so does the
+  reader now. Where Word reads a value it does not know as a default (an
+  underline, border, tab, line rule, shading, table width type, grid
+  column, kerning, oversized font size), the reader takes the same
+  default instead of refusing the document. A zero-byte custom XML item,
+  a missing core-properties or people part, and a non-numeric comment id
+  are not faults. A tracked numbering marker beside a paragraph-property
+  change is read so that Accept and Reject give Word's paragraphs.
+
+### Added
+
+- **Validator rules for faults Word refuses or repairs.** In the package:
+  bytes in front of the ZIP archive, a part or extension declared twice in
+  the content types, two relationships to a part that may exist once, a
+  comments part located by its relationship instead of its name, and
+  custom document properties Word repairs. In the markup: a run directly
+  in the body (I-DOC-004), text directly in a paragraph (I-DOC-005), a
+  section that ends inside a table cell (I-DOC-006), a drawing missing a
+  piece Word requires (I-DRAW-001, I-DRAW-002), an `mc:Ignorable` prefix
+  that is not declared (I-MC-001), a direction container without a
+  direction (I-RUN-001), a one-paragraph content control holding more
+  (I-SDT-001), a list item with empty display text (I-SDT-002), a cell
+  that does not end with a paragraph (I-TBL-001), a row with no cell
+  (I-TBL-002), deleted text inside an insertion or plain text inside a
+  deletion (I-TC-005), math directly in a table cell (I-MATH-002), and a
+  list level naming a picture bullet that does not exist. Also: a
+  property written without its value where Word needs one (I-ATTR-001:
+  paragraph, run and table style, alignment, outline level, list id and
+  level, highlight, vertical alignment), a run directly in a comment,
+  note, header or footer (I-STORY-002), a simple field with no instruction
+  (I-FLD-001), a picture content control that is also another kind
+  (I-SDT-003), `w:contentPart` in a run (I-RUN-002), an object written
+  with `w:objectEmbed` (I-OBJ-001), a glossary gallery value Word does not
+  know, a picture bullet with no picture, a thumbnail relationship that
+  points at the main document, a separator note that settings name and
+  the notes part lacks, a template reference with no relationship,
+  dangling relationship ids in headers, footers, notes and comments, and
+  an embedded chunk (`w:altChunk`) declared as a Word document whose part
+  is not a package. And: a content-type part name without its leading
+  slash, a picture or shape group under the wrong graphic-data type
+  (I-DRAW-003), a font without a name, a custom XML part or core
+  properties that are not well-formed, a core-properties date that is
+  not a W3C date, an alignment, outline level, highlight or vertical
+  alignment outside its allowed values (I-ATTR-002), a run or trailing
+  text inside a text element (I-RUN-003), and a main part whose root is
+  not in the WordprocessingML namespace. And: a plain-text content
+  control holding a field, or the end of a bookmark that starts outside
+  it (I-SDT-004); an element in an unknown namespace that is not marked
+  ignorable (I-NS-003); a drawing extent or position that is not a whole
+  number in range (I-STRUCT-001); an XML 1.1 declaration; a number format
+  or list start outside its type; a theme colour scheme missing a colour;
+  application properties with a non-numeric count or not well-formed; a
+  custom property with a malformed format id; a list item without its
+  value; a fallback written before its choice; a bookmark start without a
+  name; math text outside a math run; a chart part not well-formed; an
+  external target on a styles, numbering, font-table or settings
+  relationship. I-ATTR-002 now follows a table of what Word does with a
+  value outside its type, property by property.
+- **`validate` judges the file under its name.** Word opens a file named
+  `.docx` only when its main part is declared as a document; a template
+  or macro-enabled main part under that name is refused. The command line
+  now reports it. `stemma::api::validate_file(bytes, file_name)` is the
+  same check for embedders; `validate(bytes)` does not judge the name.
+
 ## [0.8.0] — 2026-11-12
 
 ### Added
@@ -2064,7 +2315,8 @@ applications.
   per-cell data.
 - Dual-licensed under MIT OR Apache-2.0.
 
-[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/stemma-sh/stemma/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/stemma-sh/stemma/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/stemma-sh/stemma/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/stemma-sh/stemma/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/stemma-sh/stemma/compare/v0.5.2...v0.6.0

@@ -192,6 +192,36 @@ fn compare_opt<T: PartialEq + std::fmt::Debug>(
     }
 }
 
+/// What a hoisted label looks like run by run: the text of the source runs
+/// it was hoisted from (label and separator) with the formatting each was
+/// written in, runs of equal formatting joined. Which run held the
+/// separator, and what the carriers record about where each run began, is
+/// how the label was spelled, not how it looks.
+fn prefix_formatting<'a>(
+    leading: Option<&'a crate::domain::PrefixLeadingRpr>,
+    trailing: Option<&'a crate::domain::PrefixLeadingRpr>,
+) -> Vec<(String, LabelFormatting<'a>)> {
+    let mut runs: Vec<(String, LabelFormatting<'a>)> = Vec::new();
+    for run in leading
+        .into_iter()
+        .chain(trailing)
+        .flat_map(|carrier| &carrier.source_runs)
+    {
+        match runs.last_mut() {
+            Some((text, (marks, props)))
+                if *marks == run.marks.as_slice() && **props == run.style_props =>
+            {
+                text.push_str(&run.text)
+            }
+            _ => runs.push((run.text.clone(), (run.marks.as_slice(), &run.style_props))),
+        }
+    }
+    runs
+}
+
+/// The marks and value properties a piece of a label is written in.
+type LabelFormatting<'a> = (&'a [Mark], &'a StyleProps);
+
 fn compare_val<T: PartialEq + std::fmt::Debug>(
     diffs: &mut Vec<Difference>,
     path: &str,
@@ -643,6 +673,7 @@ fn compare_paragraphs(
         has_direct_numbering,
         numbering_suppressed,
         direct_numbering_omits_ilvl,
+        direct_num_pr_without_list,
         // Derived cache: the pre-materialization numbering snapshot. Restored
         // into `numbering` during projection, so comparing `numbering` already
         // covers the structural fidelity; this is a transient bookkeeping field.
@@ -652,9 +683,10 @@ fn compare_paragraphs(
         literal_prefix_marks,
         literal_prefix_style_props,
         literal_prefix_rpr_authored: _, // ephemeral run-rPr provenance, not content
-        // mixed content/provenance; emitted XML is compared by the fidelity gate
-        literal_prefix_leading_rpr: _,
-        literal_prefix_trailing_rpr: _,
+        // Mixed content and provenance: the formatting of the label's
+        // source runs is compared below (`prefix_formatting`).
+        literal_prefix_leading_rpr,
+        literal_prefix_trailing_rpr,
         literal_prefix_leading_tab_twips,
         literal_prefix_leading_tab_count,
         literal_prefix_leading_ws,
@@ -724,6 +756,7 @@ fn compare_paragraphs(
         has_direct_numbering: b_has_direct_numbering,
         numbering_suppressed: b_numbering_suppressed,
         direct_numbering_omits_ilvl: b_direct_numbering_omits_ilvl,
+        direct_num_pr_without_list: b_direct_num_pr_without_list,
         materialized_numbering: _,
         rendered_text: _,
         literal_prefix: b_literal_prefix,
@@ -731,8 +764,8 @@ fn compare_paragraphs(
         literal_prefix_style_props: b_literal_prefix_style_props,
         literal_prefix_rpr_authored: _, // ephemeral run-rPr provenance, not content
         // mixed content/provenance; emitted XML is compared by the fidelity gate
-        literal_prefix_leading_rpr: _,
-        literal_prefix_trailing_rpr: _,
+        literal_prefix_leading_rpr: b_literal_prefix_leading_rpr,
+        literal_prefix_trailing_rpr: b_literal_prefix_trailing_rpr,
         literal_prefix_leading_tab_twips: b_literal_prefix_leading_tab_twips,
         literal_prefix_leading_tab_count: b_literal_prefix_leading_tab_count,
         literal_prefix_leading_ws: b_literal_prefix_leading_ws,
@@ -840,6 +873,12 @@ fn compare_paragraphs(
         direct_numbering_omits_ilvl,
         b_direct_numbering_omits_ilvl,
     );
+    compare_val(
+        diffs,
+        &format!("{path}.direct_num_pr_without_list"),
+        direct_num_pr_without_list,
+        b_direct_num_pr_without_list,
+    );
     compare_opt(
         diffs,
         &format!("{path}.literal_prefix"),
@@ -857,6 +896,18 @@ fn compare_paragraphs(
         &format!("{path}.literal_prefix_style_props"),
         literal_prefix_style_props,
         b_literal_prefix_style_props,
+    );
+    compare_val(
+        diffs,
+        &format!("{path}.literal_prefix.source_run_formatting"),
+        &prefix_formatting(
+            literal_prefix_leading_rpr.as_deref(),
+            literal_prefix_trailing_rpr.as_deref(),
+        ),
+        &prefix_formatting(
+            b_literal_prefix_leading_rpr.as_deref(),
+            b_literal_prefix_trailing_rpr.as_deref(),
+        ),
     );
     compare_opt(
         diffs,
@@ -1163,7 +1214,7 @@ fn compare_tracked_segments(
             }))
         }
         fn text_can_join(left: &TextNode, right: &TextNode) -> bool {
-            left.text_role == right.text_role
+            left.content_role() == right.content_role()
                 && left.marks == right.marks
                 && left.style_props == right.style_props
                 && left.source_run_attrs == right.source_run_attrs
@@ -1245,7 +1296,9 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
             // classified rather than silently dropped.
             let TextNode {
                 id: _, // ephemeral NodeId
-                text_role,
+                // compared below as content (`content_role`): a written
+                // spelling of the text is not content
+                text_role: _,
                 text,
                 marks,
                 style_props,
@@ -1255,7 +1308,7 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
             } = ta.as_ref();
             let TextNode {
                 id: _,
-                text_role: b_text_role,
+                text_role: _,
                 text: b_text,
                 marks: b_marks,
                 style_props: b_style_props,
@@ -1263,7 +1316,15 @@ fn compare_inline_node(diffs: &mut Vec<Difference>, path: &str, a: &InlineNode, 
                 source_run_attrs: b_source_run_attrs,
                 formatting_change: b_formatting_change,
             } = tb.as_ref();
-            compare_opt(diffs, &format!("{path}.text_role"), text_role, b_text_role);
+            // A written spelling of the text (line ends Word reads as spaces)
+            // is not content: compared is the role as content and the text
+            // as read.
+            compare_opt(
+                diffs,
+                &format!("{path}.text_role"),
+                &ta.content_role().cloned(),
+                &tb.content_role().cloned(),
+            );
             compare_val(diffs, &format!("{path}.text"), text, b_text);
             compare_val(diffs, &format!("{path}.marks"), marks, b_marks);
             compare_val(
@@ -1561,6 +1622,11 @@ fn compare_decorations(
         // fonts and size the auto-number renders in.
         wrapper_marks,
         wrapper_style_props,
+        // Which wrapper properties the source run wrote: write-back
+        // provenance (it keeps an explicit OFF in the markup), like a text
+        // run's `rpr_authored`; the wrapper's look is compared through
+        // `wrapper_marks` and `wrapper_style_props`.
+        wrapper_rpr_authored: _,
         joins_following_text_run,
         // raw_xml is the verbatim element bytes. The load-bearing identity
         // inside them is the `w:name` attribute (bookmarks §17.13.6.2, move
@@ -1581,6 +1647,7 @@ fn compare_decorations(
         proof_ref: _,
         wrapper_marks: b_wrapper_marks,
         wrapper_style_props: b_wrapper_style_props,
+        wrapper_rpr_authored: _,
         joins_following_text_run: b_joins_following_text_run,
         raw_xml: b_raw_xml,
         origin: _,
@@ -2201,6 +2268,7 @@ mod tests {
             date: Some(date.to_string()),
             apply_op_id: Some(format!("apply-{wire_id}")),
             identity,
+            date_utc: None,
         }
     }
 
@@ -2326,6 +2394,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -2415,6 +2484,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,
@@ -2669,6 +2739,7 @@ mod tests {
                 has_direct_numbering: true,
                 numbering_suppressed: false,
                 direct_numbering_omits_ilvl: false,
+                direct_num_pr_without_list: None,
                 materialized_numbering: None,
                 rendered_text: None,
                 literal_prefix: None,
@@ -2761,6 +2832,7 @@ mod segment_coalescing_tests {
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: None,
             joins_following_text_run: false,
             raw_xml: Some(br#"<w:bookmarkEnd w:id="2"/>"#.to_vec()),
             origin: None,
@@ -2848,6 +2920,7 @@ mod segment_coalescing_tests {
                     author: Some("A".to_string()),
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 }),
                 vec![text("Gone")],
             ),

@@ -82,6 +82,7 @@ fn session_source_validation_is_the_open_time_packages_and_survives_edits() {
                     author: Some("Editor".to_string()),
                     date: None,
                     apply_op_id: None,
+                    date_utc: None,
                 },
             },
         )

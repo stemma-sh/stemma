@@ -116,16 +116,31 @@ fn a_numbering_change_is_no_revision_and_keeps_the_numbering() {
     }
 }
 
-/// Two revisions (the inserted numbering and an existing paragraph-property
-/// change) have no single-revision spelling: still refused, naming the child.
+/// Inserted numbering beside an existing paragraph-property change: Word
+/// lists two revisions, but Accept keeps the numbering and the current
+/// properties and Reject restores the previous properties (here none, so no
+/// numbering), which is what the paragraph-property change alone gives. So
+/// the marker is read as no revision of its own (one revision fewer than
+/// Word lists), and the change resolves as Word resolves it.
 #[test]
-fn inserted_numbering_beside_a_paragraph_property_change_is_refused() {
-    let error = match Document::parse(&docx(
+fn inserted_numbering_beside_a_paragraph_property_change_is_read_as_the_change() {
+    let document = match Document::parse(&docx(
         r#"<w:ins w:id="5" w:author="Ines" w:date="2026-01-01T00:00:00Z"/>"#,
         r#"<w:pPrChange w:id="7" w:author="Otto" w:date="2026-01-02T00:00:00Z"><w:pPr/></w:pPrChange>"#,
     )) {
-        Ok(_) => panic!("two revisions cannot become one"),
-        Err(error) => error,
+        Ok(document) => document,
+        Err(error) => panic!("Word opens it cleanly: {}", error.message),
     };
-    assert!(error.message.contains("w:ins"), "{}", error.message);
+    let authors: Vec<_> = document
+        .revisions()
+        .into_iter()
+        .filter_map(|revision| revision.author)
+        .collect();
+    assert_eq!(authors, ["Otto"]);
+    for resolved in [
+        document.read_accepted().expect("accept"),
+        document.read_rejected().expect("reject"),
+    ] {
+        assert!(resolved.to_text().contains("Numbered line."));
+    }
 }

@@ -34,10 +34,6 @@ const REFUSED: &[(&str, &str)] = &[
         "side-only block equations have no qualified native Word carrier",
     ),
     (
-        "opaque-roundtrip",
-        "table-row replacement cannot be followed by another change in the same story",
-    ),
-    (
         "safe-us-vs-canada",
         "package reconciliation cannot switch differing document defaults between native Word terminals",
     ),

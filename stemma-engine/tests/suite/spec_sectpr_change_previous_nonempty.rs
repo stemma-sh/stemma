@@ -54,6 +54,7 @@ fn tracked_txn(steps: Vec<EditStep>) -> EditTransaction {
             author: Some("fid".into()),
             date: Some("2026-07-02T00:00:00Z".into()),
             apply_op_id: None,
+            date_utc: None,
         },
         summary: None,
     }

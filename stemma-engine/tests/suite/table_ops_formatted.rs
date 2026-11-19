@@ -70,6 +70,7 @@ fn text_para(id: &str, text: &str) -> ParagraphNode {
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -870,6 +871,7 @@ fn structural_op_on_table_with_tracked_row_refuses() {
         author: Some("Prior".to_string()),
         date: None,
         apply_op_id: None,
+        date_utc: None,
     }));
     let doc = doc_with(base);
 

@@ -92,17 +92,19 @@ fn stray_duplicate_run_level_rprchange_is_tolerated_and_revision_survives() {
 }
 
 #[test]
-fn non_duplicate_run_level_rprchange_still_fails_loud() {
+fn non_duplicate_run_level_rprchange_is_no_revision() {
+    // Word lists no revision for a w:rPrChange placed directly in a run (not
+    // inside its rPr): it opens the file without repair, and Accept All,
+    // Reject All and a plain save all drop the element and keep the run's
+    // properties (oracle-checked). So it is read as no revision.
     let body = concat!(
         r#"<w:p><w:r><w:rPr><w:b/></w:rPr>"#,
         r#"<w:rPrChange w:id="9" w:author="Someone Else" w:date="2024-01-01T00:00:00Z"><w:rPr/></w:rPrChange>"#,
         r#"<w:t>Titolo</w:t></w:r></w:p>"#,
     );
-    let err = match Document::parse(&build_docx(&wrap_body(body))) {
-        Ok(_) => panic!("a NON-duplicate run-level rPrChange carries a revision we must not drop"),
-        Err(e) => e,
-    };
-    assert!(format!("{err}").contains("rPrChange"), "{err}");
+    let doc = Document::parse(&build_docx(&wrap_body(body)))
+        .expect("Word opens a run-level rPrChange without repair");
+    assert!(doc.revisions().is_empty(), "{:?}", doc.revisions());
 }
 
 #[test]
@@ -132,8 +134,10 @@ fn outlook_bare_paragraph_rpr_is_preserved_verbatim() {
 /// cell's only paragraph) is a legal PENDING state in the wild: automated
 /// Word pipelines author it when tracked-deleting whole cell contents, and
 /// desktop Word (oracle-checked) opens such documents valid and unrepaired,
-/// counts one delete, CLEARS the cell content on accept (retaining the
-/// structural final paragraph, CT_Tc §17.4.66) and restores it on reject.
+/// counts one delete and restores the content on reject. Here the cell is
+/// the only one of the table's only row, its text deleted too: accepting
+/// removes the cell's text and its mark, so the row and the table go (Word,
+/// observed) and the paragraph after the table stays as it was.
 /// The engine's own producers must still never author the state (W5-F7,
 /// pinned by mark_cell_content_deleted's spec tests) — but the validator
 /// must not condemn wild input for it, and resolution must match Word.
@@ -170,22 +174,25 @@ fn deleted_cell_final_mark_resolves_like_word() {
     let bytes = build_docx(&wrap_body(DELETED_CELL_FINAL_MARK));
     let doc = Document::parse(&bytes).expect("parse");
 
-    // Accept: content cleared, structural final paragraph retained.
+    // Accept: the cell's text and mark go, and with them the table.
     let accepted = doc.project(Resolution::AcceptAll).expect("accept");
     let accepted_text = accepted.to_text();
     assert!(
         !accepted_text.contains("Short title") && accepted_text.contains("Tail paragraph."),
-        "Word's accept clears the cell content: {accepted_text:?}"
+        "Word's accept removes the cell content: {accepted_text:?}"
     );
     let xml = document_xml_of(
         &accepted
             .serialize(&ExportOptions::default())
             .expect("serialize"),
     );
-    let cell = &xml[xml.find("<w:tc>").expect("cell survives")..xml.find("</w:tc>").unwrap()];
     assert!(
-        cell.contains("<w:p"),
-        "the cell retains a structural final paragraph (CT_Tc §17.4.66): {cell}"
+        !xml.contains("<w:tbl") && !xml.contains("<w:tc"),
+        "Word's accept removes the table: {xml}"
+    );
+    assert_eq!(
+        accepted_text, "Tail paragraph.",
+        "only the paragraph after it is left"
     );
     assert!(!xml.contains("w:del"), "accept fully resolves: {xml}");
 
@@ -195,5 +202,69 @@ fn deleted_cell_final_mark_resolves_like_word() {
     assert!(
         rejected_text.contains("Short title"),
         "Word's reject restores the cell content: {rejected_text:?}"
+    );
+}
+
+/// Word writes a run with no content that still carries a tracked formatting
+/// change, for example between a field's instruction and its separator after
+/// the whole field was reformatted, and opens such a document without repair
+/// (CT_R admits zero content children, §17.3.2.25; `w:rPrChange`,
+/// §17.13.5.31). The document loads, and its text is the same pending,
+/// accepted and rejected, as in Word.
+///
+/// Word itself discards an empty run when it opens the file, so it shows no
+/// change for it. The model keeps the run, as it keeps every empty run, and
+/// so holds the change the markup states: it is listed, an untouched save
+/// keeps it, accepting keeps the run's properties and rejecting restores the
+/// earlier ones, leaving no tracked markup behind either way.
+const EMPTY_RUN_FORMATTING_CHANGE: &str = concat!(
+    r#"<w:p><w:r><w:t xml:space="preserve">Opening words </w:t></w:r>"#,
+    r#"<w:r><w:rPr><w:b/><w:sz w:val="28"/>"#,
+    r#"<w:rPrChange w:id="9" w:author="Ingrid" w:date="2024-03-02T09:10:00Z"><w:rPr/></w:rPrChange>"#,
+    r#"</w:rPr></w:r>"#,
+    r#"<w:r><w:t>closing words</w:t></w:r></w:p>"#,
+);
+
+#[test]
+fn empty_run_formatting_change_is_listed_kept_and_resolved() {
+    let doc = Document::parse(&build_docx(&wrap_body(EMPTY_RUN_FORMATTING_CHANGE)))
+        .expect("an empty run with a tracked formatting change loads");
+    let records = enumerate_revisions(&doc.snapshot().canonical);
+    assert_eq!(records.len(), 1, "one formatting change: {records:?}");
+    assert_eq!(records[0].kind, RevisionKind::FormatRun);
+    assert_eq!(doc.to_text(), "Opening words closing words");
+
+    let untouched = document_xml_of(&doc.serialize(&ExportOptions::default()).expect("save"))
+        .replace(" />", "/>");
+    assert!(
+        untouched.contains("<w:rPrChange") && untouched.contains(r#"w:author="Ingrid""#),
+        "an untouched save keeps the change pending: {untouched}"
+    );
+    assert_eq!(untouched.matches("<w:b/>").count(), 1, "{untouched}");
+
+    let accepted = document_xml_of(
+        &doc.project(Resolution::AcceptAll)
+            .expect("accept")
+            .serialize(&ExportOptions::default())
+            .expect("save accepted"),
+    )
+    .replace(" />", "/>");
+    assert!(!accepted.contains("rPrChange"), "{accepted}");
+    assert!(
+        accepted.contains("<w:b/>") && accepted.contains(r#"<w:sz w:val="28"/>"#),
+        "accept keeps the run's properties: {accepted}"
+    );
+
+    let rejected = document_xml_of(
+        &doc.project(Resolution::RejectAll)
+            .expect("reject")
+            .serialize(&ExportOptions::default())
+            .expect("save rejected"),
+    )
+    .replace(" />", "/>");
+    assert!(!rejected.contains("rPrChange"), "{rejected}");
+    assert!(
+        !rejected.contains("<w:b/>") && !rejected.contains("w:sz"),
+        "reject restores the earlier, empty properties: {rejected}"
     );
 }

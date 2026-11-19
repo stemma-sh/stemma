@@ -154,6 +154,10 @@ pub struct StyleDefinitions {
     char_styles: HashMap<String, TextMarks>,
     /// Paragraph styles' run properties: style_id → resolved TextMarks.
     para_styles: HashMap<String, TextMarks>,
+    /// Paragraph styles that are linked to a character style (§17.7.4.6):
+    /// the run properties the paragraph style's own chain resolves to,
+    /// before the linked character style is merged in.
+    linked_para_styles_own: HashMap<String, TextMarks>,
     /// Paragraph-style chains whose highest authored Latin `w:rFonts` element
     /// contains literal ascii/hAnsi values and no Theme selector. Word treats
     /// that element as replacing a lower docDefaults Theme selector rather
@@ -373,8 +377,8 @@ pub(crate) struct RawParagraphProps {
     indent_end_chars: Option<i32>,
     indent_first_line_chars: Option<i32>,
     indent_hanging_chars: Option<i32>,
-    spacing_before: Option<u32>,
-    spacing_after: Option<u32>,
+    spacing_before: Option<i32>,
+    spacing_after: Option<i32>,
     spacing_before_lines: Option<u32>,
     spacing_after_lines: Option<u32>,
     spacing_before_autospacing: Option<bool>,
@@ -601,6 +605,7 @@ impl StyleDefinitions {
         // 3. Resolve basedOn chains and fold in document defaults.
         let mut char_styles = HashMap::new();
         let mut para_styles = HashMap::new();
+        let mut linked_para_styles_own = HashMap::new();
         let mut para_literal_latin_over_doc_default_theme = HashSet::new();
         let mut para_tab_stops = HashMap::new();
         let mut para_props = HashMap::new();
@@ -632,6 +637,8 @@ impl StyleDefinitions {
                 Some(link_id) => {
                     match (raw_styles.get(link_id), char_styles.get(link_id)) {
                         (Some(linked_raw), Some(char_resolved)) => {
+                            linked_para_styles_own
+                                .insert(id.clone(), resolve_chain(id, &raw_styles));
                             // ISO 29500-1 §17.7.4.6: Three-way merge —
                             // char style's explicit properties always win,
                             // para style's explicit properties win over
@@ -739,6 +746,7 @@ impl StyleDefinitions {
             default_char_style_id,
             char_styles,
             para_styles,
+            linked_para_styles_own,
             para_literal_latin_over_doc_default_theme,
             para_tab_stops,
             para_props,
@@ -894,6 +902,18 @@ impl StyleDefinitions {
 
     /// The default character style ID (w:type="character" w:default="1").
     /// Per ISO 29500-1 §17.7.4.17, unstyled runs implicitly reference this style.
+    /// For a paragraph style linked to a character style, the run properties
+    /// its own chain resolves to before the character style is merged in;
+    /// `None` for a style that is not linked.
+    pub(crate) fn linked_paragraph_style_own_marks(&self, style_id: &str) -> Option<&TextMarks> {
+        self.linked_para_styles_own.get(style_id)
+    }
+
+    /// Whether the styles part defines a paragraph style with this id.
+    pub(crate) fn defines_paragraph_style(&self, style_id: &str) -> bool {
+        self.para_styles.contains_key(style_id)
+    }
+
     pub fn default_char_style_id(&self) -> Option<&str> {
         self.default_char_style_id.as_deref()
     }
@@ -1234,6 +1254,12 @@ impl StyleDefinitions {
     /// - `DirectNumPr::Absent` → fall through to style-resolved numPr.
     /// - `DirectNumPr::ListWithoutLevel` → the direct list at the level
     ///   [`resolve_omitted_direct_level`] gives.
+    /// - `DirectNumPr::WithoutList` → what the style gives, as for `Absent`;
+    ///   a written level replaces the level of an inherited active list.
+    ///   Checked against Word: on a paragraph whose style names a list, an
+    ///   empty `w:numPr` keeps the style's label and a `w:ilvl` alone moves
+    ///   the paragraph to that level of the same list; on a paragraph whose
+    ///   style names none, neither shape numbers it.
     pub fn resolve_effective_num_props(
         &self,
         style_id: Option<&str>,
@@ -1247,13 +1273,22 @@ impl StyleDefinitions {
                     ilvl: resolve_omitted_direct_level(Some(self), style_id),
                 });
             }
-            DirectNumPr::Absent => {}
+            DirectNumPr::Absent | DirectNumPr::WithoutList { .. } => {}
         }
-        style_id
+        let inherited = style_id
             .and_then(|id| self.para_props.get(id))
             .and_then(|p| p.num_props.clone())
             .or_else(|| self.ppr_defaults.num_props.clone())
-            .unwrap_or(DirectNumPr::Absent)
+            .unwrap_or(DirectNumPr::Absent);
+        match (direct, inherited) {
+            (DirectNumPr::WithoutList { ilvl: Some(ilvl) }, DirectNumPr::Active(list)) => {
+                DirectNumPr::Active(NumProps {
+                    num_id: list.num_id,
+                    ilvl: *ilvl,
+                })
+            }
+            (_, inherited) => inherited,
+        }
     }
 
     /// Resolve effective contextual spacing for a paragraph (§17.3.1.9).
@@ -2587,7 +2622,7 @@ fn parse_ppr_defaults(root: &Element) -> Result<RawParagraphProps, String> {
 /// read by the same ST_HpsMeasure parser as a run's
 /// (`word_ir::font_size_half_points`), so styles and runs agree, and a value is
 /// never dropped.
-fn parse_rpr_marks(rpr: &Element) -> Result<TextMarks, String> {
+pub(crate) fn parse_rpr_marks(rpr: &Element) -> Result<TextMarks, String> {
     let mut marks = TextMarks::default();
 
     for child in &rpr.children {
@@ -2884,14 +2919,16 @@ fn extract_raw_para_props(ppr: &Element) -> Result<RawParagraphProps, String> {
                 )
                 .map_err(|err| format!("pPr/spacing: {err}"))
             };
-            let before = twips("before", false)?
+            // Signed: Word opens and keeps a negative before/after, here as
+            // in a paragraph (see `word_ir::SpacingProps`).
+            let before = twips("before", true)?
                 .map(|v| {
-                    u32::try_from(v).map_err(|_| format!("pPr/spacing: w:before {v} out of range"))
+                    i32::try_from(v).map_err(|_| format!("pPr/spacing: w:before {v} out of range"))
                 })
                 .transpose()?;
-            let after = twips("after", false)?
+            let after = twips("after", true)?
                 .map(|v| {
-                    u32::try_from(v).map_err(|_| format!("pPr/spacing: w:after {v} out of range"))
+                    i32::try_from(v).map_err(|_| format!("pPr/spacing: w:after {v} out of range"))
                 })
                 .transpose()?;
             let before_lines = attr_get(sp, "w:beforeLines").and_then(|v| v.parse().ok());
@@ -3025,6 +3062,8 @@ pub fn resolve_effective_direct_num_props(
                 num_id: *num_id,
                 ilvl: resolve_omitted_direct_level(None, style_id),
             }),
+            // Without styles there is no inherited list to take a level in.
+            DirectNumPr::WithoutList { .. } => DirectNumPr::Absent,
             DirectNumPr::Absent | DirectNumPr::Suppressed | DirectNumPr::Active(_) => {
                 direct.clone()
             }
@@ -3299,8 +3338,16 @@ fn parse_ppr_tab_stops(ppr: &Element) -> Result<Option<Vec<TabStopDef>>, String>
             _ => continue,
         };
         let raw_position = attr_get(el, "w:pos").ok_or("pPr/tabs: w:tab without w:pos")?;
-        let position = crate::word_ir::tab_position_twips(raw_position)
-            .ok_or_else(|| format!("pPr/tabs: invalid w:tab/@w:pos value {raw_position:?}"))?;
+        // An empty position is position 0: Word opens a style's
+        // `<w:tab w:val="" w:pos=""/>` without repair and saves it as
+        // `<w:tab w:val="left" w:pos="0"/>` (observed; the empty alignment
+        // reads as left below).
+        let position = if raw_position.is_empty() {
+            0
+        } else {
+            crate::word_ir::tab_position_twips(raw_position)
+                .ok_or_else(|| format!("pPr/tabs: invalid w:tab/@w:pos value {raw_position:?}"))?
+        };
         // w:val — parse tab alignment (ST_TabJc §17.18.81).
         // MS-OI29500 §17.18.84: "start" is an alias for "left", "end" for "right".
         let alignment = match attr_get(el, "w:val") {
@@ -4365,8 +4412,9 @@ mod tests {
     /// A style's font size is an ST_HpsMeasure (§17.3.2.38), read as a run's
     /// is (Word 16, verified): a decimal truncates toward zero ("21.6" is 21),
     /// a non-numeric value is 0 (Word saves 0 and renders its minimum size),
-    /// never dropped so the size silently inherits. A negative size is refused
-    /// naming the style.
+    /// never dropped so the size silently inherits. A negative size is the
+    /// unsigned 16-bit number (Word saves 65532 for "-4" in a style); below
+    /// that range it is refused naming the style.
     #[test]
     fn a_style_font_size_reads_as_word_reads_it() {
         let xml = make_styles_xml(
@@ -4386,8 +4434,15 @@ mod tests {
         let negative = make_styles_xml(
             r#"<w:style w:type="character" w:styleId="Note"><w:rPr><w:sz w:val="-4"/></w:rPr></w:style>"#,
         );
-        let error = match StyleDefinitions::parse(&negative) {
-            Ok(_) => panic!("a negative size is refused"),
+        let defs = StyleDefinitions::parse(&negative).expect("Word opens a negative size");
+        let note = defs.resolve(&TextMarks::default(), Some("Note"), None);
+        assert_eq!(note.font_size, Some(65532));
+
+        let below_range = make_styles_xml(
+            r#"<w:style w:type="character" w:styleId="Note"><w:rPr><w:sz w:val="-65536"/></w:rPr></w:style>"#,
+        );
+        let error = match StyleDefinitions::parse(&below_range) {
+            Ok(_) => panic!("a size below the 16-bit range is refused"),
             Err(error) => error,
         };
         assert!(

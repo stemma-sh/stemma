@@ -119,6 +119,7 @@ fn map_docx_error(err: DocxError) -> RuntimeError {
         DocxError::ZipWrite(source) => format!("docx write failed: {source}"),
         DocxError::Io(source) => format!("docx io error: {source}"),
         DocxError::MissingFile(name) => format!("docx missing file: {name}"),
+        DocxError::InvalidEncoding(detail) => format!("docx unreadable text: {detail}"),
         DocxError::ZipBomb(detail) => format!("docx rejected: {detail}"),
         DocxError::DuplicatePartName { name, existing } => format!(
             "docx rejected: duplicate ZIP part name {name:?} (case-equivalent to {existing:?}); \
@@ -1544,7 +1545,7 @@ pub(crate) fn try_mint_identities(doc: &mut CanonDoc) -> Result<(), RevisionIden
     }
     unify_inserted_move_origin_identities(doc);
     unify_whole_paragraph_insert_identities(doc);
-    unify_inserted_note_identities(doc);
+    unify_inserted_note_identities(doc, &newly_minted_groups);
     unify_comment_change_identities(doc);
     unify_created_header_footer_identities(doc);
     unify_tail_paragraph_insert_identities(doc);
@@ -1576,7 +1577,16 @@ pub(crate) fn try_mint_identities(doc: &mut CanonDoc) -> Result<(), RevisionIden
 /// while rejecting its definition (or vice versa). The shared note id plus
 /// matching attribution is the structural proof that the carriers belong to
 /// one intention.
-fn unify_inserted_note_identities(doc: &mut CanonDoc) {
+///
+/// Only a reference carrier minted in THIS pass (its identity is still one of
+/// the pass's temporary `newly_minted` ids) may join a note. A reference that
+/// already has an identity keeps it, as every minted carrier does: minting is
+/// additive. The note story's shape is not the same in every pass — import
+/// mints before the whole-paragraph lifts, so a note opening with an empty
+/// inserted paragraph only reads as an inserted note on a later pass — and
+/// rewriting an established identity there silently readdressed a pending
+/// insertion after an unrelated edit, while a reopen re-derived the original.
+fn unify_inserted_note_identities(doc: &mut CanonDoc, newly_minted: &HashSet<u32>) {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NoteKind {
         Footnote,
@@ -1618,13 +1628,20 @@ fn unify_inserted_note_identities(doc: &mut CanonDoc) {
             })
     }
 
-    fn visit_block(block: &mut BlockNode, insertions: &[NoteInsertion]) {
+    fn visit_block(
+        block: &mut BlockNode,
+        insertions: &[NoteInsertion],
+        newly_minted: &HashSet<u32>,
+    ) {
         match block {
             BlockNode::Paragraph(paragraph) => {
                 for segment in &mut paragraph.segments {
                     let TrackingStatus::Inserted(reference_revision) = &mut segment.status else {
                         continue;
                     };
+                    if !newly_minted.contains(&reference_revision.identity) {
+                        continue;
+                    }
                     let matching = segment.inlines.iter().find_map(|inline| {
                         let InlineNode::OpaqueInline(opaque) = inline else {
                             return None;
@@ -1654,7 +1671,7 @@ fn unify_inserted_note_identities(doc: &mut CanonDoc) {
                 for row in &mut table.rows {
                     for cell in &mut row.cells {
                         for nested in &mut cell.blocks {
-                            visit_block(nested, insertions);
+                            visit_block(nested, insertions, newly_minted);
                         }
                     }
                 }
@@ -1687,7 +1704,7 @@ fn unify_inserted_note_identities(doc: &mut CanonDoc) {
         }
     }
     for tracked in &mut doc.blocks {
-        visit_block(&mut tracked.block, &insertions);
+        visit_block(&mut tracked.block, &insertions, newly_minted);
     }
 }
 
@@ -2032,7 +2049,7 @@ fn lift_whole_paragraph_moves(doc: &mut CanonDoc) {
             if tracked.move_id.is_none() {
                 continue;
             }
-            let (revision, container) = match &tracked.status {
+            let (mut revision, container) = match &tracked.status {
                 TrackingStatus::Deleted(revision) => (revision.clone(), "moveFrom"),
                 TrackingStatus::Inserted(revision) => (revision.clone(), "moveTo"),
                 _ => continue,
@@ -2040,25 +2057,57 @@ fn lift_whole_paragraph_moves(doc: &mut CanonDoc) {
             let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
                 continue;
             };
+            // The move's container of this side and attribution, as written.
+            let carrier = |inline: &InlineNode, revision: &RevisionInfo| -> Option<Element> {
+                let InlineNode::Decoration(decoration) = inline else {
+                    return None;
+                };
+                if decoration.kind != crate::domain::DecorationType::MoveRange {
+                    return None;
+                }
+                let element = word_xml::parse_raw_fragment(decoration.raw_xml.as_deref()?).ok()?;
+                let local = element.name.rsplit(':').next().unwrap_or(&element.name);
+                (local == container
+                    && attr_get(&element, "w:author") == revision.author.as_ref()
+                    && attr_get(&element, "w:date") == revision.date.as_ref())
+                .then_some(element)
+            };
+            // The status came from the move range, which carries no UTC date
+            // (Word writes `w16du:dateUtc` on the containers and the marks,
+            // not on the range). When every container of the move here gives
+            // the same one, it is the move's: keep it on the status, which the
+            // serializer writes back on the containers and the mark.
+            if revision.date_utc.is_none() {
+                let mut utc: Option<Option<String>> = None;
+                let mut agree = true;
+                for inline in paragraph.segments.iter().flat_map(|s| &s.inlines) {
+                    if let Some(element) = carrier(inline, &revision) {
+                        let this = crate::xml_attrs::revision_date_utc(&element);
+                        match &utc {
+                            None => utc = Some(this),
+                            Some(seen) if *seen == this => {}
+                            Some(_) => agree = false,
+                        }
+                    }
+                }
+                if agree && let Some(Some(date_utc)) = utc {
+                    revision.date_utc = Some(date_utc);
+                    match &mut tracked.status {
+                        TrackingStatus::Deleted(status) | TrackingStatus::Inserted(status) => {
+                            status.date_utc = revision.date_utc.clone();
+                        }
+                        _ => unreachable!("matched a move status above"),
+                    }
+                }
+            }
+            let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
+                continue;
+            };
             for segment in &mut paragraph.segments {
                 segment.inlines.retain(|inline| {
-                    let InlineNode::Decoration(decoration) = inline else {
-                        return true;
-                    };
-                    if decoration.kind != crate::domain::DecorationType::MoveRange {
-                        return true;
-                    }
-                    let Some(element) = decoration
-                        .raw_xml
-                        .as_deref()
-                        .and_then(|raw| word_xml::parse_raw_fragment(raw).ok())
-                    else {
-                        return true;
-                    };
-                    let local = element.name.rsplit(':').next().unwrap_or(&element.name);
-                    !(local == container
-                        && attr_get(&element, "w:author") == revision.author.as_ref()
-                        && attr_get(&element, "w:date") == revision.date.as_ref())
+                    carrier(inline, &revision).is_none_or(|element| {
+                        crate::xml_attrs::revision_date_utc(&element) != revision.date_utc
+                    })
                 });
             }
             paragraph
@@ -2254,7 +2303,12 @@ fn lift_lowered_inserted_simple_fields(doc: &mut CanonDoc) {
 pub(crate) fn untracked_segment_subsumed_by_insertion(segment: &TrackedSegment) -> bool {
     segment.inlines.iter().all(|inline| {
         matches!(inline, InlineNode::Decoration(decoration)
-            if decoration.origin.is_some() || decoration_is_self_contained_run(decoration))
+            if decoration.origin.is_some()
+                || decoration_is_self_contained_run(decoration)
+                // A proofing mark records where the spelling checker
+                // stopped; Word writes the one that opens at an insertion's
+                // first word outside the `w:ins`. It is not content.
+                || decoration.kind == crate::domain::DecorationType::ProofError)
     })
 }
 
@@ -2297,7 +2351,7 @@ fn lift_whole_paragraph_insertions(doc: &mut CanonDoc) {
         let control_ends = crate::block_controls::control_ends(blocks);
         for index in 0..story_len {
             let (before, rest) = blocks.split_at_mut(index);
-            let tracked = &mut rest[0];
+            let (tracked, following) = rest.split_first_mut().expect("index is within the story");
             if !matches!(tracked.status, TrackingStatus::Normal) {
                 continue;
             }
@@ -2315,11 +2369,30 @@ fn lift_whole_paragraph_insertions(doc: &mut CanonDoc) {
             }
             match &paragraph.para_mark_status {
                 Some(TrackingStatus::Inserted(mark)) => {
-                    // An empty pre-existing paragraph whose pilcrow became
-                    // inserted is the source side of an append, not an
-                    // inserted empty paragraph. Engine-authored empty blocks
-                    // always carry their fresh paraId.
-                    if paragraph.segments.is_empty() && paragraph.para_id.is_none() {
+                    // An empty paragraph is nothing but its mark: with the
+                    // mark inserted, the paragraph is inserted (Word removes
+                    // it on Reject wherever it stands). The reading does not
+                    // depend on whether the paragraph carries a w14:paraId; a
+                    // program that adds those ids on save has not changed
+                    // what the revision is.
+                    //
+                    // One shape is something else. A paragraph appended at
+                    // the end of a story or of a block content control cannot
+                    // carry its own inserted mark, so the mark is written on
+                    // the paragraph before it (see the arm below). When that
+                    // paragraph is empty, its inserted mark is the appended
+                    // paragraph's break, and the empty paragraph was there
+                    // before.
+                    let carries_the_break_of_an_appended_paragraph = paragraph.segments.is_empty()
+                        && (index + 2 == story_len || control_ends.contains_key(&(index + 1)))
+                        && following.first().is_some_and(|next| {
+                            matches!(next.status, TrackingStatus::Normal)
+                                && matches!(&next.block, BlockNode::Paragraph(appended)
+                                    if appended.para_mark_status.is_none()
+                                        && !appended.segments.is_empty()
+                                        && segments_inserted_under(appended, mark.identity))
+                        });
+                    if carries_the_break_of_an_appended_paragraph {
                         continue;
                     }
                     let block_revision = mark.clone();
@@ -3644,6 +3717,7 @@ fn build_canonical_from_archive(
         rel_lookup: &rel_lookup,
         active_move_name: None,
         open_paragraph_move_ranges: Vec::new(),
+        body_section: None,
         active_move_status: None,
     };
     let mut body_section_properties = None;
@@ -3849,6 +3923,7 @@ pub(crate) fn build_canonical_from_root_with_stories(
         rel_lookup,
         active_move_name: None,
         open_paragraph_move_ranges: Vec::new(),
+        body_section: None,
         active_move_status: None,
     };
 
@@ -4097,6 +4172,7 @@ fn consume_move_range_boundary(
                 author,
                 date,
                 apply_op_id: None,
+                date_utc: crate::xml_attrs::revision_date_utc(element),
             }));
         }
         return Ok(true);
@@ -4113,6 +4189,7 @@ fn consume_move_range_boundary(
                 author,
                 date,
                 apply_op_id: None,
+                date_utc: crate::xml_attrs::revision_date_utc(element),
             }));
         }
         return Ok(true);
@@ -4141,7 +4218,8 @@ fn consume_move_range_boundary(
 /// `w:moveFrom` is inserted text deleted since. Spell both as the stacked
 /// status, so the resolutions cascade (Reject All drops the deleted inserted
 /// text with its insertion) instead of resolving the nested change alone.
-/// Body paragraphs only: a cell paragraph carries no move pairing to test.
+/// A body paragraph that is a block-level move half is left as it is; a cell
+/// paragraph is never one (see [`stack_edits_inside_cell_move_containers`]).
 /// A `w:ins` whose only content is comment reference runs, for comments
 /// whose range holds no inserted text, is not a revision to Word (Word 16,
 /// verified on the oracle): Word lists no revision for it, and Accept and
@@ -4244,13 +4322,43 @@ fn untrack_reference_only_insertions(doc: &mut CanonDoc) {
 fn stack_edits_inside_unnamed_move_containers(
     blocks: &mut [TrackedBlock],
 ) -> Result<(), RuntimeError> {
-    for tracked in blocks
-        .iter_mut()
-        .filter(|tracked| tracked.move_id.is_none())
+    for tracked in blocks.iter_mut() {
+        match &mut tracked.block {
+            BlockNode::Paragraph(paragraph) if tracked.move_id.is_none() => {
+                stack_edits_inside_move_containers_of(paragraph)?;
+            }
+            BlockNode::Table(table) => stack_edits_inside_cell_move_containers(table)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The cell paragraphs of a table, nested tables included. A cell paragraph
+/// is no block of its own, so no block-level move pairs it: its move
+/// containers are read as the stacked state whether or not a range names
+/// them. Word removes a destination's deleted text with the destination when
+/// it rejects the move, and with the deletion when it accepts (a table row
+/// moved with a deletion in it, Word 16), which the stacked status gives.
+fn stack_edits_inside_cell_move_containers(table: &mut TableNode) -> Result<(), RuntimeError> {
+    for cell in table.rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+        for block in &mut cell.blocks {
+            match block {
+                BlockNode::Paragraph(paragraph) => {
+                    stack_edits_inside_move_containers_of(paragraph)?;
+                }
+                BlockNode::Table(inner) => stack_edits_inside_cell_move_containers(inner)?,
+                BlockNode::OpaqueBlock(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stack_edits_inside_move_containers_of(
+    paragraph: &mut ParagraphNode,
+) -> Result<(), RuntimeError> {
     {
-        let BlockNode::Paragraph(paragraph) = &mut tracked.block else {
-            continue;
-        };
         let mut open: Option<(bool, RevisionInfo, Vec<u8>)> = None;
         for segment in &mut paragraph.segments {
             if let Some((is_destination, container, _)) = &open {
@@ -4306,6 +4414,7 @@ fn stack_edits_inside_unnamed_move_containers(
                             author: attr_get(&element, "w:author").cloned(),
                             date: attr_get(&element, "w:date").cloned(),
                             apply_op_id: None,
+                            date_utc: crate::xml_attrs::revision_date_utc(&element),
                         },
                         raw.to_vec(),
                     )),
@@ -4516,6 +4625,7 @@ fn close_paragraph_move_range_at_body_level(
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(crate::word_xml::serialize_raw_fragment(element)),
         origin: None,
@@ -4545,13 +4655,87 @@ fn tag_blocks_in_move_range(blocks: &mut [TrackedBlock], ctx: &ParseContext<'_>)
             if matches!(tb.status, TrackingStatus::Normal)
                 && let Some(ref status) = ctx.active_move_status
             {
-                tb.status = status.clone();
+                let mut status = status.clone();
                 if let BlockNode::Paragraph(p) = &mut tb.block {
+                    // The range carries no UTC date; the paragraph's own move
+                    // mark of the same side and attribution does, when Word
+                    // wrote one. It is the move's: keep it.
+                    match (&mut status, &p.para_mark_status) {
+                        (TrackingStatus::Deleted(range), Some(TrackingStatus::Deleted(mark)))
+                        | (TrackingStatus::Inserted(range), Some(TrackingStatus::Inserted(mark)))
+                            if range.date_utc.is_none()
+                                && mark.author == range.author
+                                && mark.date == range.date =>
+                        {
+                            range.date_utc = mark.date_utc.clone();
+                        }
+                        _ => {}
+                    }
                     p.para_mark_status = Some(status.clone());
                 }
+                tb.status = status;
             }
         }
     }
+}
+
+/// Fold a later body-level `w:sectPr` into the ones read before it.
+///
+/// A `w:sectPr` directly in the body is the final section's properties
+/// wherever it stands; it is never a section break. Word opens a body with
+/// several (first, in the middle, last, any mix) without repair and writes
+/// one final `w:sectPr` on save, built as follows (observed, Word 16.0):
+///
+/// - header and footer references come from the first body-level `w:sectPr`
+///   only, all of them, and no later one adds or replaces any (a later
+///   default, first-page or even reference is dropped, also when the first
+///   has none);
+/// - every other property is folded in document order: a later element
+///   with the same name updates the attributes it states and keeps the
+///   others (`w:pgSz` 15840x12240 landscape then 11906x16838 gives
+///   11906x16838 landscape), and an element only an earlier one has stays
+///   (`w:titlePg`, `w:cols`, `w:pgNumType`). An empty `w:sectPr` changes
+///   nothing.
+///
+/// A later element's own children, when it has any, replace the earlier
+/// element's; that case was not observed.
+fn fold_body_section_properties(earlier: &Element, later: &Element) -> Element {
+    let is_reference =
+        |el: &Element| is_w_tag(el, "headerReference") || is_w_tag(el, "footerReference");
+    let mut folded = earlier.clone();
+    for child in &later.children {
+        let XMLNode::Element(property) = child else {
+            continue;
+        };
+        if is_reference(property) {
+            continue;
+        }
+        let existing = folded.children.iter_mut().find_map(|node| match node {
+            XMLNode::Element(el) if el.name == property.name && el.prefix == property.prefix => {
+                Some(el)
+            }
+            _ => None,
+        });
+        match existing {
+            Some(existing) => {
+                for (name, value) in &property.attributes {
+                    existing.attributes.insert(name.clone(), value.clone());
+                }
+                if property
+                    .children
+                    .iter()
+                    .any(|node| matches!(node, XMLNode::Element(_)))
+                {
+                    existing.children = property.children.clone();
+                }
+            }
+            None => folded.children.push(XMLNode::Element(property.clone())),
+        }
+    }
+    for (name, value) in &later.attributes {
+        folded.attributes.insert(name.clone(), value.clone());
+    }
+    folded
 }
 
 /// Consume one direct child of `<w:body>` into the canonical block list.
@@ -4622,11 +4806,16 @@ fn consume_body_child(
 
     // Extract sectPrChange from body-level w:sectPr (final section properties).
     if is_w_tag(element, "sectPr") {
+        let folded = match ctx.body_section.take() {
+            Some(earlier) => fold_body_section_properties(&earlier, element),
+            None => element.clone(),
+        };
         *body_section_properties = Some(
-            crate::word_ir::parse_section_properties(element, rel_lookup)
+            crate::word_ir::parse_section_properties(&folded, rel_lookup)
                 .map_err(map_word_ir_error)?,
         );
-        *body_section_property_change = extract_body_section_property_change(element)?;
+        *body_section_property_change = extract_body_section_property_change(&folded)?;
+        ctx.body_section = Some(folded);
         return Ok(());
     }
 
@@ -4964,6 +5153,7 @@ pub(crate) fn synthesize_blank_paragraph(rel_id: &str, style_id: &str) -> BlockN
         has_direct_numbering: false,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -5186,13 +5376,16 @@ struct ParseContext<'a> {
     /// and the matching `move*RangeEnd` in a later one; every paragraph from
     /// the start to the end holds that move's runs.
     open_paragraph_move_ranges: Vec<(String, String)>,
+    /// The body-level `w:sectPr` elements read so far, folded into one (see
+    /// [`fold_body_section_properties`]).
+    body_section: Option<Element>,
 }
 /// What a nested-tracked-container scan found in a body item's subtree.
 enum NestedTracking {
-    /// `ins`-in-`ins` / `del`-in-`del` (at any nesting distance): invalid
-    /// OOXML (validator rule I-TC-003, ISO 29500 §17.13.5) — refuse the
-    /// document at import.
-    SameType { name: String },
+    /// `ins`-in-`ins` / `del`-in-`del` (at any nesting distance). Word
+    /// opens it without repair and reads the inner change, and so does the
+    /// run-level parser; the body item is imported normally.
+    SameType,
     /// An unsupported nested mix: a move-container combination outside the two
     /// Word-reachable states the model supports, or nesting deeper than one
     /// level —
@@ -5234,15 +5427,14 @@ fn find_nested_tracking(element: &Element, enclosing: &[&str]) -> Option<NestedT
     if is_tracked_content_container(element) {
         // Same-type at any nesting distance is invalid OOXML.
         if enclosing.contains(&name) {
-            return Some(NestedTracking::SameType {
-                name: name.to_string(),
-            });
+            return Some(NestedTracking::SameType);
         }
         if let Some(outer) = enclosing.last() {
             let pair_supported = (*outer == "ins" && name == "del")
                 || (*outer == "del" && name == "ins")
                 || (*outer == "moveTo" && name == "del")
-                || (*outer == "moveFrom" && name == "ins");
+                || (*outer == "moveFrom" && name == "ins")
+                || (*outer == "moveFrom" && name == "del");
             // Deeper than one level, or an unknown mix: not modeled.
             if enclosing.len() >= 2 || !pair_supported {
                 return Some(NestedTracking::UnsupportedMix {
@@ -5454,17 +5646,12 @@ fn append_blocks_from_element(
     if let Some(index) = body_index {
         match find_nested_tracking(element, &[]) {
             None => {}
-            Some(NestedTracking::SameType { name }) => {
-                return Err(RuntimeError {
-                    code: ErrorCode::InvalidDocx,
-                    message: format!(
-                        "invalid nested tracked change at body item {index}: <w:{name}> \
-                         inside <w:{name}> (same-type nesting violates I-TC-003 / \
-                         ISO 29500 §17.13.5)"
-                    ),
-                    details: ErrorDetails::default(),
-                });
-            }
+            // An insertion inside an insertion, or a deletion inside a
+            // deletion. Checked against Word: it opens the document without
+            // repair and reads the content as one change, the inner one
+            // (its author and date; the outer wrapper is gone on save). The
+            // run-level parser gives the content the inner revision.
+            Some(NestedTracking::SameType) => {}
             Some(NestedTracking::UnsupportedMix { outer, inner }) => {
                 let opaque_id = NodeId::from(format!("opaque_{}", *ctx.opaque_counter));
                 *ctx.opaque_counter += 1;
@@ -5505,6 +5692,31 @@ fn append_blocks_from_element(
     }
 
     if is_w_tag(element, "p") {
+        // Compat-tolerance edge (see `crate::compat`): paragraphs inside a
+        // `w:t`, read as Word reads them, each becoming its own block.
+        if crate::compat::paragraph_has_paragraphs_in_text(element)
+            && let Some(paragraphs) = crate::compat::split_paragraphs_in_text(element)
+        {
+            let context = match body_index {
+                Some(index) => format!("body_index={index}"),
+                None => "nested block".to_string(),
+            };
+            ctx.diagnostics
+                .push(crate::compat::paragraphs_in_text_diagnostic(context));
+            for paragraph in &paragraphs {
+                let block = paragraph_from_element(
+                    paragraph,
+                    ctx.block_id_counter,
+                    ctx.numbering_defs,
+                    ctx.numbering_state,
+                    ctx.style_defs,
+                    ctx.default_tab_stop,
+                    ctx.rel_lookup,
+                )?;
+                blocks.push(normal_tracked_block(block));
+            }
+            return Ok(());
+        }
         // Compat-tolerance edge (see `crate::compat`): a `w:tbl` as a direct
         // child of `w:p` is schema-invalid (CT_P has no tbl child) but Word
         // opens it without repair, rendering the table as block content. Hoist
@@ -5627,7 +5839,44 @@ fn append_blocks_from_element(
                 let open = ctx.open_paragraph_move_ranges.last().cloned();
                 ctx.open_paragraph_move_ranges
                     .retain(|(id, _)| !ended.contains(id));
-                open.map(|(_, name)| name)
+                // A range that ends before this paragraph's first content
+                // ended with the paragraph before it: Word writes that end
+                // marker at the start of the following paragraph. This
+                // paragraph holds none of the moved content and its mark is
+                // its own (an insertion here is an insertion, not a move
+                // destination), so it does not join the move.
+                let ended_before_content: Vec<&String> = element
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        XMLNode::Element(child) => Some(child),
+                        _ => None,
+                    })
+                    .take_while(|child| {
+                        [
+                            "pPr",
+                            "bookmarkStart",
+                            "bookmarkEnd",
+                            "proofErr",
+                            "commentRangeStart",
+                            "commentRangeEnd",
+                            "permStart",
+                            "permEnd",
+                            "moveFromRangeStart",
+                            "moveFromRangeEnd",
+                            "moveToRangeStart",
+                            "moveToRangeEnd",
+                        ]
+                        .iter()
+                        .any(|marker| is_w_tag(child, marker))
+                    })
+                    .filter(|child| {
+                        is_w_tag(child, "moveFromRangeEnd") || is_w_tag(child, "moveToRangeEnd")
+                    })
+                    .filter_map(|child| attr_get(child, "w:id"))
+                    .collect();
+                open.filter(|(id, _)| !ended_before_content.contains(&id))
+                    .map(|(_, name)| name)
             }
         };
         blocks.push(tracked);
@@ -5838,6 +6087,7 @@ fn extract_block_tracking_status(container: &Element) -> Result<TrackingStatus, 
         author,
         date,
         apply_op_id: None,
+        date_utc: crate::xml_attrs::revision_date_utc(container),
     };
     Ok(if is_insertion {
         TrackingStatus::Inserted(info)
@@ -5912,6 +6162,7 @@ fn structural_range_decoration(
         // Paragraph-level range marker (bookmark/customXml range): no host run.
         wrapper_marks: Vec::new(),
         wrapper_style_props: StyleProps::default(),
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(crate::word_xml::serialize_raw_fragment(el)),
         origin: None,
@@ -6562,10 +6813,11 @@ fn table_row_from_element(
                         && let Some(read) = row_height_element(prop_el, "trHeight element")?
                     {
                         height = read;
+                        // A rule outside ST_HeightRule is no rule: Word
+                        // opens it without repair and saves the height
+                        // without w:hRule (observed with `bogus`).
                         height_rule = attr_get(prop_el, "w:hRule")
-                            .map(|s| HeightRule::from_xml_str(s))
-                            .transpose()
-                            .map_err(|e| invalid_docx(&format!("trHeight: {e}")))?;
+                            .and_then(|s| HeightRule::from_xml_str(s).ok());
                     }
                     // Detect row-level tracked changes (w:ins, w:del).
                     // A row can carry BOTH markers — inserted by one pending
@@ -6582,6 +6834,7 @@ fn table_row_from_element(
                             author: attr_get(prop_el, "w:author").cloned(),
                             date: attr_get(prop_el, "w:date").cloned(),
                             apply_op_id: None,
+                            date_utc: crate::xml_attrs::revision_date_utc(prop_el),
                         });
                     }
                     if is_w_tag(prop_el, "del") {
@@ -6592,6 +6845,7 @@ fn table_row_from_element(
                             author: attr_get(prop_el, "w:author").cloned(),
                             date: attr_get(prop_el, "w:date").cloned(),
                             apply_op_id: None,
+                            date_utc: crate::xml_attrs::revision_date_utc(prop_el),
                         });
                     }
                 }
@@ -6874,6 +7128,7 @@ fn table_cell_from_element(
         rel_lookup: ctx.rel_lookup,
         active_move_name: None,
         open_paragraph_move_ranges: Vec::new(),
+        body_section: None,
         active_move_status: None,
     };
 
@@ -6975,6 +7230,7 @@ fn table_cell_from_element(
                             author: attr_get(prop_el, "w:author").cloned(),
                             date: attr_get(prop_el, "w:date").cloned(),
                             apply_op_id: None,
+                            date_utc: crate::xml_attrs::revision_date_utc(prop_el),
                         });
                     }
                     if is_w_tag(prop_el, "cellMerge")
@@ -6996,6 +7252,7 @@ fn table_cell_from_element(
                             author: attr_get(prop_el, "w:author").cloned(),
                             date: attr_get(prop_el, "w:date").cloned(),
                             apply_op_id: None,
+                            date_utc: crate::xml_attrs::revision_date_utc(prop_el),
                         });
                     }
                 }
@@ -7061,6 +7318,38 @@ fn table_cell_from_element(
                 {
                     for content_child in &sdt_el.children {
                         if let XMLNode::Element(content_el) = content_child {
+                            // A range marker between the control's blocks
+                            // is anchored like one between the cell's own
+                            // blocks (below). Passed on as a block it had no
+                            // anchor and was dropped, tearing its pair (a
+                            // bookmark started before a table of contents
+                            // control and ended inside it).
+                            if is_w_tag(content_el, "bookmarkStart")
+                                || is_w_tag(content_el, "bookmarkEnd")
+                            {
+                                pending_markers.push((
+                                    blocks.len(),
+                                    structural_bookmark_decoration(
+                                        content_el,
+                                        &format!("tbl_{table_id}_r{row_index}_c{cell_index}"),
+                                        &mut cell_ctx,
+                                    ),
+                                ));
+                                continue;
+                            }
+                            if is_w_tag(content_el, "permStart") || is_w_tag(content_el, "permEnd")
+                            {
+                                pending_markers.push((
+                                    blocks.len(),
+                                    structural_range_decoration(
+                                        content_el,
+                                        &format!("tbl_{table_id}_r{row_index}_c{cell_index}"),
+                                        DecorationType::PermissionRange,
+                                        &mut cell_ctx,
+                                    ),
+                                ));
+                                continue;
+                            }
                             append_blocks_from_element(
                                 content_el,
                                 None,
@@ -7265,6 +7554,7 @@ fn parse_cell_merge(
             author: attr_get(element, "w:author").cloned(),
             date: attr_get(element, "w:date").cloned(),
             apply_op_id: None,
+            date_utc: crate::xml_attrs::revision_date_utc(element),
         },
         after,
         before,
@@ -7415,12 +7705,10 @@ fn parse_table_layout(tbl_pr: &Element) -> Result<Option<TableLayout>, RuntimeEr
         if let XMLNode::Element(el) = child
             && is_w_tag(el, "tblLayout")
         {
-            return match attr_get(el, "w:type") {
-                Some(v) => TableLayout::from_xml_str(v)
-                    .map(Some)
-                    .map_err(|e| invalid_docx(&format!("tblLayout: {e}"))),
-                None => Ok(None),
-            };
+            // A type outside ST_TblLayoutType is no layout: Word opens it
+            // without repair and saves the table without w:tblLayout
+            // (observed with `bogus`).
+            return Ok(attr_get(el, "w:type").and_then(|v| TableLayout::from_xml_str(v).ok()));
         }
     }
     Ok(None)
@@ -8011,11 +8299,14 @@ fn is_word_twips_number(s: &str) -> bool {
 
 /// A grid column width (`w:gridCol/@w:w`, ST_TwipsMeasure), read by
 /// [`read_twips`]. Word repairs a non-number here (recomputing the grid from
-/// the cells), which the import cannot, so it is refused; a negative width
-/// is refused as outside ST_TwipsMeasure. An empty value is no width (0, as
-/// an omitted one is, §17.4.16).
+/// the cells), which the import cannot, so it is refused. An empty or a
+/// negative value is no width (0, as an omitted one is, §17.4.16).
 pub(crate) fn parse_grid_col_width(s: &str, context: &str) -> Result<u32, RuntimeError> {
     let twips = match read_twips(s) {
+        // A negative width is no width: Word opens a grid column of -500
+        // without repair, recomputing the grid as it does on every save
+        // (observed); the model reads it as an omitted width (0).
+        Ok(Some(twips)) if twips < 0 => 0,
         Ok(twips) => twips.unwrap_or(0),
         Err(TwipsError::NotANumber) => {
             return Err(invalid_docx(&format!(
@@ -8193,16 +8484,16 @@ fn parse_table_measurement(
                 message: format!("width value '{s}' out of range in {context}"),
                 details: ErrorDetails::default(),
             };
-            let to_u32 = |n: i64, s: &str| -> Result<u32, RuntimeError> {
-                u32::try_from(n).map_err(|_| out_of_range(s))
+            // Signed, within the 32-bit range Word reads: a negative cell
+            // width opens cleanly and is saved as written (observed).
+            let to_u32 = |n: i64, s: &str| -> Result<i64, RuntimeError> {
+                i32::try_from(n).map(i64::from).map_err(|_| out_of_range(s))
             };
+            // A type outside ST_TblWidth (`px`, `bogus`) is twips: Word opens
+            // it without repair and saves the same width as `w:type="dxa"`
+            // (observed on w:tcW; the same value on w:tblW opens cleanly).
             let width_type_str = attr_get(el, "w:type").map(|s| s.as_str()).unwrap_or("dxa");
-            let declared_type =
-                WidthType::from_xml_str(width_type_str).map_err(|e| RuntimeError {
-                    code: ErrorCode::InvalidDocx,
-                    message: format!("invalid width type in {element_name} element: {e}"),
-                    details: ErrorDetails::default(),
-                })?;
+            let declared_type = WidthType::from_xml_str(width_type_str).unwrap_or(WidthType::Dxa);
             let (w, width_type, pct_literal) = match attr_get(el, "w:w") {
                 None => (0, declared_type, None),
                 Some(s) => match parse_measurement_or_percent(s, &context)? {
@@ -8348,6 +8639,7 @@ fn parse_tbl_pr_ex_change(
         identity: 0,
         author: attr_get(change, "w:author").cloned().unwrap_or_default(),
         date: attr_get(change, "w:date").cloned(),
+        date_utc: crate::xml_attrs::revision_date_utc(change),
     }))
 }
 
@@ -9413,13 +9705,8 @@ fn parse_change_revision_id(change_el: &Element) -> u32 {
         .unwrap_or(0)
 }
 
-// Match the expanded attribute name, including aliased input prefixes.
 fn parse_property_change_date_utc(change: &Element) -> Option<String> {
-    change.attributes.iter().find_map(|(name, value)| {
-        (name.namespace.as_deref() == Some(crate::xml_attrs::W16DU_NS)
-            && name.local_name == "dateUtc")
-            .then(|| value.clone())
-    })
+    crate::xml_attrs::revision_date_utc(change)
 }
 
 /// Parse w:tblPrChange from within a w:tblPr element (§17.13.5.34).
@@ -10446,6 +10733,7 @@ fn tracking_status_from_atom_ctx(ctx: &AtomTrackingContext) -> TrackingStatus {
         author: Some(ctx.author.clone()),
         date: ctx.date.clone(),
         apply_op_id: None,
+        date_utc: ctx.date_utc.clone(),
     };
     if let Some(del) = &ctx.stacked_deletion {
         // The stacked state: word_ir normalized both markup orders to
@@ -10458,6 +10746,7 @@ fn tracking_status_from_atom_ctx(ctx: &AtomTrackingContext) -> TrackingStatus {
                 author: Some(del.author.clone()),
                 date: del.date.clone(),
                 apply_op_id: None,
+                date_utc: del.date_utc.clone(),
             },
         }));
     }
@@ -10687,6 +10976,9 @@ fn paragraph_from_element(
         crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
         crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
             "numId {num_id} without a level is resolved to an active level before this point"
+        ),
+        crate::word_ir::DirectNumPr::WithoutList { .. } => unreachable!(
+            "a numPr without a list is resolved to the style's numbering before this point"
         ),
     };
 
@@ -11211,6 +11503,12 @@ fn paragraph_from_element(
             view.num_props,
             crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
         ),
+        direct_num_pr_without_list: match view.num_props {
+            crate::word_ir::DirectNumPr::WithoutList { ilvl } => {
+                Some(crate::domain::NumPrWithoutList { ilvl })
+            }
+            _ => None,
+        },
         materialized_numbering: None,
         rendered_text,
         literal_prefix,
@@ -11579,12 +11877,13 @@ pub(crate) fn convert_text_marks_to_style_props(
         run_shading: {
             match &text_marks.run_shading {
                 Some(shading) => {
+                    // A pattern outside ST_Shd is `clear`: Word opens it
+                    // without repair and saves `w:val="clear"` (observed
+                    // with `bogus` on a run).
                     let val = shading
                         .val
                         .as_deref()
-                        .map(ShadingPattern::from_xml_str)
-                        .transpose()
-                        .map_err(|e| invalid_docx(&format!("run shading: {e}")))?;
+                        .map(|v| ShadingPattern::from_xml_str(v).unwrap_or(ShadingPattern::Clear));
                     Some(Shading {
                         fill: shading.fill.clone(),
                         val,
@@ -11902,13 +12201,13 @@ fn convert_ppr_change(
                 effective_style_id,
                 &crate::word_ir::DirectNumPr::ListWithoutLevel { num_id },
             ),
-            (num_id, ilvl) => {
-                return Err(invalid_docx(&format!(
-                    "pPrChange previous w:numPr has an incomplete numbering pair \
-                     (numId={num_id:?}, ilvl={ilvl:?}) that names no list; refusing rather \
-                     than inventing the list, as for a direct w:numPr"
-                )));
-            }
+            // The previous numPr named no list: as for a direct one, the
+            // list is the style's and a written level selects its level.
+            (None, ilvl) => crate::styles::resolve_effective_direct_num_props(
+                Some(style_defs),
+                effective_style_id,
+                &crate::word_ir::DirectNumPr::WithoutList { ilvl },
+            ),
         },
     };
     if resolved_num_pr == crate::word_ir::DirectNumPr::Absent
@@ -11923,6 +12222,9 @@ fn convert_ppr_change(
         crate::word_ir::DirectNumPr::Absent | crate::word_ir::DirectNumPr::Suppressed => None,
         crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
             "numId {num_id} without a level is resolved to an active level before this point"
+        ),
+        crate::word_ir::DirectNumPr::WithoutList { .. } => unreachable!(
+            "a numPr without a list is resolved to the style's numbering before this point"
         ),
     };
     let effective_numbering = effective_num_props
@@ -12126,6 +12428,7 @@ fn convert_ppr_change(
         } else {
             crate::domain::ParagraphFormattingChangeCarrier::ParagraphProperties
         },
+        date_utc: ppr_change.date_utc.clone(),
     })
 }
 
@@ -12149,6 +12452,7 @@ fn attach_mark_only_formatting_change(
         date: change.date.clone(),
         apply_op_id: None,
         identity: 0,
+        date_utc: change.date_utc.clone(),
     };
     let mut snapshot = crate::edit::snapshot_paragraph_formatting(paragraph, &revision);
     snapshot.carrier = crate::domain::ParagraphFormattingChangeCarrier::ParagraphMarkProperties;
@@ -12181,6 +12485,7 @@ fn convert_rpr_change(text_marks: &TextMarks) -> Result<Option<FormattingChange>
         identity: 0,
         author: rpr.author.clone(),
         date: rpr.date.clone(),
+        date_utc: rpr.date_utc.clone(),
     }))
 }
 /// Convert a plain-text hyperlink's authored runs through the ordinary run
@@ -12290,7 +12595,7 @@ pub fn hyperlink_display_inlines(
         .atoms
         .iter()
         .map(|atom| match &atom.kind {
-            AtomKind::Text(text) => text.as_str(),
+            AtomKind::Text(text) => crate::word_xml::word_text_as_read(text),
             _ => unreachable!("text atoms were validated above"),
         })
         .collect();
@@ -12323,10 +12628,15 @@ fn inline_nodes_from_atoms(
                 let local_index = *inline_counter;
                 *inline_counter += 1;
                 let id = NodeId::from(format!("{}_t{}", block_id.0, local_index));
+                // The text Word reads; the written spelling is kept when it
+                // differs, for the run to be written back as it was.
+                let read = crate::word_xml::word_text_as_read(text);
+                let text_role =
+                    (read != *text).then(|| crate::domain::TextRole::WrittenLineEnds(text.clone()));
                 out.push(InlineNode::from(TextNode {
                     id,
-                    text_role: None,
-                    text: text.clone(),
+                    text_role,
+                    text: read,
                     marks: convert_text_marks_to_marks(&resolved_marks),
                     style_props: convert_text_marks_to_style_props(&resolved_marks)?,
                     rpr_authored: run_rpr_authored(&atom.marks),
@@ -12499,16 +12809,29 @@ fn inline_nodes_from_atoms(
                     block_id: id.clone(),
                     docx_anchor: format!("paragraph:{}:atom:{}", block_id.0, local_index),
                 };
+                // Without a formatting revision the complete raw run owns its
+                // rPr. With one, the raw run is held bare and its properties
+                // and revision are modeled, as on a mark alone in its run.
+                let (wrapper_marks, wrapper_style_props, formatting_change) =
+                    if atom.marks.rpr_change.is_some() {
+                        (
+                            convert_text_marks_to_marks(&atom.marks),
+                            convert_text_marks_to_style_props(&atom.marks)?,
+                            convert_rpr_change(&atom.marks)?,
+                        )
+                    } else {
+                        (Vec::new(), StyleProps::default(), None)
+                    };
                 out.push(InlineNode::from(DecorationNode {
-                    formatting_change: None,
+                    formatting_change,
                     id,
                     kind: DecorationType::EmptyRun,
                     source_run_attrs: atom.source_run_attrs.clone(),
                     opaque_ref: format!("paragraph:{}:empty-run:{}", block_id.0, local_index),
                     proof_ref,
-                    // The complete raw run owns its rPr; do not re-wrap it.
-                    wrapper_marks: Vec::new(),
-                    wrapper_style_props: StyleProps::default(),
+                    wrapper_marks,
+                    wrapper_style_props,
+                    wrapper_rpr_authored: None,
                     joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
@@ -12537,11 +12860,12 @@ fn inline_nodes_from_atoms(
                 // run with adjacent text, so re-emitting that run's rPr onto the
                 // atom-split marker run would only duplicate the formatting the
                 // text run already carries — leave those empty.
-                let (wrapper_marks, wrapper_style_props, formatting_change) =
+                let (wrapper_marks, wrapper_style_props, wrapper_rpr_authored, formatting_change) =
                     if decoration_wrapper_rpr_is_load_bearing(name) {
                         (
                             convert_text_marks_to_marks(&atom.marks),
                             convert_text_marks_to_style_props(&atom.marks)?,
+                            Some(run_rpr_authored(&atom.marks)),
                             convert_rpr_change(&atom.marks)?,
                         )
                     } else {
@@ -12571,10 +12895,11 @@ fn inline_nodes_from_atoms(
                             (
                                 convert_text_marks_to_marks(&atom.marks),
                                 convert_text_marks_to_style_props(&atom.marks)?,
+                                Some(run_rpr_authored(&atom.marks)),
                                 convert_rpr_change(&atom.marks)?,
                             )
                         } else {
-                            (Vec::new(), StyleProps::default(), None)
+                            (Vec::new(), StyleProps::default(), None, None)
                         }
                     };
                 let local_name = name.split(':').next_back().unwrap_or(name);
@@ -12596,6 +12921,7 @@ fn inline_nodes_from_atoms(
                     proof_ref,
                     wrapper_marks,
                     wrapper_style_props,
+                    wrapper_rpr_authored,
                     joins_following_text_run,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
@@ -12630,6 +12956,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width move-range wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    wrapper_rpr_authored: None,
                     joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
@@ -12661,6 +12988,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width bidi-wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    wrapper_rpr_authored: None,
                     joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
@@ -12702,6 +13030,7 @@ fn inline_nodes_from_atoms(
                     // Zero-width customXml/smartTag wrapper marker: no host run rPr.
                     wrapper_marks: Vec::new(),
                     wrapper_style_props: StyleProps::default(),
+                    wrapper_rpr_authored: None,
                     joins_following_text_run: false,
                     raw_xml: Some(raw_xml.clone()),
                     origin: None,
@@ -13288,6 +13617,7 @@ pub(crate) fn extract_body_section_property_change(
             author,
             date,
             apply_op_id: None,
+            date_utc: crate::xml_attrs::revision_date_utc(change_el),
         },
         previous_properties_raw: buf,
     }))
@@ -13855,6 +14185,7 @@ fn parse_story_blocks(
         rel_lookup: &empty_rel_lookup,
         active_move_name: None,
         open_paragraph_move_ranges: Vec::new(),
+        body_section: None,
         active_move_status: None,
     };
 
@@ -14294,6 +14625,9 @@ fn parse_story_block(
             crate::word_ir::DirectNumPr::ListWithoutLevel { num_id } => unreachable!(
                 "numId {num_id} without a level is resolved to an active level before this point"
             ),
+            crate::word_ir::DirectNumPr::WithoutList { .. } => unreachable!(
+                "a numPr without a list is resolved to the style's numbering before this point"
+            ),
         };
 
         // Synthesize numbering if available
@@ -14663,6 +14997,12 @@ fn parse_story_block(
                 view.num_props,
                 crate::word_ir::DirectNumPr::ListWithoutLevel { .. }
             ),
+            direct_num_pr_without_list: match view.num_props {
+                crate::word_ir::DirectNumPr::WithoutList { ilvl } => {
+                    Some(crate::domain::NumPrWithoutList { ilvl })
+                }
+                _ => None,
+            },
             materialized_numbering: None,
             rendered_text,
             literal_prefix,
@@ -14789,6 +15129,7 @@ fn parse_note_blocks(
         rel_lookup: &empty_rel_lookup,
         active_move_name: None,
         open_paragraph_move_ranges: Vec::new(),
+        body_section: None,
         active_move_status: None,
     };
 
@@ -15043,7 +15384,7 @@ fn extract_field_data(local_name: &str, raw_xml: &[u8]) -> Result<FieldData, Run
         }
         "instrText" | "delInstrText" => {
             let instruction_text = extract_element_text(&el);
-            let semantic = parse_field_semantic(local_name, instruction_text.as_deref())?;
+            let semantic = parse_field_semantic(instruction_text.as_deref());
             Ok(FieldData {
                 field_kind: FieldKind::Instruction,
                 instruction_text,
@@ -15055,7 +15396,7 @@ fn extract_field_data(local_name: &str, raw_xml: &[u8]) -> Result<FieldData, Run
             let instruction_text = attr_get(&el, "w:instr")
                 .or_else(|| attr_get(&el, "instr"))
                 .cloned();
-            let semantic = parse_field_semantic(local_name, instruction_text.as_deref())?;
+            let semantic = parse_field_semantic(instruction_text.as_deref());
             let result_text = {
                 let text = extract_nested_run_text(&el);
                 if text.is_empty() { None } else { Some(text) }
@@ -15080,33 +15421,19 @@ fn extract_field_data(local_name: &str, raw_xml: &[u8]) -> Result<FieldData, Run
 /// Parse a field instruction string into a typed `FieldSemantic`. Empty
 /// instructions and unknown field names produce `Ok(None)` / `Ok(Some(Other))`.
 ///
-/// `<w:fldSimple w:instr="...">` is always a complete instruction, so a parse
-/// failure there is treated as a hard error (no-fallback rule). `<w:instrText>`
-/// and `<w:delInstrText>` carry only a *fragment* of an instruction when a
-/// field is split across multiple runs (common with nested IF/MERGEFIELD); a
-/// fragment that cannot stand alone returns `Ok(None)` rather than failing.
-/// Multi-run instruction reassembly is a separate, deferred feature.
-fn parse_field_semantic(
-    local_name: &str,
-    instruction_text: Option<&str>,
-) -> Result<Option<crate::domain::FieldSemantic>, RuntimeError> {
-    let Some(text) = instruction_text else {
-        return Ok(None);
-    };
-    let trimmed = text.trim();
+/// An instruction that names a known field but lacks what that field needs
+/// (`HYPERLINK` with no target, `MERGEFIELD` with no name) has no typed
+/// reading: `Ok(None)`. Word opens such a field cleanly whether it is written
+/// as `w:fldSimple` or as a complex field, and keeps the instruction as
+/// written; so does the model (`FieldData::instruction_text` and the raw
+/// field are kept, nothing is dropped). In a complex field the text may also
+/// be one fragment of an instruction split across runs.
+fn parse_field_semantic(instruction_text: Option<&str>) -> Option<crate::domain::FieldSemantic> {
+    let trimmed = instruction_text?.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let is_complete_instruction = local_name == "fldSimple";
-    match crate::domain::parse_field_instruction(trimmed) {
-        Ok(semantic) => Ok(Some(semantic)),
-        Err(err) if is_complete_instruction => Err(RuntimeError {
-            code: ErrorCode::InvalidDocx,
-            message: format!("Failed to parse fldSimple instruction text: {err}: {text:?}"),
-            details: ErrorDetails::default(),
-        }),
-        Err(_) => Ok(None),
-    }
+    crate::domain::parse_field_instruction(trimmed).ok()
 }
 
 /// Extract direct text content from an XML element (e.g., instrText).
@@ -16779,7 +17106,9 @@ mod tests {
         // non-number here: both refused.
         assert!(parse_grid_col_width("50%", "gridCol element").is_err());
         assert!(parse_grid_col_width("abc", "gridCol element").is_err());
-        assert!(parse_grid_col_width("-100", "gridCol element").is_err());
+        // A negative width is no width: Word opens it without repair and
+        // recomputes the grid.
+        assert_eq!(parse_grid_col_width("-100", "gridCol element").unwrap(), 0);
     }
 
     // =========================================================================
@@ -17311,11 +17640,9 @@ mod tests {
 
     #[test]
     fn ppr_change_import_refuses_unresolved_or_malformed_previous_numpr_and_outline() {
+        // An empty previous numPr is not malformed: Word opens it and reads
+        // it as naming no list (`spec_numbering_numpr_without_list`).
         for (property, expected) in [
-            (
-                r#"<w:numPr/>"#,
-                "incomplete numbering pair (numId=None, ilvl=None)",
-            ),
             (
                 r#"<w:numPr><w:numId/></w:numPr>"#,
                 "numId is present without w:val",
@@ -17823,6 +18150,7 @@ mod tests {
                 author: Some("test".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         };
         let edited = doc
@@ -18121,6 +18449,7 @@ mod tests {
             wire_id: 7,
             author: Some("Reviewer".to_string()),
             date: None,
+            date_utc: None,
             kind: crate::tracked_model::RevisionKind::Delete,
             block_id: NodeId::from("p_1"),
             location: StoryScope::Body,

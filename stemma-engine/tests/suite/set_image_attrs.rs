@@ -118,6 +118,7 @@ fn txn(steps: Vec<EditStep>) -> EditTransaction {
             author: Some("Img".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }
@@ -516,6 +517,7 @@ fn media_part_bytes_unchanged_after_resize() {
             author: Some("Img".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     runtime.apply_edit(&import.doc_handle, &txn).expect("apply");

@@ -208,6 +208,7 @@ fn edit_body_paragraph(doc: &Document, target_text: &str) -> Vec<u8> {
             author: Some("Spec".to_string()),
             date: Some("2026-07-10T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&txn)

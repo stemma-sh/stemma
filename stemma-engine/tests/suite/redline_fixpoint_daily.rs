@@ -75,6 +75,7 @@ fn run_fixpoint(fixture: &str, before: &[u8], after: &[u8]) -> Result<(), String
         author: Some("fixpoint-daily".to_string()),
         date: Some("2025-06-01T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     };
 
     let diff = diff_documents(&canon_a, &canon_b)

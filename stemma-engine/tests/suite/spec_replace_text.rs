@@ -82,6 +82,7 @@ fn apply(doc: &Document, options: &ReplaceTextOptions) -> Result<Document, Strin
             author: Some(options.author.clone()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
     };
     doc.apply(&tx).map_err(|e| format!("{e:?}"))

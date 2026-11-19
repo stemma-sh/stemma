@@ -89,6 +89,7 @@ fn revision(id: u32) -> RevisionInfo {
         author: Some("enum-test".to_string()),
         date: Some("2026-06-12T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 

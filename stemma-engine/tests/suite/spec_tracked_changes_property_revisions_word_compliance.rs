@@ -161,11 +161,6 @@ fn assert_opens_clean(bytes: &[u8], msg: &str) {
     assert!(report.ok, "{msg}\n  validate() issues: {:?}", report.issues);
 }
 
-fn assert_not_opens_clean(bytes: &[u8], msg: &str) {
-    let report = stemma::api::validate(bytes);
-    assert!(!report.ok, "{msg}\n  validate() report: ok={}", report.ok);
-}
-
 fn accepted_text(bytes: &[u8]) -> String {
     Document::parse(bytes)
         .expect("parse")
@@ -388,37 +383,35 @@ fn rprchange_serializes_as_trailing_rpr_child_after_edit_reemit() {
 }
 
 #[test]
-fn pprchange_missing_id_is_nonconformant() {
+fn pprchange_missing_id_opens_clean() {
     // ECMA-376 §17.13.5.29, ISO 29500-1 §17.13.5.29.
-    // NEGATIVE post-condition: a pPrChange missing the required w:id should be
-    // reported non-conformant.
     let body = r#"<w:p><w:pPr><w:jc w:val="center"/><w:pPrChange w:author="John Doe" w:date="2006-01-01T12:00:00Z"><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>Centered</w:t></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
 
-    assert_not_opens_clean(
+    // The standard calls a missing w:id non-conformant. Checked against Word
+    // with this exact document: it opens without repair.
+    assert_opens_clean(
         &b,
-        "pprchange_missing_id_is_nonconformant — ECMA-376 §17.13.5.29 (id row: 'If this attribute is omitted, then the document is non-conformant'): \
-         a pPrChange missing the required w:id must be reported non-conformant, not opens-clean.",
+        "Word opens a property change with no w:id without repair",
     );
 }
 
 #[test]
-fn sectprchange_missing_id_is_nonconformant() {
+fn sectprchange_missing_id_opens_clean() {
     // ECMA-376 §17.13.5.32, ISO 29500-1 §17.13.5.32.
-    // NEGATIVE post-condition: a sectPrChange missing required w:id should be
-    // non-conformant.
     let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:sectPrChange w:author="John Doe" w:date="2006-01-01T12:00:00Z"><w:sectPr/></w:sectPrChange></w:sectPr>"#;
     let b = make_docx(body, &[]);
 
-    assert_not_opens_clean(
+    // The standard calls a missing w:id non-conformant. Checked against Word
+    // with this exact document: it opens without repair.
+    assert_opens_clean(
         &b,
-        "sectprchange_missing_id_is_nonconformant — ECMA-376 §17.13.5.32 (id row: 'If this attribute is omitted, then the document is non-conformant'): \
-         a sectPrChange missing the required w:id must be reported non-conformant, not opens-clean.",
+        "Word opens a property change with no w:id without repair",
     );
 }
 
 #[test]
-fn header_property_change_missing_id_is_nonconformant() {
+fn header_property_change_missing_id_opens_clean() {
     let body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr/>"#;
     let header = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -426,9 +419,11 @@ fn header_property_change_missing_id_is_nonconformant() {
 </w:hdr>"#;
     let b = make_docx(body, &[("word/header1.xml", header)]);
 
-    assert_not_opens_clean(
+    // The standard calls a missing w:id non-conformant. Checked against Word
+    // with this exact document: it opens without repair.
+    assert_opens_clean(
         &b,
-        "I-TC-002 applies to revision carriers in every Word story, including headers",
+        "Word opens a property change with no w:id without repair",
     );
 }
 

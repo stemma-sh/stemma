@@ -378,7 +378,13 @@ impl CustomProperties {
     /// class Word uses for user-entered string properties. Replacing keeps the
     /// existing position; inserting appends.
     pub fn set_string(&mut self, name: &str, value: String) {
-        if let Some(existing) = self.properties.iter_mut().find(|p| p.name == name) {
+        // Word treats names that differ only in case as one property, and
+        // repairs a part that holds both; match as Word does.
+        if let Some(existing) = self
+            .properties
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+        {
             existing.value = value;
             existing.kind = CustomValueKind::Lpwstr;
         } else {
@@ -394,7 +400,7 @@ impl CustomProperties {
     pub fn get(&self, name: &str) -> Option<&str> {
         self.properties
             .iter()
-            .find(|p| p.name == name)
+            .find(|p| p.name.eq_ignore_ascii_case(name))
             .map(|p| p.value.as_str())
     }
 
@@ -434,6 +440,74 @@ impl CustomProperties {
 
         write_xml(&root, CUSTOM_PROPS_PATH)
     }
+}
+
+/// What Word repairs in a `docProps/custom.xml`, one message per fault.
+///
+/// Observed, Word 16.0. A property belongs to the property set its `fmtid`
+/// names (compared ignoring case). Word repairs the document when two
+/// properties of one set share a name (also when the names differ only in
+/// case) or share a `pid`, and when any `pid` is below 2. The same name or
+/// `pid` in two different sets is fine, and so are gaps between pids.
+///
+/// Names are compared ignoring ASCII case only: that is the case pair Word
+/// was observed on.
+pub(crate) fn custom_properties_word_faults(bytes: &[u8]) -> Result<Vec<String>, DocPropsError> {
+    let root = parse_xml(bytes, CUSTOM_PROPS_PATH)?;
+    let mut faults = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    let mut pids = std::collections::HashSet::new();
+    for child in &root.children {
+        let XMLNode::Element(el) = child else {
+            continue;
+        };
+        if local_name(&el.name) != "property" {
+            continue;
+        }
+        let set = attr(el, "fmtid").unwrap_or_default().to_ascii_lowercase();
+        // The property set is a GUID in braces. Checked against Word: a
+        // fmtid cut to `D5CDD505` makes Word repair the file.
+        if let Some(fmtid) = attr(el, "fmtid")
+            && !is_braced_guid(fmtid)
+        {
+            faults.push(format!(
+                "custom document property set {fmtid:?} (fmtid) is not a GUID; Word repairs \
+                 such a file"
+            ));
+        }
+        if let Some(name) = attr(el, "name")
+            && !names.insert((set.clone(), name.to_ascii_lowercase()))
+        {
+            faults.push(format!(
+                "custom document property name {name:?} is used more than once; Word repairs such a file"
+            ));
+        }
+        if let Some(pid) = attr(el, "pid") {
+            if pid.parse::<i64>().is_ok_and(|pid| pid < 2) {
+                faults.push(format!(
+                    "custom document property id {pid} is below 2; Word repairs such a file"
+                ));
+            }
+            if !pids.insert((set, pid.to_string())) {
+                faults.push(format!(
+                    "custom document property id {pid} is used more than once; Word repairs such a file"
+                ));
+            }
+        }
+    }
+    Ok(faults)
+}
+
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` with hexadecimal digits.
+fn is_braced_guid(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) else {
+        return false;
+    };
+    let groups: Vec<&str> = inner.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {
+            group.len() == length && group.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 
 // ─── XML helpers (local to this module) ───────────────────────────────────────
@@ -628,6 +702,23 @@ mod tests {
         assert!(matches!(err, Err(DocPropsError::UnknownCoreField { .. })));
         // Known aliases resolve.
         assert_eq!(CoreField::parse("author").unwrap(), CoreField::Creator);
+    }
+
+    /// Word treats names that differ only in case as one property and
+    /// repairs a part holding both, so setting one must not add the other.
+    #[test]
+    fn setting_a_name_that_differs_only_in_case_replaces_the_property() {
+        let mut props = CustomProperties::default();
+        props.set_string("Berth", "seven".to_string());
+        props.set_string("berth", "nine".to_string());
+        assert_eq!(props.properties.len(), 1);
+        assert_eq!(props.properties[0].name, "Berth");
+        assert_eq!(props.get("BERTH"), Some("nine"));
+        let saved = props.serialize().unwrap();
+        assert_eq!(
+            custom_properties_word_faults(&saved).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

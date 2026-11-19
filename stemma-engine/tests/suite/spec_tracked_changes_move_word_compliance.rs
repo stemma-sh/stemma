@@ -564,19 +564,17 @@ fn move_in_math_treated_as_ins_del_not_move() {
     );
 }
 
+/// Checked against Word with this exact document: it opens a moveFrom
+/// nested in a moveFrom without repair, whatever the implementation notes
+/// say about nesting.
 #[test]
-fn nested_movefrom_rejected_at_parse() {
+fn nested_movefrom_opens_clean() {
     let body = r#"<w:p><w:moveFromRangeStart w:id="2" w:author="A" w:date="2024-01-01T00:00:00Z" w:name="m1"/><w:moveFrom w:id="3" w:author="A" w:date="2024-01-01T00:00:00Z"><w:moveFrom w:id="4" w:author="A" w:date="2024-01-01T00:00:00Z"><w:r><w:t>nested</w:t></w:r></w:moveFrom></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
-
-    // INVERTED post-condition: Word does not support nesting moveFrom, so a
-    // Word-faithful engine must NOT report this document as opens-clean. If
-    // stemma leniently accepts the nesting (report.ok == true), this assertion
-    // FAILS — that failure is the smoked-out incompliance (MS-OI29500 §2.1.338).
     let report = stemma::api::validate(&b);
     assert!(
-        !report.ok,
-        "MS-OI29500 §2.1.338 (ECMA-376 §17.13.5.22): Word does not support nesting moveFrom; a Word-faithful engine must NOT open it clean. stemma reported ok={} (lenient accept = the incompliance). Issues: {:?}",
-        report.ok, report.issues
+        report.ok,
+        "Word opens this document without repair: {:?}",
+        report.issues
     );
 }

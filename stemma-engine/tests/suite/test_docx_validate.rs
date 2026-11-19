@@ -638,10 +638,11 @@ fn rel_003_missing_internal_target() {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>"#;
 
-    // Points to styles.xml which does not exist in the package
+    // Points to theme/theme1.xml, which does not exist in the package. (An
+    // absent styles part is not a fault: Word opens that without repair.)
     let doc_rels = br#"<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
 </Relationships>"#;
 
     let document = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -662,7 +663,7 @@ fn rel_003_missing_internal_target() {
         .filter(|f| f.rule_id == "I-REL-003")
         .collect();
     assert_eq!(rel_003.len(), 1, "expected exactly 1 I-REL-003 finding");
-    assert!(rel_003[0].message.contains("styles.xml"));
+    assert!(rel_003[0].message.contains("theme1.xml"));
     assert_eq!(rel_003[0].severity, ValidationSeverity::Error);
 }
 

@@ -133,6 +133,7 @@ fn doc_with_ppr_change(id: u32) -> Document {
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("tracked pPrChange applies")
@@ -324,6 +325,7 @@ fn an_unselected_ppr_change_stays_pending() {
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("second edit applies");
@@ -437,6 +439,7 @@ fn doc_with_run_bold_change(id: u32) -> Document {
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("tracked SetRunFormatting applies")
@@ -525,6 +528,7 @@ fn a_run_formatting_change_gets_a_stamped_id_even_when_the_caller_sends_the_zero
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("tracked SetRunFormatting applies");
@@ -635,6 +639,7 @@ fn an_unselected_run_formatting_change_stays_pending() {
                 author: Some("fmt-test".to_string()),
                 date: Some("2026-06-12T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("second edit applies");
@@ -777,6 +782,7 @@ fn doc_with_table_border_change(id: u32) -> Document {
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("tracked SetTableFormatting applies")
@@ -845,6 +851,7 @@ fn doc_with_row_height_change(id: u32) -> Document {
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("tracked SetRowFormatting applies")
@@ -919,6 +926,7 @@ fn doc_with_cell_shading_change(id: u32) -> Document {
             author: Some("fmt-test".to_string()),
             date: Some("2026-06-12T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .expect("tracked SetCellFormatting applies")

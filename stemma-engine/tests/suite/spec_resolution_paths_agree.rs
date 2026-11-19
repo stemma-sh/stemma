@@ -322,16 +322,20 @@ fn assert_every_path(body: &str, accepted: &[&str], rejected: &[&str]) {
 // ─── A tracked mark on the last paragraph of a table cell ──────────────────
 //
 // §17.13.5.15 / §17.13.5.20: removing a paragraph mark joins the paragraph's
-// content into the FOLLOWING paragraph. The last paragraph of a cell has no
-// following paragraph — its mark ends the cell (CT_Tc §17.4.66 requires one) —
-// so resolving that mark away has nothing to join with and the content stays
-// where it is. Untracked text is never removed by a resolution.
+// content into the FOLLOWING paragraph. Observed in Word: accepting the
+// deleted mark of a cell's only paragraph joins it with the next cell's
+// first paragraph and removes the boundary between the cells; in a row's
+// last cell nothing happens, unless every cell of the row goes, when the row
+// goes and its text continues into the next row or past the table. A cell
+// of more than one paragraph keeps its cells (not probed in Word: its own
+// Accept All failed). Rejecting a mark insertion is not that join (not
+// probed either), and untracked text is never removed by a resolution.
 
 #[test]
-fn deleted_mark_on_a_cells_only_paragraph_keeps_its_untracked_text() {
+fn deleted_mark_on_a_cells_only_paragraph_joins_the_next_cell() {
     let cell = para_marked(&format!("del {}", rev(1, "Bob")), &run("a"));
     let body = table(&[&[cell], &[para(&run("b"))]]) + &para(&run("After."));
-    assert_every_path(&body, &["[a | b]", "After."], &["[a | b]", "After."]);
+    assert_every_path(&body, &["[ab]", "After."], &["[a | b]", "After."]);
 }
 
 #[test]
@@ -341,8 +345,10 @@ fn deleted_mark_on_a_cells_last_paragraph_keeps_both_paragraphs() {
     assert_every_path(&body, &["[p1 / p2]", "After."], &["[p1 / p2]", "After."]);
 }
 
+/// Observed in Word: the one-cell table goes and the text that survives
+/// joins the paragraph after it, whichever revision is accepted first.
 #[test]
-fn deleted_mark_on_a_cells_last_paragraph_keeps_untracked_text_beside_a_deletion() {
+fn deleted_mark_on_a_lone_cells_paragraph_beside_a_deletion_dissolves_the_table() {
     let last = para_marked(
         &format!("del {}", rev(1, "Bob")),
         &format!(
@@ -353,7 +359,7 @@ fn deleted_mark_on_a_cells_last_paragraph_keeps_untracked_text_beside_a_deletion
         ),
     );
     let body = table(&[&[last]]) + &para(&run("After."));
-    assert_every_path(&body, &["[keep ]", "After."], &["[keep gone]", "After."]);
+    assert_every_path(&body, &["keep After."], &["[keep gone]", "After."]);
 }
 
 #[test]

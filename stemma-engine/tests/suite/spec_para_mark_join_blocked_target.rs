@@ -191,10 +191,11 @@ fn reject_joins_across_table_emptied_by_same_reject() {
 // ── 3. Negative controls ─────────────────────────────────────────────────────
 
 #[test]
-fn donor_with_surviving_content_stays_before_surviving_table() {
-    // Mark resolves away but the content survives; with no join target the
-    // paragraph stays as its own paragraph (its mark becomes an ordinary
-    // terminating mark). Nothing may disappear.
+fn donor_with_surviving_content_joins_the_first_cell_of_a_surviving_table() {
+    // Mark resolves away and the content survives; the next surviving block
+    // is a table followed by a paragraph. Word 16 (observed): the content
+    // joins the first paragraph of the table's first cell, which keeps its
+    // properties, and the table stays. Nothing may disappear.
     let body = format!(
         r#"<w:p><w:pPr><w:rPr><w:ins w:id="1" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>Kept</w:t></w:r></w:p>{NORMAL_TABLE}{TAIL_P}"#
     );
@@ -203,18 +204,26 @@ fn donor_with_surviving_content_stays_before_surviving_table() {
     assert!(xml.contains("Kept"), "surviving content must stay: {xml}");
     assert_eq!(
         paragraph_count(&xml),
-        3, // donor + cell paragraph + tail
-        "donor with surviving content must remain its own paragraph: {xml}"
+        2, // cell paragraph holding the donor's text + tail
+        "donor with surviving content joins the first cell: {xml}"
+    );
+    let cell = &xml[xml.find("<w:tc>").expect("the table stays")..];
+    let first_cell_paragraph = &cell[..cell.find("</w:p>").expect("a cell paragraph")];
+    assert!(
+        first_cell_paragraph.contains("Kept") && first_cell_paragraph.contains("Cell"),
+        "the donor's text leads the first cell paragraph: {xml}"
     );
     let model = model_resolve(&body, false);
     assert_eq!(body_text(&wire), body_text(&model));
+    assert!(validate(&wire).ok, "wire output must validate");
 }
 
 #[test]
-fn already_empty_base_paragraph_survives_reject() {
-    // The paragraph was ALREADY empty in the base; its mark merely became
-    // inserted (appending a new paragraph after it). Rejecting removes what
-    // was appended — never the base paragraph itself.
+fn empty_paragraph_with_inserted_mark_goes_on_reject() {
+    // An empty paragraph is nothing but its mark. Word, on Reject All,
+    // removes an empty paragraph whose mark is inserted: before a
+    // paragraph, before a table, and as the first block of the body
+    // (observed in Word; the block that follows keeps its own properties).
     let body = format!(
         r#"<w:p><w:pPr><w:rPr><w:ins w:id="1" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:rPr></w:pPr></w:p>{NORMAL_TABLE}{TAIL_P}"#
     );
@@ -222,9 +231,99 @@ fn already_empty_base_paragraph_survives_reject() {
     let xml = document_xml_of(&wire);
     assert_eq!(
         paragraph_count(&xml),
-        3, // the empty-but-base paragraph + cell + tail
-        "an already-empty base paragraph must survive reject: {xml}"
+        2, // cell + tail
+        "the empty inserted paragraph is removed: {xml}"
     );
     let model = model_resolve(&body, false);
+    assert_eq!(paragraph_count(&document_xml_of(&model)), 2);
     assert_eq!(body_text(&wire), body_text(&model));
+}
+
+// ── 3. A paragraph that is nothing but its mark ─────────────────────────────
+//
+// Word's results for these shapes were observed directly (Accept All and
+// Reject All on each).
+
+const HEAD_P: &str = r#"<w:p><w:r><w:t>head.</w:t></w:r></w:p>"#;
+const INSERTED_MARK: &str =
+    r#"<w:pPr><w:rPr><w:ins w:id="1" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:rPr></w:pPr>"#;
+const DELETED_MARK: &str =
+    r#"<w:pPr><w:rPr><w:del w:id="1" w:author="A" w:date="2024-01-01T00:00:00Z"/></w:rPr></w:pPr>"#;
+
+fn all_paragraphs(xml: &str) -> usize {
+    // `paragraph_count` sees `<w:p>` and `<w:p ...>`, the latter including
+    // the self-closing `<w:p />`.
+    paragraph_count(xml) + xml.matches("<w:p/>").count()
+}
+
+/// Both paths leave `expected` paragraphs and the same text.
+fn assert_paragraphs_after(body: &str, accept: bool, expected: usize) {
+    let wire = wire_resolve(body, accept);
+    let model = model_resolve(body, accept);
+    assert_eq!(
+        all_paragraphs(&document_xml_of(&wire)),
+        expected,
+        "byte path: {}",
+        document_xml_of(&wire)
+    );
+    assert_eq!(
+        all_paragraphs(&document_xml_of(&model)),
+        expected,
+        "model path: {}",
+        document_xml_of(&model)
+    );
+    assert_eq!(body_text(&wire), body_text(&model));
+}
+
+#[test]
+fn empty_paragraph_with_deleted_mark_goes_on_accept() {
+    let before_table = format!("{HEAD_P}<w:p>{DELETED_MARK}</w:p>{NORMAL_TABLE}{TAIL_P}");
+    assert_paragraphs_after(&before_table, true, 3); // head + cell + tail
+    assert_paragraphs_after(&before_table, false, 4);
+    let before_paragraph = format!("{HEAD_P}<w:p>{DELETED_MARK}</w:p>{TAIL_P}");
+    assert_paragraphs_after(&before_paragraph, true, 2);
+    assert_paragraphs_after(&before_paragraph, false, 3);
+}
+
+#[test]
+fn empty_paragraph_with_inserted_mark_stays_on_accept_and_goes_on_reject() {
+    let before_paragraph = format!("{HEAD_P}<w:p>{INSERTED_MARK}</w:p>{TAIL_P}");
+    assert_paragraphs_after(&before_paragraph, true, 3);
+    assert_paragraphs_after(&before_paragraph, false, 2);
+    let at_the_end = format!("{HEAD_P}<w:p>{INSERTED_MARK}</w:p>");
+    assert_paragraphs_after(&at_the_end, true, 2);
+    assert_paragraphs_after(&at_the_end, false, 1);
+}
+
+/// A paragraph appended after an empty last paragraph has its break written
+/// on that empty paragraph. Rejecting the append leaves the story ending
+/// with one empty paragraph, as it did before.
+#[test]
+fn empty_paragraph_before_a_rejected_append_is_what_the_body_ends_with() {
+    let body = format!(
+        r#"{HEAD_P}<w:p>{INSERTED_MARK}</w:p><w:p><w:ins w:id="2" w:author="A" w:date="2024-01-01T00:00:00Z"><w:r><w:t>appended.</w:t></w:r></w:ins></w:p>"#
+    );
+    assert_paragraphs_after(&body, false, 2);
+    assert_paragraphs_after(&body, true, 3);
+}
+
+/// What the revision is does not depend on whether the paragraph carries a
+/// `w14:paraId`: some programs add one to every paragraph when they save.
+#[test]
+fn an_empty_inserted_paragraph_reads_the_same_with_and_without_a_paragraph_id() {
+    let with_attributes =
+        |attributes: &str| format!("{HEAD_P}<w:p{attributes}>{INSERTED_MARK}</w:p>{TAIL_P}");
+    let plain = Document::parse(&docx_with_body(&with_attributes(""))).expect("parse");
+    let identified = Document::parse(&docx_with_body(&with_attributes(
+        r#" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" w14:paraId="0010A0B1""#,
+    )))
+    .expect("parse");
+    let statement = |doc: &Document| {
+        doc.revisions()
+            .into_iter()
+            .map(|record| (record.kind, record.excerpt, record.block_id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(statement(&plain), statement(&identified));
+    assert_eq!(statement(&plain).len(), 1);
 }

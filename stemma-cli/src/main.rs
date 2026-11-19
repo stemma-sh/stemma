@@ -25,7 +25,9 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use stemma::api::{BlockRole, Diagnostic, DiagnosticLevel, Document, RevisionRecord, validate};
+use stemma::api::{
+    BlockRole, Diagnostic, DiagnosticLevel, Document, RevisionRecord, validate, validate_file,
+};
 use stemma::tracked_model::RevisionKind;
 use stemma::{ExportOptions, Resolution, ResolveSelectionAction};
 use stemma_artifacts::{
@@ -92,9 +94,12 @@ enum Command {
         before: PathBuf,
         /// The result to verify. It may have been produced by any tool.
         after: PathBuf,
-        /// Verification policy. v0 requires valid tracked-only change,
-        /// preservation of pending revisions, and a clean untouched proof.
-        #[arg(long, value_enum, default_value_t = VerifyPolicy::TrackedDeliveryV0)]
+        /// Verification policy. Both require valid tracked-only change and
+        /// preservation of pending revisions. v1 (the default) judges
+        /// everything outside the tracked changes by text and resolved
+        /// formatting, so a result another program saved can pass; v0 judges
+        /// it by markup, down to revision-save ids and run boundaries.
+        #[arg(long, value_enum, default_value_t = VerifyPolicy::TrackedDeliveryV1)]
         policy: VerifyPolicy,
     },
 
@@ -191,7 +196,7 @@ enum Command {
         /// The document to validate.
         file: PathBuf,
         /// Output format: text (an OK line on stdout) or json (a
-        /// stemma.validate.v0 result on stdout, for valid and invalid alike).
+        /// stemma.validate.v1 result on stdout: sound, corrupt or cannot_assess).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -211,7 +216,30 @@ enum InspectFormat {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum VerifyPolicy {
+    /// Tracked-only change, judged by text and resolved formatting: a result
+    /// another program saved passes when nothing outside the tracked changes
+    /// reads or looks different.
+    TrackedDeliveryV1,
+    /// Tracked-only change, judged by markup: every block outside the
+    /// changes is the same markup, down to revision-save ids and run
+    /// boundaries. What `apply` enforces on its own output.
     TrackedDeliveryV0,
+}
+
+impl VerifyPolicy {
+    fn name(self) -> &'static str {
+        match self {
+            VerifyPolicy::TrackedDeliveryV1 => "tracked-delivery-v1",
+            VerifyPolicy::TrackedDeliveryV0 => "tracked-delivery-v0",
+        }
+    }
+
+    fn equality(self) -> stemma::audit::UntouchedEquality {
+        match self {
+            VerifyPolicy::TrackedDeliveryV1 => stemma::audit::UntouchedEquality::Appearance,
+            VerifyPolicy::TrackedDeliveryV0 => stemma::audit::UntouchedEquality::Fidelity,
+        }
+    }
 }
 
 /// The machine-output switch the receipt-emitting verbs (`compare`, `resolve`,
@@ -384,6 +412,77 @@ fn inspect(artifacts: &PathAuthority, file: &Path, format: InspectFormat) -> Res
     }
 }
 
+/// Why a result failed the delivery policy. A fixed vocabulary; a result can
+/// fail for several reasons at once and all of them are listed.
+fn verify_fail_reasons(report: &stemma::audit::AuditReport) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !report.validator.ok {
+        reasons.push("invalid_result");
+    }
+    if report.direct_changes.len() != delivery::added_comments(report) {
+        reasons.push("untracked_change");
+    }
+    if !report.untouched.violations.is_empty() {
+        reasons.push("untouched_content_changed");
+    }
+    if delivery::preexisting_outcome(report).modified_or_resolved != 0 {
+        reasons.push("preexisting_revision_changed");
+    }
+    reasons
+}
+
+fn validator_issues_json(report: &stemma::ValidationReport) -> Vec<serde_json::Value> {
+    report
+        .issues
+        .iter()
+        .map(|issue| {
+            json!({
+                "code": format!("{:?}", issue.code),
+                "message": issue.message,
+                "context": issue.context,
+            })
+        })
+        .collect()
+}
+
+fn untouched_violation_json(violation: &stemma::audit::UntouchedViolation) -> serde_json::Value {
+    use stemma::audit::UntouchedViolationKind as Kind;
+    let (kind, before_block_id, after_block_id) = match &violation.kind {
+        Kind::BlockDiffers {
+            before_block_id,
+            after_block_id,
+        } => (
+            "block_differs",
+            Some(before_block_id.to_string()),
+            Some(after_block_id.to_string()),
+        ),
+        Kind::SequenceLengthMismatch { .. } => ("sequence_length_mismatch", None, None),
+        Kind::StoryMissing => ("story_missing", None, None),
+        Kind::StoryUnexpected => ("story_unexpected", None, None),
+    };
+    json!({
+        "story": violation.story,
+        "kind": kind,
+        "before_block_id": before_block_id,
+        "after_block_id": after_block_id,
+        "detail": violation.detail,
+    })
+}
+
+/// The `verify` result, `stemma.verify.v1`. Every answer carries `verdict`:
+///
+/// - `"pass"` (exit 0): the result is valid, every change in it is tracked,
+///   everything outside the changes is as it was under the policy, and the
+///   revisions that were pending before are still pending.
+/// - `"fail"` (exit 3): one or more of those does not hold; `reasons` lists
+///   which, from `invalid_result`, `untracked_change`,
+///   `untouched_content_changed`, `preexisting_revision_changed`.
+/// - `"cannot_assess"` (exit 4): the comparison could not be made, because
+///   the baseline is not a document the model reads, or the result holds a
+///   shape the model does not read; `cannot_assess` says why. Not a pass.
+///
+/// A file that cannot be opened at all is an operational failure (`error:`
+/// on stderr, exit 1), as for every command.
 fn verify(
     artifacts: &PathAuthority,
     before_path: &Path,
@@ -396,36 +495,102 @@ fn verify(
     let after = artifacts
         .read_source(after_path, "after_docx", None)
         .map_err(|e| e.to_string())?;
-    let report = stemma::api::audit(before.bytes(), after.bytes()).map_err(|e| {
-        format!(
-            "cannot audit {} against {}: {e}",
-            after_path.display(),
-            before_path.display()
+    let head = |verdict: &str| {
+        json!({
+            "schema": "stemma.verify.v1",
+            "policy": policy.name(),
+            "verdict": verdict,
+            "before": CompactIdentity::from(before.identity()),
+            "after": CompactIdentity::from(after.identity()),
+        })
+    };
+    let finish = |mut payload: serde_json::Value,
+                  rest: serde_json::Value,
+                  exit: u8|
+     -> Result<ExitCode, String> {
+        let (Some(fields), serde_json::Value::Object(more)) = (payload.as_object_mut(), rest)
+        else {
+            unreachable!("verify payloads are JSON objects");
+        };
+        fields.extend(more);
+        let encoded = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("cannot encode verification result: {e}"))?;
+        print_line(&encoded)?;
+        Ok(ExitCode::from(exit))
+    };
+    let cannot_assess = |why: String| {
+        finish(
+            head("cannot_assess"),
+            json!({ "reasons": [], "cannot_assess": why }),
+            EXIT_CANNOT_ASSESS,
         )
-    })?;
-
-    let preexisting = delivery::preexisting_outcome(&report);
-    let policy_pass = match policy {
-        VerifyPolicy::TrackedDeliveryV0 => delivery::tracked_delivery_failure(&report).is_none(),
     };
 
-    let after_doc = Document::parse(after.bytes())
-        .map_err(|e| format!("{}: not a valid DOCX ({e})", after_path.display()))?;
-    let accepted = after_doc
-        .project(Resolution::AcceptAll)
-        .and_then(|doc| doc.serialize(&ExportOptions::default()))
-        .map_err(|e| format!("cannot produce accepted verification projection: {e}"))?;
-    let rejected = after_doc
-        .project(Resolution::RejectAll)
-        .and_then(|doc| doc.serialize(&ExportOptions::default()))
-        .map_err(|e| format!("cannot produce rejected verification projection: {e}"))?;
+    // The result's package checks answer before the model reads anything: a
+    // result that is not a sound package fails, whatever else is true of it.
+    // That holds whether or not the model reads it: the comparison is not
+    // attempted on an unsound result, so no later step can turn the answer
+    // into "cannot assess".
+    let after_validation = validate(after.bytes());
+    if !after_validation.ok {
+        return finish(
+            head("fail"),
+            json!({
+                "reasons": ["invalid_result"],
+                "validator": {
+                    "ok": false,
+                    "issues": validator_issues_json(&after_validation),
+                },
+            }),
+            EXIT_CORRUPT,
+        );
+    }
+    let after_doc = match Document::parse(after.bytes()) {
+        Ok(doc) => doc,
+        Err(error) => {
+            return cannot_assess(format!("the result is not read by the model: {error}"));
+        }
+    };
+    if let Err(error) = Document::parse(before.bytes()) {
+        return cannot_assess(format!("the baseline is not read by the model: {error}"));
+    }
+    let report =
+        match stemma::api::audit_with_equality(before.bytes(), after.bytes(), policy.equality()) {
+            Ok(report) => report,
+            Err(error) => return cannot_assess(format!("the pair cannot be audited: {error}")),
+        };
+
+    let preexisting = delivery::preexisting_outcome(&report);
+    // Both policies ask the same four things of the audit; they differ in
+    // how the audit decided that an untouched block is the same.
+    let reasons = verify_fail_reasons(&report);
+    debug_assert_eq!(
+        reasons.is_empty(),
+        delivery::tracked_delivery_failure(&report).is_none(),
+        "the reasons are the delivery policy's failures"
+    );
+
+    let projection = |resolution: Resolution, name: &str| {
+        after_doc
+            .project(resolution)
+            .and_then(|doc| doc.serialize(&ExportOptions::default()))
+            .map_err(|e| format!("the result's {name} reading cannot be produced: {e}"))
+    };
+    let accepted = match projection(Resolution::AcceptAll, "accepted") {
+        Ok(bytes) => bytes,
+        Err(why) => return cannot_assess(why),
+    };
+    let rejected = match projection(Resolution::RejectAll, "rejected") {
+        Ok(bytes) => bytes,
+        Err(why) => return cannot_assess(why),
+    };
 
     let direct: Vec<_> = report
         .direct_changes
         .iter()
         .map(|change| {
             json!({
-                "story": format!("{:?}", change.story),
+                "story": change.story,
                 "kind": change.kind.as_str(),
                 "block_id": change.block_id.as_ref().map(ToString::to_string),
                 "old_excerpt": change.old_excerpt,
@@ -434,60 +599,74 @@ fn verify(
             })
         })
         .collect();
-    let validator_issues: Vec<_> = report
-        .validator
-        .issues
+    // The pre-existing revisions the result resolved or changed outside a
+    // tracked edit: the ones `summary.modified_or_resolved_preexisting`
+    // counts, named so a reader can find them.
+    let preexisting_changed: Vec<_> = report
+        .preexisting_revisions
         .iter()
-        .map(|issue| {
-            json!({
-                "code": format!("{:?}", issue.code),
-                "message": issue.message,
-                "context": issue.context,
-            })
+        .filter_map(|revision| {
+            let (disposition, after_excerpt) = match &revision.disposition {
+                stemma::audit::RevisionDisposition::Untouched
+                | stemma::audit::RevisionDisposition::EditedInside { .. } => {
+                    return None;
+                }
+                stemma::audit::RevisionDisposition::Modified { after_excerpt } => {
+                    ("modified", Some(after_excerpt.clone()))
+                }
+                stemma::audit::RevisionDisposition::Resolved => ("resolved", None),
+            };
+            Some(json!({
+                "revision_id": revision.record.revision_id,
+                "kind": revision.record.kind.as_str(),
+                "author": revision.record.author,
+                "date": revision.record.date,
+                "story": revision.record.location,
+                "block_id": revision.record.block_id.to_string(),
+                "excerpt": revision.record.excerpt,
+                "disposition": disposition,
+                "after_excerpt": after_excerpt,
+            }))
         })
         .collect();
-    let payload = json!({
-        "schema": "stemma.verify.v0",
-        "policy": "tracked-delivery-v0",
-        "status": if policy_pass { "pass" } else { "fail" },
-        "before": CompactIdentity::from(before.identity()),
-        "after": CompactIdentity::from(after.identity()),
-        "summary": {
-            "new_revisions": report.new_revisions.len(),
-            "preexisting_revisions": report.preexisting_revisions.len(),
-            "preexisting_revisions_edited_inside": preexisting.edited_inside,
-            "modified_or_resolved_preexisting": preexisting.modified_or_resolved,
-            "direct_changes": report.direct_changes.len(),
-            "untouched_violations": report.untouched.violations.len(),
-            "validator_ok": report.validator.ok,
-        },
-        "projections": {
-            "accepted": digest_payload(&accepted),
-            "rejected": digest_payload(&rejected),
-        },
-        "direct_changes": direct,
-        "untouched": {
-            "verified_blocks": report.untouched.verified_blocks,
-            "parts": report.untouched.parts,
-            "violations": report.untouched.violations.iter().map(|v| json!({
-                "story": format!("{:?}", v.story),
-                "kind": format!("{:?}", v.kind),
-                "detail": v.detail,
-            })).collect::<Vec<_>>(),
-        },
-        "validator": {
-            "ok": report.validator.ok,
-            "issues": validator_issues,
-        },
-    });
-    let encoded = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("cannot encode verification result: {e}"))?;
-    print_line(&encoded)?;
-    Ok(if policy_pass {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(3)
-    })
+    let pass = reasons.is_empty();
+    finish(
+        head(if pass { "pass" } else { "fail" }),
+        json!({
+            "reasons": reasons,
+            "summary": {
+                "new_revisions": report.new_revisions.len(),
+                "preexisting_revisions": report.preexisting_revisions.len(),
+                "preexisting_revisions_edited_inside": preexisting.edited_inside,
+                "modified_or_resolved_preexisting": preexisting.modified_or_resolved,
+                "direct_changes": report.direct_changes.len(),
+                "comments_added": delivery::added_comments(&report),
+                "untouched_violations": report.untouched.violations.len(),
+                "validator_ok": report.validator.ok,
+            },
+            "projections": {
+                "accepted": digest_payload(&accepted),
+                "rejected": digest_payload(&rejected),
+            },
+            "direct_changes": direct,
+            "untouched": {
+                "verified_blocks": report.untouched.verified_blocks,
+                "parts": report.untouched.parts,
+                "violations": report
+                    .untouched
+                    .violations
+                    .iter()
+                    .map(untouched_violation_json)
+                    .collect::<Vec<_>>(),
+            },
+            "preexisting_changed": preexisting_changed,
+            "validator": {
+                "ok": report.validator.ok,
+                "issues": validator_issues_json(&report.validator),
+            },
+        }),
+        if pass { 0 } else { EXIT_CORRUPT },
+    )
 }
 
 fn digest_payload(bytes: &[u8]) -> serde_json::Value {
@@ -1247,19 +1426,36 @@ fn check_ids(requested: &[u32], known: &HashSet<u32>, file: &Path) -> Result<Has
 // validate
 // ---------------------------------------------------------------------------
 
-/// The `validate --format json` result. Valid and invalid are BOTH structured
-/// results on stdout (mirroring `verify`'s pass/fail contract): `status` is
-/// `"ok"` or `"invalid"`, `issues` is empty exactly when `ok`, and the process
-/// still exits `1` on `"invalid"`. Only an operational failure (unreadable
-/// file, not a DOCX at all) stays on the `error:` stderr path.
+/// Exit code of `validate` for a document Word would repair or could not
+/// open (the same code `verify` uses for a completed check that failed).
+const EXIT_CORRUPT: u8 = 3;
+/// Exit code of `validate` for a document that could not be read into the
+/// model: no verdict on the document.
+const EXIT_CANNOT_ASSESS: u8 = 4;
+
+/// The `validate --format json` result, `stemma.validate.v1`. Every answer
+/// about the document is a structured result on stdout:
+///
+/// - `verdict: "sound"` (exit 0): the document reads, and no check found a
+///   fault. Word opens it without repair.
+/// - `verdict: "corrupt"` (exit 3): at least one check found a fault that
+///   makes Word repair the document or fail to open it; `issues` lists them.
+/// - `verdict: "cannot_assess"` (exit 4): the package checks found nothing,
+///   but the document holds a shape the model does not read; `cannot_assess`
+///   says which. This is a statement about Stemma, not about the document.
+///
+/// `block_count` and `pending_revision_count` are present when the document
+/// was read. Only an operational failure (the file cannot be opened) stays
+/// on the `error:` stderr path, exit 1.
 #[derive(Serialize)]
 struct ValidateJson {
     schema: &'static str,
-    status: &'static str,
+    verdict: &'static str,
     input: ArtifactIdentity,
-    block_count: usize,
-    pending_revision_count: usize,
+    block_count: Option<usize>,
+    pending_revision_count: Option<usize>,
     issues: Vec<ValidateIssueJson>,
+    cannot_assess: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1277,17 +1473,44 @@ fn validate_cmd(
     let input = artifacts
         .read_source(file, "input_docx", None)
         .map_err(|e| e.to_string())?;
-    let doc = Document::parse(input.bytes())
-        .map_err(|e| format!("{}: not a valid DOCX ({e})", file.display()))?;
-
-    let report = validate(input.bytes());
-    let view = doc.read();
-    let blocks = view.blocks.len();
-    let revisions = pending_revisions(&doc).len();
+    // The package checks do not need the model: they answer for a file the
+    // model cannot read, and for one that is not a package at all.
+    // The file's name matters too: Word judges the main part's content type
+    // against it.
+    let file_name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let report = validate_file(input.bytes(), &file_name);
+    let read = Document::parse(input.bytes());
+    let counts = read
+        .as_ref()
+        .ok()
+        .map(|doc| (doc.read().blocks.len(), pending_revisions(doc).len()));
+    let (verdict, exit, cannot_assess) = match (&read, report.ok) {
+        (_, false) => ("corrupt", ExitCode::from(EXIT_CORRUPT), None),
+        (Ok(_), true) => ("sound", ExitCode::SUCCESS, None),
+        (Err(error), true) => (
+            "cannot_assess",
+            ExitCode::from(EXIT_CANNOT_ASSESS),
+            Some(error.to_string()),
+        ),
+    };
 
     match format {
-        OutputFormat::Text => {
-            if !report.ok {
+        OutputFormat::Text => match verdict {
+            "sound" => {
+                let (blocks, revisions) = counts.expect("a sound document was read");
+                print_line(&format!(
+                    "OK: {} — {blocks} block{}, {revisions} pending revision{}; bytes={} sha256={}",
+                    file.display(),
+                    if blocks == 1 { "" } else { "s" },
+                    if revisions == 1 { "" } else { "s" },
+                    input.identity().bytes,
+                    input.identity().digest.hex,
+                ))?;
+            }
+            "corrupt" => {
                 let details = report
                     .issues
                     .iter()
@@ -1297,25 +1520,21 @@ fn validate_cmd(
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
-                return Err(format!("{}: invalid DOCX — {details}", file.display()));
+                eprintln!("corrupt: {}: {details}", file.display());
             }
-            print_line(&format!(
-                "OK: {} — {blocks} block{}, {revisions} pending revision{}; bytes={} sha256={}",
+            _ => eprintln!(
+                "cannot assess: {}: {}",
                 file.display(),
-                if blocks == 1 { "" } else { "s" },
-                if revisions == 1 { "" } else { "s" },
-                input.identity().bytes,
-                input.identity().digest.hex,
-            ))?;
-            Ok(ExitCode::SUCCESS)
-        }
+                cannot_assess.as_deref().unwrap_or_default()
+            ),
+        },
         OutputFormat::Json => {
             let payload = ValidateJson {
-                schema: "stemma.validate.v0",
-                status: if report.ok { "ok" } else { "invalid" },
+                schema: "stemma.validate.v1",
+                verdict,
                 input: input.identity().clone(),
-                block_count: blocks,
-                pending_revision_count: revisions,
+                block_count: counts.map(|(blocks, _)| blocks),
+                pending_revision_count: counts.map(|(_, revisions)| revisions),
                 issues: report
                     .issues
                     .iter()
@@ -1325,6 +1544,7 @@ fn validate_cmd(
                         context: issue.context.clone(),
                     })
                     .collect(),
+                cannot_assess,
             };
             let encoded = serde_json::to_string_pretty(&payload).map_err(|e| {
                 format!(
@@ -1333,13 +1553,9 @@ fn validate_cmd(
                 )
             })?;
             print_line(&encoded)?;
-            Ok(if report.ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
         }
     }
+    Ok(exit)
 }
 
 // ---------------------------------------------------------------------------

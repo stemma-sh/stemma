@@ -708,6 +708,10 @@ const FORMATTING_CHANGE_FIELDS: &[(&str, &str)] = &[
     ("author", "Revision author."),
     ("date", "Revision date, when carried."),
     (
+        "date_utc",
+        "The explicit UTC revision date (`w16du:dateUtc`), when carried.",
+    ),
+    (
         "identity",
         "Engine-minted document-unique identity, the value the resolution surface addresses; 0 is the pre-identity sentinel.",
     ),
@@ -895,6 +899,10 @@ const REVISION_RECORD_FIELDS: &[(&str, &str)] = &[
     ),
     ("author", "Author, when the source carried one."),
     ("date", "ISO-8601 date, when carried."),
+    (
+        "date_utc",
+        "The explicit UTC date (`w16du:dateUtc`), when carried; attribution like `author` and `date`.",
+    ),
     ("kind", "One of the [revision kinds](#revision-kinds)."),
     (
         "block_id",
@@ -1052,6 +1060,7 @@ fn render() -> String {
         wire_id: _,
         author: _,
         date: _,
+        date_utc: _,
         kind: first_kind,
         block_id: _,
         location: _,

@@ -232,6 +232,7 @@ fn untouched_paragraph_keeps_leftchars_zero_after_unrelated_edit() {
             author: Some("Spec".to_string()),
             date: Some("2026-07-06T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let edited = doc.apply(&txn).expect("apply unrelated edit");

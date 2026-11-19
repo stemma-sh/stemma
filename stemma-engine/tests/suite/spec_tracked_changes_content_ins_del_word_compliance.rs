@@ -432,10 +432,13 @@ fn t_inside_del_treated_as_deleted_consumption() {
         "keep gone tail",
         "ECMA-376 §17.13.5.14 — rejecting the deletion restores the deleted region's content ('gone'), which the inner run holds even though it was authored as w:t"
     );
+    // Checked against Word with this exact document: it repairs the file.
+    // Deleted text is written as w:delText; the reading above is how the
+    // engine resolves the shape, not a claim that the file is sound.
     let (ok, detail) = opens_clean(&b);
     assert!(
-        ok,
-        "ECMA-376 §17.3.3.7 / §17.13.5.14 — content inside a w:del is a conformant deleted region; Word reads it without requiring repair. issues: {detail}"
+        !ok && detail.contains("I-TC-005"),
+        "w:t inside w:del is reported: Word repairs such a file. issues: {detail}"
     );
 }
 

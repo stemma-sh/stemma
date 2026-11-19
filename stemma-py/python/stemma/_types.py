@@ -22,6 +22,8 @@ class Revision(TypedDict):
     """The raw OOXML ``w:id``; diagnostics only, never an address."""
     author: Optional[str]
     date: Optional[str]
+    date_utc: Optional[str]
+    """The explicit UTC date (``w16du:dateUtc``), when the source carried one."""
     kind: Literal[
         "insert",
         "delete",

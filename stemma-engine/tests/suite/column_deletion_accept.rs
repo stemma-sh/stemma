@@ -114,12 +114,7 @@ fn accepted_geometry(table_properties: &str, deleted: Deleted) -> (Vec<u32>, Vec
     let widths = table.rows[0]
         .cells
         .iter()
-        .map(|cell| {
-            cell.formatting
-                .width
-                .as_ref()
-                .map_or(-1, |w| i64::from(w.w))
-        })
+        .map(|cell| cell.formatting.width.as_ref().map_or(-1, |w| w.w))
         .collect();
     (table.formatting.grid_cols.clone(), widths)
 }

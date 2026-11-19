@@ -51,6 +51,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("edit-invariants".to_string()),
         date: Some("2026-04-11T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -124,6 +125,7 @@ fn build_paragraph(
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,

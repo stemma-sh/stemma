@@ -323,7 +323,9 @@ pub(crate) fn block_form_field_targets(
         }
         if is_w(e, "t") {
             for current in stack.iter_mut().filter(|f| f.separated) {
-                current.value.push_str(&e.get_text().unwrap_or_default());
+                current.value.push_str(&crate::word_xml::word_text_as_read(
+                    &e.get_text().unwrap_or_default(),
+                ));
                 current.result_text_paths.push(path.clone());
             }
             return Ok(());
@@ -350,7 +352,9 @@ pub(crate) fn block_form_field_targets(
             return;
         }
         if is_w(e, "t") {
-            out.push_str(&e.get_text().unwrap_or_default());
+            out.push_str(&crate::word_xml::word_text_as_read(
+                &e.get_text().unwrap_or_default(),
+            ));
             return;
         }
         if is_w(e, "tab") || is_w(e, "br") || is_w(e, "cr") {

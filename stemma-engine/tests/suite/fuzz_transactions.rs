@@ -628,8 +628,8 @@ fn gen_step(
                 indent: None,
                 spacing: if rng.bool() {
                     Some(ParagraphSpacing {
-                        before: Some((rng.below(6) as u32) * 60),
-                        after: Some((rng.below(6) as u32) * 60),
+                        before: Some((rng.below(6) as i32) * 60),
+                        after: Some((rng.below(6) as i32) * 60),
                         before_lines: None,
                         after_lines: None,
                         before_autospacing: None,
@@ -861,6 +861,7 @@ fn txn(steps: Vec<EditStep>, mode: MaterializationMode) -> EditTransaction {
             author: Some("Fuzz".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }

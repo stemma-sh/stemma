@@ -57,9 +57,17 @@ impl XmlWriter {
     /// root — this is valid XML.
     pub fn write_element(&mut self, element: &Element) -> io::Result<()> {
         let config = EmitterConfig::new().write_document_declaration(false);
+        let start = self.buf.len();
         element
             .write_with_config(&mut self.buf, config)
-            .map_err(|e| io::Error::other(e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // A carriage return of the content as `&#13;`, read back as itself.
+        if self.buf[start..].contains(&b'\r') {
+            let written = self.buf.split_off(start);
+            self.buf
+                .extend_from_slice(&crate::word_xml::escape_carriage_returns(written));
+        }
+        Ok(())
     }
 
     /// Writes a raw `xmltree::XMLNode`. Elements are written via `write_element`;

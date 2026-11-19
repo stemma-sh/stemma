@@ -1018,7 +1018,7 @@ fn extract_run_text(run: &Element) -> String {
         if is_w_tag(el, "t") || is_w_tag(el, "delText") {
             for node in &el.children {
                 if let XMLNode::Text(text) = node {
-                    out.push_str(text);
+                    out.push_str(&crate::word_xml::word_text_as_read(text));
                 }
             }
         } else if is_w_tag(el, "tab") {

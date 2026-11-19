@@ -343,7 +343,10 @@ fn canonical_wml_part_with_correct_override_opens_clean() {
 #[test]
 fn override_beats_default_for_wml_story_part() {
     // ECMA-376 Part 2 (OPC) §7.2.3 ; ECMA-376 Part 1 §11.3.7 ; I-CT-002
-    let body = r#"<w:p><w:r><w:t>Body referencing a footnote.</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p><w:sectPr/>"#;
+    // The body holds no footnote reference: this helper relates no part to
+    // the document, and Word repairs a reference with no footnotes
+    // relationship (checked). The content-type claim needs only the part.
+    let body = r#"<w:p><w:r><w:t>Body beside a footnotes part.</w:t></w:r></w:p><w:sectPr/>"#;
     let styles =
         r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
     let footnotes = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2"><w:p><w:r><w:t>Footnote body.</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
@@ -391,7 +394,9 @@ fn added_image_png_part_resolves_via_png_default() {
 #[test]
 fn endnotes_story_part_canonical_override_opens_clean() {
     // ECMA-376 Part 1 §11.3.4 ; ECMA-376 Part 2 (OPC) §7.2.3 ; I-CT-002
-    let body = r#"<w:p><w:r><w:t>Body referencing an endnote.</w:t></w:r><w:r><w:endnoteReference w:id="2"/></w:r></w:p><w:sectPr/>"#;
+    // No endnote reference in the body, for the reason given in
+    // `override_beats_default_for_wml_story_part`.
+    let body = r#"<w:p><w:r><w:t>Body beside an endnotes part.</w:t></w:r></w:p><w:sectPr/>"#;
     let styles =
         r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
     let endnotes = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:endnote w:id="2"><w:p><w:r><w:t>Endnote body.</w:t></w:r></w:p></w:endnote></w:endnotes>"#;

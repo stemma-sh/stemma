@@ -94,6 +94,7 @@ fn txn(step: EditStep, mode: MaterializationMode) -> EditTransaction {
             author: Some("Gate".to_string()),
             date: Some("2026-06-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }
@@ -431,6 +432,7 @@ fn duplicate_block_fill_in_one_transaction_refuses() {
             author: Some("Gate".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
     };
     let err = match doc.apply(&two) {

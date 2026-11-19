@@ -92,7 +92,7 @@ fn docx_with_spacing_ppr_change() -> Vec<u8> {
     make_docx(body, &[("word/styles.xml", styles)])
 }
 
-fn body_spacing(doc: &Document) -> (Option<u32>, Option<i32>) {
+fn body_spacing(doc: &Document) -> (Option<i32>, Option<i32>) {
     let canon = doc.snapshot().canonical.clone();
     let stemma::BlockNode::Paragraph(p) = &canon.blocks[0].block else {
         panic!("first block is a paragraph");
@@ -188,6 +188,7 @@ fn an_unchanged_paragraph_mark_snapshot_survives_save_and_reopen() {
                 author: Some("Reviewer".into()),
                 date: Some("2026-06-01T00:00:00Z".into()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("apply align change");
@@ -286,6 +287,7 @@ fn an_inserted_paragraphs_id_is_unique_against_cell_paragraphs() {
                 author: Some("Reviewer".into()),
                 date: Some("2026-06-01T00:00:00Z".into()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("insert with the cell-majority default role");
@@ -421,6 +423,7 @@ fn a_role_less_insert_inherits_the_following_paragraphs_formatting() {
                     author: Some("Reviewer".into()),
                     date: Some("2026-06-01T00:00:00Z".into()),
                     apply_op_id: None,
+                    date_utc: None,
                 },
             })
             .expect("role-less insert applies");
@@ -504,6 +507,7 @@ fn a_role_less_insert_before_inherits_the_literal_prefix_runs_formatting() {
                     author: Some("Reviewer".into()),
                     date: Some("2026-08-03T00:00:00Z".into()),
                     apply_op_id: None,
+                    date_utc: None,
                 },
             })
             .expect("role-less insert applies");
@@ -584,6 +588,7 @@ fn a_role_less_insert_before_a_spaced_label_takes_none_of_the_label() {
                     author: Some("Reviewer".into()),
                     date: Some("2026-08-03T00:00:00Z".into()),
                     apply_op_id: None,
+                    date_utc: None,
                 },
             })
             .expect("role-less insert applies");
@@ -673,6 +678,7 @@ fn a_role_less_insert_inherits_a_leading_hard_breaks_run_formatting() {
                     author: Some("Reviewer".into()),
                     date: Some("2026-08-03T00:00:00Z".into()),
                     apply_op_id: None,
+                    date_utc: None,
                 },
             })
             .expect("role-less insert applies");

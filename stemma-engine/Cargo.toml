@@ -1,6 +1,6 @@
 [package]
 name = "stemma"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # Enforceable toolchain floor for the whole workspace. Edition 2024 wants 1.85;
 # deps (zip -> time 0.3.49, and rmcp -> darling 0.23 in stemma-mcp) raise the
@@ -37,6 +37,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 dashmap = "6"
 quick-xml = "0.37"
 rayon = "1.10"
+flate2 = "1"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10.8"

@@ -996,6 +996,7 @@ fn build_note_body_paragraph(note_id: &str, kind: NoteKind, body: &str) -> Parag
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: ref_style_props,
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(format!("<w:{ref_tag}/>").into_bytes()),
         origin: None,
@@ -1042,6 +1043,7 @@ fn reserved_note(
             },
             wrapper_marks: Vec::new(),
             wrapper_style_props: StyleProps::default(),
+            wrapper_rpr_authored: None,
             joins_following_text_run: false,
             raw_xml: Some(format!("<w:{tag}/>").into_bytes()),
             origin: None,
@@ -1376,6 +1378,7 @@ mod tests {
             author: None,
             date: None,
             apply_op_id: None,
+            date_utc: None,
         };
         splice_reference(
             &mut segs,

@@ -102,18 +102,14 @@ fn serialize_element(element: &Element) -> Vec<u8> {
     stripped
         .write_with_config(&mut buf, config)
         .expect("re-serializing a parsed element must not fail");
-    buf
+    // A carriage return of the content as `&#13;`, read back as itself.
+    crate::word_xml::escape_carriage_returns(buf)
 }
 
 #[derive(Debug)]
 pub enum WordIrError {
     UnknownParagraphElement(String),
     UnknownRunElement(String),
-    UnsupportedEmptyRunFormattingRevision {
-        run_index: usize,
-        revision_id: u32,
-    },
-    MissingTrackedChangeAttribute(&'static str),
     InvalidTrackedChangeAttribute {
         attribute: &'static str,
         value: String,
@@ -159,12 +155,12 @@ pub enum WordIrError {
         attribute: &'static str,
         value: String,
     },
-    /// `w:numPr` is schema-valid with either coordinate omitted. A list
-    /// without a level is modeled (`DirectNumPr::ListWithoutLevel`); this
-    /// refusal covers a level without a list (or an empty container), and a
-    /// list without a level in a second sibling `w:pPr` that would have to
-    /// merge with an earlier pair. No Word evidence fixes those yet, so refuse
-    /// rather than invent the missing coordinate.
+    /// `w:numPr` is schema-valid with either coordinate omitted, and both
+    /// partial shapes are modeled (`DirectNumPr::ListWithoutLevel`,
+    /// `DirectNumPr::WithoutList`). This refusal covers a partial `w:numPr`
+    /// in a second sibling `w:pPr` that would have to merge with an earlier
+    /// one. No Word evidence fixes that merge yet, so refuse rather than
+    /// invent the missing coordinate.
     IncompleteDirectNumbering {
         num_id: Option<u32>,
         ilvl: Option<u32>,
@@ -233,18 +229,6 @@ impl fmt::Display for WordIrError {
             WordIrError::UnknownRunElement(name) => {
                 write!(f, "unknown run-level element: {name}")
             }
-            WordIrError::UnsupportedEmptyRunFormattingRevision {
-                run_index,
-                revision_id,
-            } => {
-                write!(
-                    f,
-                    "empty run {run_index} with formatting revision {revision_id} requires an explicit zero-width formatting-revision model"
-                )
-            }
-            WordIrError::MissingTrackedChangeAttribute(attr) => {
-                write!(f, "missing required tracked change attribute: {attr}")
-            }
             WordIrError::InvalidTrackedChangeAttribute { attribute, value } => {
                 write!(f, "invalid tracked change attribute {attribute}: {value:?}")
             }
@@ -295,9 +279,9 @@ impl fmt::Display for WordIrError {
             ),
             WordIrError::IncompleteDirectNumbering { num_id, ilvl } => write!(
                 f,
-                "w:numPr has an incomplete direct numbering pair (numId={num_id:?}, \
-                 ilvl={ilvl:?}); this shape is schema-valid, but no Word evidence fixes \
-                 its effective pair here, so refusing rather than inventing the missing \
+                "a second w:pPr carries a partial w:numPr (numId={num_id:?}, \
+                 ilvl={ilvl:?}) after an earlier w:numPr; how Word merges the two is \
+                 not established, so refusing rather than inventing the missing \
                  coordinate"
             ),
             WordIrError::DuplicateParagraphPropertyElement {
@@ -360,7 +344,9 @@ impl std::error::Error for WordIrError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AtomKind {
-    /// Actual text content.
+    /// Text content, as written in the run's `w:t`/`w:delText` leaves
+    /// (a line feed there reads as a space:
+    /// [`crate::word_xml::word_text_as_read`]).
     Text(String),
     /// Tab character (\t).
     Tab,
@@ -437,17 +423,13 @@ fn break_atom_kind(element: &Element, local_name: &str) -> Result<AtomKind, Word
         });
     }
 
-    let authored_type = attr_get(element, "w:type");
+    // A type outside ST_BrType is a line break with no stated type: Word
+    // opens it without repair and saves a plain `<w:br/>` (observed with
+    // `line` and `bogus`). The model reads it the same way.
+    let authored_type = attr_get(element, "w:type")
+        .and_then(|value| crate::domain::BreakType::from_xml_str(value).ok());
     let break_type = authored_type
-        .map(|value| {
-            crate::domain::BreakType::from_xml_str(value).map_err(|_| {
-                WordIrError::InvalidBreakAttribute {
-                    attribute: "w:type",
-                    value: value.clone(),
-                }
-            })
-        })
-        .transpose()?
+        .clone()
         .unwrap_or(crate::domain::BreakType::TextWrapping);
     let clear = attr_get(element, "w:clear")
         .map(|value| {
@@ -477,10 +459,11 @@ pub struct AtomOrigin {
 /// extracted from within that container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomTrackingContext {
-    pub is_insertion: bool,   // true = w:ins, false = w:del
-    pub revision_id: u32,     // w:id attribute
-    pub author: String,       // w:author attribute
-    pub date: Option<String>, // w:date attribute (optional per spec)
+    pub is_insertion: bool,       // true = w:ins, false = w:del
+    pub revision_id: u32,         // w:id attribute
+    pub author: String,           // w:author attribute
+    pub date: Option<String>,     // w:date attribute (optional per spec)
+    pub date_utc: Option<String>, // w16du:dateUtc attribute (optional)
     /// The STACKED state (one nesting level): the atom sits inside both an
     /// insertion and a deletion, both pending.
     /// Import normalizes BOTH markup orders (`w:del`-in-`w:ins` and
@@ -497,6 +480,7 @@ pub struct StackedDeletionLayer {
     pub revision_id: u32,
     pub author: String,
     pub date: Option<String>,
+    pub date_utc: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -654,7 +638,7 @@ pub struct TextMarks {
     /// Fit text width in twips from w:fitText w:val (§17.3.2.14).
     pub fit_text_width: Option<u32>,
     /// Fit text grouping ID from w:fitText w:id (§17.3.2.14).
-    pub fit_text_id: Option<u32>,
+    pub fit_text_id: Option<i64>,
     /// Unmodeled rPr children, captured verbatim (see
     /// `crate::domain::PreservedProp`) so they survive re-serialization even
     /// though this parser has no typed field for them.
@@ -724,6 +708,8 @@ pub struct RprChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// Explicit UTC revision date (`w16du:dateUtc`), when given.
+    pub date_utc: Option<String>,
 }
 
 /// Tracked paragraph formatting change metadata from w:pPrChange (§17.13.5.29).
@@ -813,6 +799,8 @@ pub struct PprChange {
     pub author: String,
     /// Revision date.
     pub date: Option<String>,
+    /// Explicit UTC revision date (`w16du:dateUtc`), when given.
+    pub date_utc: Option<String>,
 }
 
 /// Local names of every inner-pPr child `extract_ppr_change` extracts into a
@@ -875,6 +863,12 @@ pub enum DirectNumPr {
     /// optional; the level Word applies is resolved, not read
     /// (`StyleDefinitions::resolve_effective_num_props`).
     ListWithoutLevel { num_id: u32 },
+    /// A `w:numPr` with no `w:numId`, with or without a `w:ilvl`. Checked
+    /// against Word: it neither starts nor removes numbering; the list is
+    /// the one the paragraph's style gives, and a written level selects the
+    /// level in that inherited list
+    /// (`StyleDefinitions::resolve_effective_num_props`).
+    WithoutList { ilvl: Option<u32> },
 }
 
 /// Raw required `w:val` payload retained at the package edge so a present but
@@ -1067,8 +1061,10 @@ pub struct IndentProps {
 /// Spacing properties extracted from w:pPr/w:spacing (§17.3.1.33).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpacingProps {
-    pub before: Option<u32>,
-    pub after: Option<u32>,
+    /// Signed: Word reads and keeps a negative value (see `parse_spacing_twips`).
+    pub before: Option<i32>,
+    /// Signed, as `before`.
+    pub after: Option<i32>,
     /// Space before in hundredths of a line (100 = one line).
     /// Per §17.3.1.33, takes precedence over `before` when both are present.
     pub before_lines: Option<u32>,
@@ -1206,15 +1202,19 @@ impl ParagraphView {
                 // to match that load behavior instead of replacing the entire
                 // accumulated set on every pPr.
                 let direct_numbering = extract_num_props(element)?;
-                if let DirectNumPr::ListWithoutLevel { num_id } = direct_numbering
-                    && num_props != DirectNumPr::Absent
-                {
-                    // Whether Word merges this list into an earlier pPr's
-                    // level is unobserved; refuse rather than pick one.
-                    return Err(WordIrError::IncompleteDirectNumbering {
-                        num_id: Some(num_id),
-                        ilvl: None,
-                    });
+                if num_props != DirectNumPr::Absent {
+                    // Whether Word merges a partial numPr into an earlier
+                    // pPr's numPr is unobserved; refuse rather than pick.
+                    let partial = match direct_numbering {
+                        DirectNumPr::ListWithoutLevel { num_id } => Some((Some(num_id), None)),
+                        DirectNumPr::WithoutList { ilvl } => Some((None, ilvl)),
+                        DirectNumPr::Absent | DirectNumPr::Suppressed | DirectNumPr::Active(_) => {
+                            None
+                        }
+                    };
+                    if let Some((num_id, ilvl)) = partial {
+                        return Err(WordIrError::IncompleteDirectNumbering { num_id, ilvl });
+                    }
                 }
                 if direct_numbering != DirectNumPr::Absent {
                     num_props = direct_numbering;
@@ -1815,7 +1815,38 @@ impl ParagraphView {
                 continue;
             }
 
-            // Unknown paragraph-level element - fail fast
+            // An unknown element with no element inside it. Checked against
+            // Word: it opens the document without repair and the element
+            // contributes nothing, so it is kept verbatim as a zero-width
+            // marker, like the two arms above.
+            //
+            // One that wraps content stays refused. Word unwraps it and shows
+            // the runs inside as ordinary text; keeping it as an opaque
+            // marker would hide text Word shows.
+            if !element
+                .children
+                .iter()
+                .any(|child| matches!(child, XMLNode::Element(_)))
+            {
+                atoms.push(Atom {
+                    kind: AtomKind::Decoration {
+                        name: element.name.clone(),
+                        raw_xml: serialize_element(element),
+                    },
+                    utf16_len: 0,
+                    source_run_attrs: Vec::new(),
+                    origin: AtomOrigin {
+                        run_index: None,
+                        child_index: None,
+                        paragraph_child_index: Some(index),
+                    },
+                    marks: TextMarks::default(),
+                    tracking: None,
+                });
+                continue;
+            }
+
+            // Unknown paragraph-level element holding content - fail fast
             return Err(WordIrError::UnknownParagraphElement(element.name.clone()));
         }
         // §17.16.23: an instrText not inside a complex field's field codes is
@@ -1823,6 +1854,7 @@ impl ParagraphView {
         // surrounding fldChar context, so reclassify orphans in a single
         // ordered pass over the paragraph's atoms now that they are all present.
         reclassify_orphan_instr_text(&mut atoms);
+        reclassify_text_inside_field_code(&mut atoms);
 
         Ok(ParagraphView {
             atoms,
@@ -1866,7 +1898,7 @@ impl ParagraphView {
         let mut out = String::new();
         for atom in &self.atoms {
             match &atom.kind {
-                AtomKind::Text(text) => out.push_str(text),
+                AtomKind::Text(text) => out.push_str(&crate::word_xml::word_text_as_read(text)),
                 AtomKind::Tab => out.push('\t'),
                 AtomKind::NoBreakHyphen => out.push('\u{2011}'),
                 AtomKind::Break { .. } => out.push('\n'),
@@ -2065,6 +2097,69 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 
         // Text content (t = normal text, delText = deleted text in tracked changes)
         if local_name == "t" || local_name == "delText" {
+            // Text holds no elements, but Word opens some inside it without
+            // repair (observed, by plain resave): a `w:br` is the break it
+            // names at that point, in the run's properties; a `w:tab` is
+            // dropped. Paragraphs inside a w:t are read at the import edge.
+            // Any other element would be content this reading skips, so it
+            // is refused rather than dropped.
+            if element
+                .children
+                .iter()
+                .any(|child| matches!(child, XMLNode::Element(_)))
+            {
+                let mut piece = Element::new(&element.name);
+                piece.prefix = element.prefix.clone();
+                piece.namespace = element.namespace.clone();
+                piece.attributes = element.attributes.clone();
+                let flush = |piece: &mut Element, atoms: &mut Vec<Atom>| {
+                    let text = crate::word_xml::active_word_text(piece);
+                    piece.children.clear();
+                    if !text.is_empty() {
+                        atoms.push(Atom {
+                            utf16_len: utf16_len(&text),
+                            kind: AtomKind::Text(text),
+                            source_run_attrs: source_run_attrs.clone(),
+                            origin: AtomOrigin {
+                                run_index: Some(run_index),
+                                child_index: Some(child_index),
+                                paragraph_child_index: None,
+                            },
+                            marks: marks.clone(),
+                            tracking: None,
+                        });
+                    }
+                };
+                for node in &element.children {
+                    match node {
+                        XMLNode::Element(inner) if is_w_tag(inner, "br") => {
+                            flush(&mut piece, &mut atoms);
+                            atoms.push(Atom {
+                                kind: break_atom_kind(inner, "br")?,
+                                utf16_len: 1,
+                                source_run_attrs: source_run_attrs.clone(),
+                                origin: AtomOrigin {
+                                    run_index: Some(run_index),
+                                    child_index: Some(child_index),
+                                    paragraph_child_index: None,
+                                },
+                                marks: marks.clone(),
+                                tracking: None,
+                            });
+                        }
+                        XMLNode::Element(inner) if is_w_tag(inner, "tab") => {}
+                        XMLNode::Element(inner) => {
+                            return Err(WordIrError::UnknownRunElement(format!(
+                                "{} inside w:{local_name}",
+                                inner.name
+                            )));
+                        }
+                        other => piece.children.push(other.clone()),
+                    }
+                }
+                flush(&mut piece, &mut atoms);
+                continue;
+            }
             // Edge whitespace is content only under xml:space="preserve", as
             // Word and every other reader take it.
             let text = crate::word_xml::active_word_text(element);
@@ -2216,6 +2311,53 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
                 continue;
             }
         }
+        // Any other w:rPrChange directly in a run is no revision to Word: it
+        // opens the run without repair, lists nothing for it, and Accept
+        // All, Reject All and a plain save all drop it (observed, empty and
+        // with a previous w:rPr, in the body and in a footnote). It is kept
+        // verbatim as a zero-width marker, like an element Word ignores.
+        if local_name == "rPrChange" {
+            atoms.push(Atom {
+                kind: AtomKind::Decoration {
+                    name: element.name.clone(),
+                    raw_xml: serialize_element(element),
+                },
+                utf16_len: 0,
+                source_run_attrs: source_run_attrs.clone(),
+                origin: AtomOrigin {
+                    run_index: Some(run_index),
+                    child_index: Some(child_index),
+                    paragraph_child_index: None,
+                },
+                marks: marks.clone(),
+                tracking: None,
+            });
+            continue;
+        }
+
+        // An empty element the WordprocessingML schema does not declare.
+        // Checked against Word: it opens such a run without repair, drops
+        // the element and keeps the run's text, so it is kept verbatim as a
+        // zero-width marker. One that holds content stays refused: Word
+        // shows the text inside it, which an opaque marker would hide.
+        if is_empty_unknown_wml_element(element) {
+            atoms.push(Atom {
+                kind: AtomKind::Decoration {
+                    name: element.name.clone(),
+                    raw_xml: serialize_element(element),
+                },
+                utf16_len: 0,
+                source_run_attrs: source_run_attrs.clone(),
+                origin: AtomOrigin {
+                    run_index: Some(run_index),
+                    child_index: Some(child_index),
+                    paragraph_child_index: None,
+                },
+                marks: marks.clone(),
+                tracking: None,
+            });
+            continue;
+        }
 
         // Unknown run-level element - fail fast
         return Err(WordIrError::UnknownRunElement(element.name.clone()));
@@ -2223,18 +2365,20 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
     if atoms.is_empty() {
         // CT_R permits zero run-content children (§17.3.2.25). Preserve the
         // complete zero-width run, including authored rPr and provenance.
-        // A formatting revision on such a run needs its own revision model;
-        // raw preservation alone must not hide that unresolved revision.
-        if let Some(change) = marks.rpr_change.as_deref() {
-            return Err(WordIrError::UnsupportedEmptyRunFormattingRevision {
-                run_index,
-                revision_id: change.revision_id,
-            });
-        }
+        // A run carrying a formatting revision is held without its rPr: the
+        // properties and the revision live in `marks`, so the revision is
+        // listed, resolved and written back like any run's. Without a
+        // revision the complete raw run owns its rPr.
+        let raw_xml = if marks.rpr_change.is_some() {
+            let mut bare = run.clone();
+            bare.children
+                .retain(|child| !matches!(child, XMLNode::Element(el) if is_w_tag(el, "rPr")));
+            serialize_element(&bare)
+        } else {
+            serialize_element(run)
+        };
         atoms.push(Atom {
-            kind: AtomKind::EmptyRun {
-                raw_xml: serialize_element(run),
-            },
+            kind: AtomKind::EmptyRun { raw_xml },
             utf16_len: 0,
             source_run_attrs,
             origin: AtomOrigin {
@@ -2292,49 +2436,48 @@ fn run_atoms(run: &Element, run_index: usize) -> Result<Vec<Atom>, WordIrError> 
 fn stacked_atoms(
     outer: &Element,
     inner: &Element,
+    container_index: usize,
     run_ordinal: &mut usize,
 ) -> Result<Vec<Atom>, WordIrError> {
-    fn rev_fields(el: &Element) -> Result<(u32, String, Option<String>), WordIrError> {
+    type RevFields = (u32, String, Option<String>, Option<String>);
+    fn rev_fields(el: &Element) -> Result<RevFields, WordIrError> {
         let revision_id = tracked_change_revision_id(el)?;
-        let author = attr_value(el, "author")
-            .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
-            .to_string();
+        let author = tracked_change_author(el);
         let date = attr_value(el, "date").map(|s| s.to_string());
-        Ok((revision_id, author, date))
+        Ok((
+            revision_id,
+            author,
+            date,
+            crate::xml_attrs::revision_date_utc(el),
+        ))
     }
     let (ins_el, del_el) = if is_w_tag(outer, "ins") {
         (outer, inner)
     } else {
         (inner, outer)
     };
-    let (ins_id, ins_author, ins_date) = rev_fields(ins_el)?;
-    let (del_id, del_author, del_date) = rev_fields(del_el)?;
+    let (ins_id, ins_author, ins_date, ins_date_utc) = rev_fields(ins_el)?;
+    let (del_id, del_author, del_date, del_date_utc) = rev_fields(del_el)?;
     let ctx = AtomTrackingContext {
         is_insertion: true,
         revision_id: ins_id,
         author: ins_author,
         date: ins_date,
+        date_utc: ins_date_utc,
         stacked_deletion: Some(StackedDeletionLayer {
             revision_id: del_id,
             author: del_author,
             date: del_date,
+            date_utc: del_date_utc,
         }),
     };
 
-    let mut atoms = Vec::new();
     for child in &inner.children {
-        let element = match child {
-            XMLNode::Element(el) => el,
-            _ => continue,
-        };
-        if is_w_tag(element, "r") {
-            atoms.extend(run_atoms(element, next_run_ordinal(run_ordinal))?);
-            continue;
-        }
-        if is_w_tag(element, "ins")
-            || is_w_tag(element, "del")
-            || is_w_tag(element, "moveFrom")
-            || is_w_tag(element, "moveTo")
+        if let XMLNode::Element(element) = child
+            && (is_w_tag(element, "ins")
+                || is_w_tag(element, "del")
+                || is_w_tag(element, "moveFrom")
+                || is_w_tag(element, "moveTo"))
         {
             // Depth 2: no third state exists; never drop, never guess.
             return Err(WordIrError::NestedTrackedChange {
@@ -2343,10 +2486,25 @@ fn stacked_atoms(
             });
         }
     }
+    // The inner container holds what any tracked container holds (runs,
+    // range and proofing markers, widgets, transparent wrappers): parse it as
+    // one, then give every atom the stacked state. Reading only its runs
+    // dropped the rest, a bookmark start among them, which then left its end
+    // unpaired.
+    let mut atoms = tracked_change_atoms(inner, container_index, run_ordinal)?;
     for atom in &mut atoms {
         atom.tracking = Some(ctx.clone());
     }
     Ok(atoms)
+}
+
+/// The author of a tracked change; empty when `w:author` is absent.
+///
+/// Checked against Word: it opens a `w:ins` or `w:del` with no `w:author`
+/// without repair and shows a tracked change that has no author, which is
+/// what the empty name means here.
+fn tracked_change_author(element: &Element) -> String {
+    attr_value(element, "author").cloned().unwrap_or_default()
 }
 
 /// Parse a tracked-change annotation id at the OOXML edge.
@@ -2355,9 +2513,15 @@ fn stacked_atoms(
 /// `u32` wire-annotation slot. A syntactically valid value outside that slot is
 /// normalized to the reserved `0` marker; the document import pass replaces
 /// every such marker with a deterministic in-range id before identities are
-/// minted. Missing and non-decimal values remain hard errors.
+/// minted. A non-decimal value remains a hard error.
+///
+/// A missing `w:id` takes the same marker. Checked against Word: it opens a
+/// `w:ins` or `w:del` with no `w:id` without repair, shows it as a tracked
+/// change, and writes an id of its own on save.
 fn tracked_change_revision_id(element: &Element) -> Result<u32, WordIrError> {
-    let raw = attr_value(element, "id").ok_or(WordIrError::MissingTrackedChangeAttribute("id"))?;
+    let Some(raw) = attr_value(element, "id") else {
+        return Ok(0);
+    };
     if let Ok(value) = raw.parse::<u32>() {
         return Ok(value);
     }
@@ -2556,15 +2720,14 @@ fn tracked_container_context(
     }
     let is_insertion = is_w_tag(container, "ins") || is_w_tag(container, "moveTo");
     let revision_id = tracked_change_revision_id(container)?;
-    let author = attr_value(container, "author")
-        .ok_or(WordIrError::MissingTrackedChangeAttribute("author"))?
-        .to_string();
+    let author = tracked_change_author(container);
     let date = attr_value(container, "date").map(|s| s.to_string());
     Ok(Some(AtomTrackingContext {
         is_insertion,
         revision_id,
         author,
         date,
+        date_utc: crate::xml_attrs::revision_date_utc(container),
         stacked_deletion: None,
     }))
 }
@@ -2689,11 +2852,24 @@ fn tracked_change_atoms(
     };
 
     let mut atoms = Vec::new();
+    // The same-type container nested in this one that content has followed.
+    let mut closed_by_same_type: Option<&Element> = None;
     for child in &container.children {
         let element = match child {
             XMLNode::Element(el) => el,
             _ => continue,
         };
+        // Word reads content that follows a same-type nested container, still
+        // inside the outer one, as NOT tracked at all (observed: in
+        // ins A [a, ins B [b], c] the run c is saved as plain text). That
+        // reading is not modeled, so the shape is refused, never read as
+        // the outer change.
+        if let Some(inner) = closed_by_same_type {
+            return Err(WordIrError::NestedTrackedChange {
+                outer: container.name.clone(),
+                inner: inner.name.clone(),
+            });
+        }
         // Tracked changes contain runs (w:r)
         if is_w_tag(element, "r") {
             atoms.extend(run_atoms(element, next_run_ordinal(run_ordinal))?);
@@ -2704,13 +2880,15 @@ fn tracked_change_atoms(
         //
         // - ins/del (either wire order): an inserted-then-deleted segment;
         // - moveTo/del: a later deletion in the move destination;
-        // - moveFrom/ins: the insertion from which a later move originated.
+        // - moveFrom/ins: the insertion from which a later move originated;
+        // - moveFrom/del: a deletion in the move source (Word writes the same
+        //   deletion in the moveTo copy, so the source keeps it).
         //
-        // The two move shapes are emitted by Word itself. Their inner carrier
+        // The three move shapes are emitted by Word itself. Their inner carrier
         // remains an ordinary independent status; the enclosing move context
-        // is supplied by the linked TrackedBlock move pair. Everything else
-        // still fails loud (same-type nesting is invalid OOXML per I-TC-003,
-        // and no deeper nesting is modeled).
+        // is supplied by the linked TrackedBlock move pair. Same-type nesting
+        // is read as the inner change (see below). Everything else still
+        // fails loud: no deeper nesting is modeled.
         if tracking.is_some()
             && (is_w_tag(element, "ins")
                 || is_w_tag(element, "del")
@@ -2724,14 +2902,32 @@ fn tracked_change_atoms(
             let stacked_pair = (outer_is_ins && inner_is_del) || (outer_is_del && inner_is_ins);
             let move_destination_deletion = is_w_tag(container, "moveTo") && inner_is_del;
             let inserted_move_source = is_w_tag(container, "moveFrom") && inner_is_ins;
-            if !stacked_pair && !move_destination_deletion && !inserted_move_source {
+            let move_source_deletion = is_w_tag(container, "moveFrom") && inner_is_del;
+            // Same-type nesting: Word reads the content as the inner change
+            // alone (observed), so it is parsed like the move shapes below,
+            // keeping the inner revision.
+            let same_type = (outer_is_ins && inner_is_ins) || (outer_is_del && inner_is_del);
+            if !stacked_pair
+                && !move_destination_deletion
+                && !inserted_move_source
+                && !move_source_deletion
+                && !same_type
+            {
                 return Err(WordIrError::NestedTrackedChange {
                     outer: container.name.clone(),
                     inner: element.name.clone(),
                 });
             }
+            if same_type {
+                closed_by_same_type = Some(element);
+            }
             if stacked_pair {
-                atoms.extend(stacked_atoms(container, element, run_ordinal)?);
+                atoms.extend(stacked_atoms(
+                    container,
+                    element,
+                    container_index,
+                    run_ordinal,
+                )?);
             } else {
                 // Parse the inner revision normally. The final tagging loop
                 // deliberately does not overwrite its context with the outer
@@ -3273,6 +3469,66 @@ fn reclassify_orphan_instr_text(atoms: &mut [Atom]) {
     }
 }
 
+/// The mirror of [`reclassify_orphan_instr_text`]: a `w:t` between a complex
+/// field's `begin` and its `separate` (or its `end`, when it has no
+/// `separate`) is field code, not text of the document.
+///
+/// Observed in Word: it does not show such text, and writes it back as part
+/// of the field's `w:instrText`, wherever in the code region it stood. So
+/// the atom becomes the instruction text Word reads it as.
+///
+/// Only fields this paragraph opens are judged. For a field opened in an
+/// earlier paragraph the paragraph alone does not say whether its code or
+/// its result is running, and its text is left as text.
+fn reclassify_text_inside_field_code(atoms: &mut [Atom]) {
+    let ambiguous_field_structure = atoms.iter().any(|a| {
+        matches!(&a.kind, AtomKind::Widget { name, .. }
+            if local_element_name_str(name) == "fldChar")
+            && fld_char_type(a).is_none()
+    });
+    if ambiguous_field_structure {
+        return;
+    }
+    // One entry per field opened in this paragraph: whether its code region
+    // is still running.
+    let mut in_code: Vec<bool> = Vec::new();
+    for atom in atoms.iter_mut() {
+        if let Some(fld_type) = fld_char_type(atom) {
+            match fld_type.as_str() {
+                "begin" => in_code.push(true),
+                "separate" => {
+                    if let Some(code) = in_code.last_mut() {
+                        *code = false;
+                    }
+                }
+                "end" => {
+                    in_code.pop();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if in_code.last() != Some(&true) {
+            continue;
+        }
+        let AtomKind::Text(text) = &atom.kind else {
+            continue;
+        };
+        let escaped = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let fragment = format!(r#"<w:instrText xml:space="preserve">{escaped}</w:instrText>"#);
+        let instruction = crate::word_xml::parse_raw_fragment(fragment.as_bytes())
+            .expect("an escaped text node in a fixed element is well-formed");
+        atom.kind = AtomKind::Widget {
+            name: instruction.name.clone(),
+            raw_xml: serialize_element(&instruction),
+        };
+        atom.utf16_len = 1;
+    }
+}
+
 fn text_from_element(element: &Element) -> String {
     let mut out = String::new();
     for node in &element.children {
@@ -3367,6 +3623,12 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
             "rtl" => marks.rtl = parse_toggle_value(el),
 
             // --- Underline ---
+            // An underline value outside ST_Underline (`solid`, `bogus`) is
+            // no underline element at all: Word opens it without repair and
+            // saves the run without `w:u` (observed), so the run keeps what
+            // its style gives.
+            "u" if attr_value(el, "val")
+                .is_some_and(|val| crate::domain::UnderlineStyle::from_xml_str(val).is_err()) => {}
             "u" => {
                 marks.underline = parse_underline_value(el);
                 marks.underline_style = attr_value(el, "val").cloned();
@@ -3493,7 +3755,17 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
             "kern" => {
                 // w:kern w:val="28" — kerning threshold in half-points (ISO 29500-1 §17.3.2.19a)
                 // ST_HpsMeasure.
-                marks.kern = rpr_half_points(el, "kern", false)?;
+                // A word where the number goes is 0: Word opens `big`
+                // without repair and saves `w:val="0"` (observed).
+                marks.kern = match attr_value(el, "val") {
+                    Some(value)
+                        if !crate::import::is_schema_decimal(value)
+                            && rpr_half_points(el, "kern", false).is_err() =>
+                    {
+                        Some(0)
+                    }
+                    _ => rpr_half_points(el, "kern", false)?,
+                };
             }
             "w" => {
                 // w:w w:val="150" — character width scaling percentage (ISO 29500-1 §17.3.2.43)
@@ -3545,6 +3817,7 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
                     revision_id,
                     author,
                     date,
+                    date_utc: crate::xml_attrs::revision_date_utc(el),
                 }));
             }
 
@@ -3576,8 +3849,10 @@ pub(crate) fn parse_rpr_element(rpr: &Element) -> Result<TextMarks, WordIrError>
                     "val",
                     rpr_twips(el, "fitText", "val", false)?,
                 )?;
-                marks.fit_text_id =
-                    rpr_unsigned(el, "fitText", "id", rpr_decimal(el, "fitText", "id")?)?;
+                // The id only names a group of runs. ST_DecimalNumber is
+                // signed, Word writes negative ids, and Word opens ids
+                // beyond 32 bits without repair, so the number is kept whole.
+                marks.fit_text_id = rpr_decimal(el, "fitText", "id")?;
             }
 
             // Paragraph-mark revision markers (§17.13.5.19/.28, and the mark's
@@ -3713,6 +3988,22 @@ fn is_foreign_namespace_element(element: &Element) -> bool {
         // treat as WML-local and let the unknown-element refusal handle it.
         None => false,
     }
+}
+
+/// An element in the WordprocessingML namespace that the schema does not
+/// declare (see [`crate::wml_schema_names`]) and that holds nothing: no
+/// element and no text other than whitespace.
+fn is_empty_unknown_wml_element(element: &Element) -> bool {
+    let in_wml = element.prefix.as_deref() == Some("w")
+        || element.namespace.as_deref()
+            == Some("http://schemas.openxmlformats.org/wordprocessingml/2006/main");
+    in_wml
+        && !crate::wml_schema_names::is_wml_schema_element(&local_element_name(element))
+        && element.children.iter().all(|child| match child {
+            XMLNode::Element(_) => false,
+            XMLNode::Text(text) | XMLNode::CData(text) => text.trim().is_empty(),
+            _ => true,
+        })
 }
 
 /// Extract the local name from an element, stripping any namespace prefix.
@@ -4243,12 +4534,11 @@ fn attr_value<'a>(element: &'a Element, local: &str) -> Option<&'a String> {
 /// Returns `DirectNumPr::Absent` when no w:numPr is present,
 /// `DirectNumPr::Suppressed` when numId=0 (§17.9.18: remove inherited numbering),
 /// `DirectNumPr::Active(NumProps)` for a complete active numbering reference,
-/// or `DirectNumPr::ListWithoutLevel` for a list reference that writes no level.
+/// `DirectNumPr::ListWithoutLevel` for a list reference that writes no level,
+/// or `DirectNumPr::WithoutList` for a container that names no list.
 ///
-/// Both children are schema-optional. A list without a level is carried as
-/// written; its effective level is resolved later, with the style in hand. A
-/// level without a list (or an empty container) is still a typed refusal: no
-/// Word evidence fixes its meaning yet.
+/// Both children are schema-optional. A partial container is carried as
+/// written; what it means is resolved later, with the style in hand.
 fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
     let num_prs = w_children_named(p_pr, "numPr");
     let Some(num_pr) = num_prs.first().copied() else {
@@ -4282,13 +4572,23 @@ fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
                 element: format!("w:{element_name}"),
                 attribute: "w:val",
             })?;
-        let parsed =
-            raw.parse::<u32>()
-                .map_err(|_| WordIrError::InvalidParagraphPropertyAttribute {
-                    element: element_name,
-                    attribute: "val",
-                    value: raw.clone(),
-                })?;
+        let invalid = || WordIrError::InvalidParagraphPropertyAttribute {
+            element: element_name,
+            attribute: "val",
+            value: raw.clone(),
+        };
+        // Word holds a list level as one unsigned byte: a negative w:ilvl
+        // opens without repair and is saved wrapped (`-1` as 255, `-2` as
+        // 254, observed). The model reads it the same way. Other negative
+        // coordinates are not established and stay refused.
+        if element_name == "ilvl"
+            && let Ok(negative @ -255..=-1) = raw.parse::<i32>()
+        {
+            return Ok(Some(
+                u32::try_from(256 + negative).expect("-255..=-1 wraps into 1..=255"),
+            ));
+        }
+        let parsed = raw.parse::<u32>().map_err(|_| invalid())?;
         Ok(Some(parsed))
     };
 
@@ -4302,7 +4602,7 @@ fn extract_num_props(p_pr: &Element) -> Result<DirectNumPr, WordIrError> {
     match (num_id, ilvl) {
         (Some(num_id), Some(ilvl)) => Ok(DirectNumPr::Active(NumProps { num_id, ilvl })),
         (Some(num_id), None) => Ok(DirectNumPr::ListWithoutLevel { num_id }),
-        (num_id, ilvl) => Err(WordIrError::IncompleteDirectNumbering { num_id, ilvl }),
+        (None, ilvl) => Ok(DirectNumPr::WithoutList { ilvl }),
     }
 }
 
@@ -4391,20 +4691,19 @@ fn extract_indentation(p_pr: &Element) -> Result<Option<IndentProps>, WordIrErro
         return Ok(None);
     };
 
-    let parse_twips_i32 = |attribute: &'static str, schema_allows_negative: bool| {
+    // A value past 32 signed bits is no value: Word opens the paragraph
+    // without repair and saves it without that attribute (observed for
+    // `left` at 2^31 and 2^32, `right` and `firstLine` at 2^32; the other
+    // attributes are kept). The model reads it the same way.
+    let parse_twips_i32 = |attribute: &'static str,
+                           schema_allows_negative: bool|
+     -> Result<Option<i32>, WordIrError> {
         let Some(twips) =
             parse_paragraph_twip_measure(ind, "ind", attribute, schema_allows_negative)?
         else {
             return Ok(None);
         };
-        i32::try_from(twips).map(Some).map_err(|_| {
-            WordIrError::ParagraphPropertyAttributeOutOfRange {
-                element: "ind",
-                attribute,
-                value: attr_value(ind, attribute).cloned().unwrap_or_default(),
-                model: "signed i32 twips",
-            }
-        })
+        Ok(i32::try_from(twips).ok())
     };
     let parse_decimal_i32 = |attribute: &'static str| {
         attr_value(ind, attribute)
@@ -4786,8 +5085,8 @@ fn extract_spacing(p_pr: &Element) -> Result<Option<SpacingProps>, WordIrError> 
             .transpose()
     };
 
-    let before = parse_spacing_twips(sp, "before", false)?;
-    let after = parse_spacing_twips(sp, "after", false)?;
+    let before = parse_spacing_twips(sp, "before")?;
+    let after = parse_spacing_twips(sp, "after")?;
     let before_lines = parse_decimal_u32("beforeLines")?;
     let after_lines = parse_decimal_u32("afterLines")?;
     // §17.3.1.33: beforeAutospacing/afterAutospacing — ST_OnOff attribute.
@@ -4807,14 +5106,12 @@ fn extract_spacing(p_pr: &Element) -> Result<Option<SpacingProps>, WordIrError> 
         .transpose()?;
     // Per §17.3.1.33: "If [lineRule] is omitted, then it shall be assumed
     // to be of a value auto if a line attribute value is present."
+    // A rule outside ST_LineSpacingRule is `auto`: Word opens it without
+    // repair and saves `w:lineRule="auto"` (observed with `bogus`).
     let line_rule = attr_value(sp, "lineRule")
         .map(|value| match value.as_str() {
-            "auto" | "exact" | "atLeast" => Ok(value.clone()),
-            _ => Err(WordIrError::InvalidParagraphPropertyAttribute {
-                element: "spacing",
-                attribute: "lineRule",
-                value: value.clone(),
-            }),
+            "auto" | "exact" | "atLeast" => Ok::<String, WordIrError>(value.clone()),
+            _ => Ok("auto".to_string()),
         })
         .transpose()?;
 
@@ -4869,25 +5166,26 @@ pub(crate) fn parse_paragraph_twip_measure(
     Ok(Some(twips))
 }
 
-/// Parse one of the twip-valued `w:spacing` attributes into its canonical
-/// non-negative `u32` representation.
+/// Parse `w:spacing/@w:before` or `@w:after` into signed twips.
+///
+/// The schema types both as ST_TwipsMeasure (unsigned), but Word opens a
+/// negative value without repair, in a paragraph and in the document
+/// defaults, and keeps it as written on save (observed, Word 16.0, with
+/// `-1` and `-240`). The model holds what Word holds: the signed value.
 fn parse_spacing_twips(
     spacing: &Element,
     attribute: &'static str,
-    schema_allows_negative: bool,
-) -> Result<Option<u32>, WordIrError> {
-    let Some(twips) =
-        parse_paragraph_twip_measure(spacing, "spacing", attribute, schema_allows_negative)?
-    else {
+) -> Result<Option<i32>, WordIrError> {
+    let Some(twips) = parse_paragraph_twip_measure(spacing, "spacing", attribute, true)? else {
         return Ok(None);
     };
-    u32::try_from(twips)
+    i32::try_from(twips)
         .map(Some)
         .map_err(|_| WordIrError::ParagraphPropertyAttributeOutOfRange {
             element: "spacing",
             attribute,
             value: attr_value(spacing, attribute).cloned().unwrap_or_default(),
-            model: "non-negative u32 twips",
+            model: "i32 twips",
         })
 }
 
@@ -5061,13 +5359,14 @@ fn extract_border_edge(
             attribute: "w:val",
         })?
         .clone();
-    crate::domain::BorderStyle::from_xml_str(&style).map_err(|_| {
-        WordIrError::InvalidParagraphPropertyAttribute {
-            element: edge_name,
-            attribute: "val",
-            value: style.clone(),
-        }
-    })?;
+    // A style outside ST_Border is no border: Word opens it without repair
+    // and saves the edge as `w:val="none"` (observed with `bogus` on a
+    // paragraph's top border).
+    let style = if crate::domain::BorderStyle::from_xml_str(&style).is_ok() {
+        style
+    } else {
+        "none".to_string()
+    };
     let color = attr_value(edge, "color").cloned();
     let parse_u32 = |attribute: &'static str| {
         attr_value(edge, attribute)
@@ -5120,6 +5419,7 @@ fn extract_section_property_change(p_pr: &Element) -> Option<SectionPropertyChan
             author,
             date,
             apply_op_id: None,
+            date_utc: crate::xml_attrs::revision_date_utc(change_el),
         },
         previous_properties_raw,
     })
@@ -5229,6 +5529,7 @@ fn extract_ppr_change(p_pr: &Element) -> Result<Option<PprChange>, WordIrError> 
         preserved,
         author,
         date,
+        date_utc: crate::xml_attrs::revision_date_utc(ppr_change_el),
     }))
 }
 
@@ -5320,8 +5621,12 @@ fn rpr_half_points(
 /// CONTRACT DEFAULT (Word 16, verified): a value that is neither a number
 /// nor a universal measure ("abc") reads as 0 half-points. Word opens such a
 /// document without repair, renders its minimum size and saves `0`; it does
-/// not treat the size as absent, so neither do we. A negative number is not
-/// covered by that ruling and stays refused.
+/// not treat the size as absent, so neither do we.
+///
+/// A negative number (Word 16, verified): Word opens the document without
+/// repair and holds the size as an unsigned 16-bit number, so "-24" is
+/// 65512 and "-1" is 65535, and that is what it saves. We read the same
+/// number. Below -65535 there is no observation, and the value is refused.
 pub(crate) fn font_size_half_points(
     element: &Element,
     element_name: &'static str,
@@ -5337,12 +5642,19 @@ pub(crate) fn font_size_half_points(
     if !numeric {
         return Ok(Some(WORD_NON_NUMERIC_FONT_SIZE));
     }
-    rpr_unsigned(
-        element,
-        element_name,
-        "val",
-        rpr_half_points(element, element_name, false)?,
-    )
+    // Read signed, so a negative number reaches the 16-bit reading below.
+    // Word holds the size in 16 bits: a value above them is kept modulo
+    // 65536 (99999999999 is saved as 59391, observed).
+    let half_points = rpr_half_points(element, element_name, true)?.map(|half_points| {
+        if (-i64::from(u16::MAX)..0).contains(&half_points) {
+            half_points + i64::from(u16::MAX) + 1
+        } else if half_points > i64::from(u16::MAX) {
+            half_points % (i64::from(u16::MAX) + 1)
+        } else {
+            half_points
+        }
+    });
+    rpr_unsigned(element, element_name, "val", half_points)
 }
 
 /// What Word reads a non-numeric `w:sz` / `w:szCs` as (see
@@ -5444,6 +5756,7 @@ fn extract_para_mark_status(p_pr: &Element) -> Option<TrackingStatus> {
                 author: attr_value(el, "author").cloned(),
                 date: attr_value(el, "date").cloned(),
                 apply_op_id: None,
+                date_utc: crate::xml_attrs::revision_date_utc(el),
             });
         }
         if is_w_tag(el, "ins") || is_w_tag(el, "moveTo") {
@@ -5454,6 +5767,7 @@ fn extract_para_mark_status(p_pr: &Element) -> Option<TrackingStatus> {
                 author: attr_value(el, "author").cloned(),
                 date: attr_value(el, "date").cloned(),
                 apply_op_id: None,
+                date_utc: crate::xml_attrs::revision_date_utc(el),
             });
         }
     }
@@ -5606,16 +5920,17 @@ fn section_decimal_unsigned(
         .transpose()
 }
 
-/// [`section_decimal`] for a signed `i32` model field.
-fn section_decimal_signed(
-    element: &Element,
-    element_name: &'static str,
-    attribute: &'static str,
-) -> Result<Option<i32>, WordIrError> {
-    section_decimal(element, element_name, attribute)?
+/// `w:docGrid/@w:charSpace`: signed, since Word writes a negative value to
+/// tighten the pitch. Some producers write that negative number as its
+/// unsigned 32-bit form ("4294965247" for -2049). Checked against Word: it
+/// opens such a file without repair, reads the signed number, and writes
+/// "-2049" back. Anything outside both 32-bit ranges is refused.
+fn doc_grid_char_space(doc_grid: &Element) -> Result<Option<i32>, WordIrError> {
+    section_decimal(doc_grid, "docGrid", "charSpace")?
         .map(|number| {
             i32::try_from(number)
-                .map_err(|_| invalid_section_attribute(element, element_name, attribute))
+                .or_else(|_| u32::try_from(number).map(u32::cast_signed))
+                .map_err(|_| invalid_section_attribute(doc_grid, "docGrid", "charSpace"))
         })
         .transpose()
 }
@@ -5780,7 +6095,9 @@ pub(crate) fn parse_section_properties(
                 _ => None,
             })
             .map(|el| {
-                let width = section_twips_unsigned(el, "col", "w")?.unwrap_or(0);
+                // Signed: Word opens a negative column width without repair
+                // and writes it back unchanged.
+                let width = section_twips_signed(el, "col", "w")?.unwrap_or(0);
                 // MS-OI29500 §17.6.3: missing space attr defaults to 0
                 let space = section_twips_unsigned(el, "col", "space")?.unwrap_or(0);
                 Ok(crate::domain::ColumnDef { width, space })
@@ -5808,8 +6125,7 @@ pub(crate) fn parse_section_properties(
                 attr_value(doc_grid, "type")
                     .and_then(|s| crate::domain::DocGridType::from_xml_str(s).ok()),
                 section_decimal_unsigned(doc_grid, "docGrid", "linePitch")?,
-                // Signed: Word writes a negative charSpace to tighten pitch.
-                section_decimal_signed(doc_grid, "docGrid", "charSpace")?,
+                doc_grid_char_space(doc_grid)?,
             )
         } else {
             (None, None, None)
@@ -5985,18 +6301,17 @@ fn extract_tab_stops(p_pr: &Element) -> Result<Option<Vec<TabStopDef>>, WordIrEr
         })?;
         // w:val — parse tab alignment (ST_TabJc §17.18.81).
         // MS-OI29500 §17.18.84: "start" is an alias for "left", "end" for "right".
-        let raw_alignment =
-            attr_value(el, "val").ok_or_else(|| WordIrError::MissingRequiredAttribute {
-                element: "w:tab".to_string(),
-                attribute: "w:val",
-            })?;
-        let alignment = crate::domain::TabAlignment::from_xml_str(raw_alignment).map_err(|_| {
-            WordIrError::InvalidParagraphPropertyAttribute {
-                element: "tab",
-                attribute: "val",
-                value: raw_alignment.clone(),
-            }
-        })?;
+        // The schema requires w:val, but Word opens a tab stop without it
+        // cleanly and reads it as a left stop: on a plain resave, and after
+        // Accept All and Reject All, it writes `w:val="left"` (observed,
+        // Word 16.0, with and without a leader). The model reads it the same.
+        // An alignment outside ST_TabJc is left too (`bogus` saved as
+        // `w:val="left"`, observed).
+        let alignment = match attr_value(el, "val") {
+            None => crate::domain::TabAlignment::Left,
+            Some(raw_alignment) => crate::domain::TabAlignment::from_xml_str(raw_alignment)
+                .unwrap_or(crate::domain::TabAlignment::Left),
+        };
         // w:leader — parse tab leader (ST_TabTlc §17.18.82).
         // "none" means no leader (same as absent).
         let leader = attr_value(el, "leader")
@@ -6255,6 +6570,7 @@ fn parse_hyperlink_revision_status(el: &Element, inserted: bool) -> Option<Track
         author,
         date,
         apply_op_id: None,
+        date_utc: crate::xml_attrs::revision_date_utc(el),
     };
     Some(if inserted {
         TrackingStatus::Inserted(info)
@@ -6263,14 +6579,58 @@ fn parse_hyperlink_revision_status(el: &Element, inserted: bool) -> Option<Track
     })
 }
 
-fn collect_hyperlink_runs(element: &Element, out: &mut Vec<HyperlinkRun>) {
-    collect_hyperlink_runs_with_status(element, TrackingStatus::Normal, out);
+/// One run (`w:r`) of a hyperlink's display text: its properties and text,
+/// and the run as written when the fields do not rebuild it.
+pub(crate) fn hyperlink_run(el: &Element, status: TrackingStatus) -> HyperlinkRun {
+    let mut rpr_elements = el.children.iter().filter_map(|child| {
+        let XMLNode::Element(element) = child else {
+            return None;
+        };
+        (local_element_name(element) == "rPr").then_some(element)
+    });
+    let rpr_xml = rpr_elements.next().map(serialize_element);
+    let additional_rpr_xml = rpr_elements.map(serialize_element).collect();
+    let mut text = String::new();
+    extract_text_recursive(el, &mut text);
+    let mut run = HyperlinkRun {
+        text,
+        rpr_xml,
+        additional_rpr_xml,
+        source_xml: None,
+        source_run_attrs: source_run_attrs(el),
+        status,
+    };
+    // Keep the verbatim run only when it says more than the fields
+    // above: if the serializer rebuilds this exact run from them,
+    // the bytes are a second spelling of the same run.
+    let source = serialize_element(el);
+    let deleted = el
+        .children
+        .iter()
+        .any(|child| matches!(child, XMLNode::Element(e) if local_element_name(e) == "delText"));
+    let rebuilt = crate::word_xml::serialize_raw_fragment(&crate::serialize::build_hyperlink_run(
+        &run, deleted,
+    ));
+    if crate::import::canonical_raw_hash(&source) != crate::import::canonical_raw_hash(&rebuilt) {
+        run.source_xml = Some(source);
+    }
+    run
 }
 
+fn collect_hyperlink_runs(element: &Element, out: &mut Vec<HyperlinkRun>) {
+    let mut fields_in_code = Vec::new();
+    collect_hyperlink_runs_with_status(element, TrackingStatus::Normal, out, &mut fields_in_code);
+}
+
+/// `fields_in_code` has one entry per complex field opened so far inside the
+/// hyperlink: whether its code region is still running. A run's text there
+/// is field code (see [`reclassify_text_inside_field_code`]): it is not the
+/// link's text, and the run is kept as written.
 fn collect_hyperlink_runs_with_status(
     element: &Element,
     status: TrackingStatus,
     out: &mut Vec<HyperlinkRun>,
+    fields_in_code: &mut Vec<bool>,
 ) {
     for child in &element.children {
         let XMLNode::Element(el) = child else {
@@ -6279,39 +6639,30 @@ fn collect_hyperlink_runs_with_status(
         let local = local_element_name(el);
         match local.as_str() {
             "r" => {
-                // Direct run: extract rPr and text.
-                let mut rpr_elements = el.children.iter().filter_map(|child| {
-                    let XMLNode::Element(element) = child else {
-                        return None;
+                let mut run = hyperlink_run(el, status.clone());
+                if fields_in_code.last() == Some(&true) && !run.text.is_empty() {
+                    run.text.clear();
+                    run.source_xml = Some(serialize_element(el));
+                }
+                for run_child in &el.children {
+                    let XMLNode::Element(marker) = run_child else {
+                        continue;
                     };
-                    (local_element_name(element) == "rPr").then_some(element)
-                });
-                let rpr_xml = rpr_elements.next().map(serialize_element);
-                let additional_rpr_xml = rpr_elements.map(serialize_element).collect();
-                let mut text = String::new();
-                extract_text_recursive(el, &mut text);
-                let mut run = HyperlinkRun {
-                    text,
-                    rpr_xml,
-                    additional_rpr_xml,
-                    source_xml: None,
-                    source_run_attrs: source_run_attrs(el),
-                    status: status.clone(),
-                };
-                // Keep the verbatim run only when it says more than the fields
-                // above: if the serializer rebuilds this exact run from them,
-                // the bytes are a second spelling of the same run.
-                let source = serialize_element(el);
-                let deleted = el.children.iter().any(|child| {
-                    matches!(child, XMLNode::Element(e) if local_element_name(e) == "delText")
-                });
-                let rebuilt = crate::word_xml::serialize_raw_fragment(
-                    &crate::serialize::build_hyperlink_run(&run, deleted),
-                );
-                if crate::import::canonical_raw_hash(&source)
-                    != crate::import::canonical_raw_hash(&rebuilt)
-                {
-                    run.source_xml = Some(source);
+                    if local_element_name(marker) != "fldChar" {
+                        continue;
+                    }
+                    match attr_value(marker, "fldCharType").map(String::as_str) {
+                        Some("begin") => fields_in_code.push(true),
+                        Some("separate") => {
+                            if let Some(code) = fields_in_code.last_mut() {
+                                *code = false;
+                            }
+                        }
+                        Some("end") => {
+                            fields_in_code.pop();
+                        }
+                        _ => {}
+                    }
                 }
                 out.push(run);
             }
@@ -6322,18 +6673,18 @@ fn collect_hyperlink_runs_with_status(
             "ins" | "moveTo" => {
                 let new_status = parse_hyperlink_revision_status(el, /* inserted */ true)
                     .unwrap_or_else(|| status.clone());
-                collect_hyperlink_runs_with_status(el, new_status, out);
+                collect_hyperlink_runs_with_status(el, new_status, out, fields_in_code);
             }
             "del" | "moveFrom" => {
                 let new_status = parse_hyperlink_revision_status(el, /* inserted */ false)
                     .unwrap_or_else(|| status.clone());
-                collect_hyperlink_runs_with_status(el, new_status, out);
+                collect_hyperlink_runs_with_status(el, new_status, out, fields_in_code);
             }
             // Transparent containers from EG_ContentRunContent (§17.16.5) and
             // EG_RunLevelElts that may wrap runs. fldSimple is EG_PContent-only
             // per the schema but handled defensively for non-conformant docs.
             "smartTag" | "sdt" | "customXml" | "dir" | "bdo" | "fldSimple" | "hyperlink" => {
-                collect_hyperlink_runs_with_status(el, status.clone(), out);
+                collect_hyperlink_runs_with_status(el, status.clone(), out, fields_in_code);
             }
             // EG_RunLevelElts range markers — no text content, safe to skip.
             "bookmarkStart" | "bookmarkEnd" | "commentRangeStart" | "commentRangeEnd"
@@ -6354,7 +6705,9 @@ fn extract_text_recursive(element: &Element, out: &mut String) {
             let local_name = local_element_name(el);
             // w:t is the text element
             if local_name == "t" || local_name == "delText" {
-                out.push_str(&crate::word_xml::active_word_text(el));
+                out.push_str(&crate::word_xml::word_text_as_read(
+                    &crate::word_xml::active_word_text(el),
+                ));
             } else if local_name == "tab" {
                 // A run-level w:tab is part of the visible text (§17.3.3.32):
                 // a table of contents entry reads "A.\tTitle\t22".
@@ -6440,10 +6793,11 @@ mod tests {
 
     #[test]
     fn test_unknown_wml_namespace_element_still_refused() {
-        // GUARD: the foreign-namespace leniency must NOT swallow an unknown element
-        // in the WML namespace. A w:-prefixed element we do not model is a genuine
-        // spec gap and must still fail loud (no silent fallback).
-        let xml = br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:bogusElement/></w:p></w:hdr>"#;
+        // GUARD: an unknown WML element that WRAPS content must still fail
+        // loud. Word unwraps it and shows the runs inside as text (checked);
+        // carrying it as an opaque marker would hide that text. (An empty
+        // one contributes nothing in Word and is kept as a marker.)
+        let xml = br#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:bogusElement><w:r><w:t>inside</w:t></w:r></w:bogusElement></w:p></w:hdr>"#;
         let root = crate::word_xml::parse_document_xml(xml).unwrap();
         let para = root
             .children
@@ -6839,16 +7193,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_run_formatting_revision_refuses_instead_of_hiding_history() {
-        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:rPr><w:rPrChange w:id="27" w:author="Editor"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr></w:r>"#;
+    fn empty_run_formatting_revision_keeps_the_revision_in_its_marks() {
+        let xml = r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:rPr><w:b/><w:rPrChange w:id="27" w:author="Editor"><w:rPr/></w:rPrChange></w:rPr></w:r>"#;
         let element = parse_with_whitespace(xml);
-        assert!(matches!(
-            run_atoms(&element, 3),
-            Err(WordIrError::UnsupportedEmptyRunFormattingRevision {
-                run_index: 3,
-                revision_id: 27
-            })
-        ));
+        let atoms = run_atoms(&element, 3).unwrap();
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0].utf16_len, 0);
+        assert_eq!(
+            atoms[0].marks.rpr_change.as_deref().map(|c| c.revision_id),
+            Some(27)
+        );
+        let AtomKind::EmptyRun { raw_xml } = &atoms[0].kind else {
+            panic!("an empty run stays an empty run");
+        };
+        assert!(!std::str::from_utf8(raw_xml).unwrap().contains("rPr"));
     }
 
     #[test]
@@ -7090,7 +7448,7 @@ mod tests {
             <mc:AlternateContent>
                 <mc:Choice Requires="wps">
                     <w:r><w:t>text</w:t></w:r>
-                    <w:bogusElement/>
+                    <w:bogusElement><w:r><w:t>inside</w:t></w:r></w:bogusElement>
                 </mc:Choice>
                 <mc:Fallback>
                     <w:r><w:t>fallback</w:t></w:r>
@@ -7152,12 +7510,43 @@ mod tests {
 
     #[test]
     fn unknown_run_child_still_fails_after_bookmark_normalization() {
+        // Word shows the text inside an unknown element; an opaque marker
+        // would hide it, so one holding content is refused.
         let run = parse_with_whitespace(
-            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:unmodeledContent/></w:r>"#,
+            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:unmodeledContent><w:t>kept</w:t></w:unmodeledContent></w:r>"#,
         );
         assert!(matches!(
             run_atoms(&run, 0),
             Err(WordIrError::UnknownRunElement(name)) if name == "unmodeledContent"
+        ));
+    }
+
+    #[test]
+    fn an_empty_unknown_run_child_is_kept_as_a_marker() {
+        // Word opens a run holding an empty element it does not know without
+        // repair and drops the element; the text is unchanged.
+        let run = parse_with_whitespace(
+            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:unmodeledContent w:val="7"/><w:t>tide</w:t></w:r>"#,
+        );
+        let atoms = run_atoms(&run, 0).expect("an empty unknown element is read");
+        assert_eq!(atoms.len(), 2);
+        assert!(
+            matches!(&atoms[0].kind, AtomKind::Decoration { raw_xml, .. }
+            if String::from_utf8_lossy(raw_xml).contains("unmodeledContent"))
+        );
+        assert!(matches!(&atoms[1].kind, AtomKind::Text(text) if text == "tide"));
+    }
+
+    #[test]
+    fn an_empty_schema_element_out_of_place_in_a_run_is_still_refused() {
+        // w:pStyle is declared by the schema, just not as run content: its
+        // reading is not established, so it stays refused.
+        let run = parse_with_whitespace(
+            r#"<w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pStyle/><w:t>tide</w:t></w:r>"#,
+        );
+        assert!(matches!(
+            run_atoms(&run, 0),
+            Err(WordIrError::UnknownRunElement(name)) if name == "pStyle"
         ));
     }
 
@@ -7342,14 +7731,17 @@ mod tests {
         assert_eq!(spacing.after, Some(240));
     }
 
+    /// Checked against Word: a `w:numPr` with no `w:numId` opens without
+    /// repair and names no list, so it is carried as written, not refused
+    /// and not read as absence.
     #[test]
-    fn a_level_without_a_list_is_a_typed_refusal() {
+    fn a_numpr_without_a_list_is_carried_as_written() {
         let witnesses = [
-            ("<w:numPr/>", None, None),
-            ("<w:numPr><w:ilvl w:val=\"2\"/></w:numPr>", None, Some(2)),
+            ("<w:numPr/>", None),
+            ("<w:numPr><w:ilvl w:val=\"2\"/></w:numPr>", Some(2)),
         ];
 
-        for (num_pr, expected_num_id, expected_ilvl) in witnesses {
+        for (num_pr, expected_ilvl) in witnesses {
             let xml = format!(
                 r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
                     <w:pPr>{num_pr}</w:pPr>
@@ -7357,14 +7749,33 @@ mod tests {
                 </w:p>"#
             );
             let element = parse_with_whitespace(&xml);
-            let error = ParagraphView::from_paragraph(&element, &Default::default())
-                .expect_err("a level without a list has no frozen effective rule");
-            assert!(matches!(
-                error,
-                WordIrError::IncompleteDirectNumbering { num_id, ilvl }
-                    if num_id == expected_num_id && ilvl == expected_ilvl
-            ));
+            let view = ParagraphView::from_paragraph(&element, &Default::default()).unwrap();
+            assert_eq!(
+                view.num_props,
+                DirectNumPr::WithoutList {
+                    ilvl: expected_ilvl
+                }
+            );
         }
+    }
+
+    #[test]
+    fn a_later_numpr_without_a_list_cannot_hide_behind_an_earlier_pair() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr>
+            <w:pPr><w:numPr><w:ilvl w:val="1"/></w:numPr></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let element = parse_with_whitespace(xml);
+        let error = ParagraphView::from_paragraph(&element, &Default::default())
+            .expect_err("how Word merges the two is not established");
+        assert!(matches!(
+            error,
+            WordIrError::IncompleteDirectNumbering {
+                num_id: None,
+                ilvl: Some(1)
+            }
+        ));
     }
 
     #[test]
@@ -7545,12 +7956,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_indentation_refuses_invalid_or_unrepresentable_twip_measures() {
-        for (attribute, value, out_of_range) in [
-            ("start", "10%", false),
-            ("firstLine", "1em", false),
-            ("start", "2147483648", true),
-        ] {
+    fn extract_indentation_refuses_invalid_twip_measures() {
+        for (attribute, value) in [("start", "10%"), ("firstLine", "1em")] {
             let xml = format!(
                 r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
                     <w:pPr><w:ind w:{attribute}="{value}"/></w:pPr>
@@ -7559,30 +7966,35 @@ mod tests {
             );
             let error =
                 ParagraphView::from_paragraph(&parse_with_whitespace(&xml), &Default::default())
-                    .expect_err(
-                        "invalid or unrepresentable indentation must fail at the parse edge",
-                    );
-            if out_of_range {
-                assert!(matches!(
-                    error,
-                    WordIrError::ParagraphPropertyAttributeOutOfRange {
-                        element: "ind",
-                        attribute: actual_attribute,
-                        model: "signed i32 twips",
-                        ..
-                    } if actual_attribute == attribute
-                ));
-            } else {
-                assert!(matches!(
-                    error,
-                    WordIrError::InvalidParagraphPropertyAttribute {
-                        element: "ind",
-                        attribute: actual_attribute,
-                        ..
-                    } if actual_attribute == attribute
-                ));
-            }
+                    .expect_err("an invalid indentation must fail at the parse edge");
+            assert!(matches!(
+                error,
+                WordIrError::InvalidParagraphPropertyAttribute {
+                    element: "ind",
+                    attribute: actual_attribute,
+                    ..
+                } if actual_attribute == attribute
+            ));
         }
+    }
+
+    #[test]
+    fn extract_indentation_reads_a_value_past_32_bits_as_none() {
+        // Word opens such a paragraph without repair and saves it without
+        // that attribute, keeping the others.
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:ind w:start="2147483648" w:right="360"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let view = ParagraphView::from_paragraph(&parse_with_whitespace(xml), &Default::default())
+            .expect("a value past 32 bits is no value");
+        assert_eq!(
+            view.indentation,
+            Some(IndentProps {
+                right: Some(360),
+                ..IndentProps::default()
+            })
+        );
     }
 
     #[test]
@@ -7652,8 +8064,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_spacing_rejects_percent_and_negative_unsigned_measures() {
-        for (attribute, value) in [("before", "10%"), ("after", "-1pt")] {
+    fn extract_spacing_reads_negative_space_before_and_after() {
+        // Word opens a document whose paragraph spacing before or after is
+        // negative without repair (observed with -1 and -240).
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:pPr><w:spacing w:before="-240" w:after="-1"/></w:pPr>
+            <w:r><w:t>text</w:t></w:r>
+        </w:p>"#;
+        let el = parse_with_whitespace(xml);
+        let view = ParagraphView::from_paragraph(&el, &Default::default()).unwrap();
+        let sp = view.spacing.expect("spacing should be present");
+        assert_eq!(sp.before, Some(-240));
+        assert_eq!(sp.after, Some(-1));
+    }
+
+    #[test]
+    fn extract_spacing_rejects_a_percent_measure() {
+        for (attribute, value) in [("before", "10%"), ("after", "10%")] {
             let xml = format!(
                 r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
                     <w:pPr><w:spacing w:{attribute}="{value}"/></w:pPr>
@@ -7662,7 +8089,7 @@ mod tests {
             );
             let el = parse_with_whitespace(&xml);
             let error = ParagraphView::from_paragraph(&el, &Default::default())
-                .expect_err("invalid unsigned twip measure must fail at the parse edge");
+                .expect_err("a percent is not a twip measure and must fail at the parse edge");
             assert!(matches!(
                 error,
                 WordIrError::InvalidParagraphPropertyAttribute {
@@ -8306,10 +8733,6 @@ mod tests {
             (r#"<w:ind w:left="no"/>"#, "w:ind/@w:left"),
             (r#"<w:spacing w:before="no"/>"#, "w:spacing/@w:before"),
             (
-                r#"<w:pBdr><w:top w:val="invented"/></w:pBdr>"#,
-                "w:top/@w:val",
-            ),
-            (
                 r#"<w:tabs><w:tab w:val="left" w:pos="no"/></w:tabs>"#,
                 "w:tab/@w:pos",
             ),
@@ -8323,6 +8746,56 @@ mod tests {
             let error = ParagraphView::from_paragraph(&paragraph, &Default::default())
                 .expect_err("invalid modeled value must fail at the XML edge");
             assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    /// Checked against Word: a border style outside ST_Border opens without
+    /// repair and is saved as `none`.
+    #[test]
+    fn a_border_style_word_does_not_know_is_no_border() {
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:pPr><w:pBdr><w:top w:val="invented" w:sz="4"/></w:pBdr></w:pPr></w:p>"#;
+        let paragraph = Element::parse(xml.as_bytes()).unwrap();
+        let view = ParagraphView::from_paragraph(&paragraph, &Default::default())
+            .expect("Word opens it cleanly");
+        let top = view
+            .borders
+            .and_then(|borders| borders.top)
+            .expect("the edge is kept");
+        assert_eq!(top.style, "none");
+    }
+
+    /// Checked against Word: it saves "65512" for a size written "-24" and
+    /// "65535" for "-1".
+    #[test]
+    fn a_negative_font_size_is_the_unsigned_16_bit_number() {
+        for (written, held) in [("-24", Some(65512)), ("-1", Some(65535)), ("24", Some(24))] {
+            let xml = format!(
+                r#"<w:sz xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:val="{written}"/>"#
+            );
+            let el = Element::parse(xml.as_bytes()).unwrap();
+            assert_eq!(
+                super::font_size_half_points(&el, "sz").unwrap(),
+                held,
+                "{written}"
+            );
+        }
+        let xml = r#"<w:sz xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:val="-65536"/>"#;
+        let el = Element::parse(xml.as_bytes()).unwrap();
+        assert!(super::font_size_half_points(&el, "sz").is_err());
+    }
+
+    /// Checked against Word: it opens a `charSpace` written as an unsigned
+    /// 32-bit number and writes "-2049" back for "4294965247".
+    #[test]
+    fn doc_grid_char_space_in_unsigned_32_bit_form_is_read_signed() {
+        for (written, read) in [("4294965247", -2049), ("-2049", -2049), ("2048", 2048)] {
+            let xml = format!(
+                r#"<w:sectPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docGrid w:type="linesAndChars" w:linePitch="360" w:charSpace="{written}"/></w:sectPr>"#
+            );
+            let el = Element::parse(xml.as_bytes()).unwrap();
+            let sp = super::parse_section_properties(&el, &Default::default())
+                .expect("the test sectPr parses");
+            assert_eq!(sp.doc_grid_char_space, Some(read), "{written}");
         }
     }
 

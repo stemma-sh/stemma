@@ -62,21 +62,6 @@ fn assert_no_validation_errors(docx_bytes: &[u8], label: &str) {
     );
 }
 
-fn assert_unsafe_table_carrier_order_refuses(before_path: &str, after_path: &str) {
-    let before = std::fs::read(before_path).expect("read refusal fixture before");
-    let after = std::fs::read(after_path).expect("read refusal fixture after");
-    let runtime = SimpleRuntime::new();
-    let ib = runtime.import_docx(&before).expect("import refusal base");
-    let ia = runtime.import_docx(&after).expect("import refusal target");
-    let error = runtime
-        .diff_and_redline(&ib.doc_handle, &ia.doc_handle, redline_meta())
-        .expect_err("unsafe table carrier order must refuse");
-
-    assert_eq!(error.code, stemma::ErrorCode::UnsupportedEdit);
-    assert!(error.message.contains("table-row replacement"));
-    assert!(error.message.contains("followed by another change"));
-}
-
 // ── synthesized fixture tests ────────────────────────────────────────────
 
 #[test]
@@ -180,10 +165,13 @@ fn validate_opaque_redline_field() {
 
 // ── real sample tests ───────────────────────────────────────────────────
 
+/// The sample's comparison holds a changed table row followed by later story
+/// changes, a carrier order comparison used to refuse (Word opens and
+/// resolves such redlines); its redline must validate.
 #[test]
-fn opaque_roundtrip_sample_refuses_unsafe_table_carrier_order() {
+fn opaque_roundtrip_sample_redline_validates() {
     let samples = std::path::PathBuf::from("testdata");
-    assert_unsafe_table_carrier_order_refuses(
+    let bytes = make_redline(
         &samples
             .join("opaque-roundtrip/before.docx")
             .to_string_lossy(),
@@ -191,6 +179,7 @@ fn opaque_roundtrip_sample_refuses_unsafe_table_carrier_order() {
             .join("opaque-roundtrip/after.docx")
             .to_string_lossy(),
     );
+    assert_no_validation_errors(&bytes, "opaque-roundtrip");
 }
 
 #[test]

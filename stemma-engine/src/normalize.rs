@@ -2616,6 +2616,9 @@ fn resolve_selected_in(
 /// - Everything else → recurse
 fn reject_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaque: bool) {
     settle_inline_sdt_deletion_envelopes(parent, false, stats);
+    if is_story_block_list(parent) {
+        remove_resolved_fields(parent, false, stats);
+    }
     // Join paragraphs whose mark insertion this reject un-proposes (must
     // precede the revision pass, which drops the markers).
     join_mark_resolved_paragraphs(parent, /*keep_inserted=*/ false, stats);
@@ -3278,7 +3281,86 @@ fn row_survives(tr: &Element, keep_inserted: bool) -> bool {
             )
         }),
         keep_inserted,
+    ) && !crate::resolution_rules::row_emptied_by_resolution(
+        row_cells(tr)
+            .iter()
+            .map(|tc| emptied_cell_shape(tc, keep_inserted)),
     )
+}
+
+/// A `w:tc` as `resolution_rules::row_emptied_by_resolution` reads it. The
+/// byte twin of `tracked_model::emptied_cell_shape`.
+fn emptied_cell_shape(tc: &Element, keep_inserted: bool) -> crate::resolution_rules::EmptiedCell {
+    tc.children
+        .iter()
+        .filter_map(|child| match child {
+            XMLNode::Element(el) if !is_w_tag(el, "tcPr") => Some(el),
+            _ => None,
+        })
+        .map(|block| {
+            if !is_w_tag(block, "p") {
+                return None;
+            }
+            let mut mark_goes = false;
+            let mut content_goes = true;
+            for child in block.children.iter().filter_map(|c| match c {
+                XMLNode::Element(el) => Some(el),
+                _ => None,
+            }) {
+                if is_w_tag(child, "pPr") {
+                    let structural = child.children.iter().any(|pc| {
+                        matches!(pc, XMLNode::Element(e)
+                            if is_w_tag(e, "sectPr") || is_w_tag(e, "numPr"))
+                    });
+                    content_goes &= !structural;
+                    mark_goes = paragraph_mark_goes(child, keep_inserted);
+                } else {
+                    content_goes &= carrier_goes(child, keep_inserted);
+                }
+            }
+            Some((mark_goes, content_goes))
+        })
+        .collect()
+}
+
+/// Whether the tracked mark in a paragraph's `w:pPr/w:rPr` goes on this
+/// resolution (an untracked mark never does).
+fn paragraph_mark_goes(ppr: &Element, keep_inserted: bool) -> bool {
+    let Some(rpr) = ppr.children.iter().find_map(|c| match c {
+        XMLNode::Element(el) if is_w_tag(el, "rPr") => Some(el),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let has = |tags: &[&str]| {
+        rpr.children
+            .iter()
+            .any(|c| matches!(c, XMLNode::Element(el) if tags.iter().any(|t| is_w_tag(el, t))))
+    };
+    let has_ins = has(&["ins", "moveTo"]);
+    let has_del = has(&["del", "moveFrom"]);
+    (has_ins || has_del)
+        && !crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted)
+}
+
+/// Whether a paragraph content child leaves nothing on this resolution: a
+/// move's range bracket or a proofing mark, a tracked wrapper of a class
+/// that goes, or a wrapper holding only such children (an insertion whose
+/// text is all deleted since, on accept).
+fn carrier_goes(el: &Element, keep_inserted: bool) -> bool {
+    if is_move_range_marker(el) || is_w_tag(el, "proofErr") {
+        return true;
+    }
+    let has_ins = is_w_tag(el, "ins") || is_w_tag(el, "moveTo");
+    let has_del = is_w_tag(el, "del") || is_w_tag(el, "moveFrom");
+    if !has_ins && !has_del {
+        return false;
+    }
+    !crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted)
+        || el.children.iter().all(|c| match c {
+            XMLNode::Element(inner) => carrier_goes(inner, keep_inserted),
+            _ => true,
+        })
 }
 
 /// A `w:tr`'s cells, including those inside a row-level content control or
@@ -3314,21 +3396,21 @@ fn dropped_row_revision_count(tr: &Element, row_mark: &str) -> u32 {
     own + count_nested_revisions(tr)
 }
 
-/// Whether this resolution EMPTIES the paragraph: it HAS content children and
-/// every one is drop-class for this resolution (`w:ins`/`w:moveTo` wrappers on
-/// reject, `w:del`/`w:moveFrom` on accept; move-range delimiters go with the
-/// move either way). Zero-width markers and `pPr` are not content. Structural
-/// carriers — `w:sectPr` or `w:numPr` inside `pPr` — make the paragraph
-/// non-droppable regardless. Byte-level counterpart of the model path's
-/// `paragraph_emptied_by_accept_reject` (tracked_model.rs): a paragraph that
-/// was ALREADY empty in the base (mark merely became inserted to append a new
-/// paragraph after it) is base content and must survive, hence the
-/// had-content requirement.
+/// Whether this resolution leaves the paragraph without content: every
+/// content child is drop-class for this resolution (`w:ins`/`w:moveTo`
+/// wrappers on reject, `w:del`/`w:moveFrom` on accept; move-range delimiters
+/// go with the move either way), or there is none. Zero-width markers and
+/// `pPr` are not content. Structural carriers (`w:sectPr` or `w:numPr`
+/// inside `pPr`) make the paragraph non-droppable regardless. Byte-level
+/// counterpart of the model path's `paragraph_emptied_by_accept_reject`
+/// (tracked_model.rs). A paragraph that was empty to begin with counts: it
+/// is nothing but its mark, and Word removes it when the mark is resolved
+/// away (an inserted mark rejected, a deleted mark accepted), before a
+/// paragraph, before a table and at the start of the body alike.
 fn paragraph_emptied_by_resolution(p: &Element, keep_inserted: bool) -> bool {
     if !is_w_tag(p, "p") {
         return false;
     }
-    let mut had_content = false;
     for c in &p.children {
         let XMLNode::Element(el) = c else { continue };
         if is_w_tag(el, "pPr") {
@@ -3355,9 +3437,8 @@ fn paragraph_emptied_by_resolution(p: &Element, keep_inserted: bool) -> bool {
         if crate::resolution_rules::tracked_class_survives(has_ins, has_del, keep_inserted) {
             return false;
         }
-        had_content = true;
     }
-    had_content
+    true
 }
 
 /// A run that holds only a comment reference: a zero-width anchor, not content.
@@ -3428,6 +3509,199 @@ fn hold_anchors_beside_dropped_paragraph(parent: &mut Element, at: usize, anchor
     }
 }
 
+/// Whether `parent` holds a story's own block list (or a block content
+/// control's interior), where a field is resolved whole across paragraphs.
+fn is_story_block_list(parent: &Element) -> bool {
+    [
+        "body",
+        "hdr",
+        "ftr",
+        "footnote",
+        "endnote",
+        "comment",
+        "sdtContent",
+    ]
+    .iter()
+    .any(|local| is_w_tag(parent, local))
+}
+
+/// A field resolved as a whole: the byte twin of the model path's
+/// `extend_resolved_field_markers_over_their_fields` (tracked_model.rs).
+/// When a field's begin or end marker is a tracked insertion and this is
+/// Reject, or a tracked deletion and this is Accept, the field goes with its
+/// result, whatever the result's own tracking (Word 16). A field that spans
+/// paragraphs takes the paragraph marks inside it along: the paragraph
+/// holding its begin keeps what comes before the begin, the paragraph holding
+/// its end keeps what comes after the end and its own properties, and the two
+/// become one. Planned, like the model, only for fields whose markers sit in
+/// runs directly in a paragraph or in a tracked wrapper directly in it, and
+/// across consecutive paragraphs whose marks are untracked. Runs before the
+/// paragraph-mark joins and the revision pass.
+fn remove_resolved_fields(parent: &mut Element, keep_inserted: bool, stats: &mut NormalizeStats) {
+    /// A field marker: (paragraph child index of `parent`, child index of
+    /// that paragraph, kind, whether this resolution removes the field).
+    struct Marker {
+        paragraph: usize,
+        child: usize,
+        kind: String,
+        removes: bool,
+    }
+    let removing_wrapper = if keep_inserted { "del" } else { "ins" };
+    let mut markers: Vec<Marker> = Vec::new();
+    for (paragraph_index, node) in parent.children.iter().enumerate() {
+        let XMLNode::Element(paragraph) = node else {
+            continue;
+        };
+        if !is_w_tag(paragraph, "p") {
+            continue;
+        }
+        for (child_index, child) in paragraph.children.iter().enumerate() {
+            let XMLNode::Element(child) = child else {
+                continue;
+            };
+            let (runs, removes): (Vec<&Element>, bool) = if is_w_tag(child, "r") {
+                (vec![child], false)
+            } else if is_w_tag(child, "ins") || is_w_tag(child, "del") {
+                (
+                    child
+                        .children
+                        .iter()
+                        .filter_map(|c| match c {
+                            XMLNode::Element(r) if is_w_tag(r, "r") => Some(r),
+                            _ => None,
+                        })
+                        .collect(),
+                    is_w_tag(child, removing_wrapper),
+                )
+            } else {
+                continue;
+            };
+            for run in runs {
+                for part in &run.children {
+                    if let XMLNode::Element(part) = part
+                        && is_w_tag(part, "fldChar")
+                        && let Some(kind) = get_attr(part, "fldCharType")
+                    {
+                        markers.push(Marker {
+                            paragraph: paragraph_index,
+                            child: child_index,
+                            kind: kind.to_string(),
+                            removes,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Pair begin and end markers; a field whose begin or end removes it is
+    // planned. Outer fields only: an inner field goes with its outer one.
+    let mut open: Vec<&Marker> = Vec::new();
+    let mut fields: Vec<(&Marker, &Marker)> = Vec::new();
+    for marker in &markers {
+        match marker.kind.as_str() {
+            "begin" => open.push(marker),
+            "end" => {
+                if let Some(begin) = open.pop()
+                    && (begin.removes || marker.removes)
+                    && open.is_empty()
+                {
+                    fields.push((begin, marker));
+                }
+            }
+            _ => {}
+        }
+    }
+    let crossable = |from: usize, to: usize| -> bool {
+        (from..=to).all(|index| match &parent.children[index] {
+            XMLNode::Element(el) if is_w_tag(el, "p") => index == to || !paragraph_mark_tracked(el),
+            XMLNode::Element(_) => false,
+            _ => true,
+        })
+    };
+    // Fields whose markers share a paragraph child (several fields inside
+    // one tracked wrapper) are one stretch to remove.
+    let mut plans: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (begin, end) in fields.iter().filter(|(begin, end)| {
+        begin.paragraph == end.paragraph || crossable(begin.paragraph, end.paragraph)
+    }) {
+        if let Some(last) = plans.last_mut()
+            && (begin.paragraph, begin.child) <= (last.2, last.3)
+        {
+            (last.2, last.3) = (last.2, last.3).max((end.paragraph, end.child));
+            continue;
+        }
+        plans.push((begin.paragraph, begin.child, end.paragraph, end.child));
+    }
+    // Last field first, so earlier indices stay true.
+    for (begin_paragraph, begin_child, end_paragraph, end_child) in plans.into_iter().rev() {
+        let removed_between: Vec<XMLNode> = if begin_paragraph == end_paragraph {
+            let XMLNode::Element(paragraph) = &mut parent.children[begin_paragraph] else {
+                unreachable!("a planned field sits in a paragraph");
+            };
+            paragraph.children.drain(begin_child..=end_child).collect()
+        } else {
+            let mut removed = Vec::new();
+            let tail = {
+                let XMLNode::Element(last) = &mut parent.children[end_paragraph] else {
+                    unreachable!("a planned field ends in a paragraph");
+                };
+                removed.extend(last.children.drain(..=end_child));
+                // The end paragraph's properties stay in front.
+                let at = removed
+                    .iter()
+                    .position(|n| matches!(n, XMLNode::Element(e) if is_w_tag(e, "pPr")));
+                if let Some(at) = at {
+                    let ppr = removed.remove(at);
+                    last.children.insert(0, ppr);
+                }
+                std::mem::take(&mut last.children)
+            };
+            let middle: Vec<XMLNode> = parent
+                .children
+                .drain(begin_paragraph + 1..=end_paragraph)
+                .collect();
+            for node in middle.into_iter().rev().skip(1) {
+                removed.push(node);
+            }
+            let XMLNode::Element(first) = &mut parent.children[begin_paragraph] else {
+                unreachable!("a planned field begins in a paragraph");
+            };
+            removed.extend(first.children.drain(begin_child..));
+            first
+                .children
+                .retain(|n| !matches!(n, XMLNode::Element(e) if is_w_tag(e, "pPr")));
+            let kept_before = std::mem::take(&mut first.children);
+            let mut joined = Vec::new();
+            let mut tail = tail.into_iter().peekable();
+            if let Some(XMLNode::Element(e)) = tail.peek()
+                && is_w_tag(e, "pPr")
+            {
+                joined.push(tail.next().expect("peeked"));
+            }
+            joined.extend(kept_before);
+            joined.extend(tail);
+            first.children = joined;
+            removed
+        };
+        for node in &removed_between {
+            if let XMLNode::Element(el) = node {
+                stats.revisions_resolved +=
+                    u32::from(is_content_revision(el)) + count_nested_revisions(el);
+            }
+        }
+    }
+}
+
+/// Whether a paragraph's mark carries a tracked change.
+fn paragraph_mark_tracked(paragraph: &Element) -> bool {
+    paragraph.children.iter().any(|c| {
+        matches!(c, XMLNode::Element(ppr) if is_w_tag(ppr, "pPr")
+            && ppr.children.iter().any(|r| matches!(r, XMLNode::Element(rpr) if is_w_tag(rpr, "rPr")
+                && rpr.children.iter().any(|m| matches!(m, XMLNode::Element(mark)
+                    if ["ins", "del", "moveFrom", "moveTo"].iter().any(|t| is_w_tag(mark, t)))))))
+    })
+}
+
 /// Join paragraphs whose mark this resolution removes (ECMA-376 §17.13.5.15 /
 /// §17.13.5.20): accepting a mark DELETION — or rejecting a mark INSERTION —
 /// removes the paragraph break, so the paragraph's content merges into the
@@ -3468,6 +3742,7 @@ fn join_mark_resolved_paragraphs(
         // model path's `table_emptied_by_accept_reject` step-over), but
         // stopping at any other element — surviving content blocks the join.
         let mut next_p = None;
+        let mut blocking = None;
         for (offset, c) in parent.children[(i + 1)..].iter().enumerate() {
             match c {
                 XMLNode::Element(el) if is_w_tag(el, "p") => {
@@ -3480,7 +3755,10 @@ fn join_mark_resolved_paragraphs(
                 {
                     continue;
                 }
-                XMLNode::Element(_) => break,
+                XMLNode::Element(_) => {
+                    blocking = Some(i + 1 + offset);
+                    break;
+                }
                 _ => continue,
             }
         }
@@ -3495,9 +3773,9 @@ fn join_mark_resolved_paragraphs(
             // mark becoming an ordinary terminating mark. Mirrors the model
             // path's `paragraph_emptied_by_accept_reject` arm, including its
             // guards: structural carriers (`w:sectPr` / `w:numPr` in pPr)
-            // never drop, an already-empty base paragraph never drops, and
-            // the LAST block of a container never drops (a body/cell must
-            // still end with a paragraph).
+            // never drop, and the LAST block of a container drops only when
+            // a paragraph before it keeps content (a body/cell must still
+            // end with a paragraph).
             let container_may_be_empty = is_w_tag(parent, "sdtContent");
             let drop_empty = match &parent.children[i] {
                 XMLNode::Element(el) => {
@@ -3506,6 +3784,11 @@ fn join_mark_resolved_paragraphs(
                             || parent.children[(i + 1)..].iter().any(|c| {
                                 matches!(c, XMLNode::Element(el)
                                     if is_w_tag(el, "p") || is_w_tag(el, "tbl"))
+                            })
+                            || parent.children[..i].iter().any(|c| {
+                                matches!(c, XMLNode::Element(el)
+                                    if is_w_tag(el, "p")
+                                        && !paragraph_emptied_by_resolution(el, keep_inserted))
                             }))
                 }
                 _ => false,
@@ -3519,6 +3802,24 @@ fn join_mark_resolved_paragraphs(
                     i,
                     anchors_outlasting_paragraph(donor, keep_inserted),
                 );
+                stats.revisions_resolved += 1;
+            } else if let Some(k) = blocking
+                && !keep_inserted
+                && parent.children[(k + 1)..]
+                    .iter()
+                    .any(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "p")))
+                && let XMLNode::Element(table) = &parent.children[k]
+                && joins_first_cell_of_table(table, keep_inserted)
+            {
+                let XMLNode::Element(donor) = parent.children.remove(i) else {
+                    unreachable!("the donor is a paragraph")
+                };
+                let XMLNode::Element(table) = &mut parent.children[k - 1] else {
+                    unreachable!("joins_first_cell_of_table read a table")
+                };
+                let target = first_cell_paragraph_mut(table)
+                    .expect("joins_first_cell_of_table read a first cell paragraph");
+                prepend_paragraph_content(donor, target);
                 stats.revisions_resolved += 1;
             } else {
                 i += 1;
@@ -3539,22 +3840,578 @@ fn join_mark_resolved_paragraphs(
         let XMLNode::Element(target) = &mut parent.children[j - 1] else {
             unreachable!()
         };
-        // Insert donor content right after the target's pPr (or at the front).
-        let insert_at = target
+        insert_after_ppr(target, donor_content);
+        // Do not advance: the new occupant of slot i may itself join.
+    }
+}
+
+/// Insert `content` right after `target`'s pPr (or at its front).
+fn insert_after_ppr(target: &mut Element, content: Vec<XMLNode>) {
+    let insert_at = target
+        .children
+        .iter()
+        .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    for (k, node) in content.into_iter().enumerate() {
+        target.children.insert(insert_at + k, node);
+    }
+}
+
+/// Move `donor`'s content (not its pPr) to the front of `target`, whose
+/// properties stay.
+fn prepend_paragraph_content(donor: Element, target: &mut Element) {
+    let content: Vec<XMLNode> = donor
+        .children
+        .into_iter()
+        .filter(|c| !matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+        .collect();
+    insert_after_ppr(target, content);
+}
+
+/// The byte twin of `tracked_model::joins_first_cell_of_table`: a paragraph
+/// whose mark this resolution removes, with this table as the next surviving
+/// block, joins the first paragraph of the table's first cell (Word 16). The
+/// table is untracked, its first row untracked and kept, its first cell
+/// plain and starting with a paragraph; the caller checks a paragraph
+/// follows the table.
+fn joins_first_cell_of_table(table: &Element, keep_inserted: bool) -> bool {
+    if !is_w_tag(table, "tbl")
+        || w_child(table, "tblPr").is_some_and(|pr| w_child(pr, "tblPrChange").is_some())
+    {
+        return false;
+    }
+    let Some(row) = w_child(table, "tr") else {
+        return false;
+    };
+    if has_row_tracking(row, "ins")
+        || has_row_tracking(row, "del")
+        || !row_survives(row, keep_inserted)
+    {
+        return false;
+    }
+    let Some(cell) = w_child(row, "tc") else {
+        return false;
+    };
+    let plain = w_child(cell, "tcPr").is_none_or(|pr| {
+        ["cellIns", "cellDel", "cellMerge", "vMerge", "hMerge"]
+            .iter()
+            .all(|name| w_child(pr, name).is_none())
+    });
+    let starts_with_paragraph = cell
+        .children
+        .iter()
+        .find_map(|c| match c {
+            XMLNode::Element(el) if !is_w_tag(el, "tcPr") => Some(el),
+            _ => None,
+        })
+        .is_some_and(|first| is_w_tag(first, "p"));
+    plain && starts_with_paragraph
+}
+
+/// The first paragraph of a table's first cell.
+fn first_cell_paragraph_mut(table: &mut Element) -> Option<&mut Element> {
+    let row = table.children.iter_mut().find_map(|c| match c {
+        XMLNode::Element(el) if is_w_tag(el, "tr") => Some(el),
+        _ => None,
+    })?;
+    let cell = row.children.iter_mut().find_map(|c| match c {
+        XMLNode::Element(el) if is_w_tag(el, "tc") => Some(el),
+        _ => None,
+    })?;
+    cell.children.iter_mut().find_map(|c| match c {
+        XMLNode::Element(el) if !is_w_tag(el, "tcPr") => is_w_tag(el, "p").then_some(el),
+        _ => None,
+    })
+}
+
+/// The first `w:` child element of `parent` named `local`.
+fn w_child<'a>(parent: &'a Element, local: &str) -> Option<&'a Element> {
+    parent.children.iter().find_map(|c| match c {
+        XMLNode::Element(el) if is_w_tag(el, local) => Some(el),
+        _ => None,
+    })
+}
+
+/// A plain `dxa` twips value of a width element (`w:type` absent or `dxa`,
+/// `w:w` a non-negative integer); `None` for any other spelling.
+fn dxa_twips(width: &Element) -> Option<u32> {
+    let width_type = crate::xml_attrs::attr_get(width, "w:type").map_or("dxa", String::as_str);
+    if width_type != "dxa" {
+        return None;
+    }
+    crate::xml_attrs::attr_get(width, "w:w")?.parse().ok()
+}
+
+/// A `w:tc` as the shared cell-boundary join rules read it
+/// (`resolution_rules::CellMarkShape`) on Accept All. The byte twin of
+/// `tracked_model::cell_mark_shape`. `None` for a cell whose `w:gridSpan`
+/// cannot be read: its geometry is not ours to move.
+fn cell_mark_shape(tc: &Element) -> Option<crate::resolution_rules::CellMarkShape> {
+    let tc_pr = w_child(tc, "tcPr");
+    let blocks: Vec<&Element> = tc
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            XMLNode::Element(el) if !is_w_tag(el, "tcPr") => Some(el),
+            _ => None,
+        })
+        .collect();
+    let single = match blocks.as_slice() {
+        [p] if is_w_tag(p, "p") => Some(*p),
+        _ => None,
+    };
+    let has_pr = |local: &str| tc_pr.is_some_and(|pr| w_child(pr, local).is_some());
+    let grid_span = match tc_pr
+        .and_then(|pr| w_child(pr, "gridSpan"))
+        .map(|span| crate::xml_attrs::attr_get(span, "w:val").map(|val| val.parse::<u32>()))
+    {
+        None => 1,
+        Some(Some(Ok(span))) => span.max(1),
+        Some(_) => return None,
+    };
+    Some(crate::resolution_rules::CellMarkShape {
+        single_paragraph: single.is_some(),
+        starts_with_paragraph: blocks.first().is_some_and(|block| is_w_tag(block, "p")),
+        mark_deletion_accepted: single.is_some_and(|p| para_mark_markers(p) == (false, true)),
+        // A block-level content control inside the cell is the model's
+        // `content_sdt_wraps`.
+        plain_cell: !has_pr("cellIns")
+            && !has_pr("cellDel")
+            && !has_pr("cellMerge")
+            && !has_pr("vMerge")
+            && !blocks.iter().any(|block| is_w_tag(block, "sdt")),
+        grid_span,
+        dxa_width: tc_pr.and_then(|pr| w_child(pr, "tcW")).and_then(dxa_twips),
+    })
+}
+
+/// The `w:tc` children of a row whose only other children are its
+/// properties; `None` for a row holding anything else (a row-level content
+/// control, custom XML), which the model reads as wrapped cells.
+fn plain_row_cells(tr: &Element) -> Option<Vec<&Element>> {
+    let mut cells = Vec::new();
+    for c in &tr.children {
+        if let XMLNode::Element(el) = c {
+            if is_w_tag(el, "tc") {
+                cells.push(el);
+            } else if !is_w_tag(el, "trPr") && !is_w_tag(el, "tblPrEx") {
+                return None;
+            }
+        }
+    }
+    Some(cells)
+}
+
+/// The rows of a table whose only other children are its properties and
+/// grid; `None` when anything else sits beside the rows (a range marker, a
+/// content control or custom XML around rows).
+fn plain_table_rows(tbl: &Element) -> Option<Vec<&Element>> {
+    let mut rows = Vec::new();
+    for c in &tbl.children {
+        if let XMLNode::Element(el) = c {
+            if is_w_tag(el, "tr") {
+                rows.push(el);
+            } else if !is_w_tag(el, "tblPr") && !is_w_tag(el, "tblGrid") {
+                return None;
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// The shapes of a row's cells; `None` when the row is not plain or a cell's
+/// span cannot be read.
+fn row_shapes(tr: &Element) -> Option<Vec<crate::resolution_rules::CellMarkShape>> {
+    plain_row_cells(tr)?
+        .into_iter()
+        .map(cell_mark_shape)
+        .collect()
+}
+
+/// `table_rows_plain` of the shared rules, read from the wire: every row and
+/// its cells plain (no row-level wrapper, no `w:trPr` ins/del, no
+/// `w:cellIns`/`w:cellDel`, no `w:vMerge`, no `w:cellMerge`) and nothing
+/// beside the rows. The byte twin of `tracked_model::table_rows_plain`.
+fn table_rows_plain(tbl: &Element) -> bool {
+    let Some(rows) = plain_table_rows(tbl) else {
+        return false;
+    };
+    rows.iter().all(|tr| {
+        !has_row_tracking(tr, "ins")
+            && !has_row_tracking(tr, "del")
+            && plain_row_cells(tr).is_some_and(|cells| {
+                cells.iter().all(|tc| {
+                    ["cellIns", "cellDel", "vMerge", "cellMerge"]
+                        .iter()
+                        .all(|tag| !has_cell_tracking(tc, tag))
+                })
+            })
+    })
+}
+
+/// The content of a paragraph without its properties.
+fn paragraph_content(p: Element) -> Vec<XMLNode> {
+    p.children
+        .into_iter()
+        .filter(|c| !matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+        .collect()
+}
+
+/// Put `content` at the front of paragraph `target`, after its properties
+/// (the following paragraph's properties win, as in
+/// `join_mark_resolved_paragraphs`).
+fn prepend_to_paragraph(target: &mut Element, content: Vec<XMLNode>) {
+    let insert_at = target
+        .children
+        .iter()
+        .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
+        .map_or(0, |index| index + 1);
+    target.children.splice(insert_at..insert_at, content);
+}
+
+/// The first paragraph of a cell the rules let receive a join.
+fn first_cell_paragraph(tc: &mut Element) -> &mut Element {
+    tc.children
+        .iter_mut()
+        .find_map(|c| match c {
+            XMLNode::Element(el) if !is_w_tag(el, "tcPr") => Some(el),
+            _ => None,
+        })
+        .filter(|el| is_w_tag(el, "p"))
+        .expect("the shared rules only join into a cell starting with a paragraph")
+}
+
+/// The one paragraph a going row leaves: its cells' paragraphs joined in
+/// order, the last one's properties and deleted mark kept. Counts the
+/// resolved marks of all but the last cell.
+fn joined_row_paragraph(tr: Element, stats: &mut NormalizeStats) -> Element {
+    let mut paragraphs: Vec<Element> = tr
+        .children
+        .into_iter()
+        .filter_map(|c| match c {
+            XMLNode::Element(tc) if is_w_tag(&tc, "tc") => Some(tc),
+            _ => None,
+        })
+        .map(|tc| {
+            tc.children
+                .into_iter()
+                .find_map(|c| match c {
+                    XMLNode::Element(p) if is_w_tag(&p, "p") => Some(p),
+                    _ => None,
+                })
+                .expect("a going row's cells each hold one paragraph")
+        })
+        .collect();
+    let mut joined = paragraphs.pop().expect("a going row has a cell");
+    stats.revisions_resolved += paragraphs.len() as u32;
+    let leading: Vec<XMLNode> = paragraphs.into_iter().flat_map(paragraph_content).collect();
+    prepend_to_paragraph(&mut joined, leading);
+    joined
+}
+
+/// Remove each `w:tr` of `tbl`, other than the last, whose every cell goes on
+/// Accept All (`resolution_rules::row_goes_into_next_row`, observed in Word):
+/// its text continues into the first paragraph of the next row's first
+/// cell. The byte twin of `tracked_model::join_rows_across_accepted_marks`.
+fn join_rows_across_accepted_marks(tbl: &mut Element, stats: &mut NormalizeStats) {
+    let plain = table_rows_plain(tbl);
+    let row_positions = |tbl: &Element| -> Vec<usize> {
+        tbl.children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, XMLNode::Element(el) if is_w_tag(el, "tr")))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let mut r = 0;
+    loop {
+        let rows = row_positions(tbl);
+        if r + 1 >= rows.len() {
+            break;
+        }
+        let (XMLNode::Element(row), XMLNode::Element(next)) =
+            (&tbl.children[rows[r]], &tbl.children[rows[r + 1]])
+        else {
+            unreachable!("row positions hold elements");
+        };
+        let goes = row_shapes(row).is_some_and(|shapes| {
+            let next_first = plain_row_cells(next)
+                .and_then(|cells| cells.first().map(|tc| cell_mark_shape(tc)))
+                .flatten();
+            crate::resolution_rules::row_goes_into_next_row(&shapes, next_first, plain)
+        });
+        if !goes {
+            r += 1;
+            continue;
+        }
+        let XMLNode::Element(row) = tbl.children.remove(rows[r]) else {
+            unreachable!("row positions hold elements");
+        };
+        let joined = joined_row_paragraph(row, stats);
+        stats.revisions_resolved += 1;
+        let XMLNode::Element(next) = &mut tbl.children[rows[r]] else {
+            unreachable!("row positions hold elements");
+        };
+        let first = next
+            .children
+            .iter_mut()
+            .find_map(|c| match c {
+                XMLNode::Element(tc) if is_w_tag(tc, "tc") => Some(tc),
+                _ => None,
+            })
+            .expect("row_goes_into_next_row read a first cell");
+        prepend_to_paragraph(first_cell_paragraph(first), paragraph_content(joined));
+        // Do not advance: the row now at `r` may go onward.
+    }
+}
+
+/// Accept the deleted final paragraph marks that join a cell into the next
+/// cell of this `w:tr` (`resolution_rules::cell_mark_joins_next_cell`,
+/// observed in Word). The byte twin of
+/// `tracked_model::join_cells_across_accepted_marks`: the donor's content
+/// joins the front of the next cell's first paragraph (whose properties
+/// win), the donor `w:tc` goes, and `w:gridAfter` / `w:wAfter` take its grid
+/// columns and width. A row holding anything but its properties and plain
+/// `w:tc` children is left alone, as the model leaves a wrapped cell.
+fn join_cells_across_accepted_marks(tr: &mut Element, stats: &mut NormalizeStats) {
+    if plain_row_cells(tr).is_none() {
+        return;
+    }
+    let row_untracked = !has_row_tracking(tr, "ins") && !has_row_tracking(tr, "del");
+    let tr_pr = w_child(tr, "trPr");
+    let mut grid_after = match tr_pr
+        .and_then(|pr| w_child(pr, "gridAfter"))
+        .map(|el| crate::xml_attrs::attr_get(el, "w:val").map(|val| val.parse::<u32>()))
+    {
+        None => 0,
+        Some(Some(Ok(n))) => n,
+        // An unreadable gridAfter: the row's geometry is not ours to extend.
+        Some(_) => return,
+    };
+    let mut trailing_width = if grid_after == 0 {
+        Some(0)
+    } else {
+        tr_pr
+            .and_then(|pr| w_child(pr, "wAfter"))
+            .and_then(dxa_twips)
+    };
+    let cell_positions = |tr: &Element| -> Vec<usize> {
+        tr.children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, XMLNode::Element(el) if is_w_tag(el, "tc")))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let mut joined = false;
+    let mut k = 0;
+    loop {
+        let cells = cell_positions(tr);
+        if k + 1 >= cells.len() {
+            break;
+        }
+        let (XMLNode::Element(donor), XMLNode::Element(next)) =
+            (&tr.children[cells[k]], &tr.children[cells[k + 1]])
+        else {
+            unreachable!("cell positions hold elements");
+        };
+        let shapes = cell_mark_shape(donor).zip(cell_mark_shape(next));
+        let Some((donor_shape, next_shape)) = shapes.filter(|(donor, next)| {
+            crate::resolution_rules::cell_mark_joins_next_cell(*donor, *next, row_untracked)
+        }) else {
+            k += 1;
+            continue;
+        };
+        debug_assert!(next_shape.starts_with_paragraph);
+        let XMLNode::Element(donor) = tr.children.remove(cells[k]) else {
+            unreachable!("cell positions hold elements");
+        };
+        let donor_paragraph = donor
+            .children
+            .into_iter()
+            .find_map(|c| match c {
+                XMLNode::Element(el) if is_w_tag(&el, "p") => Some(el),
+                _ => None,
+            })
+            .expect("cell_mark_joins_next_cell requires a single-paragraph donor");
+        // The next cell now sits where the donor was.
+        let XMLNode::Element(next) = &mut tr.children[cells[k]] else {
+            unreachable!("cell positions hold elements");
+        };
+        prepend_to_paragraph(
+            first_cell_paragraph(next),
+            paragraph_content(donor_paragraph),
+        );
+        stats.revisions_resolved += 1;
+        grid_after += donor_shape.grid_span;
+        trailing_width = crate::resolution_rules::trailing_width_after_join(
+            trailing_width,
+            donor_shape.dxa_width,
+        );
+        joined = true;
+        // Do not advance: the cell now at `k` may join onward.
+    }
+    if joined {
+        set_row_after(tr, grid_after, trailing_width);
+    }
+}
+
+/// Write `w:gridAfter` and `w:wAfter` (dxa; none when `after_twips` is
+/// `None`) into the row's `w:trPr`, creating it when absent, in the schema's
+/// element order (CT_TrPrBase: cnfStyle, divId, gridBefore, gridAfter,
+/// wBefore, wAfter, then the rest).
+fn set_row_after(tr: &mut Element, grid_after: u32, after_twips: Option<u32>) {
+    let tr_pr_index = match tr
+        .children
+        .iter()
+        .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "trPr")))
+    {
+        Some(index) => index,
+        None => {
+            let at = tr
+                .children
+                .iter()
+                .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "tblPrEx")))
+                .map_or(0, |index| index + 1);
+            tr.children
+                .insert(at, XMLNode::Element(crate::word_xml::w_el("trPr")));
+            at
+        }
+    };
+    let XMLNode::Element(tr_pr) = &mut tr.children[tr_pr_index] else {
+        unreachable!("trPr position holds an element");
+    };
+    tr_pr.children.retain(|c| {
+        !matches!(c, XMLNode::Element(el) if is_w_tag(el, "gridAfter") || is_w_tag(el, "wAfter"))
+    });
+    let mut grid_after_el = crate::word_xml::w_el("gridAfter");
+    crate::xml_attrs::attr_set(&mut grid_after_el, "w:val", grid_after.to_string());
+    let position_of = |tr_pr: &Element, before: &[&str]| {
+        tr_pr
             .children
             .iter()
-            .position(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "pPr")))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        for (k, node) in donor_content.into_iter().enumerate() {
-            target.children.insert(insert_at + k, node);
+            .position(|c| match c {
+                XMLNode::Element(el) => !before.iter().any(|local| is_w_tag(el, local)),
+                _ => false,
+            })
+            .unwrap_or(tr_pr.children.len())
+    };
+    let at = position_of(tr_pr, &["cnfStyle", "divId", "gridBefore"]);
+    tr_pr.children.insert(at, XMLNode::Element(grid_after_el));
+    if let Some(after_twips) = after_twips {
+        let mut w_after_el = crate::word_xml::w_el("wAfter");
+        crate::xml_attrs::attr_set(&mut w_after_el, "w:w", after_twips.to_string());
+        crate::xml_attrs::attr_set(&mut w_after_el, "w:type", "dxa");
+        let at = position_of(
+            tr_pr,
+            &["cnfStyle", "divId", "gridBefore", "gridAfter", "wBefore"],
+        );
+        tr_pr.children.insert(at, XMLNode::Element(w_after_el));
+    }
+}
+
+/// Resolve, for each `w:tbl` child of a story-level `parent`, the rows Accept
+/// All removes (observed in Word): rows that go into the next row
+/// ([`join_rows_across_accepted_marks`]), then a going last row
+/// (`resolution_rules::last_row_goes_into_following_paragraph`). A table left
+/// with no row is replaced by its text as a paragraph keeping the last
+/// cell's deleted mark, so `join_mark_resolved_paragraphs` then joins it
+/// into the following paragraph; a table keeping rows joins the last row's
+/// text into the following paragraph here. The byte twin of
+/// `tracked_model::resolve_tables_closed_by_accepted_marks`.
+fn resolve_tables_closed_by_accepted_marks(parent: &mut Element, stats: &mut NormalizeStats) {
+    for index in 0..parent.children.len() {
+        let XMLNode::Element(tbl) = &mut parent.children[index] else {
+            continue;
+        };
+        if !is_w_tag(tbl, "tbl") {
+            continue;
         }
-        // Do not advance: the new occupant of slot i may itself join.
+        join_rows_across_accepted_marks(tbl, stats);
+        let plain = table_rows_plain(tbl);
+        let XMLNode::Element(tbl) = &parent.children[index] else {
+            unreachable!("matched a table above");
+        };
+        let following = parent.children[index + 1..]
+            .iter()
+            .position(|c| matches!(c, XMLNode::Element(_)))
+            .map(|offset| index + 1 + offset)
+            .filter(
+                |&at| matches!(&parent.children[at], XMLNode::Element(el) if is_w_tag(el, "p")),
+            );
+        let Some(rows) = plain_table_rows(tbl) else {
+            continue;
+        };
+        let row_count = rows.len();
+        let goes = rows
+            .last()
+            .and_then(|tr| row_shapes(tr))
+            .is_some_and(|shapes| {
+                crate::resolution_rules::last_row_goes_into_following_paragraph(
+                    &shapes,
+                    following.is_some(),
+                    plain,
+                )
+            });
+        if !goes {
+            continue;
+        }
+        let XMLNode::Element(tbl) = &mut parent.children[index] else {
+            unreachable!("matched a table above");
+        };
+        let last_at = tbl
+            .children
+            .iter()
+            .rposition(|c| matches!(c, XMLNode::Element(el) if is_w_tag(el, "tr")))
+            .expect("read the last row above");
+        let XMLNode::Element(row) = tbl.children.remove(last_at) else {
+            unreachable!("matched a row");
+        };
+        let joined = joined_row_paragraph(row, stats);
+        if row_count == 1 {
+            parent.children[index] = XMLNode::Element(joined);
+            continue;
+        }
+        stats.revisions_resolved += 1;
+        let at = following.expect("last_row_goes_into_following_paragraph read a paragraph");
+        let XMLNode::Element(paragraph) = &mut parent.children[at] else {
+            unreachable!("matched a paragraph above");
+        };
+        prepend_to_paragraph(paragraph, paragraph_content(joined));
     }
 }
 
 fn normalize_children(parent: &mut Element, stats: &mut NormalizeStats, inside_opaque: bool) {
     settle_inline_sdt_deletion_envelopes(parent, true, stats);
+    // Accepting a cell's deleted final mark joins the cell into the next one;
+    // a row whose every cell goes continues into the next row, or past the
+    // table into the paragraph after it (Word). All precede the paragraph
+    // join below, which resolves a removed table's last mark.
+    if is_w_tag(parent, "tbl") {
+        join_rows_across_accepted_marks(parent, stats);
+    }
+    if is_w_tag(parent, "tr") {
+        join_cells_across_accepted_marks(parent, stats);
+    }
+    // The model takes a last row past its table only in a story's own block
+    // list (a block content control's interior included), never inside a
+    // table cell.
+    let story_level = [
+        "body",
+        "hdr",
+        "ftr",
+        "footnote",
+        "endnote",
+        "comment",
+        "sdtContent",
+    ]
+    .iter()
+    .any(|local| is_w_tag(parent, local));
+    if story_level {
+        remove_resolved_fields(parent, true, stats);
+        resolve_tables_closed_by_accepted_marks(parent, stats);
+    }
     // Join paragraphs whose mark deletion this accept applies (must precede
     // the revision pass, which drops the markers).
     join_mark_resolved_paragraphs(parent, /*keep_inserted=*/ true, stats);

@@ -251,6 +251,7 @@ fn make_bookmark_decoration(para_id: &NodeId, suffix: &str, raw_xml: Vec<u8>) ->
         // Paragraph-level bookmark marker: no host run rPr.
         wrapper_marks: Vec::new(),
         wrapper_style_props: crate::domain::StyleProps::default(),
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(raw_xml),
         origin: Some(AUTHORED_ORIGIN.to_string()),
@@ -704,6 +705,7 @@ mod tests {
             has_direct_numbering: true,
             numbering_suppressed: false,
             direct_numbering_omits_ilvl: false,
+            direct_num_pr_without_list: None,
             materialized_numbering: None,
             rendered_text: None,
             literal_prefix: None,

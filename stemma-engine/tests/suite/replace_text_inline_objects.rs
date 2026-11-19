@@ -230,6 +230,7 @@ fn apply(doc: &Document, steps: &[EditStep], mode: MaterializationMode) -> Docum
             author: Some("Reviewer".to_string()),
             date: Some("2026-11-10T21:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
     .unwrap_or_else(|e| panic!("apply {mode:?}: {:?}: {}", e.code, e.message))

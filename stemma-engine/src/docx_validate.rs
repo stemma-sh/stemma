@@ -172,6 +172,9 @@ pub(crate) struct PackageState {
     pub(crate) styles_root: Option<Element>,
     /// Parsed word/numbering.xml, if present and well-formed.
     pub(crate) numbering_root: Option<Element>,
+    /// The settings part the main document relates to, if present and
+    /// well-formed (a malformed one is reported elsewhere).
+    pub(crate) settings_root: Option<Element>,
     /// The main document part name, located via the officeDocument relationship
     /// in `_rels/.rels` (OPC §9.3) — NOT assumed to be `word/document.xml`.
     /// `None` when the package has no discoverable main part (reported by
@@ -189,11 +192,31 @@ impl PackageState {
             || self.part_names.iter().any(|n| n.eq_ignore_ascii_case(name))
     }
 
-    /// The parsed comments story (`word/comments.xml`), if present and well-formed.
+    /// The parsed comments story, if present and well-formed: the part the
+    /// main document's comments relationship names, whatever its file name
+    /// (a producer may write `comments2.xml` and leave an unreferenced
+    /// `comments.xml` behind). Without such a relationship, or without a
+    /// main part, `word/comments.xml`.
     pub(crate) fn comments_root(&self) -> Option<&Element> {
+        let related = self.main_part.as_deref().and_then(|main_part| {
+            let rels_path = crate::docx_package::rels_part_path(main_part);
+            let base = crate::docx_package::part_dir(main_part);
+            self.rels_files
+                .get(&rels_path)?
+                .iter()
+                .find(|relationship| relationship_is_kind(&relationship.rel_type, "comments"))
+                .map(|relationship| match relationship.target.strip_prefix('/') {
+                    Some(absolute) => crate::docx_package::normalize_package_path(absolute),
+                    None => crate::docx_package::normalize_package_path(&format!(
+                        "{base}{}",
+                        relationship.target
+                    )),
+                })
+        });
+        let part = related.unwrap_or_else(|| "word/comments.xml".to_string());
         self.story_parts
             .iter()
-            .find(|(name, _)| name == "word/comments.xml")
+            .find(|(name, _)| *name == part)
             .map(|(_, root)| root)
     }
 }
@@ -357,7 +380,7 @@ fn build_package_state(
                 continue;
             }
         };
-        let name = file.name().to_string();
+        let name = crate::docx::package_item_name(file.name());
         if name.ends_with('/') {
             // Directory entries -- skip.
             continue;
@@ -430,6 +453,17 @@ fn build_package_state(
     // Locate the main document part via the officeDocument relationship in
     // _rels/.rels (OPC §9.3) — its name is not fixed at word/document.xml.
     let main_part = resolve_main_part(&part_names, &rels_files);
+    let settings_root = main_part.as_deref().and_then(|main| {
+        let rels_path = rels_path_for_part(main);
+        let settings = rels_files
+            .get(&rels_path)?
+            .iter()
+            .find(|rel| relationship_is_kind(&rel.rel_type, "settings"))?;
+        let part = resolve_target(&rels_base_dir(&rels_path), &settings.target);
+        file_contents
+            .get(&part)
+            .and_then(|data| Element::parse(data.as_slice()).ok())
+    });
 
     // Parse story parts once: the main document part plus any word/*.xml that
     // could be a story part. Sorted so findings come out in a deterministic
@@ -471,6 +505,7 @@ fn build_package_state(
         story_parts,
         styles_root,
         numbering_root,
+        settings_root,
         main_part,
     }
 }
@@ -518,11 +553,19 @@ fn is_story_part_name(name: &str) -> bool {
     let Some(filename) = name.strip_prefix("word/") else {
         return false;
     };
+    // A producer may number these parts (`comments1.xml`): the name is the
+    // producer's choice, the relationship type says what the part is.
+    let numbered = |stem: &str| {
+        filename
+            .strip_prefix(stem)
+            .and_then(|rest| rest.strip_suffix(".xml"))
+            .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_digit()))
+    };
     filename.starts_with("header")
         || filename.starts_with("footer")
-        || filename == "footnotes.xml"
-        || filename == "endnotes.xml"
-        || filename == "comments.xml"
+        || numbered("footnotes")
+        || numbered("endnotes")
+        || numbered("comments")
 }
 
 // =============================================================================
@@ -862,7 +905,7 @@ fn check_rel_001_rid_references(state: &PackageState, findings: &mut Vec<Validat
     // so the two validators cannot drift on what counts as a dangling reference.
     for (part_name, root) in &state.story_parts {
         let mut referenced_ids: Vec<String> = Vec::new();
-        collect_relationship_references(root, &mut referenced_ids);
+        collect_references_word_resolves(root, &mut referenced_ids);
         if referenced_ids.is_empty() {
             continue;
         }
@@ -939,7 +982,7 @@ pub(crate) fn check_story_rel_references(
     rels_bytes: Option<&[u8]>,
 ) -> Vec<ValidationFinding> {
     let mut referenced_ids: Vec<String> = Vec::new();
-    collect_relationship_references(root, &mut referenced_ids);
+    collect_references_word_resolves(root, &mut referenced_ids);
     if referenced_ids.is_empty() {
         return Vec::new();
     }
@@ -1117,6 +1160,31 @@ pub fn collect_relationship_references(element: &Element, out: &mut Vec<String>)
     }
 }
 
+/// The relationship references that must resolve for Word to open the part
+/// without repair: every reference [`collect_relationship_references`]
+/// finds, except those on an `a:blip` and inside it.
+///
+/// An `a:blip` whose `r:embed` or `r:link` names no relationship is a
+/// picture with no image behind it. Observed, Word 16.0: it opens such a
+/// document without repair and shows a placeholder. The same holds for an
+/// image reference inside the blip's extension list (an `a14:imgLayer`
+/// `r:embed` naming no relationship).
+fn collect_references_word_resolves(element: &Element, out: &mut Vec<String>) {
+    if local_element_name(element) == "blip" {
+        return;
+    }
+    for (attr_name, value) in &element.attributes {
+        if is_relationship_reference_attr(attr_name) && !value.is_empty() {
+            out.push(value.clone());
+        }
+    }
+    for child in &element.children {
+        if let XMLNode::Element(el) = child {
+            collect_references_word_resolves(el, out);
+        }
+    }
+}
+
 /// Check if an attribute name is a relationship reference (r:id, r:embed, r:link).
 fn is_relationship_reference_attr(name: &xmltree::AttributeName) -> bool {
     let local = name.local_name.as_str();
@@ -1202,6 +1270,45 @@ fn check_rel_003_internal_targets(state: &PackageState, findings: &mut Vec<Valid
                 continue;
             }
 
+            // Word opens a document without repair when one of these related
+            // parts is absent (observed, Word 16.0, by deleting the part from
+            // documents it opens cleanly): it falls back to its defaults for
+            // styles, numbering, settings, the font table and web settings,
+            // shows a placeholder for a missing image, and ignores a missing
+            // preview thumbnail. A missing theme,
+            // header, footer, footnotes, endnotes or comments part is
+            // repaired, and stays reported with every other kind.
+            if WORD_TOLERATES_ABSENT_TARGET
+                .iter()
+                .any(|kind| relationship_is_kind(&rel.rel_type, kind))
+            {
+                continue;
+            }
+            // An embedded package behind a w:object is tolerated absent; a
+            // chart's embedded workbook (a package relationship of the chart
+            // part) is not: Word cannot open the file without it (observed).
+            if relationship_is_kind(&rel.rel_type, "package")
+                && state
+                    .main_part
+                    .as_deref()
+                    .is_some_and(|main| *rels_path == rels_path_for_part(main))
+            {
+                continue;
+            }
+            // A missing header, footer, notes or comments part matters only
+            // when something refers to it. Checked against Word: with the
+            // part removed and its relationship and override kept, Word
+            // repairs the file when the section names the header or footer,
+            // or the body holds a note or comment reference; with nothing
+            // referring to the part it opens cleanly.
+            if let Some(kind) = STORY_KINDS
+                .iter()
+                .find(|kind| relationship_is_kind(&rel.rel_type, kind))
+                && !story_target_is_referenced(state, rels_path, kind, &rel.id)
+            {
+                continue;
+            }
+
             let resolved = resolve_target(&base_dir, &rel.target);
 
             // OPC part-name equivalence is ASCII case-insensitive (ECMA-376
@@ -1224,6 +1331,100 @@ fn check_rel_003_internal_targets(state: &PackageState, findings: &mut Vec<Valid
     }
 }
 
+/// Relationship kinds whose absent target part Word opens without repair.
+const WORD_TOLERATES_ABSENT_TARGET: [&str; 11] = [
+    // The core document properties, the comment authors (people) part and
+    // an embedded package (a spreadsheet behind a w:object): Word opens the
+    // file cleanly with each removed and its relationship kept, and with
+    // the core properties relationship naming a part that never existed.
+    "core-properties",
+    "people",
+    "styles",
+    "numbering",
+    "settings",
+    "fontTable",
+    "webSettings",
+    "image",
+    // The package's preview thumbnail.
+    "thumbnail",
+    // An embedded object's part, whether or not an `o:OLEObject` names it,
+    // and the glossary (building blocks) part: Word opens the file cleanly
+    // with either part removed and its relationship kept.
+    "oleObject",
+    "glossaryDocument",
+];
+
+/// Story parts whose absence is judged by whether something refers to them
+/// (see [`story_target_is_referenced`]).
+const STORY_KINDS: [&str; 5] = ["header", "footer", "footnotes", "endnotes", "comments"];
+
+/// Whether the part owning `rels_path` refers to the story a relationship of
+/// `kind` names: a header or footer by its relationship id (a section's
+/// reference), notes and comments by any reference in the source part, and
+/// notes also by the settings naming separator notes. A source part that is
+/// not a parsed story is taken as referring (the relationship stays reported).
+fn story_target_is_referenced(state: &PackageState, rels_path: &str, kind: &str, id: &str) -> bool {
+    let Some((dir, file)) = rels_path.rsplit_once("_rels/") else {
+        return true;
+    };
+    let source = format!("{dir}{}", file.strip_suffix(".rels").unwrap_or(file));
+    let Some((_, root)) = state.story_parts.iter().find(|(name, _)| *name == source) else {
+        return true;
+    };
+    let (reference, separators) = match kind {
+        "header" | "footer" => return element_names_relationship(root, id),
+        "footnotes" => ("footnoteReference", Some(("footnotePr", "footnote"))),
+        "endnotes" => ("endnoteReference", Some(("endnotePr", "endnote"))),
+        _ => ("commentReference", None),
+    };
+    // The settings naming separator notes refer to the notes part too.
+    // Checked against Word: with the notes part removed and no note
+    // reference in the body, Word repairs the file when the settings name
+    // separator notes (w:footnotePr/w:footnote, w:endnotePr/w:endnote) and
+    // opens it cleanly when they name none.
+    let settings_name_separators = separators.is_some_and(|(container, note)| {
+        state.settings_root.as_ref().is_some_and(|settings| {
+            settings.children.iter().any(|child| match child {
+                XMLNode::Element(child) if local_element_name(child) == container => {
+                    child.children.iter().any(|grandchild| {
+                        matches!(grandchild, XMLNode::Element(grandchild)
+                            if local_element_name(grandchild) == note)
+                    })
+                }
+                _ => false,
+            })
+        })
+    });
+    settings_name_separators || subtree_has_local(root, reference)
+}
+
+fn element_names_relationship(element: &Element, id: &str) -> bool {
+    element
+        .attributes
+        .iter()
+        .any(|(name, value)| is_relationship_reference_attr(name) && value == id)
+        || element.children.iter().any(|child| match child {
+            XMLNode::Element(el) => element_names_relationship(el, id),
+            _ => false,
+        })
+}
+
+fn subtree_has_local(element: &Element, local: &str) -> bool {
+    local_element_name(element) == local
+        || element.children.iter().any(|child| match child {
+            XMLNode::Element(el) => subtree_has_local(el, local),
+            _ => false,
+        })
+}
+
+/// Whether a relationship type names the given kind: its last path segment,
+/// which is the same in the transitional and strict namespaces.
+pub(crate) fn relationship_is_kind(rel_type: &str, kind: &str) -> bool {
+    rel_type
+        .rsplit_once('/')
+        .is_some_and(|(_, last)| last == kind)
+}
+
 /// Compute the base directory for resolving targets from a .rels file.
 ///
 /// The .rels file at `{dir}/_rels/{filename}.rels` corresponds to the part
@@ -1240,6 +1441,11 @@ fn rels_base_dir(rels_path: &str) -> String {
 
 /// Resolve a relationship target relative to a base directory.
 fn resolve_target(base_dir: &str, target: &str) -> String {
+    // Word reads `\` in a relationship target as the path separator: a
+    // target written `..\customXml\item1.xml` opens cleanly when the part
+    // is there, and is repaired when it is not, as with `/` (observed).
+    let target = target.replace('\\', "/");
+    let target = target.as_str();
     if target.starts_with('/') {
         // Absolute target -- strip leading slash.
         return target.strip_prefix('/').unwrap_or(target).to_string();
@@ -1517,6 +1723,8 @@ mod tests {
         assert!(is_story_part_name("word/footnotes.xml"));
         assert!(is_story_part_name("word/endnotes.xml"));
         assert!(is_story_part_name("word/comments.xml"));
+        assert!(is_story_part_name("word/comments1.xml"));
+        assert!(!is_story_part_name("word/commentsExtended1.xml"));
         assert!(!is_story_part_name("word/document.xml"));
         assert!(!is_story_part_name("word/styles.xml"));
         assert!(!is_story_part_name("_rels/.rels"));

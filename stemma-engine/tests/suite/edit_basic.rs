@@ -44,6 +44,7 @@ fn make_para(id: &str, segments: Vec<TrackedSegment>) -> ParagraphNode {
         has_direct_numbering: false,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -262,6 +263,7 @@ fn make_decoration(id: &str) -> InlineNode {
         },
         wrapper_marks: Vec::new(),
         wrapper_style_props: Default::default(),
+        wrapper_rpr_authored: None,
         joins_following_text_run: false,
         raw_xml: Some(b"<w:bookmarkStart/>".to_vec()),
         origin: None,
@@ -310,6 +312,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("Test Author".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -2847,6 +2850,7 @@ fn apply_op_id_is_stamped_on_every_tracked_segment_the_apply_produces() {
             author: Some("Jordan".to_string()),
             date: Some("2026-04-13T00:00:00Z".to_string()),
             apply_op_id: Some("op_test_xyz".to_string()),
+            date_utc: None,
         },
     };
 

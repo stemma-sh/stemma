@@ -31,6 +31,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("Edit Engine".to_string()),
         date: Some("2026-03-28T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 
@@ -1870,6 +1871,7 @@ fn edit_insert_multi_item_new_list_shares_single_override() {
             // inserted paragraphs live in the same batch, so the sibling
             // walker treats them as a single run.
             apply_op_id: Some("op_multi_list_test".to_string()),
+            date_utc: None,
         },
     };
 

@@ -192,6 +192,7 @@ fn span_insertion_right_before_a_move_source_is_the_editors_own_revision() {
                 author: Some("Editor".to_string()),
                 date: None,
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("replace_text applies");

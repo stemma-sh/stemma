@@ -88,6 +88,7 @@ fn step(block_id: &str, change: NumberingChange) -> EditTransaction {
             author: Some("Counsel".to_string()),
             date: Some("2026-06-05T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }

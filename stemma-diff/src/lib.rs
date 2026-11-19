@@ -15,6 +15,7 @@ pub(crate) mod domain {
     pub(crate) use stemma::domain::*;
 }
 
+mod bookmarks;
 mod comments;
 mod compiler;
 mod controls;
@@ -234,10 +235,12 @@ fn diff_snapshots(
     let document_diff =
         compiler::diff_documents(&accepted_source, &accepted_target).map_err(diff_error)?;
     let semantic_change_count = document_diff.changes.len();
-    refuse_unqualified_comment_replacement(&document_diff.changes)?;
     let revision = RevisionInfo {
         revision_id: stemma::runtime::max_revision_id(&source.canonical) + 1,
         identity: 0,
+        // An authored revision's UTC date is its date: the engine's clock
+        // is UTC (Word writes its local clock in `w:date`).
+        date_utc: date.clone(),
         author,
         date,
         apply_op_id: None,
@@ -261,6 +264,8 @@ fn diff_snapshots(
         },
     })?;
     let mut merged = merge.doc;
+    // A bookmark moved with edited text goes on the target copy (`bookmarks`).
+    bookmarks::place_moved_bookmarks_on_target(&mut merged);
     stemma::runtime::restore_opaque_transport_hashes(&mut merged)?;
     // A field the comparison inserted or deleted whole is one revision, as
     // in Word, so resolving any revision alone cannot tear it.
@@ -281,41 +286,6 @@ fn diff_snapshots(
     Ok(CompiledComparison {
         snapshot,
         semantic_change_count,
-    })
-}
-
-/// Refuse simultaneous comment-definition insertion and deletion.
-///
-/// The individually qualified carriers keep an inserted or deleted comment's
-/// definition and three story anchors together. Native Word does not preserve
-/// that closure when both polarities are composed in one comparison: Accept
-/// can remove the inserted definition while Reject can retain an emptied
-/// replacement anchor. Until Word demonstrates one atomic replacement form,
-/// emit no artifact for this exact carrier composition.
-fn refuse_unqualified_comment_replacement(
-    changes: &[crate::model::DiffChange],
-) -> Result<(), RuntimeError> {
-    let inserts_comment = changes
-        .iter()
-        .any(|change| matches!(change, crate::model::DiffChange::CommentInserted { .. }));
-    let deletes_comment = changes
-        .iter()
-        .any(|change| matches!(change, crate::model::DiffChange::CommentDeleted { .. }));
-    if !(inserts_comment && deletes_comment) {
-        return Ok(());
-    }
-
-    Err(RuntimeError {
-        code: ErrorCode::UnsupportedEdit,
-        message: "compare refused: simultaneous comment insertion and deletion has no qualified native Word carrier composition"
-            .to_string(),
-        details: ErrorDetails {
-            context: Some(
-                "comment definitions and their range/reference anchors must resolve atomically in both native Word terminals"
-                    .to_string(),
-            ),
-            ..ErrorDetails::default()
-        },
     })
 }
 
@@ -971,33 +941,6 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::UnsupportedEdit);
         assert!(error.message.contains("active style 'Normal'"), "{error:?}");
-    }
-
-    #[test]
-    fn simultaneous_comment_insertion_and_deletion_refuses() {
-        use crate::model::DiffChange;
-
-        let changes = vec![
-            DiffChange::CommentDeleted {
-                id: "source-comment".to_string(),
-                content_hash: "source".to_string(),
-                blocks: Vec::new(),
-            },
-            DiffChange::CommentInserted {
-                id: "target-comment".to_string(),
-                content_hash: "target".to_string(),
-                blocks: Vec::new(),
-            },
-        ];
-
-        let error = refuse_unqualified_comment_replacement(&changes)
-            .expect_err("unqualified comment replacement must refuse");
-        assert_eq!(error.code, ErrorCode::UnsupportedEdit);
-        assert!(
-            error
-                .message
-                .contains("simultaneous comment insertion and deletion")
-        );
     }
 
     #[test]

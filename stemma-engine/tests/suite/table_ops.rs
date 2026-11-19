@@ -87,6 +87,7 @@ fn make_para(id: &str, text: &str) -> ParagraphNode {
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -1195,6 +1196,7 @@ fn set_cell_text_on_foreign_pending_insert_names_actionable_options() {
             author: Some("Other Author".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         }));
     }
     let txn = translate(&table_op_json(
@@ -1341,6 +1343,7 @@ fn a_pending_cell_merge_refuses_structural_table_edits() {
             author: Some("Reviewer".to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         },
         after: VerticalMerge::Continue,
         before: VerticalMerge::None,

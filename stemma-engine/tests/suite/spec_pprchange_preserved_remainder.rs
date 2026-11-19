@@ -142,6 +142,7 @@ fn unrelated_edit_txn(target_block: stemma::domain::NodeId) -> EditTransaction {
             author: Some("Spec".to_string()),
             date: Some("2026-07-02T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     }
 }

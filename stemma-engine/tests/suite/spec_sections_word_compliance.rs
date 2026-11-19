@@ -328,17 +328,16 @@ fn continuous_section_omitting_page_props_opens_clean() {
     );
 }
 
+/// Checked against Word with this exact document: it cannot open a
+/// document whose `w:sectPr` sits in a paragraph inside a table cell.
 #[test]
-fn sectpr_in_table_cell_paragraph_opens_clean() {
+fn sectpr_in_table_cell_paragraph_is_reported() {
     let body = r#"<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:w="5000" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:sectPr><w:type w:val="continuous"/><w:pgSz w:w="12240" w:h="15840"/></w:sectPr></w:pPr><w:r><w:t>Cell text.</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>After table.</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>"#;
     let b = make_docx(body, &[]);
 
     let (ok, detail) = opens_clean(&b);
     assert!(
-        ok,
-        "MS-OI §17.6.18 (ISO 29500-1 §17.6.18): Word disallows a sectPr on a \
-         table-cell paragraph; the resulting document must open without repair, \
-         which requires the illegal in-cell sectPr not to reach Word as a \
-         cell-paragraph section break; validate reported: {detail}"
+        !ok && detail.contains("I-DOC-006"),
+        "validate reported: {detail}"
     );
 }

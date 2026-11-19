@@ -63,19 +63,21 @@ durability promise.
 |---|---|
 | `stemma inspect <input> [--format markdown\|json]` | Emit the compact revision-aware projection, bound to the exact input identity. |
 | `stemma execute <input> --plan <json> -o <out>` | Execute a concrete plan; exact alias of `apply`. |
-| `stemma verify <before> <after> [--policy tracked-delivery-v0]` | Certify any producer's result; exit `3` when policy fails. |
+| `stemma verify <before> <after> [--policy tracked-delivery-v1\|tracked-delivery-v0]` | Certify any producer's result: `pass`, `fail` (exit `3`) or `cannot_assess` (exit `4`). |
 | `stemma verify-task <manifest.json> [--root <dir>]` | Verify an MCP task delivery from its manifest and artifact files. |
 | `stemma apply <input> --worklist <json> -o <out> [--receipt <json>] [--emit-partial] [--allow-existing-author]` | Apply a `stemma.worklist.v0` and emit a native redline plus durable JSON receipt. `--allow-existing-author` confirms that the worklist intentionally continues an existing Word reviewer group. |
 | `stemma compare <base> <target> -o <out> [--author NAME] [--format text\|json]` | Diff two files' accepted readings into a redline (`reject-all == accepted base`, `accept-all == accepted target`); `--author` attributes the revisions; `--format json` emits a `stemma.compare_receipt.v0`. |
 | `stemma extract <file> [--format text\|json]` | Read the body as plain text (default) or structured JSON. |
 | `stemma read <file>` | Emit the complete structured lean view (`stemma.read.v0`): typed blocks with per-segment tracked status, the complete revision census, and every comment. |
 | `stemma resolve <file> -o <out> <disposition> [--dry-run] [--format text\|json]` | Accept/reject tracked changes; write the result; `--format json` emits a `stemma.resolve_receipt.v0`. |
-| `stemma validate <file> [--format text\|json]` | Parse + validate; print block/revision counts, or a structured `stemma.validate.v0` result. |
+| `stemma validate <file> [--format text\|json]` | Judge a package: sound, corrupt or cannot assess; `--format json` emits a `stemma.validate.v1` result. |
 
-Exit codes: `0` complete success or verification pass, `1` an operational failure (bad file,
-invalid worklist, refused destination), `2` a usage error (clap), and `3` an
-executed `apply` whose receipt is partial or a completed `verify` whose policy
-result is `fail`. By default an apply exit `3` creates no DOCX. `--emit-partial` explicitly
+Exit codes: `0` complete success, verification pass or a sound document, `1`
+an operational failure (unreadable file, invalid worklist, refused
+destination), `2` a usage error (clap), `3` an executed `apply` whose receipt
+is partial, a completed `verify` whose verdict is `fail`, or a
+`validate` verdict of corrupt, and `4` a `validate` or `verify` that could
+not assess what it was given. By default an apply exit `3` creates no DOCX. `--emit-partial` explicitly
 requests a non-deliverable partial redline, but the status and exit remain
 partial/`3`.
 
@@ -132,17 +134,38 @@ same typed planner, tracked-change materializer, audit, and safe artifact
 boundary. The execution audit is rerun over the exact serialized candidate
 before its receipt or DOCX is committed.
 
-`verify` audits any before/after pair under `tracked-delivery-v0`. It passes
-only when the result validates, contains no untracked committed delta, has no
+`verify` audits any before/after pair under a delivery policy,
+`tracked-delivery-v1` unless `--policy` names another. It passes
+only when the result validates, contains no untracked committed delta (a new
+comment is counted in `summary.comments_added` and allowed; a changed or
+removed comment is a direct change), has no
 unexplained untouched-scope violation, and leaves every pre-existing revision
 pending and unchanged except by tracked edits inside it: a revision the new
 tracked changes are stacked inside (rejecting exactly the new revisions
 restores it) counts in `summary.preexisting_revisions_edited_inside` and
 passes; a resolved revision, or one changed without a covering tracked
-change, counts in `summary.modified_or_resolved_preexisting` and fails. Its `stemma.verify.v0` JSON includes exact input identities and
-accepted/rejected projection hashes. A policy failure is a structured result
-on stdout with exit `3`, not an operational error. Use it when the output came
-from another producer or when an independent recheck is useful; a successful
+change, counts in `summary.modified_or_resolved_preexisting`, is listed in
+`preexisting_changed` (its author, kind, excerpt, and whether it was
+`modified` or `resolved`) and fails.
+
+The result is `stemma.verify.v1` JSON on stdout, and every answer about the
+pair carries `verdict`:
+
+| `verdict` | Exit | Meaning |
+| --- | --- | --- |
+| `pass` | `0` | The result is valid, every change in it is tracked, everything outside the changes is as it was, and the revisions that were pending are still pending. |
+| `fail` | `3` | One or more of those does not hold. `reasons` lists which: `invalid_result`, `untracked_change`, `untouched_content_changed`, `preexisting_revision_changed`. |
+| `cannot_assess` | `4` | The comparison was not made: the baseline is not a document the model reads, or the result holds a shape the model does not read. `cannot_assess` says why. This is not a pass. |
+
+A result that is not a sound package is a `fail` with `invalid_result` and the
+validator's issues. A file that cannot be opened is an operational error (exit
+`1`), as for every command. `pass` and `fail` results include exact input
+identities, the `summary` counts, accepted/rejected projection hashes,
+`direct_changes`, `untouched.violations` and `preexisting_changed`; stories are
+written as in the other JSON surfaces (`"Body"`, `{"Footnote": {"id": "3"}}`),
+and violation kinds are `block_differs`, `sequence_length_mismatch`,
+`story_missing` or `story_unexpected`. Use `verify` when the output came from
+another producer or when an independent recheck is useful; a successful
 `execute` has already passed the same delivery policy.
 
 ## verify-task
@@ -328,8 +351,21 @@ Revision numbers are intentionally absent. Word revision IDs are session-local
 handles and can change when the exact output is reopened; publishing them as
 artifact identities would be misleading.
 
+The two policies ask the same questions and differ in what counts as
+untouched outside the tracked changes:
+
+- `tracked-delivery-v1` (default): the same text and the same resolved
+  formatting. Revision-save ids, where a run boundary falls, proofing marks,
+  a default written out (no paragraph style against the default style, unset
+  spacing against zero), and the id under which a picture's image is
+  referenced do not count, so a result that another program saved passes
+  when nothing outside its tracked changes reads or looks different.
+- `tracked-delivery-v0`: the same markup. Every difference above counts.
+  This is what `apply`/`execute` enforce on their own output; a result that
+  passes v0 passes v1.
+
 Before output, Stemma serializes the candidate and audits those exact bytes
-under the same `tracked-delivery-v0` policy `verify` checks.
+under the `tracked-delivery-v0` policy, the stricter of the two `verify` checks.
 It blocks any untracked direct change, unexplained untouched-scope violation,
 resolved pre-existing revision, pre-existing revision changed other than by
 the worklist's tracked edits inside it, invalid package, disagreement between
@@ -666,28 +702,43 @@ runs only on a real write).
 
 ## validate
 
-Parse and validate a package. On success, exit `0` with an `OK` line reporting
-the block and pending-revision counts plus the exact input-binding values used
-by `stemma.worklist.v0`:
+Judge a package. There are three verdicts, and each has its own exit code:
 
-For example, `stemma validate redline.docx` reports `OK:` followed by the
-document path, one block, two pending revisions, its byte count, and its
-SHA-256.
+| Verdict | Exit | Meaning |
+|---|---|---|
+| sound | `0` | The document reads, and no check found a fault: Word opens it without repair. |
+| corrupt | `3` | At least one check found a fault that makes Word repair the document or fail to open it. A file that is not a package at all is corrupt. |
+| cannot assess | `4` | The package checks found nothing, but the document holds a shape Stemma does not read. This says something about Stemma, not about the document. |
 
-On failure, exit nonzero with the structured reason on stderr:
+A file that cannot be opened at all (missing, unreadable) is an operational
+failure: `error:` on stderr, exit `1`.
+
+In text format a sound document prints an `OK` line on stdout reporting the
+block and pending-revision counts plus the exact input-binding values used by
+`stemma.worklist.v0`; the other two verdicts print one line on stderr:
 
 ```
+$ stemma validate redline.docx
+OK: redline.docx: 1 block, 2 pending revisions; bytes=… sha256=…
 $ stemma validate broken.docx
-error: broken.docx: not a valid DOCX (InvalidDocx: docx read failed: invalid Zip archive: Invalid zip header)
+corrupt: broken.docx: PackageInvariant: docx read failed: invalid Zip archive: Invalid zip header
+$ stemma validate unusual.docx
+cannot assess: unusual.docx: InvalidDocx: …
 ```
 
-`--format json` emits a `stemma.validate.v0` result on stdout, for valid
-**and** invalid packages alike (mirroring `verify`'s pass/fail contract):
-`{schema, status, input, block_count, pending_revision_count, issues}`, where
-`status` is `"ok"` or `"invalid"` and `issues` enumerates each validator
-finding (`code`, `message`, `context`), empty exactly when `ok`. An invalid
-package still exits `1`. Only an operational failure (unreadable file, not a
-parseable DOCX at all) stays on the `error:` stderr path in both formats.
+`--format json` emits a `stemma.validate.v1` result on stdout for all three:
+`{schema, verdict, input, block_count, pending_revision_count, issues,
+cannot_assess}`. `verdict` is `"sound"`, `"corrupt"` or `"cannot_assess"`.
+`issues` enumerates each finding (`code`, `message`, `context`) and is
+non-empty exactly when the verdict is corrupt. `cannot_assess` is the reason
+the document was not read, or `null`. `block_count` and
+`pending_revision_count` are `null` when the document was not read.
+
+In CI, fail on anything but sound:
+
+```
+stemma validate "$file" --format json > result.json || exit 1
+```
 
 > **What import requires of a package.** Every command that reads a `.docx`
 > shares one fail-loud import: the package must carry `[Content_Types].xml`,

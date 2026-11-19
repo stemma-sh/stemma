@@ -50,6 +50,7 @@ fn plan(doc: &Document, old: &str, new: &str) -> Result<EditTransaction, Replace
             author: Some("Reviewer".to_string()),
             date: Some("2026-11-05T19:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         },
     })
 }

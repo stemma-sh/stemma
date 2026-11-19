@@ -15,6 +15,7 @@ two Word documents and produces one native tracked-changes comparison.
 | Apply exact, approved replacements | [Apply approved changes](guides/apply-approved-changes.md) |
 | Connect Stemma to an agent | [Use Stemma with an agent](guides/use-with-an-agent.md) |
 | Verify a multi-document delivery | [Verify a task delivery](guides/verify-task-delivery.md) |
+| Gate Word documents in a pipeline | [Check documents in CI](guides/check-documents-in-ci.md) |
 | Review, accept, or reject revisions | [Review and resolve changes](guides/review-and-resolve.md) |
 | Fix an error or refusal | [Troubleshooting](help/troubleshooting.md) |
 | Read working code for a common flow | [Examples](examples.md) |

@@ -5,8 +5,16 @@ use zip::write::FileOptions;
 use zip::{ZipArchive, ZipWriter};
 
 /// Maximum number of entries allowed in a DOCX zip archive.
-/// Real DOCX files typically have 20–50 entries.
-const MAX_ZIP_ENTRIES: usize = 1_000;
+///
+/// Most DOCX files have 20–50 entries, but Word opens packages with
+/// thousands (a document with many embedded images or Word's own discarded
+/// `[trash]` items; one with 3,715 opens cleanly). The bound is the most a
+/// ZIP archive can record without the ZIP64 extension, 65,535. It is not
+/// what stops a decompression bomb: the decompressed-size limits below do
+/// that. It bounds the per-entry bookkeeping (one name and one buffer per
+/// entry) for an archive of many tiny entries, which the size limits alone
+/// would let through.
+const MAX_ZIP_ENTRIES: usize = 65_535;
 
 /// Maximum cumulative decompressed size (500 MB).
 /// Prevents zip bombs from exhausting memory.
@@ -21,6 +29,8 @@ pub enum DocxError {
     ZipWrite(ZipError),
     Io(std::io::Error),
     MissingFile(String),
+    /// A package item whose text encoding cannot be read.
+    InvalidEncoding(String),
     ZipBomb(String),
     /// Two ZIP items carry equivalent names (OPC §7.3: ZIP item names shall be
     /// unique; equivalence is ASCII case-insensitive per OPC §6.2). Word
@@ -45,6 +55,95 @@ pub struct DocxFile {
 #[derive(Clone, Debug)]
 pub struct DocxArchive {
     files: Vec<DocxFile>,
+}
+
+/// The package item name a ZIP entry name stands for.
+///
+/// Some archivers write Windows path separators (`word\document.xml`). Word
+/// reads such an entry as the item `word/document.xml` and opens the package
+/// without repair (observed), so the name is read that way here; a package
+/// written back names its items with `/`.
+pub(crate) fn package_item_name(zip_entry_name: &str) -> String {
+    zip_entry_name.replace('\\', "/")
+}
+
+/// `[Content_Types].xml` as UTF-8.
+///
+/// Word opens a package whose content-types item is UTF-16 (with a byte
+/// order mark and `encoding="UTF-16"`, as .NET writes it) without repair
+/// (observed). The item is decoded here, at the package edge, and its
+/// declaration names UTF-8, so every reader sees one encoding; a package
+/// written back stores it as UTF-8. UTF-8 bytes pass through unchanged.
+fn content_types_as_utf8(name: &str, data: Vec<u8>) -> Result<Vec<u8>, DocxError> {
+    let little_endian = match data.get(..2) {
+        Some([0xFF, 0xFE]) => true,
+        Some([0xFE, 0xFF]) => false,
+        _ => return Ok(data),
+    };
+    if !data.len().is_multiple_of(2) {
+        return Err(DocxError::InvalidEncoding(format!(
+            "{name} starts with a UTF-16 byte order mark but has an odd number of bytes"
+        )));
+    }
+    let units: Vec<u16> = data[2..]
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    let text = String::from_utf16(&units).map_err(|error| {
+        DocxError::InvalidEncoding(format!("{name} is not valid UTF-16: {error}"))
+    })?;
+    let text = match text.find("?>") {
+        Some(end) if text.starts_with("<?xml") => {
+            let declaration = &text[..end];
+            let declaration = declaration
+                .replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\"")
+                .replace("encoding=\"utf-16\"", "encoding=\"UTF-8\"")
+                .replace("encoding='UTF-16'", "encoding='UTF-8'")
+                .replace("encoding='utf-16'", "encoding='UTF-8'");
+            format!("{declaration}{}", &text[end..])
+        }
+        _ => text,
+    };
+    Ok(text.into_bytes())
+}
+
+/// The decompressed bytes of ZIP item `index`, read from its raw data
+/// without the CRC-32 check (see [`DocxArchive::read`]), limited to
+/// [`MAX_FILE_BYTES`].
+fn read_without_crc_check(
+    zip: &mut ZipArchive<Cursor<&[u8]>>,
+    index: usize,
+) -> Result<Vec<u8>, DocxError> {
+    let raw = zip.by_index_raw(index).map_err(DocxError::ZipRead)?;
+    let name = raw.name().to_string();
+    let method = raw.compression();
+    let mut data = Vec::new();
+    match method {
+        zip::CompressionMethod::Stored => {
+            raw.take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut data)
+                .map_err(DocxError::Io)?;
+        }
+        zip::CompressionMethod::Deflated => {
+            flate2::read::DeflateDecoder::new(raw)
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut data)
+                .map_err(DocxError::Io)?;
+        }
+        other => {
+            return Err(DocxError::ZipBomb(format!(
+                "item {name:?} fails its CRC check and is compressed with {other:?}, which is \
+                 not read without it"
+            )));
+        }
+    }
+    Ok(data)
 }
 
 impl DocxArchive {
@@ -76,7 +175,7 @@ impl DocxArchive {
 
         for i in 0..zip.len() {
             let mut file = zip.by_index(i).map_err(DocxError::ZipRead)?;
-            let name = file.name().to_string();
+            let name = package_item_name(file.name());
 
             if !name.ends_with('/')
                 && let Some(existing) = seen_names.insert(name.to_ascii_lowercase(), name.clone())
@@ -94,7 +193,21 @@ impl DocxArchive {
             // Read with per-file and cumulative size limits.
             let mut data = Vec::new();
             let mut limited = (&mut file).take(MAX_FILE_BYTES + 1);
-            limited.read_to_end(&mut data).map_err(DocxError::Io)?;
+            let checked = limited.read_to_end(&mut data);
+            drop(file);
+            match checked {
+                Ok(_) => {}
+                // Word does not check an item's CRC-32: with the stored CRC
+                // of the main document part wrong and its data intact, Word
+                // opens the package without repair (observed). So a CRC
+                // mismatch is not a fault; the item is read from its raw
+                // bytes instead, under the same size limit. Damaged data
+                // still fails where it is parsed.
+                Err(error) if error.to_string().contains("Invalid checksum") => {
+                    data = read_without_crc_check(&mut zip, i)?;
+                }
+                Err(error) => return Err(DocxError::Io(error)),
+            }
 
             if data.len() as u64 > MAX_FILE_BYTES {
                 return Err(DocxError::ZipBomb(format!(
@@ -111,6 +224,11 @@ impl DocxArchive {
                 )));
             }
 
+            let data = if name.eq_ignore_ascii_case("[Content_Types].xml") {
+                content_types_as_utf8(&name, data)?
+            } else {
+                data
+            };
             files.push(DocxFile { name, data });
         }
         Ok(Self { files })
@@ -149,6 +267,11 @@ impl DocxArchive {
     /// (OPC §6.2), so a lookup for `word/document.xml` resolves a part stored
     /// as `word/Document.xml`. An exact match wins; `read` guarantees at most
     /// one case-equivalent entry exists.
+    /// The names of the files in the archive, in archive order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.iter().map(|file| file.name.as_str())
+    }
+
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         self.find(name).map(|file| file.data.as_slice())
     }

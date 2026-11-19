@@ -1169,6 +1169,7 @@ fn motivating_shape_replay_reaches_each_disposition_without_speculation() {
                 author: Some("Reviewer".to_string()),
                 date: Some("2026-06-03T00:00:00Z".to_string()),
                 apply_op_id: None,
+                date_utc: None,
             },
         })
         .expect("comment on the insertion target");

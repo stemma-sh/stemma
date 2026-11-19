@@ -126,8 +126,10 @@ fn opens_clean(bytes: &[u8]) -> bool {
 
 // ─── Specs ───────────────────────────────────────────────────────────────────
 
-/// I-REL-001: an r:embed on a:blip naming no relationship Id is dangling.
-/// ECMA-376 Part 2 OPC §6.5; ISO 29500-1 §9.2.
+/// Checked against Word with this exact document: it repairs the file. The
+/// cause is not the dangling r:embed (Word opens a complete picture with no
+/// image behind it cleanly, see `dangling_blip_embed_on_a_complete_picture_opens_clean`)
+/// but the incomplete pic:pic, which has no nvPicPr and no spPr (I-DRAW-001).
 #[test]
 fn dangling_rembed_blip_flagged() {
     let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Picture 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rId999"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
@@ -164,7 +166,7 @@ report={}",
 /// treated as dangling. ECMA-376 Part 2 OPC §6.5; ISO 29500-1 §9.2.
 #[test]
 fn empty_rembed_rlink_not_dangling() {
-    let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Picture 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="" r:link=""/><a:stretch><a:fillRect/></a:stretch></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
+    let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Picture 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="Picture 1"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="" r:link=""/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert!(
         opens_clean(&b),
@@ -193,9 +195,9 @@ clean. [ECMA-376 Part 2 OPC §6.5.2/§6.5.3; ISO 29500-1 §9.2, §17.16.22] repo
     );
 }
 
-/// A picture whose a:blip r:embed names no relationship is a dangling image
-/// reference; the package validator must report NOT clean.
-/// ECMA-376 Part 2 OPC §6.5.2/§6.5.3; ISO 29500-1 §9.2, §17.3.3.9.
+/// Checked against Word with this exact document: it repairs the file. The
+/// cause is the incomplete picture (no wp:docPr, no pic:nvPicPr, no
+/// pic:spPr; I-DRAW-001), not the dangling r:embed.
 #[test]
 fn dangling_blip_embed_must_not_open_clean() {
     let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="rId99" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
@@ -210,32 +212,30 @@ image embed is data loss that Word repairs, so the validator must NOT report the
     );
 }
 
-/// Full pic:pic with a dangling r:embed: validate must flag I-REL-001 and not
-/// silently drop. ECMA-376 Part 2 OPC §6.5.3; ISO 29500-1 §9.2, §J.5.
+/// A complete picture whose r:embed names no relationship. Checked against
+/// Word with this exact document: it opens without repair and shows a
+/// placeholder for the missing image, so `validate` does not report it.
 #[test]
-fn dangling_blip_embed_flagged_no_silent_drop() {
+fn dangling_blip_embed_on_a_complete_picture_opens_clean() {
     let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Picture 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="Picture 1"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdMissing" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert!(
-        !opens_clean(&b),
-        "r:embed=\"rIdMissing\" has no backing relationship in the (empty) document.xml.rels, so \
-I-REL-001 must fire and opensClean must be false; Word would flag this file for repair (data-loss) \
-rather than open it cleanly. [ECMA-376 Part 2 OPC §6.5.3; ISO 29500-1 §9.2, §J.5] report={}",
+        opens_clean(&b),
+        "Word opens a complete picture with no image behind it without repair. report={}",
         report_summary(&b)
     );
 }
 
-/// Full pic:pic with a dangling r:link (linked image): validate must flag
-/// I-REL-001. ECMA-376 Part 2 OPC §6.5.3; ISO 29500-1 §9.2.
+/// A complete picture whose r:link (a linked image) names no relationship.
+/// Checked against Word with this exact document: it opens without repair,
+/// as it does for a dangling r:embed.
 #[test]
-fn dangling_blip_link_flagged_no_silent_drop() {
+fn dangling_blip_link_on_a_complete_picture_opens_clean() {
     let body = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="914400" cy="914400"/><wp:docPr id="2" name="Picture 2"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="2" name="Picture 2"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:link="rIdLinkMissing" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/>"#;
     let b = make_docx(body, &[]);
     assert!(
-        !opens_clean(&b),
-        "r:link=\"rIdLinkMissing\" has no backing relationship, so the linked image cannot \
-resolve; I-REL-001 must fire and opensClean must be false. Word cannot resolve the linked image \
-and reports the file as needing repair. [ECMA-376 Part 2 OPC §6.5.3; ISO 29500-1 §9.2] report={}",
+        opens_clean(&b),
+        "Word opens a complete picture with no linked image behind it without repair. report={}",
         report_summary(&b)
     );
 }

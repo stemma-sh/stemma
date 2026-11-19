@@ -2553,6 +2553,7 @@ mod tests {
             author: Some(author.to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         })
     }
 
@@ -2563,6 +2564,7 @@ mod tests {
             author: Some(author.to_string()),
             date: None,
             apply_op_id: None,
+            date_utc: None,
         })
     }
 

@@ -1,16 +1,27 @@
-//! `tracked-delivery-v0`: the one delivery policy. `apply`/`execute` enforce
-//! it on their serialized candidate before committing a DOCX, and `verify`
-//! checks it on any before/after pair, so a successful `execute` and a
+//! The delivery policy. `apply`/`execute` enforce `tracked-delivery-v0` on
+//! their serialized candidate before committing a DOCX, and `verify` checks
+//! a policy on any before/after pair, so a successful `execute` and a
 //! `verify` of its output cannot disagree.
 //!
 //! The policy, over an engine audit of the exact bytes:
 //! - the result validates;
-//! - no committed content changed without a covering tracked change;
+//! - no committed content changed without a covering tracked change (a new
+//!   comment is not a change to the content: it is counted and allowed; a
+//!   changed or removed comment is not);
 //! - every block outside the changes is provably untouched;
 //! - no pre-existing revision was resolved or changed outside a tracked
 //!   edit. A revision edited inside by the new tracked changes (the engine's
 //!   `EditedInside`: rejecting exactly the new revisions restores it) is
 //!   preserved, not changed: it stays the other author's, still pending.
+//!
+//! The two versions differ in what "untouched" means, which is decided when
+//! the audit is made (`stemma::audit::UntouchedEquality`):
+//! - `tracked-delivery-v0`: the same markup, down to revision-save ids and
+//!   run boundaries. The reading for a document this engine wrote.
+//! - `tracked-delivery-v1` (`verify`'s default): the same text and the same
+//!   resolved formatting. The reading for a document another program saved,
+//!   which rewrites markup everywhere without changing the document. A
+//!   result that passes v0 passes v1.
 
 use stemma::audit::{AuditReport, RevisionDisposition};
 
@@ -42,16 +53,31 @@ pub(crate) fn preexisting_outcome(report: &AuditReport) -> PreexistingOutcome {
     outcome
 }
 
-/// `None` when the audited result passes `tracked-delivery-v0`; otherwise the
+/// The comments the result adds. A new comment is an attributed annotation
+/// beside the text, not a change to it: the policy counts it and lets it
+/// pass. A comment that was changed or removed is a direct change like any
+/// other.
+pub(crate) fn added_comments(report: &AuditReport) -> usize {
+    report
+        .direct_changes
+        .iter()
+        .filter(|change| {
+            change.kind == stemma::audit::DirectChangeKind::StoryInserted
+                && matches!(change.story, stemma::StoryScope::Comment { .. })
+        })
+        .count()
+}
+
+/// `None` when the audited result passes the delivery policy; otherwise the
 /// first failed invariant, with its count.
 pub(crate) fn tracked_delivery_failure(report: &AuditReport) -> Option<String> {
     if !report.validator.ok {
         return Some("the result failed structural validation".to_string());
     }
-    if !report.direct_changes.is_empty() {
+    let untracked = report.direct_changes.len() - added_comments(report);
+    if untracked != 0 {
         return Some(format!(
-            "the result contains {} untracked direct change(s)",
-            report.direct_changes.len()
+            "the result contains {untracked} untracked direct change(s)"
         ));
     }
     if !report.untouched.violations.is_empty() {

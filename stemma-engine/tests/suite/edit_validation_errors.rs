@@ -72,6 +72,7 @@ fn test_revision() -> RevisionInfo {
         author: Some("Test Author".to_string()),
         date: Some("2026-06-07T00:00:00Z".to_string()),
         apply_op_id: None,
+        date_utc: None,
     }
 }
 

@@ -698,7 +698,7 @@ fn apply_tracked_column_op(
                 change.previous.grid_cols = merged.formatting.grid_cols.clone();
             }
             merged.formatting.width = Some(crate::domain::TableMeasurement {
-                w: target_width,
+                w: i64::from(target_width),
                 width_type: crate::domain::WidthType::Dxa,
                 pct_literal: None,
             });
@@ -709,7 +709,7 @@ fn apply_tracked_column_op(
                 // Reject. Record history only for widths that actually change.
                 for column in 0..width {
                     let measurement = crate::domain::TableMeasurement {
-                        w: merged.formatting.grid_cols[column],
+                        w: i64::from(merged.formatting.grid_cols[column]),
                         width_type: crate::domain::WidthType::Dxa,
                         pct_literal: None,
                     };
@@ -953,7 +953,11 @@ fn delete_grid_column(
             if let (Some(measure), Some(removed)) = (cell.formatting.width.as_mut(), column_width)
                 && measure.width_type == crate::domain::WidthType::Dxa
             {
-                measure.w = measure.w.saturating_sub(removed);
+                // A non-negative width shrinks by the removed column and
+                // stops at 0; a negative one (kept as Word keeps it) is left.
+                if measure.w >= 0 {
+                    measure.w = (measure.w - i64::from(removed)).max(0);
+                }
             }
         } else {
             row.cells.remove(index);
@@ -1400,6 +1404,7 @@ fn minimal_paragraph(id: NodeId, segments: Vec<TrackedSegment>, text: &str) -> P
         has_direct_numbering: true,
         numbering_suppressed: false,
         direct_numbering_omits_ilvl: false,
+        direct_num_pr_without_list: None,
         materialized_numbering: None,
         rendered_text: None,
         literal_prefix: None,
@@ -1555,7 +1560,7 @@ mod tests {
             row.source_row_attrs = vec![("w:rsidR".to_string(), format!("0000000{index}"))];
             for cell in &mut row.cells {
                 cell.formatting.width = Some(crate::domain::TableMeasurement {
-                    w: 1200 + index as u32 * 41,
+                    w: 1200 + index as i64 * 41,
                     width_type: crate::domain::WidthType::Dxa,
                     pct_literal: None,
                 });
@@ -1627,6 +1632,7 @@ mod tests {
             author: Some("Reviewer".to_string()),
             date: Some("2026-01-01T00:00:00Z".to_string()),
             apply_op_id: None,
+            date_utc: None,
         };
         let mut counter = 2;
         lower_table_target(

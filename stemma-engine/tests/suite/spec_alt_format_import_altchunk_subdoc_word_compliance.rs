@@ -83,12 +83,14 @@ fn make_docx(body_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
         }
     }
 
-    // Content-type Overrides for each aFChunk target part (a full
-    // wordprocessingml document, the most common altChunk payload).
+    // Content-type Overrides for each aFChunk target part: an embedded .docx
+    // package, the most common altChunk payload. Word refuses a chunk
+    // declared as a WordprocessingML document that holds bare document XML
+    // rather than a package, so each part is a complete package.
     let mut afchunk_overrides = String::new();
     for rid in &afchunk_rids {
         afchunk_overrides.push_str(&format!(
-            r#"<Override PartName="/word/afchunk_{rid}.docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#
+            r#"<Override PartName="/word/afchunk_{rid}.docx" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/>"#
         ));
     }
 
@@ -103,12 +105,29 @@ fn make_docx(body_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rel_entries}</Relationships>"#
     );
 
-    // Minimal wordprocessingml body for each aFChunk target part.
-    let afchunk_part_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/><w:sectPr/></w:body></w:document>"#;
-
     use std::io::Write;
     use zip::write::FileOptions;
+
+    // A minimal embedded .docx package for each aFChunk target part.
+    let afchunk_part = {
+        let chunk_document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/><w:sectPr/></w:body></w:document>"#;
+        let chunk_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+        let mut chunk = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut chunk));
+        let opts: FileOptions = FileOptions::default();
+        for (name, content) in [
+            ("[Content_Types].xml", chunk_types),
+            ("_rels/.rels", rels),
+            ("word/document.xml", chunk_document),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        drop(zip);
+        chunk
+    };
     let mut buf = Vec::new();
     {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
@@ -125,7 +144,7 @@ fn make_docx(body_xml: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
         for rid in &afchunk_rids {
             zip.start_file(format!("word/afchunk_{rid}.docx"), opts)
                 .unwrap();
-            zip.write_all(afchunk_part_xml.as_bytes()).unwrap();
+            zip.write_all(&afchunk_part).unwrap();
         }
         for (part_path, xml) in extra_parts {
             zip.start_file(*part_path, opts).unwrap();
